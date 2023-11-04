@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-skyzen = { path="../../skyzen" }
+skyzen = { path="../skyzen" }
 tower-service = "0.3.2"
 
 [dev-dependencies]

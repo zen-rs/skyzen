@@ -1,0 +1,29 @@
+[package]
+name = "skyzen"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+skyzen-core =  { path = "../skyzen-core"}
+http-kit = { git = "https://github.com/lexoooooo/http-kit.git", rev = "f4c55b3"}
+async-trait = "0.1.57"
+matchit = "=0.6.0"
+anyhow = "1.0.75"
+serde = "1.0.188"
+serde_json = "1.0.105"
+serde_urlencoded = "0.7.1"
+cookie = { version = "0.17.0", features = ["percent-encode"]}
+
+
+[dependencies.log]
+version = "0.4.17"
+features = ["kv_unstable"]
+
+[dependencies.async-compression]
+version = "0.4.2"
+features = ["futures-io","brotli","gzip"]
+[features]
+default=[]
+typed_header = []
