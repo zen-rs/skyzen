@@ -44,10 +44,9 @@ impl Stream for Receiver {
 }
 
 impl Sender {
-    /// Create a paif of sender and SSE responder
-    pub fn new() -> (Self, Sse) {
+    pub(crate) fn new() -> (Self, Sse) {
         let (sender, receiver) = unbounded();
-        (Self { sender }, Sse::new(Receiver::new(receiver)))
+        (Self { sender }, Sse::from_stream(Receiver::new(receiver)))
     }
 
     /// Send an event to the stream.

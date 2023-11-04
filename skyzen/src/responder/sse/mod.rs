@@ -165,8 +165,12 @@ where
 }
 
 impl Sse {
+    /// Create a paif of sender and SSE responder
+    pub fn channel() -> (Sender, Sse) {
+        Sender::new()
+    }
     /// Create a SSE responder with a stream.
-    pub fn new<S, E>(stream: S) -> Self
+    pub fn from_stream<S, E>(stream: S) -> Self
     where
         S: Send + Sync + Stream<Item = Result<Event, E>> + 'static,
         E: Send + Sync + Into<anyhow::Error> + 'static,
@@ -202,13 +206,14 @@ mod test {
     use std::time::Duration;
     use tokio::task::spawn;
     use tokio::time::sleep;
+
     #[tokio::test]
     async fn channel_count() {
         async fn handler() -> Sse {
             let (sender, sse) = Sender::new();
             spawn(async move {
-                let mut count = 0;
-                loop{
+                let mut count = 1;
+                loop {
                     sender.send(Event::data(count.to_string())).await.unwrap();
                     sleep(Duration::from_secs(1)).await;
                     count += 1;
@@ -216,7 +221,6 @@ mod test {
             });
             sse
         }
-
         test_serve(into_endpoint(handler)).await;
     }
 }
