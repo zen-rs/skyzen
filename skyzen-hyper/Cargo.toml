@@ -1,0 +1,19 @@
+[package]
+name = "skyzen-hyper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+skyzen = { path="../../skyzen" }
+tower-service = "0.3.2"
+
+[dev-dependencies]
+tokio = {version="1.20.1",features=["macros","rt"]}
+log = "0.4.17"
+femme = "2.2.1"
+hyper = { version= "0.14.20",features = ["server","stream","http1","tcp"]}
+
+[dependencies.hyper]
+version = "0.14.20"
+default-features = false 
+features = ["server","stream","tcp"]
