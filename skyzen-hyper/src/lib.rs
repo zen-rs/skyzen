@@ -11,13 +11,16 @@ pub fn use_hyper<E: skyzen::Endpoint + Send + Sync>(endpoint: E) -> service::Int
 }
 
 #[cfg(test)]
-#[tokio::test]
-async fn test() {
-    femme::start();
-    use hyper::Server;
-    use skyzen::{CreateRouteNode, Route};
-
-    let route: Route = ["/".at(|| async move { "Hello,world!" })].into();
-
-    Server::bind(&([127, 0, 0, 1], 8080).into()).serve(use_hyper(route.build()));
+mod test{
+    use super::use_hyper;
+    #[tokio::test]
+    async fn test() {
+        femme::start();
+        use hyper::Server;
+        use skyzen::{CreateRouteNode, Route};
+    
+        let route: Route = ["/".at(|| async move { "Hello,world!" })].into();
+    
+        Server::bind(&([127, 0, 0, 1], 8080).into()).serve(use_hyper(route.build()));
+    }
 }
