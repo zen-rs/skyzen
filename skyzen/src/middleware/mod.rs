@@ -8,7 +8,7 @@
 //! async fn handler(){
 //!     
 //! }
-//! 
+//!
 //! into_middleware(handler)
 //! ```
 //!
