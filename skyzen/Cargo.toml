@@ -10,24 +10,40 @@ skyzen-core =  { path = "../skyzen-core"}
 http-kit = { git = "https://github.com/lexoooooo/http-kit.git", rev = "f4c55b3"}
 async-trait = "0.1.57"
 matchit = "=0.6.0"
-anyhow = "1.0.75"
 serde = "1.0.188"
-serde_json = "1.0.105"
-serde_urlencoded = "0.7.1"
 cookie = { version = "0.17.0", features = ["percent-encode"]}
-itoa = "1.0.9"
-pin-project-lite = "0.2.13"
-futures-core = "0.3.29"
-async-channel = "2.0.0"
+log = { version = "0.4.17", features = ["kv_unstable"]}
 
+[dependencies.serde_json]
+version = "1.0.105"
+optional = true
 
-[dependencies.log]
-version = "0.4.17"
-features = ["kv_unstable"]
+[dependencies.serde_urlencoded]
+version = "0.7.1"
+optional = true
 
-[dependencies.async-compression]
-version = "0.4.2"
-features = ["futures-io","brotli","gzip"]
+[dependencies.itoa]
+version = "1.0.9"
+optional = true
+
+[dependencies.anyhow]
+version = "1.0.75"
+optional = true
+
+[dependencies.async-channel]
+version = "2.0.0"
+optional = true
+
+[dependencies.pin-project-lite]
+version = "0.2.13"
+optional = true
+
+[dependencies.futures-core]
+version = "0.3.29"
+optional = true
+
 [features]
-default=[]
-typed_header = []
+default = ["json","form","sse"]
+json = ["dep:serde_json"]
+form = ["dep:serde_urlencoded"]
+sse = ["dep:itoa","dep:anyhow","dep:async-channel","dep:futures-core","dep:pin-project-lite"]

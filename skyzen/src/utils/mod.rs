@@ -1,7 +1,12 @@
-mod form;
+#[cfg(feature = "json")]
 mod json;
-pub use form::Form;
+#[cfg(feature = "json")]
 pub use json::{json, Json, JsonValue, PrettyJson};
+
+#[cfg(feature = "form")]
+mod form;
+#[cfg(feature = "form")]
+pub use form::Form;
 
 mod state;
 pub use state::State;
