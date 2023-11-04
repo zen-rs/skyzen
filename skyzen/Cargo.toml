@@ -3,16 +3,21 @@ name = "skyzen"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-skyzen-core =  { path = "../skyzen-core"}
-http-kit = { git = "https://github.com/lexoooooo/http-kit.git", rev = "f4c55b3"}
+skyzen-core =  { path = "../skyzen-core" }
+http-kit = { git = "https://github.com/lexoooooo/http-kit.git", rev = "f4c55b3" }
 async-trait = "0.1.57"
 matchit = "=0.6.0"
 serde = "1.0.188"
-cookie = { version = "0.17.0", features = ["percent-encode"]}
+cookie = { version = "0.17.0", features = ["percent-encode"] }
 log = { version = "0.4.17", features = ["kv_unstable"]}
+
+[dev-dependencies]
+tokio = { version="1.20.1", features=["macros","rt"] }
+log = "0.4.17"
+femme = "2.2.1"
+skyzen-hyper = { path = "../skyzen-hyper" }
+hyper = { version= "0.14.20",features = ["server","stream","http1","tcp"] }
 
 [dependencies.serde_json]
 version = "1.0.105"

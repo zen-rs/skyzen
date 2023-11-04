@@ -17,9 +17,9 @@ use http_kit::{
     header::{self, HeaderValue},
     Body, Request, Response,
 };
-use skyzen_core::Responder;
 use pin_project_lite::pin_project;
 use serde::Serialize;
+use skyzen_core::Responder;
 
 /// A SSE event
 #[derive(Debug)]
@@ -186,5 +186,37 @@ impl Responder for Sse {
         response.insert_header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
         response.replace_body(self.stream);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{
+        handler::into_endpoint,
+        responder::{
+            sse::{Event, Sender},
+            Sse,
+        },
+        test_helper::test_serve,
+    };
+    use std::time::Duration;
+    use tokio::task::spawn;
+    use tokio::time::sleep;
+    #[tokio::test]
+    async fn channel_count() {
+        async fn handler() -> Sse {
+            let (sender, sse) = Sender::new();
+            spawn(async move {
+                let mut count = 0;
+                loop{
+                    sender.send(Event::data(count.to_string())).await.unwrap();
+                    sleep(Duration::from_secs(1)).await;
+                    count += 1;
+                }
+            });
+            sse
+        }
+
+        test_serve(into_endpoint(handler)).await;
     }
 }

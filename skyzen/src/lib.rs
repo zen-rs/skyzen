@@ -13,6 +13,9 @@ pub mod routing;
 /// Utilities.
 pub mod utils;
 
+#[cfg(test)]
+mod test_helper;
+
 #[doc(inline)]
 pub use http_kit::{
     header, Body, Endpoint, Error, Hook, Method, Middleware, Request, Response, Result, ResultExt,
