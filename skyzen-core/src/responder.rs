@@ -1,9 +1,7 @@
-use bytestr::ByteStr;
 use bytes::Bytes;
+use bytestr::ByteStr;
 use futures_io::AsyncBufRead;
-use http::{
-    header::HeaderMap, HeaderName, HeaderValue
-};
+use http::{header::HeaderMap, HeaderName, HeaderValue};
 use http_kit::{Body, Request, Response, Result};
 use std::{borrow::Cow, pin::Pin};
 

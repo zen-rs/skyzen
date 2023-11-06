@@ -1,6 +1,7 @@
 //! Handle the request and make a response.
 //! ```
 //! // A simple echo server
+//! use bytestr::ByteStr;
 //! async fn handler(body:ByteStr) -> http_kit::Result<ByteStr>{
 //!    Ok(body)
 //! }

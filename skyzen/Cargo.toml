@@ -18,6 +18,8 @@ log = "0.4.17"
 femme = "2.2.1"
 skyzen-hyper = { path = "../skyzen-hyper" }
 hyper = { version= "0.14.20",features = ["server","stream","http1","tcp"] }
+bytestr = "0.1.0" 
+async-std = "1.12.0"
 
 [dependencies.serde_json]
 version = "1.0.105"

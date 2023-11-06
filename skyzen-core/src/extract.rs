@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use http::{Uri, Method};
-use http_kit::{Body,Request,Result};
-use bytestr::ByteStr;
 use bytes::Bytes;
+use bytestr::ByteStr;
+use http::{Method, Uri};
+use http_kit::{Body, Request, Result};
 
 /// Extract a object from request,always is the header,body value,etc.
 #[async_trait]
@@ -49,14 +49,14 @@ impl Extractor for Body {
 }
 
 #[async_trait]
-impl Extractor for Uri{
+impl Extractor for Uri {
     async fn extract(request: &mut Request) -> Result<Self> {
         Ok(request.uri().clone())
     }
 }
 
 #[async_trait]
-impl Extractor for Method{
+impl Extractor for Method {
     async fn extract(request: &mut Request) -> Result<Self> {
         Ok(request.method().clone())
     }
