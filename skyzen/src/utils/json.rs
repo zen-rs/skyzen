@@ -15,15 +15,11 @@ use crate::{
 };
 
 use serde::{de::DeserializeOwned, Serialize};
-use serde_json::{from_str, to_string, to_vec, to_vec_pretty};
+use serde_json::{from_str, to_string, to_vec};
 
 /// JSON extractor/responder.
 #[derive(Debug, Clone)]
 pub struct Json<T = JsonValue>(pub T);
-
-/// JSON extractor/responder.It could serialize data as a pretty-printed JSON.
-#[derive(Debug, Clone)]
-pub struct PrettyJson<T>(pub T);
 
 impl<T: Serialize> Responder for Json<T> {
     fn respond_to(self, _request: &Request, response: &mut Response) -> crate::Result<()> {
@@ -39,36 +35,17 @@ impl_error!(
     "This error occurs for a dismatched content type."
 );
 
-async fn extract_json<T: DeserializeOwned>(request: &mut Request) -> crate::Result<T> {
-    let body = request.take_body()?;
-    if request.get_header(CONTENT_TYPE).ok_or(ContentTypeError)? != "application/json" {
-        return Err(ContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    }
-
-    let data = body.into_string().await?;
-
-    Ok(from_str(data.as_str())?)
-}
-
 #[async_trait]
 impl<T: DeserializeOwned> Extractor for Json<T> {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
-        Ok(Self(extract_json(request).await?))
-    }
-}
+        let body = request.take_body()?;
+        if request.get_header(CONTENT_TYPE).ok_or(ContentTypeError)? != "application/json" {
+            return Err(ContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
 
-#[async_trait]
-impl<T: DeserializeOwned> Extractor for PrettyJson<T> {
-    async fn extract(request: &mut Request) -> crate::Result<Self> {
-        Ok(Self(extract_json(request).await?))
-    }
-}
+        let data = body.into_string().await?;
 
-impl<T: Serialize> Responder for PrettyJson<T> {
-    fn respond_to(self, _request: &Request, response: &mut Response) -> crate::Result<()> {
-        response.replace_body(to_vec_pretty(&self.0)?);
-        response.insert_header(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(())
+        Ok(Self(from_str(data.as_str())?))
     }
 }
 
