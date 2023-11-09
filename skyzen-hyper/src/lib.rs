@@ -3,6 +3,9 @@
 
 //! The hyper backend of skyzen
 
+use hyper::{server::conn::AddrIncoming, Server};
+use service::IntoMakeService;
+
 mod service;
 
 /// Transform the `Endpoint` of skyzen into the `Service` of hyper
@@ -10,17 +13,13 @@ pub fn use_hyper<E: skyzen::Endpoint + Send + Sync>(endpoint: E) -> service::Int
     service::IntoMakeService::new(endpoint)
 }
 
-#[cfg(test)]
-mod test {
-    use super::use_hyper;
-    #[tokio::test]
-    async fn test() {
-        femme::start();
-        use hyper::Server;
-        use skyzen::{CreateRouteNode, Route};
-
-        let route: Route = ["/".at(|| async move { "Hello,world!" })].into();
-
-        Server::bind(&([127, 0, 0, 1], 8080).into()).serve(use_hyper(route.build()));
-    }
+/// Lanuch your service on local server.
+pub fn launch_local<E: skyzen::Endpoint + 'static>(
+    endpoint: E,
+    port: u16,
+) -> hyper::Server<AddrIncoming, IntoMakeService<E>> {
+    let server = Server::bind(&([127, 0, 0, 1], port).into()).serve(use_hyper(endpoint));
+    let local_addr = server.local_addr();
+    log::info!("Server now running on {local_addr}");
+    server
 }

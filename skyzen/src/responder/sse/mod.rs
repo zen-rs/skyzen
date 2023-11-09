@@ -192,35 +192,3 @@ impl Responder for Sse {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod test {
-    use crate::{
-        handler::into_endpoint,
-        responder::{
-            sse::{Event, Sender},
-            Sse,
-        },
-        test_helper::test_serve,
-    };
-    use std::time::Duration;
-    use tokio::task::spawn;
-    use tokio::time::sleep;
-
-    #[tokio::test]
-    async fn channel_count() {
-        async fn handler() -> Sse {
-            let (sender, sse) = Sender::new();
-            spawn(async move {
-                let mut count = 1;
-                loop {
-                    sender.send(Event::data(count.to_string())).await.unwrap();
-                    sleep(Duration::from_secs(1)).await;
-                    count += 1;
-                }
-            });
-            sse
-        }
-        test_serve(into_endpoint(handler)).await;
-    }
-}

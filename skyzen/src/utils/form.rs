@@ -44,10 +44,9 @@ impl<T: DeserializeOwned> Extractor for Form<T> {
             {
                 return Err(ContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
             }
-            let body = request.take_body()?;
-            let data = body.into_string().await?;
+
             Ok(Self(
-                serde_urlencoded::from_str(data.as_str()).status(StatusCode::BAD_REQUEST)?,
+                request.into_form().await.status(StatusCode::BAD_REQUEST)?,
             ))
         }
     }

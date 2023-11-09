@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytes  = "1.1.0"
-http-kit = { git = "https://github.com/lexoooooo/http-kit.git", rev = "f4c55b3"}
+http-kit = { git = "https://github.com/lexoooooo/http-kit.git", rev = "7733014"}
 bytestr = "0.1.0" 
 async-trait = "0.1.57"
 futures-io = "0.3.23"

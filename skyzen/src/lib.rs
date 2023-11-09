@@ -6,15 +6,16 @@
 #[macro_use]
 mod macros;
 
+#[cfg(test)]
+#[macro_use]
+mod test_helper;
+
 pub mod handler;
 
 pub mod routing;
 
 /// Utilities.
 pub mod utils;
-
-#[cfg(test)]
-mod test_helper;
 
 #[doc(inline)]
 pub use http_kit::{
