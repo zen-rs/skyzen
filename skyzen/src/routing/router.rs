@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt::{Debug, Formatter},
     ops::Deref,
+    sync::Arc,
 };
 
 use super::{BoxEndpoint, Params, Route, RouteNode, RouteNodeType, SharedMiddleware};
@@ -9,17 +11,29 @@ use crate::{
 };
 
 use matchit::Match;
+use skyzen_core::Extractor;
+use smallvec::SmallVec;
 
 // The entrance of request,composing of endpoint and middlewares.
-#[allow(missing_debug_implementations)]
 pub struct App {
     endpoint: BoxEndpoint,
-    middlewares: Vec<SharedMiddleware>,
+    middlewares: SmallVec<[SharedMiddleware; 5]>,
 }
 
+/// An HTTP router.
+/// `Router` uses `Arc` internally, so it can safely be shared across threads.
+#[derive(Clone)]
 pub struct Router {
-    inner: matchit::Router<Vec<(Method, App)>>,
-    middlewares: Vec<SharedMiddleware>,
+    inner: Arc<matchit::Router<Vec<(Method, App)>>>,
+    programable_router: bool,
+}
+
+impl Debug for Router {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Router")
+            .field("programable_router", &self.programable_router)
+            .finish()
+    }
 }
 
 struct NotFoundEndpoint;
@@ -34,7 +48,7 @@ impl Endpoint for NotFoundEndpoint {
 impl_error!(RouteNotFound, "Route not found", "No route is matched.");
 
 impl Router {
-    pub fn search<'app, 'path, 'temp>(
+    fn search<'app, 'path, 'temp>(
         &'app self,
         path: &'path str,
         method: &'temp Method,
@@ -54,8 +68,13 @@ impl Router {
     }
 
     async fn call(&self, request: &mut Request) -> crate::Result<Response> {
+        if self.programable_router {
+            request.insert_extension(self.clone());
+        }
+
         let path = request.uri().path();
         let method = request.method();
+
         if let Some(Match { value, params }) = self.search(path, method) {
             let next = Next::new(&value.middlewares, value.endpoint.deref());
             let params: Vec<(String, String)> = params
@@ -66,11 +85,39 @@ impl Router {
             request.insert_extension(params);
             next.run(request).await
         } else {
-            let next = Next::new(&self.middlewares, &NotFoundEndpoint);
+            let next = Next::new(&[], &NotFoundEndpoint);
             next.run(request).await
         }
     }
+
+    /// Navigate to a route programmablly.
+    pub async fn go(&self, mut request: Request) -> crate::Result<Response> {
+        self.call(&mut request).await
+    }
+
+    /// Enable programable router, so that you can extract it from request.
+    pub fn enable_programable_router(mut self) -> Self {
+        self.programable_router = true;
+        self
+    }
 }
+
+#[async_trait]
+impl Extractor for Router {
+    async fn extract(request: &mut Request) -> crate::Result<Self> {
+        let router = request
+            .get_extension()
+            .map(|v: &Router| v.clone())
+            .ok_or(RouterNotExist)?;
+        Ok(router)
+    }
+}
+
+impl_error!(
+    RouterNotExist,
+    "This programmable router does not exist. Please check whether you have enabled the programmable router.",
+    "Error occurs if cannot extract router."
+);
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -86,32 +133,26 @@ impl From<matchit::InsertError> for RouteBuildError {
 }
 
 type FlattenBuf = HashMap<String, Vec<(Method, App)>>;
-fn flatten(
-    path_prefix: &str,
-    route: Vec<RouteNode>,
-    buf: &mut FlattenBuf,
-    middlewares: Vec<SharedMiddleware>,
-) {
+fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
     for node in route {
         let path = format!("{}{}", path_prefix, node.path);
 
         match node.node_type {
             RouteNodeType::Route(route) => {
-                flatten(
-                    &path,
-                    route,
-                    buf,
-                    [middlewares.clone(), node.middlewares].concat(),
-                );
+                flatten(&path, route.nodes, buf);
             }
-            RouteNodeType::Endpoint { endpoint, method } => {
+            RouteNodeType::Endpoint {
+                endpoint,
+                method,
+                middlewares,
+            } => {
                 let entry = buf.entry(path).or_insert(Vec::new());
 
                 entry.push((
                     method,
                     App {
                         endpoint,
-                        middlewares: middlewares.clone(),
+                        middlewares: middlewares.into(),
                     },
                 ))
             }
@@ -121,7 +162,7 @@ fn flatten(
 
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
-    flatten("", route.nodes, &mut buf, route.middlewares.clone());
+    flatten("", route.nodes, &mut buf);
     let mut router = matchit::Router::new();
     for (path, value) in buf {
         let mut set = HashSet::new();
@@ -136,8 +177,8 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
         router.insert(path, value)?;
     }
     Ok(Router {
-        inner: router,
-        middlewares: route.middlewares,
+        inner: Arc::new(router),
+        programable_router: false,
     })
 }
 

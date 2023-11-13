@@ -2,23 +2,19 @@
 
 mod param;
 mod router;
-use crate::{handler::into_endpoint, middleware::ErrorHandlingMiddleware};
-use http_kit::Endpoint;
+use crate::{handler::into_endpoint, middleware::ErrorHandlingMiddleware, utils::State};
+use http_kit::{middleware::SharedMiddleware, Endpoint};
 pub use param::Params;
+pub use router::Router;
 use skyzen_core::Responder;
 use std::{
     fmt::Debug,
     future::Future,
     ops::{Deref, DerefMut},
-    pin::Pin,
     sync::Arc,
 };
 
-/// Boxed endpoint object.
-type BoxEndpoint = Pin<Box<dyn Endpoint + Send + Sync + 'static>>;
-
-/// Boxed middleware object.
-type SharedMiddleware = Pin<Arc<dyn Middleware + Send + Sync + 'static>>;
+type BoxEndpoint = Box<dyn Endpoint>;
 
 use crate::{extract::Extractor, Method, Middleware};
 
@@ -29,7 +25,6 @@ use crate::handler::Handler;
 pub struct RouteNode {
     path: String,
     node_type: RouteNodeType,
-    middlewares: Vec<SharedMiddleware>,
 }
 
 impl RouteNode {
@@ -37,29 +32,18 @@ impl RouteNode {
     pub fn method(path: String, method: Method, endpoint: BoxEndpoint) -> Self {
         Self {
             path,
-            middlewares: Vec::new(),
-            node_type: RouteNodeType::Endpoint { endpoint, method },
+            node_type: RouteNodeType::Endpoint {
+                endpoint,
+                method,
+                middlewares: Vec::new(),
+            },
         }
     }
-
     /// Create a nest route.
     pub fn route(path: String, route: Route) -> Self {
         Self {
             path,
-            middlewares: Vec::new(),
-            node_type: RouteNodeType::Route(route.nodes),
-        }
-    }
-
-    fn set_middleware_inner(&mut self, middleware: SharedMiddleware) {
-        self.middlewares.push(middleware.clone());
-        match self.node_type {
-            RouteNodeType::Route(ref mut routes) => {
-                for route in routes {
-                    route.set_middleware_inner(middleware.clone())
-                }
-            }
-            _ => {}
+            node_type: RouteNodeType::Route(route),
         }
     }
 
@@ -74,7 +58,22 @@ impl RouteNode {
     /// This method don't require ownership of `RouteNode`
     /// If this route node is a route, all route nodes contains in this node will be applied this middleware.
     pub fn set_middleware(&mut self, middleware: impl Middleware + 'static) {
-        self.set_middleware_inner(Arc::pin(middleware))
+        self.set_middleware_inner(Arc::new(middleware));
+    }
+
+    fn set_middleware_inner(&mut self, middleware: SharedMiddleware) {
+        match self.node_type {
+            RouteNodeType::Route(ref mut routes) => routes.set_middleware_inner(middleware),
+            RouteNodeType::Endpoint {
+                ref mut middlewares,
+                ..
+            } => middlewares.push(middleware),
+        }
+    }
+
+    /// Share the state of application.
+    pub fn state<T: Clone + Send + Sync + 'static>(self, state: T) -> Self {
+        self.middleware(State(state))
     }
 
     /// Handle a error by applying a function.
@@ -89,9 +88,10 @@ impl RouteNode {
 }
 
 enum RouteNodeType {
-    Route(Vec<RouteNode>),
+    Route(Route),
     Endpoint {
         endpoint: BoxEndpoint,
+        middlewares: Vec<SharedMiddleware>,
         method: Method,
     },
 }
@@ -112,7 +112,6 @@ impl Debug for RouteNodeType {
 #[derive(Debug)]
 pub struct Route {
     nodes: Vec<RouteNode>,
-    middlewares: Vec<SharedMiddleware>,
 }
 
 impl Route {
@@ -127,11 +126,18 @@ impl Route {
     /// This method don't require ownership of `Route`
     /// All route nodes contains in this route will be applied this middleware.
     pub fn set_middleware(&mut self, middleware: impl Middleware + Send + Sync + 'static) {
-        let middleware = Arc::pin(middleware);
+        self.set_middleware_inner(Arc::new(middleware))
+    }
+
+    fn set_middleware_inner(&mut self, middleware: SharedMiddleware) {
         for node in self.nodes.deref_mut() {
-            node.set_middleware_inner(middleware.clone());
+            node.set_middleware_inner(middleware.clone())
         }
-        self.middlewares.push(middleware);
+    }
+
+    /// Share the state of application.
+    pub fn state<T: Clone + Send + Sync + 'static>(self, state: T) -> Self {
+        self.middleware(State(state))
     }
 
     /// Handle a error by applying a function.
@@ -169,7 +175,6 @@ impl<T: Into<Vec<RouteNode>>> From<T> for Route {
     fn from(nodes: T) -> Self {
         Self {
             nodes: nodes.into(),
-            middlewares: Vec::new(),
         }
     }
 }
@@ -237,7 +242,7 @@ impl CreateRouteNode for String {
         method: Method,
         handler: impl Handler<T> + Send + Sync + 'static,
     ) -> RouteNode {
-        RouteNode::method(self, method, Box::pin(into_endpoint(handler)))
+        RouteNode::method(self, method, Box::new(into_endpoint(handler)))
     }
 
     fn route(self, route: impl Into<Vec<RouteNode>>) -> RouteNode {
