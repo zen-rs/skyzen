@@ -7,8 +7,20 @@ use std::{borrow::Cow, pin::Pin};
 
 /// Transform a object into a part of HTTP response,always is response body,header,etc.
 pub trait Responder {
-    /// Modify the response,sometime also read the request(but the body may have been consumed).
+    /// Modify the response,sometime also read the request (but the body may have already been consumed).
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<()>;
+
+    /// Generate a response.
+    /// If this `Responder` requires reading the request, it may not work.
+    fn into_response(self) -> Result<Response>
+    where
+        Self: Sized,
+    {
+        let request = Request::get("/");
+        let mut response = Response::empty();
+        self.respond_to(&request, &mut response)?;
+        Ok(response)
+    }
 }
 
 macro_rules! impl_tuple_responder {
