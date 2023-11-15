@@ -49,4 +49,19 @@ macro_rules! impl_deref {
             }
         }
     };
+
+    ($ty:tt,$target:ty) => {
+        impl std::ops::Deref for $ty {
+            type Target = $target;
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl std::ops::DerefMut for $ty {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
+        }
+    };
 }
