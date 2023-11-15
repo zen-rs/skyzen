@@ -24,7 +24,7 @@ impl<T: Serialize> Responder for Json<T> {
 }
 
 impl_error!(
-    ContentTypeError,
+    JsonContentTypeError,
     "Expected content type `application/json`",
     "This error occurs for a dismatched content type."
 );
@@ -32,15 +32,17 @@ impl_error!(
 #[async_trait]
 impl<T: DeserializeOwned> Extractor for Json<T> {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
-        if request.get_header(CONTENT_TYPE).ok_or(ContentTypeError)? != "application/json" {
-            return Err(ContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        if request
+            .get_header(CONTENT_TYPE)
+            .ok_or(JsonContentTypeError)?
+            != "application/json"
+        {
+            return Err(JsonContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
 
         Ok(Self(request.into_json().await?))
     }
 }
-
-impl_deref!(Json);
 
 #[cfg(test)]
 mod test {

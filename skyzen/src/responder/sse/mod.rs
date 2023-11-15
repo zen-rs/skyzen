@@ -1,7 +1,7 @@
 //! [Server-Sent event (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) responder for levin
 
 mod channel;
-pub use channel::Sender;
+pub use channel::{SendError, Sender};
 
 use itoa::Buffer;
 

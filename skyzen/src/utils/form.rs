@@ -26,7 +26,7 @@ impl<T: Serialize> Responder for Form<T> {
 }
 
 impl_error!(
-    ContentTypeError,
+    FormContentTypeError,
     "Expected content type `application/x-www-form-urlencoded`",
     "This error occurs for a dismatched content type."
 );
@@ -34,10 +34,12 @@ impl_error!(
 #[async_trait]
 impl<T: DeserializeOwned> Extractor for Form<T> {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
-        if request.get_header(CONTENT_TYPE).ok_or(ContentTypeError)?
+        if request
+            .get_header(CONTENT_TYPE)
+            .ok_or(FormContentTypeError)?
             != APPLICATION_WWW_FORM_URLENCODED
         {
-            return Err(ContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            return Err(FormContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
 
         if request.method() == Method::GET {
@@ -52,7 +54,7 @@ impl<T: DeserializeOwned> Extractor for Form<T> {
 
 fn extract<T: DeserializeOwned>(data: &str) -> Result<Form<T>, Error> {
     Ok(Form(from_str(data).map_err(|_| {
-        Error::new(ContentTypeError, StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        Error::new(FormContentTypeError, StatusCode::UNSUPPORTED_MEDIA_TYPE)
     })?))
 }
 
