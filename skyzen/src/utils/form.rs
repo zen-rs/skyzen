@@ -1,13 +1,12 @@
-use std::ops::{Deref, DerefMut};
-
 use crate::{
     async_trait,
     extract::Extractor,
     header::{HeaderValue, CONTENT_TYPE},
     responder::Responder,
-    Method, Request, Response, ResultExt, StatusCode,
+    Method, Request, Response, StatusCode,
 };
 
+use http_kit::{Error, ResultExt};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_urlencoded::{from_str, to_string};
 
@@ -35,32 +34,26 @@ impl_error!(
 #[async_trait]
 impl<T: DeserializeOwned> Extractor for Form<T> {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
+        if request.get_header(CONTENT_TYPE).ok_or(ContentTypeError)?
+            != APPLICATION_WWW_FORM_URLENCODED
+        {
+            return Err(ContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+
         if request.method() == Method::GET {
             let data = request.uri().query().unwrap_or_default();
-            Ok(Self(from_str(data).status(StatusCode::BAD_REQUEST)?))
+            extract(data)
         } else {
-            if request.get_header(CONTENT_TYPE).ok_or(ContentTypeError)?
-                != APPLICATION_WWW_FORM_URLENCODED
-            {
-                return Err(ContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-            }
-
-            Ok(Self(
-                request.into_form().await.status(StatusCode::BAD_REQUEST)?,
-            ))
+            let data = request.take_body()?.into_string().await?;
+            extract(&data)
         }
     }
 }
 
-impl<T> Deref for Form<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+fn extract<T: DeserializeOwned>(data: &str) -> Result<Form<T>, Error> {
+    Ok(Form(from_str(data).map_err(|_| {
+        Error::new(ContentTypeError, StatusCode::UNSUPPORTED_MEDIA_TYPE)
+    })?))
 }
 
-impl<T> DerefMut for Form<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+impl_deref!(Form);

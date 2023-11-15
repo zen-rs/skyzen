@@ -1,14 +1,15 @@
-use http_kit::header::HeaderValue;
-pub use serde_json::json;
-pub use serde_json::Value as JsonValue;
-use std::ops::{Deref, DerefMut};
-
 use crate::{
     async_trait, extract::Extractor, header::CONTENT_TYPE, responder::Responder, Request, Response,
     ResultExt, StatusCode,
 };
+use http_kit::header::HeaderValue;
+pub use serde_json::from_str;
+pub use serde_json::json;
+pub use serde_json::Value as JsonValue;
 
 use serde::{de::DeserializeOwned, Serialize};
+
+const APPLICATION_JSON: HeaderValue = HeaderValue::from_static("application/json");
 
 /// JSON extractor/responder.
 #[derive(Debug, Clone)]
@@ -16,7 +17,7 @@ pub struct Json<T = JsonValue>(pub T);
 
 impl<T: Serialize> Responder for Json<T> {
     fn respond_to(self, _request: &Request, response: &mut Response) -> crate::Result<()> {
-        response.insert_header(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response.insert_header(CONTENT_TYPE, APPLICATION_JSON);
         response.replace_body(serde_json::to_vec(&self.0)?);
         Ok(())
     }
@@ -39,18 +40,7 @@ impl<T: DeserializeOwned> Extractor for Json<T> {
     }
 }
 
-impl<T> Deref for Json<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T> DerefMut for Json<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+impl_deref!(Json);
 
 #[cfg(test)]
 mod test {

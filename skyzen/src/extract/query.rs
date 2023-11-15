@@ -1,5 +1,3 @@
-use std::ops::Deref;
-
 use crate::{async_trait, extract::Extractor, Request, ResultExt, StatusCode};
 
 use serde::de::DeserializeOwned;
@@ -9,12 +7,7 @@ use serde_urlencoded::from_str;
 #[derive(Debug, Clone)]
 pub struct Query<T>(pub T);
 
-impl<T> Deref for Query<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
+impl_deref!(Query);
 
 #[async_trait]
 impl<T: DeserializeOwned> Extractor for Query<T> {
