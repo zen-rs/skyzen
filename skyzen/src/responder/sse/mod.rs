@@ -1,25 +1,48 @@
-//! [Server-Sent event (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) responder for levin
-
+//! [Server-Sent event (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) responder.
+//!
+//! SSE allows a server to send new data to client at any time, which is useful in message pushing,etc.
+//! There're two style to use [`SSE`](crate::responder::Sse) responder: stream style and channel style.
+//! # Stream style
+//! Convert a stream generating `Result<Event>` to a SSE stream.
+//! ```
+//! # use skyzen::responder::{Sse,sse::Event};
+//! use futures_util::stream::once;
+//! use std::convert::Infallible;
+//! async fn handler() -> Sse{
+//!     Sse::from_stream(once(async{Ok::<_,Infallible>(Event::data("Hello!"))}))
+//! }
+//! ```
+//!
+//! # Channel style
+//! Create a SSE stream and a sender, send message to stream with the sender.
+//! *Warning:* You must return SSE stream first before you send message by sender.
+//! ```
+//! # use skyzen::responder::{Sse,sse::Event};
+//! async fn handler() -> Sse{
+//!     let(sender,sse) = Sse::channel();
+//!     sender.send_data("Hello!");
+//!     sse
+//! }
+//! ```
 mod channel;
 pub use channel::{SendError, Sender};
 
 use itoa::Buffer;
 
+use http_kit::{
+    header::{self, HeaderValue},
+    utils::Stream,
+    Body, Request, Response,
+};
+use pin_project_lite::pin_project;
+use serde::Serialize;
+use skyzen_core::Responder;
 use std::{
     marker::PhantomData,
     pin::Pin,
     task::{ready, Context, Poll},
     time::Duration,
 };
-
-use futures_core::Stream;
-use http_kit::{
-    header::{self, HeaderValue},
-    Body, Request, Response,
-};
-use pin_project_lite::pin_project;
-use serde::Serialize;
-use skyzen_core::Responder;
 
 /// A SSE event
 #[derive(Debug)]
@@ -30,7 +53,7 @@ pub struct Event {
 }
 
 fn has_newline(v: &[u8]) -> bool {
-    v.iter().find(|x| **x == b'\n' || **x == b'\r').is_some()
+    v.iter().any(|x| *x == b'\n' || *x == b'\r')
 }
 
 impl Event {
@@ -51,10 +74,10 @@ impl Event {
     }
 
     /// Create an SSE event with a data payload in json format.
-    pub fn json(v: &impl Serialize) -> serde_json::Result<Self> {
+    pub fn json(v: impl Serialize) -> serde_json::Result<Self> {
         let mut event = Self::empty();
         event.buffer.extend_from_slice(b"data:");
-        serde_json::to_writer(&mut event.buffer, v)?;
+        serde_json::to_writer(&mut event.buffer, &v)?;
         Ok(event)
     }
 
@@ -81,17 +104,19 @@ impl Event {
 
     /// Set the id of this event.
     /// The id is useful in reconnection.See [The `Last-Event-ID` header](https://html.spec.whatwg.org/multipage/server-sent-events.html#the-last-event-id-header) for more information.
-    pub fn id(&mut self, id: impl AsRef<str>) {
+    pub fn id(mut self, id: impl AsRef<str>) -> Self {
         assert!(!self.has_id, "Id has alreay been set");
         let id = id.as_ref();
-        self.field("id", id)
+        self.field("id", id);
+        self
     }
 
     /// Set the event of this event.
-    pub fn event(&mut self, event: impl AsRef<str>) {
+    pub fn event(mut self, event: impl AsRef<str>) -> Self {
         assert!(!self.has_event, "Id has alreay been set");
         let event = event.as_ref();
-        self.field("event", event)
+        self.field("event", event);
+        self
     }
 
     // Warning: the value cannot include `\r` or `\n`
@@ -152,11 +177,12 @@ where
 {
     type Item = Result<Vec<u8>, anyhow::Error>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(ready!(self.project().stream.poll_next(cx)).map(|result| {
-            result
-                .map(|data| data.finalize())
-                .map_err(|error| error.into())
-        }))
+        Poll::Ready(ready!(self.project().stream.poll_next(cx))).map(|result| {
+            result.map(|data| {
+                data.map(|data| data.finalize())
+                    .map_err(|error| error.into())
+            })
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

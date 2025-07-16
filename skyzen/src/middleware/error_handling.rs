@@ -1,7 +1,6 @@
 use std::{fmt::Debug, future::Future};
 
-use async_trait::async_trait;
-use http_kit::{middleware::Next, Middleware, Request, Response};
+use http_kit::{Middleware, Request, Response};
 use skyzen_core::Responder;
 
 /// Handler error with an asynchronous function
@@ -17,8 +16,8 @@ impl<F> Debug for ErrorHandlingMiddleware<F> {
 
 impl<F: Send + Sync, Fut: Send, Res> ErrorHandlingMiddleware<F>
 where
-    F: 'static + Fn(crate::Error) -> Fut,
-    Fut: Future<Output = Res>,
+    F: 'static + Send + Sync + Fn(crate::Error) -> Fut,
+    Fut: Send + Sync + Future<Output = Res>,
     Res: Responder,
 {
     /// New an error handling middleware with provided handler function.
@@ -27,19 +26,18 @@ where
     }
 }
 
-#[async_trait]
 impl<F: Send + Sync, Fut: Send, Res> Middleware for ErrorHandlingMiddleware<F>
 where
-    F: 'static + Fn(crate::Error) -> Fut,
-    Fut: Future<Output = Res>,
+    F: 'static + Send + Sync + Fn(crate::Error) -> Fut,
+    Fut: Send + Sync + Future<Output = Res>,
     Res: Responder,
 {
-    async fn call_middleware(
-        &self,
+    async fn handle(
+        &mut self,
         request: &mut Request,
-        next: Next<'_>,
-    ) -> crate::Result<Response> {
-        let result = next.run(request).await;
+        mut next: impl http_kit::Endpoint,
+    ) -> http_kit::Result<Response> {
+        let result = next.respond(request).await;
         if let Err(error) = result {
             let mut response = Response::empty();
             (self.f)(error).await.respond_to(request, &mut response)?;

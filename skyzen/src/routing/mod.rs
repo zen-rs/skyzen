@@ -1,9 +1,76 @@
 //! Routing between endpoints
-
+//!
+//! Skyzen use tree-based routing system, you can create a [`RouteNode`](crate::routing::RouteNode) with [`CreateRouteNode`](crate::routing::CreateRouteNode) trait, just like this:
+//! ```
+//! use skyzen::{CreateRouteNode,routing::Params,Route};
+//! Route::new([
+//!     "/home".at(||async{}),
+//!     "/about".at(||async{}),
+//! ]);
+//! ```
+//! What's more, you can use named parameters in route.
+//! ```
+//! # use skyzen::{CreateRouteNode,routing::Params,Route};
+//! async fn hello(params:Params) -> String{
+//!     let name=params.get("name").unwrap();
+//!     format!("Hello,{name}!")
+//! }
+//! Route::new([
+//!     "/user/:name".at(hello)
+//! ]);
+//! ```
+//!
+//! Or...match everything after `/*` with catch-all parameters!
+//!```
+//! # use skyzen::{CreateRouteNode,routing::Params,Route};
+//! async fn echo(params:Params) -> String{
+//!     let path=params.get("path").unwrap();
+//!     format!("Path: {path}")
+//! }
+//! Route::new([
+//!     "/file/*path".at(echo)
+//! ]);
+//!```
+//! # Applying middleware for routes
+//! You can apply middleware for routes with `middleware` method of `Route` or `RouteNode`
+//! ```
+//! # use skyzen::{CreateRouteNode,routing::Params,Route,utils::State};
+//! Route::new([
+//!     "/couter".at(||async{})
+//! ]).middleware(State(0));
+//! ```
+//! Middleware applied on a route (both including `Route` and `RouteNode` represented a route) will also be recursively applied on all the route node in the route.
+//!
+//! # Error handling
+//! You can catch the error when endpoint fails with [`ErrorHandlingMiddleware`](crate::middleware::ErrorHandlingMiddleware).
+//! ```
+//! # use skyzen::{CreateRouteNode,routing::Params,Route,utils::State,middleware::ErrorHandlingMiddleware};
+//! Route::new([
+//!
+//! ]).middleware(ErrorHandlingMiddleware::new(|error| async{"Error!"}));
+//! ```
+//! or use the convenience method `error_handling`
+//! ```
+//! # use skyzen::{CreateRouteNode,routing::Params,Route,utils::State};
+//! Route::new([
+//!
+//! ]).error_handling(|error| async{"Error!"});
+//! ```
+//!
+//! The handling function will be called from inside to outside, until the error is catched and a response is provided.
+//! If the error is still not catched even if the outermost handling function is called, skyzen will close the connection and print log.
+//!
+//! ```
+//! # use skyzen::{CreateRouteNode,routing::Params,Route,utils::State};
+//! Route::new([
+//!     "/test".at(||async{})
+//!         .error_handling(|error| async{"Error!"})
+//! ]).error_handling(|error| async{"Error!"});
+//! ```
 mod param;
 mod router;
 use crate::{handler::into_endpoint, middleware::ErrorHandlingMiddleware, utils::State};
-use http_kit::{middleware::SharedMiddleware, Endpoint};
+use http_kit::Endpoint;
 pub use param::Params;
 pub use router::Router;
 use skyzen_core::Responder;
@@ -80,7 +147,7 @@ impl RouteNode {
     pub fn error_handling<F: Send + Sync, Fut: Send, Res>(self, f: F) -> Self
     where
         F: 'static + Fn(crate::Error) -> Fut,
-        Fut: Future<Output = crate::Result<Res>>,
+        Fut: Future<Output = Res>,
         Res: Responder,
     {
         self.middleware(ErrorHandlingMiddleware::new(f))
@@ -108,13 +175,21 @@ impl Debug for RouteNodeType {
     }
 }
 
-/// Route dispatches requests,
+/// Route is a collection of route nodes.
+///
+/// See the [`routing`](crate::routing) documentation for the usage of skyzen's routing system.
 #[derive(Debug)]
 pub struct Route {
     nodes: Vec<RouteNode>,
 }
 
 impl Route {
+    /// Create a route with route nodes.
+    pub fn new(nodes: impl Into<Vec<RouteNode>>) -> Self {
+        Self {
+            nodes: nodes.into(),
+        }
+    }
     /// Set middleware for this route.
     /// All route nodes contains in this route will be applied this middleware.
     pub fn middleware(mut self, middleware: impl Middleware + Send + Sync + 'static) -> Self {

@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_channel::unbounded;
-use futures_core::Stream;
+use http_kit::utils::Stream;
 use pin_project_lite::pin_project;
 
 use super::{Event, Sse};
@@ -39,7 +39,7 @@ impl Receiver {
 impl Stream for Receiver {
     type Item = Result<Event, anyhow::Error>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(ready!(self.project().receiver.poll_next(cx)).map(|event| Ok(event)))
+        Poll::Ready(ready!(self.project().receiver.poll_next(cx)).map(Ok))
     }
 }
 
@@ -52,5 +52,10 @@ impl Sender {
     /// Send an event to the stream.
     pub async fn send(&self, event: Event) -> Result<(), SendError> {
         self.sender.send(event).await.map_err(|_| SendError)
+    }
+
+    /// Send an event with a data payload to the stream.
+    pub async fn send_data(&self, data: impl AsRef<str>) -> Result<(), SendError> {
+        self.send(Event::data(data)).await
     }
 }

@@ -4,28 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-skyzen-core =  { path = "../skyzen-core" }
-http-kit = { git = "https://github.com/lexoooooo/http-kit.git", rev = "88881db"}
-async-trait = "0.1.57"
-matchit = "0.6.0"
-serde = "1.0.188"
-cookie = { version = "0.17.0", features = ["percent-encode"] }
-log = { version = "0.4.17", features = ["kv_unstable"]}
-smallvec = "1.11.2"
+skyzen-core.workspace = true
+http-kit.workspace = true
+matchit = "0.8.6"
+serde = "1.0"
+cookie = { version = "0.18.1", features = ["percent-encode"] }
+log.workspace = true
+smallvec = "1.15"
 
 [dev-dependencies]
-tokio = { version = "1.20.1", features=["macros","rt"] }
-log = "0.4.17"
+tokio = { version = "1.45", features = ["macros", "rt"] }
+log.workspace = true
 femme = "2.2.1"
 skyzen-hyper = { path = "../skyzen-hyper" }
-zenwave = { git = "https://github.com/lexoooooo/zenwave.git", rev = "4444c70" }
-hyper = { version= "0.14.20",features = ["server","stream","http1","tcp"] }
-bytestr = "0.1.0" 
-async-std = "1.12.0"
-serde = { version = "1.0.188", features = ["derive"]}
+zenwave = { git = "https://github.com/zen-rs/zenwave.git"}
+serde = { version = "1.0", features = ["derive"] }
 
 [dependencies.serde_json]
-version = "1.0.105"
+version = "1.0"
 optional = true
 
 [dependencies.serde_urlencoded]
@@ -33,27 +29,24 @@ version = "0.7.1"
 optional = true
 
 [dependencies.itoa]
-version = "1.0.9"
+version = "1.0"
 optional = true
 
 [dependencies.anyhow]
-version = "1.0.75"
+version = "1.0"
 optional = true
 
 [dependencies.async-channel]
-version = "2.0.0"
+version = "2.3"
 optional = true
 
 [dependencies.pin-project-lite]
-version = "0.2.13"
+version = "0.2.16"
 optional = true
 
-[dependencies.futures-core]
-version = "0.3.29"
-optional = true
 
 [features]
-default = ["json","form","sse"]
-json = ["dep:serde_json","http-kit/json"]
-form = ["dep:serde_urlencoded","http-kit/form"]
-sse = ["dep:itoa","dep:anyhow","dep:async-channel","dep:futures-core","dep:pin-project-lite"]
+default = ["json", "form", "sse"]
+json = ["dep:serde_json", "http-kit/json"]
+form = ["dep:serde_urlencoded", "http-kit/form"]
+sse = ["dep:itoa", "dep:anyhow", "dep:async-channel", "dep:pin-project-lite"]

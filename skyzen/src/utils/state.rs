@@ -1,7 +1,6 @@
 use std::ops::{Deref, DerefMut};
 
-use async_trait::async_trait;
-use http_kit::{middleware::Next, Middleware, Request, Response, Result};
+use http_kit::{Middleware, Request, Response, Result};
 use skyzen_core::Extractor;
 
 /// Share the state of application.
@@ -21,7 +20,6 @@ impl<T: Send + Sync + Clone + 'static> DerefMut for State<T> {
     }
 }
 
-#[async_trait]
 impl<T: Send + Sync + Clone + 'static> Extractor for State<T> {
     async fn extract(request: &mut Request) -> Result<Self> {
         request
@@ -34,11 +32,14 @@ impl<T: Send + Sync + Clone + 'static> Extractor for State<T> {
     }
 }
 
-#[async_trait]
 impl<T: Send + Sync + Clone + 'static> Middleware for State<T> {
-    async fn call_middleware(&self, request: &mut Request, next: Next<'_>) -> Result<Response> {
+    async fn handle(
+        &mut self,
+        request: &mut Request,
+        mut next: impl http_kit::Endpoint,
+    ) -> Result<Response> {
         request.insert_extension(self.clone());
-        next.run(request).await
+        next.respond(request).await
     }
 }
 

@@ -36,14 +36,14 @@ macro_rules! impl_error {
 
 macro_rules! impl_deref {
     ($ty:tt) => {
-        impl<T> std::ops::Deref for $ty<T> {
+        impl<T: Send + Sync> std::ops::Deref for $ty<T> {
             type Target = T;
             fn deref(&self) -> &Self::Target {
                 &self.0
             }
         }
 
-        impl<T> std::ops::DerefMut for $ty<T> {
+        impl<T: Send + Sync> std::ops::DerefMut for $ty<T> {
             fn deref_mut(&mut self) -> &mut Self::Target {
                 &mut self.0
             }

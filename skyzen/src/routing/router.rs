@@ -38,9 +38,8 @@ impl Debug for Router {
 
 struct NotFoundEndpoint;
 
-#[async_trait]
 impl Endpoint for NotFoundEndpoint {
-    async fn call_endpoint(&self, _request: &mut Request) -> crate::Result<Response> {
+    async fn respond(&self, request: &mut Request) -> http_kit::Result<Response> {
         Err(Error::new(RouteNotFound, StatusCode::NOT_FOUND))
     }
 }
@@ -102,13 +101,9 @@ impl Router {
     }
 }
 
-#[async_trait]
 impl Extractor for Router {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
-        let router = request
-            .get_extension()
-            .map(|v: &Router| v.clone())
-            .ok_or(RouterNotExist)?;
+        let router = request.get_extension().cloned().ok_or(RouterNotExist)?;
         Ok(router)
     }
 }
@@ -146,7 +141,7 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
                 method,
                 middlewares,
             } => {
-                let entry = buf.entry(path).or_insert(Vec::new());
+                let entry = buf.entry(path).or_default();
 
                 entry.push((
                     method,
@@ -182,9 +177,8 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     })
 }
 
-#[async_trait]
 impl Endpoint for Router {
-    async fn call_endpoint(&self, request: &mut Request) -> crate::Result<Response> {
+    async fn respond(&self, request: &mut Request) -> http_kit::Result<Response> {
         log::info!(method = request.method().as_str(),path=request.uri().path() ;"Request Received");
         Ok(self.call(request).await.unwrap_or_else(|error| {
             let mut response=Response::empty();

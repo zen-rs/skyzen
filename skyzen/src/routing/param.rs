@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use http_kit::{Request, StatusCode};
 use skyzen_core::Extractor;
 
@@ -30,7 +29,6 @@ impl Params {
     }
 }
 
-#[async_trait]
 impl Extractor for Params {
     async fn extract(request: &mut Request) -> http_kit::Result<Self> {
         Ok(request.remove_extension().unwrap_or(Self::empty()))

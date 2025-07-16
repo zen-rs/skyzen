@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-log = "0.4.17"
-skyzen = { path="../skyzen" }
-tower-service = "0.3.2"
+log.workspace = true
+skyzen = { path = "../skyzen" }
+tower-service = "0.3.3"
+futures-util = "0.3.31"
+http-body-util = "0.1.3"
+hyper-util = { version = "0.1.13", features = ["server", "http1", "http2"] }
+executor-core= { version = "0.1.0", default-features = false}
 
 [dependencies.hyper]
-version = "0.14.20"
-default-features = false 
-features = ["server","stream","tcp","http1","http2"]
+features = ["server", "http1", "http2"]
+version = "1.6"
+default-features = false

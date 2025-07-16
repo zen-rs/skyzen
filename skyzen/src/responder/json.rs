@@ -6,11 +6,31 @@ use serde::Serialize;
 use serde_json::to_vec_pretty;
 use skyzen_core::Responder;
 
-/// JSON extractor/responder.It could serialize data as a pretty-printed JSON.
+/// A pretty JSON responder,it serialize data as a pretty-printed JSON.
+/// # Example
+/// ```
+/// # use skyzen::responder::PrettyJson;
+/// # use serde::Serialize;
+/// #[derive(Serialize)]
+/// struct User{
+///     name:String,
+///     age:u8
+/// }
+/// async fn handler() -> PrettyJson<User>{
+///     PrettyJson(User{name:"Lexo".into(),age:17})
+/// }
+///
+/// // Expected result:
+/// //{
+/// //  "name": "Lexo",
+/// //  "age": 17
+/// //}
+///
+/// ```
 #[derive(Debug, Clone)]
-pub struct PrettyJson<T>(pub T);
+pub struct PrettyJson<T: Send + Sync + Serialize>(pub T);
 
-impl<T: Serialize> Responder for PrettyJson<T> {
+impl<T: Send + Sync + Serialize> Responder for PrettyJson<T> {
     fn respond_to(self, _request: &Request, response: &mut Response) -> http_kit::Result<()> {
         response.replace_body(to_vec_pretty(&self.0)?);
         response.insert_header(CONTENT_TYPE, HeaderValue::from_static("application/json"));

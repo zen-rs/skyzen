@@ -28,7 +28,7 @@ macro_rules! impl_base_responder {
                     _request: &http_kit::Request,
                     response:&mut http_kit::Response,
                 ) -> http_kit::Result<()> {
-                    response.insert_header(http::header::CONTENT_TYPE,http::HeaderValue::from_static("application/octet-stream"));
+                    response.insert_header(http_kit::header::CONTENT_TYPE,http_kit::header::HeaderValue::from_static("application/octet-stream"));
                     response.replace_body(self);
                     Ok(())
                 }
@@ -46,7 +46,7 @@ macro_rules! impl_base_utf8_responder {
                     _request: &http_kit::Request,
                     response: &mut http_kit::Response,
                 ) -> http_kit::Result<()> {
-                    response.insert_header(http::header::CONTENT_TYPE,http::HeaderValue::from_static("text/plain; charset=utf-8"));
+                    response.insert_header(http_kit::header::CONTENT_TYPE,http_kit::header::HeaderValue::from_static("text/plain; charset=utf-8"));
                     response.replace_body(self);
                     Ok(())
                 }

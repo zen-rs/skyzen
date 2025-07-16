@@ -6,7 +6,7 @@ use std::{
     str::{FromStr, Utf8Error},
 };
 
-use crate::{async_trait, extract::Extractor, header, header::HeaderName, Request};
+use crate::{extract::Extractor, header, header::HeaderName, Request};
 
 use std::error::Error as StdError;
 
@@ -21,7 +21,6 @@ impl_error!(
 #[derive(Debug, Clone)]
 pub struct PeerAddr(pub SocketAddr);
 
-#[async_trait]
 impl Extractor for PeerAddr {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
         Ok(Self(
@@ -46,7 +45,6 @@ impl_deref!(PeerAddr, SocketAddr);
 
 impl_deref!(ClientIp, IpAddr);
 
-#[async_trait]
 impl Extractor for ClientIp {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
         if let Some(v) = request.get_header(header::FORWARDED) {
@@ -73,10 +71,14 @@ impl Extractor for ClientIp {
     }
 }
 
+/// An error occurred while extracting the client's IP.
 #[derive(Debug)]
 pub enum Error {
+    /// The header is not syntactically valid.
     InvalidForwardedHeader,
+    /// The header is not a valid UTF-8 string.
     InvalidUtf8(Utf8Error),
+    /// Failed to parse the address.
     AddrParseError(AddrParseError),
 }
 

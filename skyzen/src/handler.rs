@@ -7,19 +7,20 @@
 //! }
 //! ```
 
-use std::{future::Future, marker::PhantomData, pin::Pin};
+use core::{future::Future, marker::PhantomData};
 
 use crate::Result;
-use async_trait::async_trait;
 use http_kit::{Endpoint, Request, Response};
 use skyzen_core::{Extractor, Responder};
 
 /// An HTTP handler.
 /// This trait is a wrapper trait for `Fn` types. You will rarely use this type directly.
-#[async_trait]
 pub trait Handler<T: Extractor>: Send + Sync {
     /// Handle the request and make a response.
-    async fn call_handler(&self, request: &mut Request) -> Result<Response>;
+    fn call_handler(
+        &self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response>> + Send + Sync;
 }
 
 struct IntoEndpoint<H: Handler<T>, T: Extractor> {
@@ -45,16 +46,16 @@ impl<H: Handler<T>, T: Extractor> IntoEndpoint<H, T> {
 macro_rules! impl_handler {
     ($($ty:ident),*) => {
         #[allow(non_snake_case)]
-        #[async_trait]
-        impl<F, Fut, Res,$($ty:Send+Extractor,)*> Handler<($($ty,)*)> for F
+
+        impl<F, Fut, Res,$($ty:Extractor,)*> Handler<($($ty,)*)> for F
         where
             F: Send+Sync + Fn($($ty,)*) -> Fut,
-            Fut: Send + Future<Output = Res>,
+            Fut: Send + Sync+Future<Output = Res>,
             Res: Responder,
         {
 
             async fn call_handler(&self, request: &mut Request) -> crate::Result<Response> {
-                let ($($ty,)*) = Extractor::extract(request).await?;
+                let ($($ty,)*) = <($($ty,)*) as Extractor>::extract(request).await?;
                 let mut response=Response::empty();
                 (self)($($ty,)*).await.respond_to(request,&mut response)?;
                 Ok(response)
@@ -66,16 +67,7 @@ macro_rules! impl_handler {
 tuples!(impl_handler);
 
 impl<H: Handler<T> + Send + Sync, T: Extractor + Send + Sync> Endpoint for IntoEndpoint<H, T> {
-    fn call_endpoint<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        request: &'life1 mut Request,
-    ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-
-        Self: 'async_trait,
-    {
-        self.handler.call_handler(request)
+    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+        self.handler.call_handler(request).await
     }
 }

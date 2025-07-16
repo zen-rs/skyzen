@@ -6,7 +6,6 @@ use std::{
     str::FromStr,
 };
 
-use async_trait::async_trait;
 use http_kit::{
     header::{self, HeaderValue},
     Request, Response,
@@ -43,7 +42,6 @@ impl FromStr for CookieJar {
     }
 }
 
-#[async_trait]
 impl Extractor for CookieJar {
     async fn extract(request: &mut Request) -> http_kit::Result<Self> {
         let cookie = request

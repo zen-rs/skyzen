@@ -1,26 +1,14 @@
-use bytes::Bytes;
-use bytestr::ByteStr;
-use futures_io::AsyncBufRead;
-use http::{header::HeaderMap, HeaderName, HeaderValue};
-use http_kit::{Body, Request, Response, Result};
+use http_kit::header::{HeaderMap, HeaderName, HeaderValue};
+use http_kit::{
+    utils::{io::AsyncBufRead, ByteStr, Bytes},
+    Body, Request, Response, Result,
+};
 use std::{borrow::Cow, pin::Pin};
 
 /// Transform a object into a part of HTTP response,always is response body,header,etc.
-pub trait Responder {
+pub trait Responder: Send + Sync {
     /// Modify the response,sometime also read the request (but the body may have already been consumed).
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<()>;
-
-    /// Generate a response.
-    /// If this `Responder` requires reading the request, it may not work.
-    fn into_response(self) -> Result<Response>
-    where
-        Self: Sized,
-    {
-        let request = Request::get("/");
-        let mut response = Response::empty();
-        self.respond_to(&request, &mut response)?;
-        Ok(response)
-    }
 }
 
 macro_rules! impl_tuple_responder {
@@ -57,7 +45,7 @@ impl Responder for Response {
     }
 }
 
-impl<T: Responder, E: Into<http_kit::Error>> Responder for std::result::Result<T, E> {
+impl<T: Responder, E: Send + Sync + Into<http_kit::Error>> Responder for std::result::Result<T, E> {
     fn respond_to(self, request: &Request, response: &mut Response) -> Result<()> {
         self.map_err(|error| error.into())
             .and_then(|responder| responder.respond_to(request, response))

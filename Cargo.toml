@@ -1,3 +1,10 @@
 [workspace]
 members = ["skyzen", "skyzen-*"]
 resolver = "2"
+
+[workspace.dependencies]
+skyzen-core = { path = "skyzen-core" }
+http-kit = { version = "0.1.1" }
+executor-core = { version = "0.1.0" }
+
+log = { version = "0.4.27", features = ["kv_unstable"] }

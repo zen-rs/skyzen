@@ -4,10 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bytes  = "1.1.0"
-http-kit = { git = "https://github.com/lexoooooo/http-kit.git", rev = "88881db"}
-bytestr = "0.1.0" 
-async-trait = "0.1.57"
-futures-io = "0.3.23"
-http = "0.2.8"
-anyhow = "1.0.75"
+http-kit.workspace = true
+executor-core = {version = "0.1.0", default-features = false}
