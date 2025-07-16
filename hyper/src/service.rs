@@ -6,7 +6,7 @@ use hyper::{
 };
 
 use skyzen::{utils::Bytes, Endpoint};
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin};
 
 pub type BoxedStdError = Box<dyn core::error::Error + Send + Sync + 'static>;
 type BoxFuture<T> = Pin<Box<dyn 'static + Send + Sync + Future<Output = T>>>;

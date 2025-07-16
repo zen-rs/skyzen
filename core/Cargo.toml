@@ -5,4 +5,7 @@ edition = "2021"
 
 [dependencies]
 http-kit.workspace = true
-executor-core = {version = "0.1.0", default-features = false}
+executor-core.workspace = true
+
+[lints]
+workspace = true
