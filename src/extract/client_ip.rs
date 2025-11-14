@@ -24,7 +24,11 @@ pub struct PeerAddr(pub SocketAddr);
 impl Extractor for PeerAddr {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
         Ok(Self(
-            request.extensions().get::<Self>().ok_or(http_kit::Error::msg("Missing remote address"))?.0,
+            request
+                .extensions()
+                .get::<Self>()
+                .ok_or_else(|| http_kit::Error::msg("Missing remote address"))?
+                .0,
         ))
     }
 }
@@ -61,7 +65,7 @@ impl Extractor for ClientIp {
             request
                 .extensions()
                 .get::<PeerAddr>()
-                .ok_or(http_kit::Error::msg("Missing remote address"))?
+                .ok_or_else(|| http_kit::Error::msg("Missing remote address"))?
                 .0
                 .ip(),
         ))
@@ -176,7 +180,7 @@ fn strip_once(s: &mut &[u8], pat: &[u8]) -> bool {
 }
 
 fn get_ipv6_str(s: &[u8]) -> Option<&[u8]> {
-    if !*s.first()? == b'[' {
+    if *s.first()? != b'[' {
         return None;
     }
 

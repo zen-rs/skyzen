@@ -3,6 +3,7 @@
 //! The hyper backend of skyzen
 
 use hyper_util::server::conn::auto::Builder;
+use log::error;
 use skyzen::utils::{AsyncRead, StreamExt};
 use skyzen::Endpoint;
 use skyzen::{
@@ -10,8 +11,8 @@ use skyzen::{
     Server,
 };
 use std::future::Future;
-use std::mem::MaybeUninit;
 use std::pin::Pin;
+use std::ptr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -21,6 +22,8 @@ pub const fn use_hyper<E: skyzen::Endpoint + Clone>(endpoint: E) -> service::Int
     service::IntoService::new(endpoint)
 }
 
+/// Hyper-based [`Server`] implementation.
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Hyper;
 
 #[derive(Debug)]
@@ -38,7 +41,7 @@ where
     Fut::Output: Send + 'static,
 {
     fn execute(&self, fut: Fut) {
-        (self.0).spawn(fut);
+        drop((self.0).spawn(fut));
     }
 }
 
@@ -54,7 +57,7 @@ impl<C: Unpin + AsyncRead> hyper::rt::Read for ConnectionWrapper<C> {
 
         // SAFETY: `buf.as_mut()` gives us a `&mut [MaybeUninit<u8>]`.
         // We must cast it to `&mut [u8]` and guarantee we will only write `n` bytes and call `advance(n)`
-        let buffer = unsafe { &mut *(buf.as_mut() as *mut [MaybeUninit<u8>] as *mut [u8]) };
+        let buffer = unsafe { &mut *(ptr::from_mut(buf.as_mut()) as *mut [u8]) };
 
         match Pin::new(inner).poll_read(cx, buffer) {
             Poll::Ready(Ok(n)) => {
@@ -97,9 +100,9 @@ impl<C: AsyncWrite + Unpin> hyper::rt::Write for ConnectionWrapper<C> {
 impl Server for Hyper {
     async fn serve<Fut, C, E>(
         self,
-        executor: impl executor_core::Executor,
-        error_handler: impl Fn(E) + 'static,
-        mut connectons: impl Stream<Item = Result<C, E>> + Unpin + 'static,
+        executor: impl executor_core::Executor + Send + Sync + 'static,
+        error_handler: impl Fn(E) + Send + Sync + 'static,
+        mut connectons: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
         endpoint: impl Endpoint + Clone + 'static,
     ) where
         Fut: Future + Send + 'static,
@@ -107,14 +110,25 @@ impl Server for Hyper {
         E: std::error::Error,
         Fut::Output: Send + 'static,
     {
-        let executor = ExecutorWrapper(Arc::new(executor));
+        let executor = Arc::new(executor);
+        let hyper_executor = ExecutorWrapper(executor.clone());
         while let Some(connection) = connectons.next().await {
             match connection {
                 Ok(connection) => {
-                    Builder::new(executor.clone()).serve_connection_with_upgrades(
-                        ConnectionWrapper(connection),
-                        use_hyper(endpoint.clone()),
-                    );
+                    let serve_executor = executor.clone();
+                    let builder_executor = hyper_executor.clone();
+                    let endpoint = endpoint.clone();
+                    let serve_future = async move {
+                        let builder = Builder::new(builder_executor);
+                        let connection_future = builder.serve_connection_with_upgrades(
+                            ConnectionWrapper(connection),
+                            use_hyper(endpoint),
+                        );
+                        if let Err(error) = connection_future.await {
+                            error!("Failed to serve Hyper connection: {error}");
+                        }
+                    };
+                    drop(serve_executor.spawn(serve_future));
                 }
                 Err(error) => error_handler(error),
             }

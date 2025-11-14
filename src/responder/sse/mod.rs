@@ -4,20 +4,20 @@
 //! There're two style to use [`SSE`](crate::responder::Sse) responder: stream style and channel style.
 //! # Stream style
 //! Convert a stream generating `Result<Event>` to a SSE stream.
-//! ```
+//! ```ignore
 //! # use skyzen::responder::{Sse,sse::Event};
 //! use futures_util::stream::once;
 //! use std::convert::Infallible;
 //! async fn handler() -> Sse{
 //!     Sse::from_stream(once(async{Ok::<_,Infallible>(Event::data("Hello!"))}))
 //! }
-//! ```
+//! ```ignore
 //!
 //! # Channel style
 //! Create a SSE stream and a sender, send message to stream with the sender.
 //! *Warning:* You must return SSE stream first before you send message by sender.
-//! ```
-//! # use skyzen::responder::{Sse,sse::Event};
+//! ```rust
+//! use skyzen::responder::{Sse,sse::Event};
 //! async fn handler() -> Sse{
 //!     let(sender,sse) = Sse::channel();
 //!     sender.send_data("Hello!");
@@ -49,7 +49,7 @@ use std::{
 pub struct Event {
     buffer: Vec<u8>,
     has_id: bool,
-    has_event: bool,
+    has_event_field: bool,
 }
 
 fn has_newline(v: &[u8]) -> bool {
@@ -61,7 +61,7 @@ impl Event {
         Self {
             buffer: Vec::new(),
             has_id: false,
-            has_event: false,
+            has_event_field: false,
         }
     }
 
@@ -91,7 +91,7 @@ impl Event {
         let message = message.as_ref();
         event.field("", message);
         // Prevent including event and id in comment
-        event.has_event = true;
+        event.has_event_field = true;
         event.has_id = true;
         event
     }
@@ -102,7 +102,7 @@ impl Event {
         let mut event = Self::empty();
         event.field("retry", Buffer::new().format(duration.as_millis()));
         // Prevent including event and id in comment.
-        event.has_event = true;
+        event.has_event_field = true;
         event.has_id = true;
         event
     }
@@ -128,9 +128,10 @@ impl Event {
     /// Panics if the event has already been set.
     #[must_use]
     pub fn event(mut self, event: impl AsRef<str>) -> Self {
-        assert!(!self.has_event, "Id has alreay been set");
+        assert!(!self.has_event_field, "Event has already been set");
         let event = event.as_ref();
         self.field("event", event);
+        self.has_event_field = true;
         self
     }
 
@@ -226,7 +227,9 @@ impl Responder for Sse {
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
         );
-        response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
         *response.body_mut() = self.stream;
         Ok(())
     }

@@ -43,7 +43,7 @@ impl Extractor for ByteStr {
 
 impl Extractor for Body {
     async fn extract(request: &mut Request) -> Result<Self> {
-        Ok(mem::replace(request.body_mut(), Body::empty()))
+        Ok(mem::replace(request.body_mut(), Self::empty()))
     }
 }
 

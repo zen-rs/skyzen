@@ -29,7 +29,7 @@ impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
             .field("programable_router", &self.programable_router)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -40,8 +40,6 @@ impl Endpoint for NotFoundEndpoint {
         Err(http_kit::Error::msg("Route not found").set_status(StatusCode::NOT_FOUND))
     }
 }
-
-impl_error!(RouteNotFound, "Route not found", "No route is matched.");
 
 impl Router {
     fn search<'app, 'path, 'temp>(
@@ -89,13 +87,18 @@ impl Router {
         }
     }
 
-    /// Navigate to a route programmablly.
+    /// Navigate to a route programmatically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no route matches the request or the endpoint fails.
     pub async fn go(&self, mut request: Request) -> crate::Result<Response> {
         self.call(&mut request).await
     }
 
     /// Enable programable router, so that you can extract it from request.
-    pub fn enable_programable_router(mut self) -> Self {
+    #[must_use]
+    pub const fn enable_programable_router(mut self) -> Self {
         self.programable_router = true;
         self
     }
@@ -107,21 +110,23 @@ impl Extractor for Router {
             .extensions()
             .get::<Self>()
             .cloned()
-            .ok_or(http_kit::Error::msg("Router not found"))?;
+            .ok_or_else(|| http_kit::Error::msg("Router not found"))?;
         Ok(router)
     }
 }
 
-impl_error!(
-    RouterNotExist,
-    "This programmable router does not exist. Please check whether you have enabled the programmable router.",
-    "Error occurs if cannot extract router."
-);
-
+/// Errors that can be raised while constructing the router.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RouteBuildError {
-    RepeatedMethod { path: String, method: Method },
+    /// Multiple endpoints registered for the same path and HTTP method.
+    RepeatedMethod {
+        /// The conflicting route path.
+        path: String,
+        /// The HTTP method assigned twice.
+        method: Method,
+    },
+    /// Propagated [`matchit`] insertion error.
     MatchitError(matchit::InsertError),
 }
 
@@ -153,19 +158,25 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
                         endpoint: Arc::new(Mutex::new(endpoint)),
                         // middlewares: middlewares.into(), // Simplified for now
                     },
-                ))
+                ));
             }
         }
     }
 }
 
+/// Build a [`Router`] from the declared [`Route`] tree.
+///
+/// # Errors
+///
+/// Returns [`RouteBuildError::RepeatedMethod`] if two endpoints handle the same path+method
+/// combination or propagates [`matchit::InsertError`] construction failures.
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     flatten("", route.nodes, &mut buf);
     let mut router = matchit::Router::new();
     for (path, value) in buf {
         let mut set = HashSet::new();
-        for (method, ..) in value.iter() {
+        for (method, ..) in &value {
             if !set.insert(method) {
                 return Err(RouteBuildError::RepeatedMethod {
                     path,
@@ -187,14 +198,13 @@ impl Endpoint for Router {
         Ok(self.call(request).await.unwrap_or_else(|error| {
             let mut response = Response::new(http_kit::Body::empty());
             *response.status_mut() = error.status();
-            let mut error_name="Error";
-            if error.status().is_server_error(){
-                error_name="Server Error"
-            }
-
-            if error.status().is_client_error(){
-                error_name="Client Error"
-            }
+            let error_name = if error.status().is_server_error() {
+                "Server Error"
+            } else if error.status().is_client_error() {
+                "Client Error"
+            } else {
+                "Error"
+            };
             log::error!(message = error.to_string().as_str(),status = error.status().as_str(); "{error_name}");
             response
         }))

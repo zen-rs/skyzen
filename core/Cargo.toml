@@ -2,6 +2,12 @@
 name = "skyzen-core"
 version = "0.1.0"
 edition = "2021"
+description = "Foundational extractor/responder traits for the Skyzen framework"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "../README.md"
+keywords = ["http", "web", "framework"]
+categories = ["web-programming::http-server"]
 
 [dependencies]
 http-kit.workspace = true

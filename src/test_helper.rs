@@ -1,7 +1,4 @@
-use http_kit::{Endpoint, Request, Response, Uri};
-use skyzen_hyper::launch_local;
-
-use zenwave::Client;
+use http_kit::{Endpoint, Request, Response};
 macro_rules! test_handler {
     (
         $endpoint:expr,
@@ -22,25 +19,11 @@ macro_rules! test_handler {
 }
 
 pub async fn test_endpoint_inner(
-    endpoint: impl Endpoint + 'static,
+    mut endpoint: impl Endpoint + 'static,
     mut expected_response: Response,
     mut request: Request,
 ) -> Result<(), http_kit::Error> {
-    let server = launch_local(endpoint, 0);
-    let local_addr = server.local_addr();
-    let mut uri = Uri::builder()
-        .scheme("http")
-        .authority(local_addr.to_string());
-    if let Some(v) = request.uri().path_and_query() {
-        uri = uri.path_and_query(v.to_owned());
-    }
-
-    request.set_uri(uri.build()?);
-    tokio::task::spawn(server);
-
-    let client = Client::new();
-
-    let mut response = client.send(request).await?;
+    let mut response = endpoint.respond(&mut request).await?;
 
     let expected_status = expected_response.status();
     let status = response.status();

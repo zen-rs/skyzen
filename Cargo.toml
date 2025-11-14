@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 skyzen-core = { path = "core" }
-http-kit = { version = "0.2.0", path = "../http-kit" }
+http-kit = { version = "0.2.0", git = "https://github.com/zen-rs/http-kit" }
 executor-core = { version = "0.1.0" }
 skyzen-hyper = { path = "hyper"}
 
@@ -28,12 +28,18 @@ clippy.cargo = "warn"
 name = "skyzen"
 version = "0.1.0"
 edition = "2021"
+description = "Skyzen - a pragmatic HTTP framework built on http-kit"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "README.md"
+keywords = ["http", "web", "framework"]
+categories = ["web-programming::http-server"]
 
 [dependencies]
 skyzen-core.workspace = true
 http-kit.workspace = true
 matchit = "0.8.6"
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 cookie = { version = "0.18.1", features = ["percent-encode"] }
 log.workspace = true
 smallvec = "1.15"
@@ -48,8 +54,6 @@ skyzen-hyper.workspace = true
 [[bin]]
 name = "test_migration"
 path = "test_migration.rs"
-zenwave = { git = "https://github.com/zen-rs/zenwave.git"}
-serde = { version = "1.0", features = ["derive"] }
 
 [dependencies.serde_json]
 version = "1.0"

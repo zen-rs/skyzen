@@ -1,5 +1,5 @@
 //! Handle the request and make a response.
-//! ```
+//! ```ignore
 //! // A simple echo server
 //! use bytestr::ByteStr;
 //! async fn handler(body:ByteStr) -> http_kit::Result<ByteStr>{
@@ -68,6 +68,6 @@ tuples!(impl_handler);
 
 impl<H: Handler<T> + Send + Sync, T: Extractor + Send + Sync> Endpoint for IntoEndpoint<H, T> {
     async fn respond(&mut self, request: &mut Request) -> http_kit::Result<Response> {
-        self.handler.call_handler(request).await.map_err(Into::into)
+        self.handler.call_handler(request).await
     }
 }

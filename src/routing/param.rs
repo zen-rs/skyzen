@@ -6,7 +6,7 @@ use skyzen_core::Extractor;
 pub struct Params(Vec<(String, String)>);
 
 impl Params {
-    pub(crate) fn new(vec: Vec<(String, String)>) -> Self {
+    pub(crate) const fn new(vec: Vec<(String, String)>) -> Self {
         Self(vec)
     }
 
@@ -15,15 +15,19 @@ impl Params {
     }
 
     /// Get the route parameter by the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested parameter is not present.
     pub fn get(&self, name: &str) -> http_kit::Result<&str> {
         let param = self
             .0
             .iter()
             .find_map(|(k, v)| if k == name { Some(v) } else { None })
-            .ok_or(
+            .ok_or_else(|| {
                 http_kit::Error::msg(format!("Missing param `{name}`"))
-                    .set_status(StatusCode::BAD_REQUEST),
-            )?;
+                    .set_status(StatusCode::BAD_REQUEST)
+            })?;
 
         Ok(param.as_str())
     }

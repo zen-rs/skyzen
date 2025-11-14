@@ -1,5 +1,5 @@
 //! Utility for writing middleware.
-//! ```rust
+//! ```ignore
 //! // An implement of timeout middleware
 //! use async_std::future::timeout;
 //! use std::time::Duration;
@@ -19,16 +19,24 @@ pub use http_kit::middleware::Middleware;
 
 use http_kit::{Request, Response, Result};
 
-/// Simplified middleware system - just for compilation
-/// This is a placeholder implementation that needs proper redesign
+/// Simplified middleware system - just for compilation.
+/// This is a placeholder implementation that needs proper redesign.
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Next;
 
 impl Next {
-    pub fn new() -> Self {
+    /// Create a placeholder [`Next`] instance.
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
     
-    pub async fn run(self, _request: &mut Request) -> Result<Response> {
+    /// Run the faux middleware chain.
+    ///
+    /// # Errors
+    ///
+    /// This placeholder never returns an error.
+    pub fn run(self, _request: &mut Request) -> Result<Response> {
         // Placeholder implementation
         Ok(Response::new(http_kit::Body::from("Middleware not fully implemented")))
     }

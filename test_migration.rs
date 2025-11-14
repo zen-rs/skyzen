@@ -1,3 +1,5 @@
+//! Smoke test binary for exercising endpoint migrations.
+
 use http_kit::{Request, Response, Body, Endpoint};
 
 struct HelloEndpoint;
