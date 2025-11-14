@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 
 mod service;
 /// Transform the `Endpoint` of skyzen into the `Service` of hyper
-pub fn use_hyper<E: skyzen::Endpoint + Clone>(endpoint: E) -> service::IntoService<E> {
+pub const fn use_hyper<E: skyzen::Endpoint + Clone>(endpoint: E) -> service::IntoService<E> {
     service::IntoService::new(endpoint)
 }
 

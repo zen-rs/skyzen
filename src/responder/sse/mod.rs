@@ -57,7 +57,7 @@ fn has_newline(v: &[u8]) -> bool {
 }
 
 impl Event {
-    fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             buffer: Vec::new(),
             has_id: false,
@@ -74,6 +74,10 @@ impl Event {
     }
 
     /// Create an SSE event with a data payload in json format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization of the value to JSON fails.
     pub fn json(v: impl Serialize) -> serde_json::Result<Self> {
         let mut event = Self::empty();
         event.buffer.extend_from_slice(b"data:");
@@ -93,6 +97,7 @@ impl Event {
     }
 
     /// Tell the client the stream's reconnection time.
+    #[must_use]
     pub fn retry(duration: Duration) -> Self {
         let mut event = Self::empty();
         event.field("retry", Buffer::new().format(duration.as_millis()));
@@ -104,6 +109,11 @@ impl Event {
 
     /// Set the id of this event.
     /// The id is useful in reconnection.See [The `Last-Event-ID` header](https://html.spec.whatwg.org/multipage/server-sent-events.html#the-last-event-id-header) for more information.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the id has already been set.
+    #[must_use]
     pub fn id(mut self, id: impl AsRef<str>) -> Self {
         assert!(!self.has_id, "Id has alreay been set");
         let id = id.as_ref();
@@ -112,6 +122,11 @@ impl Event {
     }
 
     /// Set the event of this event.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the event has already been set.
+    #[must_use]
     pub fn event(mut self, event: impl AsRef<str>) -> Self {
         assert!(!self.has_event, "Id has alreay been set");
         let event = event.as_ref();
@@ -162,7 +177,7 @@ pin_project! {
 }
 
 impl<S, E> IntoStream<S, E> {
-    pub fn new(stream: S) -> Self {
+    pub const fn new(stream: S) -> Self {
         Self {
             stream,
             _marker: PhantomData,
@@ -177,12 +192,8 @@ where
 {
     type Item = Result<Vec<u8>, anyhow::Error>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(ready!(self.project().stream.poll_next(cx))).map(|result| {
-            result.map(|data| {
-                data.map(|data| data.finalize())
-                    .map_err(|error| error.into())
-            })
-        })
+        Poll::Ready(ready!(self.project().stream.poll_next(cx)))
+            .map(|result| result.map(|data| data.map(Event::finalize).map_err(Into::into)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -192,9 +203,11 @@ where
 
 impl Sse {
     /// Create a paif of sender and SSE responder
-    pub fn channel() -> (Sender, Sse) {
+    #[must_use]
+    pub fn channel() -> (Sender, Self) {
         Sender::new()
     }
+
     /// Create a SSE responder with a stream.
     pub fn from_stream<S, E>(stream: S) -> Self
     where
@@ -209,12 +222,12 @@ impl Sse {
 
 impl Responder for Sse {
     fn respond_to(self, _request: &Request, response: &mut Response) -> http_kit::Result<()> {
-        response.insert_header(
+        response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
         );
-        response.insert_header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        response.replace_body(self.stream);
+        response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        *response.body_mut() = self.stream;
         Ok(())
     }
 }

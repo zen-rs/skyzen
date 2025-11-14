@@ -1,9 +1,9 @@
+use core::{error::Error, future::Future};
 use executor_core::Executor;
 use http_kit::{
     utils::{AsyncRead, AsyncWrite, Stream},
     Endpoint,
 };
-use std::{error::Error, future::Future};
 
 pub trait Server {
     fn serve<Fut, C, E>(

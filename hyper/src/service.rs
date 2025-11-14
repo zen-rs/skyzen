@@ -16,7 +16,7 @@ pub struct IntoService<E> {
 }
 
 impl<E: Endpoint + Clone> IntoService<E> {
-    pub fn new(endpoint: E) -> Self {
+    pub const fn new(endpoint: E) -> Self {
         Self { endpoint }
     }
 }
@@ -44,11 +44,9 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
             response.map(|response| {
                 response.map(|body| {
                     let body: MapOk<skyzen::Body, fn(Bytes) -> Frame<Bytes>> =
-                        body.map_ok(|bytes| Frame::data(bytes));
+                        body.map_ok(Frame::data);
 
-                    let body: StreamBody<MapOk<skyzen::Body, fn(Bytes) -> Frame<Bytes>>> =
-                        StreamBody::new(body);
-                    body
+                    StreamBody::new(body)
                 })
             })
         };

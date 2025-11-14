@@ -32,8 +32,8 @@ pub struct PrettyJson<T: Send + Sync + Serialize>(pub T);
 
 impl<T: Send + Sync + Serialize> Responder for PrettyJson<T> {
     fn respond_to(self, _request: &Request, response: &mut Response) -> http_kit::Result<()> {
-        response.replace_body(to_vec_pretty(&self.0)?);
-        response.insert_header(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        *response.body_mut() = http_kit::Body::from_bytes(to_vec_pretty(&self.0)?);
+        response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(())
     }
 }

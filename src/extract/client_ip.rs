@@ -24,15 +24,13 @@ pub struct PeerAddr(pub SocketAddr);
 impl Extractor for PeerAddr {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
         Ok(Self(
-            request
-                .get_extension::<PeerAddr>()
-                .ok_or(MissingRemoteAddr)?
-                .0,
+            request.extensions().get::<Self>().ok_or(http_kit::Error::msg("Missing remote address"))?.0,
         ))
     }
 }
 
 /// Extract the IP address of the client.
+///
 /// This extractor will check for the presence of the `Forwarded` or `X-Forwarded-For` header, ensuring it works even when behind a proxy.
 /// The order of determination is as follows: `Forwarded` / `X-Forwarded-For` / the peer address of the client.
 /// # Warning
@@ -47,13 +45,13 @@ impl_deref!(ClientIp, IpAddr);
 
 impl Extractor for ClientIp {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
-        if let Some(v) = request.get_header(header::FORWARDED) {
+        if let Some(v) = request.headers().get(header::FORWARDED) {
             if let Some(addr) = parse_forwarded(v.as_bytes())? {
                 return Ok(Self(addr));
             }
         }
 
-        if let Some(v) = request.get_header(HeaderName::from_static("x-forwarded-for")) {
+        if let Some(v) = request.headers().get(HeaderName::from_static("x-forwarded-for")) {
             if let Some(addr) = parse_x_forwarded_for(v.as_bytes())? {
                 return Ok(Self(addr));
             }
@@ -61,8 +59,9 @@ impl Extractor for ClientIp {
 
         Ok(Self(
             request
-                .get_extension::<PeerAddr>()
-                .ok_or(MissingRemoteAddr)?
+                .extensions()
+                .get::<PeerAddr>()
+                .ok_or(http_kit::Error::msg("Missing remote address"))?
                 .0
                 .ip(),
         ))
@@ -119,16 +118,14 @@ fn parse_forwarded(v: &[u8]) -> Result<Option<IpAddr>, Error> {
                     return Ok(Some(
                         Ipv6Addr::from_str(std::str::from_utf8(value)?)?.into(),
                     ));
-                } else {
-                    return Ok(Some(
-                        Ipv4Addr::from_str(std::str::from_utf8(value)?)?.into(),
-                    ));
                 }
-            } else {
                 return Ok(Some(
                     Ipv4Addr::from_str(std::str::from_utf8(value)?)?.into(),
                 ));
             }
+            return Ok(Some(
+                Ipv4Addr::from_str(std::str::from_utf8(value)?)?.into(),
+            ));
         }
     }
     Ok(None)
@@ -201,7 +198,7 @@ mod tests {
     #[test]
     fn test_forwarded_1() {
         let addr=parse_forwarded(b" for =192.0.2.43;  proto=https, for=198.51.100.17 ;by=\"[::1]:1234\";host=\"example.com\"").unwrap().unwrap();
-        assert_eq!(addr, IpAddr::from([192, 0, 2, 43]))
+        assert_eq!(addr, IpAddr::from([192, 0, 2, 43]));
     }
 
     #[test]
@@ -209,7 +206,7 @@ mod tests {
         let addr = parse_forwarded(b"For=\"[2001:db8:cafe::17]:4711\"")
             .unwrap()
             .unwrap();
-        assert_eq!(addr, IpAddr::from_str("2001:db8:cafe::17").unwrap())
+        assert_eq!(addr, IpAddr::from_str("2001:db8:cafe::17").unwrap());
     }
 
     #[test]
@@ -217,7 +214,7 @@ mod tests {
         let addr = parse_forwarded(b"  fOr =\"192.0.2.55\" ,  for =   \"192.0.2.43\" ,")
             .unwrap()
             .unwrap();
-        assert_eq!(addr, IpAddr::from([192, 0, 2, 55]))
+        assert_eq!(addr, IpAddr::from([192, 0, 2, 55]));
     }
 
     #[test]
@@ -225,7 +222,7 @@ mod tests {
         let addr = parse_x_forwarded_for(b"192.0.2.21,192.0.2.34,2001:db8:cafe::17")
             .unwrap()
             .unwrap();
-        assert_eq!(addr, IpAddr::from([192, 0, 2, 21]))
+        assert_eq!(addr, IpAddr::from([192, 0, 2, 21]));
     }
 
     #[test]
@@ -233,6 +230,6 @@ mod tests {
         let addr = parse_x_forwarded_for(b" 2001:db8:cafe::17, 192.0.2.21")
             .unwrap()
             .unwrap();
-        assert_eq!(addr, IpAddr::from_str("2001:db8:cafe::17").unwrap())
+        assert_eq!(addr, IpAddr::from_str("2001:db8:cafe::17").unwrap());
     }
 }

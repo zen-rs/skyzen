@@ -17,8 +17,8 @@ pub struct Json<T: Send + Sync = JsonValue>(pub T);
 
 impl<T: Send + Sync + Serialize> Responder for Json<T> {
     fn respond_to(self, _request: &Request, response: &mut Response) -> crate::Result<()> {
-        response.insert_header(CONTENT_TYPE, APPLICATION_JSON);
-        response.replace_body(serde_json::to_vec(&self.0)?);
+        response.headers_mut().insert(CONTENT_TYPE, APPLICATION_JSON);
+        *response.body_mut() = http_kit::Body::from_json(&self.0)?;
         Ok(())
     }
 }
@@ -31,15 +31,15 @@ impl_error!(
 
 impl<T: Send + Sync + DeserializeOwned> Extractor for Json<T> {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
-        if request
-            .get_header(CONTENT_TYPE)
-            .ok_or(JsonContentTypeError)?
-            != "application/json"
-        {
-            return Err(JsonContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
+            if content_type != "application/json" {
+                return Err(JsonContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            }
+        } else {
+            return Err(JsonContentTypeError).status(StatusCode::BAD_REQUEST);
         }
 
-        Ok(Self(request.into_json().await?))
+        Ok(Self(request.body_mut().into_json().await?))
     }
 }
 

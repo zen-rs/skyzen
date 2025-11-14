@@ -2,7 +2,7 @@ use http_kit::{Request, StatusCode};
 use skyzen_core::Extractor;
 
 /// Extract param defined in route.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Params(Vec<(String, String)>);
 
 impl Params {
@@ -31,6 +31,6 @@ impl Params {
 
 impl Extractor for Params {
     async fn extract(request: &mut Request) -> http_kit::Result<Self> {
-        Ok(request.remove_extension().unwrap_or(Self::empty()))
+        Ok(request.extensions_mut().remove::<Self>().unwrap_or(Self::empty()))
     }
 }

@@ -31,7 +31,7 @@ pin_project! {
 }
 
 impl Receiver {
-    pub fn new(receiver: async_channel::Receiver<Event>) -> Self {
+    pub const fn new(receiver: async_channel::Receiver<Event>) -> Self {
         Self { receiver }
     }
 }
@@ -50,11 +50,19 @@ impl Sender {
     }
 
     /// Send an event to the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SendError`] if the event cannot be sent to the stream, for example if the receiver has been dropped.
     pub async fn send(&self, event: Event) -> Result<(), SendError> {
         self.sender.send(event).await.map_err(|_| SendError)
     }
 
     /// Send an event with a data payload to the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SendError`] if the event cannot be sent to the stream, for example if the receiver has been dropped.
     pub async fn send_data(&self, data: impl AsRef<str>) -> Result<(), SendError> {
         self.send(Event::data(data)).await
     }

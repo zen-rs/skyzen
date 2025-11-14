@@ -23,12 +23,10 @@ impl<T: Send + Sync + Clone + 'static> DerefMut for State<T> {
 impl<T: Send + Sync + Clone + 'static> Extractor for State<T> {
     async fn extract(request: &mut Request) -> Result<Self> {
         request
-            .get_extension()
-            .ok_or(StateNotExist.into())
-            .map(|state| {
-                let state: &Self = state;
-                state.clone()
-            })
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .ok_or_else(|| http_kit::Error::msg("State not found"))
     }
 }
 
@@ -38,7 +36,7 @@ impl<T: Send + Sync + Clone + 'static> Middleware for State<T> {
         request: &mut Request,
         mut next: impl http_kit::Endpoint,
     ) -> Result<Response> {
-        request.insert_extension(self.clone());
+        request.extensions_mut().insert(self.clone());
         next.respond(request).await
     }
 }

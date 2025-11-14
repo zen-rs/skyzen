@@ -35,7 +35,7 @@ pub fn into_endpoint<T: Extractor + Send + Sync>(handler: impl Handler<T>) -> im
 
 impl<H: Handler<T>, T: Extractor> IntoEndpoint<H, T> {
     /// Create an `IntoEndpoint` instance.
-    pub fn new(handler: H) -> Self {
+    pub const fn new(handler: H) -> Self {
         Self {
             handler,
             _marker: PhantomData,
@@ -56,7 +56,7 @@ macro_rules! impl_handler {
 
             async fn call_handler(&self, request: &mut Request) -> crate::Result<Response> {
                 let ($($ty,)*) = <($($ty,)*) as Extractor>::extract(request).await?;
-                let mut response=Response::empty();
+                let mut response = Response::new(http_kit::Body::empty());
                 (self)($($ty,)*).await.respond_to(request,&mut response)?;
                 Ok(response)
             }
@@ -67,7 +67,7 @@ macro_rules! impl_handler {
 tuples!(impl_handler);
 
 impl<H: Handler<T> + Send + Sync, T: Extractor + Send + Sync> Endpoint for IntoEndpoint<H, T> {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
-        self.handler.call_handler(request).await
+    async fn respond(&mut self, request: &mut Request) -> http_kit::Result<Response> {
+        self.handler.call_handler(request).await.map_err(Into::into)
     }
 }

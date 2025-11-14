@@ -1,4 +1,5 @@
-use std::future::Future;
+use core::future::Future;
+use core::mem;
 
 use http_kit::{
     utils::{ByteStr, Bytes},
@@ -28,19 +29,21 @@ tuples!(impl_tuple_extractor);
 
 impl Extractor for Bytes {
     async fn extract(request: &mut Request) -> Result<Self> {
-        Ok(request.take_body()?.into_bytes().await?)
+        let body = mem::replace(request.body_mut(), Body::empty());
+        Ok(body.into_bytes().await?)
     }
 }
 
 impl Extractor for ByteStr {
     async fn extract(request: &mut Request) -> Result<Self> {
-        Ok(request.take_body()?.into_string().await?)
+        let body = mem::replace(request.body_mut(), Body::empty());
+        Ok(body.into_string().await?)
     }
 }
 
 impl Extractor for Body {
     async fn extract(request: &mut Request) -> Result<Self> {
-        Ok(request.take_body()?)
+        Ok(mem::replace(request.body_mut(), Body::empty()))
     }
 }
 

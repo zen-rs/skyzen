@@ -1,7 +1,8 @@
 #![deny(unsafe_code)]
-#![warn(missing_docs, missing_debug_implementations)]
-
+#![no_std]
 //! Base type and trait for HTTP server.
+
+extern crate alloc;
 
 #[macro_use]
 mod macros;

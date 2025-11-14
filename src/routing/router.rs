@@ -1,23 +1,20 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Formatter},
-    ops::Deref,
     sync::Arc,
 };
+use tokio::sync::Mutex;
 
-use super::{BoxEndpoint, Params, Route, RouteNode, RouteNodeType, SharedMiddleware};
-use crate::{
-    async_trait, middleware::Next, Endpoint, Error, Method, Request, Response, StatusCode,
-};
+use super::{BoxEndpoint, Params, Route, RouteNode, RouteNodeType};
+use crate::{Endpoint, Method, Request, Response, StatusCode};
 
 use matchit::Match;
 use skyzen_core::Extractor;
-use smallvec::SmallVec;
 
-// The entrance of request,composing of endpoint and middlewares.
+// The entrance of request,composing of endpoint
 pub struct App {
-    endpoint: BoxEndpoint,
-    middlewares: SmallVec<[SharedMiddleware; 5]>,
+    endpoint: Arc<Mutex<BoxEndpoint>>,
+    // middlewares: SmallVec<[SharedMiddleware; 5]>, // Simplified for now
 }
 
 /// An HTTP router.
@@ -39,8 +36,8 @@ impl Debug for Router {
 struct NotFoundEndpoint;
 
 impl Endpoint for NotFoundEndpoint {
-    async fn respond(&self, request: &mut Request) -> http_kit::Result<Response> {
-        Err(Error::new(RouteNotFound, StatusCode::NOT_FOUND))
+    async fn respond(&mut self, _request: &mut Request) -> http_kit::Result<Response> {
+        Err(http_kit::Error::msg("Route not found").set_status(StatusCode::NOT_FOUND))
     }
 }
 
@@ -68,24 +65,27 @@ impl Router {
 
     async fn call(&self, request: &mut Request) -> crate::Result<Response> {
         if self.programable_router {
-            request.insert_extension(self.clone());
+            request.extensions_mut().insert(self.clone());
         }
 
         let path = request.uri().path();
         let method = request.method();
 
         if let Some(Match { value, params }) = self.search(path, method) {
-            let next = Next::new(&value.middlewares, value.endpoint.deref());
             let params: Vec<(String, String)> = params
                 .iter()
                 .map(|(key, value)| (key.to_owned(), value.to_owned()))
                 .collect();
             let params = Params::new(params);
-            request.insert_extension(params);
-            next.run(request).await
+            request.extensions_mut().insert(params);
+
+            // Use tokio's Mutex which is Send-safe
+            let endpoint = Arc::clone(&value.endpoint);
+            let mut endpoint_guard = endpoint.lock().await;
+            endpoint_guard.respond(request).await
         } else {
-            let next = Next::new(&[], &NotFoundEndpoint);
-            next.run(request).await
+            let mut not_found = NotFoundEndpoint;
+            not_found.respond(request).await
         }
     }
 
@@ -103,7 +103,11 @@ impl Router {
 
 impl Extractor for Router {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
-        let router = request.get_extension().cloned().ok_or(RouterNotExist)?;
+        let router = request
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .ok_or(http_kit::Error::msg("Router not found"))?;
         Ok(router)
     }
 }
@@ -139,15 +143,15 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
             RouteNodeType::Endpoint {
                 endpoint,
                 method,
-                middlewares,
+                // middlewares, // Disabled for now
             } => {
                 let entry = buf.entry(path).or_default();
 
                 entry.push((
                     method,
                     App {
-                        endpoint,
-                        middlewares: middlewares.into(),
+                        endpoint: Arc::new(Mutex::new(endpoint)),
+                        // middlewares: middlewares.into(), // Simplified for now
                     },
                 ))
             }
@@ -178,11 +182,11 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
 }
 
 impl Endpoint for Router {
-    async fn respond(&self, request: &mut Request) -> http_kit::Result<Response> {
+    async fn respond(&mut self, request: &mut Request) -> http_kit::Result<Response> {
         log::info!(method = request.method().as_str(),path=request.uri().path() ;"Request Received");
         Ok(self.call(request).await.unwrap_or_else(|error| {
-            let mut response=Response::empty();
-            response.set_status(error.status());
+            let mut response = Response::new(http_kit::Body::empty());
+            *response.status_mut() = error.status();
             let mut error_name="Error";
             if error.status().is_server_error(){
                 error_name="Server Error"

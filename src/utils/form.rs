@@ -7,7 +7,7 @@ use crate::{
 
 use http_kit::Error;
 use serde::{de::DeserializeOwned, Serialize};
-use serde_urlencoded::{from_str, to_string};
+use serde_urlencoded::from_str;
 
 /// Extract form from request body.
 #[derive(Debug)]
@@ -19,8 +19,8 @@ const APPLICATION_WWW_FORM_URLENCODED: HeaderValue =
 
 impl<T: Send + Sync + Serialize + DeserializeOwned> Responder for Form<T> {
     fn respond_to(self, _request: &Request, response: &mut Response) -> crate::Result<()> {
-        response.replace_body(to_string(&self.0)?);
-        response.insert_header(CONTENT_TYPE, APPLICATION_WWW_FORM_URLENCODED);
+        *response.body_mut() = http_kit::Body::from_form(&self.0)?;
+        response.headers_mut().insert(CONTENT_TYPE, APPLICATION_WWW_FORM_URLENCODED);
         Ok(())
     }
 }
@@ -46,7 +46,8 @@ impl<T: Send + Sync + DeserializeOwned> Extractor for Form<T> {
             let data = request.uri().query().unwrap_or_default();
             extract(data)
         } else {
-            let data = request.take_body()?.into_string().await?;
+            let body = core::mem::replace(request.body_mut(), http_kit::Body::empty());
+            let data = body.into_string().await?;
             extract(&data)
         }
     }
@@ -54,7 +55,7 @@ impl<T: Send + Sync + DeserializeOwned> Extractor for Form<T> {
 
 fn extract<T: Send + Sync + DeserializeOwned>(data: &str) -> Result<Form<T>, Error> {
     Ok(Form(from_str(data).map_err(|_| {
-        Error::new(FormContentTypeError, StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        http_kit::Error::msg("Form content type error").set_status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
     })?))
 }
 

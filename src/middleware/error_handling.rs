@@ -14,19 +14,19 @@ impl<F> Debug for ErrorHandlingMiddleware<F> {
     }
 }
 
-impl<F: Send + Sync, Fut: Send, Res> ErrorHandlingMiddleware<F>
+impl<F, Fut, Res> ErrorHandlingMiddleware<F>
 where
     F: 'static + Send + Sync + Fn(crate::Error) -> Fut,
     Fut: Send + Sync + Future<Output = Res>,
     Res: Responder,
 {
     /// New an error handling middleware with provided handler function.
-    pub fn new(f: F) -> Self {
+    pub const fn new(f: F) -> Self {
         Self { f }
     }
 }
 
-impl<F: Send + Sync, Fut: Send, Res> Middleware for ErrorHandlingMiddleware<F>
+impl<F, Fut, Res> Middleware for ErrorHandlingMiddleware<F>
 where
     F: 'static + Send + Sync + Fn(crate::Error) -> Fut,
     Fut: Send + Sync + Future<Output = Res>,
@@ -39,7 +39,7 @@ where
     ) -> http_kit::Result<Response> {
         let result = next.respond(request).await;
         if let Err(error) = result {
-            let mut response = Response::empty();
+            let mut response = Response::new(http_kit::Body::empty());
             (self.f)(error).await.respond_to(request, &mut response)?;
             return Ok(response);
         }

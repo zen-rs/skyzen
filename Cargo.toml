@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 skyzen-core = { path = "core" }
-http-kit = { version = "0.1.1" }
+http-kit = { version = "0.2.0", path = "../http-kit" }
 executor-core = { version = "0.1.0" }
 skyzen-hyper = { path = "hyper"}
 
@@ -37,12 +37,17 @@ serde = "1.0"
 cookie = { version = "0.18.1", features = ["percent-encode"] }
 log.workspace = true
 smallvec = "1.15"
+tokio = { version = "1.45", features = ["sync", "macros", "rt-multi-thread"] }
 
 [dev-dependencies]
-tokio = { version = "1.45", features = ["macros", "rt"] }
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread"] }
 log.workspace = true
 femme = "2.2.1"
 skyzen-hyper.workspace = true
+
+[[bin]]
+name = "test_migration"
+path = "test_migration.rs"
 zenwave = { git = "https://github.com/zen-rs/zenwave.git"}
 serde = { version = "1.0", features = ["derive"] }
 

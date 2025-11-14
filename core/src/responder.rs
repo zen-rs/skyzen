@@ -1,13 +1,21 @@
+use alloc::borrow::Cow;
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::pin::Pin;
 use http_kit::header::{HeaderMap, HeaderName, HeaderValue};
 use http_kit::{
-    utils::{io::AsyncBufRead, ByteStr, Bytes},
+    utils::{AsyncBufRead, ByteStr, Bytes},
     Body, Request, Response, Result,
 };
-use std::{borrow::Cow, pin::Pin};
 
 /// Transform a object into a part of HTTP response,always is response body,header,etc.
 pub trait Responder: Send + Sync {
     /// Modify the response,sometime also read the request (but the body may have already been consumed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response fails.
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<()>;
 }
 
@@ -40,14 +48,17 @@ impl_base_responder![
 impl_base_utf8_responder![ByteStr, String, &str, Cow<'_, str>];
 
 impl Responder for Response {
-    fn respond_to(self, _request: &Request, _response: &mut Response) -> Result<()> {
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<()> {
+        *response = self;
         Ok(())
     }
 }
 
-impl<T: Responder, E: Send + Sync + Into<http_kit::Error>> Responder for std::result::Result<T, E> {
+impl<T: Responder, E: Send + Sync + Into<http_kit::Error>> Responder
+    for core::result::Result<T, E>
+{
     fn respond_to(self, request: &Request, response: &mut Response) -> Result<()> {
-        self.map_err(|error| error.into())
+        self.map_err(Into::into)
             .and_then(|responder| responder.respond_to(request, response))
     }
 }
