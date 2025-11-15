@@ -11,12 +11,12 @@
 //! async fn handler() -> Sse{
 //!     Sse::from_stream(once(async{Ok::<_,Infallible>(Event::data("Hello!"))}))
 //! }
-//! ```ignore
+//! ```
 //!
 //! # Channel style
 //! Create a SSE stream and a sender, send message to stream with the sender.
 //! *Warning:* You must return SSE stream first before you send message by sender.
-//! ```rust
+//! ```ignore
 //! use skyzen::responder::{Sse,sse::Event};
 //! async fn handler() -> Sse{
 //!     let(sender,sse) = Sse::channel();

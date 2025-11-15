@@ -1,11 +1,19 @@
-use std::{fmt::Debug, future::Future};
+use std::{fmt::Debug, future::Future, sync::Arc};
 
 use http_kit::{Middleware, Request, Response};
 use skyzen_core::Responder;
 
 /// Handler error with an asynchronous function
 pub struct ErrorHandlingMiddleware<F> {
-    f: F,
+    f: Arc<F>,
+}
+
+impl<F> Clone for ErrorHandlingMiddleware<F> {
+    fn clone(&self) -> Self {
+        Self {
+            f: Arc::clone(&self.f),
+        }
+    }
 }
 
 impl<F> Debug for ErrorHandlingMiddleware<F> {
@@ -21,8 +29,8 @@ where
     Res: Responder,
 {
     /// New an error handling middleware with provided handler function.
-    pub const fn new(f: F) -> Self {
-        Self { f }
+    pub fn new(f: F) -> Self {
+        Self { f: Arc::new(f) }
     }
 }
 

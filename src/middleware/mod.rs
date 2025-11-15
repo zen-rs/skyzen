@@ -1,15 +1,19 @@
 //! Utility for writing middleware.
-//! ```ignore
-//! // An implement of timeout middleware
-//! use async_std::future::timeout;
-//! use std::time::Duration;
-//! use async_trait::async_trait;
-//! use http_kit::{Request,Response,middleware::{Middleware,Next}};
-//! struct TimeOut(Duration);
+//! ```rust
+//! use skyzen::{middleware::Middleware, Request, Response};
+//! use log::info;
 //!
-//! impl Middleware for TimeOut{
-//!     async fn call_middleware(&self, request: &mut Request, next: Next<'_>) -> http_kit::Result<Response>{
-//!         timeout(self.0,next.run(request)).await?
+//! #[derive(Clone, Default)]
+//! struct LogMiddleware;
+//!
+//! impl Middleware for LogMiddleware {
+//!     async fn handle(
+//!         &mut self,
+//!         request: &mut Request,
+//!         mut next: impl http_kit::Endpoint,
+//!     ) -> http_kit::Result<Response> {
+//!         info!("request received");
+//!         next.respond(request).await
 //!     }
 //! }
 //! ```
@@ -30,7 +34,7 @@ impl Next {
     pub const fn new() -> Self {
         Self
     }
-    
+
     /// Run the faux middleware chain.
     ///
     /// # Errors
@@ -38,6 +42,8 @@ impl Next {
     /// This placeholder never returns an error.
     pub fn run(self, _request: &mut Request) -> Result<Response> {
         // Placeholder implementation
-        Ok(Response::new(http_kit::Body::from("Middleware not fully implemented")))
+        Ok(Response::new(http_kit::Body::from(
+            "Middleware not fully implemented",
+        )))
     }
 }

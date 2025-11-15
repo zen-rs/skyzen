@@ -35,6 +35,9 @@ impl Params {
 
 impl Extractor for Params {
     async fn extract(request: &mut Request) -> http_kit::Result<Self> {
-        Ok(request.extensions_mut().remove::<Self>().unwrap_or(Self::empty()))
+        Ok(request
+            .extensions_mut()
+            .remove::<Self>()
+            .unwrap_or(Self::empty()))
     }
 }

@@ -55,7 +55,10 @@ impl Extractor for ClientIp {
             }
         }
 
-        if let Some(v) = request.headers().get(HeaderName::from_static("x-forwarded-for")) {
+        if let Some(v) = request
+            .headers()
+            .get(HeaderName::from_static("x-forwarded-for"))
+        {
             if let Some(addr) = parse_x_forwarded_for(v.as_bytes())? {
                 return Ok(Self(addr));
             }

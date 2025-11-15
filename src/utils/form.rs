@@ -20,7 +20,9 @@ const APPLICATION_WWW_FORM_URLENCODED: HeaderValue =
 impl<T: Send + Sync + Serialize + DeserializeOwned> Responder for Form<T> {
     fn respond_to(self, _request: &Request, response: &mut Response) -> crate::Result<()> {
         *response.body_mut() = http_kit::Body::from_form(&self.0)?;
-        response.headers_mut().insert(CONTENT_TYPE, APPLICATION_WWW_FORM_URLENCODED);
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, APPLICATION_WWW_FORM_URLENCODED);
         Ok(())
     }
 }
@@ -55,7 +57,8 @@ impl<T: Send + Sync + DeserializeOwned> Extractor for Form<T> {
 
 fn extract<T: Send + Sync + DeserializeOwned>(data: &str) -> Result<Form<T>, Error> {
     Ok(Form(from_str(data).map_err(|_| {
-        http_kit::Error::msg("Form content type error").set_status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        http_kit::Error::msg("Form content type error")
+            .set_status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
     })?))
 }
 

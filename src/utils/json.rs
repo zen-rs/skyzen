@@ -17,7 +17,9 @@ pub struct Json<T: Send + Sync = JsonValue>(pub T);
 
 impl<T: Send + Sync + Serialize> Responder for Json<T> {
     fn respond_to(self, _request: &Request, response: &mut Response) -> crate::Result<()> {
-        response.headers_mut().insert(CONTENT_TYPE, APPLICATION_JSON);
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, APPLICATION_JSON);
         *response.body_mut() = http_kit::Body::from_json(&self.0)?;
         Ok(())
     }

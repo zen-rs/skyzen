@@ -1,9 +1,8 @@
 //! Handle the request and make a response.
-//! ```ignore
+//! ```rust
 //! // A simple echo server
-//! use bytestr::ByteStr;
-//! async fn handler(body:ByteStr) -> http_kit::Result<ByteStr>{
-//!    Ok(body)
+//! async fn handler(body: String) -> http_kit::Result<String> {
+//!     Ok(body)
 //! }
 //! ```
 
@@ -38,6 +37,19 @@ impl<H: Handler<T>, T: Extractor> IntoEndpoint<H, T> {
     pub const fn new(handler: H) -> Self {
         Self {
             handler,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<H, T> Clone for IntoEndpoint<H, T>
+where
+    H: Handler<T> + Clone,
+    T: Extractor,
+{
+    fn clone(&self) -> Self {
+        Self {
+            handler: self.handler.clone(),
             _marker: PhantomData,
         }
     }

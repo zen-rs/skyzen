@@ -3,9 +3,8 @@ use std::{
     fmt::{Debug, Formatter},
     sync::Arc,
 };
-use tokio::sync::Mutex;
 
-use super::{BoxEndpoint, Params, Route, RouteNode, RouteNodeType};
+use super::{BoxEndpoint, EndpointFactory, Params, Route, RouteNode, RouteNodeType};
 use crate::{Endpoint, Method, Request, Response, StatusCode};
 
 use matchit::Match;
@@ -13,8 +12,18 @@ use skyzen_core::Extractor;
 
 // The entrance of request,composing of endpoint
 pub struct App {
-    endpoint: Arc<Mutex<BoxEndpoint>>,
+    endpoint_factory: EndpointFactory,
     // middlewares: SmallVec<[SharedMiddleware; 5]>, // Simplified for now
+}
+
+impl App {
+    fn new(endpoint_factory: EndpointFactory) -> Self {
+        Self { endpoint_factory }
+    }
+
+    fn endpoint(&self) -> BoxEndpoint {
+        (self.endpoint_factory)()
+    }
 }
 
 /// An HTTP router.
@@ -29,7 +38,7 @@ impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
             .field("programable_router", &self.programable_router)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -40,6 +49,8 @@ impl Endpoint for NotFoundEndpoint {
         Err(http_kit::Error::msg("Route not found").set_status(StatusCode::NOT_FOUND))
     }
 }
+
+impl_error!(RouteNotFound, "Route not found", "No route is matched.");
 
 impl Router {
     fn search<'app, 'path, 'temp>(
@@ -77,28 +88,21 @@ impl Router {
             let params = Params::new(params);
             request.extensions_mut().insert(params);
 
-            // Use tokio's Mutex which is Send-safe
-            let endpoint = Arc::clone(&value.endpoint);
-            let mut endpoint_guard = endpoint.lock().await;
-            endpoint_guard.respond(request).await
+            let mut endpoint = value.endpoint();
+            endpoint.respond(request).await
         } else {
             let mut not_found = NotFoundEndpoint;
             not_found.respond(request).await
         }
     }
 
-    /// Navigate to a route programmatically.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no route matches the request or the endpoint fails.
+    /// Navigate to a route programmablly.
     pub async fn go(&self, mut request: Request) -> crate::Result<Response> {
         self.call(&mut request).await
     }
 
     /// Enable programable router, so that you can extract it from request.
-    #[must_use]
-    pub const fn enable_programable_router(mut self) -> Self {
+    pub fn enable_programable_router(mut self) -> Self {
         self.programable_router = true;
         self
     }
@@ -110,23 +114,21 @@ impl Extractor for Router {
             .extensions()
             .get::<Self>()
             .cloned()
-            .ok_or_else(|| http_kit::Error::msg("Router not found"))?;
+            .ok_or(http_kit::Error::msg("Router not found"))?;
         Ok(router)
     }
 }
 
-/// Errors that can be raised while constructing the router.
+impl_error!(
+    RouterNotExist,
+    "This programmable router does not exist. Please check whether you have enabled the programmable router.",
+    "Error occurs if cannot extract router."
+);
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RouteBuildError {
-    /// Multiple endpoints registered for the same path and HTTP method.
-    RepeatedMethod {
-        /// The conflicting route path.
-        path: String,
-        /// The HTTP method assigned twice.
-        method: Method,
-    },
-    /// Propagated [`matchit`] insertion error.
+    RepeatedMethod { path: String, method: Method },
     MatchitError(matchit::InsertError),
 }
 
@@ -146,37 +148,25 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
                 flatten(&path, route.nodes, buf);
             }
             RouteNodeType::Endpoint {
-                endpoint,
+                endpoint_factory,
                 method,
                 // middlewares, // Disabled for now
             } => {
                 let entry = buf.entry(path).or_default();
 
-                entry.push((
-                    method,
-                    App {
-                        endpoint: Arc::new(Mutex::new(endpoint)),
-                        // middlewares: middlewares.into(), // Simplified for now
-                    },
-                ));
+                entry.push((method, App::new(endpoint_factory)))
             }
         }
     }
 }
 
-/// Build a [`Router`] from the declared [`Route`] tree.
-///
-/// # Errors
-///
-/// Returns [`RouteBuildError::RepeatedMethod`] if two endpoints handle the same path+method
-/// combination or propagates [`matchit::InsertError`] construction failures.
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     flatten("", route.nodes, &mut buf);
     let mut router = matchit::Router::new();
     for (path, value) in buf {
         let mut set = HashSet::new();
-        for (method, ..) in &value {
+        for (method, ..) in value.iter() {
             if !set.insert(method) {
                 return Err(RouteBuildError::RepeatedMethod {
                     path,
@@ -198,13 +188,14 @@ impl Endpoint for Router {
         Ok(self.call(request).await.unwrap_or_else(|error| {
             let mut response = Response::new(http_kit::Body::empty());
             *response.status_mut() = error.status();
-            let error_name = if error.status().is_server_error() {
-                "Server Error"
-            } else if error.status().is_client_error() {
-                "Client Error"
-            } else {
-                "Error"
-            };
+            let mut error_name="Error";
+            if error.status().is_server_error(){
+                error_name="Server Error"
+            }
+
+            if error.status().is_client_error(){
+                error_name="Client Error"
+            }
             log::error!(message = error.to_string().as_str(),status = error.status().as_str(); "{error_name}");
             response
         }))
