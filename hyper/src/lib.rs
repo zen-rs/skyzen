@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 
 mod service;
 /// Transform the `Endpoint` of skyzen into the `Service` of hyper
-pub const fn use_hyper<E: skyzen::Endpoint + Clone>(endpoint: E) -> service::IntoService<E> {
+pub const fn use_hyper<E: skyzen::Endpoint + Sync + Clone>(endpoint: E) -> service::IntoService<E> {
     service::IntoService::new(endpoint)
 }
 
@@ -103,7 +103,7 @@ impl Server for Hyper {
         executor: impl executor_core::Executor + Send + Sync + 'static,
         error_handler: impl Fn(E) + Send + Sync + 'static,
         mut connectons: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
-        endpoint: impl Endpoint + Clone + 'static,
+        endpoint: impl Endpoint + Sync + Clone + 'static,
     ) where
         Fut: Future + Send + 'static,
         C: Unpin + Send + AsyncRead + AsyncWrite + 'static,

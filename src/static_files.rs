@@ -67,8 +67,8 @@ impl IntoRouteNode for StaticDir {
 
 fn serve_static(directory: &Path, index_file: &str, params: &Params) -> http_kit::Result<Response> {
     let requested_path = params.get("path").unwrap_or("");
-    let sanitized = sanitize_relative_path(requested_path)
-        .ok_or_else(|| invalid_path_error(requested_path))?;
+    let sanitized =
+        sanitize_relative_path(requested_path).ok_or_else(|| invalid_path_error(requested_path))?;
     let file_path = resolve_target_path(directory, &sanitized, index_file)
         .ok_or_else(|| file_not_found_error(requested_path))?;
 

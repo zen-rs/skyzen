@@ -1,4 +1,9 @@
-use std::{future::Future, net::SocketAddr, pin::Pin};
+use std::{
+    future::Future,
+    io::Write as _,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+};
 
 use crate::Endpoint;
 use futures_util::{stream::MapOk, TryStreamExt};
@@ -8,10 +13,111 @@ use hyper::{
     service::Service,
 };
 use hyper_util::{rt::TokioIo, server::conn::auto::Builder as HyperBuilder};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, signal};
 
 type BoxedStdError = Box<dyn std::error::Error + Send + Sync + 'static>;
-type BoxFuture<T> = Pin<Box<dyn Send + Sync + Future<Output = T> + 'static>>;
+type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
+
+/// Initialize a pretty logger once per process.
+pub fn init_logging() {
+    use env_logger::Env;
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        env_logger::Builder::from_env(Env::default().default_filter_or("info"))
+            .format(|buf, record| {
+                let ts = buf.timestamp_millis();
+                writeln!(
+                    buf,
+                    "[{} {:>5} {}] {}",
+                    ts,
+                    record.level(),
+                    record.target(),
+                    record.args()
+                )
+            })
+            .init();
+    });
+}
+
+/// Apply CLI overrides such as `--addr` or `--port` to configure the listener.
+pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
+    let mut args = args.into_iter();
+    let _ = args.next(); // binary name
+    let mut listen = None;
+    let mut host = None;
+    let mut port = None;
+
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--listen=") {
+            listen = Some(value.to_owned());
+        } else if let Some(value) = arg.strip_prefix("--addr=") {
+            listen = Some(value.to_owned());
+        } else if let Some(value) = arg.strip_prefix("--host=") {
+            host = Some(value.to_owned());
+        } else if let Some(value) = arg.strip_prefix("--port=") {
+            port = Some(value.to_owned());
+        } else {
+            match arg.as_str() {
+                "--listen" | "--addr" => {
+                    if let Some(value) = args.next() {
+                        listen = Some(value);
+                    }
+                }
+                "--host" => {
+                    if let Some(value) = args.next() {
+                        host = Some(value);
+                    }
+                }
+                "--port" | "-p" => {
+                    if let Some(value) = args.next() {
+                        port = Some(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(addr) = listen {
+        match addr.parse::<SocketAddr>() {
+            Ok(socket) => {
+                std::env::set_var("SKYZEN_ADDRESS", socket.to_string());
+                log::info!("Configured listener address via CLI: {socket}");
+            }
+            Err(error) => log::warn!("Ignoring invalid --listen address `{addr}`: {error}"),
+        }
+        return;
+    }
+
+    if host.is_none() && port.is_none() {
+        return;
+    }
+
+    let mut candidate = server_addr();
+    if let Some(host) = host {
+        match host.parse::<IpAddr>() {
+            Ok(ip) => candidate.set_ip(ip),
+            Err(error) => {
+                log::warn!("Ignoring invalid --host `{host}`: {error}");
+                return;
+            }
+        }
+    }
+    if let Some(port) = port {
+        match port.parse::<u16>() {
+            Ok(value) => candidate.set_port(value),
+            Err(error) => {
+                log::warn!("Ignoring invalid --port `{port}`: {error}");
+                return;
+            }
+        }
+    }
+
+    std::env::set_var("SKYZEN_ADDRESS", candidate.to_string());
+    log::info!("Configured listener address via CLI: {candidate}");
+}
 
 /// Build the Tokio runtime and serve the provided endpoint over Hyper.
 ///
@@ -30,8 +136,9 @@ where
 
     runtime.block_on(async move {
         let endpoint = factory().await;
-        if let Err(error) = run_server(endpoint).await {
-            log::error!("Skyzen server terminated: {error}");
+        match run_server(endpoint).await {
+            Ok(()) => log::info!("Skyzen server shut down gracefully"),
+            Err(error) => log::error!("Skyzen server terminated: {error}"),
         }
     });
 }
@@ -44,20 +151,34 @@ where
     let listener = TcpListener::bind(addr).await?;
     log::info!("Skyzen listening on http://{addr}");
 
+    let shutdown_signal = signal::ctrl_c();
+    tokio::pin!(shutdown_signal);
+
     loop {
-        let (stream, peer) = listener.accept().await?;
-        log::debug!("Accepted connection from {peer}");
-        let service = IntoService::new(endpoint.clone());
-        tokio::spawn(async move {
-            let builder = HyperBuilder::new(hyper_util::rt::TokioExecutor::new());
-            if let Err(error) = builder
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
-                log::error!("Hyper connection error: {error}");
+        tokio::select! {
+            biased;
+            _ = shutdown_signal.as_mut() => {
+                log::info!("Ctrl+C received, stopping accept loop");
+                break;
             }
-        });
+            accept_result = listener.accept() => {
+                let (stream, peer) = accept_result?;
+                log::debug!("Accepted connection from {peer}");
+                let service = IntoService::new(endpoint.clone());
+                tokio::spawn(async move {
+                    let builder = HyperBuilder::new(hyper_util::rt::TokioExecutor::new());
+                    if let Err(error) = builder
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        log::error!("Hyper connection error: {error}");
+                    }
+                });
+            }
+        }
     }
+
+    Ok(())
 }
 
 fn server_addr() -> SocketAddr {

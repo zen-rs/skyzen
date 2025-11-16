@@ -9,7 +9,7 @@ use skyzen::{utils::Bytes, Endpoint};
 use std::{future::Future, pin::Pin};
 
 pub type BoxedStdError = Box<dyn core::error::Error + Send + Sync + 'static>;
-type BoxFuture<T> = Pin<Box<dyn 'static + Send + Sync + Future<Output = T>>>;
+type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
 #[derive(Debug)]
 pub struct IntoService<E> {
     endpoint: E,

@@ -16,7 +16,7 @@ pub trait Server {
         executor: impl Executor + Send + Sync + 'static,
         error_handler: impl Fn(E) + Send + Sync + 'static,
         connectons: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
-        endpoint: impl Endpoint + Clone + 'static,
+        endpoint: impl Endpoint + Sync + Clone + 'static,
     ) -> impl Future<Output = ()>
     where
         Fut: Future + Send + 'static,

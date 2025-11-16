@@ -7,9 +7,9 @@ use http_kit::{
 };
 
 /// Extract a object from request,always is the header,body value,etc.
-pub trait Extractor: Sized + Send + Sync {
+pub trait Extractor: Sized + Send {
     /// Read the request and parse a value.
-    fn extract(request: &mut Request) -> impl Future<Output = Result<Self>> + Send + Sync;
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self>> + Send;
 }
 
 macro_rules! impl_tuple_extractor {
@@ -17,7 +17,7 @@ macro_rules! impl_tuple_extractor {
         #[allow(non_snake_case)]
         #[allow(unused_variables)]
         #[allow(clippy::unused_unit)]
-        impl<$($ty:Extractor+Send+Sync,)*> Extractor for ($($ty,)*) {
+        impl<$($ty:Extractor+Send,)*> Extractor for ($($ty,)*) {
             async fn extract(request:&mut Request) -> Result<Self>{
                 Ok(($($ty::extract(request).await?,)*))
             }

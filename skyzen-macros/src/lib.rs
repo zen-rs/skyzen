@@ -31,6 +31,9 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[cfg(not(target_arch = "wasm32"))]
         fn main() {
+            ::skyzen::runtime::native::init_logging();
+            ::skyzen::runtime::native::apply_cli_overrides(::std::env::args());
+            ::log::info!("Skyzen application starting up");
             ::skyzen::runtime::native::launch(|| #native_factory);
         }
 

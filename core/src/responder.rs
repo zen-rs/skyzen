@@ -10,7 +10,7 @@ use http_kit::{
 };
 
 /// Transform a object into a part of HTTP response,always is response body,header,etc.
-pub trait Responder: Send + Sync {
+pub trait Responder: Send {
     /// Modify the response,sometime also read the request (but the body may have already been consumed).
     ///
     /// # Errors
@@ -35,15 +35,14 @@ macro_rules! impl_tuple_responder {
 
 tuples!(impl_tuple_responder);
 
-impl_base_responder![
-    Bytes,
-    Vec<u8>,
-    &[u8],
-    Cow<'_, [u8]>,
-    Box<dyn AsyncBufRead + Send + Sync + 'static>,
-    Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>,
-    Body
-];
+impl_base_responder![Bytes, Vec<u8>, &[u8], Cow<'_, [u8]>, Body];
+
+impl Responder for Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>> {
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<()> {
+        *response.body_mut() = Body::from_reader(self, None);
+        Ok(())
+    }
+}
 
 impl_base_utf8_responder![ByteStr, String, &str, Cow<'_, str>];
 

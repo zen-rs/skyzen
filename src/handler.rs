@@ -16,10 +16,7 @@ use skyzen_core::{Extractor, Responder};
 /// This trait is a wrapper trait for `Fn` types. You will rarely use this type directly.
 pub trait Handler<T: Extractor>: Send + Sync {
     /// Handle the request and make a response.
-    fn call_handler(
-        &self,
-        request: &mut Request,
-    ) -> impl Future<Output = Result<Response>> + Send + Sync;
+    fn call_handler(&self, request: &mut Request) -> impl Future<Output = Result<Response>> + Send;
 }
 
 /// Adapter that turns a strongly typed [`Handler`] into an [`Endpoint`].

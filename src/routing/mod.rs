@@ -183,7 +183,7 @@ impl Route {
     #[must_use]
     pub fn middleware<M>(mut self, middleware: M) -> Self
     where
-        M: Middleware + Clone + 'static,
+        M: Middleware + Sync + Clone + 'static,
     {
         self.apply_middleware(middleware);
         self
@@ -192,7 +192,7 @@ impl Route {
     #[allow(clippy::needless_pass_by_value)]
     fn apply_middleware<M>(&mut self, middleware: M)
     where
-        M: Middleware + Clone + 'static,
+        M: Middleware + Sync + Clone + 'static,
     {
         for node in &mut self.nodes {
             node.apply_middleware(middleware.clone());
@@ -239,7 +239,7 @@ impl RouteNode {
 
     fn apply_middleware<M>(&mut self, middleware: M)
     where
-        M: Middleware + Clone + 'static,
+        M: Middleware + Sync + Clone + 'static,
     {
         match &mut self.node_type {
             RouteNodeType::Route(route) => route.apply_middleware(middleware),
@@ -255,7 +255,7 @@ impl RouteNode {
 
 fn wrap_endpoint_factory<M>(factory: EndpointFactory, middleware: M) -> EndpointFactory
 where
-    M: Middleware + Clone + 'static,
+    M: Middleware + Sync + Clone + 'static,
 {
     Arc::new(move || {
         let endpoint = factory();
