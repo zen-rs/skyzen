@@ -1,6 +1,5 @@
 use std::{
     future::Future,
-    io::Write as _,
     net::{IpAddr, SocketAddr},
     pin::Pin,
 };
@@ -14,30 +13,54 @@ use hyper::{
 };
 use hyper_util::{rt::TokioIo, server::conn::auto::Builder as HyperBuilder};
 use tokio::{net::TcpListener, signal};
+use tracing_subscriber::EnvFilter;
 
 type BoxedStdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
 
-/// Initialize a pretty logger once per process.
+/// Initialize the tracing subscriber + color-eyre once per process.
+/// # Panics
+/// If the subscriber fails to initialize.
 pub fn init_logging() {
-    use env_logger::Env;
     use std::sync::Once;
 
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-            .format(|buf, record| {
-                let ts = buf.timestamp_millis();
-                writeln!(
-                    buf,
-                    "[{} {:>5} {}] {}",
-                    ts,
-                    record.level(),
-                    record.target(),
-                    record.args()
-                )
-            })
+        if let Err(error) = color_eyre::install() {
+            eprintln!("failed to install color-eyre: {error}");
+        }
+
+        let _ = tracing_log::LogTracer::builder()
+            .with_max_level(log::LevelFilter::Trace)
             .init();
+
+        let env_filter = EnvFilter::try_from_default_env()
+            .or_else(|_| EnvFilter::try_new("info"))
+            .expect("failed to build env filter");
+
+        if tracing::dispatcher::has_been_set() {
+            return;
+        }
+
+        if let Err(error) = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .with_file(false)
+            .with_line_number(false)
+            .event_format(
+                tracing_subscriber::fmt::format()
+                    .with_level(true)
+                    .with_target(true)
+                    .compact(),
+            )
+            .try_init()
+        {
+            // Another subscriber was already installed (likely by a test harness),
+            // so we ignore the error to avoid noisy stderr output.
+            tracing::debug!("tracing subscriber already initialized: {error:?}");
+        }
     });
 }
 
@@ -183,7 +206,7 @@ where
 
 fn server_addr() -> SocketAddr {
     std::env::var("SKYZEN_ADDRESS")
-        .unwrap_or_else(|_| "0.0.0.0:8787".to_owned())
+        .unwrap_or_else(|_| "127.0.0.1:8787".to_owned())
         .parse()
         .unwrap_or_else(|error| panic!("Invalid SKYZEN_ADDRESS value: {error}"))
 }
