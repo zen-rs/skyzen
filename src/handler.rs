@@ -14,7 +14,7 @@ use skyzen_core::{Extractor, Responder};
 
 /// An HTTP handler.
 /// This trait is a wrapper trait for `Fn` types. You will rarely use this type directly.
-pub trait Handler<T: Extractor>: Send + Sync {
+pub trait Handler<T: Extractor>: Send + Sync + Clone + 'static {
     /// Handle the request and make a response.
     fn call_handler(&self, request: &mut Request) -> impl Future<Output = Result<Response>> + Send;
 }
@@ -62,8 +62,8 @@ macro_rules! impl_handler {
 
         impl<F, Fut, Res,$($ty:Extractor,)*> Handler<($($ty,)*)> for F
         where
-            F: Send + Sync + Fn($($ty,)*) -> Fut,
-            Fut: Send + Sync+Future<Output = Res>,
+            F: 'static + Clone + Send + Sync + Fn($($ty,)*) -> Fut,
+            Fut: Send + Future<Output = Res>,
             Res: Responder,
         {
 

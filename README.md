@@ -62,9 +62,19 @@ Instead of returning `Router`, you may return any type implementing `Endpoint + 
 When compiled for non-wasm targets the `#[skyzen::main]` macro generates a concrete `fn main()` that:
 
 1. Installs `color-eyre` + `tracing_subscriber` to provide colorful logs and pretty error reports (respecting `RUST_LOG`).
-2. Reads CLI overrides (`--listen`, `--addr`, `--host`, `--port`, `-p`) and writes the resolved address into the `SKYZEN_ADDRESS` environment variable (default `127.0.0.1:8787`).
+2. Reads CLI overrides (`--listen`, `--addr`, `--host`, `--port`, `-p`) and writes the resolved address into the `SKYZEN_ADDRESS` environment variable (default `0.0.0.0:8787`).
 3. Boots a multi-threaded Tokio runtime, spawns a Hyper server, and begins serving the router.
 4. Listens for `Ctrl+C` and performs a graceful shutdown of the accept loop, logging final status.
+
+Need to bring your own tracing/logging? Disable the built-in subscriber via `default_logger = false` and initialize whichever subscriber you prefer:
+
+```rust
+#[skyzen::main(default_logger = false)]
+async fn main() -> Router {
+    tracing_subscriber::fmt().init();
+    router()
+}
+```
 
 Because Skyzen sits on top of the async `http-kit` stack, all handlers are async by default and can leverage the existing ecosystem (SQLx, reqwest, redis, etc.) with zero extra setup.
 

@@ -2,11 +2,21 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, ItemFn};
+use syn::{
+    parse_macro_input, punctuated::Punctuated, Error, Expr, ExprLit, ItemFn, Lit, MetaNameValue,
+    Token,
+};
 
 /// Attribute macro that boots a Skyzen Endpoint on native or wasm runtimes.
 #[proc_macro_attribute]
-pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args =
+        parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
+    let options = match MainOptions::from_args(&args) {
+        Ok(options) => options,
+        Err(error) => return error.to_compile_error().into(),
+    };
+
     let mut function = parse_macro_input!(item as ItemFn);
     let is_async = function.sig.asyncness.is_some();
 
@@ -26,12 +36,18 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let wasm_factory = native_factory.clone();
 
+    let init_logging = if options.default_logger {
+        quote! { ::skyzen::runtime::native::init_logging(); }
+    } else {
+        quote! {}
+    };
+
     let output = quote! {
         #function
 
         #[cfg(not(target_arch = "wasm32"))]
         fn main() {
-            ::skyzen::runtime::native::init_logging();
+            #init_logging
             ::skyzen::runtime::native::apply_cli_overrides(::std::env::args());
             ::log::info!("Skyzen application starting up");
             ::skyzen::runtime::native::launch(|| #native_factory);
@@ -49,4 +65,38 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     output.into()
+}
+
+struct MainOptions {
+    default_logger: bool,
+}
+
+impl MainOptions {
+    fn from_args(args: &Punctuated<MetaNameValue, Token![,]>) -> syn::Result<Self> {
+        let mut options = Self {
+            default_logger: true,
+        };
+
+        for meta in args {
+            if !meta.path.is_ident("default_logger") {
+                return Err(Error::new_spanned(
+                    &meta.path,
+                    "unsupported option, expected `default_logger = true|false`",
+                ));
+            }
+
+            let value = match &meta.value {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Bool(bool_lit),
+                    ..
+                }) => bool_lit.value,
+                other => {
+                    return Err(Error::new_spanned(other, "expected boolean literal"));
+                }
+            };
+            options.default_logger = value;
+        }
+
+        Ok(options)
+    }
 }
