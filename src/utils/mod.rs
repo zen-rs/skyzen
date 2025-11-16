@@ -8,6 +8,11 @@ mod form;
 #[cfg(feature = "form")]
 pub use form::Form;
 
+#[cfg(feature = "multipart")]
+mod multipart;
+#[cfg(feature = "multipart")]
+pub use multipart::{Field, Multipart, MultipartBoundaryError, MultipartError};
+
 mod state;
 pub use state::State;
 
@@ -17,6 +22,8 @@ pub mod cookie;
 pub mod error {
     pub use super::form::FormContentTypeError;
     pub use super::json::JsonContentTypeError;
+    #[cfg(feature = "multipart")]
+    pub use super::multipart::MultipartBoundaryError;
     pub use super::state::StateNotExist;
 }
 
