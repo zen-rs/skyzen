@@ -11,7 +11,7 @@ categories = ["web-programming::http-server"]
 
 [dependencies]
 http-kit.workspace = true
-executor-core.workspace = true
+executor-core = { workspace = true, default-features = false }
 
 [lints]
 workspace = true

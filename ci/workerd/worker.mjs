@@ -1,10 +1,11 @@
 import init, { fetch as wasmFetch } from "./worker.js";
+import wasmUrl from "./worker_bg.wasm";
 
 let initPromise;
 
 async function ensureInitialized() {
   if (!initPromise) {
-    initPromise = init();
+    initPromise = init({ module_or_path: wasmUrl });
   }
   await initPromise;
 }

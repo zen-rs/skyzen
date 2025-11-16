@@ -46,9 +46,11 @@ where
 }
 
 async fn convert_request(request: Request) -> Result<crate::Request, JsValue> {
-    let mut builder = http::Request::builder()
-        .method(request.method())
-        .uri(request.url());
+    let method = request
+        .method()
+        .parse::<http::Method>()
+        .map_err(|error| JsValue::from_str(&format!("Invalid method `{error}`")))?;
+    let mut builder = http::Request::builder().method(method).uri(request.url());
 
     let headers = request.headers();
     let iter = js_sys::try_iter(&headers)?
@@ -77,24 +79,24 @@ async fn convert_request(request: Request) -> Result<crate::Request, JsValue> {
 
 async fn convert_response(response: crate::Response) -> Result<Response, JsValue> {
     let status = response.status().as_u16();
-    let mut init = web_sys::ResponseInit::new();
-    init.status(status);
-    init.status_text(response.status().canonical_reason().unwrap_or("OK"));
+    let init = web_sys::ResponseInit::new();
+    init.set_status(status);
+    init.set_status_text(response.status().canonical_reason().unwrap_or("OK"));
 
     let headers = web_sys::Headers::new()?;
     for (key, value) in response.headers().iter() {
         headers.append(key.as_str(), value.to_str().unwrap_or_default())?;
     }
-    init.headers(&headers);
+    init.set_headers(&headers);
 
-    let bytes = response
+    let mut bytes = response
         .into_body()
         .into_bytes()
         .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let array = js_sys::Uint8Array::from(bytes.as_ref());
+        .map_err(|error| JsValue::from_str(&error.to_string()))?
+        .to_vec();
 
-    Response::new_with_u8_array_and_init(&array, &init)
+    Response::new_with_opt_u8_array_and_init(Some(bytes.as_mut_slice()), &init)
 }
 
 async fn read_body_bytes(request: &Request) -> Result<Vec<u8>, JsValue> {
