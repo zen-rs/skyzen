@@ -33,7 +33,7 @@ impl_error!(
     "This error occurs for a dismatched content type."
 );
 
-impl<T: Send + Sync + DeserializeOwned> Extractor for Form<T> {
+impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
         /*if request
             .get_header(CONTENT_TYPE)

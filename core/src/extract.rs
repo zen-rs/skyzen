@@ -7,7 +7,7 @@ use http_kit::{
 };
 
 /// Extract a object from request,always is the header,body value,etc.
-pub trait Extractor: Sized + Send {
+pub trait Extractor: Sized + Send + Sync + 'static {
     /// Read the request and parse a value.
     fn extract(request: &mut Request) -> impl Future<Output = Result<Self>> + Send;
 }

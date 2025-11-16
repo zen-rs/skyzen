@@ -27,9 +27,7 @@ pub struct IntoEndpoint<H: Handler<T>, T: Extractor> {
 }
 
 /// Transform handler to endpoint.
-pub const fn into_endpoint<T: Extractor + Send + Sync, H: Handler<T>>(
-    handler: H,
-) -> IntoEndpoint<H, T> {
+pub const fn into_endpoint<T: Extractor + Send, H: Handler<T>>(handler: H) -> IntoEndpoint<H, T> {
     IntoEndpoint::new(handler)
 }
 

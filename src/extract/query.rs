@@ -9,7 +9,7 @@ pub struct Query<T>(pub T);
 
 impl_deref!(Query);
 
-impl<T: Send + Sync + DeserializeOwned> Extractor for Query<T> {
+impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
         let data = request.uri().query().unwrap_or_default();
         Ok(Self(from_str(data).status(StatusCode::BAD_REQUEST)?))

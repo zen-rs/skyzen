@@ -1,4 +1,3 @@
-#![deny(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations)]
 
 //! A simple and fast web server framework.

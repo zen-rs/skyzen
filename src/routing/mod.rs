@@ -334,7 +334,7 @@ fn endpoint_node_from_handler<P, H, T>(path: P, method: Method, handler: H) -> R
 where
     P: Into<String>,
     H: Handler<T>,
-    T: Extractor + Send + Sync + 'static,
+    T: Extractor,
 {
     let endpoint = handler::into_endpoint(handler);
     RouteNode::new_endpoint(path.into(), method, endpoint)
@@ -346,13 +346,13 @@ pub trait CreateRouteNode: Sized {
     fn at<H, T>(self, handler: H) -> RouteNode
     where
         H: Handler<T>,
-        T: Extractor + Send + Sync + 'static;
+        T: Extractor;
 
     /// Alias for [`CreateRouteNode::at`].
     fn get<H, T>(self, handler: H) -> RouteNode
     where
         H: Handler<T>,
-        T: Extractor + Send + Sync + 'static,
+        T: Extractor,
     {
         self.at(handler)
     }
@@ -361,19 +361,19 @@ pub trait CreateRouteNode: Sized {
     fn post<H, T>(self, handler: H) -> RouteNode
     where
         H: Handler<T>,
-        T: Extractor + Send + Sync + 'static;
+        T: Extractor;
 
     /// Attach a PUT handler to the path.
     fn put<H, T>(self, handler: H) -> RouteNode
     where
         H: Handler<T>,
-        T: Extractor + Send + Sync + 'static;
+        T: Extractor;
 
     /// Attach a DELETE handler to the path.
     fn delete<H, T>(self, handler: H) -> RouteNode
     where
         H: Handler<T>,
-        T: Extractor + Send + Sync + 'static;
+        T: Extractor;
 
     /// Mount nested routes under the current path segment.
     fn route(self, routes: impl Routes) -> RouteNode;
@@ -400,7 +400,7 @@ where
     fn at<H, T>(self, handler: H) -> RouteNode
     where
         H: Handler<T>,
-        T: Extractor + Send + Sync + 'static,
+        T: Extractor,
     {
         endpoint_node_from_handler(self, Method::GET, handler)
     }
@@ -408,7 +408,7 @@ where
     fn post<H, T>(self, handler: H) -> RouteNode
     where
         H: Handler<T>,
-        T: Extractor + Send + Sync + 'static,
+        T: Extractor,
     {
         endpoint_node_from_handler(self, Method::POST, handler)
     }
@@ -416,7 +416,7 @@ where
     fn put<H, T>(self, handler: H) -> RouteNode
     where
         H: Handler<T>,
-        T: Extractor + Send + Sync + 'static,
+        T: Extractor,
     {
         endpoint_node_from_handler(self, Method::PUT, handler)
     }
@@ -424,7 +424,7 @@ where
     fn delete<H, T>(self, handler: H) -> RouteNode
     where
         H: Handler<T>,
-        T: Extractor + Send + Sync + 'static,
+        T: Extractor,
     {
         endpoint_node_from_handler(self, Method::DELETE, handler)
     }

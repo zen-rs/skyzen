@@ -31,7 +31,7 @@ impl_error!(
     "This error occurs for a dismatched content type."
 );
 
-impl<T: Send + Sync + DeserializeOwned> Extractor for Json<T> {
+impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
         if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
             if content_type != "application/json" {
