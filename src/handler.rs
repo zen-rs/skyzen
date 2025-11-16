@@ -22,13 +22,17 @@ pub trait Handler<T: Extractor>: Send + Sync {
     ) -> impl Future<Output = Result<Response>> + Send + Sync;
 }
 
-struct IntoEndpoint<H: Handler<T>, T: Extractor> {
+/// Adapter that turns a strongly typed [`Handler`] into an [`Endpoint`].
+#[derive(Debug)]
+pub struct IntoEndpoint<H: Handler<T>, T: Extractor> {
     handler: H,
     _marker: PhantomData<T>,
 }
 
 /// Transform handler to endpoint.
-pub fn into_endpoint<T: Extractor + Send + Sync>(handler: impl Handler<T>) -> impl Endpoint {
+pub const fn into_endpoint<T: Extractor + Send + Sync, H: Handler<T>>(
+    handler: H,
+) -> IntoEndpoint<H, T> {
     IntoEndpoint::new(handler)
 }
 
@@ -61,7 +65,7 @@ macro_rules! impl_handler {
 
         impl<F, Fut, Res,$($ty:Extractor,)*> Handler<($($ty,)*)> for F
         where
-            F: Send+Sync + Fn($($ty,)*) -> Fut,
+            F: Send + Sync + Fn($($ty,)*) -> Fut,
             Fut: Send + Sync+Future<Output = Res>,
             Res: Responder,
         {

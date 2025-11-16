@@ -28,12 +28,14 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
     type Error = BoxedStdError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
-    fn call(&self, req: hyper::Request<Incoming>) -> Self::Future {
+    fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
         // TODO: Rewrite when impl Trait in associated types stablized
         let mut endpoint = self.endpoint.clone();
         let fut = async move {
+            let on_upgrade = hyper::upgrade::on(&mut req);
             let mut request: skyzen::Request =
                 skyzen::Request::from(req.map(BodyDataStream::new).map(skyzen::Body::from_stream));
+            request.extensions_mut().insert(on_upgrade);
             let response: Result<skyzen::Response, skyzen::Error> =
                 endpoint.respond(&mut request).await;
 

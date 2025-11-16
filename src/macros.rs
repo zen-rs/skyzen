@@ -23,6 +23,7 @@ macro_rules! impl_error {
     ($ty:ident,$message:expr,$description:expr) => {
         #[derive(Debug)]
         #[doc = $description]
+        #[allow(dead_code)]
         pub struct $ty;
         impl std::fmt::Display for $ty {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

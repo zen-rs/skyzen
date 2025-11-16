@@ -1,75 +1,121 @@
-//! Routing between endpoints
+//! Tree-based routing primitives.
 //!
-//! Skyzen uses a tree-based routing system. The original `CreateRouteNode::at` builder syntax
-//! shown in the examples below is still experimental, so the snippets are marked as ignored:
-//! ```ignore
-//! use skyzen::{CreateRouteNode, routing::Params, Route};
-//! Route::new((
-//!     "/home".at(|| async {}),
-//!     "/about".at(|| async {}),
-//! ));
-//! ```
+//! Routes are defined by combining nodes produced by the [`CreateRouteNode`] extension. Path
+//! literals gain builder methods such as `.at(handler)` (GET), `.post(handler)`, `.put(handler)`,
+//! `.delete(handler)`, `.ws(handler)`, and `.route(children)`
+//! so you can describe the full tree declaratively. Once a tree is assembled, call [`Route::build`]
+//! to obtain a [`Router`] that can be mounted on a server or invoked directly from tests.
 //!
-//! Named parameters are extracted via [`Params`]:
-//! ```ignore
-//! use skyzen::{CreateRouteNode, routing::Params, Route};
-//! async fn hello(params: Params) -> String {
-//!     let name = params.get("name").unwrap();
-//!     format!("Hello, {name}!")
+//! ## Building routes
+//! ```no_run
+//! use skyzen::{
+//!     routing::{CreateRouteNode, Params, Route},
+//!     Result,
+//! };
+//!
+//! async fn ping() -> Result<&'static str> {
+//!     Ok("pong")
 //! }
-//! Route::new((
-//!     "/user/:name".at(hello)
-//! ));
-//! ```
 //!
-//! Catch-all segments after `/*` are also supported:
-//! ```ignore
-//! # use skyzen::{CreateRouteNode, routing::Params, Route};
-//! async fn echo(params: Params) -> String {
-//!     let path = params.get("path").unwrap();
-//!     format!("Path: {path}")
+//! async fn hello(params: Params) -> Result<String> {
+//!     let name = params.get("name")?;
+//!     Ok(format!("Hello, {name}!"))
 //! }
-//! Route::new((
-//!     "/file/*path".at(echo)
+//!
+//! let router = Route::new((
+//!     "/ping".at(ping),
+//!     "/user".route((
+//!         "/{name}".at(hello),
+//!     )),
+//! ))
+//! .build();
+//! ```
+//!
+//! ## Named parameters and wildcards
+//! Use `{name}` to capture a single path segment and `{*path}` to capture the rest of the path.
+//! Extract the captured values with [`Params`]:
+//! ```no_run
+//! use skyzen::{
+//!     routing::{CreateRouteNode, Params, Route},
+//!     Result,
+//! };
+//!
+//! async fn echo(params: Params) -> Result<String> {
+//!     let path = params.get("path")?;
+//!     Ok(format!("Path: {path}"))
+//! }
+//!
+//! let route = Route::new(("/files/{*path}".at(echo),));
+//! ```
+//!
+//! ## Applying middleware to a route tree
+//! Middleware can be attached to a [`Route`] via [`Route::middleware`]. The middleware is cloned
+//! for every endpoint reachable from the route:
+//! ```no_run
+//! use skyzen::{
+//!     routing::{CreateRouteNode, Route},
+//!     utils::State,
+//! };
+//!
+//! let route = Route::new(("/counter".at(|| async { http_kit::Result::Ok("0") }),))
+//! .middleware(State(0usize));
+//! ```
+//!
+//! Error handling can also be expressed as middleware. For example, you can catch endpoint errors
+//! with [`ErrorHandlingMiddleware`](crate::middleware::ErrorHandlingMiddleware):
+//! ```no_run
+//! use skyzen::{
+//!     middleware::ErrorHandlingMiddleware,
+//!     routing::{CreateRouteNode, Route},
+//!     Result,
+//! };
+//!
+//! async fn boom() -> Result<&'static str> {
+//!     Err(skyzen::Error::msg("boom"))
+//! }
+//!
+//! let router = Route::new(("/panic".at(boom),))
+//! .middleware(ErrorHandlingMiddleware::new(|error| async move {
+//!     format!("Recovered from {error}")
+//! }))
+//! .build();
+//!
+//! ## WebSockets
+//! When the `websocket` feature is enabled you can use `.ws` to accept upgrades without manually
+//! extracting [`WebSocketUpgrade`](crate::websocket::WebSocketUpgrade):
+//! ```no_run
+//! use futures_util::{SinkExt, StreamExt};
+//! use skyzen::{
+//!     routing::CreateRouteNode,
+//!     websocket::WebSocketMessage,
+//! };
+//!
+//! let routes = Route::new((
+//!     "/chat".ws(|mut socket| async move {
+//!         while let Some(Ok(message)) = socket.next().await {
+//!             if let Ok(text) = message.into_text() {
+//!                 let _ = socket.send(WebSocketMessage::text(text)).await;
+//!             }
+//!         }
+//!     }),
 //! ));
 //! ```
-//!
-//! # Applying middleware for routes
-//! You can apply middleware with `Route::middleware`:
-//! ```ignore
-//! # use skyzen::{CreateRouteNode, routing::Params, Route, utils::State};
-//! Route::new((
-//!     "/counter".at(|| async {})
-//! )).middleware(State(0));
-//! ```
-//! Middleware applied on a route will also be recursively applied to every child node.
-//!
-//! # Error handling
-//! Capture endpoint failures with [`ErrorHandlingMiddleware`](crate::middleware::ErrorHandlingMiddleware):
-//! ```ignore
-//! # use skyzen::{CreateRouteNode, routing::Params, Route, utils::State, middleware::ErrorHandlingMiddleware};
-//! Route::new(()).middleware(ErrorHandlingMiddleware::new(|error| async { "Error!" }));
-//! ```
-//! or use the convenience method `error_handling`:
-//! ```ignore
-//! # use skyzen::{CreateRouteNode, routing::Params, Route, utils::State};
-//! Route::new(()).error_handling(|error| async { "Error!" });
+//! The `.ws` builder enforces the HTTP upgrade requirements automatically.
 //! ```
 //!
-//! Handlers bubble errors from the innermost route outward until one is caught:
-//! ```ignore
-//! # use skyzen::{CreateRouteNode, routing::Params, Route, utils::State};
-//! Route::new((
-//!     "/test".at(|| async {})
-//!         .error_handling(|error| async { "Inner error" })
-//! )).error_handling(|error| async { "Outer error" });
-//! ```
+//! Middleware is applied from the outermost route to the innermost endpoint, so errors bubble up
+//! until they are handled.
 
+#[cfg(feature = "websocket")]
+use std::future::Future;
 use std::{fmt, sync::Arc};
 
-use crate::Middleware;
+#[cfg(feature = "websocket")]
+use crate::websocket::{WebSocket, WebSocketUpgrade};
+use crate::{handler, handler::Handler, Middleware};
 use http_kit::endpoint::{AnyEndpoint, WithMiddleware};
 use http_kit::{Endpoint, Method};
+use skyzen_core::Extractor;
 
 /// Type alias for dynamically dispatched endpoints stored in the routing tree.
 pub type BoxEndpoint = AnyEndpoint;
@@ -88,16 +134,16 @@ pub use router::{build, RouteBuildError, Router};
 #[derive(Debug)]
 pub struct Route {
     /// All nodes that hang off the route's mount point.
-    pub nodes: Vec<RouteNode>,
+    nodes: Vec<RouteNode>,
 }
 
 /// A single node in the routing tree.
 #[derive(Debug)]
 pub struct RouteNode {
     /// The literal path segment represented by this node.
-    pub path: String,
+    path: String,
     /// The kind of node.
-    pub node_type: RouteNodeType,
+    node_type: RouteNodeType,
 }
 
 /// Distinguishes between nested routes and terminal endpoints.
@@ -152,12 +198,21 @@ impl Route {
             node.apply_middleware(middleware.clone());
         }
     }
+
+    /// Build the route, panicking on error.
+    ///
+    /// # Panics
+    /// Panics if the route is invalid.
+    #[must_use]
+    pub fn build(self) -> Router {
+        build(self).expect("Failed to build router")
+    }
 }
 
 impl RouteNode {
     /// Construct an endpoint node with the provided handler.
     #[must_use]
-    pub fn new_endpoint<E>(path: impl Into<String>, method: Method, endpoint: E) -> Self
+    pub(crate) fn new_endpoint<E>(path: impl Into<String>, method: Method, endpoint: E) -> Self
     where
         E: Endpoint + Clone + Send + Sync + 'static,
     {
@@ -175,7 +230,7 @@ impl RouteNode {
 
     /// Construct a nested route node mounted under `path`.
     #[must_use]
-    pub fn new_route(path: impl Into<String>, route: Route) -> Self {
+    pub(crate) fn new_route(path: impl Into<String>, route: Route) -> Self {
         Self {
             path: path.into(),
             node_type: RouteNodeType::Route(route),
@@ -245,6 +300,12 @@ impl Routes for RouteNode {
     }
 }
 
+impl Routes for Route {
+    fn into_route_nodes(self) -> Vec<RouteNode> {
+        self.nodes
+    }
+}
+
 impl Routes for () {
     fn into_route_nodes(self) -> Vec<RouteNode> {
         Vec::new()
@@ -268,6 +329,110 @@ macro_rules! impl_routes_tuple {
 }
 
 tuples!(impl_routes_tuple);
+
+fn endpoint_node_from_handler<P, H, T>(path: P, method: Method, handler: H) -> RouteNode
+where
+    P: Into<String>,
+    H: Handler<T> + Clone + 'static,
+    T: Extractor + Send + Sync + 'static,
+{
+    let endpoint = handler::into_endpoint(handler);
+    RouteNode::new_endpoint(path.into(), method, endpoint)
+}
+
+/// Builder extension that turns a path literal into convenient routing nodes.
+pub trait CreateRouteNode: Sized {
+    /// Attach a GET handler to the path.
+    fn at<H, T>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T> + Clone + 'static,
+        T: Extractor + Send + Sync + 'static;
+
+    /// Alias for [`CreateRouteNode::at`].
+    fn get<H, T>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T> + Clone + 'static,
+        T: Extractor + Send + Sync + 'static,
+    {
+        self.at(handler)
+    }
+
+    /// Attach a POST handler to the path.
+    fn post<H, T>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T> + Clone + 'static,
+        T: Extractor + Send + Sync + 'static;
+
+    /// Attach a PUT handler to the path.
+    fn put<H, T>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T> + Clone + 'static,
+        T: Extractor + Send + Sync + 'static;
+
+    /// Attach a DELETE handler to the path.
+    fn delete<H, T>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T> + Clone + 'static,
+        T: Extractor + Send + Sync + 'static;
+
+    /// Mount nested routes under the current path segment.
+    fn route(self, routes: impl Routes) -> RouteNode;
+
+    /// Attach a WebSocket handler that automatically performs the upgrade handshake.
+    #[cfg(feature = "websocket")]
+    fn ws<F, Fut>(self, handler: F) -> RouteNode
+    where
+        F: Fn(WebSocket) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let builder = move |upgrade: WebSocketUpgrade| {
+            let callback = handler.clone();
+            async move { upgrade.on_upgrade(callback) }
+        };
+        self.at(builder)
+    }
+}
+
+impl<P> CreateRouteNode for P
+where
+    P: Into<String>,
+{
+    fn at<H, T>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T> + Clone + 'static,
+        T: Extractor + Send + Sync + 'static,
+    {
+        endpoint_node_from_handler(self, Method::GET, handler)
+    }
+
+    fn post<H, T>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T> + Clone + 'static,
+        T: Extractor + Send + Sync + 'static,
+    {
+        endpoint_node_from_handler(self, Method::POST, handler)
+    }
+
+    fn put<H, T>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T> + Clone + 'static,
+        T: Extractor + Send + Sync + 'static,
+    {
+        endpoint_node_from_handler(self, Method::PUT, handler)
+    }
+
+    fn delete<H, T>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T> + Clone + 'static,
+        T: Extractor + Send + Sync + 'static,
+    {
+        endpoint_node_from_handler(self, Method::DELETE, handler)
+    }
+
+    fn route(self, routes: impl Routes) -> RouteNode {
+        RouteNode::new_route(self.into(), Route::new(routes))
+    }
+}
 
 // Disabled the Node trait for now since middleware system needs redesign
 // pub trait Node {

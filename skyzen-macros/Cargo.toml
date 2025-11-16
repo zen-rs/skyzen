@@ -1,0 +1,21 @@
+[package]
+name = "skyzen-macros"
+version = "0.1.0"
+edition = "2021"
+description = "Procedural macros powering the Skyzen web framework"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "../README.md"
+keywords = ["http", "web", "framework"]
+categories = ["web-programming::http-server"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[lints]
+workspace = true
