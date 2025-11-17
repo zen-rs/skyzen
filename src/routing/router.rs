@@ -5,7 +5,9 @@ use std::{
 };
 
 use super::{BoxEndpoint, EndpointFactory, Params, Route, RouteNode, RouteNodeType};
-use crate::{Endpoint, Method, Request, Response, StatusCode};
+#[cfg(debug_assertions)]
+use crate::openapi::RouteOpenApiEntry;
+use crate::{openapi::OpenApi, Endpoint, Method, Request, Response, StatusCode};
 
 use matchit::Match;
 use skyzen_core::Extractor;
@@ -52,14 +54,21 @@ impl App {
 pub struct Router {
     inner: Arc<matchit::Router<Vec<(Method, App)>>>,
     programable_router: bool,
+    #[cfg(debug_assertions)]
+    openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
 }
 
 impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Router")
+        let mut debug_struct = f.debug_struct("Router");
+        debug_struct
             .field("inner", &self.inner)
-            .field("programable_router", &self.programable_router)
-            .finish()
+            .field("programable_router", &self.programable_router);
+        #[cfg(debug_assertions)]
+        {
+            debug_struct.field("openapi_entries", &self.openapi_entries.len());
+        }
+        debug_struct.finish()
     }
 }
 
@@ -138,6 +147,20 @@ impl Router {
         self.programable_router = true;
         self
     }
+
+    /// Build an [`OpenApi`] definition containing every route registered on this router.
+    #[must_use]
+    pub fn openapi(&self) -> OpenApi {
+        #[cfg(debug_assertions)]
+        {
+            return OpenApi::from_entries(&self.openapi_entries);
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            OpenApi::default()
+        }
+    }
 }
 
 impl Extractor for Router {
@@ -179,6 +202,37 @@ impl From<matchit::InsertError> for RouteBuildError {
 }
 
 type FlattenBuf = HashMap<String, Vec<(Method, App)>>;
+
+#[cfg(debug_assertions)]
+fn flatten(
+    path_prefix: &str,
+    route: Vec<RouteNode>,
+    buf: &mut FlattenBuf,
+    openapi_entries: &mut Vec<RouteOpenApiEntry>,
+) {
+    for node in route {
+        let path = format!("{}{}", path_prefix, node.path);
+
+        match node.node_type {
+            RouteNodeType::Route(route) => {
+                flatten(&path, route.nodes, buf, openapi_entries);
+            }
+            RouteNodeType::Endpoint {
+                endpoint_factory,
+                method,
+                openapi,
+                // middlewares, // Disabled for now
+            } => {
+                let entry = buf.entry(path.clone()).or_default();
+
+                entry.push((method.clone(), App::new(endpoint_factory)));
+                openapi_entries.push(RouteOpenApiEntry::new(path, method, openapi));
+            }
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
 fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
     for node in route {
         let path = format!("{}{}", path_prefix, node.path);
@@ -190,10 +244,10 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
             RouteNodeType::Endpoint {
                 endpoint_factory,
                 method,
+                openapi,
                 // middlewares, // Disabled for now
             } => {
                 let entry = buf.entry(path).or_default();
-
                 entry.push((method, App::new(endpoint_factory)));
             }
         }
@@ -206,9 +260,51 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
 ///
 /// Returns [`RouteBuildError`] if the route tree contains conflicting method registrations or if
 /// the underlying path matcher rejects the route definition.
+#[cfg(debug_assertions)]
+pub fn build(route: Route) -> Result<Router, RouteBuildError> {
+    let mut buf = HashMap::new();
+    let mut openapi_entries = Vec::new();
+    flatten("", route.nodes, &mut buf, &mut openapi_entries);
+    finalize_router(buf, Some(openapi_entries))
+}
+
+#[cfg(not(debug_assertions))]
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     flatten("", route.nodes, &mut buf);
+    finalize_router(buf, None)
+}
+
+#[cfg(debug_assertions)]
+fn finalize_router(
+    buf: HashMap<String, Vec<(Method, App)>>,
+    openapi_entries: Option<Vec<RouteOpenApiEntry>>,
+) -> Result<Router, RouteBuildError> {
+    let mut router = matchit::Router::new();
+    for (path, value) in buf {
+        let mut set = HashSet::new();
+        for (method, ..) in &value {
+            if !set.insert(method) {
+                return Err(RouteBuildError::RepeatedMethod {
+                    path,
+                    method: method.clone(),
+                });
+            }
+        } //check route
+        router.insert(path, value)?;
+    }
+    Ok(Router {
+        inner: Arc::new(router),
+        programable_router: false,
+        openapi_entries: Arc::new(openapi_entries.unwrap_or_default()),
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn finalize_router(
+    buf: HashMap<String, Vec<(Method, App)>>,
+    _openapi_entries: Option<Vec<()>>,
+) -> Result<Router, RouteBuildError> {
     let mut router = matchit::Router::new();
     for (path, value) in buf {
         let mut set = HashSet::new();

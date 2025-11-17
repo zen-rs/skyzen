@@ -6,6 +6,7 @@ use std::{
 
 use crate::{
     header::{self, HeaderValue},
+    openapi,
     routing::{IntoRouteNode, Params, Route, RouteNode},
     Endpoint, Method, Request, Response, StatusCode,
 };
@@ -57,8 +58,18 @@ impl IntoRouteNode for StaticDir {
             "/{*path}"
         };
         let route = Route::new((
-            RouteNode::new_endpoint("", Method::GET, endpoint.clone()),
-            RouteNode::new_endpoint(wildcard_suffix, Method::GET, endpoint),
+            RouteNode::new_endpoint(
+                "",
+                Method::GET,
+                endpoint.clone(),
+                openapi::describe_handler::<StaticDirEndpoint>(),
+            ),
+            RouteNode::new_endpoint(
+                wildcard_suffix,
+                Method::GET,
+                endpoint,
+                openapi::describe_handler::<StaticDirEndpoint>(),
+            ),
         ));
 
         RouteNode::new_route(self.mount_path, route)

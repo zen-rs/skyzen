@@ -40,3 +40,17 @@ wasm-bindgen --target web target/wasm32-unknown-unknown/release/examples/worker.
 ```
 
 Deploy the generated artifacts with `wrangler publish worker-dist/worker.js` (create `worker.js` that imports the wasm bundle and forwards `fetch` to it).
+
+## `openapi.rs`
+
+Features:
+
+- Demonstrates `#[skyzen::openapi]` for handlers along with typed `Json<T>` extractors/responders.
+- Shows how to build a `Router`, call `.openapi()`, and inspect the collected operations.
+- Prints schemas and doc comments when compiled in debug mode (release builds disable OpenAPI instrumentation and log an explicit message).
+
+Run it locally:
+
+```sh
+cargo run --example openapi
+```

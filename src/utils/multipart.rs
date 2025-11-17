@@ -226,8 +226,6 @@ mod tests {
 
         let error = Multipart::extract(&mut request).await.unwrap_err();
         assert_eq!(error.status(), crate::StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        assert!(error
-            .downcast_ref::<MultipartBoundaryError>()
-            .is_some());
+        assert!(error.downcast_ref::<MultipartBoundaryError>().is_some());
     }
 }

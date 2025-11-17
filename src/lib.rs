@@ -13,14 +13,17 @@ pub mod handler;
 
 pub mod routing;
 
+/// OpenAPI helpers.
+pub mod openapi;
+
 /// Utilities.
 pub mod utils;
 
 /// Runtime primitives leveraged by `#[skyzen::main]`.
 pub mod runtime;
 
-/// Attribute macro for bootstrapping Skyzen applications.
-pub use skyzen_macros::main;
+/// Attribute macros exported by Skyzen.
+pub use skyzen_macros::{main, openapi};
 
 /// Static asset helpers for building file servers.
 pub mod static_files;
@@ -34,6 +37,9 @@ pub use http_kit::{
 #[doc(inline)]
 pub use routing::{CreateRouteNode, Route};
 pub use skyzen_core::Server;
+
+#[doc(inline)]
+pub use openapi::{OpenApi, OpenApiOperation, OpenApiSchema};
 
 /// Extract strong-typed object from your request.
 pub mod extract;

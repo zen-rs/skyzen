@@ -110,9 +110,11 @@
 use std::future::Future;
 use std::{fmt, sync::Arc};
 
+#[cfg(debug_assertions)]
+use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "websocket")]
 use crate::websocket::{WebSocket, WebSocketUpgrade};
-use crate::{handler, handler::Handler, Middleware};
+use crate::{handler, handler::Handler, openapi, openapi::OpenApi, Middleware};
 use http_kit::endpoint::{AnyEndpoint, WithMiddleware};
 use http_kit::{Endpoint, Method};
 use skyzen_core::Extractor;
@@ -156,6 +158,8 @@ pub enum RouteNodeType {
         endpoint_factory: EndpointFactory,
         /// HTTP method matched by the node.
         method: Method,
+        /// Handler metadata for OpenAPI export.
+        openapi: openapi::RouteHandlerDoc,
     },
 }
 
@@ -207,12 +211,33 @@ impl Route {
     pub fn build(self) -> Router {
         build(self).expect("Failed to build router")
     }
+
+    /// Generate an [`OpenApi`] document describing this route tree.
+    #[must_use]
+    pub fn openapi(&self) -> OpenApi {
+        #[cfg(debug_assertions)]
+        {
+            let mut entries = Vec::new();
+            collect_openapi_entries("", &self.nodes, &mut entries);
+            return OpenApi::from_entries(&entries);
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            OpenApi::default()
+        }
+    }
 }
 
 impl RouteNode {
     /// Construct an endpoint node with the provided handler.
     #[must_use]
-    pub(crate) fn new_endpoint<E>(path: impl Into<String>, method: Method, endpoint: E) -> Self
+    pub(crate) fn new_endpoint<E>(
+        path: impl Into<String>,
+        method: Method,
+        endpoint: E,
+        openapi: openapi::RouteHandlerDoc,
+    ) -> Self
     where
         E: Endpoint + Clone + Send + Sync + 'static,
     {
@@ -223,6 +248,7 @@ impl RouteNode {
             node_type: RouteNodeType::Endpoint {
                 endpoint_factory,
                 method,
+                openapi,
                 // middlewares: Vec::new(), // Disabled for now
             },
         }
@@ -336,8 +362,30 @@ where
     H: Handler<T>,
     T: Extractor,
 {
+    let handler_doc = openapi::describe_handler::<H>();
     let endpoint = handler::into_endpoint(handler);
-    RouteNode::new_endpoint(path.into(), method, endpoint)
+    RouteNode::new_endpoint(path.into(), method, endpoint, handler_doc)
+}
+
+#[cfg(debug_assertions)]
+fn collect_openapi_entries(
+    path_prefix: &str,
+    nodes: &[RouteNode],
+    buf: &mut Vec<RouteOpenApiEntry>,
+) {
+    for node in nodes {
+        let path = format!("{}{}", path_prefix, node.path);
+        match &node.node_type {
+            RouteNodeType::Route(route) => {
+                collect_openapi_entries(&path, &route.nodes, buf);
+            }
+            RouteNodeType::Endpoint {
+                method, openapi, ..
+            } => {
+                buf.push(RouteOpenApiEntry::new(path, method.clone(), *openapi));
+            }
+        }
+    }
 }
 
 /// Builder extension that turns a path literal into convenient routing nodes.
