@@ -4,7 +4,7 @@
 //! There're two style to use [`SSE`](crate::responder::Sse) responder: stream style and channel style.
 //! # Stream style
 //! Convert a stream generating `Result<Event>` to a SSE stream.
-//! ```ignore
+//! ```
 //! # use skyzen::responder::{Sse,sse::Event};
 //! use futures_util::stream::once;
 //! use std::convert::Infallible;
@@ -16,7 +16,7 @@
 //! # Channel style
 //! Create a SSE stream and a sender, send message to stream with the sender.
 //! *Warning:* You must return SSE stream first before you send message by sender.
-//! ```ignore
+//! ```
 //! use skyzen::responder::{Sse,sse::Event};
 //! async fn handler() -> Sse{
 //!     let(sender,sse) = Sse::channel();

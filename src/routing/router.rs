@@ -39,7 +39,7 @@ impl App {
 /// `Router` stores its routing tree inside an [`Arc`], so it can be cloned cheaply and shared
 /// across threads.
 ///
-/// ```ignore
+/// ```
 /// use skyzen::{routing::{CreateRouteNode, Route, Router}, Result};
 ///
 /// let router: Router = Route::new((

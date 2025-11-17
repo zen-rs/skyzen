@@ -79,6 +79,7 @@
 //!     format!("Recovered from {error}")
 //! }))
 //! .build();
+//! ```
 //!
 //! ## WebSockets
 //! When the `websocket` feature is enabled you can use `.ws` to accept upgrades without manually
@@ -86,7 +87,7 @@
 //! ```no_run
 //! use futures_util::{SinkExt, StreamExt};
 //! use skyzen::{
-//!     routing::CreateRouteNode,
+//!     routing::{CreateRouteNode, Route},
 //!     websocket::WebSocketMessage,
 //! };
 //!
@@ -101,7 +102,6 @@
 //! ));
 //! ```
 //! The `.ws` builder enforces the HTTP upgrade requirements automatically.
-//! ```
 //!
 //! Middleware is applied from the outermost route to the innermost endpoint, so errors bubble up
 //! until they are handled.

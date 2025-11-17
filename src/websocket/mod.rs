@@ -2,7 +2,7 @@
 //!
 //! Handlers can request a protocol switch by extracting [`WebSocketUpgrade`]
 //! and returning the result of [`WebSocketUpgrade::on_upgrade`]:
-//! ```ignore
+//! ```
 //! use futures_util::{SinkExt, StreamExt};
 //! use skyzen::{websocket::{WebSocketMessage, WebSocketUpgrade}, Responder};
 //!
