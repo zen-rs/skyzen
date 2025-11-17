@@ -81,7 +81,7 @@
 //! .build();
 //! ```
 //!
-//! ## WebSockets
+//! ## WebSocket routes
 //! When the `websocket` feature is enabled you can use `.ws` to accept upgrades without manually
 //! extracting [`WebSocketUpgrade`](crate::websocket::WebSocketUpgrade):
 //! ```no_run
@@ -158,7 +158,7 @@ pub enum RouteNodeType {
         endpoint_factory: EndpointFactory,
         /// HTTP method matched by the node.
         method: Method,
-        /// Handler metadata for OpenAPI export.
+        /// Handler metadata for `OpenAPI` export.
         openapi: openapi::RouteHandlerDoc,
     },
 }
@@ -219,7 +219,7 @@ impl Route {
         {
             let mut entries = Vec::new();
             collect_openapi_entries("", &self.nodes, &mut entries);
-            return OpenApi::from_entries(&entries);
+            OpenApi::from_entries(&entries)
         }
 
         #[cfg(not(debug_assertions))]

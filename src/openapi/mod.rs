@@ -1,11 +1,9 @@
-//! OpenAPI helpers powered by `schemars`.
+//! OpenAPI helpers powered by `utoipa` schemas.
+
+use std::fmt;
 
 use http_kit::Method;
-use schemars::{
-    gen::{SchemaGenerator, SchemaSettings},
-    schema::Schema,
-    JsonSchema,
-};
+use utoipa::openapi::{schema::Schema, RefOr};
 
 #[cfg(debug_assertions)]
 use linkme::distributed_slice;
@@ -14,32 +12,30 @@ mod builtins;
 
 /// Assert that `T` can produce an OpenAPI schema.
 #[doc(hidden)]
-pub const fn assert_schema<T: OpenApiSchema>() {
+pub const fn assert_schema<T>()
+where
+    T: OpenApiSchema,
+{
     let _ = ::core::marker::PhantomData::<T>;
 }
 
-/// Trait implemented by extractors and responders that can describe themselves via JSON Schema.
+/// Trait implemented by extractors and responders that can describe themselves via OpenAPI schema.
 pub trait OpenApiSchema: Send + Sync + 'static {
     /// Produce a [`Schema`] for the implementing type.
-    fn schema(generator: &mut SchemaGenerator) -> Schema;
-}
-
-/// Helper for implementers that already derive [`JsonSchema`].
-pub fn schema_from_json_schema<T>(generator: &mut SchemaGenerator) -> Schema
-where
-    T: JsonSchema + Send + Sync + 'static,
-{
-    <T as JsonSchema>::json_schema(generator)
+    fn schema() -> RefOr<Schema>;
 }
 
 /// Helper function referenced by the procedural macro to obtain a [`Schema`].
-pub fn schema_of<T: OpenApiSchema>(generator: &mut SchemaGenerator) -> Schema {
-    T::schema(generator)
+pub fn schema_of<T>() -> RefOr<Schema>
+where
+    T: OpenApiSchema,
+{
+    T::schema()
 }
 
 #[cfg(debug_assertions)]
 /// Function pointer used to lazily build a [`Schema`].
-pub type SchemaFn = fn(&mut SchemaGenerator) -> Schema;
+pub type SchemaFn = fn() -> RefOr<Schema>;
 
 #[cfg(debug_assertions)]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
@@ -96,7 +92,7 @@ pub fn describe_handler<H: 'static>() -> RouteHandlerDoc {
     {
         let type_name = std::any::type_name::<H>();
         let spec = find_handler_spec(type_name);
-        return RouteHandlerDoc::new(type_name, spec);
+        RouteHandlerDoc::new(type_name, spec)
     }
 
     #[cfg(not(debug_assertions))]
@@ -108,7 +104,7 @@ pub fn describe_handler<H: 'static>() -> RouteHandlerDoc {
 
 #[cfg(debug_assertions)]
 #[derive(Debug, Clone)]
-/// Route metadata stored when OpenAPI instrumentation is enabled.
+/// Route metadata stored when `OpenAPI` instrumentation is enabled.
 pub struct RouteOpenApiEntry {
     /// HTTP path served by the handler.
     pub path: String,
@@ -122,7 +118,7 @@ pub struct RouteOpenApiEntry {
 impl RouteOpenApiEntry {
     #[must_use]
     /// Construct a new entry describing a route + handler pair.
-    pub fn new(path: String, method: Method, handler: RouteHandlerDoc) -> Self {
+    pub const fn new(path: String, method: Method, handler: RouteHandlerDoc) -> Self {
         Self {
             path,
             method,
@@ -131,7 +127,7 @@ impl RouteOpenApiEntry {
     }
 }
 
-/// Minimal OpenAPI representation for Skyzen routers.
+/// Minimal `OpenAPI` representation for Skyzen routers.
 #[derive(Debug, Clone, Default)]
 pub struct OpenApi {
     #[cfg(debug_assertions)]
@@ -143,37 +139,33 @@ impl OpenApi {
     #[cfg(debug_assertions)]
     #[must_use]
     pub(crate) fn from_entries(entries: &[RouteOpenApiEntry]) -> Self {
-        let mut generator = SchemaSettings::openapi3().into_generator();
         let operations = entries
             .iter()
             .map(|entry| {
                 let handler_type = entry.handler.type_name;
-                if let Some(spec) = entry.handler.spec {
-                    let docs = spec.docs;
-                    let parameters = spec
-                        .parameters
-                        .iter()
-                        .map(|schema| schema(&mut generator))
-                        .collect();
-                    let response = (spec.response)(&mut generator);
-                    OpenApiOperation {
-                        path: entry.path.clone(),
-                        method: entry.method.clone(),
-                        handler_type,
-                        docs,
-                        parameters,
-                        response,
-                    }
-                } else {
-                    OpenApiOperation {
+                entry.handler.spec.map_or_else(
+                    || OpenApiOperation {
                         path: entry.path.clone(),
                         method: entry.method.clone(),
                         handler_type,
                         docs: None,
                         parameters: Vec::new(),
-                        response: Schema::Bool(true),
-                    }
-                }
+                        response: RefOr::T(Schema::default()),
+                    },
+                    |spec| {
+                        let docs = spec.docs;
+                        let parameters = spec.parameters.iter().map(|schema| schema()).collect();
+                        let response = (spec.response)();
+                        OpenApiOperation {
+                            path: entry.path.clone(),
+                            method: entry.method.clone(),
+                            handler_type,
+                            docs,
+                            parameters,
+                            response,
+                        }
+                    },
+                )
             })
             .collect();
         Self { operations }
@@ -200,7 +192,7 @@ impl OpenApi {
         }
     }
 
-    /// Indicates whether OpenAPI instrumentation is active.
+    /// Indicates whether `OpenAPI` instrumentation is active.
     #[must_use]
     pub const fn is_enabled(&self) -> bool {
         cfg!(debug_assertions)
@@ -208,7 +200,7 @@ impl OpenApi {
 }
 
 /// Description of a single handler operation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenApiOperation {
     /// Path served by the handler.
     pub path: String,
@@ -219,7 +211,19 @@ pub struct OpenApiOperation {
     /// Documentation extracted from the handler's doc comments.
     pub docs: Option<&'static str>,
     /// Schemas describing the extractor arguments.
-    pub parameters: Vec<Schema>,
+    pub parameters: Vec<RefOr<Schema>>,
     /// Schema describing the responder.
-    pub response: Schema,
+    pub response: RefOr<Schema>,
+}
+
+impl fmt::Debug for OpenApiOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenApiOperation")
+            .field("path", &self.path)
+            .field("method", &self.method)
+            .field("handler_type", &self.handler_type)
+            .field("docs", &self.docs)
+            .field("parameters", &self.parameters.len())
+            .finish()
+    }
 }

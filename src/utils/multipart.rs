@@ -28,6 +28,10 @@ impl Multipart {
     }
 
     /// Yields the next [`Field`] if available.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultipartError`] if parsing the field fails.
     pub async fn next_field(&mut self) -> Result<Option<Field<'_>>, MultipartError> {
         let field = self
             .inner
@@ -70,28 +74,36 @@ impl Stream for Field<'_> {
     }
 }
 
-impl<'a> Field<'a> {
+impl Field<'_> {
     /// Name of the form field (the `name` parameter on the `Content-Disposition` header).
+    #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.inner.name()
     }
 
     /// Filename from the `Content-Disposition` header when the field represents a file.
+    #[must_use]
     pub fn file_name(&self) -> Option<&str> {
         self.inner.file_name()
     }
 
     /// Content type reported for this field, if present.
+    #[must_use]
     pub fn content_type(&self) -> Option<&str> {
-        self.inner.content_type().map(|mime| mime.as_ref())
+        self.inner.content_type().map(AsRef::as_ref)
     }
 
     /// Headers associated with this field.
+    #[must_use]
     pub fn headers(&self) -> &HeaderMap {
         self.inner.headers()
     }
 
     /// Reads the entire field contents into memory as bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultipartError`] if the payload cannot be read.
     pub async fn bytes(self) -> Result<Bytes, MultipartError> {
         self.inner
             .bytes()
@@ -100,11 +112,19 @@ impl<'a> Field<'a> {
     }
 
     /// Reads the entire field contents into a UTF-8 string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultipartError`] if the payload cannot be read or decoded.
     pub async fn text(self) -> Result<String, MultipartError> {
         self.inner.text().await.map_err(MultipartError::from_multer)
     }
 
     /// Reads the next chunk from the field stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultipartError`] if streaming the payload fails.
     pub async fn chunk(&mut self) -> Result<Option<Bytes>, MultipartError> {
         self.inner
             .chunk()
@@ -120,12 +140,13 @@ pub struct MultipartError {
 }
 
 impl MultipartError {
-    fn from_multer(source: multer::Error) -> Self {
+    const fn from_multer(source: multer::Error) -> Self {
         Self { source }
     }
 
     /// HTTP status associated with this error.
-    pub fn status(&self) -> StatusCode {
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
         match &self.source {
             multer::Error::UnknownField { .. }
             | multer::Error::IncompleteFieldData { .. }
@@ -157,11 +178,14 @@ impl std::error::Error for MultipartError {
     }
 }
 
-impl_error!(
-    MultipartBoundaryError,
-    "Expected content type `multipart/form-data` with a boundary",
-    "This error occurs when `multipart/form-data` boundary information is missing or invalid."
-);
+/// Error raised when `multipart/form-data` boundary metadata is missing or invalid.
+#[derive(Debug)]
+#[allow(dead_code)]
+#[skyzen::error(
+    status = StatusCode::UNSUPPORTED_MEDIA_TYPE,
+    message = "Expected content type `multipart/form-data` with a boundary"
+)]
+pub struct MultipartBoundaryError;
 
 fn boundary_from_headers(headers: &HeaderMap) -> Option<String> {
     let content_type = headers.get(CONTENT_TYPE)?.to_str().ok()?;
@@ -176,7 +200,7 @@ pin_project! {
 }
 
 impl RequestBodyStream {
-    fn new(body: Body) -> Self {
+    const fn new(body: Body) -> Self {
         Self { body }
     }
 }

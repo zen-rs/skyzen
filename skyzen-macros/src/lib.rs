@@ -3,8 +3,11 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, parse_quote, punctuated::Punctuated, Attribute, Error, Expr, ExprLit, FnArg,
-    ItemFn, Lit, Meta, MetaNameValue, ReturnType, Token,
+    parse::{Parse, ParseStream},
+    parse_macro_input, parse_quote,
+    punctuated::Punctuated,
+    Attribute, DeriveInput, Error, Expr, ExprLit, FnArg, Item, ItemFn, Lit, LitStr, Meta,
+    MetaNameValue, ReturnType, Token,
 };
 
 /// Attribute macro that boots a Skyzen Endpoint on native or wasm runtimes.
@@ -67,27 +70,48 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     output.into()
 }
 
-/// Annotate handlers that should appear in generated OpenAPI documentation.
+/// Annotate handlers that should appear in generated `OpenAPI` documentation.
 #[proc_macro_attribute]
 pub fn openapi(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
-    match expand_openapi(function) {
+    match expand_openapi(&function) {
         Ok(tokens) => tokens,
         Err(error) => error.to_compile_error().into(),
     }
 }
 
-fn expand_openapi(function: ItemFn) -> syn::Result<TokenStream> {
+/// Define a lightweight error type with documentation and optional status code.
+#[proc_macro_attribute]
+pub fn error(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as ErrorArgs);
+    let item = parse_macro_input!(item as Item);
+    match expand_error(args, item) {
+        Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+/// Derive helper for bridging `utoipa::ToSchema` into `OpenApiSchema`.
+#[proc_macro_derive(OpenApiSchema)]
+pub fn derive_openapi_schema(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match expand_openapi_schema(input) {
+        Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+fn expand_openapi(function: &ItemFn) -> syn::Result<TokenStream> {
     let fn_ident = &function.sig.ident;
 
     let doc = doc_string(&function.attrs);
-    let doc_tokens = doc
-        .as_deref()
-        .map(|docs| {
+    let doc_tokens = doc.as_deref().map_or_else(
+        || quote! { None },
+        |docs| {
             let lit = Lit::Str(syn::LitStr::new(docs, fn_ident.span()));
             quote! { Some(#lit) }
-        })
-        .unwrap_or_else(|| quote! { None });
+        },
+    );
 
     let mut param_types = Vec::new();
     for input in &function.sig.inputs {
@@ -104,10 +128,11 @@ fn expand_openapi(function: ItemFn) -> syn::Result<TokenStream> {
         }
     }
 
-    let response_ty = match &function.sig.output {
+    let raw_response_ty = match &function.sig.output {
         ReturnType::Type(_, ty) => (*ty).clone(),
         ReturnType::Default => parse_quote!(()),
     };
+    let response_ty = unwrap_result_type(&raw_response_ty);
 
     let assertions = param_types.iter().map(|ty| {
         quote! { ::skyzen::openapi::assert_schema::<#ty>(); }
@@ -152,6 +177,134 @@ fn expand_openapi(function: ItemFn) -> syn::Result<TokenStream> {
     .into())
 }
 
+fn expand_error(args: ErrorArgs, item: Item) -> syn::Result<TokenStream> {
+    let message = args.message.clone().ok_or_else(|| {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            "missing `message = \"...\"`",
+        )
+    })?;
+
+    match item {
+        Item::Struct(item_struct) => {
+            let ident = &item_struct.ident;
+            let generics = &item_struct.generics;
+            let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+            let display_impl = quote! {
+                impl #impl_generics ::core::fmt::Display for #ident #ty_generics #where_clause {
+                    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                        f.write_str(#message)
+                    }
+                }
+            };
+
+            let error_impl = quote! {
+                impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {}
+            };
+
+            let status_impl = args.status.map(|status| {
+                quote! {
+                    impl #impl_generics ::skyzen::HttpError for #ident #ty_generics #where_clause {
+                        fn status(&self) -> ::skyzen::StatusCode {
+                            #status
+                        }
+                    }
+                }
+            });
+
+            Ok(quote! {
+                #item_struct
+                #display_impl
+                #error_impl
+                #status_impl
+            }
+            .into())
+        }
+        Item::Enum(item_enum) => {
+            let ident = &item_enum.ident;
+            let generics = &item_enum.generics;
+            let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+            let display_impl = quote! {
+                impl #impl_generics ::core::fmt::Display for #ident #ty_generics #where_clause {
+                    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                        f.write_str(#message)
+                    }
+                }
+            };
+
+            let error_impl = quote! {
+                impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {}
+            };
+
+            let status_impl = args.status.map(|status| {
+                quote! {
+                    impl #impl_generics ::skyzen::HttpError for #ident #ty_generics #where_clause {
+                        fn status(&self) -> ::skyzen::StatusCode {
+                            #status
+                        }
+                    }
+                }
+            });
+
+            Ok(quote! {
+                #item_enum
+                #display_impl
+                #error_impl
+                #status_impl
+            }
+            .into())
+        }
+        other => Err(Error::new_spanned(
+            other,
+            "#[skyzen::error] can only be applied to structs or enums",
+        )),
+    }
+}
+
+#[derive(Default)]
+struct ErrorArgs {
+    status: Option<Expr>,
+    message: Option<LitStr>,
+}
+
+impl Parse for ErrorArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let mut args = Self::default();
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "status" => {
+                    if args.status.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `status`"));
+                    }
+                    args.status = Some(input.parse()?);
+                }
+                "message" => {
+                    if args.message.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `message`"));
+                    }
+                    args.message = Some(input.parse()?);
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unsupported #[error] argument `{other}`"),
+                    ));
+                }
+            }
+
+            if input.peek(Token![,]) {
+                let _: Token![,] = input.parse()?;
+            }
+        }
+
+        Ok(args)
+    }
+}
+
 fn doc_string(attrs: &[Attribute]) -> Option<String> {
     let mut docs = Vec::new();
     for attr in attrs {
@@ -174,6 +327,39 @@ fn doc_string(attrs: &[Attribute]) -> Option<String> {
     } else {
         Some(docs.join("\n"))
     }
+}
+
+fn unwrap_result_type(ty: &syn::Type) -> syn::Type {
+    if let syn::Type::Path(type_path) = ty {
+        if type_path.qself.is_none() {
+            if let Some(segment) = type_path.path.segments.last() {
+                if segment.ident == "Result" {
+                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                        if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                            return inner.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ty.clone()
+}
+
+fn expand_openapi_schema(input: DeriveInput) -> syn::Result<TokenStream> {
+    let ident = &input.ident;
+    let generics = input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let tokens = quote! {
+        impl #impl_generics ::skyzen::openapi::OpenApiSchema for #ident #ty_generics #where_clause {
+            fn schema() -> ::utoipa::openapi::RefOr<::utoipa::openapi::schema::Schema> {
+                <Self as ::utoipa::ToSchema<'static>>::schema().1
+            }
+        }
+    };
+
+    Ok(tokens.into())
 }
 
 struct MainOptions {

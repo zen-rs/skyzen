@@ -1,8 +1,8 @@
 use crate::{
-    extract::Extractor, header::CONTENT_TYPE, responder::Responder, Request, Response, ResultExt,
-    StatusCode,
+    extract::Extractor, header::CONTENT_TYPE, responder::Responder, Request, Response, StatusCode,
 };
 use http_kit::header::HeaderValue;
+use http_kit::ResultExt;
 pub use serde_json::json;
 pub use serde_json::Value as JsonValue;
 
@@ -20,16 +20,17 @@ impl<T: Send + Sync + Serialize> Responder for Json<T> {
         response
             .headers_mut()
             .insert(CONTENT_TYPE, APPLICATION_JSON);
-        *response.body_mut() = http_kit::Body::from_json(&self.0)?;
+        *response.body_mut() =
+            http_kit::Body::from_json(&self.0).status(StatusCode::BAD_REQUEST)?;
         Ok(())
     }
 }
 
-impl_error!(
-    JsonContentTypeError,
-    "Expected content type `application/json`",
-    "This error occurs for a dismatched content type."
-);
+/// Error raised when the content-type header is not `application/json`.
+#[derive(Debug)]
+#[allow(dead_code)]
+#[skyzen::error(message = "Expected content type `application/json`")]
+pub struct JsonContentTypeError;
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
@@ -41,7 +42,12 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
             return Err(JsonContentTypeError).status(StatusCode::BAD_REQUEST);
         }
 
-        Ok(Self(request.body_mut().into_json().await?))
+        let value = request
+            .body_mut()
+            .into_json()
+            .await
+            .map_err(|error| http_kit::Error::new(error, StatusCode::BAD_REQUEST))?;
+        Ok(Self(value))
     }
 }
 

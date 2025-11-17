@@ -1,3 +1,4 @@
+use http::StatusCode;
 use http_kit::{
     header::{HeaderValue, CONTENT_TYPE},
     Request, Response,
@@ -32,7 +33,9 @@ pub struct PrettyJson<T: Send + Sync + Serialize>(pub T);
 
 impl<T: Send + Sync + Serialize> Responder for PrettyJson<T> {
     fn respond_to(self, _request: &Request, response: &mut Response) -> http_kit::Result<()> {
-        *response.body_mut() = http_kit::Body::from_bytes(to_vec_pretty(&self.0)?);
+        let payload = to_vec_pretty(&self.0)
+            .map_err(|error| http_kit::Error::new(error, StatusCode::SERVICE_UNAVAILABLE))?;
+        *response.body_mut() = http_kit::Body::from_bytes(payload);
         response
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));

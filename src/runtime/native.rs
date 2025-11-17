@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -15,7 +16,34 @@ use hyper_util::{rt::TokioIo, server::conn::auto::Builder as HyperBuilder};
 use tokio::{net::TcpListener, signal};
 use tracing_subscriber::EnvFilter;
 
-type BoxedStdError = Box<dyn std::error::Error + Send + Sync + 'static>;
+#[derive(Debug)]
+struct ServiceError(Box<dyn http_kit::HttpError>);
+
+impl ServiceError {
+    fn new(error: crate::Error) -> Self {
+        Self(error.into_inner())
+    }
+}
+
+impl From<crate::Error> for ServiceError {
+    fn from(error: crate::Error) -> Self {
+        Self::new(error)
+    }
+}
+
+impl fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for ServiceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+type BoxedStdError = ServiceError;
 type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
 
 /// Initialize the tracing subscriber + color-eyre once per process.
@@ -240,7 +268,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
             request.extensions_mut().insert(on_upgrade);
             let response = endpoint.respond(&mut request).await;
             let response: Result<hyper::Response<crate::Body>, BoxedStdError> =
-                response.map_err(crate::Error::into_inner);
+                response.map_err(ServiceError::from);
 
             response.map(|response| {
                 response.map(|body| {

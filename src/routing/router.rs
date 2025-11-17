@@ -53,7 +53,7 @@ impl App {
 #[derive(Clone)]
 pub struct Router {
     inner: Arc<matchit::Router<Vec<(Method, App)>>>,
-    programable_router: bool,
+    programmable_router_enabled: bool,
     #[cfg(debug_assertions)]
     openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
 }
@@ -61,9 +61,10 @@ pub struct Router {
 impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut debug_struct = f.debug_struct("Router");
-        debug_struct
-            .field("inner", &self.inner)
-            .field("programable_router", &self.programable_router);
+        debug_struct.field("inner", &self.inner).field(
+            "programmable_router_enabled",
+            &self.programmable_router_enabled,
+        );
         #[cfg(debug_assertions)]
         {
             debug_struct.field("openapi_entries", &self.openapi_entries.len());
@@ -80,7 +81,11 @@ impl Endpoint for NotFoundEndpoint {
     }
 }
 
-impl_error!(RouteNotFound, "Route not found", "No route is matched.");
+/// No route is matched.
+#[derive(Debug)]
+#[allow(dead_code)]
+#[skyzen::error(status = StatusCode::NOT_FOUND, message = "Route not found")]
+pub struct RouteNotFound;
 
 impl Router {
     fn search<'app, 'path, 'temp>(
@@ -103,7 +108,7 @@ impl Router {
     }
 
     async fn call(&self, request: &mut Request) -> crate::Result<Response> {
-        if self.programable_router {
+        if self.programmable_router_enabled {
             request.extensions_mut().insert(self.clone());
         }
 
@@ -144,7 +149,7 @@ impl Router {
     /// be retrieved inside handlers via `Router::extract(request).await`.
     #[must_use]
     pub const fn enable_programable_router(mut self) -> Self {
-        self.programable_router = true;
+        self.programmable_router_enabled = true;
         self
     }
 
@@ -153,7 +158,7 @@ impl Router {
     pub fn openapi(&self) -> OpenApi {
         #[cfg(debug_assertions)]
         {
-            return OpenApi::from_entries(&self.openapi_entries);
+            OpenApi::from_entries(&self.openapi_entries)
         }
 
         #[cfg(not(debug_assertions))]
@@ -174,11 +179,14 @@ impl Extractor for Router {
     }
 }
 
-impl_error!(
-    RouterNotExist,
-    "This programmable router does not exist. Please check whether you have enabled the programmable router.",
-    "Error occurs if cannot extract router."
-);
+/// Error occurs if router extraction fails while programmable router is disabled.
+#[derive(Debug)]
+#[allow(dead_code)]
+#[skyzen::error(
+    status = StatusCode::INTERNAL_SERVER_ERROR,
+    message = "This programmable router does not exist. Please check whether you have enabled the programmable router."
+)]
+pub struct RouterNotExist;
 
 /// Errors produced when constructing a [`Router`] from a [`Route`](crate::routing::Route).
 #[derive(Debug)]
@@ -295,7 +303,7 @@ fn finalize_router(
     }
     Ok(Router {
         inner: Arc::new(router),
-        programable_router: false,
+        programmable_router_enabled: false,
         openapi_entries: Arc::new(openapi_entries.unwrap_or_default()),
     })
 }
@@ -320,7 +328,7 @@ fn finalize_router(
     }
     Ok(Router {
         inner: Arc::new(router),
-        programable_router: false,
+        programmable_router_enabled: false,
     })
 }
 

@@ -3,7 +3,7 @@ use core::mem;
 
 use http_kit::{
     utils::{ByteStr, Bytes},
-    Body, Method, Request, Result, Uri,
+    Body, Method, Request, Result, ResultExt, StatusCode, Uri,
 };
 
 /// Extract a object from request,always is the header,body value,etc.
@@ -30,14 +30,14 @@ tuples!(impl_tuple_extractor);
 impl Extractor for Bytes {
     async fn extract(request: &mut Request) -> Result<Self> {
         let body = mem::replace(request.body_mut(), Body::empty());
-        Ok(body.into_bytes().await?)
+        body.into_bytes().await.status(StatusCode::BAD_REQUEST)
     }
 }
 
 impl Extractor for ByteStr {
     async fn extract(request: &mut Request) -> Result<Self> {
         let body = mem::replace(request.body_mut(), Body::empty());
-        Ok(body.into_string().await?)
+        body.into_string().await.status(StatusCode::BAD_REQUEST)
     }
 }
 

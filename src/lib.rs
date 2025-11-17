@@ -2,6 +2,8 @@
 
 //! A simple and fast web server framework.
 
+extern crate self as skyzen;
+
 #[macro_use]
 mod macros;
 
@@ -23,7 +25,7 @@ pub mod utils;
 pub mod runtime;
 
 /// Attribute macros exported by Skyzen.
-pub use skyzen_macros::{main, openapi};
+pub use skyzen_macros::{error, main, openapi};
 
 /// Static asset helpers for building file servers.
 pub mod static_files;
@@ -31,8 +33,8 @@ pub use static_files::StaticDir;
 
 #[doc(inline)]
 pub use http_kit::{
-    header, Body, Endpoint, Error, Method, Middleware, Request, Response, Result, ResultExt,
-    StatusCode, Uri,
+    header, Body, Endpoint, Error, HttpError, Method, Middleware, Request, Response, Result,
+    ResultExt, StatusCode, Uri,
 };
 #[doc(inline)]
 pub use routing::{CreateRouteNode, Route};
@@ -40,6 +42,8 @@ pub use skyzen_core::Server;
 
 #[doc(inline)]
 pub use openapi::{OpenApi, OpenApiOperation, OpenApiSchema};
+
+pub use utoipa::ToSchema;
 
 /// Extract strong-typed object from your request.
 pub mod extract;

@@ -41,8 +41,11 @@ impl<T: Send + Sync + Clone + 'static> Middleware for State<T> {
     }
 }
 
-impl_error!(
-    StateNotExist,
-    "This state does not exist",
-    "Error occurs if cannot extract state"
-);
+/// Error occurs when extracting a missing state from the request extensions.
+#[derive(Debug)]
+#[allow(dead_code)]
+#[skyzen::error(
+    status = skyzen::StatusCode::INTERNAL_SERVER_ERROR,
+    message = "This state does not exist"
+)]
+pub struct StateNotExist;

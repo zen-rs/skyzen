@@ -6,15 +6,17 @@ use std::{
     str::{FromStr, Utf8Error},
 };
 
+use http::StatusCode;
+
 use crate::{extract::Extractor, header, header::HeaderName, Request};
 
 use std::error::Error as StdError;
 
-impl_error!(
-    MissingRemoteAddr,
-    "Missing remote addr, maybe it's not a tcp/udp connection",
-    "This error occurs when the remote addr is missed."
-);
+/// Raised when the connection metadata does not expose the remote address.
+#[derive(Debug)]
+#[allow(dead_code)]
+#[skyzen::error(message = "Missing remote addr, maybe it's not a tcp/udp connection")]
+pub struct MissingRemoteAddr;
 
 /// Extract the apparent address of the client.
 /// If the server is behind a proxy, you may obtain the proxy's address instead of the actual user's.
@@ -50,7 +52,9 @@ impl_deref!(ClientIp, IpAddr);
 impl Extractor for ClientIp {
     async fn extract(request: &mut Request) -> crate::Result<Self> {
         if let Some(v) = request.headers().get(header::FORWARDED) {
-            if let Some(addr) = parse_forwarded(v.as_bytes())? {
+            if let Some(addr) = parse_forwarded(v.as_bytes())
+                .map_err(|error| http_kit::Error::new(error, StatusCode::BAD_REQUEST))?
+            {
                 return Ok(Self(addr));
             }
         }
@@ -59,7 +63,9 @@ impl Extractor for ClientIp {
             .headers()
             .get(HeaderName::from_static("x-forwarded-for"))
         {
-            if let Some(addr) = parse_x_forwarded_for(v.as_bytes())? {
+            if let Some(addr) = parse_x_forwarded_for(v.as_bytes())
+                .map_err(|error| http_kit::Error::new(error, StatusCode::BAD_REQUEST))?
+            {
                 return Ok(Self(addr));
             }
         }

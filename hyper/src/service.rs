@@ -40,7 +40,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 endpoint.respond(&mut request).await;
 
             let response: Result<hyper::Response<skyzen::Body>, BoxedStdError> =
-                response.map_err(skyzen::Error::into_inner);
+                response.map_err(|error| skyzen::Error::into_inner(error) as BoxedStdError);
 
             response.map(|response| {
                 response.map(|body| {

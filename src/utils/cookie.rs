@@ -1,5 +1,6 @@
 //! HTTP cookies
 pub use cookie::Cookie;
+use http::StatusCode;
 
 use std::{
     ops::{Deref, DerefMut},
@@ -8,7 +9,7 @@ use std::{
 
 use http_kit::{
     header::{self, HeaderValue},
-    Request, Response,
+    Request, Response, ResultExt,
 };
 use skyzen_core::{Extractor, Responder};
 
@@ -48,8 +49,8 @@ impl Extractor for CookieJar {
             .headers()
             .get(header::COOKIE)
             .map_or(&[] as &[u8], |v| v.as_bytes());
-        let cookies = core::str::from_utf8(cookie)?;
-        Ok(cookies.parse()?)
+        let cookies = core::str::from_utf8(cookie).status(StatusCode::BAD_REQUEST)?;
+        Ok(cookies.parse().status(StatusCode::BAD_REQUEST)?)
     }
 }
 
@@ -58,7 +59,8 @@ impl Responder for CookieJar {
         for cookie in self.0.delta() {
             response.headers_mut().append(
                 header::SET_COOKIE,
-                HeaderValue::try_from(cookie.encoded().to_string())?,
+                HeaderValue::try_from(cookie.encoded().to_string())
+                    .status(StatusCode::BAD_REQUEST)?,
             ); // TODO: reduce unnecessary header value check
         }
         Ok(())

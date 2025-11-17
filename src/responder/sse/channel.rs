@@ -17,11 +17,11 @@ pub struct Sender {
     sender: async_channel::Sender<Event>,
 }
 
-impl_error!(
-    SendError,
-    "Error type that fails to send an event",
-    "Cannot send the event to stream"
-);
+/// Error returned when sending an SSE event fails because the stream is gone.
+#[derive(Debug)]
+#[allow(dead_code)]
+#[skyzen::error(message = "Error type that fails to send an event")]
+pub struct SendError;
 
 pin_project! {
     struct Receiver{

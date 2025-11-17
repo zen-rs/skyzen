@@ -1,19 +1,19 @@
 //! Demonstrates the `#[skyzen::openapi]` attribute and router introspection APIs.
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use skyzen::{
     routing::{CreateRouteNode, Route},
     utils::Json,
-    OpenApi,
+    OpenApi, OpenApiSchema, ToSchema,
 };
+use skyzen_macros::OpenApiSchema;
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, ToSchema, OpenApiSchema)]
 struct HelloQuery {
     name: String,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, ToSchema, OpenApiSchema)]
 struct HelloResponse {
     message: String,
 }
@@ -45,10 +45,10 @@ fn log_openapi(spec: &OpenApi) {
         }
 
         for (idx, schema) in op.parameters.iter().enumerate() {
-            println!("  param[{idx}]: {:?}", schema);
+            println!("  param[{idx}]: {schema:?}");
         }
 
-        println!("  response: {:?}", op.response);
+        println!("  response: {response:?}", response = &op.response);
     }
 }
 
