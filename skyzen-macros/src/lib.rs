@@ -354,7 +354,7 @@ fn expand_openapi_schema(input: DeriveInput) -> syn::Result<TokenStream> {
     let tokens = quote! {
         impl #impl_generics ::skyzen::openapi::OpenApiSchema for #ident #ty_generics #where_clause {
             fn schema() -> ::utoipa::openapi::RefOr<::utoipa::openapi::schema::Schema> {
-                <Self as ::utoipa::ToSchema<'static>>::schema().1
+                <Self as ::utoipa::PartialSchema>::schema()
             }
         }
     };

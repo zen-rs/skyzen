@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use http_kit::{Request, Response};
 #[cfg(feature = "json")]
 use serde::Serialize;
-use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType};
+use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType, Type};
 use utoipa::openapi::RefOr;
 
 use crate::{
@@ -26,7 +26,7 @@ use crate::utils::Form;
 fn string_schema(description: &'static str) -> RefOr<Schema> {
     RefOr::T(Schema::Object(
         ObjectBuilder::new()
-            .schema_type(SchemaType::String)
+            .schema_type(SchemaType::from(Type::String))
             .description(Some(description))
             .build(),
     ))
@@ -35,7 +35,7 @@ fn string_schema(description: &'static str) -> RefOr<Schema> {
 fn object_schema(title: &'static str, description: &'static str) -> RefOr<Schema> {
     RefOr::T(Schema::Object(
         ObjectBuilder::new()
-            .schema_type(SchemaType::Object)
+            .schema_type(SchemaType::from(Type::Object))
             .title(Some(title))
             .description(Some(description))
             .build(),

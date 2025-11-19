@@ -1,9 +1,19 @@
 //! OpenAPI helpers powered by `utoipa` schemas.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-use http_kit::Method;
-use utoipa::openapi::{schema::Schema, RefOr};
+use crate::{handler::Handler, Body, Endpoint, Request, Response, Result};
+use http_kit::{header, Method, StatusCode};
+use utoipa::openapi::{
+    content::Content,
+    info::Info,
+    path::{HttpMethod, Operation, OperationBuilder, PathItemBuilder, Paths, PathsBuilder},
+    request_body::RequestBodyBuilder,
+    response::{ResponseBuilder, ResponsesBuilder},
+    schema::{ObjectBuilder, Schema, SchemaType, Type},
+    OpenApi as UtoipaSpec, RefOr, Required,
+};
+use utoipa_redoc::Redoc;
 
 #[cfg(debug_assertions)]
 use linkme::distributed_slice;
@@ -197,6 +207,42 @@ impl OpenApi {
     pub const fn is_enabled(&self) -> bool {
         cfg!(debug_assertions)
     }
+
+    #[must_use]
+    /// Convert the collected spec to a [`Redoc`](utoipa_redoc::Redoc) endpoint.
+    pub fn redoc(&self) -> OpenApiRedocEndpoint {
+        if !self.is_enabled() {
+            return OpenApiRedocEndpoint::disabled();
+        }
+
+        let html = Redoc::new(self.to_utoipa_spec()).to_html();
+        OpenApiRedocEndpoint::enabled(html)
+    }
+
+    fn to_utoipa_spec(&self) -> UtoipaSpec {
+        UtoipaSpec::new(self.default_info(), self.build_paths())
+    }
+
+    fn default_info(&self) -> Info {
+        Info::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    }
+
+    fn build_paths(&self) -> Paths {
+        self.operations()
+            .iter()
+            .fold(PathsBuilder::new(), |builder, op| {
+                if let Some(http_method) = method_to_http_method(&op.method) {
+                    let operation = build_operation(op);
+                    let path_item = PathItemBuilder::new()
+                        .operation(http_method, operation)
+                        .build();
+                    builder.path(op.path.clone(), path_item)
+                } else {
+                    builder
+                }
+            })
+            .build()
+    }
 }
 
 /// Description of a single handler operation.
@@ -226,4 +272,138 @@ impl fmt::Debug for OpenApiOperation {
             .field("parameters", &self.parameters.len())
             .finish()
     }
+}
+
+#[derive(Clone, Debug)]
+/// Endpoint that renders the OpenAPI document via Redoc.
+pub struct OpenApiRedocEndpoint {
+    html: Option<Arc<String>>,
+}
+
+impl OpenApiRedocEndpoint {
+    fn enabled(html: String) -> Self {
+        Self {
+            html: Some(Arc::new(html)),
+        }
+    }
+
+    const fn disabled() -> Self {
+        Self { html: None }
+    }
+}
+
+impl Endpoint for OpenApiRedocEndpoint {
+    async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+        match &self.html {
+            Some(html) => {
+                let mut response = Response::new(Body::from(html.as_bytes().to_vec()));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/html; charset=utf-8"),
+                );
+                Ok(response)
+            }
+            None => {
+                let mut response = Response::new(Body::from(
+                    "OpenAPI instrumentation disabled at compile time"
+                        .as_bytes()
+                        .to_vec(),
+                ));
+                *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+                Ok(response)
+            }
+        }
+    }
+}
+
+impl Handler<()> for OpenApiRedocEndpoint {
+    async fn call_handler(&self, request: &mut Request) -> Result<Response> {
+        let mut endpoint = self.clone();
+        endpoint.respond(request).await
+    }
+}
+
+fn method_to_http_method(method: &Method) -> Option<HttpMethod> {
+    match method.as_str() {
+        "GET" => Some(HttpMethod::Get),
+        "POST" => Some(HttpMethod::Post),
+        "PUT" => Some(HttpMethod::Put),
+        "DELETE" => Some(HttpMethod::Delete),
+        "PATCH" => Some(HttpMethod::Patch),
+        "OPTIONS" => Some(HttpMethod::Options),
+        "HEAD" => Some(HttpMethod::Head),
+        "TRACE" => Some(HttpMethod::Trace),
+        _ => None,
+    }
+}
+
+fn build_operation(op: &OpenApiOperation) -> Operation {
+    let mut builder = OperationBuilder::new()
+        .operation_id(Some(op.handler_type.to_owned()))
+        .responses(build_responses(op));
+
+    if let Some(body) = build_request_body(op) {
+        builder = builder.request_body(Some(body));
+    }
+
+    if let Some(docs) = op.docs {
+        if let Some(summary) = doc_summary(docs) {
+            builder = builder.summary(Some(summary));
+        }
+        builder = builder.description(Some(docs.to_owned()));
+    }
+
+    builder.build()
+}
+
+fn build_responses(op: &OpenApiOperation) -> utoipa::openapi::response::Responses {
+    ResponsesBuilder::new()
+        .response(
+            StatusCode::OK.as_str(),
+            ResponseBuilder::new()
+                .description("Successful response")
+                .content("application/json", Content::new(Some(op.response.clone())))
+                .build(),
+        )
+        .build()
+}
+
+fn build_request_body(op: &OpenApiOperation) -> Option<utoipa::openapi::request_body::RequestBody> {
+    if op.parameters.is_empty() {
+        return None;
+    }
+
+    let schema = aggregate_parameter_schema(&op.parameters);
+    Some(
+        RequestBodyBuilder::new()
+            .description(Some("Extractor arguments"))
+            .required(Some(Required::True))
+            .content("application/json", Content::new(Some(schema)))
+            .build(),
+    )
+}
+
+fn aggregate_parameter_schema(parameters: &[RefOr<Schema>]) -> RefOr<Schema> {
+    if parameters.len() == 1 {
+        return parameters[0].clone();
+    }
+
+    let object = parameters.iter().enumerate().fold(
+        ObjectBuilder::new().schema_type(SchemaType::from(Type::Object)),
+        |builder, (idx, schema)| {
+            let name = format!("param{idx}");
+            builder
+                .property(name.clone(), schema.clone())
+                .required(name)
+        },
+    );
+
+    RefOr::T(Schema::from(object.build()))
+}
+
+fn doc_summary(docs: &str) -> Option<String> {
+    docs.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(std::string::ToString::to_string)
 }

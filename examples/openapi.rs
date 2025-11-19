@@ -1,10 +1,9 @@
 //! Demonstrates the `#[skyzen::openapi]` attribute and router introspection APIs.
 
 use serde::{Deserialize, Serialize};
+use serde_json::to_string;
 use skyzen::{
-    routing::{CreateRouteNode, Route},
-    utils::Json,
-    OpenApi, OpenApiSchema, ToSchema,
+    OpenApi, ToSchema, routing::{CreateRouteNode, Route, Router}, utils::Json
 };
 use skyzen_macros::OpenApiSchema;
 
@@ -31,6 +30,9 @@ fn log_openapi(spec: &OpenApi) {
         println!("OpenAPI instrumentation disabled (release build).");
         return;
     }
+    fn schema_to_string<T: Serialize>(schema: &T) -> String {
+        to_string(schema).unwrap_or_else(|err| format!("<invalid schema: {err}>"))
+    }
 
     for op in spec.operations() {
         println!(
@@ -45,16 +47,25 @@ fn log_openapi(spec: &OpenApi) {
         }
 
         for (idx, schema) in op.parameters.iter().enumerate() {
-            println!("  param[{idx}]: {schema:?}");
+            println!("  param[{idx}]: {}", schema_to_string(schema));
         }
 
-        println!("  response: {response:?}", response = &op.response);
+        println!("  response: {}", schema_to_string(&op.response));
     }
 }
 
-fn main() {
-    let router = Route::new(("/hello".at(hello),)).build();
+#[skyzen::main]
+fn main() -> Router{
+    let redoc_endpoint = Route::new(("/hello".at(hello),)).openapi().redoc();
+    let router = Route::new((
+        "/hello".at(hello),
+        // Serve interactive docs at GET /docs via utoipa-redoc.
+        "/docs".at(redoc_endpoint),
+    ))
+    .build();
     let openapi = router.openapi();
     println!("OpenAPI enabled: {}", openapi.is_enabled());
+    println!("ReDoc endpoint mounted at GET /docs");
     log_openapi(&openapi);
+    router
 }
