@@ -18,6 +18,8 @@ Follow Rust 2021 conventions: modules and files in `snake_case`, types and trait
 ## Testing Guidelines
 Tests live alongside implementation modules or inside each crate’s `tests` directory; integration helpers (e.g., `src/test_helper.rs`) should be reused rather than duplicated. Name tests with the behavior under test (`handles_route_conflicts`) and use `#[tokio::test(flavor = "multi_thread")]` when exercising async handlers. New features must include positive, negative, and concurrency coverage when applicable, and regression tests should reference the issue or scenario they prevent in a doc comment.
 
+Whenever a change could influence our WASM support, run the wasm toolchain locally with `wasm-bindgen` followed by the Wrangler smoke tests. You can mirror the sequence documented in `.github/workflows/workerd.yml` to ensure the local run matches CI expectations.
+
 ## Commit & Pull Request Guidelines
 Recent history favors imperative verbs and optional scopes (`feat: enhance project metadata`, `Refactor skyzen service…`). Keep commits focused on one concern, mention the touched crate when useful, and include “feat/fix/chore” prefixes for user-facing changes. Pull requests should link related issues, summarize architectural impact, list new commands or feature flags, and paste the results of `cargo fmt`, `cargo clippy`, and `cargo test`. Include screenshots or cURL transcripts when demonstrating handler behavior so reviewers can reproduce locally.
 
