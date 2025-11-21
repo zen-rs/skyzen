@@ -35,6 +35,6 @@ pub mod sse;
 pub use sse::Sse;
 
 #[cfg(feature = "json")]
-mod json;
+pub mod json;
 #[cfg(feature = "json")]
 pub use json::PrettyJson;

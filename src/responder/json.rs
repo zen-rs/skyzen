@@ -1,3 +1,6 @@
+//! Json responder module.
+//! It provides a responder serializing data as pretty-printed JSON.
+
 use http_kit::{
     header::{HeaderValue, CONTENT_TYPE},
     Request, Response,
@@ -31,9 +34,11 @@ use skyzen_core::Responder;
 #[derive(Debug, Clone)]
 pub struct PrettyJson<T: Send + Sync + Serialize>(pub T);
 
-http_error!(pub PrettyJsonError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize JSON payload");
+http_error!(
+    /// An error occurred when serializing the JSON payload.
+    pub PrettyJsonError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize JSON payload");
 
-impl<T: Send + Sync + Serialize+'static> Responder for PrettyJson<T> {
+impl<T: Send + Sync + Serialize + 'static> Responder for PrettyJson<T> {
     type Error = PrettyJsonError;
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         let payload = to_vec_pretty(&self.0).map_err(|_| PrettyJsonError::new())?;
