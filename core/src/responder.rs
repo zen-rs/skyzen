@@ -60,7 +60,7 @@ macro_rules! impl_tuple_responder {
             impl <$($ty: Responder),*>core::error::Error for TupleResponderError<$($ty),*> {}
 
             impl<$($ty: Responder),*>http_kit::HttpError for TupleResponderError<$($ty),*> {
-                fn status(&self) -> http_kit::StatusCode { {
+                fn status(&self) -> ::core::option::Option<http_kit::StatusCode> { {
                     match self {
                         $(TupleResponderError::$ty(e) => e.status(),)*
                         #[allow(unreachable_patterns)]

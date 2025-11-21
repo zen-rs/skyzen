@@ -334,15 +334,16 @@ impl Endpoint for Router {
         log::info!(method = request.method().as_str(),path=request.uri().path() ;"Request Received");
         Ok(self.call(request).await.unwrap_or_else(|error| {
             let mut response = Response::new(http_kit::Body::empty());
-            *response.status_mut() = error.status();
-            let error_name = if error.status().is_server_error() {
+            let status = error.status().unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+            *response.status_mut() = status;
+            let error_name = if status.is_server_error() {
                 "Server Error"
-            } else if error.status().is_client_error() {
+            } else if status.is_client_error() {
                 "Client Error"
             } else {
                 "Error"
             };
-            log::error!(message = error.to_string().as_str(),status = error.status().as_str(); "{error_name}");
+            log::error!(message = error.to_string().as_str(),status = status.as_str(); "{error_name}");
             response
         }))
     }
@@ -518,7 +519,7 @@ mod tests {
         }
 
         let error = router.clone().go(request).await.unwrap_err();
-        assert_eq!(error.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(error.status(), Some(StatusCode::UPGRADE_REQUIRED));
     }
 
     #[tokio::test]
@@ -527,6 +528,6 @@ mod tests {
         let request = get_request("/unknown");
         let response = router.clone().go(request).await;
         let error = response.unwrap_err();
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error.status(), Some(StatusCode::NOT_FOUND));
     }
 }

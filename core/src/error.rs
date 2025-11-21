@@ -49,8 +49,8 @@ impl From<Error> for Box<dyn HttpError> {
         }
 
         impl HttpError for Wrapper {
-            fn status(&self) -> StatusCode {
-                self.inner.status()
+            fn status(&self) -> Option<StatusCode> {
+                Some(self.inner.status())
             }
         }
 
@@ -287,8 +287,8 @@ impl Error {
             }
         }
         impl HttpError for Wrapper {
-            fn status(&self) -> StatusCode {
-                self.inner.status()
+            fn status(&self) -> Option<StatusCode> {
+                Some(self.inner.status())
             }
         }
         Box::new(Wrapper { inner: self })

@@ -51,7 +51,7 @@ macro_rules! impl_tuple_extractor {
             impl <$($ty: Extractor),*>core::error::Error for TupleExtractorError<$($ty),*> {}
 
             impl <$($ty: Extractor),*>http_kit::HttpError for TupleExtractorError<$($ty),*> {
-                fn status(&self) -> http_kit::StatusCode {
+                fn status(&self) -> ::core::option::Option<http_kit::StatusCode> {
                     match self {
                         $(TupleExtractorError::$ty(e) => e.status(),)*
                         #[allow(unreachable_patterns)]

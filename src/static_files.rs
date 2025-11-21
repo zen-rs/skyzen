@@ -16,7 +16,7 @@ use skyzen_core::Extractor;
 /// `StaticDir` implements [`IntoRouteNode`], so it can be dropped directly inside `Route::new`.
 /// Files are looked up relative to the provided directory, `..` segments are rejected,
 /// and directories fall back to `index.html` by default.
-/// 
+///
 /// Note: `StaticDir` does not support `OpenAPI` documentation generation for its routes.
 #[derive(Debug, Clone)]
 pub struct StaticDir {
@@ -59,18 +59,8 @@ impl IntoRouteNode for StaticDir {
             "/{*path}"
         };
         let route = Route::new((
-            RouteNode::new_endpoint(
-                "",
-                Method::GET,
-                endpoint.clone(),
-                None
-            ),
-            RouteNode::new_endpoint(
-                wildcard_suffix,
-                Method::GET,
-                endpoint,
-                None
-            ),
+            RouteNode::new_endpoint("", Method::GET, endpoint.clone(), None),
+            RouteNode::new_endpoint(wildcard_suffix, Method::GET, endpoint, None),
         ));
 
         RouteNode::new_route(self.mount_path, route)
@@ -83,8 +73,7 @@ async fn serve_static(
     params: &Params,
 ) -> Result<Response, StaticDirError> {
     let requested_path = params.get("path").unwrap_or("");
-    let sanitized =
-        sanitize_relative_path(requested_path).ok_or(StaticDirError::InvalidPath)?;
+    let sanitized = sanitize_relative_path(requested_path).ok_or(StaticDirError::InvalidPath)?;
     let file_path = resolve_target_path(directory, &sanitized, index_file)
         .ok_or(StaticDirError::FileNotFound)?;
 
@@ -99,11 +88,8 @@ async fn serve_static(
 }
 
 async fn read_file(path: &Path) -> Result<Vec<u8>, StaticDirError> {
-    async_fs::read(path)
-        .await
-        .map_err(StaticDirError::IoError)
+    async_fs::read(path).await.map_err(StaticDirError::IoError)
 }
-
 
 fn guess_content_type(path: &Path) -> Option<HeaderValue> {
     mime_guess::from_path(path)
@@ -268,7 +254,7 @@ mod tests {
 
         let request = get_request("/files/../Cargo.toml");
         let error = router.clone().go(request).await.unwrap_err();
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.status(), Some(StatusCode::BAD_REQUEST));
     }
 
     #[tokio::test]
@@ -278,7 +264,7 @@ mod tests {
 
         let request = get_request("/assets/app.js");
         let error = router.clone().go(request).await.unwrap_err();
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error.status(), Some(StatusCode::NOT_FOUND));
     }
 
     #[tokio::test]

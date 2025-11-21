@@ -38,7 +38,7 @@ impl<E: Extractor, R: Responder> core::fmt::Debug for HandlerError<E, R> {
 }
 
 impl<E: Extractor, R: Responder> http_kit::HttpError for HandlerError<E, R> {
-    fn status(&self) -> http_kit::StatusCode {
+    fn status(&self) -> Option<http::StatusCode> {
         match self {
             HandlerError::ExtractorError(e) => e.status(),
             HandlerError::ResponderError(e) => e.status(),

@@ -228,8 +228,8 @@ fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<
         impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {}
 
         impl #impl_generics ::skyzen::HttpError for #ident #ty_generics #where_clause {
-            fn status(&self) -> ::skyzen::StatusCode {
-                #status
+            fn status(&self) -> ::core::option::Option<::skyzen::StatusCode> {
+                Some(#status)
             }
         }
     }
@@ -283,7 +283,7 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
         });
 
         status_arms.push(quote! {
-            #pattern => #status_expr
+            #pattern => ::core::option::Option::Some(#status_expr)
         });
 
         if let Some(from_info) = from {
@@ -326,7 +326,7 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
         impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {}
 
         impl #impl_generics ::skyzen::HttpError for #ident #ty_generics #where_clause {
-            fn status(&self) -> ::skyzen::StatusCode {
+            fn status(&self) -> ::core::option::Option<::skyzen::StatusCode> {
                 match self {
                     #(#status_arms),*
                 }
