@@ -145,13 +145,12 @@ fn expand_openapi(function: &ItemFn) -> syn::Result<TokenStream> {
     };
     let response_ty = unwrap_result_type(&raw_response_ty);
 
-    let assertions = param_types.iter().map(|ty| {
-        quote! { ::skyzen::openapi::assert_schema::<#ty>(); }
-    });
+    let assertions = param_types
+        .iter()
+        .map(|ty| quote! { ::skyzen::openapi::assert_schema::<#ty>(); });
 
-    let response_assert = quote! {
-        ::skyzen::openapi::assert_schema::<#response_ty>();
-    };
+    let response_assert =
+        quote! { ::skyzen::openapi::assert_schema::<#response_ty>(); };
 
     let schema_array = if param_types.is_empty() {
         quote! { &[] }
@@ -161,6 +160,8 @@ fn expand_openapi(function: &ItemFn) -> syn::Result<TokenStream> {
         });
         quote! { &[#(#schema_fns),*] }
     };
+
+    let response_schema_fn = quote! { Some(::skyzen::openapi::schema_of::<#response_ty>) };
 
     let type_name_literal = quote! { concat!(module_path!(), "::", stringify!(#fn_ident)) };
     let spec_ident = format_ident!(
@@ -182,7 +183,7 @@ fn expand_openapi(function: &ItemFn) -> syn::Result<TokenStream> {
             type_name: #type_name_literal,
             docs: #doc_tokens,
             parameters: #schema_array,
-            response: ::skyzen::openapi::schema_of::<#response_ty>,
+            response: #response_schema_fn,
         };
     }
     .into())
@@ -697,8 +698,8 @@ fn expand_openapi_schema(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let tokens = quote! {
         impl #impl_generics ::skyzen::openapi::OpenApiSchema for #ident #ty_generics #where_clause {
-            fn schema() -> ::utoipa::openapi::RefOr<::utoipa::openapi::schema::Schema> {
-                <Self as ::utoipa::PartialSchema>::schema()
+            fn schema() -> ::core::option::Option<::utoipa::openapi::RefOr<::utoipa::openapi::schema::Schema>> {
+                ::core::option::Option::Some(<Self as ::utoipa::PartialSchema>::schema())
             }
         }
     };

@@ -45,8 +45,8 @@ fn object_schema(title: &'static str, description: &'static str) -> RefOr<Schema
 macro_rules! simple_schema {
     ($ty:ty, $schema:expr) => {
         impl OpenApiSchema for $ty {
-            fn schema() -> RefOr<Schema> {
-                $schema
+            fn schema() -> Option<RefOr<Schema>> {
+                Some($schema)
             }
         }
     };
@@ -86,7 +86,7 @@ impl<T> OpenApiSchema for Query<T>
 where
     T: OpenApiSchema,
 {
-    fn schema() -> RefOr<Schema> {
+    fn schema() -> Option<RefOr<Schema>> {
         T::schema()
     }
 }
@@ -96,7 +96,7 @@ impl<T> OpenApiSchema for Form<T>
 where
     T: OpenApiSchema,
 {
-    fn schema() -> RefOr<Schema> {
+    fn schema() -> Option<RefOr<Schema>> {
         T::schema()
     }
 }
@@ -106,7 +106,7 @@ impl<T> OpenApiSchema for Json<T>
 where
     T: OpenApiSchema,
 {
-    fn schema() -> RefOr<Schema> {
+    fn schema() -> Option<RefOr<Schema>> {
         T::schema()
     }
 }
@@ -116,16 +116,27 @@ impl<T> OpenApiSchema for PrettyJson<T>
 where
     T: OpenApiSchema + Serialize,
 {
-    fn schema() -> RefOr<Schema> {
+    fn schema() -> Option<RefOr<Schema>> {
         T::schema()
     }
 }
 
 impl<T> OpenApiSchema for State<T>
 where
-    T: OpenApiSchema + Clone + Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
 {
-    fn schema() -> RefOr<Schema> {
-        T::schema()
+    fn schema() -> Option<RefOr<Schema>> {
+        None
+    }
+}
+
+/// Wrapper that explicitly opts out of OpenAPI schema generation for contained extractors or
+/// responders.
+#[derive(Debug, Clone, Copy)]
+pub struct IgnoreOpenApi<T>(pub T);
+
+impl<T: Send + Sync + 'static> OpenApiSchema for IgnoreOpenApi<T> {
+    fn schema() -> Option<RefOr<Schema>> {
+        None
     }
 }

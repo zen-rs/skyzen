@@ -21,6 +21,15 @@ use utoipa_redoc::Redoc;
 pub use linkme::distributed_slice;
 
 mod builtins;
+pub use builtins::IgnoreOpenApi;
+
+/// Wrap a type to exclude it from OpenAPI parameter/response schemas in `#[skyzen::openapi]`.
+#[macro_export]
+macro_rules! ignore_openapi {
+    ($ty:ty) => {
+        $crate::IgnoreOpenApi<$ty>
+    };
+}
 
 /// Assert that `T` can produce an OpenAPI schema.
 #[doc(hidden)]
@@ -33,21 +42,22 @@ where
 
 /// Trait implemented by extractors and responders that can describe themselves via OpenAPI schema.
 pub trait OpenApiSchema: Send + Sync + 'static {
-    /// Produce a [`Schema`] for the implementing type.
-    fn schema() -> RefOr<Schema>;
+    /// Produce a [`Schema`] for the implementing type, or `None` to opt out of documentation.
+    fn schema() -> Option<RefOr<Schema>>;
 }
 
 /// Helper function referenced by the procedural macro to obtain a [`Schema`].
-pub fn schema_of<T>() -> RefOr<Schema>
+pub fn schema_of<T>() -> Option<RefOr<Schema>>
 where
     T: OpenApiSchema,
 {
     T::schema()
 }
 
+#[doc(hidden)]
 #[cfg(debug_assertions)]
 /// Function pointer used to lazily build a [`Schema`].
-pub type SchemaFn = fn() -> RefOr<Schema>;
+pub type SchemaFn = fn() -> Option<RefOr<Schema>>;
 
 #[cfg(debug_assertions)]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
@@ -64,8 +74,8 @@ pub struct HandlerSpec {
     pub docs: Option<&'static str>,
     /// Schema generators for each extractor argument.
     pub parameters: &'static [SchemaFn],
-    /// Schema generator for the responder type.
-    pub response: SchemaFn,
+    /// Schema generator for the responder type, if any.
+    pub response: Option<SchemaFn>,
 }
 
 #[cfg(debug_assertions)]
@@ -162,12 +172,16 @@ impl OpenApi {
                         handler_type,
                         docs: None,
                         parameters: Vec::new(),
-                        response: RefOr::T(Schema::default()),
+                        response: None,
                     },
                     |spec| {
                         let docs = spec.docs;
-                        let parameters = spec.parameters.iter().map(|schema| schema()).collect();
-                        let response = (spec.response)();
+                        let parameters = spec
+                            .parameters
+                            .iter()
+                            .filter_map(|schema| schema())
+                            .collect();
+                        let response = spec.response.and_then(|schema| schema());
                         OpenApiOperation {
                             path: entry.path.clone(),
                             method: entry.method.clone(),
@@ -260,8 +274,8 @@ pub struct OpenApiOperation {
     pub docs: Option<&'static str>,
     /// Schemas describing the extractor arguments.
     pub parameters: Vec<RefOr<Schema>>,
-    /// Schema describing the responder.
-    pub response: RefOr<Schema>,
+    /// Schema describing the responder, if documented.
+    pub response: Option<RefOr<Schema>>,
 }
 
 impl fmt::Debug for OpenApiOperation {
@@ -349,14 +363,14 @@ fn build_operation(op: &OpenApiOperation) -> Operation {
 }
 
 fn build_responses(op: &OpenApiOperation) -> utoipa::openapi::response::Responses {
+    let mut builder = ResponseBuilder::new().description("Successful response");
+
+    if let Some(schema) = &op.response {
+        builder = builder.content("application/json", Content::new(Some(schema.clone())));
+    }
+
     ResponsesBuilder::new()
-        .response(
-            StatusCode::OK.as_str(),
-            ResponseBuilder::new()
-                .description("Successful response")
-                .content("application/json", Content::new(Some(op.response.clone())))
-                .build(),
-        )
+        .response(StatusCode::OK.as_str(), builder.build())
         .build()
 }
 
