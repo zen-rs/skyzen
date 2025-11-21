@@ -6,16 +6,17 @@ use serde_json::to_string;
 use skyzen::{
     routing::{CreateRouteNode, Route, Router},
     utils::Json,
-    OpenApi, ToSchema,
+    OpenApi,
 };
-use skyzen_macros::OpenApiSchema;
 
-#[derive(Debug, Deserialize, ToSchema, OpenApiSchema)]
+#[skyzen::openapi]
+#[derive(Debug, Deserialize)]
 struct HelloQuery {
     name: String,
 }
 
-#[derive(Debug, Serialize, ToSchema, OpenApiSchema)]
+#[skyzen::openapi]
+#[derive(Debug, Serialize)]
 struct HelloResponse {
     message: String,
 }
@@ -53,7 +54,10 @@ fn log_openapi(spec: &OpenApi) {
             println!("  param[{idx}]: {}", schema_to_string(schema));
         }
 
-        println!("  response: {}", schema_to_string(&op.response));
+        match &op.response {
+            Some(schema) => println!("  response: {}", schema_to_string(schema)),
+            None => println!("  response: <ignored>"),
+        }
     }
 }
 

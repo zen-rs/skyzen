@@ -14,6 +14,8 @@ use utoipa::openapi::{
     OpenApi as UtoipaSpec, RefOr, Required,
 };
 use utoipa_redoc::Redoc;
+/// OpenAPI schema reference type alias.
+pub type SchemaRef = RefOr<Schema>;
 
 // Re-exported for macro-generated registrations without requiring downstream crates to depend on
 // `linkme` directly.
@@ -27,7 +29,11 @@ pub use builtins::IgnoreOpenApi;
 #[macro_export]
 macro_rules! ignore_openapi {
     ($ty:ty) => {
-        $crate::IgnoreOpenApi<$ty>
+        impl ::skyzen::openapi::OpenApiSchema for $ty {
+            fn schema() -> ::core::option::Option<::skyzen::openapi::SchemaRef> {
+                None
+            }
+        }
     };
 }
 
@@ -43,11 +49,11 @@ where
 /// Trait implemented by extractors and responders that can describe themselves via OpenAPI schema.
 pub trait OpenApiSchema: Send + Sync + 'static {
     /// Produce a [`Schema`] for the implementing type, or `None` to opt out of documentation.
-    fn schema() -> Option<RefOr<Schema>>;
+    fn schema() -> Option<SchemaRef>;
 }
 
 /// Helper function referenced by the procedural macro to obtain a [`Schema`].
-pub fn schema_of<T>() -> Option<RefOr<Schema>>
+pub fn schema_of<T>() -> Option<SchemaRef>
 where
     T: OpenApiSchema,
 {
@@ -57,7 +63,7 @@ where
 #[doc(hidden)]
 #[cfg(debug_assertions)]
 /// Function pointer used to lazily build a [`Schema`].
-pub type SchemaFn = fn() -> Option<RefOr<Schema>>;
+pub type SchemaFn = fn() -> Option<SchemaRef>;
 
 #[cfg(debug_assertions)]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
@@ -273,9 +279,9 @@ pub struct OpenApiOperation {
     /// Documentation extracted from the handler's doc comments.
     pub docs: Option<&'static str>,
     /// Schemas describing the extractor arguments.
-    pub parameters: Vec<RefOr<Schema>>,
+    pub parameters: Vec<SchemaRef>,
     /// Schema describing the responder, if documented.
-    pub response: Option<RefOr<Schema>>,
+    pub response: Option<SchemaRef>,
 }
 
 impl fmt::Debug for OpenApiOperation {

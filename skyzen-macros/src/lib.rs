@@ -8,7 +8,7 @@ use syn::{
     punctuated::Punctuated,
     spanned::Spanned,
     Attribute, Data, DeriveInput, Error, Expr, ExprLit, Fields, FnArg, Item, ItemEnum, ItemFn,
-    ItemStruct, Lit, LitInt, LitStr, Meta, MetaNameValue, ReturnType, Token, Type, Variant,
+    ItemStruct, Lit, LitInt, LitStr, Meta, MetaNameValue, Path, ReturnType, Token, Type, Variant,
 };
 
 /// Attribute macro that boots a Skyzen Endpoint on native or wasm runtimes.
@@ -71,13 +71,30 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     output.into()
 }
 
-/// Annotate handlers that should appear in generated `OpenAPI` documentation.
+/// Annotate handlers that should appear in generated `OpenAPI` documentation or mark types for
+/// schema generation.
 #[proc_macro_attribute]
 pub fn openapi(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let function = parse_macro_input!(item as ItemFn);
-    match expand_openapi(&function) {
-        Ok(tokens) => tokens,
-        Err(error) => error.to_compile_error().into(),
+    let item = parse_macro_input!(item as Item);
+    match item {
+        Item::Fn(function) => match expand_openapi_fn(&function) {
+            Ok(tokens) => tokens,
+            Err(error) => error.to_compile_error().into(),
+        },
+        Item::Struct(struct_item) => match expand_openapi_schema_item(struct_item) {
+            Ok(tokens) => tokens,
+            Err(error) => error.to_compile_error().into(),
+        },
+        Item::Enum(enum_item) => match expand_openapi_schema_enum(enum_item) {
+            Ok(tokens) => tokens,
+            Err(error) => error.to_compile_error().into(),
+        },
+        other => Error::new_spanned(
+            other,
+            "#[skyzen::openapi] may only be applied to functions, structs, or enums",
+        )
+        .to_compile_error()
+        .into(),
     }
 }
 
@@ -102,17 +119,7 @@ pub fn derive_http_error(item: TokenStream) -> TokenStream {
     }
 }
 
-/// Derive helper for bridging `utoipa::ToSchema` into `OpenApiSchema`.
-#[proc_macro_derive(OpenApiSchema)]
-pub fn derive_openapi_schema(item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as DeriveInput);
-    match expand_openapi_schema(input) {
-        Ok(tokens) => tokens,
-        Err(error) => error.to_compile_error().into(),
-    }
-}
-
-fn expand_openapi(function: &ItemFn) -> syn::Result<TokenStream> {
+fn expand_openapi_fn(function: &ItemFn) -> syn::Result<TokenStream> {
     let fn_ident = &function.sig.ident;
 
     let doc = doc_string(&function.attrs);
@@ -149,8 +156,7 @@ fn expand_openapi(function: &ItemFn) -> syn::Result<TokenStream> {
         .iter()
         .map(|ty| quote! { ::skyzen::openapi::assert_schema::<#ty>(); });
 
-    let response_assert =
-        quote! { ::skyzen::openapi::assert_schema::<#response_ty>(); };
+    let response_assert = quote! { ::skyzen::openapi::assert_schema::<#response_ty>(); };
 
     let schema_array = if param_types.is_empty() {
         quote! { &[] }
@@ -187,6 +193,65 @@ fn expand_openapi(function: &ItemFn) -> syn::Result<TokenStream> {
         };
     }
     .into())
+}
+
+fn expand_openapi_schema_item(mut item_struct: ItemStruct) -> syn::Result<TokenStream> {
+    ensure_to_schema(&mut item_struct.attrs);
+    let ident = &item_struct.ident;
+    let (impl_generics, ty_generics, where_clause) = item_struct.generics.split_for_impl();
+
+    Ok(quote! {
+        #item_struct
+
+        impl #impl_generics ::skyzen::openapi::OpenApiSchema for #ident #ty_generics #where_clause {
+            fn schema() -> ::core::option::Option<::skyzen::openapi::SchemaRef> {
+                ::core::option::Option::Some(<Self as ::skyzen::PartialSchema>::schema())
+            }
+        }
+    }
+    .into())
+}
+
+fn expand_openapi_schema_enum(mut item_enum: ItemEnum) -> syn::Result<TokenStream> {
+    ensure_to_schema(&mut item_enum.attrs);
+    let ident = &item_enum.ident;
+    let (impl_generics, ty_generics, where_clause) = item_enum.generics.split_for_impl();
+
+    Ok(quote! {
+        #item_enum
+
+        impl #impl_generics ::skyzen::openapi::OpenApiSchema for #ident #ty_generics #where_clause {
+            fn schema() -> ::core::option::Option<::skyzen::openapi::SchemaRef> {
+                ::core::option::Option::Some(<Self as ::skyzen::PartialSchema>::schema())
+            }
+        }
+    }
+    .into())
+}
+
+fn ensure_to_schema(attrs: &mut Vec<Attribute>) {
+    if has_to_schema(attrs) {
+        return;
+    }
+    attrs.push(parse_quote!(#[derive(::utoipa::ToSchema)]));
+}
+
+fn has_to_schema(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("derive") {
+            return false;
+        }
+        attr.parse_args_with(Punctuated::<Path, Token![,]>::parse_terminated)
+            .map(|paths| {
+                paths.iter().any(|path| {
+                    path.segments
+                        .last()
+                        .map(|seg| seg.ident == "ToSchema")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn expand_error(args: ErrorArgs, item: Item) -> syn::Result<TokenStream> {
@@ -689,22 +754,6 @@ fn unwrap_result_type(ty: &syn::Type) -> syn::Type {
         }
     }
     ty.clone()
-}
-
-fn expand_openapi_schema(input: DeriveInput) -> syn::Result<TokenStream> {
-    let ident = &input.ident;
-    let generics = input.generics;
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-
-    let tokens = quote! {
-        impl #impl_generics ::skyzen::openapi::OpenApiSchema for #ident #ty_generics #where_clause {
-            fn schema() -> ::core::option::Option<::utoipa::openapi::RefOr<::utoipa::openapi::schema::Schema>> {
-                ::core::option::Option::Some(<Self as ::utoipa::PartialSchema>::schema())
-            }
-        }
-    };
-
-    Ok(tokens.into())
 }
 
 struct MainOptions {

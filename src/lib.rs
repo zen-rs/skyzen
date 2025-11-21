@@ -44,7 +44,7 @@ pub use skyzen_core::Server;
 #[doc(inline)]
 pub use openapi::{IgnoreOpenApi, OpenApi, OpenApiOperation, OpenApiSchema};
 
-pub use utoipa::ToSchema;
+pub use utoipa::{PartialSchema, ToSchema};
 
 /// Extract strong-typed object from your request.
 pub mod extract;

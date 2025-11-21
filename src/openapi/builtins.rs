@@ -23,7 +23,7 @@ use crate::{responder::PrettyJson, utils::Json};
 #[cfg(feature = "form")]
 use crate::utils::Form;
 
-fn string_schema(description: &'static str) -> RefOr<Schema> {
+fn string_schema(description: &'static str) -> ::skyzen::openapi::SchemaRef {
     RefOr::T(Schema::Object(
         ObjectBuilder::new()
             .schema_type(SchemaType::from(Type::String))
@@ -32,7 +32,7 @@ fn string_schema(description: &'static str) -> RefOr<Schema> {
     ))
 }
 
-fn object_schema(title: &'static str, description: &'static str) -> RefOr<Schema> {
+fn object_schema(title: &'static str, description: &'static str) -> ::skyzen::openapi::SchemaRef {
     RefOr::T(Schema::Object(
         ObjectBuilder::new()
             .schema_type(SchemaType::from(Type::Object))
@@ -45,7 +45,7 @@ fn object_schema(title: &'static str, description: &'static str) -> RefOr<Schema
 macro_rules! simple_schema {
     ($ty:ty, $schema:expr) => {
         impl OpenApiSchema for $ty {
-            fn schema() -> Option<RefOr<Schema>> {
+            fn schema() -> Option<::skyzen::openapi::SchemaRef> {
                 Some($schema)
             }
         }
@@ -86,7 +86,7 @@ impl<T> OpenApiSchema for Query<T>
 where
     T: OpenApiSchema,
 {
-    fn schema() -> Option<RefOr<Schema>> {
+    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
         T::schema()
     }
 }
@@ -96,7 +96,7 @@ impl<T> OpenApiSchema for Form<T>
 where
     T: OpenApiSchema,
 {
-    fn schema() -> Option<RefOr<Schema>> {
+    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
         T::schema()
     }
 }
@@ -106,7 +106,7 @@ impl<T> OpenApiSchema for Json<T>
 where
     T: OpenApiSchema,
 {
-    fn schema() -> Option<RefOr<Schema>> {
+    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
         T::schema()
     }
 }
@@ -116,7 +116,7 @@ impl<T> OpenApiSchema for PrettyJson<T>
 where
     T: OpenApiSchema + Serialize,
 {
-    fn schema() -> Option<RefOr<Schema>> {
+    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
         T::schema()
     }
 }
@@ -125,7 +125,7 @@ impl<T> OpenApiSchema for State<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn schema() -> Option<RefOr<Schema>> {
+    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
         None
     }
 }
@@ -136,7 +136,7 @@ where
 pub struct IgnoreOpenApi<T>(pub T);
 
 impl<T: Send + Sync + 'static> OpenApiSchema for IgnoreOpenApi<T> {
-    fn schema() -> Option<RefOr<Schema>> {
+    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
         None
     }
 }
