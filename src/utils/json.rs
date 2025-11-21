@@ -1,3 +1,6 @@
+//! JSON utilities module.
+//! It provides JSON extractor and responder.
+
 use crate::{
     extract::Extractor, header::CONTENT_TYPE, responder::Responder, Request, Response, StatusCode,
 };
@@ -15,7 +18,9 @@ const APPLICATION_JSON: HeaderValue = HeaderValue::from_static("application/json
 #[derive(Debug, Clone)]
 pub struct Json<T: Send + Sync + 'static = JsonValue>(pub T);
 
-http_error!(pub JsonEncodingError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to encode JSON response");
+http_error!(
+    /// An error occurred when encoding the JSON response.
+    pub JsonEncodingError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to encode JSON response");
 
 impl<T: Send + Sync + Serialize + 'static> Responder for Json<T> {
     type Error = JsonEncodingError;

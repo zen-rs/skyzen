@@ -1,3 +1,6 @@
+//! State utilities module.
+//! It provides a middleware and extractor for application state sharing.
+
 use std::{
     convert::Infallible,
     ops::{Deref, DerefMut},

@@ -1,19 +1,19 @@
 #[cfg(feature = "json")]
-mod json;
+pub mod json;
 #[cfg(feature = "json")]
 pub use json::{json, Json, JsonValue};
 
 #[cfg(feature = "form")]
-mod form;
+pub mod form;
 #[cfg(feature = "form")]
 pub use form::Form;
 
 #[cfg(feature = "multipart")]
-mod multipart;
+pub mod multipart;
 #[cfg(feature = "multipart")]
 pub use multipart::{Field, Multipart, MultipartBoundaryError, MultipartError};
 
-mod state;
+pub mod state;
 pub use state::State;
 
 pub mod cookie;

@@ -1,3 +1,5 @@
+//! Form utilities module.
+
 use crate::{
     extract::Extractor,
     header::{HeaderValue, CONTENT_TYPE},

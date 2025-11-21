@@ -1,3 +1,6 @@
+//! Multipart form data utilities module.
+//! It provides an extractor for `multipart/form-data` requests.
+
 use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll};
