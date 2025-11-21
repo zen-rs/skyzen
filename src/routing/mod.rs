@@ -227,6 +227,14 @@ impl Route {
             OpenApi::default()
         }
     }
+
+    /// Enable the Redoc API documentation endpoint at `/api-docs`.
+    #[must_use]
+    pub fn enable_api_doc(mut self) -> Self {
+        let openapi = self.openapi();
+        self.nodes.push(openapi.redoc_route("/api-docs"));
+        self
+    }
 }
 
 impl RouteNode {
@@ -287,6 +295,129 @@ where
         let middleware = middleware.clone();
         AnyEndpoint::new(WithMiddleware::new(endpoint, middleware))
     })
+}
+
+impl RouteNode {
+    /// Attach a GET handler to the current route node.
+    #[must_use]
+    pub fn at<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::GET, handler)
+    }
+
+    /// Alias for [`RouteNode::at`].
+    #[must_use]
+    pub fn get<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.at(handler)
+    }
+
+    /// Attach a POST handler to the current route node.
+    #[must_use]
+    pub fn post<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::POST, handler)
+    }
+
+    /// Attach a PUT handler to the current route node.
+    #[must_use]
+    pub fn put<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::PUT, handler)
+    }
+
+    /// Attach a DELETE handler to the current route node.
+    #[must_use]
+    pub fn delete<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::DELETE, handler)
+    }
+
+    /// Attach an endpoint under the current path with an arbitrary HTTP method.
+    #[must_use]
+    pub fn endpoint<E>(self, method: Method, endpoint: E) -> Self
+    where
+        E: Endpoint + Clone + Send + Sync + 'static,
+    {
+        self.extend_with_nodes(vec![RouteNode::new_endpoint("", method, endpoint, None)])
+    }
+
+    /// Attach additional child routes under the current path.
+    #[must_use]
+    pub fn route(self, routes: impl Routes) -> Self {
+        self.extend_with_nodes(routes.into_route_nodes())
+    }
+
+    /// Attach a WebSocket handler that performs the upgrade under the current path.
+    #[cfg(feature = "websocket")]
+    #[must_use]
+    pub fn ws<F, Fut>(self, handler: F) -> Self
+    where
+        F: Fn(WebSocket) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let builder = move |upgrade: WebSocketUpgrade| {
+            let callback = handler.clone();
+            async move { upgrade.on_upgrade(callback) }
+        };
+        self.at(builder)
+    }
+
+    fn with_handler<H, T, R>(self, method: Method, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        let endpoint = endpoint_node_from_handler("", method, handler);
+        self.extend_with_nodes(vec![endpoint])
+    }
+
+    fn extend_with_nodes(self, mut additional: Vec<RouteNode>) -> Self {
+        let path = self.path;
+        let mut nodes = match self.node_type {
+            RouteNodeType::Route(route) => route.nodes,
+            RouteNodeType::Endpoint {
+                endpoint_factory,
+                method,
+                openapi,
+            } => vec![RouteNode {
+                path: String::new(),
+                node_type: RouteNodeType::Endpoint {
+                    endpoint_factory,
+                    method,
+                    openapi,
+                },
+            }],
+        };
+
+        nodes.append(&mut additional);
+
+        RouteNode {
+            path,
+            node_type: RouteNodeType::Route(Route { nodes }),
+        }
+    }
 }
 
 // Trait for building routes

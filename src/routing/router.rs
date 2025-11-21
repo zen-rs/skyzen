@@ -496,6 +496,51 @@ mod tests {
         assert_eq!(body, "created");
     }
 
+    #[tokio::test]
+    async fn chains_handlers_on_route_node() {
+        async fn list() -> Result<&'static str> {
+            Ok("list")
+        }
+
+        async fn create() -> Result<&'static str> {
+            Ok("created")
+        }
+
+        let router = build(Route::new(("/items".at(list).post(create),))).unwrap();
+
+        let response = router.clone().go(get_request("/items")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "list");
+
+        let request = request_with_method("/items", Method::POST);
+        let response = router.clone().go(request).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "created");
+    }
+
+    #[tokio::test]
+    async fn exposes_api_docs_at_root() {
+        async fn ping() -> Result<&'static str> {
+            Ok("pong")
+        }
+
+        let router = build(Route::new(("/ping".at(ping),)).enable_api_doc()).unwrap();
+
+        let response = router
+            .clone()
+            .go(get_request("/api-docs"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("content type missing")
+            .to_str()
+            .unwrap();
+        assert!(content_type.contains("text/html"));
+    }
+
     #[cfg(feature = "websocket")]
     #[tokio::test]
     async fn websocket_routes_require_upgrades() {

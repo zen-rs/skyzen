@@ -13,7 +13,7 @@ use utoipa::openapi::{
     path::{HttpMethod, Operation, OperationBuilder, PathItemBuilder, Paths, PathsBuilder},
     request_body::RequestBodyBuilder,
     response::{ResponseBuilder, ResponsesBuilder},
-    schema::{ObjectBuilder, Schema, SchemaType, Type},
+    schema::{ComponentsBuilder, ObjectBuilder, Schema, SchemaType, Type},
     OpenApi as UtoipaSpec, RefOr, Required,
 };
 use utoipa_redoc::Redoc;
@@ -230,8 +230,19 @@ impl OpenApi {
         OpenApiRedocEndpoint::enabled(html)
     }
 
+    /// Build a [`RouteNode`] that serves the generated `OpenAPI` document at the provided mount path.
+    #[must_use]
+    pub fn redoc_route(&self, mount_path: impl Into<String>) -> RouteNode {
+        let endpoint = self.redoc();
+        redoc_route(endpoint, mount_path.into())
+    }
+
     fn to_utoipa_spec(&self) -> UtoipaSpec {
-        UtoipaSpec::new(self.default_info(), self.build_paths())
+        UtoipaSpec::builder()
+            .info(self.default_info())
+            .paths(self.build_paths())
+            .components(Some(ComponentsBuilder::new().build()))
+            .build()
     }
 
     fn default_info(&self) -> Info {
@@ -324,16 +335,19 @@ impl Endpoint for OpenApiRedocEndpoint {
     }
 }
 
+fn redoc_route(endpoint: OpenApiRedocEndpoint, mount_path: String) -> RouteNode {
+    let wildcard_suffix = "/{*path}";
+    let route = Route::new((
+        RouteNode::new_endpoint("", Method::GET, endpoint.clone(), None),
+        RouteNode::new_endpoint(wildcard_suffix, Method::GET, endpoint, None),
+    ));
+
+    RouteNode::new_route(mount_path, route)
+}
+
 impl IntoRouteNode for OpenApiRedocEndpoint {
     fn into_route_node(self) -> RouteNode {
-        let endpoint = self;
-        let wildcard_suffix = "/{*path}";
-        let route = Route::new((
-            RouteNode::new_endpoint("", Method::GET, endpoint.clone(), None),
-            RouteNode::new_endpoint(wildcard_suffix, Method::GET, endpoint, None),
-        ));
-
-        RouteNode::new_route("/api-doc", route)
+        redoc_route(self, "/api-doc".to_string())
     }
 }
 
