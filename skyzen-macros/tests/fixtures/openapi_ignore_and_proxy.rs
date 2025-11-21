@@ -3,11 +3,28 @@ use skyzen_macros::openapi;
 
 extern crate self as skyzen;
 
+mod utoipa {
+    use std::borrow::Cow;
+    pub trait ToSchema {
+        fn name() -> Cow<'static, str> {
+            Cow::Borrowed("Stub")
+        }
+        fn schema() -> crate::openapi::SchemaRef {
+            ()
+        }
+        fn schemas(_: &mut Vec<(String, crate::openapi::SchemaRef)>) {}
+    }
+
+    impl<T> ToSchema for T {}
+}
+
+pub use crate::utoipa::ToSchema;
 pub mod openapi {
     pub use linkme::distributed_slice;
 
     pub type SchemaRef = ();
     pub type SchemaFn = fn() -> Option<SchemaRef>;
+    pub type SchemaCollector = fn(&mut Vec<(String, SchemaRef)>);
 
     pub trait ToSchema {}
 
@@ -24,6 +41,7 @@ pub mod openapi {
         pub docs: Option<&'static str>,
         pub parameters: &'static [SchemaFn],
         pub response: Option<SchemaFn>,
+        pub schemas: &'static [SchemaCollector],
     }
 
     pub fn schema_of<T: PartialSchema>() -> Option<SchemaRef> {

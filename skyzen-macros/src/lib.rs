@@ -153,6 +153,15 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
 
     let response_assert = quote! { let _ = ::skyzen::openapi::schema_of::<#response_ty>; };
 
+    let schema_types: Vec<_> = parameter_schemas
+        .iter()
+        .filter_map(|schema| match schema {
+            ParameterSchema::Ignored => None,
+            ParameterSchema::Normal(ty) | ParameterSchema::Proxy(ty) => Some(ty.clone()),
+        })
+        .chain(std::iter::once(response_ty.clone()))
+        .collect();
+
     let parameter_schema_fns: Vec<_> = parameter_schemas
         .iter()
         .filter_map(|schema| match schema {
@@ -171,6 +180,36 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
 
     let response_schema_fn = quote! { Some(::skyzen::openapi::schema_of::<#response_ty>) };
 
+    let mut schema_collector_idents = Vec::new();
+    let schema_collector_defs: Vec<_> = schema_types
+        .iter()
+        .enumerate()
+        .map(|(idx, ty)| {
+            let ident = format_ident!(
+                "__SKYZEN_OPENAPI_SCHEMAS_{}_{}",
+                fn_ident.to_string().to_uppercase(),
+                idx
+            );
+            schema_collector_idents.push(ident.clone());
+            quote! {
+                #[cfg(debug_assertions)]
+                fn #ident(schemas: &mut Vec<(String, ::skyzen::openapi::SchemaRef)>) {
+                    schemas.push((
+                        <#ty as ::skyzen::ToSchema>::name().into_owned(),
+                        <#ty as ::skyzen::PartialSchema>::schema(),
+                    ));
+                    <#ty as ::skyzen::ToSchema>::schemas(schemas);
+                }
+            }
+        })
+        .collect();
+
+    let schema_collectors = if schema_collector_idents.is_empty() {
+        quote! { &[] }
+    } else {
+        quote! { &[#(#schema_collector_idents),*] }
+    };
+
     let type_name_literal = quote! { concat!(module_path!(), "::", stringify!(#fn_ident)) };
     let spec_ident = format_ident!(
         "__SKYZEN_OPENAPI_SPEC_{}",
@@ -185,6 +224,8 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
             #response_assert
         };
 
+        #(#schema_collector_defs)*
+
         #[cfg(debug_assertions)]
         #[::skyzen::openapi::distributed_slice(::skyzen::openapi::HANDLER_SPECS)]
         static #spec_ident: ::skyzen::openapi::HandlerSpec = ::skyzen::openapi::HandlerSpec {
@@ -192,6 +233,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
             docs: #doc_tokens,
             parameters: #schema_array,
             response: #response_schema_fn,
+            schemas: #schema_collectors,
         };
     }
     .into())

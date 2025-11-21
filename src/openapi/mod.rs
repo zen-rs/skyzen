@@ -1,6 +1,11 @@
 //! OpenAPI helpers powered by `utoipa` schemas.
 
-use std::{fmt, sync::Arc};
+#[cfg(debug_assertions)]
+use std::collections::BTreeMap;
+use std::{
+    fmt::{self, Debug},
+    sync::Arc,
+};
 
 use crate::{
     routing::{IntoRouteNode, RouteNode},
@@ -55,6 +60,10 @@ macro_rules! ignore_openapi {
 pub type SchemaFn = fn() -> Option<SchemaRef>;
 
 #[cfg(debug_assertions)]
+/// Function pointer used to register schemas in the OpenAPI components section.
+pub type SchemaCollector = fn(&mut Vec<(String, SchemaRef)>);
+
+#[cfg(debug_assertions)]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
 #[distributed_slice]
 pub static HANDLER_SPECS: [HandlerSpec] = [..];
@@ -71,6 +80,8 @@ pub struct HandlerSpec {
     pub parameters: &'static [SchemaFn],
     /// Schema generator for the responder type, if any.
     pub response: Option<SchemaFn>,
+    /// Schema collectors for parameters and responders, including their transitive dependencies.
+    pub schemas: &'static [SchemaCollector],
 }
 
 #[cfg(debug_assertions)]
@@ -78,6 +89,17 @@ fn find_handler_spec(type_name: &str) -> Option<&'static HandlerSpec> {
     HANDLER_SPECS
         .iter()
         .find(|spec| spec.type_name == type_name)
+}
+
+#[cfg(debug_assertions)]
+fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, SchemaRef>) {
+    let mut buffer = Vec::new();
+    for collector in collectors {
+        collector(&mut buffer);
+    }
+    for (name, schema) in buffer {
+        defs.entry(name).or_insert(schema);
+    }
 }
 
 /// Handler metadata attached to each endpoint.
@@ -145,10 +167,29 @@ impl RouteOpenApiEntry {
 }
 
 /// Minimal `OpenAPI` representation for Skyzen routers.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct OpenApi {
     #[cfg(debug_assertions)]
     operations: Vec<OpenApiOperation>,
+    #[cfg(debug_assertions)]
+    schemas: Vec<(String, SchemaRef)>,
+}
+
+impl Debug for OpenApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenApi")
+            .field("operations", &{
+                #[cfg(debug_assertions)]
+                {
+                    &self.operations
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    &"[]"
+                }
+            })
+            .finish()
+    }
 }
 
 impl OpenApi {
@@ -156,6 +197,7 @@ impl OpenApi {
     #[cfg(debug_assertions)]
     #[must_use]
     pub(crate) fn from_entries(entries: &[RouteOpenApiEntry]) -> Self {
+        let mut schema_defs = BTreeMap::new();
         let operations = entries
             .iter()
             .map(|entry| {
@@ -170,6 +212,7 @@ impl OpenApi {
                         response: None,
                     },
                     |spec| {
+                        collect_schemas(spec.schemas, &mut schema_defs);
                         let docs = spec.docs;
                         let parameters = spec
                             .parameters
@@ -189,7 +232,11 @@ impl OpenApi {
                 )
             })
             .collect();
-        Self { operations }
+        let schemas = schema_defs.into_iter().collect();
+        Self {
+            operations,
+            schemas,
+        }
     }
 
     /// Build an empty OpenAPI definition when OpenAPI support is disabled.
@@ -241,7 +288,7 @@ impl OpenApi {
         UtoipaSpec::builder()
             .info(self.default_info())
             .paths(self.build_paths())
-            .components(Some(ComponentsBuilder::new().build()))
+            .components(Some(self.build_components()))
             .build()
     }
 
@@ -264,6 +311,22 @@ impl OpenApi {
                 }
             })
             .build()
+    }
+
+    #[cfg(debug_assertions)]
+    fn build_components(&self) -> utoipa::openapi::schema::Components {
+        self.schemas
+            .iter()
+            .cloned()
+            .fold(ComponentsBuilder::new(), |builder, (name, schema)| {
+                builder.schema(name, schema)
+            })
+            .build()
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn build_components(&self) -> utoipa::openapi::schema::Components {
+        ComponentsBuilder::new().build()
     }
 }
 

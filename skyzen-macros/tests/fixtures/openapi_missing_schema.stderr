@@ -1,0 +1,25 @@
+warning: unused import: `linkme_impl::distributed_slice`
+ --> tests/fixtures/openapi_missing_schema.rs:1:5
+  |
+1 | use linkme_impl::distributed_slice;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0277]: the trait bound `MissingSchema: PartialSchema` is not satisfied
+  --> tests/fixtures/openapi_missing_schema.rs:64:20
+   |
+64 | fn handler(_param: MissingSchema) -> ResponseSchema {
+   |                    ^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `PartialSchema` is not implemented for `MissingSchema`
+  --> tests/fixtures/openapi_missing_schema.rs:53:1
+   |
+53 | struct MissingSchema;
+   | ^^^^^^^^^^^^^^^^^^^^
+   = help: the trait `PartialSchema` is implemented for `ResponseSchema`
+note: required by a bound in `schema_of`
+  --> tests/fixtures/openapi_missing_schema.rs:47:25
+   |
+47 |     pub fn schema_of<T: PartialSchema>() -> Option<SchemaRef> {
+   |                         ^^^^^^^^^^^^^ required by this bound in `schema_of`
