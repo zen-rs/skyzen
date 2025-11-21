@@ -6,17 +6,15 @@ use serde_json::to_string;
 use skyzen::{
     routing::{CreateRouteNode, Route, Router},
     utils::Json,
-    OpenApi,
+    OpenApi, ToSchema,
 };
 
-#[skyzen::openapi]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct HelloQuery {
     name: String,
 }
 
-#[skyzen::openapi]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct HelloResponse {
     message: String,
 }

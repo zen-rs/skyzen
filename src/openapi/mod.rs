@@ -25,39 +25,25 @@ pub use linkme::distributed_slice;
 mod builtins;
 pub use builtins::IgnoreOpenApi;
 
-/// Wrap a type to exclude it from OpenAPI parameter/response schemas in `#[skyzen::openapi]`.
+/// Return the schema for a `ToSchema` type.
+pub fn schema_of<T>() -> Option<SchemaRef>
+where
+    T: crate::ToSchema,
+{
+    Some(<T as crate::PartialSchema>::schema())
+}
+
+/// Explicitly ignore OpenAPI generation for a type by providing an empty schema.
 #[macro_export]
 macro_rules! ignore_openapi {
     ($ty:ty) => {
-        impl ::skyzen::openapi::OpenApiSchema for $ty {
-            fn schema() -> ::core::option::Option<::skyzen::openapi::SchemaRef> {
-                None
+        impl ::utoipa::PartialSchema for $ty {
+            fn schema() -> ::utoipa::openapi::RefOr<::utoipa::openapi::schema::Schema> {
+                ::utoipa::openapi::schema::empty().into()
             }
         }
+        impl ::utoipa::ToSchema for $ty {}
     };
-}
-
-/// Assert that `T` can produce an OpenAPI schema.
-#[doc(hidden)]
-pub const fn assert_schema<T>()
-where
-    T: OpenApiSchema,
-{
-    let _ = ::core::marker::PhantomData::<T>;
-}
-
-/// Trait implemented by extractors and responders that can describe themselves via OpenAPI schema.
-pub trait OpenApiSchema: Send + Sync + 'static {
-    /// Produce a [`Schema`] for the implementing type, or `None` to opt out of documentation.
-    fn schema() -> Option<SchemaRef>;
-}
-
-/// Helper function referenced by the procedural macro to obtain a [`Schema`].
-pub fn schema_of<T>() -> Option<SchemaRef>
-where
-    T: OpenApiSchema,
-{
-    T::schema()
 }
 
 #[doc(hidden)]

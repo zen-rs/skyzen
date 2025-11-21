@@ -17,5 +17,10 @@ proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
 
+[dev-dependencies]
+linkme = "0.3"
+linkme-impl = "0.3"
+trybuild = "1"
+
 [lints]
 workspace = true

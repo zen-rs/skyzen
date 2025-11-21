@@ -1,0 +1,15 @@
+error: #[skyzen::openapi] may only be applied to functions
+  --> tests/fixtures/openapi_struct.rs:30:1
+   |
+30 | / struct NotAllowed {
+31 | |     value: i32,
+32 | | }
+   | |_^
+
+warning: unused import: `linkme::distributed_slice`
+ --> tests/fixtures/openapi_struct.rs:1:5
+  |
+1 | use linkme::distributed_slice;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

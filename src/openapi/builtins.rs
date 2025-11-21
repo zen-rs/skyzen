@@ -1,6 +1,3 @@
-use std::net::SocketAddr;
-
-use http_kit::{Request, Response};
 #[cfg(feature = "json")]
 use serde::Serialize;
 use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType, Type};
@@ -11,10 +8,9 @@ use crate::{
         client_ip::{ClientIp, PeerAddr},
         Query,
     },
-    openapi::OpenApiSchema,
+    openapi::SchemaRef,
     routing::Params,
     utils::State,
-    Body,
 };
 
 #[cfg(feature = "json")]
@@ -23,7 +19,7 @@ use crate::{responder::PrettyJson, utils::Json};
 #[cfg(feature = "form")]
 use crate::utils::Form;
 
-fn string_schema(description: &'static str) -> ::skyzen::openapi::SchemaRef {
+fn string_schema(description: &'static str) -> SchemaRef {
     RefOr::T(Schema::Object(
         ObjectBuilder::new()
             .schema_type(SchemaType::from(Type::String))
@@ -32,7 +28,7 @@ fn string_schema(description: &'static str) -> ::skyzen::openapi::SchemaRef {
     ))
 }
 
-fn object_schema(title: &'static str, description: &'static str) -> ::skyzen::openapi::SchemaRef {
+fn object_schema(title: &'static str, description: &'static str) -> SchemaRef {
     RefOr::T(Schema::Object(
         ObjectBuilder::new()
             .schema_type(SchemaType::from(Type::Object))
@@ -44,35 +40,24 @@ fn object_schema(title: &'static str, description: &'static str) -> ::skyzen::op
 
 macro_rules! simple_schema {
     ($ty:ty, $schema:expr) => {
-        impl OpenApiSchema for $ty {
-            fn schema() -> Option<::skyzen::openapi::SchemaRef> {
-                Some($schema)
+        impl ::utoipa::PartialSchema for $ty {
+            fn schema() -> SchemaRef {
+                $schema
+            }
+        }
+
+        impl ::utoipa::ToSchema for $ty {
+            fn name() -> ::std::borrow::Cow<'static, str> {
+                ::std::borrow::Cow::Borrowed(stringify!($ty))
             }
         }
     };
 }
 
-simple_schema!(Body, string_schema("Raw HTTP body"));
-simple_schema!(
-    Request,
-    object_schema(
-        "Request",
-        "Opaque HTTP request. Prefer typed extractors for structured data."
-    )
-);
-simple_schema!(
-    Response,
-    object_schema(
-        "Response",
-        "Opaque HTTP response. Prefer typed responders for structured data."
-    )
-);
-simple_schema!(skyzen::Error, string_schema("Framework error variant"));
 simple_schema!(
     Params,
     object_schema("Params", "Route parameters extracted from the current path")
 );
-simple_schema!(SocketAddr, string_schema("Socket address (IP + port)"));
 simple_schema!(
     ClientIp,
     string_schema("Client IP address (may be forwarded)")
@@ -82,61 +67,79 @@ simple_schema!(
     string_schema("Peer socket address reported by the transport")
 );
 
-impl<T> OpenApiSchema for Query<T>
+impl<T> utoipa::PartialSchema for Query<T>
 where
-    T: OpenApiSchema,
+    T: utoipa::ToSchema,
 {
-    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
-        T::schema()
+    fn schema() -> SchemaRef {
+        <T as utoipa::PartialSchema>::schema()
+    }
+}
+
+impl<T> utoipa::ToSchema for Query<T> where T: utoipa::ToSchema {}
+
+#[cfg(feature = "form")]
+impl<T> utoipa::PartialSchema for Form<T>
+where
+    T: utoipa::ToSchema + 'static + Send + Sync,
+{
+    fn schema() -> SchemaRef {
+        <T as utoipa::PartialSchema>::schema()
     }
 }
 
 #[cfg(feature = "form")]
-impl<T> OpenApiSchema for Form<T>
+impl<T> utoipa::ToSchema for Form<T> where T: utoipa::ToSchema + 'static + Send + Sync {}
+
+#[cfg(feature = "json")]
+impl<T> utoipa::PartialSchema for Json<T>
 where
-    T: OpenApiSchema,
+    T: utoipa::ToSchema + 'static + Send + Sync,
 {
-    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
-        T::schema()
+    fn schema() -> SchemaRef {
+        <T as utoipa::PartialSchema>::schema()
     }
 }
 
 #[cfg(feature = "json")]
-impl<T> OpenApiSchema for Json<T>
+impl<T> utoipa::ToSchema for Json<T> where T: utoipa::ToSchema + 'static + Send + Sync {}
+
+#[cfg(feature = "json")]
+impl<T> utoipa::PartialSchema for PrettyJson<T>
 where
-    T: OpenApiSchema,
+    T: utoipa::ToSchema + Serialize + 'static + Send + Sync,
 {
-    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
-        T::schema()
+    fn schema() -> SchemaRef {
+        <T as utoipa::PartialSchema>::schema()
     }
 }
 
 #[cfg(feature = "json")]
-impl<T> OpenApiSchema for PrettyJson<T>
-where
-    T: OpenApiSchema + Serialize,
+impl<T> utoipa::ToSchema for PrettyJson<T> where
+    T: utoipa::ToSchema + Serialize + 'static + Send + Sync
 {
-    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
-        T::schema()
-    }
 }
 
-impl<T> OpenApiSchema for State<T>
+impl<T> utoipa::PartialSchema for State<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
-        None
+    fn schema() -> SchemaRef {
+        utoipa::openapi::schema::empty().into()
     }
 }
+
+impl<T> utoipa::ToSchema for State<T> where T: Clone + Send + Sync + 'static {}
 
 /// Wrapper that explicitly opts out of OpenAPI schema generation for contained extractors or
 /// responders.
 #[derive(Debug, Clone, Copy)]
 pub struct IgnoreOpenApi<T>(pub T);
 
-impl<T: Send + Sync + 'static> OpenApiSchema for IgnoreOpenApi<T> {
-    fn schema() -> Option<::skyzen::openapi::SchemaRef> {
-        None
+impl<T: Send + Sync + 'static> utoipa::PartialSchema for IgnoreOpenApi<T> {
+    fn schema() -> SchemaRef {
+        utoipa::openapi::schema::empty().into()
     }
 }
+
+impl<T: Send + Sync + 'static> utoipa::ToSchema for IgnoreOpenApi<T> {}

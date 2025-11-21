@@ -42,7 +42,7 @@ pub use skyzen_core::error::*;
 pub use skyzen_core::Server;
 
 #[doc(inline)]
-pub use openapi::{IgnoreOpenApi, OpenApi, OpenApiOperation, OpenApiSchema};
+pub use openapi::{IgnoreOpenApi, OpenApi, OpenApiOperation};
 
 pub use utoipa::{PartialSchema, ToSchema};
 
