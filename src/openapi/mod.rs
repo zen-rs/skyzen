@@ -61,7 +61,7 @@ pub type SchemaFn = fn() -> Option<SchemaRef>;
 
 #[cfg(debug_assertions)]
 /// Function pointer used to register schemas in the OpenAPI components section.
-pub type SchemaCollector = fn(&mut Vec<(String, SchemaRef)>);
+pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
 
 #[cfg(debug_assertions)]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
@@ -92,13 +92,41 @@ fn find_handler_spec(type_name: &str) -> Option<&'static HandlerSpec> {
 }
 
 #[cfg(debug_assertions)]
-fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, SchemaRef>) {
-    let mut buffer = Vec::new();
-    for collector in collectors {
-        collector(&mut buffer);
+fn register_type<T>(defs: &mut BTreeMap<String, SchemaRef>)
+where
+    T: crate::PartialSchema + crate::ToSchema,
+{
+    let name = <T as crate::ToSchema>::name().into_owned();
+    defs.entry(name)
+        .or_insert_with(<T as crate::PartialSchema>::schema);
+    let mut nested = Vec::new();
+    <T as crate::ToSchema>::schemas(&mut nested);
+    for (dep_name, schema) in nested {
+        defs.entry(dep_name).or_insert(schema);
     }
-    for (name, schema) in buffer {
-        defs.entry(name).or_insert(schema);
+}
+
+#[cfg(debug_assertions)]
+/// Registers types and their dependencies into the OpenAPI components map.
+pub trait RegisterSchemas {
+    /// Insert the type's schema and dependent schemas into the provided map.
+    fn register(defs: &mut BTreeMap<String, SchemaRef>);
+}
+
+#[cfg(debug_assertions)]
+impl<T> RegisterSchemas for T
+where
+    T: crate::PartialSchema + crate::ToSchema,
+{
+    fn register(defs: &mut BTreeMap<String, SchemaRef>) {
+        register_type::<T>(defs);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, SchemaRef>) {
+    for collector in collectors {
+        collector(defs);
     }
 }
 

@@ -193,12 +193,8 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
             schema_collector_idents.push(ident.clone());
             quote! {
                 #[cfg(debug_assertions)]
-                fn #ident(schemas: &mut Vec<(String, ::skyzen::openapi::SchemaRef)>) {
-                    schemas.push((
-                        <#ty as ::skyzen::ToSchema>::name().into_owned(),
-                        <#ty as ::skyzen::PartialSchema>::schema(),
-                    ));
-                    <#ty as ::skyzen::ToSchema>::schemas(schemas);
+                fn #ident(schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>) {
+                    <#ty as ::skyzen::openapi::RegisterSchemas>::register(schemas);
                 }
             }
         })

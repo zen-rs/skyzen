@@ -24,7 +24,11 @@ pub mod openapi {
 
     pub type SchemaRef = ();
     pub type SchemaFn = fn() -> Option<SchemaRef>;
-    pub type SchemaCollector = fn(&mut Vec<(String, SchemaRef)>);
+    pub type SchemaCollector = fn(&mut std::collections::BTreeMap<String, SchemaRef>);
+
+    pub trait RegisterSchemas {
+        fn register(defs: &mut std::collections::BTreeMap<String, SchemaRef>);
+    }
 
     pub trait ToSchema {}
 
@@ -47,6 +51,10 @@ pub mod openapi {
     pub fn schema_of<T: PartialSchema>() -> Option<SchemaRef> {
         let _ = <T as PartialSchema>::schema();
         None
+    }
+
+    impl<T> RegisterSchemas for T {
+        fn register(_: &mut std::collections::BTreeMap<String, SchemaRef>) {}
     }
 }
 

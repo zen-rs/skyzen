@@ -79,7 +79,14 @@ where
     }
 }
 
-impl<T> utoipa::ToSchema for Query<T> where T: utoipa::ToSchema {}
+impl<T> utoipa::ToSchema for Query<T>
+where
+    T: utoipa::ToSchema,
+{
+    fn schemas(schemas: &mut Vec<(String, SchemaRef)>) {
+        T::schemas(schemas);
+    }
+}
 
 #[cfg(feature = "form")]
 impl<T> utoipa::PartialSchema for Form<T>
@@ -92,7 +99,14 @@ where
 }
 
 #[cfg(feature = "form")]
-impl<T> utoipa::ToSchema for Form<T> where T: utoipa::ToSchema + 'static + Send + Sync {}
+impl<T> utoipa::ToSchema for Form<T>
+where
+    T: utoipa::ToSchema + 'static + Send + Sync,
+{
+    fn schemas(schemas: &mut Vec<(String, SchemaRef)>) {
+        T::schemas(schemas);
+    }
+}
 
 #[cfg(feature = "json")]
 impl<T> utoipa::PartialSchema for Json<T>
@@ -105,7 +119,14 @@ where
 }
 
 #[cfg(feature = "json")]
-impl<T> utoipa::ToSchema for Json<T> where T: utoipa::ToSchema + 'static + Send + Sync {}
+impl<T> utoipa::ToSchema for Json<T>
+where
+    T: utoipa::ToSchema + 'static + Send + Sync,
+{
+    fn schemas(schemas: &mut Vec<(String, SchemaRef)>) {
+        T::schemas(schemas);
+    }
+}
 
 #[cfg(feature = "json")]
 impl<T> utoipa::PartialSchema for PrettyJson<T>
@@ -118,9 +139,13 @@ where
 }
 
 #[cfg(feature = "json")]
-impl<T> utoipa::ToSchema for PrettyJson<T> where
-    T: utoipa::ToSchema + Serialize + 'static + Send + Sync
+impl<T> utoipa::ToSchema for PrettyJson<T>
+where
+    T: utoipa::ToSchema + Serialize + 'static + Send + Sync,
 {
+    fn schemas(schemas: &mut Vec<(String, SchemaRef)>) {
+        T::schemas(schemas);
+    }
 }
 
 impl<T> utoipa::PartialSchema for State<T>
