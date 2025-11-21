@@ -8,7 +8,8 @@ use syn::{
     punctuated::Punctuated,
     spanned::Spanned,
     Attribute, Data, DeriveInput, Error, Expr, ExprLit, Fields, FnArg, Item, ItemEnum, ItemFn,
-    ItemStruct, Lit, LitInt, LitStr, Meta, MetaNameValue, ReturnType, Token, Type, Variant,
+    ItemStruct, Lit, LitInt, LitStr, Meta, MetaNameValue, PatType, ReturnType, Token, Type,
+    Variant,
 };
 
 /// Attribute macro that boots a Skyzen Endpoint on native or wasm runtimes.
@@ -76,7 +77,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn openapi(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = parse_macro_input!(item as Item);
     match item {
-        Item::Fn(function) => match expand_openapi_fn(&function) {
+        Item::Fn(function) => match expand_openapi_fn(function) {
             Ok(tokens) => tokens,
             Err(error) => error.to_compile_error().into(),
         },
@@ -107,7 +108,7 @@ pub fn derive_http_error(item: TokenStream) -> TokenStream {
     }
 }
 
-fn expand_openapi_fn(function: &ItemFn) -> syn::Result<TokenStream> {
+fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     let fn_ident = &function.sig.ident;
 
     let doc = doc_string(&function.attrs);
@@ -119,8 +120,8 @@ fn expand_openapi_fn(function: &ItemFn) -> syn::Result<TokenStream> {
         },
     );
 
-    let mut param_types = Vec::new();
-    for input in &function.sig.inputs {
+    let mut parameter_schemas = Vec::new();
+    for input in &mut function.sig.inputs {
         match input {
             FnArg::Receiver(receiver) => {
                 return Err(Error::new_spanned(
@@ -129,7 +130,7 @@ fn expand_openapi_fn(function: &ItemFn) -> syn::Result<TokenStream> {
                 ));
             }
             FnArg::Typed(pat_type) => {
-                param_types.push((*pat_type.ty).clone());
+                parameter_schemas.push(parse_parameter_schema(pat_type)?);
             }
         }
     }
@@ -140,19 +141,32 @@ fn expand_openapi_fn(function: &ItemFn) -> syn::Result<TokenStream> {
     };
     let response_ty = unwrap_result_type(&raw_response_ty);
 
-    let assertions = param_types
+    let assertions: Vec<_> = parameter_schemas
         .iter()
-        .map(|ty| quote! { let _ = ::skyzen::openapi::schema_of::<#ty>; });
+        .filter_map(|schema| match schema {
+            ParameterSchema::Ignored => None,
+            ParameterSchema::Normal(ty) | ParameterSchema::Proxy(ty) => {
+                Some(quote! { let _ = ::skyzen::openapi::schema_of::<#ty>; })
+            }
+        })
+        .collect();
 
     let response_assert = quote! { let _ = ::skyzen::openapi::schema_of::<#response_ty>; };
 
-    let schema_array = if param_types.is_empty() {
+    let parameter_schema_fns: Vec<_> = parameter_schemas
+        .iter()
+        .filter_map(|schema| match schema {
+            ParameterSchema::Ignored => None,
+            ParameterSchema::Normal(ty) | ParameterSchema::Proxy(ty) => {
+                Some(quote! { ::skyzen::openapi::schema_of::<#ty> })
+            }
+        })
+        .collect();
+
+    let schema_array = if parameter_schema_fns.is_empty() {
         quote! { &[] }
     } else {
-        let schema_fns = param_types
-            .iter()
-            .map(|ty| quote! { ::skyzen::openapi::schema_of::<#ty> });
-        quote! { &[#(#schema_fns),*] }
+        quote! { &[#(#parameter_schema_fns),*] }
     };
 
     let response_schema_fn = quote! { Some(::skyzen::openapi::schema_of::<#response_ty>) };
@@ -181,6 +195,64 @@ fn expand_openapi_fn(function: &ItemFn) -> syn::Result<TokenStream> {
         };
     }
     .into())
+}
+
+enum ParameterSchema {
+    Normal(Type),
+    Proxy(Type),
+    Ignored,
+}
+
+fn parse_parameter_schema(pat_type: &mut PatType) -> syn::Result<ParameterSchema> {
+    let mut ignored = None;
+    let mut proxy = None;
+    let mut retained = Vec::new();
+
+    for attr in pat_type.attrs.drain(..) {
+        if attr.path().is_ident("ignore") {
+            if !matches!(attr.meta, Meta::Path(_)) {
+                return Err(Error::new_spanned(
+                    attr,
+                    "#[ignore] does not take arguments",
+                ));
+            }
+            if ignored.is_some() {
+                return Err(Error::new(attr.span(), "duplicate #[ignore] attribute"));
+            }
+            ignored = Some(attr.span());
+            continue;
+        }
+
+        if attr.path().is_ident("proxy") {
+            if proxy.is_some() {
+                return Err(Error::new(attr.span(), "duplicate #[proxy] attribute"));
+            }
+            let ty = attr.parse_args::<Type>().map_err(|_| {
+                Error::new_spanned(&attr.meta, "#[proxy] expects a type, e.g. #[proxy(String)]")
+            })?;
+            proxy = Some(ty);
+            continue;
+        }
+
+        retained.push(attr);
+    }
+
+    pat_type.attrs = retained;
+
+    if ignored.is_some() && proxy.is_some() {
+        return Err(Error::new(
+            pat_type.span(),
+            "cannot combine #[ignore] with #[proxy]",
+        ));
+    }
+
+    if ignored.is_some() {
+        Ok(ParameterSchema::Ignored)
+    } else if let Some(ty) = proxy {
+        Ok(ParameterSchema::Proxy(ty))
+    } else {
+        Ok(ParameterSchema::Normal((*pat_type.ty).clone()))
+    }
 }
 
 fn expand_error(args: ErrorArgs, item: Item) -> syn::Result<TokenStream> {

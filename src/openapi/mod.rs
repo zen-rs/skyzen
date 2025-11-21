@@ -2,7 +2,10 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::{Body, Endpoint, Request, Response};
+use crate::{
+    routing::{IntoRouteNode, RouteNode},
+    Body, Endpoint, Request, Response, Route,
+};
 use http_kit::{header, http_error, Method, StatusCode};
 use utoipa::openapi::{
     content::Content,
@@ -318,6 +321,19 @@ impl Endpoint for OpenApiRedocEndpoint {
             }
             None => Err(OpenApiRedocDisabledError::new()),
         }
+    }
+}
+
+impl IntoRouteNode for OpenApiRedocEndpoint {
+    fn into_route_node(self) -> RouteNode {
+        let endpoint = self;
+        let wildcard_suffix = "/{*path}";
+        let route = Route::new((
+            RouteNode::new_endpoint("", Method::GET, endpoint.clone(), None),
+            RouteNode::new_endpoint(wildcard_suffix, Method::GET, endpoint, None),
+        ));
+
+        RouteNode::new_route("/api-doc", route)
     }
 }
 

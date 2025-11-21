@@ -47,6 +47,12 @@ impl StaticDir {
     }
 }
 
+impl IntoRouteNode for Route {
+    fn into_route_node(self) -> RouteNode {
+        RouteNode::new_route("", self)
+    }
+}
+
 impl IntoRouteNode for StaticDir {
     fn into_route_node(self) -> RouteNode {
         let endpoint = StaticDirEndpoint {
