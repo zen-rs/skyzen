@@ -12,6 +12,7 @@ categories = ["web-programming::http-server"]
 [dependencies]
 http-kit.workspace = true
 executor-core = { workspace = true, default-features = false }
+eyre = "0.6.12"
 
 [lints]
 workspace = true

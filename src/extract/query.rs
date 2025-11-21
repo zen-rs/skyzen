@@ -1,5 +1,6 @@
-use crate::{extract::Extractor, Request, ResultExt, StatusCode};
+use crate::{extract::Extractor, Request, StatusCode};
 
+use http_kit::http_error;
 use serde::de::DeserializeOwned;
 use serde_urlencoded::from_str;
 
@@ -9,10 +10,15 @@ pub struct Query<T>(pub T);
 
 impl_deref!(Query);
 
+http_error!(
+    /// An error occurred while parsing the query string.
+    pub QueryError, StatusCode::BAD_REQUEST, "Failed to parse query string");
+
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
-    async fn extract(request: &mut Request) -> crate::Result<Self> {
+    type Error = QueryError;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         let data = request.uri().query().unwrap_or_default();
-        Ok(Self(from_str(data).status(StatusCode::BAD_REQUEST)?))
+        Ok(Self(from_str(data).map_err(|_| QueryError::new())?))
     }
 }
 
@@ -20,6 +26,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
 mod tests {
     use super::Query;
     use crate::{Body, Method, StatusCode};
+    use http_kit::HttpError;
     use serde::Deserialize;
     use skyzen_core::Extractor;
 

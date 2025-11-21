@@ -21,7 +21,7 @@ mod error_handling;
 pub use error_handling::ErrorHandlingMiddleware;
 pub use http_kit::middleware::Middleware;
 
-use http_kit::{Request, Response, Result};
+use http_kit::{error::BoxHttpError, Request, Response};
 
 /// Simplified middleware system - just for compilation.
 /// This is a placeholder implementation that needs proper redesign.
@@ -40,7 +40,7 @@ impl Next {
     /// # Errors
     ///
     /// This placeholder never returns an error.
-    pub fn run(self, _request: &mut Request) -> Result<Response> {
+    pub fn run(self, _request: &mut Request) -> Result<Response, BoxHttpError> {
         // Placeholder implementation
         Ok(Response::new(http_kit::Body::from(
             "Middleware not fully implemented",

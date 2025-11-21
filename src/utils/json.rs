@@ -2,7 +2,7 @@ use crate::{
     extract::Extractor, header::CONTENT_TYPE, responder::Responder, Request, Response, StatusCode,
 };
 use http_kit::header::HeaderValue;
-use http_kit::ResultExt;
+use http_kit::http_error;
 pub use serde_json::json;
 pub use serde_json::Value as JsonValue;
 
@@ -13,40 +13,55 @@ const APPLICATION_JSON: HeaderValue = HeaderValue::from_static("application/json
 
 /// JSON extractor/responder.
 #[derive(Debug, Clone)]
-pub struct Json<T: Send + Sync = JsonValue>(pub T);
+pub struct Json<T: Send + Sync + 'static = JsonValue>(pub T);
 
-impl<T: Send + Sync + Serialize> Responder for Json<T> {
-    fn respond_to(self, _request: &Request, response: &mut Response) -> crate::Result<()> {
+http_error!(pub JsonEncodingError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to encode JSON response");
+
+impl<T: Send + Sync + Serialize + 'static> Responder for Json<T> {
+    type Error = JsonEncodingError;
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         response
             .headers_mut()
             .insert(CONTENT_TYPE, APPLICATION_JSON);
         *response.body_mut() =
-            http_kit::Body::from_json(&self.0).status(StatusCode::BAD_REQUEST)?;
+            http_kit::Body::from_json(&self.0).map_err(|_| JsonEncodingError::new())?;
         Ok(())
     }
 }
 
 /// Error raised when the content-type header is not `application/json`.
-#[derive(Debug)]
-#[allow(dead_code)]
-#[skyzen::error(message = "Expected content type `application/json`")]
-pub struct JsonContentTypeError;
+#[skyzen::error]
+pub enum JsonContentTypeError {
+    /// The content type header is missing.
+    #[error("Expected content type `application/json`", status = StatusCode::BAD_REQUEST)]
+    Missing,
+    /// The content type does not match `application/json`.
+    #[error(
+        "Expected content type `application/json`",
+        status = StatusCode::UNSUPPORTED_MEDIA_TYPE
+    )]
+    Unsupported,
+    /// The payload could not be parsed as JSON.
+    #[error("Failed to parse JSON payload", status = StatusCode::BAD_REQUEST)]
+    InvalidPayload,
+}
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
-    async fn extract(request: &mut Request) -> crate::Result<Self> {
+    type Error = JsonContentTypeError;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
             if content_type != "application/json" {
-                return Err(JsonContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+                return Err(JsonContentTypeError::Unsupported);
             }
         } else {
-            return Err(JsonContentTypeError).status(StatusCode::BAD_REQUEST);
+            return Err(JsonContentTypeError::Missing);
         }
 
         let value = request
             .body_mut()
             .into_json()
             .await
-            .map_err(|error| http_kit::Error::new(error, StatusCode::BAD_REQUEST))?;
+            .map_err(|_| JsonContentTypeError::InvalidPayload)?;
         Ok(Self(value))
     }
 }

@@ -2,8 +2,8 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::{handler::Handler, Body, Endpoint, Request, Response, Result};
-use http_kit::{header, Method, StatusCode};
+use crate::{Body, Endpoint, Request, Response};
+use http_kit::{header, http_error, Method, StatusCode};
 use utoipa::openapi::{
     content::Content,
     info::Info,
@@ -151,6 +151,7 @@ impl OpenApi {
     pub(crate) fn from_entries(entries: &[RouteOpenApiEntry]) -> Self {
         let operations = entries
             .iter()
+            
             .map(|entry| {
                 let handler_type = entry.handler.type_name;
                 entry.handler.spec.map_or_else(
@@ -280,6 +281,7 @@ pub struct OpenApiRedocEndpoint {
     html: Option<Arc<String>>,
 }
 
+
 impl OpenApiRedocEndpoint {
     fn enabled(html: String) -> Self {
         Self {
@@ -292,8 +294,13 @@ impl OpenApiRedocEndpoint {
     }
 }
 
+http_error!(
+    /// Error returned when OpenAPI support is disabled.
+    pub OpenApiRedocDisabledError, StatusCode::NOT_IMPLEMENTED, "OpenAPI instrumentation disabled at compile time");
+
 impl Endpoint for OpenApiRedocEndpoint {
-    async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+    type Error = OpenApiRedocDisabledError;
+    async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
         match &self.html {
             Some(html) => {
                 let mut response = Response::new(Body::from(html.as_bytes().to_vec()));
@@ -303,23 +310,8 @@ impl Endpoint for OpenApiRedocEndpoint {
                 );
                 Ok(response)
             }
-            None => {
-                let mut response = Response::new(Body::from(
-                    "OpenAPI instrumentation disabled at compile time"
-                        .as_bytes()
-                        .to_vec(),
-                ));
-                *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-                Ok(response)
-            }
+            None => Err(OpenApiRedocDisabledError::new()),
         }
-    }
-}
-
-impl Handler<()> for OpenApiRedocEndpoint {
-    async fn call_handler(&self, request: &mut Request) -> Result<Response> {
-        let mut endpoint = self.clone();
-        endpoint.respond(request).await
     }
 }
 

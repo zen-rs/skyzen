@@ -5,10 +5,9 @@ use hyper::{
     service::Service,
 };
 
-use skyzen::{utils::Bytes, Endpoint};
+use skyzen::{BodyError, Endpoint, utils::Bytes};
 use std::{future::Future, pin::Pin};
 
-pub type BoxedStdError = Box<dyn core::error::Error + Send + Sync + 'static>;
 type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
 #[derive(Debug)]
 pub struct IntoService<E> {
@@ -25,7 +24,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
     for IntoService<E>
 {
     type Response = hyper::Response<StreamBody<MapOk<skyzen::Body, fn(Bytes) -> Frame<Bytes>>>>;
-    type Error = BoxedStdError;
+    type Error = E::Error;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
     fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
@@ -34,13 +33,15 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
             let mut request: skyzen::Request =
-                skyzen::Request::from(req.map(BodyDataStream::new).map(skyzen::Body::from_stream));
+                skyzen::Request::from(req.map(BodyDataStream::new).map(|body|{
+                    skyzen::Body::from_stream(body.map_err(|error|{
+                        BodyError::Other(Box::new(error))
+                    }))
+                }));
             request.extensions_mut().insert(on_upgrade);
-            let response: Result<skyzen::Response, skyzen::Error> =
-                endpoint.respond(&mut request).await;
+            let response: Result<skyzen::Response, _> = endpoint.respond(&mut request).await;
 
-            let response: Result<hyper::Response<skyzen::Body>, BoxedStdError> =
-                response.map_err(|error| skyzen::Error::into_inner(error) as BoxedStdError);
+            let response: Result<hyper::Response<skyzen::Body>, _> = response;
 
             response.map(|response| {
                 response.map(|body| {

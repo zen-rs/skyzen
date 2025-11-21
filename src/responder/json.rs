@@ -1,8 +1,8 @@
-use http::StatusCode;
 use http_kit::{
     header::{HeaderValue, CONTENT_TYPE},
     Request, Response,
 };
+use http_kit::{http_error, StatusCode};
 use serde::Serialize;
 use serde_json::to_vec_pretty;
 use skyzen_core::Responder;
@@ -31,10 +31,12 @@ use skyzen_core::Responder;
 #[derive(Debug, Clone)]
 pub struct PrettyJson<T: Send + Sync + Serialize>(pub T);
 
-impl<T: Send + Sync + Serialize> Responder for PrettyJson<T> {
-    fn respond_to(self, _request: &Request, response: &mut Response) -> http_kit::Result<()> {
-        let payload = to_vec_pretty(&self.0)
-            .map_err(|error| http_kit::Error::new(error, StatusCode::SERVICE_UNAVAILABLE))?;
+http_error!(pub PrettyJsonError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize JSON payload");
+
+impl<T: Send + Sync + Serialize+'static> Responder for PrettyJson<T> {
+    type Error = PrettyJsonError;
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
+        let payload = to_vec_pretty(&self.0).map_err(|_| PrettyJsonError::new())?;
         *response.body_mut() = http_kit::Body::from_bytes(payload);
         response
             .headers_mut()

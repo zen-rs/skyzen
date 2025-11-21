@@ -24,8 +24,8 @@ pub mod utils;
 /// Runtime primitives leveraged by `#[skyzen::main]`.
 pub mod runtime;
 
-/// Attribute macros exported by Skyzen.
-pub use skyzen_macros::{error, main, openapi};
+/// Attribute & derive macros exported by Skyzen.
+pub use skyzen_macros::{error, main, openapi, HttpError};
 
 /// Static asset helpers for building file servers.
 pub mod static_files;
@@ -33,11 +33,11 @@ pub use static_files::StaticDir;
 
 #[doc(inline)]
 pub use http_kit::{
-    header, Body, Endpoint, Error, HttpError, Method, Middleware, Request, Response, Result,
-    ResultExt, StatusCode, Uri,
+    header, Body, Endpoint, HttpError, Method, Middleware, Request, Response, StatusCode, Uri,BodyError
 };
 #[doc(inline)]
 pub use routing::{CreateRouteNode, Route};
+pub use skyzen_core::error::*;
 pub use skyzen_core::Server;
 
 #[doc(inline)]

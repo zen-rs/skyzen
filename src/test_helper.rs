@@ -1,4 +1,9 @@
-use http_kit::{Endpoint, Request, Response};
+use core::mem;
+
+use http_kit::{Endpoint, Request, Response, error::BoxHttpError, http_error};
+use http_kit::StatusCode;
+
+http_error!(pub BodyReadError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response body");
 macro_rules! test_handler {
     (
         $endpoint:expr,
@@ -22,8 +27,11 @@ pub async fn test_endpoint_inner(
     mut endpoint: impl Endpoint + 'static,
     mut expected_response: Response,
     mut request: Request,
-) -> Result<(), http_kit::Error> {
-    let mut response = endpoint.respond(&mut request).await?;
+) -> Result<(), BoxHttpError> {
+    let mut response = endpoint
+        .respond(&mut request)
+        .await
+        .map_err(|error| Box::new(error) as BoxHttpError)?;
 
     let expected_status = expected_response.status();
     let status = response.status();
@@ -32,9 +40,15 @@ pub async fn test_endpoint_inner(
         "Test failed,expected status {expected_status}, but found {status}"
     );
 
-    let expected_response = expected_response.take_body()?.into_bytes().await?;
+    let expected_response = mem::take(expected_response.body_mut())
+        .into_bytes()
+        .await
+        .map_err(|_| Box::new(BodyReadError::new()) as BoxHttpError)?;
 
-    let response = response.take_body()?.into_bytes().await?;
+    let response = mem::take(response.body_mut())
+        .into_bytes()
+        .await
+        .map_err(|_| Box::new(BodyReadError::new()) as BoxHttpError)?;
 
     assert!(
         expected_response == response,

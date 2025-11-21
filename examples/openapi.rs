@@ -1,9 +1,12 @@
 //! Demonstrates the `#[skyzen::openapi]` attribute and router introspection APIs.
 
+use http::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::to_string;
 use skyzen::{
-    OpenApi, ToSchema, routing::{CreateRouteNode, Route, Router}, utils::Json
+    routing::{CreateRouteNode, Route, Router},
+    utils::Json,
+    OpenApi, ToSchema,
 };
 use skyzen_macros::OpenApiSchema;
 
@@ -55,12 +58,12 @@ fn log_openapi(spec: &OpenApi) {
 }
 
 #[skyzen::main]
-fn main() -> Router{
+fn main() -> Router {
     let redoc_endpoint = Route::new(("/hello".at(hello),)).openapi().redoc();
     let router = Route::new((
         "/hello".at(hello),
         // Serve interactive docs at GET /docs via utoipa-redoc.
-        "/docs".at(redoc_endpoint),
+        "/docs".endpoint(Method::GET, redoc_endpoint)
     ))
     .build();
     let openapi = router.openapi();

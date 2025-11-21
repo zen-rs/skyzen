@@ -1,22 +1,19 @@
 //! Look up the IP address of client.
 
 use std::{
-    fmt::Display,
     net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::{FromStr, Utf8Error},
 };
 
 use http::StatusCode;
+use http_kit::http_error;
 
 use crate::{extract::Extractor, header, header::HeaderName, Request};
 
-use std::error::Error as StdError;
-
-/// Raised when the connection metadata does not expose the remote address.
-#[derive(Debug)]
-#[allow(dead_code)]
-#[skyzen::error(message = "Missing remote addr, maybe it's not a tcp/udp connection")]
-pub struct MissingRemoteAddr;
+http_error!(/// Raised when the connection metadata does not expose the remote address.
+pub MissingRemoteAddr,
+StatusCode::INTERNAL_SERVER_ERROR, 
+"Missing remote addr, maybe it's not a tcp/udp connection");
 
 /// Extract the apparent address of the client.
 /// If the server is behind a proxy, you may obtain the proxy's address instead of the actual user's.
@@ -24,12 +21,13 @@ pub struct MissingRemoteAddr;
 pub struct PeerAddr(pub SocketAddr);
 
 impl Extractor for PeerAddr {
-    async fn extract(request: &mut Request) -> crate::Result<Self> {
+    type Error = MissingRemoteAddr;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         Ok(Self(
             request
                 .extensions()
                 .get::<Self>()
-                .ok_or_else(|| http_kit::Error::msg("Missing remote address"))?
+                .ok_or(MissingRemoteAddr::new())?
                 .0,
         ))
     }
@@ -50,11 +48,10 @@ impl_deref!(PeerAddr, SocketAddr);
 impl_deref!(ClientIp, IpAddr);
 
 impl Extractor for ClientIp {
-    async fn extract(request: &mut Request) -> crate::Result<Self> {
+    type Error = ClientIpError;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         if let Some(v) = request.headers().get(header::FORWARDED) {
-            if let Some(addr) = parse_forwarded(v.as_bytes())
-                .map_err(|error| http_kit::Error::new(error, StatusCode::BAD_REQUEST))?
-            {
+            if let Some(addr) = parse_forwarded(v.as_bytes())? {
                 return Ok(Self(addr));
             }
         }
@@ -63,9 +60,7 @@ impl Extractor for ClientIp {
             .headers()
             .get(HeaderName::from_static("x-forwarded-for"))
         {
-            if let Some(addr) = parse_x_forwarded_for(v.as_bytes())
-                .map_err(|error| http_kit::Error::new(error, StatusCode::BAD_REQUEST))?
-            {
+            if let Some(addr) = parse_x_forwarded_for(v.as_bytes())? {
                 return Ok(Self(addr));
             }
         }
@@ -74,7 +69,7 @@ impl Extractor for ClientIp {
             request
                 .extensions()
                 .get::<PeerAddr>()
-                .ok_or_else(|| http_kit::Error::msg("Missing remote address"))?
+                .ok_or(ClientIpError::MissingRemoteAddr)?
                 .0
                 .ip(),
         ))
@@ -84,40 +79,28 @@ impl Extractor for ClientIp {
 }
 
 /// An error occurred while extracting the client's IP.
-#[derive(Debug)]
-pub enum Error {
+
+#[skyzen::error(status = StatusCode::BAD_REQUEST)]
+pub enum ClientIpError {
     /// The header is not syntactically valid.
+    #[error("Invalid forwarded header")]
     InvalidForwardedHeader,
     /// The header is not a valid UTF-8 string.
-    InvalidUtf8(Utf8Error),
+    #[error("Invalid UTF-8 in forwarded header")]
+    InvalidUtf8(#[from] Utf8Error),
+    #[error("Failed to parse address")]
     /// Failed to parse the address.
-    AddrParseError(AddrParseError),
+    AddrParseError(#[from] AddrParseError),
+    /// The remote address is missing.
+    #[error("Missing remote addr, maybe it's not a tcp/udp connection")]
+    MissingRemoteAddr,
 }
 
-impl From<AddrParseError> for Error {
-    fn from(error: AddrParseError) -> Self {
-        Self::AddrParseError(error)
-    }
-}
-
-impl From<Utf8Error> for Error {
-    fn from(error: Utf8Error) -> Self {
-        Self::InvalidUtf8(error)
-    }
-}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Invalid forwarded header")
-    }
-}
-
-impl StdError for Error {}
-
-fn parse_forwarded(v: &[u8]) -> Result<Option<IpAddr>, Error> {
+fn parse_forwarded(v: &[u8]) -> Result<Option<IpAddr>, ClientIpError> {
     for v in v.split(|b| *b == b';') {
         for v in v.split(|b| *b == b',') {
-            let (mut key, mut value) = split_once(v, b'=').ok_or(Error::InvalidForwardedHeader)?;
+            let (mut key, mut value) =
+                split_once(v, b'=').ok_or(ClientIpError::InvalidForwardedHeader)?;
             trim(&mut key);
 
             if !key.eq_ignore_ascii_case(b"for") {
@@ -144,7 +127,7 @@ fn parse_forwarded(v: &[u8]) -> Result<Option<IpAddr>, Error> {
     Ok(None)
 }
 
-fn parse_x_forwarded_for(v: &[u8]) -> Result<Option<IpAddr>, Error> {
+fn parse_x_forwarded_for(v: &[u8]) -> Result<Option<IpAddr>, ClientIpError> {
     if let Some(mut v) = v.split(|v| *v == b',').next() {
         trim(&mut v);
         Ok(Some(IpAddr::from_str(std::str::from_utf8(v)?)?))

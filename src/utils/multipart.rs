@@ -5,14 +5,13 @@ use core::task::{Context, Poll};
 use crate::{
     extract::Extractor,
     header::{HeaderMap, CONTENT_TYPE},
-    Body, Request, ResultExt, StatusCode,
+    Body, Request, StatusCode,
 };
 use futures_core::Stream;
 use http_kit::utils::{Bytes, Stream as LiteStream};
+use http_kit::{http_error, BodyError};
 use multer::Field as MulterField;
 use pin_project_lite::pin_project;
-
-type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Extractor that parses `multipart/form-data` bodies.
 #[derive(Debug)]
@@ -46,11 +45,15 @@ impl Multipart {
     }
 }
 
+http_error!(
+    /// Error indicating that the multipart boundary is missing or invalid.
+    pub MultipartBoundaryError, StatusCode::UNSUPPORTED_MEDIA_TYPE, "Expected content type `multipart/form-data` with a boundary");
+
 impl Extractor for Multipart {
-    async fn extract(request: &mut Request) -> crate::Result<Self> {
-        let boundary = boundary_from_headers(request.headers())
-            .ok_or(MultipartBoundaryError)
-            .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+    type Error = MultipartBoundaryError;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        let boundary =
+            boundary_from_headers(request.headers()).ok_or(MultipartBoundaryError::new())?;
 
         let body = mem::replace(request.body_mut(), Body::empty());
         Ok(Self::from_parts(boundary, body))
@@ -178,15 +181,6 @@ impl std::error::Error for MultipartError {
     }
 }
 
-/// Error raised when `multipart/form-data` boundary metadata is missing or invalid.
-#[derive(Debug)]
-#[allow(dead_code)]
-#[skyzen::error(
-    status = StatusCode::UNSUPPORTED_MEDIA_TYPE,
-    message = "Expected content type `multipart/form-data` with a boundary"
-)]
-pub struct MultipartBoundaryError;
-
 fn boundary_from_headers(headers: &HeaderMap) -> Option<String> {
     let content_type = headers.get(CONTENT_TYPE)?.to_str().ok()?;
     multer::parse_boundary(content_type).ok()
@@ -206,7 +200,7 @@ impl RequestBodyStream {
 }
 
 impl Stream for RequestBodyStream {
-    type Item = Result<Bytes, BoxError>;
+    type Item = Result<Bytes, BodyError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut body = self.project().body;
@@ -216,8 +210,9 @@ impl Stream for RequestBodyStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{Multipart, MultipartBoundaryError};
+    use super::{Multipart};
     use crate::{header::HeaderValue, Body, Request};
+    use http_kit::HttpError;
     use skyzen_core::Extractor;
 
     #[tokio::test]
@@ -250,6 +245,5 @@ mod tests {
 
         let error = Multipart::extract(&mut request).await.unwrap_err();
         assert_eq!(error.status(), crate::StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        assert!(error.downcast_ref::<MultipartBoundaryError>().is_some());
     }
 }

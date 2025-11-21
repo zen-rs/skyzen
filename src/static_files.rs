@@ -6,7 +6,6 @@ use std::{
 
 use crate::{
     header::{self, HeaderValue},
-    openapi,
     routing::{IntoRouteNode, Params, Route, RouteNode},
     Endpoint, Method, Request, Response, StatusCode,
 };
@@ -17,6 +16,8 @@ use skyzen_core::Extractor;
 /// `StaticDir` implements [`IntoRouteNode`], so it can be dropped directly inside `Route::new`.
 /// Files are looked up relative to the provided directory, `..` segments are rejected,
 /// and directories fall back to `index.html` by default.
+/// 
+/// Note: `StaticDir` does not support `OpenAPI` documentation generation for its routes.
 #[derive(Debug, Clone)]
 pub struct StaticDir {
     mount_path: String,
@@ -62,13 +63,13 @@ impl IntoRouteNode for StaticDir {
                 "",
                 Method::GET,
                 endpoint.clone(),
-                openapi::describe_handler::<StaticDirEndpoint>(),
+                None
             ),
             RouteNode::new_endpoint(
                 wildcard_suffix,
                 Method::GET,
                 endpoint,
-                openapi::describe_handler::<StaticDirEndpoint>(),
+                None
             ),
         ));
 
@@ -76,14 +77,18 @@ impl IntoRouteNode for StaticDir {
     }
 }
 
-fn serve_static(directory: &Path, index_file: &str, params: &Params) -> http_kit::Result<Response> {
+async fn serve_static(
+    directory: &Path,
+    index_file: &str,
+    params: &Params,
+) -> Result<Response, StaticDirError> {
     let requested_path = params.get("path").unwrap_or("");
     let sanitized =
-        sanitize_relative_path(requested_path).ok_or_else(|| invalid_path_error(requested_path))?;
+        sanitize_relative_path(requested_path).ok_or(StaticDirError::InvalidPath)?;
     let file_path = resolve_target_path(directory, &sanitized, index_file)
-        .ok_or_else(|| file_not_found_error(requested_path))?;
+        .ok_or(StaticDirError::FileNotFound)?;
 
-    let data = read_file(&file_path)?;
+    let data = read_file(&file_path).await?;
     let mut response = Response::new(http_kit::Body::from(data));
 
     if let Some(value) = guess_content_type(&file_path) {
@@ -93,27 +98,12 @@ fn serve_static(directory: &Path, index_file: &str, params: &Params) -> http_kit
     Ok(response)
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>, http_kit::Error> {
-    std::fs::read(path).map_err(|error| map_io_error(&error, path))
+async fn read_file(path: &Path) -> Result<Vec<u8>, StaticDirError> {
+    async_fs::read(path)
+        .await
+        .map_err(StaticDirError::IoError)
 }
 
-fn map_io_error(error: &io::Error, path: &Path) -> http_kit::Error {
-    let status = if error.kind() == io::ErrorKind::NotFound {
-        StatusCode::NOT_FOUND
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-    http_kit::Error::msg(format!("Failed to read `{}`: {error}", path.display())).set_status(status)
-}
-
-fn invalid_path_error(path: &str) -> http_kit::Error {
-    http_kit::Error::msg(format!("Invalid static path `{path}`"))
-        .set_status(StatusCode::BAD_REQUEST)
-}
-
-fn file_not_found_error(path: &str) -> http_kit::Error {
-    http_kit::Error::msg(format!("File `{path}` not found")).set_status(StatusCode::NOT_FOUND)
-}
 
 fn guess_content_type(path: &Path) -> Option<HeaderValue> {
     mime_guess::from_path(path)
@@ -174,10 +164,25 @@ struct StaticDirEndpoint {
     index_file: Arc<String>,
 }
 
+/// Errors that can occur when serving static files.
+#[skyzen::error]
+pub enum StaticDirError {
+    /// The requested path is invalid.
+    #[error("Invalid static path", status = StatusCode::BAD_REQUEST)]
+    InvalidPath,
+    /// The requested file was not found.
+    #[error("File not found", status = StatusCode::NOT_FOUND)]
+    FileNotFound,
+    /// An I/O error occurred while reading the file.
+    #[error("Failed to read file: {0}", status = StatusCode::INTERNAL_SERVER_ERROR)]
+    IoError(#[from] io::Error),
+}
+
 impl Endpoint for StaticDirEndpoint {
-    async fn respond(&mut self, request: &mut Request) -> http_kit::Result<Response> {
-        let params = Params::extract(request).await?;
-        serve_static(self.directory.as_ref(), self.index_file.as_ref(), &params)
+    type Error = StaticDirError;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        let params = Params::extract(request).await.unwrap(); // Params extractor never fails, so unwrap is safe
+        serve_static(self.directory.as_ref(), self.index_file.as_ref(), &params).await
     }
 }
 

@@ -1,6 +1,10 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    convert::Infallible,
+    ops::{Deref, DerefMut},
+};
 
-use http_kit::{Middleware, Request, Response, Result};
+use http::StatusCode;
+use http_kit::{http_error, middleware::MiddlewareError, Middleware, Request, Response};
 use skyzen_core::Extractor;
 
 /// Share the state of application.
@@ -20,32 +24,32 @@ impl<T: Send + Sync + Clone + 'static> DerefMut for State<T> {
     }
 }
 
+http_error!(
+    /// An error occurred when extracting a missing state from the request extensions.
+    pub StateNotExist, StatusCode::INTERNAL_SERVER_ERROR, "This state does not exist"
+);
+
 impl<T: Send + Sync + Clone + 'static> Extractor for State<T> {
-    async fn extract(request: &mut Request) -> Result<Self> {
+    type Error = StateNotExist;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         request
             .extensions()
             .get::<Self>()
             .cloned()
-            .ok_or_else(|| http_kit::Error::msg("State not found"))
+            .ok_or(StateNotExist::new())
     }
 }
 
 impl<T: Send + Sync + Clone + 'static> Middleware for State<T> {
-    async fn handle(
+    type Error = Infallible;
+    async fn handle<N: http_kit::Endpoint>(
         &mut self,
         request: &mut Request,
-        mut next: impl http_kit::Endpoint,
-    ) -> Result<Response> {
+        mut next: N,
+    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
         request.extensions_mut().insert(self.clone());
-        next.respond(request).await
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)
     }
 }
-
-/// Error occurs when extracting a missing state from the request extensions.
-#[derive(Debug)]
-#[allow(dead_code)]
-#[skyzen::error(
-    status = skyzen::StatusCode::INTERNAL_SERVER_ERROR,
-    message = "This state does not exist"
-)]
-pub struct StateNotExist;

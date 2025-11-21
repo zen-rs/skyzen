@@ -23,11 +23,12 @@ macro_rules! impl_base_responder {
     ($($ty:ty),*) => {
         $(
             impl Responder for $ty {
+                type Error = core::convert::Infallible;
                 fn respond_to(
                     self,
                     _request: &http_kit::Request,
                     response:&mut http_kit::Response,
-                ) -> http_kit::Result<()> {
+                ) -> Result<(), Self::Error> {
                     response.headers_mut().insert(http_kit::header::CONTENT_TYPE,http_kit::header::HeaderValue::from_static("application/octet-stream"));
                     *response.body_mut() = http_kit::Body::from(self);
                     Ok(())
@@ -41,11 +42,12 @@ macro_rules! impl_base_utf8_responder {
     ($($ty:ty),*) => {
         $(
             impl Responder for $ty {
+                type Error = core::convert::Infallible;
                 fn respond_to(
                     self,
                     _request: &http_kit::Request,
                     response: &mut http_kit::Response,
-                ) -> http_kit::Result<()> {
+                ) -> Result<(), Self::Error> {
                     response.headers_mut().insert(http_kit::header::CONTENT_TYPE,http_kit::header::HeaderValue::from_static("text/plain; charset=utf-8"));
                     *response.body_mut() = http_kit::Body::from(self);
                     Ok(())

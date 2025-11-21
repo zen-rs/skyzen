@@ -27,17 +27,17 @@
 mod channel;
 pub use channel::{SendError, Sender};
 
+use futures_util::TryStreamExt;
 use itoa::Buffer;
 
 use http_kit::{
-    header::{self, HeaderValue},
-    utils::Stream,
-    Body, Request, Response,
+    Body, BodyError, Request, Response, header::{self, HeaderValue}, utils::Stream
 };
 use pin_project_lite::pin_project;
 use serde::Serialize;
 use skyzen_core::Responder;
 use std::{
+    convert::Infallible,
     marker::PhantomData,
     pin::Pin,
     task::{ready, Context, Poll},
@@ -189,12 +189,12 @@ impl<S, E> IntoStream<S, E> {
 impl<S, E> Stream for IntoStream<S, E>
 where
     S: Stream<Item = Result<Event, E>>,
-    E: Into<anyhow::Error>,
+    E: core::error::Error + Send + Sync + 'static,
 {
-    type Item = Result<Vec<u8>, anyhow::Error>;
+    type Item = Result<Vec<u8>, E>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(ready!(self.project().stream.poll_next(cx)))
-            .map(|result| result.map(|data| data.map(Event::finalize).map_err(Into::into)))
+            .map(|result| result.map(|data| data.map(Event::finalize)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -213,16 +213,19 @@ impl Sse {
     pub fn from_stream<S, E>(stream: S) -> Self
     where
         S: Send + Sync + Stream<Item = Result<Event, E>> + 'static,
-        E: Send + Sync + Into<anyhow::Error> + 'static,
+        E: Send + Sync + core::error::Error + 'static,
     {
         Self {
-            stream: Body::from_stream(IntoStream::new(stream)),
+            stream: Body::from_stream(IntoStream::new(stream).map_err(|error|{
+                BodyError::Other(Box::new(error)) // TODO: improve error handling, currently we just box the error
+            })),
         }
     }
 }
 
 impl Responder for Sse {
-    fn respond_to(self, _request: &Request, response: &mut Response) -> http_kit::Result<()> {
+    type Error = Infallible;
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),

@@ -18,7 +18,7 @@
 //! }
 //! ```
 
-use crate::{header, Method, Request, Response, Result, StatusCode};
+use crate::{header, Method, Request, Response, StatusCode};
 use async_tungstenite::{
     tokio::TokioAdapter,
     tungstenite::{
@@ -27,7 +27,6 @@ use async_tungstenite::{
     },
     WebSocketStream,
 };
-use http_kit::Error;
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper_util::rt::TokioIo;
 use skyzen_core::{Extractor, Responder};
@@ -35,14 +34,42 @@ use tokio::task;
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-fn bad_request(message: &str) -> Error {
-    Error::msg(message.to_string()).set_status(StatusCode::BAD_REQUEST)
+/// Errors that can occur during WebSocket upgrade.
+#[skyzen::error(status = StatusCode::BAD_REQUEST)]
+pub enum WebSocketUpgradeError{
+    /// The HTTP method is not GET.
+    #[error("Method not allowed")]
+    MethodNotAllowed,
+
+    /// The `Upgrade` header is missing.
+    #[error("Missing upgrade header")]
+    MissingUpgradeHeader,
+
+    /// The `Connection` header is missing.
+    #[error("Missing Connection header for WebSocket request")]
+    MissingConnectionHeader,
+
+    /// The `Sec-WebSocket-Key` header is missing.
+    #[error("Missing Sec-WebSocket-Key header")]
+    MissingSecWebSocketKey,
+
+    /// The `Upgrade` header is not `websocket`.
+    #[error("Upgrade header must be `websocket`")]
+    InvalidUpgradeHeader,
+
+    /// The `Connection` header is invalid.
+    #[error("Invalid Connection header for WebSocket request")]
+    InvalidConnectionHeader,
+
+    /// The `Sec-WebSocket-Version` header is not `13`.
+    #[error("Unsupported Sec-WebSocket-Version. Only version 13 is accepted")]
+    UnsupportedVersion,
+    /// The `OnUpgrade` extension is missing.
+    #[error("Missing OnUpgrade extension")]
+    MissingOnUpgrade
 }
 
-fn missing_upgrade() -> Error {
-    Error::msg("WebSocket upgrades are not supported on this transport")
-        .set_status(StatusCode::UPGRADE_REQUIRED)
-}
+
 
 fn header_has_token(value: &header::HeaderValue, token: &str) -> bool {
     value
@@ -68,7 +95,7 @@ fn parse_protocols(value: Option<&header::HeaderValue>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn compute_accept_header(key: &header::HeaderValue) -> Result<header::HeaderValue> {
+fn compute_accept_header(key: &header::HeaderValue) -> header::HeaderValue {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use sha1::{Digest, Sha1};
@@ -78,10 +105,7 @@ fn compute_accept_header(key: &header::HeaderValue) -> Result<header::HeaderValu
     hasher.update(GUID.as_bytes());
     let digest = hasher.finalize();
     let encoded = STANDARD.encode(digest);
-    header::HeaderValue::from_str(&encoded).map_err(|_| {
-        Error::msg("Failed to encode websocket accept key")
-            .set_status(StatusCode::INTERNAL_SERVER_ERROR)
-    })
+    header::HeaderValue::from_str(&encoded).expect("Fail to create Sec-WebSocket-Accept header")
 }
 
 /// Stream representing a WebSocket connection handled by `async-tungstenite`.
@@ -148,48 +172,45 @@ impl WebSocketUpgrade {
 type WebSocketCallbackFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 type DynCallback = Box<dyn FnOnce(WebSocket) -> WebSocketCallbackFuture + Send + Sync>;
 
+
 impl Extractor for WebSocketUpgrade {
-    async fn extract(request: &mut Request) -> Result<Self> {
+    type Error = WebSocketUpgradeError;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         if request.method() != Method::GET {
-            return Err(Error::msg("WebSocket connections must use GET")
-                .set_status(StatusCode::METHOD_NOT_ALLOWED));
+            return Err(WebSocketUpgradeError::MethodNotAllowed);
         }
         let (key, requested_protocols) = {
             let headers = request.headers();
 
             let key = headers
                 .get(header::SEC_WEBSOCKET_KEY)
-                .ok_or_else(|| bad_request("Missing Sec-WebSocket-Key header"))?
+                .ok_or_else(|| WebSocketUpgradeError::MissingSecWebSocketKey)?
                 .clone();
 
             let connection = headers
                 .get(header::CONNECTION)
-                .ok_or_else(|| bad_request("Missing Connection header"))?;
+                .ok_or_else(|| WebSocketUpgradeError::MissingConnectionHeader)?;
 
             if !header_has_token(connection, "upgrade") {
-                return Err(bad_request(
-                    "Invalid Connection header for WebSocket request",
-                ));
+                return Err(WebSocketUpgradeError::MissingUpgradeHeader);
             }
 
             let upgrade_header = headers
                 .get(header::UPGRADE)
-                .ok_or_else(|| bad_request("Missing Upgrade header"))?;
+                .ok_or_else(|| WebSocketUpgradeError::MissingUpgradeHeader)?;
 
             if !upgrade_header
                 .to_str()
                 .map(|value| value.eq_ignore_ascii_case("websocket"))
                 .unwrap_or(false)
             {
-                return Err(bad_request("Upgrade header must be `websocket`"));
+                return Err(WebSocketUpgradeError::InvalidUpgradeHeader);
             }
 
             match headers.get(header::SEC_WEBSOCKET_VERSION) {
                 Some(version) if version == "13" => {}
                 _ => {
-                    return Err(bad_request(
-                        "Unsupported Sec-WebSocket-Version. Only version 13 is accepted",
-                    ));
+                    return Err(WebSocketUpgradeError::UnsupportedVersion);
                 }
             }
 
@@ -201,7 +222,7 @@ impl Extractor for WebSocketUpgrade {
         let on_upgrade = request
             .extensions_mut()
             .remove::<OnUpgrade>()
-            .ok_or_else(missing_upgrade)?;
+            .ok_or_else(|| WebSocketUpgradeError::MissingOnUpgrade)?;
 
         Ok(Self {
             key,
@@ -229,8 +250,13 @@ impl std::fmt::Debug for WebSocketUpgradeResponder {
 }
 
 impl Responder for WebSocketUpgradeResponder {
-    fn respond_to(mut self, _request: &Request, response: &mut Response) -> Result<()> {
-        let accept = compute_accept_header(&self.upgrade.key)?;
+    type Error = WebSocketUpgradeError;
+    fn respond_to(
+        mut self,
+        _request: &Request,
+        response: &mut Response,
+    ) -> Result<(), Self::Error> {
+        let accept = compute_accept_header(&self.upgrade.key);
         *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
 
         {

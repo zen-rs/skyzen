@@ -67,7 +67,7 @@ simple_schema!(
         "Opaque HTTP response. Prefer typed responders for structured data."
     )
 );
-simple_schema!(http_kit::Error, string_schema("Framework error variant"));
+simple_schema!(skyzen::Error, string_schema("Framework error variant"));
 simple_schema!(
     Params,
     object_schema("Params", "Route parameters extracted from the current path")

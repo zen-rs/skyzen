@@ -1,10 +1,9 @@
 use std::{
-    pin::Pin,
-    task::{ready, Context, Poll},
+    convert::Infallible, pin::Pin, task::{Context, Poll, ready}
 };
 
 use async_channel::unbounded;
-use http_kit::utils::Stream;
+use http_kit::{http_error, utils::Stream};
 use pin_project_lite::pin_project;
 
 use super::{Event, Sse};
@@ -17,11 +16,9 @@ pub struct Sender {
     sender: async_channel::Sender<Event>,
 }
 
-/// Error returned when sending an SSE event fails because the stream is gone.
-#[derive(Debug)]
-#[allow(dead_code)]
-#[skyzen::error(message = "Error type that fails to send an event")]
-pub struct SendError;
+http_error!(
+    /// An error occurred when sending an event to the SSE channel.
+    pub SendError, http_kit::StatusCode::INTERNAL_SERVER_ERROR, "Failed to send event to SSE channel");
 
 pin_project! {
     struct Receiver{
@@ -37,7 +34,7 @@ impl Receiver {
 }
 
 impl Stream for Receiver {
-    type Item = Result<Event, anyhow::Error>;
+    type Item = Result<Event, Infallible>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(ready!(self.project().receiver.poll_next(cx)).map(Ok))
     }
@@ -55,7 +52,7 @@ impl Sender {
     ///
     /// Returns a [`SendError`] if the event cannot be sent to the stream, for example if the receiver has been dropped.
     pub async fn send(&self, event: Event) -> Result<(), SendError> {
-        self.sender.send(event).await.map_err(|_| SendError)
+        self.sender.send(event).await.map_err(|_| SendError::new())
     }
 
     /// Send an event with a data payload to the stream.

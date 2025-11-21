@@ -9,6 +9,8 @@ use super::{BoxEndpoint, EndpointFactory, Params, Route, RouteNode, RouteNodeTyp
 use crate::openapi::RouteOpenApiEntry;
 use crate::{openapi::OpenApi, Endpoint, Method, Request, Response, StatusCode};
 
+use http_kit::error::BoxHttpError;
+use http_kit::http_error;
 use matchit::Match;
 use skyzen_core::Extractor;
 
@@ -73,19 +75,17 @@ impl Debug for Router {
     }
 }
 
+http_error!(pub NotFound, StatusCode::NOT_FOUND, "Route not found.");
+
+#[derive(Debug, Clone, Copy)]
 struct NotFoundEndpoint;
 
 impl Endpoint for NotFoundEndpoint {
-    async fn respond(&mut self, _request: &mut Request) -> http_kit::Result<Response> {
-        Err(http_kit::Error::msg("Route not found").set_status(StatusCode::NOT_FOUND))
+    type Error = BoxHttpError;
+    async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
+        Err(Box::new(NotFound::new()) as BoxHttpError)
     }
 }
-
-/// No route is matched.
-#[derive(Debug)]
-#[allow(dead_code)]
-#[skyzen::error(status = StatusCode::NOT_FOUND, message = "Route not found")]
-pub struct RouteNotFound;
 
 impl Router {
     fn search<'app, 'path, 'temp>(
@@ -107,7 +107,7 @@ impl Router {
         }
     }
 
-    async fn call(&self, request: &mut Request) -> crate::Result<Response> {
+    async fn call(&self, request: &mut Request) -> Result<Response, BoxHttpError> {
         if self.programmable_router_enabled {
             request.extensions_mut().insert(self.clone());
         }
@@ -139,7 +139,7 @@ impl Router {
     ///
     /// Cloning a router is cheap, so prefer `router.clone().go(request)` when invoking it from
     /// tests or asynchronous workers.
-    pub async fn go(&self, mut request: Request) -> crate::Result<Response> {
+    pub async fn go(&self, mut request: Request) -> Result<Response, BoxHttpError> {
         self.call(&mut request).await
     }
 
@@ -168,25 +168,19 @@ impl Router {
     }
 }
 
+http_error!(pub RouterNotExist, StatusCode::INTERNAL_SERVER_ERROR, "This programmable router does not exist. Please check whether you have enabled the programmable router.");
+
 impl Extractor for Router {
-    async fn extract(request: &mut Request) -> crate::Result<Self> {
+    type Error = RouterNotExist;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         let router = request
             .extensions()
             .get::<Self>()
             .cloned()
-            .ok_or_else(|| http_kit::Error::msg("Router not found"))?;
+            .ok_or(RouterNotExist::new())?;
         Ok(router)
     }
 }
-
-/// Error occurs if router extraction fails while programmable router is disabled.
-#[derive(Debug)]
-#[allow(dead_code)]
-#[skyzen::error(
-    status = StatusCode::INTERNAL_SERVER_ERROR,
-    message = "This programmable router does not exist. Please check whether you have enabled the programmable router."
-)]
-pub struct RouterNotExist;
 
 /// Errors produced when constructing a [`Router`] from a [`Route`](crate::routing::Route).
 #[derive(Debug)]
@@ -234,7 +228,9 @@ fn flatten(
                 let entry = buf.entry(path.clone()).or_default();
 
                 entry.push((method.clone(), App::new(endpoint_factory)));
-                openapi_entries.push(RouteOpenApiEntry::new(path, method, openapi));
+                if let Some(openapi) = openapi {
+                    openapi_entries.push(RouteOpenApiEntry::new(path, method, openapi));
+                }
             }
         }
     }
@@ -333,7 +329,8 @@ fn finalize_router(
 }
 
 impl Endpoint for Router {
-    async fn respond(&mut self, request: &mut Request) -> http_kit::Result<Response> {
+    type Error = BoxHttpError;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         log::info!(method = request.method().as_str(),path=request.uri().path() ;"Request Received");
         Ok(self.call(request).await.unwrap_or_else(|error| {
             let mut response = Response::new(http_kit::Body::empty());
@@ -408,12 +405,19 @@ mod tests {
     struct HeaderMiddleware;
 
     impl Middleware for HeaderMiddleware {
-        async fn handle(
+        type Error = std::convert::Infallible;
+        async fn handle<N: crate::Endpoint>(
             &mut self,
             request: &mut crate::Request,
-            mut next: impl crate::Endpoint,
-        ) -> http_kit::Result<Response> {
-            let mut response = next.respond(request).await?;
+            mut next: N,
+        ) -> std::result::Result<
+            Response,
+            http_kit::middleware::MiddlewareError<N::Error, Self::Error>,
+        > {
+            let mut response = next
+                .respond(request)
+                .await
+                .map_err(http_kit::middleware::MiddlewareError::Endpoint)?;
             response.headers_mut().insert(
                 header::HeaderName::from_static("x-middleware"),
                 header::HeaderValue::from_static("applied"),

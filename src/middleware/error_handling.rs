@@ -1,6 +1,6 @@
 use std::{fmt::Debug, future::Future, sync::Arc};
 
-use http_kit::{Middleware, Request, Response};
+use http_kit::{Middleware, Request, Response, error::BoxHttpError, middleware::MiddlewareError};
 use skyzen_core::Responder;
 
 /// Handler error with an asynchronous function
@@ -24,7 +24,7 @@ impl<F> Debug for ErrorHandlingMiddleware<F> {
 
 impl<F, Fut, Res> ErrorHandlingMiddleware<F>
 where
-    F: 'static + Send + Sync + Fn(crate::Error) -> Fut,
+    F: 'static + Send + Sync + Fn(BoxHttpError) -> Fut,
     Fut: Send + Sync + Future<Output = Res>,
     Res: Responder,
 {
@@ -36,22 +36,27 @@ where
 
 impl<F, Fut, Res> Middleware for ErrorHandlingMiddleware<F>
 where
-    F: 'static + Send + Sync + Fn(crate::Error) -> Fut,
+    F: 'static + Send + Sync + Fn(BoxHttpError) -> Fut,
     Fut: Send + Sync + Future<Output = Res>,
     Res: Responder,
 {
-    async fn handle(
+    type Error = Res::Error;
+    async fn handle<N: http_kit::Endpoint>(
         &mut self,
         request: &mut Request,
-        mut next: impl http_kit::Endpoint,
-    ) -> http_kit::Result<Response> {
-        let result = next.respond(request).await;
-        if let Err(error) = result {
-            let mut response = Response::new(http_kit::Body::empty());
-            (self.f)(error).await.respond_to(request, &mut response)?;
-            return Ok(response);
+        mut next: N,
+    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
+        match next.respond(request).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let mut response = Response::new(http_kit::Body::empty());
+                // We have to erase the error here, since we cannot write Fn(impl HttpError) -> ...
+                (self.f)(Box::new(error) as BoxHttpError)
+                    .await
+                    .respond_to(request, &mut response)
+                    .map_err(MiddlewareError::Middleware)?;
+                Ok(response)
+            }
         }
-
-        result
     }
 }

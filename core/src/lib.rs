@@ -13,3 +13,5 @@ mod responder;
 pub use responder::Responder;
 mod server;
 pub use server::Server;
+pub mod error;
+pub use error::*;

@@ -9,7 +9,7 @@ use std::{
 
 use http_kit::{
     header::{self, HeaderValue},
-    Request, Response, ResultExt,
+    http_error, Request, Response,
 };
 use skyzen_core::{Extractor, Responder};
 
@@ -43,24 +43,39 @@ impl FromStr for CookieJar {
     }
 }
 
+http_error!(
+    /// Error occurs when parsing cookies from request headers.
+    pub CookieParseError, StatusCode::BAD_REQUEST, "Failed to parse cookies"
+);
+
 impl Extractor for CookieJar {
-    async fn extract(request: &mut Request) -> http_kit::Result<Self> {
+    type Error = CookieParseError;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         let cookie = request
             .headers()
             .get(header::COOKIE)
             .map_or(&[] as &[u8], |v| v.as_bytes());
-        let cookies = core::str::from_utf8(cookie).status(StatusCode::BAD_REQUEST)?;
-        Ok(cookies.parse().status(StatusCode::BAD_REQUEST)?)
+        let cookies = core::str::from_utf8(cookie)
+            .map_err(|_| CookieParseError::new())?
+            .parse::<Self>()
+            .map_err(|_| CookieParseError::new())?;
+        Ok(cookies)
     }
 }
 
+http_error!(
+    /// Error occurs when setting cookies to response headers.
+    pub CookieSetError, StatusCode::SERVICE_UNAVAILABLE, "Failed to set cookies"
+);
+
 impl Responder for CookieJar {
-    fn respond_to(self, _request: &Request, response: &mut Response) -> http_kit::Result<()> {
+    type Error = CookieSetError;
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         for cookie in self.0.delta() {
             response.headers_mut().append(
                 header::SET_COOKIE,
                 HeaderValue::try_from(cookie.encoded().to_string())
-                    .status(StatusCode::BAD_REQUEST)?,
+                    .map_err(|_| CookieSetError::new())?,
             ); // TODO: reduce unnecessary header value check
         }
         Ok(())

@@ -1,5 +1,4 @@
 use std::{
-    fmt,
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -8,6 +7,7 @@ use std::{
 use crate::Endpoint;
 use futures_util::{stream::MapOk, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
+use http_kit::{BodyError, error::BoxHttpError};
 use hyper::{
     body::{Frame, Incoming},
     service::Service,
@@ -16,34 +16,6 @@ use hyper_util::{rt::TokioIo, server::conn::auto::Builder as HyperBuilder};
 use tokio::{net::TcpListener, signal};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug)]
-struct ServiceError(Box<dyn http_kit::HttpError>);
-
-impl ServiceError {
-    fn new(error: crate::Error) -> Self {
-        Self(error.into_inner())
-    }
-}
-
-impl From<crate::Error> for ServiceError {
-    fn from(error: crate::Error) -> Self {
-        Self::new(error)
-    }
-}
-
-impl fmt::Display for ServiceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl std::error::Error for ServiceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.source()
-    }
-}
-
-type BoxedStdError = ServiceError;
 type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
 
 /// Initialize the tracing subscriber + color-eyre once per process.
@@ -256,7 +228,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
     type Response = hyper::Response<
         StreamBody<MapOk<crate::Body, fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>>>,
     >;
-    type Error = BoxedStdError;
+    type Error = BoxHttpError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
     fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
@@ -264,11 +236,15 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
             let mut request: crate::Request =
-                crate::Request::from(req.map(BodyDataStream::new).map(crate::Body::from_stream));
+                crate::Request::from(req.map(BodyDataStream::new).map(|body| {
+                    crate::Body::from_stream(body.map_err(|error|{
+                        BodyError::Other(Box::new(error))
+                    }))
+                }));
             request.extensions_mut().insert(on_upgrade);
             let response = endpoint.respond(&mut request).await;
-            let response: Result<hyper::Response<crate::Body>, BoxedStdError> =
-                response.map_err(ServiceError::from);
+            let response: Result<hyper::Response<crate::Body>, Self::Error> =
+                response.map_err(|error| Box::new(error) as BoxHttpError);
 
             response.map(|response| {
                 response.map(|body| {
