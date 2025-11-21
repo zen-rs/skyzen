@@ -3,6 +3,7 @@ use serde::Serialize;
 use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType, Type};
 use utoipa::openapi::RefOr;
 
+use crate::ignore_openapi;
 use crate::{
     extract::{
         client_ip::{ClientIp, PeerAddr},
@@ -10,7 +11,7 @@ use crate::{
     },
     openapi::SchemaRef,
     routing::Params,
-    utils::State,
+    utils::{cookie::CookieJar, State},
 };
 
 #[cfg(feature = "json")]
@@ -66,6 +67,8 @@ simple_schema!(
     PeerAddr,
     string_schema("Peer socket address reported by the transport")
 );
+
+ignore_openapi!(CookieJar);
 
 impl<T> utoipa::PartialSchema for Query<T>
 where

@@ -80,12 +80,9 @@ pub fn openapi(_attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(tokens) => tokens,
             Err(error) => error.to_compile_error().into(),
         },
-        other => Error::new_spanned(
-            other,
-            "#[skyzen::openapi] may only be applied to functions",
-        )
-        .to_compile_error()
-        .into(),
+        other => Error::new_spanned(other, "#[skyzen::openapi] may only be applied to functions")
+            .to_compile_error()
+            .into(),
     }
 }
 
