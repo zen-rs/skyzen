@@ -63,7 +63,7 @@ fn main() -> Router {
     let router = Route::new((
         "/hello".at(hello),
         // Serve interactive docs at GET /docs via utoipa-redoc.
-        "/docs".endpoint(Method::GET, redoc_endpoint)
+        "/docs".endpoint(Method::GET, redoc_endpoint),
     ))
     .build();
     let openapi = router.openapi();

@@ -36,7 +36,7 @@ const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// Errors that can occur during WebSocket upgrade.
 #[skyzen::error(status = StatusCode::BAD_REQUEST)]
-pub enum WebSocketUpgradeError{
+pub enum WebSocketUpgradeError {
     /// The HTTP method is not GET.
     #[error("Method not allowed")]
     MethodNotAllowed,
@@ -66,10 +66,8 @@ pub enum WebSocketUpgradeError{
     UnsupportedVersion,
     /// The `OnUpgrade` extension is missing.
     #[error("Missing OnUpgrade extension")]
-    MissingOnUpgrade
+    MissingOnUpgrade,
 }
-
-
 
 fn header_has_token(value: &header::HeaderValue, token: &str) -> bool {
     value
@@ -171,7 +169,6 @@ impl WebSocketUpgrade {
 
 type WebSocketCallbackFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 type DynCallback = Box<dyn FnOnce(WebSocket) -> WebSocketCallbackFuture + Send + Sync>;
-
 
 impl Extractor for WebSocketUpgrade {
     type Error = WebSocketUpgradeError;

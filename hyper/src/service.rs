@@ -5,7 +5,7 @@ use hyper::{
     service::Service,
 };
 
-use skyzen::{BodyError, Endpoint, utils::Bytes};
+use skyzen::{utils::Bytes, BodyError, Endpoint};
 use std::{future::Future, pin::Pin};
 
 type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
@@ -33,10 +33,10 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
             let mut request: skyzen::Request =
-                skyzen::Request::from(req.map(BodyDataStream::new).map(|body|{
-                    skyzen::Body::from_stream(body.map_err(|error|{
-                        BodyError::Other(Box::new(error))
-                    }))
+                skyzen::Request::from(req.map(BodyDataStream::new).map(|body| {
+                    skyzen::Body::from_stream(
+                        body.map_err(|error| BodyError::Other(Box::new(error))),
+                    )
                 }));
             request.extensions_mut().insert(on_upgrade);
             let response: Result<skyzen::Response, _> = endpoint.respond(&mut request).await;

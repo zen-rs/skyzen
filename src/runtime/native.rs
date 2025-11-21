@@ -7,7 +7,7 @@ use std::{
 use crate::Endpoint;
 use futures_util::{stream::MapOk, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
-use http_kit::{BodyError, error::BoxHttpError};
+use http_kit::{error::BoxHttpError, BodyError};
 use hyper::{
     body::{Frame, Incoming},
     service::Service,
@@ -237,9 +237,9 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
             let on_upgrade = hyper::upgrade::on(&mut req);
             let mut request: crate::Request =
                 crate::Request::from(req.map(BodyDataStream::new).map(|body| {
-                    crate::Body::from_stream(body.map_err(|error|{
-                        BodyError::Other(Box::new(error))
-                    }))
+                    crate::Body::from_stream(
+                        body.map_err(|error| BodyError::Other(Box::new(error))),
+                    )
                 }));
             request.extensions_mut().insert(on_upgrade);
             let response = endpoint.respond(&mut request).await;

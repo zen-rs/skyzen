@@ -31,7 +31,9 @@ use futures_util::TryStreamExt;
 use itoa::Buffer;
 
 use http_kit::{
-    Body, BodyError, Request, Response, header::{self, HeaderValue}, utils::Stream
+    header::{self, HeaderValue},
+    utils::Stream,
+    Body, BodyError, Request, Response,
 };
 use pin_project_lite::pin_project;
 use serde::Serialize;
@@ -216,7 +218,7 @@ impl Sse {
         E: Send + Sync + core::error::Error + 'static,
     {
         Self {
-            stream: Body::from_stream(IntoStream::new(stream).map_err(|error|{
+            stream: Body::from_stream(IntoStream::new(stream).map_err(|error| {
                 BodyError::Other(Box::new(error)) // TODO: improve error handling, currently we just box the error
             })),
         }

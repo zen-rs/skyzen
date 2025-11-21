@@ -33,7 +33,8 @@ pub use static_files::StaticDir;
 
 #[doc(inline)]
 pub use http_kit::{
-    header, Body, Endpoint, HttpError, Method, Middleware, Request, Response, StatusCode, Uri,BodyError
+    header, Body, BodyError, Endpoint, HttpError, Method, Middleware, Request, Response,
+    StatusCode, Uri,
 };
 #[doc(inline)]
 pub use routing::{CreateRouteNode, Route};

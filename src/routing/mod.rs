@@ -355,10 +355,10 @@ macro_rules! impl_routes_tuple {
 
 tuples!(impl_routes_tuple);
 
-fn endpoint_node_from_handler<P, H, T,R>(path: P, method: Method, handler: H) -> RouteNode
+fn endpoint_node_from_handler<P, H, T, R>(path: P, method: Method, handler: H) -> RouteNode
 where
     P: Into<String>,
-    H: Handler<T,R>,
+    H: Handler<T, R>,
     T: Extractor,
     R: Responder,
 {
@@ -383,7 +383,7 @@ fn collect_openapi_entries(
                 method, openapi, ..
             } => {
                 if let Some(openapi) = openapi {
-                buf.push(RouteOpenApiEntry::new(path, method.clone(), *openapi));
+                    buf.push(RouteOpenApiEntry::new(path, method.clone(), *openapi));
                 }
             }
         }
@@ -395,8 +395,9 @@ pub trait CreateRouteNode: Sized {
     /// Attach a GET handler to the path.
     fn at<H, T, R>(self, handler: H) -> RouteNode
     where
-        H: Handler<T,R>,
-        T: Extractor,R:Responder;
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
 
     /// Alias for [`CreateRouteNode::at`].
     fn get<H, T, R>(self, handler: H) -> RouteNode
@@ -415,12 +416,12 @@ pub trait CreateRouteNode: Sized {
         T: Extractor,
         R: Responder;
 
-        /// Attach a PUT handler to the path.
-        fn put<H, T , R>(self, handler: H) -> RouteNode
-        where
-            H: Handler<T, R>,
-            T: Extractor,
-            R: Responder;
+    /// Attach a PUT handler to the path.
+    fn put<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
 
     /// Attach a DELETE handler to the path.
     fn delete<H, T, R>(self, handler: H) -> RouteNode
@@ -433,7 +434,7 @@ pub trait CreateRouteNode: Sized {
     fn route(self, routes: impl Routes) -> RouteNode;
 
     /// Attach an endpoint at the specified method and path.
-    /// 
+    ///
     /// Note: This is a low-level method; prefer using `.at`, `.post`, etc. for common HTTP methods.
     /// Especially when using OpenAPI, those methods will automatically generate documentation.
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
@@ -460,43 +461,46 @@ where
     P: Into<String>,
 {
     fn at<H, T, R>(self, handler: H) -> RouteNode
-        where
-            H: Handler<T,R>,
-            T: Extractor,R:Responder {
-                endpoint_node_from_handler(self, Method::GET, handler)
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::GET, handler)
     }
 
     fn post<H, T, R>(self, handler: H) -> RouteNode
-        where
-            H: Handler<T, R>,
-            T: Extractor,
-            R: Responder {
-                endpoint_node_from_handler(self, Method::POST, handler)
-
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::POST, handler)
     }
 
-    fn put<H, T , R>(self, handler: H) -> RouteNode
-            where
-                H: Handler<T, R>,
-                T: Extractor,
-                R: Responder {
-                endpoint_node_from_handler(self, Method::PUT, handler)
-
+    fn put<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::PUT, handler)
     }
 
     fn delete<H, T, R>(self, handler: H) -> RouteNode
-        where
-            H: Handler<T, R>,
-            T: Extractor,
-            R: Responder {
-                endpoint_node_from_handler(self, Method::DELETE, handler)
-
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::DELETE, handler)
     }
 
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
-        where
-            E: Endpoint + Clone + Send + Sync + 'static {
-            RouteNode::new_endpoint(self, method, endpoint, None)
+    where
+        E: Endpoint + Clone + Send + Sync + 'static,
+    {
+        RouteNode::new_endpoint(self, method, endpoint, None)
     }
 
     fn route(self, routes: impl Routes) -> RouteNode {

@@ -15,8 +15,10 @@ use utoipa::openapi::{
 };
 use utoipa_redoc::Redoc;
 
+// Re-exported for macro-generated registrations without requiring downstream crates to depend on
+// `linkme` directly.
 #[cfg(debug_assertions)]
-use linkme::distributed_slice;
+pub use linkme::distributed_slice;
 
 mod builtins;
 
@@ -151,7 +153,6 @@ impl OpenApi {
     pub(crate) fn from_entries(entries: &[RouteOpenApiEntry]) -> Self {
         let operations = entries
             .iter()
-            
             .map(|entry| {
                 let handler_type = entry.handler.type_name;
                 entry.handler.spec.map_or_else(
@@ -280,7 +281,6 @@ impl fmt::Debug for OpenApiOperation {
 pub struct OpenApiRedocEndpoint {
     html: Option<Arc<String>>,
 }
-
 
 impl OpenApiRedocEndpoint {
     fn enabled(html: String) -> Self {

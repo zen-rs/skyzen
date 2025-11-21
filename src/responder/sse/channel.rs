@@ -1,5 +1,7 @@
 use std::{
-    convert::Infallible, pin::Pin, task::{Context, Poll, ready}
+    convert::Infallible,
+    pin::Pin,
+    task::{ready, Context, Poll},
 };
 
 use async_channel::unbounded;

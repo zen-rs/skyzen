@@ -1,6 +1,6 @@
 use std::{fmt::Debug, future::Future, sync::Arc};
 
-use http_kit::{Middleware, Request, Response, error::BoxHttpError, middleware::MiddlewareError};
+use http_kit::{error::BoxHttpError, middleware::MiddlewareError, Middleware, Request, Response};
 use skyzen_core::Responder;
 
 /// Handler error with an asynchronous function

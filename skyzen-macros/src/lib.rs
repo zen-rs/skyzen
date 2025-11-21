@@ -177,7 +177,7 @@ fn expand_openapi(function: &ItemFn) -> syn::Result<TokenStream> {
         };
 
         #[cfg(debug_assertions)]
-        #[linkme::distributed_slice(::skyzen::openapi::HANDLER_SPECS)]
+        #[::skyzen::openapi::distributed_slice(::skyzen::openapi::HANDLER_SPECS)]
         static #spec_ident: ::skyzen::openapi::HandlerSpec = ::skyzen::openapi::HandlerSpec {
             type_name: #type_name_literal,
             docs: #doc_tokens,
