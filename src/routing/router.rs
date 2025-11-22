@@ -13,6 +13,7 @@ use http_kit::error::BoxHttpError;
 use http_kit::http_error;
 use matchit::Match;
 use skyzen_core::Extractor;
+use tracing::{error, info};
 
 // The entrance of request,composing of endpoint
 pub struct App {
@@ -331,10 +332,16 @@ fn finalize_router(
 impl Endpoint for Router {
     type Error = BoxHttpError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        log::info!(method = request.method().as_str(),path=request.uri().path() ;"Request Received");
+        info!(
+            method = request.method().as_str(),
+            path = request.uri().path(),
+            "request received"
+        );
         Ok(self.call(request).await.unwrap_or_else(|error| {
             let mut response = Response::new(http_kit::Body::empty());
-            let status = error.status().unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+            let status = error
+                .status()
+                .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
             *response.status_mut() = status;
             let error_name = if status.is_server_error() {
                 "Server Error"
@@ -343,7 +350,11 @@ impl Endpoint for Router {
             } else {
                 "Error"
             };
-            log::error!(message = error.to_string().as_str(),status = status.as_str(); "{error_name}");
+            error!(
+                message = error.to_string().as_str(),
+                status = status.as_str(),
+                "{error_name}"
+            );
             response
         }))
     }

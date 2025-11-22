@@ -10,13 +10,13 @@ keywords = ["http", "web", "framework"]
 categories = ["web-programming::http-server"]
 
 [dependencies]
-log.workspace = true
 skyzen.workspace = true
 tower-service = "0.3.3"
 futures-util = "0.3.31"
 http-body-util = "0.1.3"
 hyper-util = { version = "0.1.13", features = ["server", "http1", "http2"] }
 executor-core.workspace = true
+tracing.workspace = true
 
 [dependencies.hyper]
 features = ["server", "http1", "http2"]

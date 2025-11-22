@@ -8,7 +8,7 @@ http-kit = { git = "https://github.com/zen-rs/http-kit" }
 executor-core = { version = "0.1.0", default-features = false }
 skyzen-hyper = { path = "hyper"}
 
-log = { version = "0.4.27", features = ["kv_unstable"] }
+tracing = "0.1.40"
 skyzen = { path = "."}
 
 [workspace.lints]
@@ -42,7 +42,7 @@ http-kit.workspace = true
 matchit = "0.8.6"
 serde = { version = "1.0", features = ["derive"] }
 cookie = { version = "0.18.1", features = ["percent-encode"] }
-log.workspace = true
+tracing.workspace = true
 smallvec = "1.15"
 mime_guess = "2.0"
 skyzen-macros = { path = "skyzen-macros" }
@@ -63,8 +63,6 @@ utoipa-redoc = "6.0"
 async-fs = "2.2.0"
 
 [dev-dependencies]
-log.workspace = true
-
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 color-eyre = "0.6"
 tracing = "0.1"

@@ -111,7 +111,7 @@ impl ArticleStore {
 }
 
 /// List articles with optional tag and text filters.
-#[skyzen::openapi(name = "articles.list")]
+#[skyzen::openapi]
 async fn list_articles(
     Query(filter): Query<ArticleFilter>,
     State(store): State<SharedStore>,
@@ -121,7 +121,7 @@ async fn list_articles(
 }
 
 /// Create a new article from JSON body.
-#[skyzen::openapi(name = "articles.create")]
+#[skyzen::openapi]
 async fn create_article(
     State(store): State<SharedStore>,
     Json(draft): Json<ArticleDraft>,
@@ -131,7 +131,7 @@ async fn create_article(
 }
 
 /// Fetch a single article by id or return 404.
-#[skyzen::openapi(name = "articles.get")]
+#[skyzen::openapi]
 async fn get_article(
     params: Params,
     State(store): State<SharedStore>,

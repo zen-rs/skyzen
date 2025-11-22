@@ -1,7 +1,7 @@
 //! Utility for writing middleware.
 //! ```rust
 //! use skyzen::{middleware::Middleware, Request, Response};
-//! use log::info;
+//! use tracing::info;
 //!
 //! #[derive(Clone, Default)]
 //! struct LogMiddleware;

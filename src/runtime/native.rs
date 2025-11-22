@@ -14,6 +14,8 @@ use hyper::{
 };
 use hyper_util::{rt::TokioIo, server::conn::auto::Builder as HyperBuilder};
 use tokio::{net::TcpListener, signal};
+use tracing::{debug, error, info, warn};
+use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
 
 type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
@@ -31,7 +33,7 @@ pub fn init_logging() {
         }
 
         let _ = tracing_log::LogTracer::builder()
-            .with_max_level(log::LevelFilter::Trace)
+            .with_max_level(LogLevelFilter::Trace)
             .init();
 
         let env_filter = EnvFilter::try_from_default_env()
@@ -107,9 +109,9 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
         match addr.parse::<SocketAddr>() {
             Ok(socket) => {
                 std::env::set_var("SKYZEN_ADDRESS", socket.to_string());
-                log::info!("Configured listener address via CLI: {socket}");
+                info!("Configured listener address via CLI: {socket}");
             }
-            Err(error) => log::warn!("Ignoring invalid --listen address `{addr}`: {error}"),
+            Err(error) => warn!("Ignoring invalid --listen address `{addr}`: {error}"),
         }
         return;
     }
@@ -123,7 +125,7 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
         match host.parse::<IpAddr>() {
             Ok(ip) => candidate.set_ip(ip),
             Err(error) => {
-                log::warn!("Ignoring invalid --host `{host}`: {error}");
+                warn!("Ignoring invalid --host `{host}`: {error}");
                 return;
             }
         }
@@ -132,14 +134,14 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
         match port.parse::<u16>() {
             Ok(value) => candidate.set_port(value),
             Err(error) => {
-                log::warn!("Ignoring invalid --port `{port}`: {error}");
+                warn!("Ignoring invalid --port `{port}`: {error}");
                 return;
             }
         }
     }
 
     std::env::set_var("SKYZEN_ADDRESS", candidate.to_string());
-    log::info!("Configured listener address via CLI: {candidate}");
+    info!("Configured listener address via CLI: {candidate}");
 }
 
 /// Build the Tokio runtime and serve the provided endpoint over Hyper.
@@ -160,8 +162,8 @@ where
     runtime.block_on(async move {
         let endpoint = factory().await;
         match run_server(endpoint).await {
-            Ok(()) => log::info!("Skyzen server shut down gracefully"),
-            Err(error) => log::error!("Skyzen server terminated: {error}"),
+            Ok(()) => info!("Skyzen server shut down gracefully"),
+            Err(error) => error!("Skyzen server terminated: {error}"),
         }
     });
 }
@@ -171,7 +173,7 @@ where
     E: Endpoint + Clone + Send + Sync + 'static,
 {
     let listener = TcpListener::bind(server_addr()).await?;
-    log::info!(
+    info!(
         "Skyzen listening on http://{}",
         listener.local_addr().unwrap()
     );
@@ -183,12 +185,12 @@ where
         tokio::select! {
             biased;
             _ = shutdown_signal.as_mut() => {
-                log::info!("Ctrl+C received, stopping accept loop");
+                info!("Ctrl+C received, stopping accept loop");
                 break;
             }
             accept_result = listener.accept() => {
                 let (stream, peer) = accept_result?;
-                log::debug!("Accepted connection from {peer}");
+                debug!("Accepted connection from {peer}");
                 let service = IntoService::new(endpoint.clone());
                 tokio::spawn(async move {
                     let builder = HyperBuilder::new(hyper_util::rt::TokioExecutor::new());
@@ -196,7 +198,7 @@ where
                         .serve_connection(TokioIo::new(stream), service)
                         .await
                     {
-                        log::error!("Hyper connection error: {error}");
+                        error!("Hyper connection error: {error}");
                     }
                 });
             }
@@ -255,19 +257,19 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
 
             match &response {
                 Ok(ok) => {
-                    log::info!(
+                    info!(
                         method = method.as_str(),
                         path = path.as_str(),
-                        status = ok.status().as_u16();
+                        status = ok.status().as_u16(),
                         "request completed"
                     );
                 }
                 Err(err) => {
                     let status = err.status().map(|s| s.as_u16()).unwrap_or(500);
-                    log::error!(
+                    error!(
                         method = method.as_str(),
                         path = path.as_str(),
-                        status = status;
+                        status = status,
                         "request failed: {err}"
                     );
                 }

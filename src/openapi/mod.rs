@@ -163,8 +163,6 @@ pub struct HandlerSpec {
     pub type_name: &'static str,
     /// Default display name derived from the module path (without the crate prefix).
     pub operation_name: &'static str,
-    /// User-provided operation name override, if any.
-    pub display_name: Option<&'static str>,
     /// Documentation collected from the handler's doc comments.
     pub docs: Option<&'static str>,
     /// Schema generators for each extractor argument.
@@ -365,10 +363,7 @@ impl OpenApi {
                             path: entry.path.clone(),
                             method: entry.method.clone(),
                             handler_type,
-                            operation_id: spec
-                                .display_name
-                                .unwrap_or_else(|| trim_crate(spec.operation_name))
-                                .to_owned(),
+                            operation_id: trim_crate(spec.operation_name).to_owned(),
                             docs,
                             parameters,
                             responses,
@@ -601,10 +596,7 @@ fn build_operation(op: &OpenApiOperation) -> Operation {
     }
 
     if let Some(docs) = op.docs {
-        let doc_string = docs.to_owned();
-        if Some(doc_string.as_str()) != summary.as_deref() {
-            builder = builder.description(Some(doc_string));
-        }
+        builder = builder.description(Some(docs.to_owned()));
     }
 
     builder.build()
@@ -693,8 +685,21 @@ fn aggregate_parameter_schema(parameters: &[(String, RefOr<Schema>)]) -> RefOr<S
 }
 
 fn doc_summary(docs: &str) -> Option<String> {
-    docs.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(std::string::ToString::to_string)
+    let mut lines = docs.lines();
+    let mut paragraph = Vec::new();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !paragraph.is_empty() {
+                break;
+            }
+            continue;
+        }
+        paragraph.push(trimmed);
+    }
+    if paragraph.is_empty() {
+        None
+    } else {
+        Some(paragraph.join(" "))
+    }
 }

@@ -3,7 +3,6 @@
 //! The hyper backend of skyzen
 
 use hyper_util::server::conn::auto::Builder;
-use log::error;
 use skyzen::utils::{AsyncRead, StreamExt};
 use skyzen::Endpoint;
 use skyzen::{
@@ -15,6 +14,7 @@ use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use tracing::error;
 
 mod service;
 /// Transform the `Endpoint` of skyzen into the `Service` of hyper

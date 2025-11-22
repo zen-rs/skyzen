@@ -54,7 +54,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn main() {
             #init_logging
             ::skyzen::runtime::native::apply_cli_overrides(::std::env::args());
-            ::log::info!("Skyzen application starting up");
+            ::tracing::info!("Skyzen application starting up");
             ::skyzen::runtime::native::launch(|| #native_factory);
         }
 
@@ -77,14 +77,18 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn openapi(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args =
         parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
-    let options = match OpenApiOptions::from_args(&args) {
-        Ok(options) => options,
-        Err(error) => return error.to_compile_error().into(),
-    };
+    if !args.is_empty() {
+        return Error::new_spanned(
+            quote! { #args },
+            "#[skyzen::openapi] does not take arguments; remove them",
+        )
+        .to_compile_error()
+        .into();
+    }
 
     let item = parse_macro_input!(item as Item);
     match item {
-        Item::Fn(function) => match expand_openapi_fn(function, options) {
+        Item::Fn(function) => match expand_openapi_fn(function) {
             Ok(tokens) => tokens,
             Err(error) => error.to_compile_error().into(),
         },
@@ -115,7 +119,7 @@ pub fn derive_http_error(item: TokenStream) -> TokenStream {
     }
 }
 
-fn expand_openapi_fn(mut function: ItemFn, options: OpenApiOptions) -> syn::Result<TokenStream> {
+fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     let fn_ident = &function.sig.ident;
 
     let doc = doc_string(&function.attrs);
@@ -123,13 +127,6 @@ fn expand_openapi_fn(mut function: ItemFn, options: OpenApiOptions) -> syn::Resu
         || quote! { None },
         |docs| {
             let lit = Lit::Str(syn::LitStr::new(docs, fn_ident.span()));
-            quote! { Some(#lit) }
-        },
-    );
-    let display_name_tokens = options.display_name.map_or_else(
-        || quote! { None },
-        |name| {
-            let lit = Lit::Str(name);
             quote! { Some(#lit) }
         },
     );
@@ -268,7 +265,6 @@ fn expand_openapi_fn(mut function: ItemFn, options: OpenApiOptions) -> syn::Resu
         static #spec_ident: ::skyzen::openapi::HandlerSpec = ::skyzen::openapi::HandlerSpec {
             type_name: #type_name_literal,
             operation_name: #operation_name_literal,
-            display_name: #display_name_tokens,
             docs: #doc_tokens,
             parameters: #schema_array,
             parameter_names: #parameter_names_array,
@@ -288,43 +284,6 @@ enum ParameterSchema {
 struct ParameterMeta {
     schema: ParameterSchema,
     name: Option<syn::Ident>,
-}
-
-#[derive(Default)]
-struct OpenApiOptions {
-    display_name: Option<LitStr>,
-}
-
-impl OpenApiOptions {
-    fn from_args(args: &Punctuated<MetaNameValue, Token![,]>) -> syn::Result<Self> {
-        let mut options = Self::default();
-        for meta in args {
-            if meta.path.is_ident("name") {
-                if options.display_name.is_some() {
-                    return Err(Error::new_spanned(&meta.path, "duplicate `name` argument"));
-                }
-                let Expr::Lit(expr_lit) = &meta.value else {
-                    return Err(Error::new_spanned(
-                        &meta.value,
-                        "`name` must be a string literal, e.g. name = \"List activity\"",
-                    ));
-                };
-                let Lit::Str(lit) = &expr_lit.lit else {
-                    return Err(Error::new_spanned(
-                        &expr_lit.lit,
-                        "`name` must be a string literal, e.g. name = \"List activity\"",
-                    ));
-                };
-                options.display_name = Some(lit.clone());
-            } else {
-                return Err(Error::new_spanned(
-                    &meta.path,
-                    "unsupported #[skyzen::openapi] argument",
-                ));
-            }
-        }
-        Ok(options)
-    }
 }
 
 fn parse_parameter_schema(pat_type: &mut PatType) -> syn::Result<ParameterMeta> {
