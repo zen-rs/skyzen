@@ -54,7 +54,6 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn main() {
             #init_logging
             ::skyzen::runtime::native::apply_cli_overrides(::std::env::args());
-            ::tracing::info!("Skyzen application starting up");
             ::skyzen::runtime::native::launch(|| #native_factory);
         }
 

@@ -160,6 +160,8 @@ where
         .expect("Failed to build Tokio runtime");
 
     runtime.block_on(async move {
+        tracing::info!("Skyzen application starting up");
+
         let endpoint = factory().await;
         match run_server(endpoint).await {
             Ok(()) => info!("Skyzen server shut down gracefully"),
