@@ -393,7 +393,6 @@ fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<
             }
         }
 
-        #[cfg(feature = "openapi")]
         impl #impl_generics ::skyzen::openapi::ResponderOpenApiSchema for #ident #ty_generics #where_clause {
             fn responder_schemas() -> ::core::option::Option<::std::vec::Vec<::skyzen::openapi::ResponseSchema>> {
                 ::core::option::Option::Some(vec![::skyzen::openapi::ResponseSchema {
@@ -515,7 +514,6 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
             }
         }
 
-        #[cfg(feature = "openapi")]
         impl #impl_generics ::skyzen::openapi::ResponderOpenApiSchema for #ident #ty_generics #where_clause {
             fn responder_schemas() -> ::core::option::Option<::std::vec::Vec<::skyzen::openapi::ResponseSchema>> {
                 ::core::option::Option::Some(vec![#(#openapi_responses),*])
