@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
 };
 
@@ -170,9 +170,11 @@ async fn run_server<E>(endpoint: E) -> std::io::Result<()>
 where
     E: Endpoint + Clone + Send + Sync + 'static,
 {
-    let addr = server_addr();
-    let listener = TcpListener::bind(addr).await?;
-    log::info!("Skyzen listening on http://{addr}");
+    let listener = TcpListener::bind(server_addr()).await?;
+    log::info!(
+        "Skyzen listening on http://{}",
+        listener.local_addr().unwrap()
+    );
 
     let shutdown_signal = signal::ctrl_c();
     tokio::pin!(shutdown_signal);
@@ -205,10 +207,13 @@ where
 }
 
 fn server_addr() -> SocketAddr {
-    std::env::var("SKYZEN_ADDRESS")
-        .unwrap_or_else(|_| "127.0.0.1:8787".to_owned())
-        .parse()
-        .unwrap_or_else(|error| panic!("Invalid SKYZEN_ADDRESS value: {error}"))
+    if let Ok(addr) = std::env::var("SKYZEN_ADDRESS") {
+        // Use the provided address by default
+        addr.parse()
+            .unwrap_or_else(|error| panic!("Invalid SKYZEN_ADDRESS value: {error}"))
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+    }
 }
 
 #[derive(Debug)]
@@ -235,6 +240,8 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
         let mut endpoint = self.endpoint.clone();
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
+            let method = req.method().clone();
+            let path = req.uri().path().to_owned();
             let mut request: crate::Request =
                 crate::Request::from(req.map(BodyDataStream::new).map(|body| {
                     crate::Body::from_stream(
@@ -245,6 +252,26 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
             let response = endpoint.respond(&mut request).await;
             let response: Result<hyper::Response<crate::Body>, Self::Error> =
                 response.map_err(|error| Box::new(error) as BoxHttpError);
+
+            match &response {
+                Ok(ok) => {
+                    log::info!(
+                        method = method.as_str(),
+                        path = path.as_str(),
+                        status = ok.status().as_u16();
+                        "request completed"
+                    );
+                }
+                Err(err) => {
+                    let status = err.status().map(|s| s.as_u16()).unwrap_or(500);
+                    log::error!(
+                        method = method.as_str(),
+                        path = path.as_str(),
+                        status = status;
+                        "request failed: {err}"
+                    );
+                }
+            }
 
             response.map(|response| {
                 response.map(|body| {

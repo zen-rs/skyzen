@@ -587,8 +587,13 @@ fn method_to_http_method(method: &Method) -> Option<HttpMethod> {
 }
 
 fn build_operation(op: &OpenApiOperation) -> Operation {
+    let summary = op
+        .docs
+        .and_then(doc_summary)
+        .or_else(|| Some(op.operation_id.clone()));
     let mut builder = OperationBuilder::new()
         .operation_id(Some(op.operation_id.clone()))
+        .summary(summary.clone())
         .responses(build_responses(op));
 
     if let Some(body) = build_request_body(op) {
@@ -596,10 +601,10 @@ fn build_operation(op: &OpenApiOperation) -> Operation {
     }
 
     if let Some(docs) = op.docs {
-        if let Some(summary) = doc_summary(docs) {
-            builder = builder.summary(Some(summary));
+        let doc_string = docs.to_owned();
+        if Some(doc_string.as_str()) != summary.as_deref() {
+            builder = builder.description(Some(doc_string));
         }
-        builder = builder.description(Some(docs.to_owned()));
     }
 
     builder.build()
