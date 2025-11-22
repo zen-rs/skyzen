@@ -18,7 +18,7 @@ use utoipa::openapi::{
     request_body::RequestBodyBuilder,
     response::{ResponseBuilder, ResponsesBuilder},
     schema::{ComponentsBuilder, ObjectBuilder, Schema, SchemaType, Type},
-    OpenApi as UtoipaSpec, RefOr, Required,
+    Deprecated, OpenApi as UtoipaSpec, RefOr, Required,
 };
 use utoipa_redoc::Redoc;
 /// OpenAPI schema reference type alias.
@@ -165,6 +165,8 @@ pub struct HandlerSpec {
     pub operation_name: &'static str,
     /// Documentation collected from the handler's doc comments.
     pub docs: Option<&'static str>,
+    /// Deprecation flag extracted from handler attributes.
+    pub deprecated: bool,
     /// Schema generators for each extractor argument.
     pub parameters: &'static [ExtractorSchemaFn],
     /// Names of each documented extractor argument (aligned with `parameters`).
@@ -338,6 +340,7 @@ impl OpenApi {
                         handler_type,
                         operation_id: trim_crate(handler_type).to_owned(),
                         docs: None,
+                        deprecated: false,
                         parameters: Vec::new(),
                         responses: Vec::new(),
                     },
@@ -363,8 +366,9 @@ impl OpenApi {
                             path: entry.path.clone(),
                             method: entry.method.clone(),
                             handler_type,
-                            operation_id: trim_crate(spec.operation_name).to_owned(),
+                            operation_id: spec.operation_name.to_owned(),
                             docs,
+                            deprecated: spec.deprecated,
                             parameters,
                             responses,
                         }
@@ -493,6 +497,8 @@ pub struct OpenApiOperation {
     pub operation_id: String,
     /// Documentation extracted from the handler's doc comments.
     pub docs: Option<&'static str>,
+    /// Whether the handler is deprecated.
+    pub deprecated: bool,
     /// Schemas describing the extractor arguments.
     pub parameters: Vec<NamedExtractorSchema>,
     /// Schemas describing all potential responses.
@@ -590,6 +596,10 @@ fn build_operation(op: &OpenApiOperation) -> Operation {
         .operation_id(Some(op.operation_id.clone()))
         .summary(summary.clone())
         .responses(build_responses(op));
+
+    if op.deprecated {
+        builder = builder.deprecated(Some(Deprecated::True));
+    }
 
     if let Some(body) = build_request_body(op) {
         builder = builder.request_body(Some(body));

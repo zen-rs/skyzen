@@ -122,6 +122,11 @@ pub fn derive_http_error(item: TokenStream) -> TokenStream {
 fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     let fn_ident = &function.sig.ident;
 
+    let deprecated = function
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("deprecated"));
+
     let doc = doc_string(&function.attrs);
     let doc_tokens = doc.as_deref().map_or_else(
         || quote! { None },
@@ -266,6 +271,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
             type_name: #type_name_literal,
             operation_name: #operation_name_literal,
             docs: #doc_tokens,
+            deprecated: #deprecated,
             parameters: #schema_array,
             parameter_names: #parameter_names_array,
             response: #response_schema_fn,

@@ -111,6 +111,8 @@ impl ArticleStore {
 }
 
 /// List articles with optional tag and text filters.
+///
+/// This demonstrates query extractors, shared state, and OpenAPI metadata.
 #[skyzen::openapi]
 async fn list_articles(
     Query(filter): Query<ArticleFilter>,
@@ -121,6 +123,8 @@ async fn list_articles(
 }
 
 /// Create a new article from JSON body.
+///
+/// Accepts a JSON payload describing the article and returns the stored record.
 #[skyzen::openapi]
 async fn create_article(
     State(store): State<SharedStore>,
@@ -131,6 +135,8 @@ async fn create_article(
 }
 
 /// Fetch a single article by id or return 404.
+///
+/// Uses path params and custom errors to demonstrate error mapping in OpenAPI.
 #[skyzen::openapi]
 async fn get_article(
     params: Params,
@@ -140,14 +146,26 @@ async fn get_article(
     store.get(id).map(Json).ok_or(ApiError::NotFound)
 }
 
+/// Deprecated health check for compatibility with legacy clients.
+///
+/// Prefer using `GET /articles` instead. This endpoint remains for older SDKs.
+#[deprecated(note = "use GET /articles instead")]
+#[skyzen::openapi]
+async fn legacy_ping() -> &'static str {
+    "ok"
+}
+
 #[skyzen::main]
 fn main() -> Router {
     let store = State(Arc::new(ArticleStore::new()));
 
-    let api_routes = Route::new(("/articles"
-        .at(list_articles)
-        .post(create_article)
-        .route(("/articles/{id}".at(get_article),)),));
+    let api_routes = Route::new((
+        "/articles"
+            .at(list_articles)
+            .post(create_article)
+            .route(("/articles/{id}".at(get_article),)),
+        "/legacy/ping".at(legacy_ping),
+    ));
 
     let openapi = api_routes.openapi();
     let docs = openapi.redoc_route("/docs");
