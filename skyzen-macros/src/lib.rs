@@ -215,7 +215,6 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         );
         schema_collector_idents.push(ident.clone());
         schema_collector_defs.push(quote! {
-            #[cfg(all(debug_assertions, feature = "openapi"))]
             fn #ident(schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>) {
                 <#ty as ::skyzen::openapi::ExtractorOpenApiSchema>::register_schemas(schemas);
             }
@@ -228,7 +227,6 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     );
     schema_collector_idents.push(response_collector_ident.clone());
     schema_collector_defs.push(quote! {
-        #[cfg(all(debug_assertions, feature = "openapi"))]
         fn #response_collector_ident(
             schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
         ) {
@@ -265,7 +263,6 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
 
         #(#schema_collector_defs)*
 
-        #[cfg(all(debug_assertions, feature = "openapi"))]
         #[::skyzen::openapi::distributed_slice(::skyzen::openapi::HANDLER_SPECS)]
         static #spec_ident: ::skyzen::openapi::HandlerSpec = ::skyzen::openapi::HandlerSpec {
             type_name: #type_name_literal,
