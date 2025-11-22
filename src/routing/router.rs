@@ -5,7 +5,7 @@ use std::{
 };
 
 use super::{BoxEndpoint, EndpointFactory, Params, Route, RouteNode, RouteNodeType};
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, feature = "openapi"))]
 use crate::openapi::RouteOpenApiEntry;
 use crate::{openapi::OpenApi, Endpoint, Method, Request, Response, StatusCode};
 
@@ -56,7 +56,7 @@ impl App {
 pub struct Router {
     inner: Arc<matchit::Router<Vec<(Method, App)>>>,
     programmable_router_enabled: bool,
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "openapi"))]
     openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
 }
 
@@ -67,7 +67,7 @@ impl Debug for Router {
             "programmable_router_enabled",
             &self.programmable_router_enabled,
         );
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "openapi"))]
         {
             debug_struct.field("openapi_entries", &self.openapi_entries.len());
         }
@@ -156,12 +156,12 @@ impl Router {
     /// Build an [`OpenApi`] definition containing every route registered on this router.
     #[must_use]
     pub fn openapi(&self) -> OpenApi {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "openapi"))]
         {
             OpenApi::from_entries(&self.openapi_entries)
         }
 
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(all(debug_assertions, feature = "openapi")))]
         {
             OpenApi::default()
         }
@@ -205,7 +205,7 @@ impl From<matchit::InsertError> for RouteBuildError {
 
 type FlattenBuf = HashMap<String, Vec<(Method, App)>>;
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, feature = "openapi"))]
 fn flatten(
     path_prefix: &str,
     route: Vec<RouteNode>,
@@ -236,7 +236,7 @@ fn flatten(
     }
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(all(debug_assertions, feature = "openapi")))]
 fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
     for node in route {
         let path = format!("{}{}", path_prefix, node.path);
@@ -248,7 +248,7 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
             RouteNodeType::Endpoint {
                 endpoint_factory,
                 method,
-                openapi,
+                openapi: _,
                 // middlewares, // Disabled for now
             } => {
                 let entry = buf.entry(path).or_default();
@@ -264,7 +264,7 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
 ///
 /// Returns [`RouteBuildError`] if the route tree contains conflicting method registrations or if
 /// the underlying path matcher rejects the route definition.
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, feature = "openapi"))]
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     let mut openapi_entries = Vec::new();
@@ -272,14 +272,14 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     finalize_router(buf, Some(openapi_entries))
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(all(debug_assertions, feature = "openapi")))]
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     flatten("", route.nodes, &mut buf);
     finalize_router(buf, None)
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, feature = "openapi"))]
 fn finalize_router(
     buf: HashMap<String, Vec<(Method, App)>>,
     openapi_entries: Option<Vec<RouteOpenApiEntry>>,
@@ -304,7 +304,7 @@ fn finalize_router(
     })
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(all(debug_assertions, feature = "openapi")))]
 fn finalize_router(
     buf: HashMap<String, Vec<(Method, App)>>,
     _openapi_entries: Option<Vec<()>>,
@@ -526,11 +526,7 @@ mod tests {
 
         let router = build(Route::new(("/ping".at(ping),)).enable_api_doc()).unwrap();
 
-        let response = router
-            .clone()
-            .go(get_request("/api-docs"))
-            .await
-            .unwrap();
+        let response = router.clone().go(get_request("/api-docs")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let content_type = response
             .headers()

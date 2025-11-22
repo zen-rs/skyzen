@@ -104,7 +104,8 @@ version = "0.2.16"
 optional = true
 
 [features]
-default = ["json", "form", "multipart", "sse", "websocket", "rt"]
+default = ["json", "form", "multipart", "sse", "websocket", "rt", "openapi"]
+openapi = []
 json = ["dep:serde_json", "http-kit/json"]
 form = ["dep:serde_urlencoded", "http-kit/form"]
 multipart = ["dep:multer", "dep:pin-project-lite", "dep:futures-core"]

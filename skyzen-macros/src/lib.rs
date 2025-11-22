@@ -74,10 +74,17 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Annotate handlers that should appear in generated `OpenAPI` documentation.
 #[proc_macro_attribute]
-pub fn openapi(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn openapi(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args =
+        parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
+    let options = match OpenApiOptions::from_args(&args) {
+        Ok(options) => options,
+        Err(error) => return error.to_compile_error().into(),
+    };
+
     let item = parse_macro_input!(item as Item);
     match item {
-        Item::Fn(function) => match expand_openapi_fn(function) {
+        Item::Fn(function) => match expand_openapi_fn(function, options) {
             Ok(tokens) => tokens,
             Err(error) => error.to_compile_error().into(),
         },
@@ -108,7 +115,7 @@ pub fn derive_http_error(item: TokenStream) -> TokenStream {
     }
 }
 
-fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
+fn expand_openapi_fn(mut function: ItemFn, options: OpenApiOptions) -> syn::Result<TokenStream> {
     let fn_ident = &function.sig.ident;
 
     let doc = doc_string(&function.attrs);
@@ -116,6 +123,13 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         || quote! { None },
         |docs| {
             let lit = Lit::Str(syn::LitStr::new(docs, fn_ident.span()));
+            quote! { Some(#lit) }
+        },
+    );
+    let display_name_tokens = options.display_name.map_or_else(
+        || quote! { None },
+        |name| {
+            let lit = Lit::Str(name);
             quote! { Some(#lit) }
         },
     );
@@ -139,38 +153,46 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         ReturnType::Type(_, ty) => (*ty).clone(),
         ReturnType::Default => parse_quote!(()),
     };
-    let response_ty = unwrap_result_type(&raw_response_ty);
+    let response_ty = raw_response_ty;
 
-    let assertions: Vec<_> = parameter_schemas
+    let parameter_types: Vec<_> = parameter_schemas
         .iter()
-        .filter_map(|schema| match schema {
-            ParameterSchema::Ignored => None,
-            ParameterSchema::Normal(ty) | ParameterSchema::Proxy(ty) => {
-                Some(quote! { let _ = ::skyzen::openapi::schema_of::<#ty>; })
-            }
-        })
-        .collect();
-
-    let response_assert = quote! { let _ = ::skyzen::openapi::schema_of::<#response_ty>; };
-
-    let schema_types: Vec<_> = parameter_schemas
-        .iter()
-        .filter_map(|schema| match schema {
+        .filter_map(|meta| match &meta.schema {
             ParameterSchema::Ignored => None,
             ParameterSchema::Normal(ty) | ParameterSchema::Proxy(ty) => Some(ty.clone()),
         })
-        .chain(std::iter::once(response_ty.clone()))
         .collect();
 
-    let parameter_schema_fns: Vec<_> = parameter_schemas
+    let assertions: Vec<_> = parameter_types
         .iter()
-        .filter_map(|schema| match schema {
-            ParameterSchema::Ignored => None,
-            ParameterSchema::Normal(ty) | ParameterSchema::Proxy(ty) => {
-                Some(quote! { ::skyzen::openapi::schema_of::<#ty> })
-            }
-        })
+        .map(|ty| quote! { let _ = ::skyzen::openapi::extractor_schema_of::<#ty>; })
         .collect();
+
+    let response_assert =
+        quote! { let _ = ::skyzen::openapi::responder_schemas_of::<#response_ty>; };
+
+    let mut parameter_schema_fns = Vec::new();
+    let mut parameter_name_lits = Vec::new();
+    let mut included_idx = 0usize;
+    for meta in &parameter_schemas {
+        match &meta.schema {
+            ParameterSchema::Ignored => {}
+            ParameterSchema::Normal(ty) | ParameterSchema::Proxy(ty) => {
+                parameter_schema_fns.push(quote! { ::skyzen::openapi::extractor_schema_of::<#ty> });
+                let name = meta
+                    .name
+                    .as_ref()
+                    .map(|ident| quote! { stringify!(#ident) })
+                    .unwrap_or_else(|| {
+                        let lit =
+                            syn::LitStr::new(&format!("param{included_idx}"), fn_ident.span());
+                        quote! { #lit }
+                    });
+                parameter_name_lits.push(name);
+                included_idx += 1;
+            }
+        }
+    }
 
     let schema_array = if parameter_schema_fns.is_empty() {
         quote! { &[] }
@@ -178,27 +200,39 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         quote! { &[#(#parameter_schema_fns),*] }
     };
 
-    let response_schema_fn = quote! { Some(::skyzen::openapi::schema_of::<#response_ty>) };
+    let response_schema_fn =
+        quote! { Some(::skyzen::openapi::responder_schemas_of::<#response_ty>) };
 
     let mut schema_collector_idents = Vec::new();
-    let schema_collector_defs: Vec<_> = schema_types
-        .iter()
-        .enumerate()
-        .map(|(idx, ty)| {
-            let ident = format_ident!(
-                "__SKYZEN_OPENAPI_SCHEMAS_{}_{}",
-                fn_ident.to_string().to_uppercase(),
-                idx
-            );
-            schema_collector_idents.push(ident.clone());
-            quote! {
-                #[cfg(debug_assertions)]
-                fn #ident(schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>) {
-                    <#ty as ::skyzen::openapi::RegisterSchemas>::register(schemas);
-                }
+    let mut schema_collector_defs = Vec::new();
+    for (idx, ty) in parameter_types.iter().enumerate() {
+        let ident = format_ident!(
+            "__SKYZEN_OPENAPI_SCHEMAS_{}_{}",
+            fn_ident.to_string().to_uppercase(),
+            idx
+        );
+        schema_collector_idents.push(ident.clone());
+        schema_collector_defs.push(quote! {
+            #[cfg(all(debug_assertions, feature = "openapi"))]
+            fn #ident(schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>) {
+                <#ty as ::skyzen::openapi::ExtractorOpenApiSchema>::register_schemas(schemas);
             }
-        })
-        .collect();
+        });
+    }
+
+    let response_collector_ident = format_ident!(
+        "__SKYZEN_OPENAPI_SCHEMAS_{}_RESP",
+        fn_ident.to_string().to_uppercase()
+    );
+    schema_collector_idents.push(response_collector_ident.clone());
+    schema_collector_defs.push(quote! {
+        #[cfg(all(debug_assertions, feature = "openapi"))]
+        fn #response_collector_ident(
+            schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
+        ) {
+            <#response_ty as ::skyzen::openapi::ResponderOpenApiSchema>::register_schemas(schemas);
+        }
+    });
 
     let schema_collectors = if schema_collector_idents.is_empty() {
         quote! { &[] }
@@ -206,7 +240,14 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         quote! { &[#(#schema_collector_idents),*] }
     };
 
+    let parameter_names_array = if parameter_name_lits.is_empty() {
+        quote! { &[] }
+    } else {
+        quote! { &[#(#parameter_name_lits),*] }
+    };
+
     let type_name_literal = quote! { concat!(module_path!(), "::", stringify!(#fn_ident)) };
+    let operation_name_literal = quote! { #type_name_literal };
     let spec_ident = format_ident!(
         "__SKYZEN_OPENAPI_SPEC_{}",
         fn_ident.to_string().to_uppercase()
@@ -222,12 +263,15 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
 
         #(#schema_collector_defs)*
 
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "openapi"))]
         #[::skyzen::openapi::distributed_slice(::skyzen::openapi::HANDLER_SPECS)]
         static #spec_ident: ::skyzen::openapi::HandlerSpec = ::skyzen::openapi::HandlerSpec {
             type_name: #type_name_literal,
+            operation_name: #operation_name_literal,
+            display_name: #display_name_tokens,
             docs: #doc_tokens,
             parameters: #schema_array,
+            parameter_names: #parameter_names_array,
             response: #response_schema_fn,
             schemas: #schema_collectors,
         };
@@ -241,7 +285,49 @@ enum ParameterSchema {
     Ignored,
 }
 
-fn parse_parameter_schema(pat_type: &mut PatType) -> syn::Result<ParameterSchema> {
+struct ParameterMeta {
+    schema: ParameterSchema,
+    name: Option<syn::Ident>,
+}
+
+#[derive(Default)]
+struct OpenApiOptions {
+    display_name: Option<LitStr>,
+}
+
+impl OpenApiOptions {
+    fn from_args(args: &Punctuated<MetaNameValue, Token![,]>) -> syn::Result<Self> {
+        let mut options = Self::default();
+        for meta in args {
+            if meta.path.is_ident("name") {
+                if options.display_name.is_some() {
+                    return Err(Error::new_spanned(&meta.path, "duplicate `name` argument"));
+                }
+                let Expr::Lit(expr_lit) = &meta.value else {
+                    return Err(Error::new_spanned(
+                        &meta.value,
+                        "`name` must be a string literal, e.g. name = \"List activity\"",
+                    ));
+                };
+                let Lit::Str(lit) = &expr_lit.lit else {
+                    return Err(Error::new_spanned(
+                        &expr_lit.lit,
+                        "`name` must be a string literal, e.g. name = \"List activity\"",
+                    ));
+                };
+                options.display_name = Some(lit.clone());
+            } else {
+                return Err(Error::new_spanned(
+                    &meta.path,
+                    "unsupported #[skyzen::openapi] argument",
+                ));
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn parse_parameter_schema(pat_type: &mut PatType) -> syn::Result<ParameterMeta> {
     let mut ignored = None;
     let mut proxy = None;
     let mut retained = Vec::new();
@@ -284,13 +370,20 @@ fn parse_parameter_schema(pat_type: &mut PatType) -> syn::Result<ParameterSchema
         ));
     }
 
-    if ignored.is_some() {
-        Ok(ParameterSchema::Ignored)
+    let name = match &*pat_type.pat {
+        syn::Pat::Ident(ident) => Some(ident.ident.clone()),
+        _ => None,
+    };
+
+    let schema = if ignored.is_some() {
+        ParameterSchema::Ignored
     } else if let Some(ty) = proxy {
-        Ok(ParameterSchema::Proxy(ty))
+        ParameterSchema::Proxy(ty)
     } else {
-        Ok(ParameterSchema::Normal((*pat_type.ty).clone()))
-    }
+        ParameterSchema::Normal((*pat_type.ty).clone())
+    };
+
+    Ok(ParameterMeta { schema, name })
 }
 
 fn expand_error(args: ErrorArgs, item: Item) -> syn::Result<TokenStream> {
@@ -337,6 +430,18 @@ fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<
                 Some(#status)
             }
         }
+
+        #[cfg(feature = "openapi")]
+        impl #impl_generics ::skyzen::openapi::ResponderOpenApiSchema for #ident #ty_generics #where_clause {
+            fn responder_schemas() -> ::core::option::Option<::std::vec::Vec<::skyzen::openapi::ResponseSchema>> {
+                ::core::option::Option::Some(vec![::skyzen::openapi::ResponseSchema {
+                    status: ::core::option::Option::Some(#status),
+                    description: ::core::option::Option::Some(#message),
+                    schema: ::core::option::Option::None,
+                    content_type: ::core::option::Option::None,
+                }])
+            }
+        }
     }
     .into())
 }
@@ -354,6 +459,7 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
     let mut status_arms = Vec::new();
     let mut from_impls = Vec::new();
     let mut cleaned_variants = Punctuated::new();
+    let mut openapi_responses = Vec::new();
 
     for variant in item_enum.variants.into_iter() {
         let variant_ident = variant.ident.clone();
@@ -389,6 +495,15 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
 
         status_arms.push(quote! {
             #pattern => ::core::option::Option::Some(#status_expr)
+        });
+
+        openapi_responses.push(quote! {
+            ::skyzen::openapi::ResponseSchema {
+                status: ::core::option::Option::Some(#status_expr),
+                description: ::core::option::Option::Some(#message),
+                schema: ::core::option::Option::None,
+                content_type: ::core::option::Option::None,
+            }
         });
 
         if let Some(from_info) = from {
@@ -435,6 +550,13 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
                 match self {
                     #(#status_arms),*
                 }
+            }
+        }
+
+        #[cfg(feature = "openapi")]
+        impl #impl_generics ::skyzen::openapi::ResponderOpenApiSchema for #ident #ty_generics #where_clause {
+            fn responder_schemas() -> ::core::option::Option<::std::vec::Vec<::skyzen::openapi::ResponseSchema>> {
+                ::core::option::Option::Some(vec![#(#openapi_responses),*])
             }
         }
 
@@ -776,23 +898,6 @@ fn doc_string(attrs: &[Attribute]) -> Option<String> {
     } else {
         Some(docs.join("\n"))
     }
-}
-
-fn unwrap_result_type(ty: &syn::Type) -> syn::Type {
-    if let syn::Type::Path(type_path) = ty {
-        if type_path.qself.is_none() {
-            if let Some(segment) = type_path.path.segments.last() {
-                if segment.ident == "Result" {
-                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                        if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                            return inner.clone();
-                        }
-                    }
-                }
-            }
-        }
-    }
-    ty.clone()
 }
 
 struct MainOptions {

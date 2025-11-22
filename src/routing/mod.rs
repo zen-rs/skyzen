@@ -110,7 +110,7 @@
 use std::future::Future;
 use std::{fmt, sync::Arc};
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, feature = "openapi"))]
 use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "websocket")]
 use crate::websocket::{WebSocket, WebSocketUpgrade};
@@ -215,14 +215,14 @@ impl Route {
     /// Generate an [`OpenApi`] document describing this route tree.
     #[must_use]
     pub fn openapi(&self) -> OpenApi {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "openapi"))]
         {
             let mut entries = Vec::new();
             collect_openapi_entries("", &self.nodes, &mut entries);
             OpenApi::from_entries(&entries)
         }
 
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(all(debug_assertions, feature = "openapi")))]
         {
             OpenApi::default()
         }
@@ -498,7 +498,7 @@ where
     RouteNode::new_endpoint(path.into(), method, endpoint, Some(handler_doc))
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, feature = "openapi"))]
 fn collect_openapi_entries(
     path_prefix: &str,
     nodes: &[RouteNode],
