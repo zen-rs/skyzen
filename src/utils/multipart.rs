@@ -61,6 +61,14 @@ impl Extractor for Multipart {
         let body = mem::replace(request.body_mut(), Body::empty());
         Ok(Self::from_parts(boundary, body))
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<crate::openapi::ExtractorSchema> {
+        Some(crate::openapi::ExtractorSchema {
+            content_type: Some("multipart/form-data"),
+            schema: None,
+        })
+    }
 }
 
 /// Represents a single multipart field.

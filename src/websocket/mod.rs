@@ -300,6 +300,16 @@ impl Responder for WebSocketUpgradeResponder {
 
         Ok(())
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<crate::openapi::ResponseSchema>> {
+        Some(vec![crate::openapi::ResponseSchema {
+            status: Some(StatusCode::SWITCHING_PROTOCOLS),
+            description: None,
+            schema: None,
+            content_type: None,
+        }])
+    }
 }
 
 #[cfg(test)]

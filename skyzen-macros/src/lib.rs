@@ -158,10 +158,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
 
     let parameter_types: Vec<_> = parameter_schemas
         .iter()
-        .filter_map(|meta| match &meta.schema {
-            ParameterSchema::Ignored => None,
-            ParameterSchema::Normal(ty) | ParameterSchema::Proxy(ty) => Some(ty.clone()),
-        })
+        .map(|meta| meta.ty.clone())
         .collect();
 
     let assertions: Vec<_> = parameter_types
@@ -176,23 +173,18 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     let mut parameter_name_lits = Vec::new();
     let mut included_idx = 0usize;
     for meta in &parameter_schemas {
-        match &meta.schema {
-            ParameterSchema::Ignored => {}
-            ParameterSchema::Normal(ty) | ParameterSchema::Proxy(ty) => {
-                parameter_schema_fns.push(quote! { ::skyzen::openapi::extractor_schema_of::<#ty> });
-                let name = meta
-                    .name
-                    .as_ref()
-                    .map(|ident| quote! { stringify!(#ident) })
-                    .unwrap_or_else(|| {
-                        let lit =
-                            syn::LitStr::new(&format!("param{included_idx}"), fn_ident.span());
-                        quote! { #lit }
-                    });
-                parameter_name_lits.push(name);
-                included_idx += 1;
-            }
-        }
+        let ty = &meta.ty;
+        parameter_schema_fns.push(quote! { ::skyzen::openapi::extractor_schema_of::<#ty> });
+        let name = meta
+            .name
+            .as_ref()
+            .map(|ident| quote! { stringify!(#ident) })
+            .unwrap_or_else(|| {
+                let lit = syn::LitStr::new(&format!("param{included_idx}"), fn_ident.span());
+                quote! { #lit }
+            });
+        parameter_name_lits.push(name);
+        included_idx += 1;
     }
 
     let schema_array = if parameter_schema_fns.is_empty() {
@@ -215,7 +207,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         schema_collector_idents.push(ident.clone());
         schema_collector_defs.push(quote! {
             fn #ident(schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>) {
-                <#ty as ::skyzen::openapi::ExtractorOpenApiSchema>::register_schemas(schemas);
+                ::skyzen::openapi::register_extractor_schemas_for::<#ty>(schemas);
             }
         });
     }
@@ -229,7 +221,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         fn #response_collector_ident(
             schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
         ) {
-            <#response_ty as ::skyzen::openapi::ResponderOpenApiSchema>::register_schemas(schemas);
+            ::skyzen::openapi::register_responder_schemas_for::<#response_ty>(schemas);
         }
     });
 
@@ -277,46 +269,20 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     .into())
 }
 
-enum ParameterSchema {
-    Normal(Type),
-    Proxy(Type),
-    Ignored,
-}
-
 struct ParameterMeta {
-    schema: ParameterSchema,
+    ty: Type,
     name: Option<syn::Ident>,
 }
 
 fn parse_parameter_schema(pat_type: &mut PatType) -> syn::Result<ParameterMeta> {
-    let mut ignored = None;
-    let mut proxy = None;
     let mut retained = Vec::new();
 
     for attr in pat_type.attrs.drain(..) {
-        if attr.path().is_ident("ignore") {
-            if !matches!(attr.meta, Meta::Path(_)) {
-                return Err(Error::new_spanned(
-                    attr,
-                    "#[ignore] does not take arguments",
-                ));
-            }
-            if ignored.is_some() {
-                return Err(Error::new(attr.span(), "duplicate #[ignore] attribute"));
-            }
-            ignored = Some(attr.span());
-            continue;
-        }
-
-        if attr.path().is_ident("proxy") {
-            if proxy.is_some() {
-                return Err(Error::new(attr.span(), "duplicate #[proxy] attribute"));
-            }
-            let ty = attr.parse_args::<Type>().map_err(|_| {
-                Error::new_spanned(&attr.meta, "#[proxy] expects a type, e.g. #[proxy(String)]")
-            })?;
-            proxy = Some(ty);
-            continue;
+        if attr.path().is_ident("ignore") || attr.path().is_ident("proxy") {
+            return Err(Error::new_spanned(
+                attr,
+                "#[ignore] and #[proxy] have been removed; remove this attribute",
+            ));
         }
 
         retained.push(attr);
@@ -324,27 +290,15 @@ fn parse_parameter_schema(pat_type: &mut PatType) -> syn::Result<ParameterMeta> 
 
     pat_type.attrs = retained;
 
-    if ignored.is_some() && proxy.is_some() {
-        return Err(Error::new(
-            pat_type.span(),
-            "cannot combine #[ignore] with #[proxy]",
-        ));
-    }
-
     let name = match &*pat_type.pat {
         syn::Pat::Ident(ident) => Some(ident.ident.clone()),
         _ => None,
     };
 
-    let schema = if ignored.is_some() {
-        ParameterSchema::Ignored
-    } else if let Some(ty) = proxy {
-        ParameterSchema::Proxy(ty)
-    } else {
-        ParameterSchema::Normal((*pat_type.ty).clone())
-    };
-
-    Ok(ParameterMeta { schema, name })
+    Ok(ParameterMeta {
+        ty: (*pat_type.ty).clone(),
+        name,
+    })
 }
 
 fn expand_error(args: ErrorArgs, item: Item) -> syn::Result<TokenStream> {
@@ -391,17 +345,6 @@ fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<
                 Some(#status)
             }
         }
-
-        impl #impl_generics ::skyzen::openapi::ResponderOpenApiSchema for #ident #ty_generics #where_clause {
-            fn responder_schemas() -> ::core::option::Option<::std::vec::Vec<::skyzen::openapi::ResponseSchema>> {
-                ::core::option::Option::Some(vec![::skyzen::openapi::ResponseSchema {
-                    status: ::core::option::Option::Some(#status),
-                    description: ::core::option::Option::Some(#message),
-                    schema: ::core::option::Option::None,
-                    content_type: ::core::option::Option::None,
-                }])
-            }
-        }
     }
     .into())
 }
@@ -419,7 +362,6 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
     let mut status_arms = Vec::new();
     let mut from_impls = Vec::new();
     let mut cleaned_variants = Punctuated::new();
-    let mut openapi_responses = Vec::new();
 
     for variant in item_enum.variants.into_iter() {
         let variant_ident = variant.ident.clone();
@@ -455,15 +397,6 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
 
         status_arms.push(quote! {
             #pattern => ::core::option::Option::Some(#status_expr)
-        });
-
-        openapi_responses.push(quote! {
-            ::skyzen::openapi::ResponseSchema {
-                status: ::core::option::Option::Some(#status_expr),
-                description: ::core::option::Option::Some(#message),
-                schema: ::core::option::Option::None,
-                content_type: ::core::option::Option::None,
-            }
         });
 
         if let Some(from_info) = from {
@@ -510,12 +443,6 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
                 match self {
                     #(#status_arms),*
                 }
-            }
-        }
-
-        impl #impl_generics ::skyzen::openapi::ResponderOpenApiSchema for #ident #ty_generics #where_clause {
-            fn responder_schemas() -> ::core::option::Option<::std::vec::Vec<::skyzen::openapi::ResponseSchema>> {
-                ::core::option::Option::Some(vec![#(#openapi_responses),*])
             }
         }
 

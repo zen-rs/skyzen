@@ -1,7 +1,11 @@
 use core::mem;
 use core::{convert::Infallible, future::Future};
 
+#[cfg(feature = "openapi")]
+use crate::openapi::{ExtractorSchema, SchemaRef};
 use alloc::boxed::Box;
+#[cfg(feature = "openapi")]
+use alloc::collections::BTreeMap;
 use http_kit::error::BoxHttpError;
 use http_kit::{
     http_error,
@@ -15,6 +19,16 @@ pub trait Extractor: Sized + Send + Sync + 'static {
     type Error: HttpError;
     /// Read the request and parse a value.
     fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send;
+
+    /// Describe the extractor's OpenAPI schema, if available.
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<ExtractorSchema> {
+        None
+    }
+
+    /// Register dependent schemas into the OpenAPI components map.
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(_defs: &mut BTreeMap<String, SchemaRef>) {}
 }
 
 macro_rules! impl_tuple_extractor {
@@ -66,11 +80,24 @@ macro_rules! impl_tuple_extractor {
             #[allow(clippy::unused_unit)]
             impl<$($ty:Extractor+Send,)*> Extractor for ($($ty,)*) {
                 type Error = TupleExtractorError<$($ty),*>;
-                async fn extract(request:&mut Request) -> Result<Self,Self::Error>{
+            async fn extract(request:&mut Request) -> Result<Self,Self::Error>{
                     Ok(($($ty::extract(request).await.map_err(|error|{
                         TupleExtractorError::$ty(error)
                     })?,)*))
                 }
+            }
+
+            #[cfg(feature = "openapi")]
+            #[allow(dead_code)]
+            fn openapi() -> Option<crate::openapi::ExtractorSchema> {
+                None
+            }
+
+            #[cfg(feature = "openapi")]
+            #[allow(dead_code)]
+            fn register_openapi_schemas(
+                _defs: &mut alloc::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+            ) {
             }
         };
     };
@@ -86,6 +113,14 @@ impl Extractor for Bytes {
         let body = mem::replace(request.body_mut(), Body::empty());
         body.into_bytes().await.map_err(|_| InvalidBody::new())
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<ExtractorSchema> {
+        Some(ExtractorSchema {
+            content_type: Some("application/octet-stream"),
+            schema: None,
+        })
+    }
 }
 
 impl Extractor for ByteStr {
@@ -94,12 +129,28 @@ impl Extractor for ByteStr {
         let body = mem::replace(request.body_mut(), Body::empty());
         body.into_string().await.map_err(|_| InvalidBody::new())
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<ExtractorSchema> {
+        Some(ExtractorSchema {
+            content_type: Some("text/plain; charset=utf-8"),
+            schema: None,
+        })
+    }
 }
 
 impl Extractor for Body {
     type Error = Infallible;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         Ok(mem::replace(request.body_mut(), Self::empty()))
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<ExtractorSchema> {
+        Some(ExtractorSchema {
+            content_type: Some("application/octet-stream"),
+            schema: None,
+        })
     }
 }
 
@@ -122,6 +173,16 @@ impl<T: Extractor> Extractor for Option<T> {
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         Ok(T::extract(request).await.ok())
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<ExtractorSchema> {
+        T::openapi()
+    }
+
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
+        T::register_openapi_schemas(defs);
+    }
 }
 
 // Let's erase the error for Result<T,E>, otherwise user have to deal with double error types.
@@ -131,5 +192,15 @@ impl<T: Extractor> Extractor for Result<T, BoxHttpError> {
         Ok(T::extract(request)
             .await
             .map_err(|e| Box::new(e) as BoxHttpError))
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<ExtractorSchema> {
+        T::openapi()
+    }
+
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
+        T::register_openapi_schemas(defs);
     }
 }

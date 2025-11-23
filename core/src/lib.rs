@@ -1,8 +1,10 @@
 #![deny(unsafe_code)]
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 //! Base type and trait for HTTP server.
 
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 #[macro_use]
 mod macros;
@@ -15,3 +17,5 @@ mod server;
 pub use server::Server;
 pub mod error;
 pub use error::*;
+#[cfg(feature = "openapi")]
+pub mod openapi;

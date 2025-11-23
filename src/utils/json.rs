@@ -32,6 +32,22 @@ impl<T: Send + Sync + Serialize + 'static> Responder for Json<T> {
             http_kit::Body::from_json(&self.0).map_err(|_| JsonEncodingError::new())?;
         Ok(())
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<crate::openapi::ResponseSchema>> {
+        Some(vec![crate::openapi::ResponseSchema {
+            status: None,
+            description: None,
+            schema: None,
+            content_type: Some("application/json"),
+        }])
+    }
+
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(
+        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+    ) {
+    }
 }
 
 /// Error raised when the content-type header is not `application/json`.
@@ -68,6 +84,20 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
             .await
             .map_err(|_| JsonContentTypeError::InvalidPayload)?;
         Ok(Self(value))
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<crate::openapi::ExtractorSchema> {
+        Some(crate::openapi::ExtractorSchema {
+            content_type: Some("application/json"),
+            schema: None,
+        })
+    }
+
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(
+        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+    ) {
     }
 }
 

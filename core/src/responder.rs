@@ -1,5 +1,7 @@
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
+#[cfg(feature = "openapi")]
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::Infallible;
@@ -12,6 +14,8 @@ use http_kit::{
     Body, Request, Response,
 };
 
+#[cfg(feature = "openapi")]
+use crate::openapi::{ResponseSchema, SchemaRef};
 use crate::Error;
 
 /// Transform a object into a part of HTTP response,always is response body,header,etc.
@@ -24,6 +28,16 @@ pub trait Responder: Sized + Send + Sync + 'static {
     ///
     /// Returns an error if the response fails.
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error>;
+
+    /// Describe the responder's OpenAPI schemas, if available.
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<ResponseSchema>> {
+        None
+    }
+
+    /// Register dependent schemas into the OpenAPI components map.
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(_defs: &mut BTreeMap<String, SchemaRef>) {}
 }
 
 macro_rules! impl_tuple_responder {
@@ -79,6 +93,25 @@ macro_rules! impl_tuple_responder {
                         $($ty.respond_to(request,response).map_err(|e| TupleResponderError::$ty(e))?;)*
                         Ok(())
                     }
+
+                    #[cfg(feature = "openapi")]
+                    fn openapi() -> Option<Vec<ResponseSchema>> {
+                        #[allow(unused_mut)]
+                        let mut schemas = Vec::new();
+                        $(
+                            if let Some(mut inner) = <$ty as Responder>::openapi() {
+                                schemas.append(&mut inner);
+                            }
+                        )*
+                        if schemas.is_empty() { None } else { Some(schemas) }
+                    }
+
+                    #[cfg(feature = "openapi")]
+                    fn register_openapi_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
+                        $(
+                            <$ty as Responder>::register_openapi_schemas(defs);
+                        )*
+                    }
                 }
             };
         };
@@ -104,6 +137,16 @@ impl Responder for Response {
         *response = self;
         Ok(())
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<ResponseSchema>> {
+        Some(vec![ResponseSchema {
+            status: None,
+            description: None,
+            schema: None,
+            content_type: None,
+        }])
+    }
 }
 
 impl<T: Responder, E: HttpError> Responder for core::result::Result<T, E> {
@@ -115,6 +158,30 @@ impl<T: Responder, E: HttpError> Responder for core::result::Result<T, E> {
                 .map_err(|e| Box::new(e) as BoxHttpError),
             Err(e) => Err(Box::new(e) as BoxHttpError),
         }
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<ResponseSchema>> {
+        let mut schemas = Vec::new();
+        if let Some(mut inner) = T::openapi() {
+            schemas.append(&mut inner);
+        }
+        schemas.push(ResponseSchema {
+            status: Some(http_kit::StatusCode::SERVICE_UNAVAILABLE),
+            description: None,
+            schema: None,
+            content_type: None,
+        });
+        if schemas.is_empty() {
+            None
+        } else {
+            Some(schemas)
+        }
+    }
+
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
+        T::register_openapi_schemas(defs);
     }
 }
 
@@ -128,6 +195,24 @@ impl<T: Responder> Responder for core::result::Result<T, Error> {
             Err(e) => Err(e.into_boxed_http_error()),
         }
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<ResponseSchema>> {
+        let mut schemas = Vec::new();
+        if let Some(mut inner) = T::openapi() {
+            schemas.append(&mut inner);
+        }
+        if schemas.is_empty() {
+            None
+        } else {
+            Some(schemas)
+        }
+    }
+
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
+        T::register_openapi_schemas(defs);
+    }
 }
 
 impl Responder for HeaderMap {
@@ -135,6 +220,16 @@ impl Responder for HeaderMap {
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         response.headers_mut().extend(self);
         Ok(())
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<ResponseSchema>> {
+        Some(vec![ResponseSchema {
+            status: None,
+            description: None,
+            schema: None,
+            content_type: None,
+        }])
     }
 }
 
@@ -144,5 +239,15 @@ impl Responder for (HeaderName, HeaderValue) {
         let (key, value) = self;
         response.headers_mut().append(key, value);
         Ok(())
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<ResponseSchema>> {
+        Some(vec![ResponseSchema {
+            status: None,
+            description: None,
+            schema: None,
+            content_type: None,
+        }])
     }
 }

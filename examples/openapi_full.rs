@@ -3,6 +3,8 @@
 //! Builds a small article API with multiple extractors, responders, and custom errors wired
 //! through `#[skyzen::openapi]` so every handler is documented automatically.
 
+#![allow(deprecated)]
+
 use std::{
     collections::HashMap,
     sync::{

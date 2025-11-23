@@ -7,6 +7,8 @@ use std::{
 };
 
 use crate::{
+    extract::Extractor,
+    responder::Responder,
     routing::{IntoRouteNode, RouteNode},
     Body, Endpoint, Request, Response, Route,
 };
@@ -21,24 +23,15 @@ use utoipa::openapi::{
     Deprecated, OpenApi as UtoipaSpec, RefOr, Required,
 };
 use utoipa_redoc::Redoc;
+
 /// OpenAPI schema reference type alias.
 pub type SchemaRef = RefOr<Schema>;
 
-// Re-exported for macro-generated registrations without requiring downstream crates to depend on
-// `linkme` directly.
-#[cfg(all(debug_assertions, feature = "openapi"))]
-pub use linkme::distributed_slice;
+#[cfg(feature = "openapi")]
+pub use skyzen_core::openapi::{ExtractorSchema, ResponseSchema, SchemaCollector};
 
-mod builtins;
-pub use builtins::IgnoreOpenApi;
-mod impls;
-
-/// Strip the crate prefix from a module path, e.g. `my_crate::users::get` -> `users::get`.
-pub fn trim_crate(path: &str) -> &str {
-    path.split_once("::").map_or(path, |(_, rest)| rest)
-}
-
-/// Schema information captured for an extractor argument.
+#[cfg(not(feature = "openapi"))]
+/// Schema information captured for an extractor argument (stubbed when `openapi` is disabled).
 #[derive(Clone)]
 pub struct ExtractorSchema {
     /// Content type associated with the extractor, if any.
@@ -47,7 +40,8 @@ pub struct ExtractorSchema {
     pub schema: Option<SchemaRef>,
 }
 
-/// Schema information captured for a responder.
+#[cfg(not(feature = "openapi"))]
+/// Schema information captured for a responder (stubbed when `openapi` is disabled).
 #[derive(Clone)]
 pub struct ResponseSchema {
     /// HTTP status code returned by the responder (or [`StatusCode::OK`] by default).
@@ -60,6 +54,7 @@ pub struct ResponseSchema {
     pub content_type: Option<&'static str>,
 }
 
+#[cfg(not(feature = "openapi"))]
 impl fmt::Debug for ExtractorSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExtractorSchema")
@@ -69,6 +64,7 @@ impl fmt::Debug for ExtractorSchema {
     }
 }
 
+#[cfg(not(feature = "openapi"))]
 impl fmt::Debug for ResponseSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ResponseSchema")
@@ -80,28 +76,26 @@ impl fmt::Debug for ResponseSchema {
     }
 }
 
+#[cfg(not(feature = "openapi"))]
+pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
+
+// Re-exported for macro-generated registrations without requiring downstream crates to depend on
+// `linkme` directly.
+#[cfg(all(debug_assertions, feature = "openapi"))]
+pub use linkme::distributed_slice;
+
+mod builtins;
+pub use builtins::IgnoreOpenApi;
+
+/// Strip the crate prefix from a module path, e.g. `my_crate::users::get` -> `users::get`.
+pub fn trim_crate(path: &str) -> &str {
+    path.split_once("::").map_or(path, |(_, rest)| rest)
+}
+
 /// Function pointer used to lazily build an extractor schema.
 pub type ExtractorSchemaFn = fn() -> Option<ExtractorSchema>;
 /// Function pointer used to lazily build responder schemas.
 pub type ResponderSchemaFn = fn() -> Option<Vec<ResponseSchema>>;
-
-/// Trait implemented by extractors that can describe their OpenAPI schema.
-pub trait ExtractorOpenApiSchema {
-    /// Return the schema for this extractor, if applicable.
-    fn extractor_schema() -> Option<ExtractorSchema>;
-
-    /// Register dependent schemas into the OpenAPI components map.
-    fn register_schemas(_defs: &mut BTreeMap<String, SchemaRef>) {}
-}
-
-/// Trait implemented by responders that can describe their OpenAPI schemas.
-pub trait ResponderOpenApiSchema {
-    /// Return schemas for every response variant produced by this responder.
-    fn responder_schemas() -> Option<Vec<ResponseSchema>>;
-
-    /// Register dependent schemas into the OpenAPI components map.
-    fn register_schemas(_defs: &mut BTreeMap<String, SchemaRef>) {}
-}
 
 /// Return the schema for a `ToSchema` type.
 pub fn schema_of<T>() -> Option<SchemaRef>
@@ -111,44 +105,71 @@ where
     Some(<T as crate::PartialSchema>::schema())
 }
 
-/// Return the extractor schema for `T` if it implements [`ExtractorOpenApiSchema`].
+/// Return the extractor schema for `T` if it exposes OpenAPI metadata.
 pub fn extractor_schema_of<T>() -> Option<ExtractorSchema>
 where
-    T: ExtractorOpenApiSchema,
+    T: Extractor,
 {
-    <T as ExtractorOpenApiSchema>::extractor_schema()
+    #[cfg(feature = "openapi")]
+    {
+        <T as Extractor>::openapi()
+    }
+
+    #[cfg(not(feature = "openapi"))]
+    {
+        let _ = core::marker::PhantomData::<T>;
+        None
+    }
 }
 
-/// Return the responder schemas for `T` if it implements [`ResponderOpenApiSchema`].
+/// Return the responder schemas for `T` if it exposes OpenAPI metadata.
 pub fn responder_schemas_of<T>() -> Option<Vec<ResponseSchema>>
 where
-    T: ResponderOpenApiSchema,
+    T: Responder,
 {
-    <T as ResponderOpenApiSchema>::responder_schemas()
+    #[cfg(feature = "openapi")]
+    {
+        <T as Responder>::openapi()
+    }
+
+    #[cfg(not(feature = "openapi"))]
+    {
+        let _ = core::marker::PhantomData::<T>;
+        None
+    }
 }
 
-/// Explicitly ignore OpenAPI generation for a type by providing an empty schema.
-#[macro_export]
-macro_rules! ignore_openapi {
-    ($ty:ty) => {
-        impl ::skyzen::openapi::ExtractorOpenApiSchema for $ty {
-            fn extractor_schema() -> ::core::option::Option<::skyzen::openapi::ExtractorSchema> {
-                None
-            }
-        }
+/// Register dependent schemas for the extractor type if OpenAPI metadata is available.
+pub fn register_extractor_schemas_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
+where
+    T: Extractor,
+{
+    #[cfg(feature = "openapi")]
+    {
+        <T as Extractor>::register_openapi_schemas(defs);
+    }
 
-        impl ::skyzen::openapi::ResponderOpenApiSchema for $ty {
-            fn responder_schemas(
-            ) -> ::core::option::Option<::std::vec::Vec<::skyzen::openapi::ResponseSchema>> {
-                None
-            }
-        }
-    };
+    #[cfg(not(feature = "openapi"))]
+    {
+        let _ = (core::marker::PhantomData::<T>, defs);
+    }
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
-/// Function pointer used to register schemas in the OpenAPI components section.
-pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
+/// Register dependent schemas for the responder type if OpenAPI metadata is available.
+pub fn register_responder_schemas_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
+where
+    T: Responder,
+{
+    #[cfg(feature = "openapi")]
+    {
+        <T as Responder>::register_openapi_schemas(defs);
+    }
+
+    #[cfg(not(feature = "openapi"))]
+    {
+        let _ = (core::marker::PhantomData::<T>, defs);
+    }
+}
 
 #[cfg(all(debug_assertions, feature = "openapi"))]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
@@ -250,7 +271,7 @@ impl RouteHandlerDoc {
 
     #[cfg(not(all(debug_assertions, feature = "openapi")))]
     const fn new() -> Self {
-        Self
+        Self {}
     }
 }
 
@@ -387,7 +408,7 @@ impl OpenApi {
     #[cfg(not(all(debug_assertions, feature = "openapi")))]
     #[must_use]
     pub(crate) fn from_entries(_: &[()]) -> Self {
-        Self
+        Self {}
     }
 
     /// Inspect the registered operations. In release builds this returns an empty slice.

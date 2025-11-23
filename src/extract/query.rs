@@ -20,6 +20,20 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
         let data = request.uri().query().unwrap_or_default();
         Ok(Self(from_str(data).map_err(|_| QueryError::new())?))
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<crate::openapi::ExtractorSchema> {
+        Some(crate::openapi::ExtractorSchema {
+            content_type: Some("application/x-www-form-urlencoded"),
+            schema: None,
+        })
+    }
+
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(
+        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+    ) {
+    }
 }
 
 #[cfg(test)]

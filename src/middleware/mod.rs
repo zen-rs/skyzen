@@ -18,6 +18,8 @@
 //! }
 //! ```
 mod error_handling;
+
+pub mod auth;
 pub use error_handling::ErrorHandlingMiddleware;
 pub use http_kit::middleware::Middleware;
 

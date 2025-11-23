@@ -34,6 +34,22 @@ impl<T: Send + Sync + Serialize + DeserializeOwned + 'static> Responder for Form
             .insert(CONTENT_TYPE, APPLICATION_WWW_FORM_URLENCODED);
         Ok(())
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<crate::openapi::ResponseSchema>> {
+        Some(vec![crate::openapi::ResponseSchema {
+            status: None,
+            description: None,
+            schema: None,
+            content_type: Some("application/x-www-form-urlencoded"),
+        }])
+    }
+
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(
+        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+    ) {
+    }
 }
 
 http_error!(
@@ -64,6 +80,20 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
                 .map_err(|_| FormContentTypeError::new())?;
             extract(&data)
         }
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<crate::openapi::ExtractorSchema> {
+        Some(crate::openapi::ExtractorSchema {
+            content_type: Some("application/x-www-form-urlencoded"),
+            schema: None,
+        })
+    }
+
+    #[cfg(feature = "openapi")]
+    fn register_openapi_schemas(
+        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+    ) {
     }
 }
 

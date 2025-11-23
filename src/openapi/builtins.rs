@@ -1,26 +1,17 @@
-use std::collections::BTreeMap;
-
 #[cfg(any(feature = "json", feature = "form"))]
 use serde::Serialize;
 use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType, Type};
 use utoipa::openapi::RefOr;
 
-use crate::ignore_openapi;
 use crate::{
     extract::{
         client_ip::{ClientIp, PeerAddr},
         Query,
     },
-    openapi::{
-        register_schema_for, schema_of, ExtractorOpenApiSchema, ExtractorSchema,
-        ResponderOpenApiSchema, ResponseSchema, SchemaRef,
-    },
+    openapi::SchemaRef,
     routing::Params,
-    utils::{cookie::CookieJar, State},
+    utils::State,
 };
-
-#[cfg(feature = "multipart")]
-use crate::utils::Multipart;
 
 #[cfg(feature = "json")]
 use crate::{responder::PrettyJson, utils::Json};
@@ -76,47 +67,6 @@ simple_schema!(
     string_schema("Peer socket address reported by the transport")
 );
 
-impl ExtractorOpenApiSchema for Params {
-    fn extractor_schema() -> Option<ExtractorSchema> {
-        schema_of::<Self>().map(|schema| ExtractorSchema {
-            content_type: None,
-            schema: Some(schema),
-        })
-    }
-
-    fn register_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
-        register_schema_for::<Self>(defs);
-    }
-}
-
-impl ExtractorOpenApiSchema for ClientIp {
-    fn extractor_schema() -> Option<ExtractorSchema> {
-        schema_of::<Self>().map(|schema| ExtractorSchema {
-            content_type: None,
-            schema: Some(schema),
-        })
-    }
-
-    fn register_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
-        register_schema_for::<Self>(defs);
-    }
-}
-
-impl ExtractorOpenApiSchema for PeerAddr {
-    fn extractor_schema() -> Option<ExtractorSchema> {
-        schema_of::<Self>().map(|schema| ExtractorSchema {
-            content_type: None,
-            schema: Some(schema),
-        })
-    }
-
-    fn register_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
-        register_schema_for::<Self>(defs);
-    }
-}
-
-ignore_openapi!(CookieJar);
-
 impl<T> utoipa::PartialSchema for Query<T>
 where
     T: utoipa::ToSchema,
@@ -132,32 +82,6 @@ where
 {
     fn schemas(schemas: &mut Vec<(String, SchemaRef)>) {
         T::schemas(schemas);
-    }
-}
-
-impl<T> ExtractorOpenApiSchema for Query<T>
-where
-    T: utoipa::PartialSchema + utoipa::ToSchema + Send + Sync + 'static,
-{
-    fn extractor_schema() -> Option<ExtractorSchema> {
-        schema_of::<T>().map(|schema| ExtractorSchema {
-            content_type: Some("application/x-www-form-urlencoded"),
-            schema: Some(schema),
-        })
-    }
-
-    fn register_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
-        register_schema_for::<T>(defs);
-    }
-}
-
-#[cfg(feature = "multipart")]
-impl ExtractorOpenApiSchema for Multipart {
-    fn extractor_schema() -> Option<ExtractorSchema> {
-        Some(ExtractorSchema {
-            content_type: Some("multipart/form-data"),
-            schema: None,
-        })
     }
 }
 
@@ -178,42 +102,6 @@ where
 {
     fn schemas(schemas: &mut Vec<(String, SchemaRef)>) {
         T::schemas(schemas);
-    }
-}
-
-#[cfg(feature = "form")]
-impl<T> ExtractorOpenApiSchema for Form<T>
-where
-    T: utoipa::PartialSchema + utoipa::ToSchema + Send + Sync + 'static,
-{
-    fn extractor_schema() -> Option<ExtractorSchema> {
-        schema_of::<T>().map(|schema| ExtractorSchema {
-            content_type: Some("application/x-www-form-urlencoded"),
-            schema: Some(schema),
-        })
-    }
-
-    fn register_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
-        register_schema_for::<T>(defs);
-    }
-}
-
-#[cfg(feature = "form")]
-impl<T> ResponderOpenApiSchema for Form<T>
-where
-    T: utoipa::PartialSchema + utoipa::ToSchema + Serialize + Send + Sync + 'static,
-{
-    fn responder_schemas() -> Option<Vec<ResponseSchema>> {
-        Some(vec![ResponseSchema {
-            status: None,
-            description: None,
-            schema: schema_of::<T>(),
-            content_type: Some("application/x-www-form-urlencoded"),
-        }])
-    }
-
-    fn register_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
-        register_schema_for::<T>(defs);
     }
 }
 
@@ -238,42 +126,6 @@ where
 }
 
 #[cfg(feature = "json")]
-impl<T> ExtractorOpenApiSchema for Json<T>
-where
-    T: utoipa::PartialSchema + utoipa::ToSchema + Send + Sync + 'static,
-{
-    fn extractor_schema() -> Option<ExtractorSchema> {
-        schema_of::<T>().map(|schema| ExtractorSchema {
-            content_type: Some("application/json"),
-            schema: Some(schema),
-        })
-    }
-
-    fn register_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
-        register_schema_for::<T>(defs);
-    }
-}
-
-#[cfg(feature = "json")]
-impl<T> ResponderOpenApiSchema for Json<T>
-where
-    T: utoipa::PartialSchema + utoipa::ToSchema + Serialize + Send + Sync + 'static,
-{
-    fn responder_schemas() -> Option<Vec<ResponseSchema>> {
-        Some(vec![ResponseSchema {
-            status: None,
-            description: None,
-            schema: schema_of::<T>(),
-            content_type: Some("application/json"),
-        }])
-    }
-
-    fn register_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
-        register_schema_for::<T>(defs);
-    }
-}
-
-#[cfg(feature = "json")]
 impl<T> utoipa::PartialSchema for PrettyJson<T>
 where
     T: utoipa::ToSchema + Serialize + 'static + Send + Sync,
@@ -293,25 +145,6 @@ where
     }
 }
 
-#[cfg(feature = "json")]
-impl<T> ResponderOpenApiSchema for PrettyJson<T>
-where
-    T: utoipa::PartialSchema + utoipa::ToSchema + Serialize + Send + Sync + 'static,
-{
-    fn responder_schemas() -> Option<Vec<ResponseSchema>> {
-        Some(vec![ResponseSchema {
-            status: None,
-            description: None,
-            schema: schema_of::<T>(),
-            content_type: Some("application/json"),
-        }])
-    }
-
-    fn register_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
-        register_schema_for::<T>(defs);
-    }
-}
-
 impl<T> utoipa::PartialSchema for State<T>
 where
     T: Clone + Send + Sync + 'static,
@@ -322,15 +155,6 @@ where
 }
 
 impl<T> utoipa::ToSchema for State<T> where T: Clone + Send + Sync + 'static {}
-
-impl<T> ExtractorOpenApiSchema for State<T>
-where
-    T: Clone + Send + Sync + 'static,
-{
-    fn extractor_schema() -> Option<ExtractorSchema> {
-        None
-    }
-}
 
 /// Wrapper that explicitly opts out of OpenAPI schema generation for contained extractors or
 /// responders.
@@ -344,15 +168,3 @@ impl<T: Send + Sync + 'static> utoipa::PartialSchema for IgnoreOpenApi<T> {
 }
 
 impl<T: Send + Sync + 'static> utoipa::ToSchema for IgnoreOpenApi<T> {}
-
-impl<T: Send + Sync + 'static> ExtractorOpenApiSchema for IgnoreOpenApi<T> {
-    fn extractor_schema() -> Option<ExtractorSchema> {
-        None
-    }
-}
-
-impl<T: Send + Sync + 'static> ResponderOpenApiSchema for IgnoreOpenApi<T> {
-    fn responder_schemas() -> Option<Vec<ResponseSchema>> {
-        None
-    }
-}

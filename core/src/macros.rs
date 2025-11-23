@@ -33,6 +33,16 @@ macro_rules! impl_base_responder {
                     *response.body_mut() = http_kit::Body::from(self);
                     Ok(())
                 }
+
+                #[cfg(feature = "openapi")]
+                fn openapi() -> Option<alloc::vec::Vec<crate::openapi::ResponseSchema>> {
+                    Some(vec![crate::openapi::ResponseSchema {
+                        status: None,
+                        description: None,
+                        schema: None,
+                        content_type: Some("application/octet-stream"),
+                    }])
+                }
             }
         )*
     };
@@ -51,6 +61,16 @@ macro_rules! impl_base_utf8_responder {
                     response.headers_mut().insert(http_kit::header::CONTENT_TYPE,http_kit::header::HeaderValue::from_static("text/plain; charset=utf-8"));
                     *response.body_mut() = http_kit::Body::from(self);
                     Ok(())
+                }
+
+                #[cfg(feature = "openapi")]
+                fn openapi() -> Option<alloc::vec::Vec<crate::openapi::ResponseSchema>> {
+                    Some(vec![crate::openapi::ResponseSchema {
+                        status: None,
+                        description: None,
+                        schema: Some(crate::openapi::plain_string_schema()),
+                        content_type: Some("text/plain; charset=utf-8"),
+                    }])
                 }
             }
         )*

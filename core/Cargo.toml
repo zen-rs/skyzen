@@ -13,6 +13,12 @@ categories = ["web-programming::http-server"]
 http-kit.workspace = true
 executor-core = { workspace = true, default-features = false }
 eyre = "0.6.12"
+utoipa = { version = "5.4", optional = true, default-features = false }
 
 [lints]
 workspace = true
+
+[features]
+default = ["std"]
+std = []
+openapi = ["std", "dep:utoipa"]
