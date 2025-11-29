@@ -39,7 +39,7 @@ const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 #[skyzen::error(status = StatusCode::BAD_REQUEST)]
 pub enum WebSocketUpgradeError {
     /// The HTTP method is not GET.
-    #[error("Method not allowed")]
+    #[error("Method not allowed", status = StatusCode::METHOD_NOT_ALLOWED)]
     MethodNotAllowed,
 
     /// The `Upgrade` header is missing.
@@ -66,7 +66,7 @@ pub enum WebSocketUpgradeError {
     #[error("Unsupported Sec-WebSocket-Version. Only version 13 is accepted")]
     UnsupportedVersion,
     /// The `OnUpgrade` extension is missing.
-    #[error("Missing OnUpgrade extension")]
+    #[error("Missing OnUpgrade extension", status = StatusCode::UPGRADE_REQUIRED)]
     MissingOnUpgrade,
 }
 
@@ -150,6 +150,16 @@ impl WebSocketUpgrade {
     #[must_use]
     pub const fn config(mut self, config: WebSocketConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Set the maximum incoming message size accepted by the websocket.
+    ///
+    /// Pass `None` to disable the limit enforced by `async-tungstenite`.
+    #[must_use]
+    pub fn max_message_size(mut self, max_size: Option<usize>) -> Self {
+        let config = self.config.get_or_insert_with(WebSocketConfig::default);
+        config.max_message_size = max_size;
         self
     }
 
@@ -315,12 +325,38 @@ impl Responder for WebSocketUpgradeResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Body;
+    use crate::{websocket::WebSocketMessage, Body};
+    use futures_util::StreamExt;
+    use tokio::io::duplex;
 
     fn build_request() -> Request {
         let mut request = Request::new(Body::empty());
         *request.method_mut() = Method::GET;
         request
+    }
+
+    async fn build_valid_upgrade() -> (WebSocketUpgrade, Request) {
+        let mut request = build_request();
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_KEY,
+            hyper::header::HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        request.headers_mut().insert(
+            header::CONNECTION,
+            hyper::header::HeaderValue::from_static("Upgrade"),
+        );
+        request.headers_mut().insert(
+            header::UPGRADE,
+            hyper::header::HeaderValue::from_static("websocket"),
+        );
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_VERSION,
+            hyper::header::HeaderValue::from_static("13"),
+        );
+        let on_upgrade = hyper::upgrade::on(&mut request);
+        request.extensions_mut().insert(on_upgrade);
+        let upgrade = WebSocketUpgrade::extract(&mut request).await.unwrap();
+        (upgrade, request)
     }
 
     #[tokio::test]
@@ -350,26 +386,108 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_valid_request() {
-        let mut request = build_request();
-        request.headers_mut().insert(
-            header::SEC_WEBSOCKET_KEY,
-            hyper::header::HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
-        );
-        request.headers_mut().insert(
-            header::CONNECTION,
-            hyper::header::HeaderValue::from_static("Upgrade"),
-        );
-        request.headers_mut().insert(
-            header::UPGRADE,
-            hyper::header::HeaderValue::from_static("websocket"),
-        );
-        request.headers_mut().insert(
-            header::SEC_WEBSOCKET_VERSION,
-            hyper::header::HeaderValue::from_static("13"),
-        );
-        let on_upgrade = hyper::upgrade::on(&mut request);
-        request.extensions_mut().insert(on_upgrade);
-        let ws = WebSocketUpgrade::extract(&mut request).await.unwrap();
+        let (ws, _) = build_valid_upgrade().await;
         assert!(ws.response_protocol.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_switching_protocols_response() {
+        let (upgrade, request) = build_valid_upgrade().await;
+
+        let responder = upgrade.on_upgrade(|_socket| async move {});
+        let mut response = Response::new(Body::empty());
+        responder
+            .respond_to(&request, &mut response)
+            .expect("response should build");
+
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get(header::UPGRADE),
+            Some(&header::HeaderValue::from_static("websocket"))
+        );
+        assert_eq!(
+            headers.get(header::CONNECTION),
+            Some(&header::HeaderValue::from_static("upgrade"))
+        );
+        assert_eq!(
+            headers.get(header::SEC_WEBSOCKET_ACCEPT),
+            Some(&header::HeaderValue::from_static(
+                "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_overriding_max_message_size() {
+        let (upgrade, _) = build_valid_upgrade().await;
+        let upgrade = upgrade.max_message_size(None);
+        assert!(upgrade
+            .config
+            .as_ref()
+            .is_some_and(|config| config.max_message_size.is_none()));
+        let upgraded_again = upgrade.max_message_size(Some(512));
+        assert_eq!(
+            upgraded_again
+                .config
+                .as_ref()
+                .and_then(|config| config.max_message_size),
+            Some(512)
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_roundtrip_over_duplex() {
+        let (client_stream, server_stream) = duplex(1024);
+        let server_socket =
+            WebSocketStream::from_raw_socket(TokioAdapter::new(server_stream), Role::Server, None)
+                .await;
+
+        let server = tokio::spawn(async move {
+            let mut server_socket = server_socket;
+            while let Some(Ok(message)) = server_socket.next().await {
+                if let Ok(text) = message.into_text() {
+                    let _ = server_socket.send(WebSocketMessage::text(text)).await;
+                }
+            }
+        });
+
+        let mut client_socket =
+            WebSocketStream::from_raw_socket(TokioAdapter::new(client_stream), Role::Client, None)
+                .await;
+
+        client_socket
+            .send(WebSocketMessage::text("hello"))
+            .await
+            .expect("send message");
+        let reply = client_socket
+            .next()
+            .await
+            .expect("missing reply")
+            .expect("websocket frame");
+        assert_eq!(reply.into_text().unwrap(), "hello");
+
+        let _ = client_socket.close(None).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn applies_custom_max_message_size_to_stream() {
+        let (upgrade, _) = build_valid_upgrade().await;
+        let config = upgrade.max_message_size(None).config.clone();
+
+        let (client_stream, server_stream) = duplex(1024);
+        let server_socket = WebSocketStream::from_raw_socket(
+            TokioAdapter::new(server_stream),
+            Role::Server,
+            config,
+        )
+        .await;
+        let _client_socket =
+            WebSocketStream::from_raw_socket(TokioAdapter::new(client_stream), Role::Client, None)
+                .await;
+
+        assert!(server_socket.get_config().max_message_size.is_none());
     }
 }

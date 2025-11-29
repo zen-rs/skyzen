@@ -82,7 +82,7 @@ pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
 // Re-exported for macro-generated registrations without requiring downstream crates to depend on
 // `linkme` directly.
 #[cfg(all(debug_assertions, feature = "openapi"))]
-pub use linkme::distributed_slice;
+pub use linkme;
 
 mod builtins;
 pub use builtins::IgnoreOpenApi;
@@ -173,7 +173,8 @@ where
 
 #[cfg(all(debug_assertions, feature = "openapi"))]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
-#[distributed_slice]
+#[linkme::distributed_slice]
+#[linkme(crate = ::skyzen::openapi::linkme)]
 pub static HANDLER_SPECS: [HandlerSpec] = [..];
 
 #[cfg(all(debug_assertions, feature = "openapi"))]

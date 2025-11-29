@@ -23,5 +23,9 @@ features = ["server", "http1", "http2"]
 version = "1.6"
 default-features = false
 
+[dev-dependencies]
+async-tungstenite = { version = "0.32.0", features = ["tokio-runtime"] }
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "signal"] }
+
 [lints]
 workspace = true
