@@ -1,3 +1,5 @@
+//! WebSocket tests for the Skyzen framework.
+
 use async_tungstenite::{
     client_async,
     tokio::TokioAdapter,

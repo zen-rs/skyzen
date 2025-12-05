@@ -197,7 +197,7 @@ where
                 tokio::spawn(async move {
                     let builder = HyperBuilder::new(hyper_util::rt::TokioExecutor::new());
                     if let Err(error) = builder
-                        .serve_connection(TokioIo::new(stream), service)
+                        .serve_connection_with_upgrades(TokioIo::new(stream), service)
                         .await
                     {
                         error!("Hyper connection error: {error}");
