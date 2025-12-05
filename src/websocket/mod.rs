@@ -181,64 +181,74 @@ impl WebSocketUpgrade {
 type WebSocketCallbackFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 type DynCallback = Box<dyn FnOnce(WebSocket) -> WebSocketCallbackFuture + Send + Sync>;
 
+fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeError> {
+    if request.method() != Method::GET {
+        return Err(WebSocketUpgradeError::MethodNotAllowed);
+    }
+    let (key, requested_protocols) = {
+        let headers = request.headers();
+
+        let key = headers
+            .get(header::SEC_WEBSOCKET_KEY)
+            .ok_or_else(|| WebSocketUpgradeError::MissingSecWebSocketKey)?
+            .clone();
+
+        let connection = headers
+            .get(header::CONNECTION)
+            .ok_or_else(|| WebSocketUpgradeError::MissingConnectionHeader)?;
+
+        if !header_has_token(connection, "upgrade") {
+            return Err(WebSocketUpgradeError::MissingUpgradeHeader);
+        }
+
+        let upgrade_header = headers
+            .get(header::UPGRADE)
+            .ok_or_else(|| WebSocketUpgradeError::MissingUpgradeHeader)?;
+
+        if !upgrade_header
+            .to_str()
+            .map(|value| value.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false)
+        {
+            return Err(WebSocketUpgradeError::InvalidUpgradeHeader);
+        }
+
+        match headers.get(header::SEC_WEBSOCKET_VERSION) {
+            Some(version) if version == "13" => {}
+            _ => {
+                return Err(WebSocketUpgradeError::UnsupportedVersion);
+            }
+        }
+
+        let requested_protocols = parse_protocols(headers.get(header::SEC_WEBSOCKET_PROTOCOL));
+
+        (key, requested_protocols)
+    };
+
+    let on_upgrade = request
+        .extensions_mut()
+        .remove::<OnUpgrade>()
+        .ok_or_else(|| WebSocketUpgradeError::MissingOnUpgrade)?;
+
+    Ok(WebSocketUpgrade {
+        key,
+        on_upgrade,
+        requested_protocols,
+        response_protocol: None,
+        config: None,
+    })
+}
+
 impl Extractor for WebSocketUpgrade {
     type Error = WebSocketUpgradeError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        if request.method() != Method::GET {
-            return Err(WebSocketUpgradeError::MethodNotAllowed);
+        let result = upgrade(request);
+
+        if let Err(ref error) = result {
+            error!("WebSocket upgrade failed: {error}");
         }
-        let (key, requested_protocols) = {
-            let headers = request.headers();
 
-            let key = headers
-                .get(header::SEC_WEBSOCKET_KEY)
-                .ok_or_else(|| WebSocketUpgradeError::MissingSecWebSocketKey)?
-                .clone();
-
-            let connection = headers
-                .get(header::CONNECTION)
-                .ok_or_else(|| WebSocketUpgradeError::MissingConnectionHeader)?;
-
-            if !header_has_token(connection, "upgrade") {
-                return Err(WebSocketUpgradeError::MissingUpgradeHeader);
-            }
-
-            let upgrade_header = headers
-                .get(header::UPGRADE)
-                .ok_or_else(|| WebSocketUpgradeError::MissingUpgradeHeader)?;
-
-            if !upgrade_header
-                .to_str()
-                .map(|value| value.eq_ignore_ascii_case("websocket"))
-                .unwrap_or(false)
-            {
-                return Err(WebSocketUpgradeError::InvalidUpgradeHeader);
-            }
-
-            match headers.get(header::SEC_WEBSOCKET_VERSION) {
-                Some(version) if version == "13" => {}
-                _ => {
-                    return Err(WebSocketUpgradeError::UnsupportedVersion);
-                }
-            }
-
-            let requested_protocols = parse_protocols(headers.get(header::SEC_WEBSOCKET_PROTOCOL));
-
-            (key, requested_protocols)
-        };
-
-        let on_upgrade = request
-            .extensions_mut()
-            .remove::<OnUpgrade>()
-            .ok_or_else(|| WebSocketUpgradeError::MissingOnUpgrade)?;
-
-        Ok(Self {
-            key,
-            on_upgrade,
-            requested_protocols,
-            response_protocol: None,
-            config: None,
-        })
+        result
     }
 }
 
