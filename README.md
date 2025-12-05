@@ -1,6 +1,6 @@
 # Skyzen
 
-Skyzen is a router-first HTTP framework that targets both native servers (Tokio + Hyper) and modern edge platforms powered by WebAssembly. The project is layered as a Cargo workspace containing the main `skyzen` crate, shared traits in `skyzen-core`, macros in `skyzen-macros`, and an optional Hyper backend in `skyzen-hyper`.
+Skyzen is an ergonomic HTTP framework that targets both native servers (Tokio + Hyper) and modern edge platforms powered by WebAssembly. The project is layered as a Cargo workspace containing the main `skyzen` crate, shared traits in `skyzen-core`, macros in `skyzen-macros`, and an optional Hyper backend in `skyzen-hyper`.
 
 ## Highlights
 
@@ -8,7 +8,7 @@ Skyzen is a router-first HTTP framework that targets both native servers (Tokio 
 - **Native niceties out of the box** – pretty logging, `Ctrl+C` graceful shutdown, and CLI overrides for host/port (`--listen`, `--addr`, `--host`, `--port` or `-p`) are enabled automatically.
 - **Wasm anywhere** – the wasm runtime works with the standard `fetch(Request, Env, Context)` signature which runs unmodified on Cloudflare Workers, Deno Deploy, Fastly Compute@Edge, and other WinterCG implementations.
 - **Routing + extractors + responders** – compose routers via `Route::new`, extract strongly-typed data from requests, plug in middleware stacks, or respond with anything implementing `Responder`.
-- **Shared core traits** – `skyzen-core` defines the server traits consumed by both native and wasm stacks, keeping abstractions decoupled from any specific runtime.
+- **First-class OpenAPI support** – automatically generate OpenAPI definitions from your handlers and serve interactive Redoc documentation with a single method call.
 
 ## Quick start
 
@@ -24,16 +24,29 @@ Create a router and annotate your entry function:
 ```rust
 use skyzen::{
     routing::{CreateRouteNode, Params, Route, Router},
-    Result,
+    utils::Json,
+    Result, ToSchema,
 };
+use serde::Serialize;
+
+#[derive(Serialize, ToSchema)]
+struct Message {
+    message: String,
+}
 
 async fn health() -> &'static str {
     "OK"
 }
 
-async fn greet(params: Params) -> Result<String> {
+/// Greet a user by name
+///
+/// Greet a user by name in a personalized way.
+#[skyzen::openapi]
+async fn greet(params: Params) -> Result<Json<Message>> {
     let name = params.get("name")?;
-    Ok(format!("Hello, {name}!"))
+    Ok(Json(Message {
+        message: format!("Hello, {name}!"),
+    }))
 }
 
 fn router() -> Router {
@@ -42,6 +55,7 @@ fn router() -> Router {
         "/health".at(health),
         "/hello/{name}".at(greet),
     ))
+    .enable_api_doc() // Enable OpenAPI documentation at /api-docs
     .build()
 }
 
@@ -95,6 +109,17 @@ wasm-bindgen --target web target/wasm32-unknown-unknown/release/your_app.wasm --
 ```
 
 Upload the generated artifacts (plus your Worker bootstrap script) and Cloudflare will call the exported `fetch` just like any other Worker. Because the runtime does not rely on Tokio, no additional shims are necessary.
+
+## How OpenAPI works
+
+Skyzen achieves seamless OpenAPI integration through a combination of compile-time reflection and distributed slice collection:
+
+1.  **Zero-config metadata**: The `#[skyzen::openapi]` attribute macro inspects your handler's signature at compile time, identifying extractor types (like `Json<T>`, `Query<T>`) and the return type.
+2.  **Distributed collection**: Metadata for each handler is stored in a distributed static slice (via `linkme`), allowing the framework to discover all annotated handlers across your codebase without a central registry.
+3.  **Automatic association**: When you mount a handler using `.at(handler)`, Skyzen automatically looks up its associated metadata and attaches it to the route tree.
+4.  **Schema generation**: Types implement `ToSchema` (from `utoipa`), allowing the framework to recursively generate JSON schemas for all request bodies and responses.
+
+This means you never have to manually sync your documentation with your code—just annotate your handlers, and the router does the rest.
 
 ## Workspace layout
 
