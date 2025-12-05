@@ -1,3 +1,5 @@
+//! WebSocket echo example.
+
 use futures_util::StreamExt;
 use skyzen::{
     routing::{CreateRouteNode, Route, Router},

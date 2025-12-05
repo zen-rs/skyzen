@@ -1,5 +1,7 @@
 //! Demonstrates the `#[skyzen::openapi]` attribute and router introspection APIs.
 
+#![allow(unused)]
+
 use http::Method;
 use serde::{Deserialize, Serialize};
 use skyzen::{
