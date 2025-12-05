@@ -120,7 +120,7 @@ pub struct WebSocketUpgrade {
     on_upgrade: OnUpgrade,
     requested_protocols: Vec<String>,
     response_protocol: Option<String>,
-    config: Option<WebSocketConfig>,
+    config: WebSocketConfig,
 }
 
 impl WebSocketUpgrade {
@@ -149,7 +149,7 @@ impl WebSocketUpgrade {
     /// Override the [`WebSocketConfig`] used for the upgraded stream.
     #[must_use]
     pub const fn config(mut self, config: WebSocketConfig) -> Self {
-        self.config = Some(config);
+        self.config = config;
         self
     }
 
@@ -158,8 +158,7 @@ impl WebSocketUpgrade {
     /// Pass `None` to disable the limit enforced by `async-tungstenite`.
     #[must_use]
     pub fn max_message_size(mut self, max_size: Option<usize>) -> Self {
-        let config = self.config.get_or_insert_with(WebSocketConfig::default);
-        config.max_message_size = max_size;
+        self.config.max_message_size = max_size;
         self
     }
 
@@ -235,7 +234,7 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
         on_upgrade,
         requested_protocols,
         response_protocol: None,
-        config: None,
+        config: WebSocketConfig::default(),
     })
 }
 
@@ -306,7 +305,7 @@ impl Responder for WebSocketUpgradeResponder {
                         let stream = WebSocketStream::from_raw_socket(
                             TokioAdapter::new(io),
                             Role::Server,
-                            config,
+                            Some(config),
                         )
                         .await;
                         callback(stream).await;
@@ -432,18 +431,9 @@ mod tests {
     async fn allows_overriding_max_message_size() {
         let (upgrade, _) = build_valid_upgrade().await;
         let upgrade = upgrade.max_message_size(None);
-        assert!(upgrade
-            .config
-            .as_ref()
-            .is_some_and(|config| config.max_message_size.is_none()));
+        assert!(upgrade.config.max_message_size.is_none());
         let upgraded_again = upgrade.max_message_size(Some(512));
-        assert_eq!(
-            upgraded_again
-                .config
-                .as_ref()
-                .and_then(|config| config.max_message_size),
-            Some(512)
-        );
+        assert_eq!(upgraded_again.config.max_message_size, Some(512));
     }
 
     #[tokio::test]
@@ -491,7 +481,7 @@ mod tests {
         let server_socket = WebSocketStream::from_raw_socket(
             TokioAdapter::new(server_stream),
             Role::Server,
-            config,
+            Some(config),
         )
         .await;
         let _client_socket =

@@ -1,3 +1,5 @@
+//! Authentication middleware.
+
 use std::future::Future;
 
 use http_kit::{middleware::MiddlewareError, Endpoint, HttpError, Middleware, Request, Response};
@@ -19,7 +21,7 @@ pub trait Authenticater {
 }
 
 /// Middleware for authenticating requests.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AuthMiddleware<A: Authenticater> {
     authenticator: A,
 }
