@@ -113,6 +113,7 @@ websocket = [
     "dep:async-tungstenite",
     "dep:base64",
     "dep:sha1",
+    "dep:serde_json",
 ]
 rt = [
     "dep:tokio",

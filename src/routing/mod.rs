@@ -85,17 +85,14 @@
 //! When the `websocket` feature is enabled you can use `.ws` to accept upgrades without manually
 //! extracting [`WebSocketUpgrade`](crate::websocket::WebSocketUpgrade):
 //! ```no_run
-//! use futures_util::{SinkExt, StreamExt};
-//! use skyzen::{
-//!     routing::{CreateRouteNode, Route},
-//!     websocket::WebSocketMessage,
-//! };
+//! use futures_util::StreamExt;
+//! use skyzen::routing::{CreateRouteNode, Route};
 //!
 //! let routes = Route::new((
 //!     "/chat".ws(|mut socket| async move {
 //!         while let Some(Ok(message)) = socket.next().await {
 //!             if let Ok(text) = message.into_text() {
-//!                 let _ = socket.send(WebSocketMessage::text(text)).await;
+//!                 let _ = socket.send_text(text).await;
 //!             }
 //!         }
 //!     }),

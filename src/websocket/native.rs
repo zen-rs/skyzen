@@ -3,15 +3,15 @@
 //! Handlers can request a protocol switch by extracting [`WebSocketUpgrade`]
 //! and returning the result of [`WebSocketUpgrade::on_upgrade`]:
 //! ```
-//! use futures_util::{SinkExt, StreamExt};
+//! use futures_util::StreamExt;
 //! use skyzen::{websocket::{WebSocketMessage, WebSocketUpgrade}, Responder};
 //!
 //! async fn ws_handler(ws: WebSocketUpgrade) -> impl Responder {
 //!     ws.on_upgrade(|mut socket| async move {
 //!         while let Some(Ok(message)) = socket.next().await {
 //!             if message.is_text() {
-//!                 let reply = WebSocketMessage::text(message.into_text().unwrap());
-//!                 let _ = socket.send(reply).await;
+//!                 let reply = message.into_text().unwrap();
+//!                 let _ = socket.send_text(reply).await;
 //!             }
 //!         }
 //!     })
@@ -34,6 +34,7 @@ use async_tungstenite::{
         },
         Error as TungsteniteError, Message as TungsteniteMessage,
     },
+    WebSocketReceiver as AsyncWebSocketReceiver, WebSocketSender as AsyncWebSocketSender,
     WebSocketStream,
 };
 use futures_core::Stream;
@@ -41,6 +42,7 @@ use futures_util::Sink;
 use http_kit::utils::{AsyncRead, AsyncWrite, Bytes};
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper_util::rt::TokioIo;
+use serde::Serialize;
 use skyzen_core::{Extractor, Responder};
 use std::{
     pin::Pin,
@@ -142,13 +144,23 @@ where
     ) -> Self {
         let config = config.unwrap_or_default();
         let inner =
-            WebSocketStream::from_raw_socket(stream, role, Some(to_tungstenite_config(&config)))
-                .await;
+            WebSocketStream::from_raw_socket(stream, role, to_tungstenite_config(&config)).await;
         Self { inner, config }
     }
 
-    /// Send a message over the websocket connection.
-    pub async fn send(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
+    /// Serialize a value to JSON text and send it over the websocket connection.
+    pub async fn send<T: Serialize>(&mut self, value: T) -> WebSocketResult<()> {
+        let payload = serde_json::to_string(&value)?;
+        self.send_text(payload).await
+    }
+
+    /// Send a raw text frame without JSON serialization.
+    pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
+        self.send_message(WebSocketMessage::text(text)).await
+    }
+
+    /// Send a [`WebSocketMessage`] without additional processing.
+    pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
         self.inner
             .send(message.into())
             .await
@@ -166,6 +178,23 @@ where
             .close(close_frame.map(Into::into))
             .await
             .map_err(WebSocketError::from)
+    }
+
+    /// Split the websocket into independent sender and receiver halves.
+    pub fn split(self) -> (WebSocketSender<IO>, WebSocketReceiver<IO>) {
+        let config = self.config.clone();
+        let (inner_sink, inner_stream) = self.inner.split();
+
+        (
+            WebSocketSender {
+                inner: inner_sink,
+                config: config.clone(),
+            },
+            WebSocketReceiver {
+                inner: inner_stream,
+                config,
+            },
+        )
     }
 }
 
@@ -231,6 +260,133 @@ where
         Pin::new(&mut self.inner)
             .poll_close(cx)
             .map_err(WebSocketError::from)
+    }
+}
+
+/// Sender half returned from [`WebSocket::split`].
+pub struct WebSocketSender<IO = NativeIo> {
+    inner: AsyncWebSocketSender<IO>,
+    config: WebSocketConfig,
+}
+
+impl<IO> WebSocketSender<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Serialize a value to JSON text and send it over the websocket connection.
+    pub async fn send<T: Serialize>(&mut self, value: T) -> WebSocketResult<()> {
+        let payload = serde_json::to_string(&value)?;
+        self.send_text(payload).await
+    }
+
+    /// Send a raw text frame without JSON serialization.
+    pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
+        self.send_message(WebSocketMessage::text(text)).await
+    }
+
+    /// Send a [`WebSocketMessage`] without additional processing.
+    pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
+        self.inner
+            .send(message.into())
+            .await
+            .map_err(WebSocketError::from)
+    }
+
+    /// Close the websocket connection gracefully.
+    pub async fn close(&mut self, close_frame: Option<WebSocketCloseFrame>) -> WebSocketResult<()> {
+        self.inner
+            .close(close_frame.map(Into::into))
+            .await
+            .map_err(WebSocketError::from)
+    }
+
+    /// Access the underlying websocket configuration.
+    pub fn get_config(&self) -> &WebSocketConfig {
+        &self.config
+    }
+}
+
+impl<IO> std::fmt::Debug for WebSocketSender<IO> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketSender").finish_non_exhaustive()
+    }
+}
+
+impl<IO> Sink<WebSocketMessage> for WebSocketSender<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    type Error = WebSocketError;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Pin::new(&mut self.inner)
+            .poll_ready(cx)
+            .map_err(WebSocketError::from)
+    }
+
+    fn start_send(
+        mut self: Pin<&mut Self>,
+        item: WebSocketMessage,
+    ) -> std::result::Result<(), Self::Error> {
+        Pin::new(&mut self.inner)
+            .start_send(item.into())
+            .map_err(WebSocketError::from)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Pin::new(&mut self.inner)
+            .poll_flush(cx)
+            .map_err(WebSocketError::from)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Pin::new(&mut self.inner)
+            .poll_close(cx)
+            .map_err(WebSocketError::from)
+    }
+}
+
+/// Receiver half returned from [`WebSocket::split`].
+pub struct WebSocketReceiver<IO = NativeIo> {
+    inner: AsyncWebSocketReceiver<IO>,
+    config: WebSocketConfig,
+}
+
+impl<IO> WebSocketReceiver<IO> {
+    /// Access the underlying websocket configuration.
+    pub fn get_config(&self) -> &WebSocketConfig {
+        &self.config
+    }
+}
+
+impl<IO> std::fmt::Debug for WebSocketReceiver<IO> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketReceiver").finish_non_exhaustive()
+    }
+}
+
+impl<IO> Stream for WebSocketReceiver<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    type Item = WebSocketResult<WebSocketMessage>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(Ok(message.into()))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -513,7 +669,7 @@ fn to_tungstenite_config(config: &WebSocketConfig) -> TungsteniteConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{websocket::WebSocketMessage, Body};
+    use crate::Body;
     use futures_util::StreamExt;
     use tokio::io::duplex;
 
@@ -625,7 +781,7 @@ mod tests {
             let mut server_socket = server_socket;
             while let Some(Ok(message)) = server_socket.next().await {
                 if let Ok(text) = message.into_text() {
-                    let _ = server_socket.send(WebSocketMessage::text(text)).await;
+                    let _ = server_socket.send_text(text).await;
                 }
             }
         });
@@ -634,7 +790,7 @@ mod tests {
             WebSocket::from_raw_socket(TokioAdapter::new(client_stream), Role::Client, None).await;
 
         client_socket
-            .send(WebSocketMessage::text("hello"))
+            .send_text("hello")
             .await
             .expect("send message");
         let reply = client_socket
@@ -643,6 +799,37 @@ mod tests {
             .expect("missing reply")
             .expect("websocket frame");
         assert_eq!(reply.into_text().unwrap(), "hello");
+
+        let _ = client_socket.close(None).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_split_roundtrip_over_duplex() {
+        let (client_stream, server_stream) = duplex(1024);
+        let server_socket =
+            WebSocket::from_raw_socket(TokioAdapter::new(server_stream), Role::Server, None).await;
+        let (mut tx, mut rx) = server_socket.split();
+
+        let server = tokio::spawn(async move {
+            while let Some(Ok(message)) = rx.next().await {
+                if let Ok(text) = message.into_text() {
+                    let _ = tx.send_text(format!("echo:{text}")).await;
+                }
+            }
+        });
+
+        let mut client_socket =
+            WebSocket::from_raw_socket(TokioAdapter::new(client_stream), Role::Client, None).await;
+
+        client_socket.send_text("ping").await.expect("send message");
+        let reply = client_socket
+            .next()
+            .await
+            .expect("missing reply")
+            .expect("websocket frame");
+        assert_eq!(reply.into_text().unwrap(), "echo:ping");
 
         let _ = client_socket.close(None).await;
         server.abort();

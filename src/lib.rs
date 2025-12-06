@@ -57,4 +57,6 @@ pub mod middleware;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 #[cfg(feature = "websocket")]
-pub use websocket::{WebSocket, WebSocketMessage, WebSocketUpgrade};
+pub use websocket::{
+    WebSocket, WebSocketMessage, WebSocketReceiver, WebSocketSender, WebSocketUpgrade,
+};

@@ -3,7 +3,7 @@
 use futures_util::StreamExt;
 use skyzen::{
     routing::{CreateRouteNode, Route, Router},
-    websocket::{WebSocketMessage, WebSocketUpgrade},
+    websocket::WebSocketUpgrade,
     Responder,
 };
 
@@ -11,9 +11,7 @@ async fn websocket_echo(upgrade: WebSocketUpgrade) -> impl Responder {
     upgrade.on_upgrade(|mut socket| async move {
         while let Some(Ok(message)) = socket.next().await {
             if let Ok(text) = message.into_text() {
-                let _ = socket
-                    .send(WebSocketMessage::text(format!("echo:{text}")))
-                    .await;
+                let _ = socket.send_text(format!("echo:{text}")).await;
             }
         }
     })

@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use hyper::header::SEC_WEBSOCKET_PROTOCOL;
 use skyzen::{
     routing::{CreateRouteNode, Route},
-    websocket::{WebSocketMessage, WebSocketUpgrade},
+    websocket::WebSocketUpgrade,
 };
 use tokio::io::duplex;
 
@@ -55,7 +55,7 @@ async fn websocket_roundtrip_over_hyper() {
         Route::new(("/ws".ws(|mut socket| async move {
             while let Some(Ok(message)) = socket.next().await {
                 if let Ok(text) = message.into_text() {
-                    let _ = socket.send(WebSocketMessage::text(text)).await;
+                    let _ = socket.send_text(text).await;
                 }
             }
         }),)),
@@ -96,7 +96,7 @@ async fn websocket_negotiates_protocol_with_standard_client() {
             upgrade
                 .protocols(["chat", "superchat"])
                 .on_upgrade(|mut socket| async move {
-                    let _ = socket.send(WebSocketMessage::text("protocol-ok")).await;
+                    let _ = socket.send_text("protocol-ok").await;
                 })
         }),)),
         request,
@@ -133,7 +133,7 @@ async fn websocket_uses_custom_max_message_size() {
                         .max_message_size
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "none".to_owned());
-                    let _ = socket.send(WebSocketMessage::text(limit)).await;
+                    let _ = socket.send_text(limit).await;
                 })
         }),)),
         "ws://localhost/config",

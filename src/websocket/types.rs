@@ -95,3 +95,10 @@ impl fmt::Display for WebSocketError {
 }
 
 impl std::error::Error for WebSocketError {}
+
+#[cfg(feature = "json")]
+impl From<serde_json::Error> for WebSocketError {
+    fn from(error: serde_json::Error) -> Self {
+        WebSocketError::Protocol(error.to_string())
+    }
+}
