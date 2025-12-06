@@ -335,7 +335,7 @@ pub struct OpenApi {
 impl Debug for OpenApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenApi")
-            .field("operations", &self.operations)
+            .field("operations", &"[..]")
             .field("schemas", &"[..]")
             .finish()
     }
