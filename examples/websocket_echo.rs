@@ -28,14 +28,14 @@ async fn websocket_echo(upgrade: WebSocketUpgrade) -> impl Responder {
                 WebSocketMessage::Text(text) => {
                     let _ = socket.send_text(format!("echo:{text}")).await;
                 }
-                WebSocketMessage::Close(_) => break,
+                WebSocketMessage::Close => break,
                 _ => {}
             }
         }
     })
 }
 
-/// JSON echo handler - demonstrates recv_json() and send() convenience methods
+/// JSON echo handler - demonstrates `recv_json()` and `send()` convenience methods
 async fn websocket_json(upgrade: WebSocketUpgrade) -> impl Responder {
     upgrade.on_upgrade(|mut socket| async move {
         // Receive JSON messages using the convenient recv_json method
@@ -52,11 +52,11 @@ async fn websocket_json(upgrade: WebSocketUpgrade) -> impl Responder {
     })
 }
 
-/// Binary echo handler - demonstrates send_binary() convenience method
+/// Binary echo handler - echoes back binary messages with a prefix byte
 async fn websocket_binary(upgrade: WebSocketUpgrade) -> impl Responder {
     upgrade.on_upgrade(|mut socket| async move {
         while let Some(Ok(message)) = socket.next().await {
-            if let Ok(data) = message.into_binary() {
+            if let Some(data) = message.into_bytes() {
                 println!("Received {} bytes", data.len());
                 // Echo back with a prefix byte
                 let mut response = vec![0xFF];

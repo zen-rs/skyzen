@@ -20,9 +20,7 @@
 
 use crate::{
     header,
-    websocket::types::{
-        WebSocketCloseFrame, WebSocketConfig, WebSocketError, WebSocketMessage, WebSocketResult,
-    },
+    websocket::types::{WebSocketCloseFrame, WebSocketError, WebSocketResult},
     Method, Request, Response, StatusCode,
 };
 use async_tungstenite::{
@@ -39,7 +37,10 @@ use async_tungstenite::{
 };
 use futures_core::Stream;
 use futures_util::Sink;
-use http_kit::utils::Bytes;
+use http_kit::{
+    utils::{ByteStr, Bytes},
+    ws::{WebSocketConfig, WebSocketMessage},
+};
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
@@ -169,7 +170,7 @@ impl WebSocket {
     /// # Errors
     ///
     /// Returns [`WebSocketError::Protocol`] if the message is not binary.
-    pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+    pub async fn send_binary(&mut self, data: impl Into<Bytes>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::binary(data)).await
     }
 
@@ -182,7 +183,7 @@ impl WebSocket {
     /// # Errors
     ///
     /// Returns [`WebSocketError::Protocol`] if the message is not ping.
-    pub async fn send_ping(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+    pub async fn send_ping(&mut self, data: impl Into<Bytes>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::Ping(data.into())).await
     }
 
@@ -195,7 +196,7 @@ impl WebSocket {
     /// # Errors
     ///
     /// Returns [`WebSocketError::Protocol`] if the message is not pong.
-    pub async fn send_pong(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+    pub async fn send_pong(&mut self, data: impl Into<Bytes>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::Pong(data.into())).await
     }
 
@@ -206,7 +207,7 @@ impl WebSocket {
     /// Returns [`WebSocketError::Transport`] if the connection fails to send the message.
     pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
         self.inner
-            .send(message.into())
+            .send(to_tungstenite_msg(message))
             .await
             .map_err(WebSocketError::from)
     }
@@ -237,8 +238,8 @@ impl WebSocket {
         loop {
             match self.next().await {
                 Some(Ok(msg)) => {
-                    if let Some(result) = msg.try_into_json() {
-                        return Some(result);
+                    if let Some(result) = msg.into_json::<T>() {
+                        return result.map_err(WebSocketError::from).into();
                     }
                     // Skip non-text messages, continue loop
                 }
@@ -294,7 +295,7 @@ impl Stream for WebSocket {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(Ok(message.into()))),
+            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(Ok(to_websocket_msg(message)))),
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -319,7 +320,7 @@ impl Sink<WebSocketMessage> for WebSocket {
         item: WebSocketMessage,
     ) -> std::result::Result<(), Self::Error> {
         Pin::new(&mut self.inner)
-            .start_send(item.into())
+            .start_send(to_tungstenite_msg(item))
             .map_err(WebSocketError::from)
     }
 
@@ -373,7 +374,7 @@ impl WebSocketSender {
     /// # Errors
     ///
     /// Returns [`WebSocketError::Protocol`] if the message is not binary.
-    pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+    pub async fn send_binary(&mut self, data: impl Into<Bytes>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::binary(data)).await
     }
 
@@ -386,7 +387,7 @@ impl WebSocketSender {
     /// # Errors
     ///
     /// Returns [`WebSocketError::Protocol`] if the message is not ping.
-    pub async fn send_ping(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+    pub async fn send_ping(&mut self, data: impl Into<Bytes>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::Ping(data.into())).await
     }
 
@@ -399,7 +400,7 @@ impl WebSocketSender {
     /// # Errors
     ///
     /// Returns [`WebSocketError::Protocol`] if the message is not pong.
-    pub async fn send_pong(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+    pub async fn send_pong(&mut self, data: impl Into<Bytes>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::Pong(data.into())).await
     }
 
@@ -410,7 +411,7 @@ impl WebSocketSender {
     /// Returns [`WebSocketError::Transport`] if the connection fails to send the message.
     pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
         self.inner
-            .send(message.into())
+            .send(to_tungstenite_msg(message))
             .await
             .map_err(WebSocketError::from)
     }
@@ -457,7 +458,7 @@ impl Sink<WebSocketMessage> for WebSocketSender {
         item: WebSocketMessage,
     ) -> std::result::Result<(), Self::Error> {
         Pin::new(&mut self.inner)
-            .start_send(item.into())
+            .start_send(to_tungstenite_msg(item))
             .map_err(WebSocketError::from)
     }
 
@@ -499,8 +500,8 @@ impl WebSocketReceiver {
         loop {
             match self.next().await {
                 Some(Ok(msg)) => {
-                    if let Some(result) = msg.try_into_json() {
-                        return Some(result);
+                    if let Some(result) = msg.into_json() {
+                        return result.map_err(WebSocketError::from).into();
                     }
                     // Skip non-text messages, continue loop
                 }
@@ -528,7 +529,7 @@ impl Stream for WebSocketReceiver {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(Ok(message.into()))),
+            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(Ok(to_websocket_msg(message)))),
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -763,28 +764,28 @@ impl From<TungsteniteError> for WebSocketError {
     }
 }
 
-impl From<WebSocketMessage> for TungsteniteMessage {
-    fn from(message: WebSocketMessage) -> Self {
-        match message {
-            WebSocketMessage::Text(text) => Self::Text(Utf8Bytes::from(text)),
-            WebSocketMessage::Binary(bytes) => Self::Binary(Bytes::from(bytes)),
-            WebSocketMessage::Ping(bytes) => Self::Ping(Bytes::from(bytes)),
-            WebSocketMessage::Pong(bytes) => Self::Pong(Bytes::from(bytes)),
-            WebSocketMessage::Close(frame) => Self::Close(frame.map(Into::into)),
-        }
+fn to_tungstenite_msg(message: WebSocketMessage) -> TungsteniteMessage {
+    match message {
+        WebSocketMessage::Text(text) => TungsteniteMessage::Text({
+            unsafe { Utf8Bytes::from_bytes_unchecked(text.into_bytes()) }
+        }),
+        WebSocketMessage::Binary(bytes) => TungsteniteMessage::Binary(bytes),
+        WebSocketMessage::Ping(bytes) => TungsteniteMessage::Ping(bytes),
+        WebSocketMessage::Pong(bytes) => TungsteniteMessage::Pong(bytes),
+        WebSocketMessage::Close => TungsteniteMessage::Close(None),
     }
 }
 
-impl From<TungsteniteMessage> for WebSocketMessage {
-    fn from(message: TungsteniteMessage) -> Self {
-        match message {
-            TungsteniteMessage::Text(text) => Self::Text(text.to_string()),
-            TungsteniteMessage::Binary(bytes) => Self::Binary(bytes.to_vec()),
-            TungsteniteMessage::Ping(bytes) => Self::Ping(bytes.to_vec()),
-            TungsteniteMessage::Pong(bytes) => Self::Pong(bytes.to_vec()),
-            TungsteniteMessage::Close(frame) => Self::Close(frame.map(Into::into)),
-            TungsteniteMessage::Frame(_) => Self::Close(None),
+fn to_websocket_msg(message: TungsteniteMessage) -> WebSocketMessage {
+    match message {
+        TungsteniteMessage::Text(text) => {
+            WebSocketMessage::Text(unsafe { ByteStr::from_utf8_unchecked(Bytes::from(text)) })
         }
+        TungsteniteMessage::Binary(bytes) => WebSocketMessage::Binary(bytes),
+        TungsteniteMessage::Ping(bytes) => WebSocketMessage::Ping(bytes),
+        TungsteniteMessage::Pong(bytes) => WebSocketMessage::Pong(bytes),
+        TungsteniteMessage::Close(_) => WebSocketMessage::Close,
+        TungsteniteMessage::Frame(_) => unimplemented!(),
     }
 }
 

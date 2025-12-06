@@ -67,7 +67,7 @@ async fn hello(Json(query): Json<HelloQuery>) -> skyzen::Result<Json<HelloRespon
     }))
 }
 
-/// Creates a task under a project, demonstrating multiple extractors with OpenAPI metadata.
+/// Creates a task under a project, demonstrating multiple extractors with `OpenAPI` metadata.
 #[skyzen::openapi]
 async fn create_task(
     params: skyzen::routing::Params,
@@ -90,13 +90,14 @@ async fn create_task(
     Ok(Json(task))
 }
 
+fn schema_to_string<T: Serialize>(schema: &T) -> String {
+    serde_json::to_string(schema).unwrap_or_else(|err| format!("<invalid schema: {err}>"))
+}
+
 fn log_openapi(spec: &OpenApi) {
     if !spec.is_enabled() {
         println!("OpenAPI instrumentation disabled (release build).");
         return;
-    }
-    fn schema_to_string<T: Serialize>(schema: &T) -> String {
-        serde_json::to_string(schema).unwrap_or_else(|err| format!("<invalid schema: {err}>"))
     }
 
     for op in spec.operations() {
@@ -116,8 +117,7 @@ fn log_openapi(spec: &OpenApi) {
                 .schema
                 .schema
                 .as_ref()
-                .map(schema_to_string)
-                .unwrap_or_else(|| "<undocumented>".to_string());
+                .map_or_else(|| "<undocumented>".to_string(), schema_to_string);
             let content_type = param.schema.content_type.unwrap_or("<unknown>");
             println!("  param {} ({}): {}", param.name, content_type, schema);
         }
@@ -131,8 +131,7 @@ fn log_openapi(spec: &OpenApi) {
                 let schema = response
                     .schema
                     .as_ref()
-                    .map(schema_to_string)
-                    .unwrap_or_else(|| "<undocumented>".to_string());
+                    .map_or_else(|| "<undocumented>".to_string(), schema_to_string);
                 println!(
                     "  response {} ({}): {}",
                     status.as_u16(),

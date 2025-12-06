@@ -4,13 +4,6 @@ use std::{fmt, io};
 /// Result type used by websocket operations.
 pub type WebSocketResult<T> = Result<T, WebSocketError>;
 
-/// Lightweight websocket configuration used across targets.
-#[derive(Clone, Debug, Default)]
-pub struct WebSocketConfig {
-    /// Maximum incoming message size in bytes. `None` removes the limit.
-    pub max_message_size: Option<usize>,
-}
-
 /// Close frame representation that avoids depending on tungstenite types.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebSocketCloseFrame {
@@ -27,101 +20,6 @@ impl WebSocketCloseFrame {
             code,
             reason: reason.into(),
         }
-    }
-}
-
-/// Message wrapper that mirrors the common websocket frames we need.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WebSocketMessage {
-    /// Text payload.
-    Text(String),
-    /// Binary payload.
-    Binary(Vec<u8>),
-    /// Ping control frame.
-    Ping(Vec<u8>),
-    /// Pong control frame.
-    Pong(Vec<u8>),
-    /// Close control frame.
-    Close(Option<WebSocketCloseFrame>),
-}
-
-impl WebSocketMessage {
-    /// Create a text message.
-    pub fn text(value: impl Into<String>) -> Self {
-        Self::Text(value.into())
-    }
-
-    /// Create a binary message.
-    pub fn binary(bytes: impl Into<Vec<u8>>) -> Self {
-        Self::Binary(bytes.into())
-    }
-
-    /// Returns true when the message is textual.
-    #[must_use]
-    pub const fn is_text(&self) -> bool {
-        matches!(self, Self::Text(_))
-    }
-
-    /// Consume and return the text payload if present.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WebSocketError::Protocol`] if the message is not text.
-    pub fn into_text(self) -> Result<String, Self> {
-        match self {
-            Self::Text(text) => Ok(text),
-            other => Err(other),
-        }
-    }
-
-    /// Deserialize JSON text message into a typed value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WebSocketError::Protocol`] if the message is not text or JSON deserialization fails.
-    #[cfg(feature = "json")]
-    pub fn into_json<T: serde::de::DeserializeOwned>(self) -> WebSocketResult<T> {
-        match self {
-            Self::Text(text) => serde_json::from_str(&text).map_err(WebSocketError::from),
-            _ => Err(WebSocketError::Protocol(
-                "Expected text message for JSON deserialization".into(),
-            )),
-        }
-    }
-
-    /// Try to deserialize JSON text message, returning None if not text.
-    ///
-    /// Returns `None` for non-text messages, or `Some(Result)` for text messages.
-    #[cfg(feature = "json")]
-    pub fn try_into_json<T: serde::de::DeserializeOwned>(self) -> Option<WebSocketResult<T>> {
-        match self {
-            Self::Text(text) => Some(serde_json::from_str(&text).map_err(WebSocketError::from)),
-            _ => None,
-        }
-    }
-
-    /// Returns true when the message is binary.
-    #[must_use]
-    pub const fn is_binary(&self) -> bool {
-        matches!(self, Self::Binary(_))
-    }
-
-    /// Consume and return the binary payload if present.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WebSocketError::Protocol`] if the message is not binary.
-    pub fn into_binary(self) -> Result<Vec<u8>, Self> {
-        match self {
-            Self::Binary(data) => Ok(data),
-            other => Err(other),
-        }
-    }
-
-    /// Returns true when the message is a close frame.
-    #[must_use]
-    pub const fn is_close(&self) -> bool {
-        matches!(self, Self::Close(_))
     }
 }
 

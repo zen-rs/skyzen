@@ -1,4 +1,4 @@
-//! Comprehensive OpenAPI + routing showcase.
+//! Comprehensive `OpenAPI` + routing showcase.
 //!
 //! Builds a small article API with multiple extractors, responders, and custom errors wired
 //! through `#[skyzen::openapi]` so every handler is documented automatically.
@@ -73,9 +73,11 @@ impl ArticleStore {
     }
 
     fn insert(&self, draft: ArticleDraft) -> Result<Article, ApiError> {
-        let mut items = self.items.lock().expect("store poisoned");
-        if items.values().any(|a| a.title == draft.title) {
-            return Err(ApiError::DuplicateTitle);
+        {
+            let items = self.items.lock().expect("store poisoned");
+            if items.values().any(|a| a.title == draft.title) {
+                return Err(ApiError::DuplicateTitle);
+            }
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -86,7 +88,10 @@ impl ArticleStore {
             tags: draft.tags,
             published: draft.publish,
         };
-        items.insert(article.id.clone(), article.clone());
+        self.items
+            .lock()
+            .expect("store poisoned")
+            .insert(article.id.clone(), article.clone());
         Ok(article)
     }
 
@@ -114,7 +119,7 @@ impl ArticleStore {
 
 /// List articles with optional tag and text filters.
 ///
-/// This demonstrates query extractors, shared state, and OpenAPI metadata.
+/// This demonstrates query extractors, shared state, and `OpenAPI` metadata.
 #[skyzen::openapi]
 async fn list_articles(
     Query(filter): Query<ArticleFilter>,
@@ -138,7 +143,7 @@ async fn create_article(
 
 /// Fetch a single article by id or return 404.
 ///
-/// Uses path params and custom errors to demonstrate error mapping in OpenAPI.
+/// Uses path params and custom errors to demonstrate error mapping in `OpenAPI`.
 #[skyzen::openapi]
 async fn get_article(
     params: Params,
