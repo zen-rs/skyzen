@@ -68,6 +68,54 @@ impl WebSocketMessage {
             other => Err(other),
         }
     }
+
+    /// Deserialize JSON text message into a typed value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not text or JSON deserialization fails.
+    #[cfg(feature = "json")]
+    pub fn into_json<T: serde::de::DeserializeOwned>(self) -> WebSocketResult<T> {
+        match self {
+            WebSocketMessage::Text(text) => {
+                serde_json::from_str(&text).map_err(WebSocketError::from)
+            }
+            _ => Err(WebSocketError::Protocol(
+                "Expected text message for JSON deserialization".into(),
+            )),
+        }
+    }
+
+    /// Try to deserialize JSON text message, returning None if not text.
+    ///
+    /// Returns `None` for non-text messages, or `Some(Result)` for text messages.
+    #[cfg(feature = "json")]
+    pub fn try_into_json<T: serde::de::DeserializeOwned>(self) -> Option<WebSocketResult<T>> {
+        match self {
+            WebSocketMessage::Text(text) => {
+                Some(serde_json::from_str(&text).map_err(WebSocketError::from))
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns true when the message is binary.
+    pub fn is_binary(&self) -> bool {
+        matches!(self, WebSocketMessage::Binary(_))
+    }
+
+    /// Consume and return the binary payload if present.
+    pub fn into_binary(self) -> Result<Vec<u8>, Self> {
+        match self {
+            WebSocketMessage::Binary(data) => Ok(data),
+            other => Err(other),
+        }
+    }
+
+    /// Returns true when the message is a close frame.
+    pub fn is_close(&self) -> bool {
+        matches!(self, WebSocketMessage::Close(_))
+    }
 }
 
 /// Errors produced by websocket operations.

@@ -80,6 +80,7 @@ wasm-bindgen = { version = "0.2.92", features = ["spans"] }
 wasm-bindgen-futures = "0.4.42"
 js-sys = "0.3.69"
 web-sys = { version = "0.3.69", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController"] }
+futures-channel = { version = "0.3.31", optional = true }
 
 [dependencies.serde_json]
 version = "1.0"
@@ -102,18 +103,24 @@ version = "0.2.16"
 optional = true
 
 [features]
-default = ["json", "form", "multipart", "sse", "websocket", "rt", "openapi"]
+default = ["json", "form", "multipart", "sse", "rt", "openapi", "websocket-native"]
 openapi = ["skyzen-core/openapi"]
 json = ["dep:serde_json", "http-kit/json"]
 form = ["dep:serde_urlencoded", "http-kit/form"]
 multipart = ["dep:multer", "dep:pin-project-lite", "dep:futures-core"]
 sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
-websocket = [
+websocket = ["json", "dep:futures-core"]
+websocket-native = [
+    "websocket",
     "rt",
     "dep:async-tungstenite",
     "dep:base64",
     "dep:sha1",
-    "dep:serde_json",
+    "dep:futures-util",
+]
+websocket-wasm = [
+    "websocket",
+    "dep:futures-channel",
 ]
 rt = [
     "dep:tokio",

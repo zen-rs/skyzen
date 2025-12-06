@@ -17,7 +17,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.100
+        run: cargo install wasm-bindgen-cli --version 0.2.106
 
       - name: Build worker example
         run: cargo build --example worker --release --target wasm32-unknown-unknown --no-default-features --features json,form
@@ -34,17 +34,26 @@ jobs:
       - name: Launch wrangler dev
         run: |
           cd target/workerd
-          wrangler dev --local --config wrangler.toml --port 8787 &
+          mkdir -p .home .wrangler/logs .wrangler-config
+          HOME=$PWD/.home \
+          WRANGLER_LOG_DIR=$PWD/.wrangler/logs \
+          XDG_CONFIG_HOME=$PWD/.wrangler-config \
+          wrangler dev --local --ip 127.0.0.1 --port 8787 --inspector-port 0 --config wrangler.toml > wrangler.log 2>&1 &
           echo $! > ../../wrangler.pid
           sleep 5
 
       - name: Exercise worker
         run: |
-          curl --retry 5 --retry-connrefused --retry-delay 1 http://127.0.0.1:8787/ | grep "Hello from Skyzen!"
+          curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/health | grep OK
+          curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/hello/Skyzen | grep "Hello, Skyzen!"
 
       - name: Shutdown wrangler
         if: always()
         run: |
           if [ -f wrangler.pid ]; then
             kill $(cat wrangler.pid)
+          fi
+          if [ -f target/workerd/wrangler.log ]; then
+            echo "--- wrangler log ---"
+            tail -n 100 target/workerd/wrangler.log
           fi

@@ -48,11 +48,25 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 
 ### Feature Flags
 
-Default features: `json`, `form`, `multipart`, `sse`, `websocket`, `rt`, `openapi`
+Default features: `json`, `form`, `multipart`, `sse`, `rt`, `openapi`, `websocket-native`
 
 - `rt` - Enables Tokio/Hyper runtime (native builds)
 - `openapi` - OpenAPI schema generation (debug builds only)
-- `websocket` - WebSocket support via `async-tungstenite`
+- `websocket` - Base WebSocket types and traits (platform-agnostic)
+- `websocket-native` - WebSocket support for native targets via `async-tungstenite`
+- `websocket-wasm` - WebSocket support for WASM targets via WinterCG WebSocketPair API
+
+#### WebSocket Platform Support
+
+The WebSocket implementation provides a unified API across both native and WASM targets:
+
+- **Native (tokio)**: Full WebSocket support via `async-tungstenite`, including custom ping/pong control
+- **WASM (WinterCG)**: WebSocket support via custom FFI bindings to the WebSocketPair API, compatible with Cloudflare Workers and other WinterCG-compliant runtimes
+
+**Platform differences:**
+- WASM has a 1 MiB message size limit (platform imposed)
+- WASM does not support custom ping/pong frame control
+- Both platforms share the same convenience methods: `send()` for JSON, `send_text()` for text, `send_binary()` for binary, and `recv_json()` for JSON deserialization
 
 ### Workspace Lints
 

@@ -39,7 +39,7 @@ use async_tungstenite::{
 };
 use futures_core::Stream;
 use futures_util::Sink;
-use http_kit::utils::{AsyncRead, AsyncWrite, Bytes};
+use http_kit::utils::Bytes;
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
@@ -128,17 +128,14 @@ fn compute_accept_header(key: &header::HeaderValue) -> header::HeaderValue {
 type NativeIo = TokioAdapter<TokioIo<Upgraded>>;
 
 /// Stream representing a WebSocket connection handled by `async-tungstenite`.
-pub struct WebSocket<IO = NativeIo> {
-    inner: WebSocketStream<IO>,
+pub struct WebSocket {
+    inner: WebSocketStream<NativeIo>,
     config: WebSocketConfig,
 }
 
-impl<IO> WebSocket<IO>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-{
+impl WebSocket {
     pub(crate) async fn from_raw_socket(
-        stream: IO,
+        stream: NativeIo,
         role: Role,
         config: Option<WebSocketConfig>,
     ) -> Self {
@@ -159,12 +156,72 @@ where
         self.send_message(WebSocketMessage::text(text)).await
     }
 
+    /// Send raw binary data without JSON serialization.
+    pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        self.send_message(WebSocketMessage::binary(data)).await
+    }
+
+    /// Send a ping frame with optional payload.
+    ///
+    /// # Platform Notes
+    /// - **Native**: Full support
+    /// - **WASM**: Returns error (not supported by WinterCG API)
+    pub async fn send_ping(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        self.send_message(WebSocketMessage::Ping(data.into())).await
+    }
+
+    /// Send a pong frame with optional payload.
+    ///
+    /// # Platform Notes
+    /// - **Native**: Full support
+    /// - **WASM**: Returns error (not supported by WinterCG API)
+    pub async fn send_pong(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        self.send_message(WebSocketMessage::Pong(data.into())).await
+    }
+
     /// Send a [`WebSocketMessage`] without additional processing.
     pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
         self.inner
             .send(message.into())
             .await
             .map_err(WebSocketError::from)
+    }
+
+    /// Receive and deserialize the next JSON message.
+    ///
+    /// Skips non-text messages and returns None when connection closes.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use skyzen::websocket::WebSocket;
+    /// # use serde::Deserialize;
+    /// # #[derive(Deserialize)]
+    /// # struct MyData { value: i32 }
+    /// # async fn example(mut socket: WebSocket) {
+    /// while let Some(Ok(data)) = socket.recv_json::<MyData>().await {
+    ///     println!("Received: {}", data.value);
+    /// }
+    /// # }
+    /// ```
+    #[cfg(feature = "json")]
+    pub async fn recv_json<T: serde::de::DeserializeOwned>(
+        &mut self,
+    ) -> Option<WebSocketResult<T>> {
+        use futures_util::StreamExt;
+
+        loop {
+            match self.next().await {
+                Some(Ok(msg)) => {
+                    if let Some(result) = msg.try_into_json() {
+                        return Some(result);
+                    }
+                    // Skip non-text messages, continue loop
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+        }
     }
 
     /// Access the underlying websocket configuration.
@@ -181,7 +238,7 @@ where
     }
 
     /// Split the websocket into independent sender and receiver halves.
-    pub fn split(self) -> (WebSocketSender<IO>, WebSocketReceiver<IO>) {
+    pub fn split(self) -> (WebSocketSender, WebSocketReceiver) {
         let config = self.config.clone();
         let (inner_sink, inner_stream) = self.inner.split();
 
@@ -198,16 +255,13 @@ where
     }
 }
 
-impl<IO> std::fmt::Debug for WebSocket<IO> {
+impl std::fmt::Debug for WebSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebSocket").finish_non_exhaustive()
     }
 }
 
-impl<IO> Stream for WebSocket<IO>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-{
+impl Stream for WebSocket {
     type Item = WebSocketResult<WebSocketMessage>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -220,10 +274,7 @@ where
     }
 }
 
-impl<IO> Sink<WebSocketMessage> for WebSocket<IO>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-{
+impl Sink<WebSocketMessage> for WebSocket {
     type Error = WebSocketError;
 
     fn poll_ready(
@@ -264,15 +315,12 @@ where
 }
 
 /// Sender half returned from [`WebSocket::split`].
-pub struct WebSocketSender<IO = NativeIo> {
-    inner: AsyncWebSocketSender<IO>,
+pub struct WebSocketSender {
+    inner: AsyncWebSocketSender<NativeIo>,
     config: WebSocketConfig,
 }
 
-impl<IO> WebSocketSender<IO>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-{
+impl WebSocketSender {
     /// Serialize a value to JSON text and send it over the websocket connection.
     pub async fn send<T: Serialize>(&mut self, value: T) -> WebSocketResult<()> {
         let payload = serde_json::to_string(&value)?;
@@ -282,6 +330,29 @@ where
     /// Send a raw text frame without JSON serialization.
     pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::text(text)).await
+    }
+
+    /// Send raw binary data without JSON serialization.
+    pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        self.send_message(WebSocketMessage::binary(data)).await
+    }
+
+    /// Send a ping frame with optional payload.
+    ///
+    /// # Platform Notes
+    /// - **Native**: Full support
+    /// - **WASM**: Returns error (not supported by WinterCG API)
+    pub async fn send_ping(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        self.send_message(WebSocketMessage::Ping(data.into())).await
+    }
+
+    /// Send a pong frame with optional payload.
+    ///
+    /// # Platform Notes
+    /// - **Native**: Full support
+    /// - **WASM**: Returns error (not supported by WinterCG API)
+    pub async fn send_pong(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        self.send_message(WebSocketMessage::Pong(data.into())).await
     }
 
     /// Send a [`WebSocketMessage`] without additional processing.
@@ -306,16 +377,13 @@ where
     }
 }
 
-impl<IO> std::fmt::Debug for WebSocketSender<IO> {
+impl std::fmt::Debug for WebSocketSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebSocketSender").finish_non_exhaustive()
     }
 }
 
-impl<IO> Sink<WebSocketMessage> for WebSocketSender<IO>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-{
+impl Sink<WebSocketMessage> for WebSocketSender {
     type Error = WebSocketError;
 
     fn poll_ready(
@@ -356,28 +424,48 @@ where
 }
 
 /// Receiver half returned from [`WebSocket::split`].
-pub struct WebSocketReceiver<IO = NativeIo> {
-    inner: AsyncWebSocketReceiver<IO>,
+pub struct WebSocketReceiver {
+    inner: AsyncWebSocketReceiver<NativeIo>,
     config: WebSocketConfig,
 }
 
-impl<IO> WebSocketReceiver<IO> {
+impl WebSocketReceiver {
+    /// Receive and deserialize the next JSON message.
+    ///
+    /// Skips non-text messages and returns None when connection closes.
+    #[cfg(feature = "json")]
+    pub async fn recv_json<T: serde::de::DeserializeOwned>(
+        &mut self,
+    ) -> Option<WebSocketResult<T>> {
+        use futures_util::StreamExt;
+
+        loop {
+            match self.next().await {
+                Some(Ok(msg)) => {
+                    if let Some(result) = msg.try_into_json() {
+                        return Some(result);
+                    }
+                    // Skip non-text messages, continue loop
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+        }
+    }
+
     /// Access the underlying websocket configuration.
     pub fn get_config(&self) -> &WebSocketConfig {
         &self.config
     }
 }
 
-impl<IO> std::fmt::Debug for WebSocketReceiver<IO> {
+impl std::fmt::Debug for WebSocketReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebSocketReceiver").finish_non_exhaustive()
     }
 }
 
-impl<IO> Stream for WebSocketReceiver<IO>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-{
+impl Stream for WebSocketReceiver {
     type Item = WebSocketResult<WebSocketMessage>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -670,8 +758,6 @@ fn to_tungstenite_config(config: &WebSocketConfig) -> TungsteniteConfig {
 mod tests {
     use super::*;
     use crate::Body;
-    use futures_util::StreamExt;
-    use tokio::io::duplex;
 
     fn build_request() -> Request {
         let mut request = Request::new(Body::empty());
@@ -771,86 +857,6 @@ mod tests {
         assert_eq!(upgraded_again.config.max_message_size, Some(512));
     }
 
-    #[tokio::test]
-    async fn websocket_roundtrip_over_duplex() {
-        let (client_stream, server_stream) = duplex(1024);
-        let server_socket =
-            WebSocket::from_raw_socket(TokioAdapter::new(server_stream), Role::Server, None).await;
-
-        let server = tokio::spawn(async move {
-            let mut server_socket = server_socket;
-            while let Some(Ok(message)) = server_socket.next().await {
-                if let Ok(text) = message.into_text() {
-                    let _ = server_socket.send_text(text).await;
-                }
-            }
-        });
-
-        let mut client_socket =
-            WebSocket::from_raw_socket(TokioAdapter::new(client_stream), Role::Client, None).await;
-
-        client_socket
-            .send_text("hello")
-            .await
-            .expect("send message");
-        let reply = client_socket
-            .next()
-            .await
-            .expect("missing reply")
-            .expect("websocket frame");
-        assert_eq!(reply.into_text().unwrap(), "hello");
-
-        let _ = client_socket.close(None).await;
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn websocket_split_roundtrip_over_duplex() {
-        let (client_stream, server_stream) = duplex(1024);
-        let server_socket =
-            WebSocket::from_raw_socket(TokioAdapter::new(server_stream), Role::Server, None).await;
-        let (mut tx, mut rx) = server_socket.split();
-
-        let server = tokio::spawn(async move {
-            while let Some(Ok(message)) = rx.next().await {
-                if let Ok(text) = message.into_text() {
-                    let _ = tx.send_text(format!("echo:{text}")).await;
-                }
-            }
-        });
-
-        let mut client_socket =
-            WebSocket::from_raw_socket(TokioAdapter::new(client_stream), Role::Client, None).await;
-
-        client_socket.send_text("ping").await.expect("send message");
-        let reply = client_socket
-            .next()
-            .await
-            .expect("missing reply")
-            .expect("websocket frame");
-        assert_eq!(reply.into_text().unwrap(), "echo:ping");
-
-        let _ = client_socket.close(None).await;
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn applies_custom_max_message_size_to_stream() {
-        let (upgrade, _) = build_valid_upgrade().await;
-        let config = upgrade.max_message_size(None).config.clone();
-
-        let (client_stream, server_stream) = duplex(1024);
-        let server_socket = WebSocket::from_raw_socket(
-            TokioAdapter::new(server_stream),
-            Role::Server,
-            Some(config),
-        )
-        .await;
-        let _client_socket =
-            WebSocket::from_raw_socket(TokioAdapter::new(client_stream), Role::Client, None).await;
-
-        assert!(server_socket.get_config().max_message_size.is_none());
-    }
+    // NOTE: Direct WebSocket tests have been moved to hyper/tests/websocket.rs
+    // where they can properly test through the full hyper upgrade flow.
 }

@@ -31,3 +31,7 @@ fn build_router() -> Router {
 fn worker() -> Router {
     build_router()
 }
+
+// Cargo expects a main when building the example as a bin; wasm uses the exported fetch instead.
+#[cfg(target_arch = "wasm32")]
+fn main() {}

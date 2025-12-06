@@ -3,3 +3,9 @@
 /target
 /*/target
 /*/Cargo.lock
+ci/workerd/.wrangler*
+ci/workerd/node_modules
+ci/workerd/worker.js
+ci/workerd/worker.d.ts
+ci/workerd/worker_bg.wasm
+ci/workerd/worker_bg.wasm.d.ts

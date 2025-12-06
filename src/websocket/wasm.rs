@@ -1,60 +1,199 @@
-//! Wasm WebSocket stubs.
+//! WinterCG WebSocket implementation for WASM targets.
 //!
-//! The wasm target re-exports the same API surface so code can compile, but
-//! server-side upgrades and raw-socket usage are not supported. All runtime
-//! operations return an `Unsupported` error.
+//! This module provides WebSocket support for WinterCG-compatible runtimes
+//! (like Cloudflare Workers) using the WebSocketPair API.
 
 use crate::{
-    websocket::types::{
-        WebSocketCloseFrame, WebSocketConfig, WebSocketError, WebSocketMessage, WebSocketResult,
+    header,
+    websocket::{
+        ffi,
+        types::{
+            WebSocketCloseFrame, WebSocketConfig, WebSocketError, WebSocketMessage,
+            WebSocketResult,
+        },
     },
-    Request, Response, StatusCode,
+    Method, Request, Response, StatusCode,
 };
+use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
-use futures_util::Sink;
 use serde::Serialize;
 use skyzen_core::{Extractor, Responder};
 use std::{
+    cell::RefCell,
     pin::Pin,
+    rc::Rc,
     task::{Context, Poll},
 };
+use wasm_bindgen::{prelude::*, JsCast};
 
-#[skyzen::error(status = StatusCode::NOT_IMPLEMENTED)]
-pub enum WebSocketUpgradeError {
-    /// WebSocket upgrades are not available on wasm targets.
-    #[error("WebSocket upgrades are not supported on wasm targets")]
-    Unsupported,
-}
-
-#[derive(Debug, Clone)]
+/// WebSocket connection for WASM targets.
+///
+/// # Platform Notes
+/// - Maximum message size: 1 MiB (platform imposed)
+/// - No ping/pong frame control (use `send_ping`/`send_pong` returns error)
+/// - Event-driven model converted to Stream
 pub struct WebSocket {
+    inner: ffi::WebSocket,
+    rx: UnboundedReceiver<WebSocketResult<WebSocketMessage>>,
+    _closures: Rc<RefCell<EventClosures>>,
     config: WebSocketConfig,
 }
 
+/// Holds the event handler closures to prevent them from being dropped.
+struct EventClosures {
+    _on_message: Closure<dyn FnMut(ffi::MessageEvent)>,
+    _on_close: Closure<dyn FnMut(ffi::CloseEvent)>,
+    _on_error: Closure<dyn FnMut(ffi::ErrorEvent)>,
+}
+
 impl WebSocket {
-    pub(crate) async fn from_raw_socket<IO, R>(
-        _stream: IO,
-        _role: R,
-        config: Option<WebSocketConfig>,
-    ) -> Self {
+    pub(crate) fn from_ffi_socket(socket: ffi::WebSocket, config: WebSocketConfig) -> Self {
+        let (tx, rx) = mpsc::unbounded();
+
+        // Create event handlers
+        let closures = Self::setup_event_handlers(&socket, tx);
+
         Self {
-            config: config.unwrap_or_default(),
+            inner: socket,
+            rx,
+            _closures: Rc::new(RefCell::new(closures)),
+            config,
+        }
+    }
+
+    fn setup_event_handlers(
+        socket: &ffi::WebSocket,
+        tx: UnboundedSender<WebSocketResult<WebSocketMessage>>,
+    ) -> EventClosures {
+        // Message handler
+        let tx_message = tx.clone();
+        let on_message = Closure::wrap(Box::new(move |event: ffi::MessageEvent| {
+            let data = event.data();
+
+            let message = if let Some(text) = data.as_string() {
+                WebSocketMessage::Text(text)
+            } else if js_sys::Uint8Array::instanceof(&data) {
+                let array = js_sys::Uint8Array::from(data);
+                let mut bytes = vec![0u8; array.length() as usize];
+                array.copy_to(&mut bytes);
+                WebSocketMessage::Binary(bytes)
+            } else {
+                // Unknown data type, skip
+                return;
+            };
+
+            let _ = tx_message.unbounded_send(Ok(message));
+        }) as Box<dyn FnMut(ffi::MessageEvent)>);
+
+        // Close handler
+        let tx_close = tx.clone();
+        let on_close = Closure::wrap(Box::new(move |event: ffi::CloseEvent| {
+            let close_frame = WebSocketCloseFrame {
+                code: event.code(),
+                reason: event.reason(),
+            };
+            let _ = tx_close.unbounded_send(Ok(WebSocketMessage::Close(Some(close_frame))));
+        }) as Box<dyn FnMut(ffi::CloseEvent)>);
+
+        // Error handler
+        let on_error = Closure::wrap(Box::new(move |event: ffi::ErrorEvent| {
+            let _ = tx.unbounded_send(Err(WebSocketError::Protocol(event.message())));
+        }) as Box<dyn FnMut(ffi::ErrorEvent)>);
+
+        // Attach event listeners
+        socket.add_event_listener("message", on_message.as_ref().unchecked_ref());
+        socket.add_event_listener("close", on_close.as_ref().unchecked_ref());
+        socket.add_event_listener("error", on_error.as_ref().unchecked_ref());
+
+        EventClosures {
+            _on_message: on_message,
+            _on_close: on_close,
+            _on_error: on_error,
         }
     }
 
     /// Serialize a value to JSON text and send it over the websocket connection.
-    pub async fn send<T: Serialize>(&mut self, _value: T) -> WebSocketResult<()> {
-        Err(unsupported_error())
+    #[cfg(feature = "json")]
+    pub async fn send<T: Serialize>(&mut self, value: T) -> WebSocketResult<()> {
+        let payload = serde_json::to_string(&value)?;
+        self.send_text(payload).await
     }
 
     /// Send a raw text frame without JSON serialization.
-    pub async fn send_text(&mut self, _text: impl Into<String>) -> WebSocketResult<()> {
-        Err(unsupported_error())
+    pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
+        let text = text.into();
+        self.inner
+            .send(&JsValue::from_str(&text))
+            .map_err(|e| WebSocketError::Protocol(format!("{:?}", e)))
+    }
+
+    /// Send raw binary data without JSON serialization.
+    pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        let bytes = data.into();
+        let array = js_sys::Uint8Array::from(&bytes[..]);
+        self.inner
+            .send(&array.into())
+            .map_err(|e| WebSocketError::Protocol(format!("{:?}", e)))
+    }
+
+    /// Send a ping frame with optional payload.
+    ///
+    /// # Platform Notes
+    /// - **Native**: Full support
+    /// - **WASM**: Returns error (not supported by WinterCG API)
+    pub async fn send_ping(&mut self, _data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        Err(WebSocketError::Protocol(
+            "Ping frames not supported on WASM platform".into(),
+        ))
+    }
+
+    /// Send a pong frame with optional payload.
+    ///
+    /// # Platform Notes
+    /// - **Native**: Full support
+    /// - **WASM**: Returns error (not supported by WinterCG API)
+    pub async fn send_pong(&mut self, _data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        Err(WebSocketError::Protocol(
+            "Pong frames not supported on WASM platform".into(),
+        ))
     }
 
     /// Send a [`WebSocketMessage`] without additional processing.
-    pub async fn send_message(&mut self, _message: WebSocketMessage) -> WebSocketResult<()> {
-        Err(unsupported_error())
+    pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
+        match message {
+            WebSocketMessage::Text(text) => self.send_text(text).await,
+            WebSocketMessage::Binary(data) => self.send_binary(data).await,
+            WebSocketMessage::Close(close_frame) => {
+                if let Some(frame) = close_frame {
+                    self.close(Some(frame)).await
+                } else {
+                    self.close(None).await
+                }
+            }
+            WebSocketMessage::Ping(_) => self.send_ping(vec![]).await,
+            WebSocketMessage::Pong(_) => self.send_pong(vec![]).await,
+        }
+    }
+
+    /// Receive and deserialize the next JSON message.
+    ///
+    /// Skips non-text messages and returns None when connection closes.
+    #[cfg(feature = "json")]
+    pub async fn recv_json<T: serde::de::DeserializeOwned>(&mut self) -> Option<WebSocketResult<T>> {
+        use futures_util::StreamExt;
+
+        loop {
+            match self.next().await {
+                Some(Ok(msg)) => {
+                    if let Some(result) = msg.try_into_json() {
+                        return Some(result);
+                    }
+                    // Skip non-text messages, continue loop
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+        }
     }
 
     /// Access the underlying websocket configuration.
@@ -63,92 +202,137 @@ impl WebSocket {
     }
 
     /// Close the websocket connection gracefully.
-    pub async fn close(
-        &mut self,
-        _close_frame: Option<WebSocketCloseFrame>,
-    ) -> WebSocketResult<()> {
-        Err(unsupported_error())
+    pub async fn close(&mut self, close_frame: Option<WebSocketCloseFrame>) -> WebSocketResult<()> {
+        if let Some(frame) = close_frame {
+            self.inner.close(Some(frame.code), Some(&frame.reason));
+        } else {
+            self.inner.close(None, None);
+        }
+        Ok(())
     }
 
     /// Split the websocket into independent sender and receiver halves.
+    ///
+    /// # Note
+    /// Splitting is not fully supported on WASM - both halves share the same underlying connection.
+    /// This is provided for API compatibility but may have different semantics than native.
     pub fn split(self) -> (WebSocketSender, WebSocketReceiver) {
         let config = self.config.clone();
+        let inner = self.inner;
+        let closures = self._closures;
+
         (
             WebSocketSender {
+                inner: inner.clone(),
                 config: config.clone(),
+                _closures: closures.clone(),
             },
-            WebSocketReceiver { config },
+            WebSocketReceiver {
+                rx: self.rx,
+                config,
+                _closures: closures,
+            },
         )
+    }
+}
+
+impl std::fmt::Debug for WebSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocket").finish_non_exhaustive()
     }
 }
 
 impl Stream for WebSocket {
     type Item = WebSocketResult<WebSocketMessage>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(Some(Err(unsupported_error())))
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_next(cx)
     }
 }
 
-impl Sink<WebSocketMessage> for WebSocket {
-    type Error = WebSocketError;
-
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), Self::Error>> {
-        Poll::Ready(Err(unsupported_error()))
-    }
-
-    fn start_send(
-        self: Pin<&mut Self>,
-        _item: WebSocketMessage,
-    ) -> std::result::Result<(), Self::Error> {
-        Err(unsupported_error())
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), Self::Error>> {
-        Poll::Ready(Err(unsupported_error()))
-    }
-
-    fn poll_close(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), Self::Error>> {
-        Poll::Ready(Err(unsupported_error()))
-    }
-}
-
-/// Sender half returned from [`WebSocket::split`] (unsupported on wasm).
+/// Sender half returned from [`WebSocket::split`].
+///
+/// # Note
+/// On WASM, this shares the underlying connection with the receiver.
 pub struct WebSocketSender {
+    inner: ffi::WebSocket,
     config: WebSocketConfig,
+    _closures: Rc<RefCell<EventClosures>>,
 }
 
 impl WebSocketSender {
     /// Serialize a value to JSON text and send it over the websocket connection.
-    pub async fn send<T: Serialize>(&mut self, _value: T) -> WebSocketResult<()> {
-        Err(unsupported_error())
+    #[cfg(feature = "json")]
+    pub async fn send<T: Serialize>(&mut self, value: T) -> WebSocketResult<()> {
+        let payload = serde_json::to_string(&value)?;
+        self.send_text(payload).await
     }
 
     /// Send a raw text frame without JSON serialization.
-    pub async fn send_text(&mut self, _text: impl Into<String>) -> WebSocketResult<()> {
-        Err(unsupported_error())
+    pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
+        let text = text.into();
+        self.inner
+            .send(&JsValue::from_str(&text))
+            .map_err(|e| WebSocketError::Protocol(format!("{:?}", e)))
+    }
+
+    /// Send raw binary data without JSON serialization.
+    pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        let bytes = data.into();
+        let array = js_sys::Uint8Array::from(&bytes[..]);
+        self.inner
+            .send(&array.into())
+            .map_err(|e| WebSocketError::Protocol(format!("{:?}", e)))
+    }
+
+    /// Send a ping frame with optional payload.
+    ///
+    /// # Platform Notes
+    /// - **Native**: Full support
+    /// - **WASM**: Returns error (not supported by WinterCG API)
+    pub async fn send_ping(&mut self, _data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        Err(WebSocketError::Protocol(
+            "Ping frames not supported on WASM platform".into(),
+        ))
+    }
+
+    /// Send a pong frame with optional payload.
+    ///
+    /// # Platform Notes
+    /// - **Native**: Full support
+    /// - **WASM**: Returns error (not supported by WinterCG API)
+    pub async fn send_pong(&mut self, _data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+        Err(WebSocketError::Protocol(
+            "Pong frames not supported on WASM platform".into(),
+        ))
     }
 
     /// Send a [`WebSocketMessage`] without additional processing.
-    pub async fn send_message(&mut self, _message: WebSocketMessage) -> WebSocketResult<()> {
-        Err(unsupported_error())
+    pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
+        match message {
+            WebSocketMessage::Text(text) => self.send_text(text).await,
+            WebSocketMessage::Binary(data) => self.send_binary(data).await,
+            WebSocketMessage::Close(close_frame) => {
+                if let Some(frame) = close_frame {
+                    self.close(Some(frame)).await
+                } else {
+                    self.close(None).await
+                }
+            }
+            WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => {
+                Err(WebSocketError::Protocol("Ping/Pong not supported on WASM".into()))
+            }
+        }
     }
 
     /// Close the websocket connection gracefully.
-    pub async fn close(
-        &mut self,
-        _close_frame: Option<WebSocketCloseFrame>,
-    ) -> WebSocketResult<()> {
-        Err(unsupported_error())
+    pub async fn close(&mut self, close_frame: Option<WebSocketCloseFrame>) -> WebSocketResult<()> {
+        if let Some(frame) = close_frame {
+            self.inner.close(Some(frame.code), Some(&frame.reason));
+        } else {
+            self.inner.close(None, None);
+        }
+        Ok(())
     }
 
     /// Access the underlying websocket configuration.
@@ -163,44 +347,35 @@ impl std::fmt::Debug for WebSocketSender {
     }
 }
 
-impl Sink<WebSocketMessage> for WebSocketSender {
-    type Error = WebSocketError;
-
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), Self::Error>> {
-        Poll::Ready(Err(unsupported_error()))
-    }
-
-    fn start_send(
-        self: Pin<&mut Self>,
-        _item: WebSocketMessage,
-    ) -> std::result::Result<(), Self::Error> {
-        Err(unsupported_error())
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), Self::Error>> {
-        Poll::Ready(Err(unsupported_error()))
-    }
-
-    fn poll_close(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), Self::Error>> {
-        Poll::Ready(Err(unsupported_error()))
-    }
-}
-
-/// Receiver half returned from [`WebSocket::split`] (unsupported on wasm).
+/// Receiver half returned from [`WebSocket::split`].
 pub struct WebSocketReceiver {
+    rx: UnboundedReceiver<WebSocketResult<WebSocketMessage>>,
     config: WebSocketConfig,
+    _closures: Rc<RefCell<EventClosures>>,
 }
 
 impl WebSocketReceiver {
+    /// Receive and deserialize the next JSON message.
+    ///
+    /// Skips non-text messages and returns None when connection closes.
+    #[cfg(feature = "json")]
+    pub async fn recv_json<T: serde::de::DeserializeOwned>(&mut self) -> Option<WebSocketResult<T>> {
+        use futures_util::StreamExt;
+
+        loop {
+            match self.next().await {
+                Some(Ok(msg)) => {
+                    if let Some(result) = msg.try_into_json() {
+                        return Some(result);
+                    }
+                    // Skip non-text messages, continue loop
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+        }
+    }
+
     /// Access the underlying websocket configuration.
     pub fn get_config(&self) -> &WebSocketConfig {
         &self.config
@@ -216,66 +391,208 @@ impl std::fmt::Debug for WebSocketReceiver {
 impl Stream for WebSocketReceiver {
     type Item = WebSocketResult<WebSocketMessage>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(Some(Err(unsupported_error())))
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_next(cx)
     }
 }
 
+/// Errors that can occur during WebSocket upgrade.
+#[skyzen::error(status = StatusCode::BAD_REQUEST)]
+pub enum WebSocketUpgradeError {
+    /// The HTTP method is not GET.
+    #[error("Method not allowed", status = StatusCode::METHOD_NOT_ALLOWED)]
+    MethodNotAllowed,
+
+    /// The `Upgrade` header is missing or invalid.
+    #[error("Missing or invalid upgrade header")]
+    MissingUpgradeHeader,
+
+    /// The `Connection` header is missing.
+    #[error("Missing Connection header for WebSocket request")]
+    MissingConnectionHeader,
+
+    /// The `Sec-WebSocket-Key` header is missing.
+    #[error("Missing Sec-WebSocket-Key header")]
+    MissingSecWebSocketKey,
+
+    /// The `Upgrade` header is not `websocket`.
+    #[error("Upgrade header must be `websocket`")]
+    InvalidUpgradeHeader,
+
+    /// The `Connection` header is invalid.
+    #[error("Invalid Connection header for WebSocket request")]
+    InvalidConnectionHeader,
+
+    /// The `Sec-WebSocket-Version` header is not `13`.
+    #[error("Unsupported Sec-WebSocket-Version. Only version 13 is accepted")]
+    UnsupportedVersion,
+}
+
 /// Helper that contains the state required to accept a WebSocket connection.
-#[derive(Debug, Clone)]
-pub struct WebSocketUpgrade;
+pub struct WebSocketUpgrade {
+    pair: Option<ffi::WebSocketPair>,
+    protocols: Vec<String>,
+    config: WebSocketConfig,
+}
 
 impl WebSocketUpgrade {
-    /// Negotiate the sub-protocol returned to the client (noop on wasm).
+    fn new() -> Self {
+        Self {
+            pair: Some(ffi::WebSocketPair::new()),
+            protocols: Vec::new(),
+            config: WebSocketConfig::default(),
+        }
+    }
+
+    /// Negotiate the sub-protocol returned to the client.
+    ///
+    /// # Note
+    /// On WASM, protocol negotiation is tracked but not enforced by the runtime.
     #[must_use]
-    pub fn protocols<I, S>(self, _protocols: I) -> Self
+    pub fn protocols<I, S>(mut self, protocols: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        self.protocols = protocols
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
         self
     }
 
-    /// Override the [`WebSocketConfig`] used for the upgraded stream (noop on wasm).
+    /// Override the [`WebSocketConfig`] used for the upgraded stream.
     #[must_use]
-    pub const fn config(self, _config: WebSocketConfig) -> Self {
+    pub const fn config(mut self, config: WebSocketConfig) -> Self {
+        self.config = config;
         self
     }
 
-    /// Set the maximum incoming message size accepted by the websocket (noop on wasm).
+    /// Set the maximum incoming message size accepted by the websocket.
+    ///
+    /// # Platform Notes
+    /// - **Native**: Enforced by async-tungstenite
+    /// - **WASM**: 1 MiB limit enforced by runtime (this setting is advisory only)
     #[must_use]
-    pub const fn max_message_size(self, _max_size: Option<usize>) -> Self {
+    pub fn max_message_size(mut self, max_size: Option<usize>) -> Self {
+        self.config.max_message_size = max_size;
         self
     }
 
     /// Finalize the handshake and start handling the upgraded socket with `callback`.
-    pub fn on_upgrade<F, Fut>(self, _callback: F) -> WebSocketUpgradeResponder
+    pub fn on_upgrade<F, Fut>(mut self, callback: F) -> WebSocketUpgradeResponder
     where
-        F: FnOnce(WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        F: FnOnce(WebSocket) -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
     {
-        WebSocketUpgradeResponder
+        let pair = self.pair.take().expect("pair already consumed");
+        let server = pair.server();
+        let client = pair.client();
+
+        // Accept the connection
+        server.accept();
+
+        // Create our WebSocket wrapper
+        let socket = WebSocket::from_ffi_socket(server, self.config);
+
+        // Spawn the callback to handle messages
+        wasm_bindgen_futures::spawn_local(async move {
+            callback(socket).await;
+        });
+
+        WebSocketUpgradeResponder { client }
     }
+}
+
+impl std::fmt::Debug for WebSocketUpgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketUpgrade")
+            .field("protocols", &self.protocols)
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+fn header_has_token(value: &header::HeaderValue, token: &str) -> bool {
+    value
+        .to_str()
+        .map(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+        .unwrap_or(false)
 }
 
 impl Extractor for WebSocketUpgrade {
     type Error = WebSocketUpgradeError;
-    async fn extract(_request: &mut Request) -> Result<Self, Self::Error> {
-        Err(WebSocketUpgradeError::Unsupported)
+
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        // Validate WebSocket upgrade request
+        if request.method() != Method::GET {
+            return Err(WebSocketUpgradeError::MethodNotAllowed);
+        }
+
+        let headers = request.headers();
+
+        // Check Sec-WebSocket-Key
+        headers
+            .get(header::SEC_WEBSOCKET_KEY)
+            .ok_or(WebSocketUpgradeError::MissingSecWebSocketKey)?;
+
+        // Check Connection header
+        let connection = headers
+            .get(header::CONNECTION)
+            .ok_or(WebSocketUpgradeError::MissingConnectionHeader)?;
+
+        if !header_has_token(connection, "upgrade") {
+            return Err(WebSocketUpgradeError::InvalidConnectionHeader);
+        }
+
+        // Check Upgrade header
+        let upgrade_header = headers
+            .get(header::UPGRADE)
+            .ok_or(WebSocketUpgradeError::MissingUpgradeHeader)?;
+
+        if !upgrade_header
+            .to_str()
+            .map(|value| value.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false)
+        {
+            return Err(WebSocketUpgradeError::InvalidUpgradeHeader);
+        }
+
+        // Check version
+        match headers.get(header::SEC_WEBSOCKET_VERSION) {
+            Some(version) if version == "13" => {}
+            _ => return Err(WebSocketUpgradeError::UnsupportedVersion),
+        }
+
+        Ok(WebSocketUpgrade::new())
     }
 }
 
 /// [`Responder`] returned from [`WebSocketUpgrade::on_upgrade`].
-#[derive(Debug, Clone)]
-pub struct WebSocketUpgradeResponder;
+pub struct WebSocketUpgradeResponder {
+    client: ffi::WebSocket,
+}
 
-impl Responder for WebSocketUpgradeResponder {
-    type Error = WebSocketUpgradeError;
-    fn respond_to(self, _request: &Request, _response: &mut Response) -> Result<(), Self::Error> {
-        Err(WebSocketUpgradeError::Unsupported)
+impl std::fmt::Debug for WebSocketUpgradeResponder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketUpgradeResponder").finish()
     }
 }
 
-fn unsupported_error() -> WebSocketError {
-    WebSocketError::Protocol("WebSocket upgrades are not supported on wasm targets".to_owned())
+impl Responder for WebSocketUpgradeResponder {
+    type Error = std::convert::Infallible;
+
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
+        // Set status to 101 Switching Protocols
+        *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+
+        // Store the client socket in extensions for the runtime to extract
+        response.extensions_mut().insert(self.client);
+
+        Ok(())
+    }
 }

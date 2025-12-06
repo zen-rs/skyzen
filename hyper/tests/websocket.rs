@@ -151,3 +151,97 @@ async fn websocket_uses_custom_max_message_size() {
     handle.abort();
     let _ = handle.await;
 }
+
+#[tokio::test]
+async fn websocket_json_convenience_methods() {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct TestMessage {
+        value: i32,
+        text: String,
+    }
+
+    let (mut client, _, handle) = spawn_router(
+        Route::new(("/json".ws(|mut socket| async move {
+            // Use recv_json() convenience method
+            while let Some(Ok(msg)) = socket.recv_json::<TestMessage>().await {
+                // Use send() convenience method for JSON
+                let response = TestMessage {
+                    value: msg.value * 2,
+                    text: format!("Echo: {}", msg.text),
+                };
+                let _ = socket.send(&response).await;
+            }
+        }),)),
+        "ws://localhost/json",
+    )
+    .await;
+
+    // Send JSON message
+    let send_msg = TestMessage {
+        value: 42,
+        text: "hello".to_string(),
+    };
+    let json_str = serde_json::to_string(&send_msg).unwrap();
+    client
+        .send(Message::text(json_str))
+        .await
+        .expect("send message");
+
+    // Receive JSON response
+    let reply = client
+        .next()
+        .await
+        .expect("missing reply")
+        .expect("websocket frame");
+    let received: TestMessage = serde_json::from_str(&reply.into_text().unwrap()).unwrap();
+
+    assert_eq!(received.value, 84);
+    assert_eq!(received.text, "Echo: hello");
+
+    let _ = client.close(None).await;
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn websocket_binary_convenience_methods() {
+    let (mut client, _, handle) = spawn_router(
+        Route::new(("/binary".ws(|mut socket| async move {
+            while let Some(Ok(message)) = socket.next().await {
+                if let Ok(data) = message.into_binary() {
+                    // Use send_binary() convenience method
+                    let mut response = vec![0xFF];
+                    response.extend_from_slice(&data);
+                    let _ = socket.send_binary(response).await;
+                }
+            }
+        }),)),
+        "ws://localhost/binary",
+    )
+    .await;
+
+    // Send binary message
+    let test_data = vec![0x01, 0x02, 0x03, 0x04];
+    client
+        .send(Message::binary(test_data.clone()))
+        .await
+        .expect("send message");
+
+    // Receive binary response
+    let reply = client
+        .next()
+        .await
+        .expect("missing reply")
+        .expect("websocket frame");
+    let received = reply.into_data();
+
+    assert_eq!(received.len(), 5);
+    assert_eq!(received[0], 0xFF);
+    assert_eq!(&received[1..], &test_data[..]);
+
+    let _ = client.close(None).await;
+    handle.abort();
+    let _ = handle.await;
+}
