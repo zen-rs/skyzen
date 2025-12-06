@@ -67,7 +67,7 @@ mod tests {
     async fn surfaces_bad_request_for_invalid_payload() {
         let mut request = request("http://localhost/search?q=rust&page=two");
         let error = Query::<Search>::extract(&mut request).await.unwrap_err();
-        assert_eq!(error.status(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
     }
     fn request(uri: &str) -> http_kit::Request {
         let mut request = http_kit::Request::new(Body::empty());

@@ -48,23 +48,28 @@ pub enum WebSocketMessage {
 impl WebSocketMessage {
     /// Create a text message.
     pub fn text(value: impl Into<String>) -> Self {
-        WebSocketMessage::Text(value.into())
+        Self::Text(value.into())
     }
 
     /// Create a binary message.
     pub fn binary(bytes: impl Into<Vec<u8>>) -> Self {
-        WebSocketMessage::Binary(bytes.into())
+        Self::Binary(bytes.into())
     }
 
     /// Returns true when the message is textual.
-    pub fn is_text(&self) -> bool {
-        matches!(self, WebSocketMessage::Text(_))
+    #[must_use]
+    pub const fn is_text(&self) -> bool {
+        matches!(self, Self::Text(_))
     }
 
     /// Consume and return the text payload if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not text.
     pub fn into_text(self) -> Result<String, Self> {
         match self {
-            WebSocketMessage::Text(text) => Ok(text),
+            Self::Text(text) => Ok(text),
             other => Err(other),
         }
     }
@@ -77,9 +82,7 @@ impl WebSocketMessage {
     #[cfg(feature = "json")]
     pub fn into_json<T: serde::de::DeserializeOwned>(self) -> WebSocketResult<T> {
         match self {
-            WebSocketMessage::Text(text) => {
-                serde_json::from_str(&text).map_err(WebSocketError::from)
-            }
+            Self::Text(text) => serde_json::from_str(&text).map_err(WebSocketError::from),
             _ => Err(WebSocketError::Protocol(
                 "Expected text message for JSON deserialization".into(),
             )),
@@ -92,29 +95,33 @@ impl WebSocketMessage {
     #[cfg(feature = "json")]
     pub fn try_into_json<T: serde::de::DeserializeOwned>(self) -> Option<WebSocketResult<T>> {
         match self {
-            WebSocketMessage::Text(text) => {
-                Some(serde_json::from_str(&text).map_err(WebSocketError::from))
-            }
+            Self::Text(text) => Some(serde_json::from_str(&text).map_err(WebSocketError::from)),
             _ => None,
         }
     }
 
     /// Returns true when the message is binary.
-    pub fn is_binary(&self) -> bool {
-        matches!(self, WebSocketMessage::Binary(_))
+    #[must_use]
+    pub const fn is_binary(&self) -> bool {
+        matches!(self, Self::Binary(_))
     }
 
     /// Consume and return the binary payload if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not binary.
     pub fn into_binary(self) -> Result<Vec<u8>, Self> {
         match self {
-            WebSocketMessage::Binary(data) => Ok(data),
+            Self::Binary(data) => Ok(data),
             other => Err(other),
         }
     }
 
     /// Returns true when the message is a close frame.
-    pub fn is_close(&self) -> bool {
-        matches!(self, WebSocketMessage::Close(_))
+    #[must_use]
+    pub const fn is_close(&self) -> bool {
+        matches!(self, Self::Close(_))
     }
 }
 
@@ -129,15 +136,15 @@ pub enum WebSocketError {
 
 impl From<io::Error> for WebSocketError {
     fn from(error: io::Error) -> Self {
-        WebSocketError::Transport(error)
+        Self::Transport(error)
     }
 }
 
 impl fmt::Display for WebSocketError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WebSocketError::Transport(err) => write!(f, "transport error: {err}"),
-            WebSocketError::Protocol(err) => write!(f, "protocol error: {err}"),
+            Self::Transport(err) => write!(f, "transport error: {err}"),
+            Self::Protocol(err) => write!(f, "protocol error: {err}"),
         }
     }
 }
@@ -147,6 +154,6 @@ impl std::error::Error for WebSocketError {}
 #[cfg(feature = "json")]
 impl From<serde_json::Error> for WebSocketError {
     fn from(error: serde_json::Error) -> Self {
-        WebSocketError::Protocol(error.to_string())
+        Self::Protocol(error.to_string())
     }
 }

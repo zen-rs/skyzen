@@ -29,8 +29,8 @@ impl fmt::Display for MissingParam {
 impl std::error::Error for MissingParam {}
 
 impl HttpError for MissingParam {
-    fn status(&self) -> Option<StatusCode> {
-        Some(StatusCode::BAD_REQUEST)
+    fn status(&self) -> StatusCode {
+        StatusCode::BAD_REQUEST
     }
 }
 

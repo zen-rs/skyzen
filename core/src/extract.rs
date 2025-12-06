@@ -20,13 +20,14 @@ pub trait Extractor: Sized + Send + Sync + 'static {
     /// Read the request and parse a value.
     fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send;
 
-    /// Describe the extractor's OpenAPI schema, if available.
+    /// Describe the extractor's `OpenAPI` schema, if available.
     #[cfg(feature = "openapi")]
+    #[must_use]
     fn openapi() -> Option<ExtractorSchema> {
         None
     }
 
-    /// Register dependent schemas into the OpenAPI components map.
+    /// Register dependent schemas into the `OpenAPI` components map.
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(_defs: &mut BTreeMap<String, SchemaRef>) {}
 }
@@ -65,7 +66,7 @@ macro_rules! impl_tuple_extractor {
             impl <$($ty: Extractor),*>core::error::Error for TupleExtractorError<$($ty),*> {}
 
             impl <$($ty: Extractor),*>http_kit::HttpError for TupleExtractorError<$($ty),*> {
-                fn status(&self) -> ::core::option::Option<http_kit::StatusCode> {
+                fn status(&self) -> http_kit::StatusCode {
                     match self {
                         $(TupleExtractorError::$ty(e) => e.status(),)*
                         #[allow(unreachable_patterns)]
@@ -89,13 +90,13 @@ macro_rules! impl_tuple_extractor {
 
             #[cfg(feature = "openapi")]
             #[allow(dead_code)]
-            fn openapi() -> Option<crate::openapi::ExtractorSchema> {
+            const fn openapi() -> Option<crate::openapi::ExtractorSchema> {
                 None
             }
 
             #[cfg(feature = "openapi")]
             #[allow(dead_code)]
-            fn register_openapi_schemas(
+            const fn register_openapi_schemas(
                 _defs: &mut alloc::collections::BTreeMap<String, crate::openapi::SchemaRef>,
             ) {
             }

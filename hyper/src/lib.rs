@@ -100,7 +100,7 @@ impl<C: AsyncWrite + Unpin> hyper::rt::Write for ConnectionWrapper<C> {
 impl Server for Hyper {
     async fn serve<Fut, C, E>(
         self,
-        executor: impl executor_core::Executor + Send + Sync + 'static,
+        executor: impl executor_core::Executor + 'static,
         error_handler: impl Fn(E) + Send + Sync + 'static,
         mut connectons: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
         endpoint: impl Endpoint + Sync + Clone + 'static,

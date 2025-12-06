@@ -356,7 +356,7 @@ impl RouteNode {
     where
         E: Endpoint + Clone + Send + Sync + 'static,
     {
-        self.extend_with_nodes(vec![RouteNode::new_endpoint("", method, endpoint, None)])
+        self.extend_with_nodes(vec![Self::new_endpoint("", method, endpoint, None)])
     }
 
     /// Attach additional child routes under the current path.
@@ -390,7 +390,7 @@ impl RouteNode {
         self.extend_with_nodes(vec![endpoint])
     }
 
-    fn extend_with_nodes(self, mut additional: Vec<RouteNode>) -> Self {
+    fn extend_with_nodes(self, mut additional: Vec<Self>) -> Self {
         let path = self.path;
         let mut nodes = match self.node_type {
             RouteNodeType::Route(route) => route.nodes,
@@ -398,7 +398,7 @@ impl RouteNode {
                 endpoint_factory,
                 method,
                 openapi,
-            } => vec![RouteNode {
+            } => vec![Self {
                 path: String::new(),
                 node_type: RouteNodeType::Endpoint {
                     endpoint_factory,
@@ -410,7 +410,7 @@ impl RouteNode {
 
         nodes.append(&mut additional);
 
-        RouteNode {
+        Self {
             path,
             node_type: RouteNodeType::Route(Route { nodes }),
         }
@@ -564,7 +564,7 @@ pub trait CreateRouteNode: Sized {
     /// Attach an endpoint at the specified method and path.
     ///
     /// Note: This is a low-level method; prefer using `.at`, `.post`, etc. for common HTTP methods.
-    /// Especially when using OpenAPI, those methods will automatically generate documentation.
+    /// Especially when using `OpenAPI`, those methods will automatically generate documentation.
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
     where
         E: Endpoint + Clone + Send + Sync + 'static;

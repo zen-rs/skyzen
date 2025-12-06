@@ -1,4 +1,4 @@
-//! OpenAPI primitives shared by the core traits.
+//! `OpenAPI` primitives shared by the core traits.
 
 use alloc::collections::BTreeMap;
 use core::fmt;
@@ -9,7 +9,7 @@ use utoipa::openapi::{
     RefOr,
 };
 
-/// OpenAPI schema reference type alias.
+/// `OpenAPI` schema reference type alias.
 pub type SchemaRef = RefOr<Schema>;
 
 /// Schema information captured for an extractor argument.
@@ -55,6 +55,7 @@ impl fmt::Debug for ResponseSchema {
 }
 
 /// Minimal string schema helper for responder payloads.
+#[must_use]
 pub fn plain_string_schema() -> SchemaRef {
     RefOr::T(Schema::Object(
         utoipa::openapi::schema::ObjectBuilder::new()
@@ -63,5 +64,5 @@ pub fn plain_string_schema() -> SchemaRef {
     ))
 }
 
-/// Function pointer used to register schemas in the OpenAPI components section.
+/// Function pointer used to register schemas in the `OpenAPI` components section.
 pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);

@@ -156,7 +156,7 @@ where
 
 impl<T> utoipa::ToSchema for State<T> where T: Clone + Send + Sync + 'static {}
 
-/// Wrapper that explicitly opts out of OpenAPI schema generation for contained extractors or
+/// Wrapper that explicitly opts out of `OpenAPI` schema generation for contained extractors or
 /// responders.
 #[derive(Debug, Clone, Copy)]
 pub struct IgnoreOpenApi<T>(pub T);

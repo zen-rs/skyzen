@@ -118,6 +118,7 @@ pub fn derive_http_error(item: TokenStream) -> TokenStream {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     let fn_ident = &function.sig.ident;
 
@@ -171,20 +172,17 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
 
     let mut parameter_schema_fns = Vec::new();
     let mut parameter_name_lits = Vec::new();
-    let mut included_idx = 0usize;
-    for meta in &parameter_schemas {
+    for (included_idx, meta) in parameter_schemas.iter().enumerate() {
         let ty = &meta.ty;
         parameter_schema_fns.push(quote! { ::skyzen::openapi::extractor_schema_of::<#ty> });
-        let name = meta
-            .name
-            .as_ref()
-            .map(|ident| quote! { stringify!(#ident) })
-            .unwrap_or_else(|| {
+        let name = meta.name.as_ref().map_or_else(
+            || {
                 let lit = syn::LitStr::new(&format!("param{included_idx}"), fn_ident.span());
                 quote! { #lit }
-            });
+            },
+            |ident| quote! { stringify!(#ident) },
+        );
         parameter_name_lits.push(name);
-        included_idx += 1;
     }
 
     let schema_array = if parameter_schema_fns.is_empty() {
@@ -313,6 +311,7 @@ fn expand_error(args: ErrorArgs, item: Item) -> syn::Result<TokenStream> {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<TokenStream> {
     let ident = &item_struct.ident;
     let generics = &item_struct.generics;
@@ -342,8 +341,8 @@ fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<
         impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {}
 
         impl #impl_generics ::skyzen::HttpError for #ident #ty_generics #where_clause {
-            fn status(&self) -> ::core::option::Option<::skyzen::StatusCode> {
-                Some(#status)
+            fn status(&self) -> ::skyzen::StatusCode {
+                #status
             }
         }
     }
@@ -364,7 +363,7 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
     let mut from_impls = Vec::new();
     let mut cleaned_variants = Punctuated::new();
 
-    for variant in item_enum.variants.into_iter() {
+    for variant in item_enum.variants {
         let variant_ident = variant.ident.clone();
         let (
             variant,
@@ -397,7 +396,7 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
         });
 
         status_arms.push(quote! {
-            #pattern => ::core::option::Option::Some(#status_expr)
+            #pattern => #status_expr
         });
 
         if let Some(from_info) = from {
@@ -440,7 +439,7 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
         impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {}
 
         impl #impl_generics ::skyzen::HttpError for #ident #ty_generics #where_clause {
-            fn status(&self) -> ::core::option::Option<::skyzen::StatusCode> {
+            fn status(&self) -> ::skyzen::StatusCode {
                 match self {
                     #(#status_arms),*
                 }
@@ -596,7 +595,7 @@ fn parse_variant(mut variant: Variant) -> syn::Result<(Variant, VariantMeta)> {
     let mut other_attrs = Vec::new();
     let mut meta = None;
 
-    for attr in variant.attrs.into_iter() {
+    for attr in variant.attrs {
         if attr.path().is_ident("error") {
             if meta.is_some() {
                 return Err(Error::new(attr.span(), "duplicate #[error] attribute"));

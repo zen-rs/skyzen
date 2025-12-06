@@ -2,7 +2,7 @@
 //!
 //! **Platform Support:**
 //! - ✅ Native (tokio): Full WebSocket support via async-tungstenite
-//! - ✅ WASM (WinterCG): WebSocket support via WebSocketPair API
+//! - ✅ WASM (WinterCG): WebSocket support via `WebSocketPair` API
 //!
 //! **Platform Differences:**
 //! - WASM: 1 MiB message size limit (platform imposed)
@@ -108,15 +108,15 @@
 
 mod types;
 
+#[cfg(target_arch = "wasm32")]
+mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
-#[cfg(target_arch = "wasm32")]
-mod ffi;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
+pub use types::*;
 #[cfg(target_arch = "wasm32")]
 pub use wasm::*;
-pub use types::*;

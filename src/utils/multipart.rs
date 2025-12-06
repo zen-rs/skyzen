@@ -255,9 +255,6 @@ mod tests {
         );
 
         let error = Multipart::extract(&mut request).await.unwrap_err();
-        assert_eq!(
-            error.status(),
-            Some(crate::StatusCode::UNSUPPORTED_MEDIA_TYPE)
-        );
+        assert_eq!(error.status(), crate::StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 }

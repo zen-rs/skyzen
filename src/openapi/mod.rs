@@ -24,7 +24,7 @@ use utoipa::openapi::{
 };
 use utoipa_redoc::Redoc;
 
-/// OpenAPI schema reference type alias.
+/// `OpenAPI` schema reference type alias.
 pub type SchemaRef = RefOr<Schema>;
 
 #[cfg(feature = "openapi")]
@@ -88,6 +88,7 @@ mod builtins;
 pub use builtins::IgnoreOpenApi;
 
 /// Strip the crate prefix from a module path, e.g. `my_crate::users::get` -> `users::get`.
+#[must_use]
 pub fn trim_crate(path: &str) -> &str {
     path.split_once("::").map_or(path, |(_, rest)| rest)
 }
@@ -98,6 +99,7 @@ pub type ExtractorSchemaFn = fn() -> Option<ExtractorSchema>;
 pub type ResponderSchemaFn = fn() -> Option<Vec<ResponseSchema>>;
 
 /// Return the schema for a `ToSchema` type.
+#[must_use]
 pub fn schema_of<T>() -> Option<SchemaRef>
 where
     T: crate::ToSchema,
@@ -105,7 +107,8 @@ where
     Some(<T as crate::PartialSchema>::schema())
 }
 
-/// Return the extractor schema for `T` if it exposes OpenAPI metadata.
+/// Return the extractor schema for `T` if it exposes `OpenAPI` metadata.
+#[must_use]
 pub fn extractor_schema_of<T>() -> Option<ExtractorSchema>
 where
     T: Extractor,
@@ -122,7 +125,8 @@ where
     }
 }
 
-/// Return the responder schemas for `T` if it exposes OpenAPI metadata.
+/// Return the responder schemas for `T` if it exposes `OpenAPI` metadata.
+#[must_use]
 pub fn responder_schemas_of<T>() -> Option<Vec<ResponseSchema>>
 where
     T: Responder,
@@ -139,7 +143,7 @@ where
     }
 }
 
-/// Register dependent schemas for the extractor type if OpenAPI metadata is available.
+/// Register dependent schemas for the extractor type if `OpenAPI` metadata is available.
 pub fn register_extractor_schemas_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
 where
     T: Extractor,
@@ -155,7 +159,7 @@ where
     }
 }
 
-/// Register dependent schemas for the responder type if OpenAPI metadata is available.
+/// Register dependent schemas for the responder type if `OpenAPI` metadata is available.
 pub fn register_responder_schemas_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
 where
     T: Responder,
@@ -221,7 +225,7 @@ where
     }
 }
 
-/// Register a schema and its dependencies when OpenAPI is enabled.
+/// Register a schema and its dependencies when `OpenAPI` is enabled.
 pub fn register_schema_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
 where
     T: crate::PartialSchema + crate::ToSchema,
@@ -232,7 +236,7 @@ where
 }
 
 #[cfg(all(debug_assertions, feature = "openapi"))]
-/// Registers types and their dependencies into the OpenAPI components map.
+/// Registers types and their dependencies into the `OpenAPI` components map.
 pub trait RegisterSchemas {
     /// Insert the type's schema and dependent schemas into the provided map.
     fn register(defs: &mut BTreeMap<String, SchemaRef>);
@@ -331,16 +335,8 @@ pub struct OpenApi {
 impl Debug for OpenApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenApi")
-            .field("operations", &{
-                #[cfg(all(debug_assertions, feature = "openapi"))]
-                {
-                    &self.operations
-                }
-                #[cfg(not(all(debug_assertions, feature = "openapi")))]
-                {
-                    &"[]"
-                }
-            })
+            .field("operations", &self.operations)
+            .field("schemas", &"[..]")
             .finish()
     }
 }
@@ -451,15 +447,16 @@ impl OpenApi {
     }
 
     /// Convert collected operations to a fully hydrated [`utoipa::openapi::OpenApi`] document.
+    #[must_use]
     pub fn to_utoipa_spec(&self) -> UtoipaSpec {
         UtoipaSpec::builder()
-            .info(self.default_info())
+            .info(Self::default_info())
             .paths(self.build_paths())
             .components(Some(self.build_components()))
             .build()
     }
 
-    fn default_info(&self) -> Info {
+    fn default_info() -> Info {
         Info::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
     }
 
@@ -515,7 +512,7 @@ pub struct OpenApiOperation {
     pub method: Method,
     /// Handler type name.
     pub handler_type: &'static str,
-    /// Operation identifier used in the OpenAPI document.
+    /// Operation identifier used in the `OpenAPI` document.
     pub operation_id: String,
     /// Documentation extracted from the handler's doc comments.
     pub docs: Option<&'static str>,
@@ -533,7 +530,9 @@ impl fmt::Debug for OpenApiOperation {
             .field("path", &self.path)
             .field("method", &self.method)
             .field("handler_type", &self.handler_type)
+            .field("operation_id", &self.operation_id)
             .field("docs", &self.docs)
+            .field("deprecated", &self.deprecated)
             .field("parameters", &self.parameters.len())
             .field("responses", &self.responses.len())
             .finish()
@@ -541,7 +540,7 @@ impl fmt::Debug for OpenApiOperation {
 }
 
 #[derive(Clone, Debug)]
-/// Endpoint that renders the OpenAPI document via Redoc.
+/// Endpoint that renders the `OpenAPI` document via Redoc.
 pub struct OpenApiRedocEndpoint {
     html: Option<Arc<String>>,
 }
@@ -565,17 +564,17 @@ http_error!(
 impl Endpoint for OpenApiRedocEndpoint {
     type Error = OpenApiRedocDisabledError;
     async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-        match &self.html {
-            Some(html) => {
+        self.html.as_ref().map_or_else(
+            || Err(OpenApiRedocDisabledError::new()),
+            |html| {
                 let mut response = Response::new(Body::from(html.as_bytes().to_vec()));
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
                     header::HeaderValue::from_static("text/html; charset=utf-8"),
                 );
                 Ok(response)
-            }
-            None => Err(OpenApiRedocDisabledError::new()),
-        }
+            },
+        )
     }
 }
 
@@ -616,7 +615,7 @@ fn build_operation(op: &OpenApiOperation) -> Operation {
         .or_else(|| Some(op.operation_id.clone()));
     let mut builder = OperationBuilder::new()
         .operation_id(Some(op.operation_id.clone()))
-        .summary(summary.clone())
+        .summary(summary)
         .responses(build_responses(op));
 
     if op.deprecated {
@@ -717,9 +716,9 @@ fn aggregate_parameter_schema(parameters: &[(String, RefOr<Schema>)]) -> RefOr<S
 }
 
 fn doc_summary(docs: &str) -> Option<String> {
-    let mut lines = docs.lines();
+    let lines = docs.lines();
     let mut paragraph = Vec::new();
-    while let Some(line) = lines.next() {
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             if !paragraph.is_empty() {

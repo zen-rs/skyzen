@@ -13,7 +13,7 @@ pub trait Server {
     /// is used to report connection-accept errors surfaced by `connectons`.
     fn serve<Fut, C, E>(
         self,
-        executor: impl Executor + Send + Sync + 'static,
+        executor: impl Executor + 'static,
         error_handler: impl Fn(E) + Send + Sync + 'static,
         connectons: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
         endpoint: impl Endpoint + Sync + Clone + 'static,

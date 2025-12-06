@@ -29,13 +29,14 @@ pub trait Responder: Sized + Send + Sync + 'static {
     /// Returns an error if the response fails.
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error>;
 
-    /// Describe the responder's OpenAPI schemas, if available.
+    /// Describe the responder's `OpenAPI` schemas, if available.
     #[cfg(feature = "openapi")]
+    #[must_use]
     fn openapi() -> Option<Vec<ResponseSchema>> {
         None
     }
 
-    /// Register dependent schemas into the OpenAPI components map.
+    /// Register dependent schemas into the `OpenAPI` components map.
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(_defs: &mut BTreeMap<String, SchemaRef>) {}
 }
@@ -74,7 +75,7 @@ macro_rules! impl_tuple_responder {
             impl <$($ty: Responder),*>core::error::Error for TupleResponderError<$($ty),*> {}
 
             impl<$($ty: Responder),*>http_kit::HttpError for TupleResponderError<$($ty),*> {
-                fn status(&self) -> ::core::option::Option<http_kit::StatusCode> { {
+                fn status(&self) -> http_kit::StatusCode { {
                     match self {
                         $(TupleResponderError::$ty(e) => e.status(),)*
                         #[allow(unreachable_patterns)]

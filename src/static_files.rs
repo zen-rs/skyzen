@@ -260,7 +260,7 @@ mod tests {
 
         let request = get_request("/files/../Cargo.toml");
         let error = router.clone().go(request).await.unwrap_err();
-        assert_eq!(error.status(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -270,7 +270,7 @@ mod tests {
 
         let request = get_request("/assets/app.js");
         let error = router.clone().go(request).await.unwrap_err();
-        assert_eq!(error.status(), Some(StatusCode::NOT_FOUND));
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -146,17 +146,29 @@ impl WebSocket {
     }
 
     /// Serialize a value to JSON text and send it over the websocket connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the serialization fails.
     pub async fn send<T: Serialize>(&mut self, value: T) -> WebSocketResult<()> {
         let payload = serde_json::to_string(&value)?;
         self.send_text(payload).await
     }
 
     /// Send a raw text frame without JSON serialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not text.
     pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::text(text)).await
     }
 
     /// Send raw binary data without JSON serialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not binary.
     pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::binary(data)).await
     }
@@ -165,7 +177,11 @@ impl WebSocket {
     ///
     /// # Platform Notes
     /// - **Native**: Full support
-    /// - **WASM**: Returns error (not supported by WinterCG API)
+    /// - **WASM**: Returns error (not supported by `WinterCG` API)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not ping.
     pub async fn send_ping(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::Ping(data.into())).await
     }
@@ -174,12 +190,20 @@ impl WebSocket {
     ///
     /// # Platform Notes
     /// - **Native**: Full support
-    /// - **WASM**: Returns error (not supported by WinterCG API)
+    /// - **WASM**: Returns error (not supported by `WinterCG` API)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not pong.
     pub async fn send_pong(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::Pong(data.into())).await
     }
 
     /// Send a [`WebSocketMessage`] without additional processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Transport`] if the connection fails to send the message.
     pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
         self.inner
             .send(message.into())
@@ -225,11 +249,15 @@ impl WebSocket {
     }
 
     /// Access the underlying websocket configuration.
-    pub fn get_config(&self) -> &WebSocketConfig {
+    pub const fn get_config(&self) -> &WebSocketConfig {
         &self.config
     }
 
     /// Close the websocket connection gracefully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Transport`] if the connection fails to close.
     pub async fn close(&mut self, close_frame: Option<WebSocketCloseFrame>) -> WebSocketResult<()> {
         self.inner
             .close(close_frame.map(Into::into))
@@ -322,17 +350,29 @@ pub struct WebSocketSender {
 
 impl WebSocketSender {
     /// Serialize a value to JSON text and send it over the websocket connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the serialization fails.
     pub async fn send<T: Serialize>(&mut self, value: T) -> WebSocketResult<()> {
         let payload = serde_json::to_string(&value)?;
         self.send_text(payload).await
     }
 
     /// Send a raw text frame without JSON serialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not text.
     pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::text(text)).await
     }
 
     /// Send raw binary data without JSON serialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not binary.
     pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::binary(data)).await
     }
@@ -341,7 +381,11 @@ impl WebSocketSender {
     ///
     /// # Platform Notes
     /// - **Native**: Full support
-    /// - **WASM**: Returns error (not supported by WinterCG API)
+    /// - **WASM**: Returns error (not supported by `WinterCG` API)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not ping.
     pub async fn send_ping(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::Ping(data.into())).await
     }
@@ -350,12 +394,20 @@ impl WebSocketSender {
     ///
     /// # Platform Notes
     /// - **Native**: Full support
-    /// - **WASM**: Returns error (not supported by WinterCG API)
+    /// - **WASM**: Returns error (not supported by `WinterCG` API)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Protocol`] if the message is not pong.
     pub async fn send_pong(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::Pong(data.into())).await
     }
 
     /// Send a [`WebSocketMessage`] without additional processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Transport`] if the connection fails to send the message.
     pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
         self.inner
             .send(message.into())
@@ -364,6 +416,10 @@ impl WebSocketSender {
     }
 
     /// Close the websocket connection gracefully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebSocketError::Transport`] if the connection fails to close.
     pub async fn close(&mut self, close_frame: Option<WebSocketCloseFrame>) -> WebSocketResult<()> {
         self.inner
             .close(close_frame.map(Into::into))
@@ -372,7 +428,8 @@ impl WebSocketSender {
     }
 
     /// Access the underlying websocket configuration.
-    pub fn get_config(&self) -> &WebSocketConfig {
+    #[must_use]
+    pub const fn get_config(&self) -> &WebSocketConfig {
         &self.config
     }
 }
@@ -454,7 +511,8 @@ impl WebSocketReceiver {
     }
 
     /// Access the underlying websocket configuration.
-    pub fn get_config(&self) -> &WebSocketConfig {
+    #[must_use]
+    pub const fn get_config(&self) -> &WebSocketConfig {
         &self.config
     }
 }
@@ -522,7 +580,7 @@ impl WebSocketUpgrade {
     ///
     /// Pass `None` to disable the limit enforced by the backend implementation.
     #[must_use]
-    pub fn max_message_size(mut self, max_size: Option<usize>) -> Self {
+    pub const fn max_message_size(mut self, max_size: Option<usize>) -> Self {
         self.config.max_message_size = max_size;
         self
     }
@@ -554,12 +612,12 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
 
         let key = headers
             .get(header::SEC_WEBSOCKET_KEY)
-            .ok_or_else(|| WebSocketUpgradeError::MissingSecWebSocketKey)?
+            .ok_or(WebSocketUpgradeError::MissingSecWebSocketKey)?
             .clone();
 
         let connection = headers
             .get(header::CONNECTION)
-            .ok_or_else(|| WebSocketUpgradeError::MissingConnectionHeader)?;
+            .ok_or(WebSocketUpgradeError::MissingConnectionHeader)?;
 
         if !header_has_token(connection, "upgrade") {
             return Err(WebSocketUpgradeError::MissingUpgradeHeader);
@@ -567,7 +625,7 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
 
         let upgrade_header = headers
             .get(header::UPGRADE)
-            .ok_or_else(|| WebSocketUpgradeError::MissingUpgradeHeader)?;
+            .ok_or(WebSocketUpgradeError::MissingUpgradeHeader)?;
 
         if !upgrade_header
             .to_str()
@@ -592,7 +650,7 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
     let on_upgrade = request
         .extensions_mut()
         .remove::<OnUpgrade>()
-        .ok_or_else(|| WebSocketUpgradeError::MissingOnUpgrade)?;
+        .ok_or(WebSocketUpgradeError::MissingOnUpgrade)?;
 
     Ok(WebSocketUpgrade {
         key,
@@ -699,8 +757,8 @@ impl Responder for WebSocketUpgradeResponder {
 impl From<TungsteniteError> for WebSocketError {
     fn from(error: TungsteniteError) -> Self {
         match error {
-            TungsteniteError::Io(err) => WebSocketError::Transport(err),
-            other => WebSocketError::Protocol(other.to_string()),
+            TungsteniteError::Io(err) => Self::Transport(err),
+            other => Self::Protocol(other.to_string()),
         }
     }
 }
@@ -708,11 +766,11 @@ impl From<TungsteniteError> for WebSocketError {
 impl From<WebSocketMessage> for TungsteniteMessage {
     fn from(message: WebSocketMessage) -> Self {
         match message {
-            WebSocketMessage::Text(text) => TungsteniteMessage::Text(Utf8Bytes::from(text)),
-            WebSocketMessage::Binary(bytes) => TungsteniteMessage::Binary(Bytes::from(bytes)),
-            WebSocketMessage::Ping(bytes) => TungsteniteMessage::Ping(Bytes::from(bytes)),
-            WebSocketMessage::Pong(bytes) => TungsteniteMessage::Pong(Bytes::from(bytes)),
-            WebSocketMessage::Close(frame) => TungsteniteMessage::Close(frame.map(Into::into)),
+            WebSocketMessage::Text(text) => Self::Text(Utf8Bytes::from(text)),
+            WebSocketMessage::Binary(bytes) => Self::Binary(Bytes::from(bytes)),
+            WebSocketMessage::Ping(bytes) => Self::Ping(Bytes::from(bytes)),
+            WebSocketMessage::Pong(bytes) => Self::Pong(Bytes::from(bytes)),
+            WebSocketMessage::Close(frame) => Self::Close(frame.map(Into::into)),
         }
     }
 }
@@ -720,19 +778,19 @@ impl From<WebSocketMessage> for TungsteniteMessage {
 impl From<TungsteniteMessage> for WebSocketMessage {
     fn from(message: TungsteniteMessage) -> Self {
         match message {
-            TungsteniteMessage::Text(text) => WebSocketMessage::Text(text.to_string()),
-            TungsteniteMessage::Binary(bytes) => WebSocketMessage::Binary(bytes.to_vec()),
-            TungsteniteMessage::Ping(bytes) => WebSocketMessage::Ping(bytes.to_vec()),
-            TungsteniteMessage::Pong(bytes) => WebSocketMessage::Pong(bytes.to_vec()),
-            TungsteniteMessage::Close(frame) => WebSocketMessage::Close(frame.map(Into::into)),
-            _ => WebSocketMessage::Close(None),
+            TungsteniteMessage::Text(text) => Self::Text(text.to_string()),
+            TungsteniteMessage::Binary(bytes) => Self::Binary(bytes.to_vec()),
+            TungsteniteMessage::Ping(bytes) => Self::Ping(bytes.to_vec()),
+            TungsteniteMessage::Pong(bytes) => Self::Pong(bytes.to_vec()),
+            TungsteniteMessage::Close(frame) => Self::Close(frame.map(Into::into)),
+            TungsteniteMessage::Frame(_) => Self::Close(None),
         }
     }
 }
 
 impl From<WebSocketCloseFrame> for TungsteniteCloseFrame {
     fn from(frame: WebSocketCloseFrame) -> Self {
-        TungsteniteCloseFrame {
+        Self {
             code: CloseCode::from(frame.code),
             reason: Utf8Bytes::from(frame.reason),
         }
@@ -741,7 +799,7 @@ impl From<WebSocketCloseFrame> for TungsteniteCloseFrame {
 
 impl From<TungsteniteCloseFrame> for WebSocketCloseFrame {
     fn from(frame: TungsteniteCloseFrame) -> Self {
-        WebSocketCloseFrame {
+        Self {
             code: u16::from(frame.code),
             reason: frame.reason.to_string(),
         }

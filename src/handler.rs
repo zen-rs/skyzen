@@ -22,8 +22,8 @@ pub enum HandlerError<E: Extractor, R: Responder> {
 impl<E: Extractor, R: Responder> Display for HandlerError<E, R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            HandlerError::ExtractorError(e) => write!(f, "{}", e),
-            HandlerError::ResponderError(e) => write!(f, "{}", e),
+            Self::ExtractorError(e) => write!(f, "{e}"),
+            Self::ResponderError(e) => write!(f, "{e}"),
         }
     }
 }
@@ -31,17 +31,17 @@ impl<E: Extractor, R: Responder> Display for HandlerError<E, R> {
 impl<E: Extractor, R: Responder> core::fmt::Debug for HandlerError<E, R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            HandlerError::ExtractorError(e) => write!(f, "{:?}", e),
-            HandlerError::ResponderError(e) => write!(f, "{:?}", e),
+            Self::ExtractorError(e) => write!(f, "{e:?}"),
+            Self::ResponderError(e) => write!(f, "{e:?}"),
         }
     }
 }
 
 impl<E: Extractor, R: Responder> http_kit::HttpError for HandlerError<E, R> {
-    fn status(&self) -> Option<http::StatusCode> {
+    fn status(&self) -> http_kit::StatusCode {
         match self {
-            HandlerError::ExtractorError(e) => e.status(),
-            HandlerError::ResponderError(e) => e.status(),
+            Self::ExtractorError(e) => e.status(),
+            Self::ResponderError(e) => e.status(),
         }
     }
 }

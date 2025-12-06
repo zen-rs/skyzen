@@ -108,7 +108,9 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
     if let Some(addr) = listen {
         match addr.parse::<SocketAddr>() {
             Ok(socket) => {
-                std::env::set_var("SKYZEN_ADDRESS", socket.to_string());
+                unsafe {
+                    std::env::set_var("SKYZEN_ADDRESS", socket.to_string());
+                }
                 info!("Configured listener address via CLI: {socket}");
             }
             Err(error) => warn!("Ignoring invalid --listen address `{addr}`: {error}"),
@@ -140,7 +142,9 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
         }
     }
 
-    std::env::set_var("SKYZEN_ADDRESS", candidate.to_string());
+    unsafe {
+        std::env::set_var("SKYZEN_ADDRESS", candidate.to_string());
+    }
     info!("Configured listener address via CLI: {candidate}");
 }
 
@@ -211,13 +215,14 @@ where
 }
 
 fn server_addr() -> SocketAddr {
-    if let Ok(addr) = std::env::var("SKYZEN_ADDRESS") {
-        // Use the provided address by default
-        addr.parse()
-            .unwrap_or_else(|error| panic!("Invalid SKYZEN_ADDRESS value: {error}"))
-    } else {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-    }
+    std::env::var("SKYZEN_ADDRESS").map_or_else(
+        |_| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        |addr| {
+            // Use the provided address by default
+            addr.parse()
+                .unwrap_or_else(|error| panic!("Invalid SKYZEN_ADDRESS value: {error}"))
+        },
+    )
 }
 
 #[derive(Debug)]
@@ -267,7 +272,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                     );
                 }
                 Err(err) => {
-                    let status = err.status().map(|s| s.as_u16()).unwrap_or(500);
+                    let status = err.status().as_u16();
                     error!(
                         method = method.as_str(),
                         path = path.as_str(),

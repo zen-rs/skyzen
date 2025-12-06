@@ -49,8 +49,8 @@ impl From<Error> for Box<dyn HttpError> {
         }
 
         impl HttpError for Wrapper {
-            fn status(&self) -> Option<StatusCode> {
-                Some(self.inner.status())
+            fn status(&self) -> StatusCode {
+                self.inner.status()
             }
         }
 
@@ -139,6 +139,7 @@ impl Error {
     ///
     /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
     /// ```
+    #[must_use]
     pub fn set_status<S>(mut self, status: S) -> Self
     where
         S: TryInto<StatusCode>,
@@ -149,7 +150,7 @@ impl Error {
             assert!(
                 (400..=599).contains(&status.as_u16()),
                 "Expected a status code within 400~599"
-            )
+            );
         }
 
         self.status = status;
@@ -168,7 +169,8 @@ impl Error {
     /// let err = Error::msg("not found").set_status(StatusCode::NOT_FOUND);
     /// assert_eq!(err.status(), StatusCode::NOT_FOUND);
     /// ```
-    pub fn status(&self) -> StatusCode {
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
         self.status
     }
 
@@ -191,12 +193,16 @@ impl Error {
     ///     Err(original) => println!("Not an IO error: {}", original),
     /// }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Self)` when the inner error cannot be downcast into the requested type.
     pub fn downcast<E>(self) -> core::result::Result<Box<E>, Self>
     where
         E: core::error::Error + Send + Sync + 'static,
     {
         let Self { status, error } = self;
-        error.downcast().map_err(|error| Self { status, error })
+        error.downcast().map_err(|error| Self { error, status })
     }
 
     /// Attempts to downcast the inner error to a reference of the concrete type.
@@ -217,6 +223,7 @@ impl Error {
     ///     println!("IO error kind: {:?}", io_error.kind());
     /// }
     /// ```
+    #[must_use]
     pub fn downcast_ref<E>(&self) -> Option<&E>
     where
         E: core::error::Error + Send + Sync + 'static,
@@ -252,11 +259,13 @@ impl Error {
     /// Converts this error into a boxed standard error trait object.
     ///
     /// # Examples
-    ///// ```rust
+    ///
+    /// ```rust
     /// use skyzen::Error;
     /// let err = Error::msg("Not found");
     /// let boxed_err: Box<dyn std::error::Error + Send> = err.into_boxed_error();
     /// ```
+    #[must_use]
     pub fn into_boxed_error(self) -> Box<dyn core::error::Error + Send + 'static> {
         self.into_boxed_http_error() as Box<dyn core::error::Error + Send + 'static>
     }
@@ -264,12 +273,14 @@ impl Error {
     /// Converts this error into a boxed `HttpError` trait object.
     ///
     /// # Examples
-    //// ```rust
+    ///
+    /// ```rust
     /// use skyzen::Error;
     /// use http::StatusCode;
     /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
     /// let boxed_err: Box<dyn skyzen::HttpError> = err.into_boxed_http_error();
     /// ```
+    #[must_use]
     pub fn into_boxed_http_error(self) -> Box<dyn HttpError> {
         struct Wrapper {
             inner: Error,
@@ -287,8 +298,8 @@ impl Error {
             }
         }
         impl HttpError for Wrapper {
-            fn status(&self) -> Option<StatusCode> {
-                Some(self.inner.status())
+            fn status(&self) -> StatusCode {
+                self.inner.status()
             }
         }
         Box::new(Wrapper { inner: self })
@@ -321,13 +332,13 @@ impl core::fmt::Display for Error {
 
 impl AsRef<dyn core::error::Error + Send + 'static> for Error {
     fn as_ref(&self) -> &(dyn core::error::Error + Send + 'static) {
-        self.deref()
+        &**self
     }
 }
 
 impl AsMut<dyn core::error::Error + Send + 'static> for Error {
     fn as_mut(&mut self) -> &mut (dyn core::error::Error + Send + 'static) {
-        self.deref_mut()
+        &mut **self
     }
 }
 
@@ -335,13 +346,13 @@ impl Deref for Error {
     type Target = dyn core::error::Error + Send + 'static;
 
     fn deref(&self) -> &Self::Target {
-        self.error.deref()
+        &*self.error
     }
 }
 
 impl DerefMut for Error {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.error.deref_mut()
+        &mut *self.error
     }
 }
 
@@ -396,6 +407,10 @@ where
     /// let result: Result<i32> = None
     ///     .status(StatusCode::BAD_REQUEST);
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Error` when the result is `Err` or the option is `None`, using the provided status code.
     fn status<S>(self, status: S) -> Result<T>
     where
         S: TryInto<StatusCode>,
@@ -421,6 +436,6 @@ impl<T> ResultExt<T> for Option<T> {
         S: TryInto<StatusCode>,
         S::Error: core::fmt::Debug,
     {
-        self.ok_or(Error::msg("None Error").set_status(status))
+        self.ok_or_else(|| Error::msg("None Error").set_status(status))
     }
 }

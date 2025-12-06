@@ -28,7 +28,7 @@ pub struct AuthMiddleware<A: Authenticater> {
 
 impl<A: Authenticater> AuthMiddleware<A> {
     /// Create a new authentication middleware.
-    pub fn new(authenticator: A) -> Self {
+    pub const fn new(authenticator: A) -> Self {
         Self { authenticator }
     }
 }
