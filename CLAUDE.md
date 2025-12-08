@@ -48,13 +48,13 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 
 ### Feature Flags
 
-Default features: `json`, `form`, `multipart`, `sse`, `rt`, `openapi`, `websocket-native`
+Default features: `json`, `form`, `multipart`, `sse`, `rt`, `openapi`, `ws`
 
 - `rt` - Enables Tokio/Hyper runtime (native builds)
 - `openapi` - OpenAPI schema generation (debug builds only)
-- `websocket` - Base WebSocket types and traits (platform-agnostic)
-- `websocket-native` - WebSocket support for native targets via `async-tungstenite`
-- `websocket-wasm` - WebSocket support for WASM targets via WinterCG WebSocketPair API
+- `ws` - Unified WebSocket support; pulls in the right backend per target (native via async-tungstenite, wasm via WebSocketPair)
+- `websocket` - Base WebSocket types and traits (platform-agnostic, implied by `ws`)
+- `websocket-native` / `websocket-wasm` - Backward-compatible aliases that now forward to `ws`
 
 #### WebSocket Platform Support
 
