@@ -161,7 +161,7 @@ impl WebSocket {
     /// # Errors
     ///
     /// Returns [`WebSocketError::Protocol`] if the message is not text.
-    pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
+    pub async fn send_text(&mut self, text: impl Into<ByteStr>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::text(text)).await
     }
 
@@ -365,7 +365,7 @@ impl WebSocketSender {
     /// # Errors
     ///
     /// Returns [`WebSocketError::Protocol`] if the message is not text.
-    pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
+    pub async fn send_text(&mut self, text: impl Into<ByteStr>) -> WebSocketResult<()> {
         self.send_message(WebSocketMessage::text(text)).await
     }
 

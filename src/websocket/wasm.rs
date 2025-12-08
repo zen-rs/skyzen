@@ -8,14 +8,14 @@ use crate::{
     websocket::{
         ffi,
         types::{
-            WebSocketCloseFrame, WebSocketConfig, WebSocketError, WebSocketMessage,
-            WebSocketResult,
+            WebSocketCloseFrame, WebSocketConfig, WebSocketError, WebSocketMessage, WebSocketResult,
         },
     },
     Method, Request, Response, StatusCode,
 };
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
+use http_kit::utils::ByteStr;
 use serde::Serialize;
 use skyzen_core::{Extractor, Responder};
 use std::{
@@ -120,7 +120,7 @@ impl WebSocket {
     }
 
     /// Send a raw text frame without JSON serialization.
-    pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
+    pub async fn send_text(&mut self, text: impl Into<ByteStr>) -> WebSocketResult<()> {
         let text = text.into();
         self.inner
             .send(&JsValue::from_str(&text))
@@ -179,7 +179,9 @@ impl WebSocket {
     ///
     /// Skips non-text messages and returns None when connection closes.
     #[cfg(feature = "json")]
-    pub async fn recv_json<T: serde::de::DeserializeOwned>(&mut self) -> Option<WebSocketResult<T>> {
+    pub async fn recv_json<T: serde::de::DeserializeOwned>(
+        &mut self,
+    ) -> Option<WebSocketResult<T>> {
         use futures_util::StreamExt;
 
         loop {
@@ -269,7 +271,7 @@ impl WebSocketSender {
     }
 
     /// Send a raw text frame without JSON serialization.
-    pub async fn send_text(&mut self, text: impl Into<String>) -> WebSocketResult<()> {
+    pub async fn send_text(&mut self, text: impl Into<ByteStr>) -> WebSocketResult<()> {
         let text = text.into();
         self.inner
             .send(&JsValue::from_str(&text))
@@ -319,9 +321,9 @@ impl WebSocketSender {
                     self.close(None).await
                 }
             }
-            WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => {
-                Err(WebSocketError::Protocol("Ping/Pong not supported on WASM".into()))
-            }
+            WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => Err(WebSocketError::Protocol(
+                "Ping/Pong not supported on WASM".into(),
+            )),
         }
     }
 
@@ -359,7 +361,9 @@ impl WebSocketReceiver {
     ///
     /// Skips non-text messages and returns None when connection closes.
     #[cfg(feature = "json")]
-    pub async fn recv_json<T: serde::de::DeserializeOwned>(&mut self) -> Option<WebSocketResult<T>> {
+    pub async fn recv_json<T: serde::de::DeserializeOwned>(
+        &mut self,
+    ) -> Option<WebSocketResult<T>> {
         use futures_util::StreamExt;
 
         loop {

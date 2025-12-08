@@ -54,7 +54,7 @@ async fn websocket_roundtrip_over_hyper() {
     let (mut client, _, handle) = spawn_router(
         Route::new(("/ws".ws(|mut socket| async move {
             while let Some(Ok(message)) = socket.next().await {
-                if let Ok(text) = message.into_text() {
+                if let Some(text) = message.into_text() {
                     let _ = socket.send_text(text).await;
                 }
             }
@@ -131,8 +131,7 @@ async fn websocket_uses_custom_max_message_size() {
                     let limit = socket
                         .get_config()
                         .max_message_size
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "none".to_owned());
+                        .map_or_else(|| "none".to_owned(), |value| value.to_string());
                     let _ = socket.send_text(limit).await;
                 })
         }),)),
@@ -210,7 +209,7 @@ async fn websocket_binary_convenience_methods() {
     let (mut client, _, handle) = spawn_router(
         Route::new(("/binary".ws(|mut socket| async move {
             while let Some(Ok(message)) = socket.next().await {
-                if let Ok(data) = message.into_binary() {
+                if let Some(data) = message.into_bytes() {
                     // Use send_binary() convenience method
                     let mut response = vec![0xFF];
                     response.extend_from_slice(&data);
