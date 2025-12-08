@@ -45,7 +45,7 @@
 //! async fn text_echo(ws: WebSocketUpgrade) -> impl Responder {
 //!     ws.on_upgrade(|mut socket| async move {
 //!         while let Some(Ok(message)) = socket.next().await {
-//!             if let Ok(text) = message.into_text() {
+//!             if let Some(text) = message.into_text() {
 //!                 let _ = socket.send_text(text).await;
 //!             }
 //!         }
@@ -62,7 +62,7 @@
 //! async fn binary_echo(ws: WebSocketUpgrade) -> impl Responder {
 //!     ws.on_upgrade(|mut socket| async move {
 //!         while let Some(Ok(message)) = socket.next().await {
-//!             if let Ok(data) = message.into_binary() {
+//!             if let Some(data) = message.into_bytes() {
 //!                 let _ = socket.send_binary(data).await;
 //!             }
 //!         }
@@ -95,11 +95,14 @@
 //! # Configuration
 //!
 //! ```no_run
-//! # use skyzen::websocket::WebSocketUpgrade;
+//! # use skyzen::websocket::{WebSocketConfig, WebSocketUpgrade};
 //! # use skyzen::Responder;
 //! async fn with_config(ws: WebSocketUpgrade) -> impl Responder {
-//!     ws.max_message_size(Some(1024 * 1024)) // 1 MB limit
-//!         .max_frame_size(Some(64 * 1024))    // 64 KB frame limit
+//!     let config = WebSocketConfig::default()
+//!         .with_max_message_size(Some(1024 * 1024)) // 1 MB limit
+//!         .with_max_frame_size(Some(64 * 1024)); // 64 KB frame limit
+//!
+//!     ws.config(config)
 //!         .on_upgrade(|socket| async move {
 //!             // Handle connection
 //!         })

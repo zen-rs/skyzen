@@ -55,9 +55,10 @@
 //! use skyzen::{
 //!     routing::{CreateRouteNode, Route},
 //!     utils::State,
+//!     Result,
 //! };
 //!
-//! let route = Route::new(("/counter".at(|| async { http_kit::Result::Ok("0") }),))
+//! let route = Route::new(("/counter".at(|| async { Result::Ok("0") }),))
 //! .middleware(State(0usize));
 //! ```
 //!
@@ -91,7 +92,7 @@
 //! let routes = Route::new((
 //!     "/chat".ws(|mut socket| async move {
 //!         while let Some(Ok(message)) = socket.next().await {
-//!             if let Ok(text) = message.into_text() {
+//!             if let Some(text) = message.into_text() {
 //!                 let _ = socket.send_text(text).await;
 //!             }
 //!         }

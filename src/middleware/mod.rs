@@ -7,13 +7,17 @@
 //! struct LogMiddleware;
 //!
 //! impl Middleware for LogMiddleware {
-//!     async fn handle(
+//!     type Error = http_kit::Error;
+//!     async fn handle<E: http_kit::Endpoint>(
 //!         &mut self,
 //!         request: &mut Request,
-//!         mut next: impl http_kit::Endpoint,
-//!     ) -> http_kit::Result<Response> {
+//!         mut next: E,
+//!     ) -> http_kit::Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>>
+//!     {
 //!         info!("request received");
-//!         next.respond(request).await
+//!         next.respond(request)
+//!             .await
+//!             .map_err(http_kit::middleware::MiddlewareError::Endpoint)
 //!     }
 //! }
 //! ```

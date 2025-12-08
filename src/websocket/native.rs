@@ -9,8 +9,7 @@
 //! async fn ws_handler(ws: WebSocketUpgrade) -> impl Responder {
 //!     ws.on_upgrade(|mut socket| async move {
 //!         while let Some(Ok(message)) = socket.next().await {
-//!             if message.is_text() {
-//!                 let reply = message.into_text().unwrap();
+//!             if let Some(reply) = message.into_text() {
 //!                 let _ = socket.send_text(reply).await;
 //!             }
 //!         }
