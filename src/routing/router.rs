@@ -546,7 +546,7 @@ mod tests {
         assert!(content_type.contains("text/html"));
     }
 
-    #[cfg(feature = "websocket")]
+    #[cfg(feature = "ws")]
     #[tokio::test]
     async fn websocket_routes_require_upgrades() {
         use crate::header::{self, HeaderValue};

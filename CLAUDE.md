@@ -53,8 +53,6 @@ Default features: `json`, `form`, `multipart`, `sse`, `rt`, `openapi`, `ws`
 - `rt` - Enables Tokio/Hyper runtime (native builds)
 - `openapi` - OpenAPI schema generation (debug builds only)
 - `ws` - Unified WebSocket support; pulls in the right backend per target (native via async-tungstenite, wasm via WebSocketPair)
-- `websocket` - Base WebSocket types and traits (platform-agnostic, implied by `ws`)
-- `websocket-native` / `websocket-wasm` - Backward-compatible aliases that now forward to `ws`
 
 #### WebSocket Platform Support
 

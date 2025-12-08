@@ -54,9 +54,9 @@ pub use responder::Responder;
 
 pub mod middleware;
 
-#[cfg(feature = "websocket")]
+#[cfg(feature = "ws")]
 pub mod websocket;
-#[cfg(feature = "websocket")]
+#[cfg(feature = "ws")]
 pub use websocket::{
     WebSocket, WebSocketMessage, WebSocketReceiver, WebSocketSender, WebSocketUpgrade,
 };

@@ -83,7 +83,7 @@
 //! ```
 //!
 //! ## WebSocket routes
-//! When the `websocket` feature is enabled you can use `.ws` to accept upgrades without manually
+//! When the `ws` feature is enabled you can use `.ws` to accept upgrades without manually
 //! extracting [`WebSocketUpgrade`](crate::websocket::WebSocketUpgrade):
 //! ```no_run
 //! use futures_util::StreamExt;
@@ -104,13 +104,13 @@
 //! Middleware is applied from the outermost route to the innermost endpoint, so errors bubble up
 //! until they are handled.
 
-#[cfg(feature = "websocket")]
+#[cfg(feature = "ws")]
 use std::future::Future;
 use std::{fmt, sync::Arc};
 
 #[cfg(all(debug_assertions, feature = "openapi"))]
 use crate::openapi::RouteOpenApiEntry;
-#[cfg(feature = "websocket")]
+#[cfg(feature = "ws")]
 use crate::websocket::{WebSocket, WebSocketUpgrade};
 use crate::{handler, handler::Handler, openapi, openapi::OpenApi, Middleware};
 use http_kit::endpoint::{AnyEndpoint, WithMiddleware};
@@ -367,7 +367,7 @@ impl RouteNode {
     }
 
     /// Attach a WebSocket handler that performs the upgrade under the current path.
-    #[cfg(feature = "websocket")]
+    #[cfg(feature = "ws")]
     #[must_use]
     pub fn ws<F, Fut>(self, handler: F) -> Self
     where
@@ -571,7 +571,7 @@ pub trait CreateRouteNode: Sized {
         E: Endpoint + Clone + Send + Sync + 'static;
 
     /// Attach a WebSocket handler that automatically performs the upgrade handshake.
-    #[cfg(feature = "websocket")]
+    #[cfg(feature = "ws")]
     fn ws<F, Fut>(self, handler: F) -> RouteNode
     where
         F: Fn(WebSocket) -> Fut + Clone + Send + Sync + 'static,
