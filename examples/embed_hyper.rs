@@ -38,6 +38,8 @@
 //!
 //! Run with: `cargo run --example embed_hyper`
 
+#![cfg(feature = "hyper")]
+
 use async_net::TcpListener;
 use futures_lite::stream;
 use serde::Serialize;
