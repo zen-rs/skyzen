@@ -11,6 +11,8 @@ use crate::{
     },
     Method, Request, Response, StatusCode,
 };
+
+pub use ffi::create_websocket_response;
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 use http_kit::utils::ByteStr;
@@ -569,8 +571,24 @@ impl Extractor for WebSocketUpgrade {
 }
 
 /// Wrapper to make `ffi::WebSocket` Send/Sync safe in single-threaded WASM environment.
+///
+/// This is used to store the client WebSocket in response extensions, which requires
+/// `Send + Sync` bounds. The inner socket can be extracted via [`into_inner`](Self::into_inner).
 #[derive(Clone)]
-struct SendSyncWebSocket(ffi::WebSocket);
+pub struct SendSyncWebSocket(pub(crate) ffi::WebSocket);
+
+impl SendSyncWebSocket {
+    /// Consume the wrapper and return the inner WebSocket.
+    pub fn into_inner(self) -> ffi::WebSocket {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for SendSyncWebSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendSyncWebSocket").finish_non_exhaustive()
+    }
+}
 
 // SAFETY: WASM is single-threaded, so Send/Sync is safe for JsValue wrappers.
 unsafe impl Send for SendSyncWebSocket {}

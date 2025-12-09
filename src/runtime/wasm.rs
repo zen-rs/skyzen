@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use crate::{Body, Endpoint};
+use crate::{Body, Endpoint, StatusCode};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -77,7 +77,18 @@ async fn convert_request(request: Request) -> Result<crate::Request, JsValue> {
     Ok(crate::Request::from(http_request))
 }
 
-async fn convert_response(response: crate::Response) -> Result<Response, JsValue> {
+async fn convert_response(mut response: crate::Response) -> Result<Response, JsValue> {
+    // Handle WebSocket upgrade responses (status 101)
+    #[cfg(feature = "ws")]
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        if let Some(ws) = response
+            .extensions_mut()
+            .remove::<crate::websocket::SendSyncWebSocket>()
+        {
+            return crate::websocket::create_websocket_response(&ws.into_inner());
+        }
+    }
+
     let status = response.status().as_u16();
     let init = web_sys::ResponseInit::new();
     init.set_status(status);

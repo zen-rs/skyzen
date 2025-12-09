@@ -98,3 +98,45 @@ extern "C" {
     #[wasm_bindgen(method, getter)]
     pub fn message(this: &ErrorEvent) -> String;
 }
+
+/// Custom ResponseInit that supports the `webSocket` property for WinterCG runtimes.
+///
+/// This is required because `web_sys::ResponseInit` doesn't include the `webSocket` field
+/// which is a Cloudflare Workers/WinterCG extension to the standard Response API.
+#[wasm_bindgen]
+extern "C" {
+    /// ResponseInit dictionary with WebSocket support.
+    #[wasm_bindgen(extends = js_sys::Object)]
+    #[derive(Clone, Debug)]
+    pub type ResponseInit;
+}
+
+impl ResponseInit {
+    /// Create a new ResponseInit with WebSocket upgrade configuration.
+    pub fn new_websocket(status: u16, websocket: &WebSocket) -> Self {
+        let init = js_sys::Object::new();
+        js_sys::Reflect::set(&init, &"status".into(), &status.into()).unwrap();
+        js_sys::Reflect::set(&init, &"webSocket".into(), websocket).unwrap();
+        init.unchecked_into()
+    }
+}
+
+/// Create a WebSocket upgrade Response for WinterCG runtimes.
+///
+/// This creates a Response with status 101 and the client WebSocket attached,
+/// which is the required format for Cloudflare Workers WebSocket upgrades.
+#[wasm_bindgen]
+extern "C" {
+    /// Create a new Response with options.
+    #[wasm_bindgen(js_namespace = Response, js_name = "new", catch)]
+    fn response_new_with_init(
+        body: JsValue,
+        init: &ResponseInit,
+    ) -> Result<web_sys::Response, JsValue>;
+}
+
+/// Create a WebSocket upgrade response.
+pub fn create_websocket_response(client: &WebSocket) -> Result<web_sys::Response, JsValue> {
+    let init = ResponseInit::new_websocket(101, client);
+    response_new_with_init(JsValue::NULL, &init)
+}
