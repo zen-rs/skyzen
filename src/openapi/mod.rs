@@ -164,6 +164,7 @@ where
 }
 
 /// Register dependent schemas for the responder type if `OpenAPI` metadata is available.
+#[allow(clippy::missing_const_for_fn)]
 pub fn register_responder_schemas_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
 where
     T: Responder,
