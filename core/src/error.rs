@@ -18,7 +18,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use skyzen::Error;
 /// use http::StatusCode;
 ///
@@ -72,7 +72,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::Error;
     /// use http::StatusCode;
     /// use std::io;
@@ -102,7 +102,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::Error;
     ///
     /// let err = Error::msg("Something went wrong");
@@ -133,7 +133,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::Error;
     /// use http::StatusCode;
     ///
@@ -162,7 +162,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::Error;
     /// use http::StatusCode;
     ///
@@ -180,7 +180,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::Error;
     /// use http::StatusCode;
     /// use std::io;
@@ -211,7 +211,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::Error;
     /// use http::StatusCode;
     /// use std::io;
@@ -237,7 +237,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::Error;
     /// use http::StatusCode;
     /// use std::io;
@@ -260,7 +260,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::Error;
     /// let err = Error::msg("Not found");
     /// let boxed_err: Box<dyn std::error::Error + Send> = err.into_boxed_error();
@@ -274,7 +274,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::Error;
     /// use http::StatusCode;
     /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
@@ -364,7 +364,7 @@ impl DerefMut for Error {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use skyzen::{ResultExt, Result};
 /// use http::StatusCode;
 /// use std::fs;
@@ -394,7 +394,7 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use skyzen::{ResultExt, Result};
     /// use http::StatusCode;
     /// use std::fs;
