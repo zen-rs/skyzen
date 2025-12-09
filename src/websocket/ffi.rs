@@ -30,6 +30,7 @@ extern "C" {
 #[wasm_bindgen]
 extern "C" {
     /// WebSocket type from the WinterCG runtime.
+    #[derive(Clone)]
     pub type WebSocket;
 
     /// Accept the WebSocket connection.

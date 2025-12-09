@@ -20,7 +20,9 @@ pub mod cookie;
 
 /// Error types
 pub mod error {
+    #[cfg(feature = "form")]
     pub use super::form::FormContentTypeError;
+    #[cfg(feature = "json")]
     pub use super::json::JsonContentTypeError;
     #[cfg(feature = "multipart")]
     pub use super::multipart::MultipartBoundaryError;

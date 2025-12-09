@@ -77,6 +77,7 @@ impl fmt::Debug for ResponseSchema {
 }
 
 #[cfg(not(feature = "openapi"))]
+/// Function type that collects OpenAPI schemas into a definitions map.
 pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
 
 // Re-exported for macro-generated registrations without requiring downstream crates to depend on
@@ -401,25 +402,26 @@ impl OpenApi {
         }
     }
 
-    /// Build an empty OpenAPI definition when OpenAPI support is disabled.
+    /// Build an empty `OpenAPI` definition when `OpenAPI` support is disabled.
     #[cfg(not(all(debug_assertions, feature = "openapi")))]
     #[must_use]
-    pub(crate) fn from_entries(_: &[()]) -> Self {
+    #[allow(dead_code)]
+    pub(crate) const fn from_entries(_: &[()]) -> Self {
         Self {}
     }
 
     /// Inspect the registered operations. In release builds this returns an empty slice.
     #[must_use]
+    #[cfg(all(debug_assertions, feature = "openapi"))]
     pub fn operations(&self) -> &[OpenApiOperation] {
-        #[cfg(all(debug_assertions, feature = "openapi"))]
-        {
-            &self.operations
-        }
+        &self.operations
+    }
 
-        #[cfg(not(all(debug_assertions, feature = "openapi")))]
-        {
-            &[]
-        }
+    /// Inspect the registered operations. In release builds this returns an empty slice.
+    #[must_use]
+    #[cfg(not(all(debug_assertions, feature = "openapi")))]
+    pub const fn operations(&self) -> &[OpenApiOperation] {
+        &[]
     }
 
     /// Indicates whether `OpenAPI` instrumentation is active.
@@ -489,6 +491,7 @@ impl OpenApi {
     }
 
     #[cfg(not(all(debug_assertions, feature = "openapi")))]
+    #[allow(clippy::unused_self)]
     fn build_components(&self) -> utoipa::openapi::schema::Components {
         ComponentsBuilder::new().build()
     }

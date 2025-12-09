@@ -7,12 +7,11 @@ use crate::{
     header,
     websocket::{
         ffi,
-        types::{
-            WebSocketCloseFrame, WebSocketConfig, WebSocketError, WebSocketMessage, WebSocketResult,
-        },
+        types::{WebSocketCloseFrame, WebSocketError, WebSocketResult},
     },
     Method, Request, Response, StatusCode,
 };
+use http_kit::ws::{WebSocketConfig, WebSocketMessage};
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 use http_kit::utils::ByteStr;
@@ -71,12 +70,12 @@ impl WebSocket {
             let data = event.data();
 
             let message = if let Some(text) = data.as_string() {
-                WebSocketMessage::Text(text)
+                WebSocketMessage::Text(text.into())
             } else if js_sys::Uint8Array::instanceof(&data) {
                 let array = js_sys::Uint8Array::from(data);
                 let mut bytes = vec![0u8; array.length() as usize];
                 array.copy_to(&mut bytes);
-                WebSocketMessage::Binary(bytes)
+                WebSocketMessage::Binary(bytes.into())
             } else {
                 // Unknown data type, skip
                 return;
@@ -87,12 +86,8 @@ impl WebSocket {
 
         // Close handler
         let tx_close = tx.clone();
-        let on_close = Closure::wrap(Box::new(move |event: ffi::CloseEvent| {
-            let close_frame = WebSocketCloseFrame {
-                code: event.code(),
-                reason: event.reason(),
-            };
-            let _ = tx_close.unbounded_send(Ok(WebSocketMessage::Close(Some(close_frame))));
+        let on_close = Closure::wrap(Box::new(move |_event: ffi::CloseEvent| {
+            let _ = tx_close.unbounded_send(Ok(WebSocketMessage::Close));
         }) as Box<dyn FnMut(ffi::CloseEvent)>);
 
         // Error handler
@@ -163,13 +158,7 @@ impl WebSocket {
         match message {
             WebSocketMessage::Text(text) => self.send_text(text).await,
             WebSocketMessage::Binary(data) => self.send_binary(data).await,
-            WebSocketMessage::Close(close_frame) => {
-                if let Some(frame) = close_frame {
-                    self.close(Some(frame)).await
-                } else {
-                    self.close(None).await
-                }
-            }
+            WebSocketMessage::Close => self.close(None).await,
             WebSocketMessage::Ping(_) => self.send_ping(vec![]).await,
             WebSocketMessage::Pong(_) => self.send_pong(vec![]).await,
         }
@@ -187,8 +176,8 @@ impl WebSocket {
         loop {
             match self.next().await {
                 Some(Ok(msg)) => {
-                    if let Some(result) = msg.try_into_json() {
-                        return Some(result);
+                    if let Some(result) = msg.into_json() {
+                        return Some(result.map_err(WebSocketError::from));
                     }
                     // Skip non-text messages, continue loop
                 }
@@ -314,13 +303,7 @@ impl WebSocketSender {
         match message {
             WebSocketMessage::Text(text) => self.send_text(text).await,
             WebSocketMessage::Binary(data) => self.send_binary(data).await,
-            WebSocketMessage::Close(close_frame) => {
-                if let Some(frame) = close_frame {
-                    self.close(Some(frame)).await
-                } else {
-                    self.close(None).await
-                }
-            }
+            WebSocketMessage::Close => self.close(None).await,
             WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => Err(WebSocketError::Protocol(
                 "Ping/Pong not supported on WASM".into(),
             )),
@@ -369,8 +352,8 @@ impl WebSocketReceiver {
         loop {
             match self.next().await {
                 Some(Ok(msg)) => {
-                    if let Some(result) = msg.try_into_json() {
-                        return Some(result);
+                    if let Some(result) = msg.into_json() {
+                        return Some(result.map_err(WebSocketError::from));
                     }
                     // Skip non-text messages, continue loop
                 }
@@ -432,9 +415,16 @@ pub enum WebSocketUpgradeError {
     UnsupportedVersion,
 }
 
+/// Wrapper to make `WebSocketPair` Send/Sync safe in single-threaded WASM environment.
+struct SendSyncWebSocketPair(ffi::WebSocketPair);
+
+// SAFETY: WASM is single-threaded, so Send/Sync is safe for JsValue wrappers.
+unsafe impl Send for SendSyncWebSocketPair {}
+unsafe impl Sync for SendSyncWebSocketPair {}
+
 /// Helper that contains the state required to accept a WebSocket connection.
 pub struct WebSocketUpgrade {
-    pair: Option<ffi::WebSocketPair>,
+    pair: Option<SendSyncWebSocketPair>,
     protocols: Vec<String>,
     config: WebSocketConfig,
 }
@@ -442,7 +432,7 @@ pub struct WebSocketUpgrade {
 impl WebSocketUpgrade {
     fn new() -> Self {
         Self {
-            pair: Some(ffi::WebSocketPair::new()),
+            pair: Some(SendSyncWebSocketPair(ffi::WebSocketPair::new())),
             protocols: Vec::new(),
             config: WebSocketConfig::default(),
         }
@@ -489,7 +479,7 @@ impl WebSocketUpgrade {
         F: FnOnce(WebSocket) -> Fut + 'static,
         Fut: std::future::Future<Output = ()> + 'static,
     {
-        let pair = self.pair.take().expect("pair already consumed");
+        let pair = self.pair.take().expect("pair already consumed").0;
         let server = pair.server();
         let client = pair.client();
 
@@ -504,7 +494,9 @@ impl WebSocketUpgrade {
             callback(socket).await;
         });
 
-        WebSocketUpgradeResponder { client }
+        WebSocketUpgradeResponder {
+            client: SendSyncWebSocket(client),
+        }
     }
 }
 
@@ -576,9 +568,17 @@ impl Extractor for WebSocketUpgrade {
     }
 }
 
+/// Wrapper to make `ffi::WebSocket` Send/Sync safe in single-threaded WASM environment.
+#[derive(Clone)]
+struct SendSyncWebSocket(ffi::WebSocket);
+
+// SAFETY: WASM is single-threaded, so Send/Sync is safe for JsValue wrappers.
+unsafe impl Send for SendSyncWebSocket {}
+unsafe impl Sync for SendSyncWebSocket {}
+
 /// [`Responder`] returned from [`WebSocketUpgrade::on_upgrade`].
 pub struct WebSocketUpgradeResponder {
-    client: ffi::WebSocket,
+    client: SendSyncWebSocket,
 }
 
 impl std::fmt::Debug for WebSocketUpgradeResponder {
@@ -595,6 +595,7 @@ impl Responder for WebSocketUpgradeResponder {
         *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
 
         // Store the client socket in extensions for the runtime to extract
+        // We use SendSyncWebSocket to satisfy Send + Sync bounds
         response.extensions_mut().insert(self.client);
 
         Ok(())

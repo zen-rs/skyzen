@@ -274,6 +274,7 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
 }
 
 #[cfg(not(all(debug_assertions, feature = "openapi")))]
+/// Build a [`Router`] from a [`Route`] tree.
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     flatten("", route.nodes, &mut buf);

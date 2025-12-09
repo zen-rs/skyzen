@@ -1,13 +1,13 @@
 //! Utility for writing middleware.
 //! ```rust
-//! use skyzen::{middleware::Middleware, Request, Response};
+//! use skyzen::{middleware::Middleware, BoxHttpError, Request, Response};
 //! use tracing::info;
 //!
 //! #[derive(Clone, Default)]
 //! struct LogMiddleware;
 //!
 //! impl Middleware for LogMiddleware {
-//!     type Error = http_kit::Error;
+//!     type Error = BoxHttpError;
 //!     async fn handle<E: http_kit::Endpoint>(
 //!         &mut self,
 //!         request: &mut Request,

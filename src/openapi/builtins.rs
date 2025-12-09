@@ -4,14 +4,14 @@ use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType, Type};
 use utoipa::openapi::RefOr;
 
 use crate::{
-    extract::{
-        client_ip::{ClientIp, PeerAddr},
-        Query,
-    },
+    extract::client_ip::{ClientIp, PeerAddr},
     openapi::SchemaRef,
     routing::Params,
     utils::State,
 };
+
+#[cfg(feature = "form")]
+use crate::extract::Query;
 
 #[cfg(feature = "json")]
 use crate::{responder::PrettyJson, utils::Json};
@@ -67,6 +67,7 @@ simple_schema!(
     string_schema("Peer socket address reported by the transport")
 );
 
+#[cfg(feature = "form")]
 impl<T> utoipa::PartialSchema for Query<T>
 where
     T: utoipa::ToSchema,
@@ -76,6 +77,7 @@ where
     }
 }
 
+#[cfg(feature = "form")]
 impl<T> utoipa::ToSchema for Query<T>
 where
     T: utoipa::ToSchema,

@@ -1,7 +1,7 @@
 //! Runtime utilities used by `#[skyzen::main]`.
 
 /// Native (async-executor backed) runtime utilities.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
 pub mod native;
 
 /// WebWorker/WASM runtime utilities.
