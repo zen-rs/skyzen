@@ -93,11 +93,7 @@ where
         let service = skyzen_hyper::IntoService::new(router, spawner);
         let builder = http1::Builder::new();
 
-        if let Err(error) = builder
-            .serve_connection(io, service)
-            .with_upgrades()
-            .await
-        {
+        if let Err(error) = builder.serve_connection(io, service).with_upgrades().await {
             panic!("websocket server failure: {error}");
         }
     });
