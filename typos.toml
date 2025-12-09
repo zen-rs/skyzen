@@ -1,0 +1,3 @@
+[default.extend-words]
+# FlateCompression comes from the flate2 crate (DEFLATE algorithm)
+Flate = "Flate"
