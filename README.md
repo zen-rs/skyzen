@@ -1,86 +1,107 @@
 # Skyzen
 
-Skyzen is an ergonomic HTTP framework that targets both native servers (Tokio + Hyper) and modern edge platforms powered by WebAssembly. The project is layered as a Cargo workspace containing the main `skyzen` crate, shared traits in `skyzen-core`, macros in `skyzen-macros`, and an optional Hyper backend in `skyzen-hyper`.
+A fast, ergonomic HTTP framework for Rust that works everywhere - from native servers to WebAssembly edge platforms.
 
-## Highlights
-
-- **Single entry point macro** – annotate any function that returns a `Router` or an `impl Endpoint + Clone + Sync` with `#[skyzen::main]` and Skyzen wires up both the native `main` function and the WinterCG-compatible `fetch` handler for wasm targets.
-- **Native niceties out of the box** – pretty logging, `Ctrl+C` graceful shutdown, and CLI overrides for host/port (`--listen`, `--addr`, `--host`, `--port` or `-p`) are enabled automatically.
-- **Wasm anywhere** – the wasm runtime works with the standard `fetch(Request, Env, Context)` signature which runs unmodified on Cloudflare Workers, Deno Deploy, Fastly Compute@Edge, and other WinterCG implementations.
-- **Routing + extractors + responders** – compose routers via `Route::new`, extract strongly-typed data from requests, plug in middleware stacks, or respond with anything implementing `Responder`.
-- **First-class OpenAPI support** – automatically generate OpenAPI definitions from your handlers and serve interactive Redoc documentation with a single method call.
-
-## Quick start
-
-Add Skyzen to your project (from this workspace, use a path dependency; otherwise use the published crate):
+## Getting Started
 
 ```toml
 [dependencies]
 skyzen = "0.1"
 ```
 
-Create a router and annotate your entry function:
+The simplest Skyzen app:
 
 ```rust
-use skyzen::{
-    routing::{CreateRouteNode, Params, Route, Router},
-    utils::Json,
-    Result, ToSchema,
-};
-use serde::Serialize;
+use skyzen::routing::{CreateRouteNode, Route, Router};
 
-#[derive(Serialize, ToSchema)]
-struct Message {
-    message: String,
+#[skyzen::main]
+fn main() -> Router {
+    Route::new((
+        "/".at(|| async { "Hello, World!" }),
+        "/health".at(|| async { "OK" }),
+    ))
+    .build()
 }
+```
 
-async fn health() -> &'static str {
-    "OK"
-}
+Run with `cargo run` and visit `http://127.0.0.1:8787`.
 
-/// Greet a user by name
-///
-/// Greet a user by name in a personalized way.
-#[skyzen::openapi]
-async fn greet(params: Params) -> Result<Json<Message>> {
-    let name = params.get("name")?;
-    Ok(Json(Message {
-        message: format!("Hello, {name}!"),
-    }))
-}
+## Routing
+
+Skyzen's routing system is built around `Route::new()` and intuitive path methods:
+
+```rust
+use skyzen::routing::{CreateRouteNode, Route, Router};
 
 fn router() -> Router {
     Route::new((
-        "/".at(|| async { "Hello from Skyzen!" }),
-        "/health".at(health),
-        "/hello/{name}".at(greet),
+        // Simple handlers
+        "/".at(|| async { "Home" }),
+
+        // Path parameters
+        "/users/{id}".at(|params: Params| async move {
+            let id = params.get("id")?;
+            Ok(format!("User: {id}"))
+        }),
+
+        // HTTP methods
+        "/posts".get(list_posts),
+        "/posts".post(create_post),
+        "/posts/{id}".put(update_post),
+        "/posts/{id}".delete(delete_post),
     ))
-    .enable_api_doc() // Enable OpenAPI documentation at /api-docs
     .build()
 }
+```
 
+### WebSocket Support
+
+Add WebSocket endpoints with the `.ws` convenience method:
+
+```rust
+use skyzen::routing::{CreateRouteNode, Route};
+use skyzen::websocket::WebSocketUpgrade;
+
+Route::new((
+    // Simple echo server
+    "/ws".ws(|mut socket| async move {
+        while let Some(Ok(message)) = socket.next().await {
+            if let Some(text) = message.into_text() {
+                let _ = socket.send_text(text).await;
+            }
+        }
+    }),
+
+    // With protocol negotiation
+    "/chat".at(|upgrade: WebSocketUpgrade| async move {
+        upgrade
+            .protocols(["chat", "superchat"])
+            .on_upgrade(|mut socket| async move {
+                // Handle the connection
+            })
+    }),
+))
+```
+
+WebSocket works on both native (via `async-tungstenite`) and WASM (via `WebSocketPair`).
+
+## The `#[skyzen::main]` Macro
+
+For HTTP servers, `#[skyzen::main]` is the recommended way to start your app. It provides:
+
+- **Pretty logging** with `tracing` (respects `RUST_LOG`)
+- **Graceful shutdown** on `Ctrl+C`
+- **CLI overrides** for host/port (`--port`, `--host`, `--listen`)
+- **Tokio + Hyper runtime** configured and ready
+
+```rust
 #[skyzen::main]
 fn main() -> Router {
     router()
 }
 ```
 
-Running `cargo run` starts a development server on `127.0.0.1:8787`. Clients can now hit `GET /`, `GET /health`, or `GET /hello/alex`.
-
-### Using any endpoint type
-
-Instead of returning `Router`, you may return any type implementing `Endpoint + Clone + Sync + Send + 'static`. This enables advanced scenarios such as building middleware stacks, composing routers dynamically, or wiring other protocol servers.
-
-## Native mode
-
-When compiled for non-wasm targets the `#[skyzen::main]` macro generates a concrete `fn main()` that:
-
-1. Installs `color-eyre` + `tracing_subscriber` to provide colorful logs and pretty error reports (respecting `RUST_LOG`).
-2. Reads CLI overrides (`--listen`, `--addr`, `--host`, `--port`, `-p`) and writes the resolved address into the `SKYZEN_ADDRESS` environment variable (default `0.0.0.0:8787`).
-3. Boots a multi-threaded Tokio runtime, spawns a Hyper server, and begins serving the router.
-4. Listens for `Ctrl+C` and performs a graceful shutdown of the accept loop, logging final status.
-
-Need to bring your own tracing/logging? Disable the built-in subscriber via `default_logger = false` and initialize whichever subscriber you prefer:
+Disable the default logger if you want to configure your own:
 
 ```rust
 #[skyzen::main(default_logger = false)]
@@ -90,63 +111,84 @@ async fn main() -> Router {
 }
 ```
 
-Because Skyzen sits on top of the async `http-kit` stack, all handlers are async by default and can leverage the existing ecosystem (SQLx, reqwest, redis, etc.) with zero extra setup.
+### WASM Deployment
 
-## Wasm mode
-
-Compiling the same code for wasm32 (`cargo build --target wasm32-unknown-unknown`) changes the macro output so that no native `main` exists. Instead, the macro exports a `#[wasm_bindgen] pub async fn fetch(request, env, ctx)` that:
-
-1. Lazily constructs your router/endpoint.
-2. Converts the incoming `web_sys::Request` into a Skyzen `Request`.
-3. Executes the endpoint and transforms the `Response` back into a WinterCG-compatible `web_sys::Response`.
-
-That makes it straightforward to deploy to Cloudflare Workers or any environment that expects the `fetch` contract:
+The same code compiles to WebAssembly for edge platforms:
 
 ```sh
-rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown --release
-wasm-bindgen --target web target/wasm32-unknown-unknown/release/your_app.wasm --out-dir worker
 ```
 
-Upload the generated artifacts (plus your Worker bootstrap script) and Cloudflare will call the exported `fetch` just like any other Worker. Because the runtime does not rely on Tokio, no additional shims are necessary.
+On WASM targets, `#[skyzen::main]` exports a WinterCG-compatible `fetch` handler that works on Cloudflare Workers, Deno Deploy, and other edge runtimes.
 
-## How OpenAPI works
+## Custom Server Usage
 
-Skyzen achieves seamless OpenAPI integration through a combination of compile-time reflection and distributed slice collection:
+For advanced scenarios like embedding Skyzen or using a custom runtime, implement the `Server` trait directly:
 
-1.  **Zero-config metadata**: The `#[skyzen::openapi]` attribute macro inspects your handler's signature at compile time, identifying extractor types (like `Json<T>`, `Query<T>`) and the return type.
-2.  **Distributed collection**: Metadata for each handler is stored in a distributed static slice (via `linkme`), allowing the framework to discover all annotated handlers across your codebase without a central registry.
-3.  **Automatic association**: When you mount a handler using `.at(handler)`, Skyzen automatically looks up its associated metadata and attaches it to the route tree.
-4.  **Schema generation**: Types implement `ToSchema` (from `utoipa`), allowing the framework to recursively generate JSON schemas for all request bodies and responses.
+```rust
+use skyzen::{Server, Endpoint};
+use skyzen_hyper::Hyper;
 
-This means you never have to manually sync your documentation with your code—just annotate your handlers, and the router does the rest.
+async fn run_custom() {
+    let router = router().build();
+    let executor = MyExecutor::new();
+    let connections = my_tcp_listener();
 
-## Workspace layout
-
-- `src/` – the primary `skyzen` crate containing routing, middleware, responders, runtime helpers, and extractors.
-- `core/` – the `skyzen-core` crate that hosts foundational traits (`RequestHandler`, middleware traits, server abstractions) reusable by alternative runtimes.
-- `hyper/` – the optional Hyper backend (`skyzen-hyper`) that integrates Hyper’s executor with `skyzen-core`.
-- `skyzen-macros/` – proc-macros such as `#[skyzen::main]`.
-- `examples/` – runnable examples for native + wasm targets; see `examples/README.md` for usage and build commands.
-
-## Local development
-
-From the repository root:
-
-```sh
-cargo fmt
-cargo clippy --workspace --all-targets --all-features
-cargo test --workspace --all-features
+    Hyper.serve(
+        executor,
+        |error| eprintln!("Connection error: {error}"),
+        connections,
+        router,
+    ).await;
+}
 ```
 
-`cargo fmt` ensures consistent style, `cargo clippy` enforces the workspace lint list (including pedantic/nursery groups), and `cargo test` validates every crate and feature combination. Use `RUST_LOG=debug` while debugging integration tests or routers that rely on verbose tracing.
+The `Server` trait gives you full control over:
+- Which executor to use (not tied to Tokio)
+- Connection handling and error recovery
+- Integration with existing infrastructure
 
-## Testing on wasm
+## Extractors & Responders
 
-- Native tests: `cargo test --all-features`
-- Wasm smoke test (headless): `cargo test -p skyzen --target wasm32-unknown-unknown --no-default-features` (requires `wasm-bindgen-test` runner)
-- Cloudflare preview: `wrangler dev --local target/wasm32-unknown-unknown/release/your_app.wasm`
+Pull data from requests with extractors:
+
+```rust
+use skyzen::utils::Json;
+use skyzen::routing::Params;
+
+async fn create_user(
+    params: Params,
+    Json(body): Json<CreateUserRequest>,
+) -> Result<Json<User>> {
+    // params and body are automatically extracted
+}
+```
+
+Return anything that implements `Responder`:
+
+```rust
+async fn handler() -> impl Responder {
+    Json(data)  // or String, &str, Response, Result<T>, etc.
+}
+```
+
+## OpenAPI Documentation
+
+Generate API docs automatically:
+
+```rust
+#[skyzen::openapi]
+async fn get_user(params: Params) -> Result<Json<User>> {
+    // Handler implementation
+}
+
+fn router() -> Router {
+    Route::new(("/users/{id}".at(get_user),))
+        .enable_api_doc()  // Serves docs at /api-docs
+        .build()
+}
+```
 
 ## License
 
-Skyzen is available under the terms of the MIT or Apache-2.0 license, at your option.
+MIT or Apache-2.0, at your option.
