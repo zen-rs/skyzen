@@ -77,7 +77,7 @@ impl fmt::Debug for ResponseSchema {
 }
 
 #[cfg(not(feature = "openapi"))]
-/// Function type that collects OpenAPI schemas into a definitions map.
+/// Function type that collects `OpenAPI` schemas into a definitions map.
 pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
 
 // Re-exported for macro-generated registrations without requiring downstream crates to depend on
@@ -110,6 +110,7 @@ where
 
 /// Return the extractor schema for `T` if it exposes `OpenAPI` metadata.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn extractor_schema_of<T>() -> Option<ExtractorSchema>
 where
     T: Extractor,
@@ -128,6 +129,7 @@ where
 
 /// Return the responder schemas for `T` if it exposes `OpenAPI` metadata.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn responder_schemas_of<T>() -> Option<Vec<ResponseSchema>>
 where
     T: Responder,
@@ -145,6 +147,7 @@ where
 }
 
 /// Register dependent schemas for the extractor type if `OpenAPI` metadata is available.
+#[allow(clippy::missing_const_for_fn)]
 pub fn register_extractor_schemas_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
 where
     T: Extractor,
@@ -227,6 +230,7 @@ where
 }
 
 /// Register a schema and its dependencies when `OpenAPI` is enabled.
+#[allow(clippy::missing_const_for_fn)]
 pub fn register_schema_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
 where
     T: crate::PartialSchema + crate::ToSchema,
@@ -284,6 +288,7 @@ impl RouteHandlerDoc {
 /// Describe the provided handler type, registering metadata during debug builds and doing nothing
 /// in release builds.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn describe_handler<H: 'static>() -> RouteHandlerDoc {
     #[cfg(all(debug_assertions, feature = "openapi"))]
     {

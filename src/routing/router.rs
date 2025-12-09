@@ -273,8 +273,13 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     finalize_router(buf, Some(openapi_entries))
 }
 
-#[cfg(not(all(debug_assertions, feature = "openapi")))]
 /// Build a [`Router`] from a [`Route`] tree.
+///
+/// # Errors
+///
+/// Returns [`RouteBuildError`] if the route tree contains conflicting method registrations or if
+/// the underlying path matcher rejects the route definition.
+#[cfg(not(all(debug_assertions, feature = "openapi")))]
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     flatten("", route.nodes, &mut buf);

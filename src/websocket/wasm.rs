@@ -11,10 +11,10 @@ use crate::{
     },
     Method, Request, Response, StatusCode,
 };
-use http_kit::ws::{WebSocketConfig, WebSocketMessage};
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 use http_kit::utils::ByteStr;
+use http_kit::ws::{WebSocketConfig, WebSocketMessage};
 use serde::Serialize;
 use skyzen_core::{Extractor, Responder};
 use std::{
