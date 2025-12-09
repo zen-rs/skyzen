@@ -35,7 +35,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
     fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
-        // TODO: Rewrite when impl Trait in associated types stablized
+        // TODO: Rewrite when impl Trait in associated types stabilized
         let mut endpoint = self.endpoint.clone();
         let executor = self.executor.clone();
         let fut = async move {

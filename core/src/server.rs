@@ -10,12 +10,12 @@ pub trait Server {
     /// Serve an [`Endpoint`] over a stream of connections.
     ///
     /// The provided `executor` runs background tasks created by the server while the `error_handler`
-    /// is used to report connection-accept errors surfaced by `connectons`.
+    /// is used to report connection-accept errors surfaced by `connections`.
     fn serve<C, E>(
         self,
         executor: impl Executor + 'static,
         error_handler: impl Fn(E) + Send + Sync + 'static,
-        connectons: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
+        connections: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
         endpoint: impl Endpoint + Sync + Clone + 'static,
     ) -> impl Future<Output = ()>
     where

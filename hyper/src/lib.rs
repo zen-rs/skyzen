@@ -162,7 +162,7 @@ impl Server for Hyper {
         self,
         executor: impl executor_core::Executor + 'static,
         error_handler: impl Fn(E) + Send + Sync + 'static,
-        mut connectons: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
+        mut connections: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
         endpoint: impl Endpoint + Sync + Clone + 'static,
     ) where
         C: Unpin + Send + AsyncRead + AsyncWrite + 'static,
@@ -173,7 +173,7 @@ impl Server for Hyper {
         let executor = Arc::new(executor);
         let hyper_executor = ExecutorWrapper::new(executor.clone());
         let shared_executor: Arc<AnyExecutor> = Arc::new(AnyExecutor::new(executor.clone()));
-        while let Some(connection) = connectons.next().await {
+        while let Some(connection) = connections.next().await {
             match connection {
                 Ok(connection) => {
                     let serve_executor = executor.clone();

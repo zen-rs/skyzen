@@ -56,7 +56,7 @@ impl App {
 #[derive(Clone)]
 pub struct Router {
     inner: Arc<matchit::Router<Vec<(Method, App)>>>,
-    programmable_router_enabled: bool,
+    already_router_enabled: bool,
     #[cfg(all(debug_assertions, feature = "openapi"))]
     openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
 }
@@ -64,10 +64,9 @@ pub struct Router {
 impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut debug_struct = f.debug_struct("Router");
-        debug_struct.field("inner", &self.inner).field(
-            "programmable_router_enabled",
-            &self.programmable_router_enabled,
-        );
+        debug_struct
+            .field("inner", &self.inner)
+            .field("already_router_enabled", &self.already_router_enabled);
         #[cfg(all(debug_assertions, feature = "openapi"))]
         {
             debug_struct.field("openapi_entries", &self.openapi_entries.len());
@@ -109,7 +108,7 @@ impl Router {
     }
 
     async fn call(&self, request: &mut Request) -> Result<Response, BoxHttpError> {
-        if self.programmable_router_enabled {
+        if self.already_router_enabled {
             request.extensions_mut().insert(self.clone());
         }
 
@@ -150,7 +149,7 @@ impl Router {
     /// be retrieved inside handlers via `Router::extract(request).await`.
     #[must_use]
     pub const fn enable_programable_router(mut self) -> Self {
-        self.programmable_router_enabled = true;
+        self.already_router_enabled = true;
         self
     }
 
@@ -169,7 +168,7 @@ impl Router {
     }
 }
 
-http_error!(pub RouterNotExist, StatusCode::INTERNAL_SERVER_ERROR, "This programmable router does not exist. Please check whether you have enabled the programmable router.");
+http_error!(pub RouterNotExist, StatusCode::INTERNAL_SERVER_ERROR, "This already router does not exist. Please check whether you have enabled the already router.");
 
 impl Extractor for Router {
     type Error = RouterNotExist;
@@ -306,7 +305,7 @@ fn finalize_router(
     }
     Ok(Router {
         inner: Arc::new(router),
-        programmable_router_enabled: false,
+        already_router_enabled: false,
         openapi_entries: Arc::new(openapi_entries.unwrap_or_default()),
     })
 }
@@ -331,7 +330,7 @@ fn finalize_router(
     }
     Ok(Router {
         inner: Arc::new(router),
-        programmable_router_enabled: false,
+        already_router_enabled: false,
     })
 }
 

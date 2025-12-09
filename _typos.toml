@@ -1,0 +1,2 @@
+[default.extend-words]
+flate = "Flate" # flate is not flag! it is a kind of compression algorithm.

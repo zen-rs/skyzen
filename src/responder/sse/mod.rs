@@ -117,7 +117,7 @@ impl Event {
     /// Panics if the id has already been set.
     #[must_use]
     pub fn id(mut self, id: impl AsRef<str>) -> Self {
-        assert!(!self.has_id, "Id has alreay been set");
+        assert!(!self.has_id, "Id has already been set");
         let id = id.as_ref();
         self.field("id", id);
         self

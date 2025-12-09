@@ -7,7 +7,7 @@ use http_kit::{middleware::MiddlewareError, Endpoint, HttpError, Middleware, Req
 use crate::utils::State;
 
 /// Trait for authenticating users from requests.
-pub trait Authenticater {
+pub trait Authenticator {
     /// The type of user returned upon successful authentication.
     type User;
     /// The error type returned when authentication fails.
@@ -22,11 +22,11 @@ pub trait Authenticater {
 
 /// Middleware for authenticating requests.
 #[derive(Clone, Debug)]
-pub struct AuthMiddleware<A: Authenticater> {
+pub struct AuthMiddleware<A: Authenticator> {
     authenticator: A,
 }
 
-impl<A: Authenticater> AuthMiddleware<A> {
+impl<A: Authenticator> AuthMiddleware<A> {
     /// Create a new authentication middleware.
     pub const fn new(authenticator: A) -> Self {
         Self { authenticator }
@@ -35,7 +35,7 @@ impl<A: Authenticater> AuthMiddleware<A> {
 
 impl<A> Middleware for AuthMiddleware<A>
 where
-    A: Authenticater + Send + Sync + Clone + 'static,
+    A: Authenticator + Send + Sync + Clone + 'static,
     A::User: Send + Sync + Clone + 'static,
     A::Error: HttpError,
 {

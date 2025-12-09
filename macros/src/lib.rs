@@ -171,7 +171,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         quote! { let _ = ::skyzen::openapi::responder_schemas_of::<#response_ty>; };
 
     let mut parameter_schema_fns = Vec::new();
-    let mut parameter_name_lits = Vec::new();
+    let mut parameter_name_lists = Vec::new();
     for (included_idx, meta) in parameter_schemas.iter().enumerate() {
         let ty = &meta.ty;
         parameter_schema_fns.push(quote! { ::skyzen::openapi::extractor_schema_of::<#ty> });
@@ -182,7 +182,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
             },
             |ident| quote! { stringify!(#ident) },
         );
-        parameter_name_lits.push(name);
+        parameter_name_lists.push(name);
     }
 
     let schema_array = if parameter_schema_fns.is_empty() {
@@ -229,10 +229,10 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         quote! { &[#(#schema_collector_idents),*] }
     };
 
-    let parameter_names_array = if parameter_name_lits.is_empty() {
+    let parameter_names_array = if parameter_name_lists.is_empty() {
         quote! { &[] }
     } else {
-        quote! { &[#(#parameter_name_lits),*] }
+        quote! { &[#(#parameter_name_lists),*] }
     };
 
     let type_name_literal = quote! { concat!(module_path!(), "::", stringify!(#fn_ident)) };
