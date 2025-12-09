@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn keeps_valid_relative_segments() {
         let path = sanitize_relative_path("styles/main.css").unwrap();
-        assert_eq!(path.to_string_lossy(), "styles/main.css");
+        assert_eq!(path, std::path::Path::new("styles").join("main.css"));
     }
 
     fn get_request(path: &str) -> http_kit::Request {

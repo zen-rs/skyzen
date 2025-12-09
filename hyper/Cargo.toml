@@ -12,7 +12,6 @@ categories = ["web-programming::http-server"]
 [dependencies]
 skyzen-core.workspace = true
 http-kit.workspace = true
-tower-service = "0.3.3"
 futures-util = "0.3.31"
 http-body-util = "0.1.3"
 executor-core.workspace = true
