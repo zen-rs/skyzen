@@ -3,7 +3,8 @@
 use core::ops::{Deref, DerefMut};
 
 use alloc::boxed::Box;
-use http_kit::{HttpError, StatusCode};
+pub use http_kit::HttpError;
+use http_kit::StatusCode;
 
 /// A specialized `Result` type for HTTP operations.
 /// This is a convenient alias for `core::result::Result<T, Error>`,
@@ -132,7 +133,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// # use skyzen_core::Error;
     /// # use skyzen_core::StatusCode;
     ///
@@ -161,7 +162,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// # use skyzen_core::Error;
     /// # use skyzen_core::StatusCode;
     ///
@@ -179,7 +180,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// # use skyzen_core::Error;
     /// # use skyzen_core::StatusCode;
     /// use std::io;
@@ -210,7 +211,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// # use skyzen_core::Error;
     /// # use skyzen_core::StatusCode;
     /// use std::io;
@@ -236,7 +237,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// # use skyzen_core::Error;
     /// # use skyzen_core::StatusCode;
     /// use std::io;
@@ -259,7 +260,7 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// # use skyzen_core::Error;
     /// let err = Error::msg("Not found");
     /// let boxed_err: Box<dyn std::error::Error + Send> = err.into_boxed_error();
@@ -273,11 +274,11 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// # use skyzen_core::Error;
-    /// # use skyzen_core::StatusCode;
+    /// ```rust
+    ///
+    /// # use skyzen_core::{StatusCode, error::HttpError, Error};
     /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
-    /// let boxed_err: Box<dyn skyzen::HttpError> = err.into_boxed_http_error();
+    /// let boxed_err: Box<dyn HttpError> = err.into_boxed_http_error();
     /// ```
     #[must_use]
     pub fn into_boxed_http_error(self) -> Box<dyn HttpError> {
@@ -363,9 +364,8 @@ impl DerefMut for Error {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use skyzen::{ResultExt, Result};
-/// # use skyzen_core::StatusCode;
+/// ```rust
+/// # use skyzen_core::{StatusCode, error::{ResultExt,Result}};
 /// use std::fs;
 ///
 /// fn read_config() -> Result<String> {
@@ -393,9 +393,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use skyzen::{ResultExt, Result};
-    /// # use skyzen_core::StatusCode;
+    /// ```rust
+    /// # use skyzen_core::{error::ResultExt, Result, StatusCode};
     /// use std::fs;
     ///
     /// // With Result

@@ -24,7 +24,6 @@ use crate::{
     Method, Request, Response, StatusCode,
 };
 use async_tungstenite::{
-    tokio::TokioAdapter,
     tungstenite::{
         protocol::{
             frame::{coding::CloseCode, Utf8Bytes},
@@ -51,9 +50,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::io::{
-    AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, ReadBuf as TokioReadBuf,
-};
+use http_kit::utils::{AsyncRead, AsyncWrite};
 use tracing::error;
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -130,32 +127,32 @@ fn compute_accept_header(key: &header::HeaderValue) -> header::HeaderValue {
     header::HeaderValue::from_str(&encoded).expect("Fail to create Sec-WebSocket-Accept header")
 }
 
-/// Upgraded
+/// Upgraded connection wrapper that implements `futures_io` traits.
 #[derive(Debug)]
 pub struct UpgradedIo(Upgraded);
 
-impl TokioAsyncRead for UpgradedIo {
+impl AsyncRead for UpgradedIo {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut TokioReadBuf<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
         let this = self.get_mut();
-        let mut hyper_buf = ReadBuf::uninit(unsafe { buf.unfilled_mut() });
+        let mut hyper_buf = ReadBuf::uninit(unsafe {
+            // SAFETY: We're converting &mut [u8] to &mut [MaybeUninit<u8>]
+            // This is safe because MaybeUninit<u8> has the same layout as u8
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len())
+        });
         let cursor = hyper_buf.unfilled();
         match Pin::new(&mut this.0).poll_read(cx, cursor) {
-            Poll::Ready(Ok(())) => {
-                let filled = hyper_buf.filled().len();
-                buf.advance(filled);
-                Poll::Ready(Ok(()))
-            }
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(hyper_buf.filled().len())),
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-impl TokioAsyncWrite for UpgradedIo {
+impl AsyncWrite for UpgradedIo {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -168,27 +165,12 @@ impl TokioAsyncWrite for UpgradedIo {
         Pin::new(&mut self.get_mut().0).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.0.is_write_vectored()
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
     }
 }
 
-type NativeIo = TokioAdapter<UpgradedIo>;
+type NativeIo = UpgradedIo;
 
 /// Stream representing a WebSocket connection handled by `async-tungstenite`.
 pub struct WebSocket {
@@ -808,9 +790,7 @@ impl Responder for WebSocketUpgradeResponder {
                 match on_upgrade.await {
                     Ok(upgraded) => {
                         let io = UpgradedIo(upgraded);
-                        let stream =
-                            WebSocket::from_raw_socket(TokioAdapter::new(io), Role::Server, config)
-                                .await;
+                        let stream = WebSocket::from_raw_socket(io, Role::Server, config).await;
                         callback(stream).await;
                     }
                     Err(error) => {

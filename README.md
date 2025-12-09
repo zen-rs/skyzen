@@ -1,5 +1,11 @@
 # Skyzen
 
+[![crates.io](https://img.shields.io/crates/v/skyzen.svg)](https://crates.io/crates/skyzen) 
+[![doc.rs](https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square)](https://docs.rs/skyzen)
+[![License](https://img.shields.io/crates/l/skyzen.svg)](LICENSE)
+[![Coverage](https://img.shields.io/codecov/c/github/zen-rs/skyzen?logo=codecov)](https://app.codecov.io/gh/zen-rs/skyzen)
+
+
 A fast, ergonomic HTTP framework for Rust that works everywhere - from native servers to WebAssembly edge platforms.
 
 ## Getting Started
