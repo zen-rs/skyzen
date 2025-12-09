@@ -148,7 +148,7 @@ impl Router {
     /// When enabled, the router instance is stored in the request extensions for each call and can
     /// be retrieved inside handlers via `Router::extract(request).await`.
     #[must_use]
-    pub const fn enable_programable_router(mut self) -> Self {
+    pub const fn enable_programmable_router(mut self) -> Self {
         self.already_router_enabled = true;
         self
     }
