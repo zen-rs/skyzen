@@ -1,0 +1,24 @@
+[workspace]
+pr_draft = false
+pr_labels = ["release"]
+git_release_name = "{{ crate_name }}-v{{ version }}"
+publish = true
+git_tag_enable = true
+changelog_update = true
+
+[[package]]
+name = "skyzen"
+git_release_name = "v{{ version }}"
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "skyzen-core"
+git_tag_name = "core-v{{ version }}"
+
+[[package]]
+name = "skyzen-hyper"
+git_tag_name = "hyper-v{{ version }}"
+
+[[package]]
+name = "skyzen-macros"
+git_tag_name = "macros-v{{ version }}"

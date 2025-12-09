@@ -6,7 +6,7 @@ resolver = "2"
 skyzen-core = { path = "core" }
 skyzen-macros = { path = "macros" }
 
-http-kit = "0.4"
+http-kit = "0.4.2"
 executor-core = { version = "0.7.1", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper" }
 

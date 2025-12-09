@@ -1,0 +1,136 @@
+name: Test
+
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: Native (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # All features on all platforms
+          - name: Linux
+            os: ubuntu-latest
+            features: "--all-features"
+            targets: "--all-targets"
+
+          - name: macOS
+            os: macos-latest
+            features: "--all-features"
+            targets: "--all-targets"
+
+          - name: Windows
+            os: windows-latest
+            features: "--all-features"
+            targets: "--all-targets"
+
+          # Hyper only (no rt) - Linux
+          - name: Linux (hyper only)
+            os: ubuntu-latest
+            features: "--no-default-features --features json,hyper"
+            targets: ""
+
+          # Minimal (no hyper, no rt) - Linux
+          - name: Linux (minimal)
+            os: ubuntu-latest
+            features: "--no-default-features --features json"
+            targets: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ matrix.os }}
+
+      - name: Run clippy
+        run: cargo clippy --workspace ${{ matrix.targets }} ${{ matrix.features }} -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace ${{ matrix.targets }} ${{ matrix.features }}
+
+  wasm-build:
+    name: WASM Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-wasm
+
+      - name: Check WASM build (minimal)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features json
+
+      - name: Check WASM build (with ws)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features json,ws
+
+  wasm-workerd:
+    name: WASM (workerd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-wasm
+
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.106
+
+      - name: Build worker example
+        run: cargo build --example worker --release --target wasm32-unknown-unknown --no-default-features --features json,form
+
+      - name: Generate bindings
+        run: |
+          wasm-bindgen --target web --out-dir target/workerd target/wasm32-unknown-unknown/release/examples/worker.wasm
+          cp ci/workerd/worker.mjs target/workerd/worker.mjs
+          cp ci/workerd/wrangler.toml target/workerd/wrangler.toml
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Launch wrangler dev
+        run: |
+          cd target/workerd
+          mkdir -p .home .wrangler/logs .wrangler-config
+          HOME=$PWD/.home \
+          WRANGLER_LOG_DIR=$PWD/.wrangler/logs \
+          XDG_CONFIG_HOME=$PWD/.wrangler-config \
+          wrangler dev --local --ip 127.0.0.1 --port 8787 --inspector-port 0 --config wrangler.toml > wrangler.log 2>&1 &
+          echo $! > ../../wrangler.pid
+          sleep 5
+
+      - name: Exercise worker
+        run: |
+          curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/health | grep OK
+          curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/hello/Skyzen | grep "Hello, Skyzen!"
+
+      - name: Shutdown wrangler
+        if: always()
+        run: |
+          if [ -f wrangler.pid ]; then
+            kill $(cat wrangler.pid) || true
+          fi
+          if [ -f target/workerd/wrangler.log ]; then
+            echo "--- wrangler log ---"
+            tail -n 100 target/workerd/wrangler.log
+          fi

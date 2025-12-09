@@ -1,28 +1,32 @@
-name: ci
+name: CI
+
+permissions:
+  contents: read
 
 on:
   push:
-    branches:
-      - "**"
+    branches: ["**"]
   pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  ubuntu:
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          components: clippy, rustfmt
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: cargo test
-        run: cargo test --workspace --all-features
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
