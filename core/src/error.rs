@@ -20,7 +20,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 ///
 /// ```rust
 /// # use skyzen_core::Error;
-/// # use http::StatusCode;
+/// #  use skyzen_core::StatusCode;
 ///
 /// // Create from a string message
 /// let err = Error::msg("Something went wrong");
@@ -72,12 +72,11 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use skyzen::Error;
-    /// use http::StatusCode;
-    /// use std::io;
+    /// ```rust
+    /// # use skyzen_core::Error;
+    /// # use skyzen_core::StatusCode;
     ///
-    /// let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
+    /// let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
     /// let http_err = Error::new(io_err, StatusCode::NOT_FOUND);
     /// ```
     pub fn new<E, S>(error: E, status: S) -> Self
@@ -102,8 +101,8 @@ impl Error {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use skyzen::Error;
+    /// ```rust
+    /// # use skyzen_core::Error;
     ///
     /// let err = Error::msg("Something went wrong");
     /// let err = Error::msg(format!("Failed to process item {}", 42));
@@ -134,8 +133,8 @@ impl Error {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use skyzen::Error;
-    /// use http::StatusCode;
+    /// # use skyzen_core::Error;
+    /// # use skyzen_core::StatusCode;
     ///
     /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
     /// ```
@@ -163,8 +162,8 @@ impl Error {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use skyzen::Error;
-    /// use http::StatusCode;
+    /// # use skyzen_core::Error;
+    /// # use skyzen_core::StatusCode;
     ///
     /// let err = Error::msg("not found").set_status(StatusCode::NOT_FOUND);
     /// assert_eq!(err.status(), StatusCode::NOT_FOUND);
@@ -181,8 +180,8 @@ impl Error {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use skyzen::Error;
-    /// use http::StatusCode;
+    /// # use skyzen_core::Error;
+    /// # use skyzen_core::StatusCode;
     /// use std::io;
     ///
     /// let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
@@ -212,8 +211,8 @@ impl Error {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use skyzen::Error;
-    /// use http::StatusCode;
+    /// # use skyzen_core::Error;
+    /// # use skyzen_core::StatusCode;
     /// use std::io;
     ///
     /// let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
@@ -238,8 +237,8 @@ impl Error {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use skyzen::Error;
-    /// use http::StatusCode;
+    /// # use skyzen_core::Error;
+    /// # use skyzen_core::StatusCode;
     /// use std::io;
     ///
     /// let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
@@ -261,7 +260,7 @@ impl Error {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use skyzen::Error;
+    /// # use skyzen_core::Error;
     /// let err = Error::msg("Not found");
     /// let boxed_err: Box<dyn std::error::Error + Send> = err.into_boxed_error();
     /// ```
@@ -275,8 +274,8 @@ impl Error {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use skyzen::Error;
-    /// use http::StatusCode;
+    /// # use skyzen_core::Error;
+    /// # use skyzen_core::StatusCode;
     /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
     /// let boxed_err: Box<dyn skyzen::HttpError> = err.into_boxed_http_error();
     /// ```
@@ -366,7 +365,7 @@ impl DerefMut for Error {
 ///
 /// ```rust,ignore
 /// use skyzen::{ResultExt, Result};
-/// use http::StatusCode;
+/// # use skyzen_core::StatusCode;
 /// use std::fs;
 ///
 /// fn read_config() -> Result<String> {
@@ -396,7 +395,7 @@ where
     ///
     /// ```rust,ignore
     /// use skyzen::{ResultExt, Result};
-    /// use http::StatusCode;
+    /// # use skyzen_core::StatusCode;
     /// use std::fs;
     ///
     /// // With Result
