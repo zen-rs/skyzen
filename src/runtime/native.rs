@@ -15,12 +15,12 @@ use futures_util::{future::FutureExt, stream::MapOk, StreamExt, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
 use http_kit::{
     error::BoxHttpError,
-    utils::{AsyncRead, AsyncWrite},
+    utils::{AsyncRead, AsyncReadExt, AsyncWrite},
     BodyError,
 };
 use hyper::{
     body::{Frame, Incoming},
-    server::conn::http1,
+    server::conn::{http1, http2},
     service::Service,
 };
 use tracing::{debug, error, info, warn};
@@ -28,6 +28,19 @@ use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
 
 type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
+
+#[derive(Clone, Copy, Debug)]
+struct HyperExecutor;
+
+impl<Fut> hyper::rt::Executor<Fut> for HyperExecutor
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    fn execute(&self, fut: Fut) {
+        DefaultExecutor.spawn(fut).detach();
+    }
+}
 
 struct ConnectionWrapper<C>(C);
 
@@ -78,6 +91,66 @@ impl<C: AsyncWrite + Unpin> hyper::rt::Write for ConnectionWrapper<C> {
     ) -> Poll<Result<(), std::io::Error>> {
         let inner = &mut self.get_mut().0;
         Pin::new(inner).poll_close(cx)
+    }
+}
+
+#[derive(Debug)]
+struct Prefixed<C> {
+    buffer: Vec<u8>,
+    pos: usize,
+    inner: C,
+}
+
+impl<C> Prefixed<C> {
+    fn new(inner: C, buffer: Vec<u8>) -> Self {
+        Self {
+            buffer,
+            pos: 0,
+            inner,
+        }
+    }
+}
+
+impl<C: Unpin> Unpin for Prefixed<C> {}
+
+impl<C: AsyncRead + Unpin> AsyncRead for Prefixed<C> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+        if this.pos < this.buffer.len() {
+            let available = this.buffer.len() - this.pos;
+            let n = available.min(buf.len());
+            buf[..n].copy_from_slice(&this.buffer[this.pos..this.pos + n]);
+            this.pos += n;
+            if this.pos == this.buffer.len() {
+                this.buffer.clear();
+                this.pos = 0;
+            }
+            return Poll::Ready(Ok(n));
+        }
+
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for Prefixed<C> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
     }
 }
 
@@ -249,6 +322,8 @@ async fn run_server<E>(endpoint: E) -> std::io::Result<()>
 where
     E: Endpoint + Clone + Send + Sync + 'static,
 {
+    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
     let listener = TcpListener::bind(server_addr()).await?;
     info!(
         "Skyzen listening on http://{}",
@@ -273,19 +348,42 @@ where
                             debug!("Accepted connection from {peer}");
                         }
                         let endpoint = endpoint.clone();
-                        let builder = http1::Builder::new();
-                        DefaultExecutor
-                            .spawn(async move {
-                                let service = IntoService::new(endpoint);
-                                if let Err(error) = builder
-                                    .serve_connection(ConnectionWrapper(stream), service)
-                                    .with_upgrades()
-                                    .await
-                                {
-                                    error!("Hyper connection error: {error}");
-                                }
-                            })
-                            .detach();
+                        let (stream, is_h2) = match sniff_protocol(stream, HTTP2_PREFACE).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                error!("Failed to read connection preface: {error}");
+                                continue;
+                            }
+                        };
+
+                        if is_h2 {
+                            let service = IntoService::new(endpoint);
+                            DefaultExecutor
+                                .spawn(async move {
+                                    let builder = http2::Builder::new(HyperExecutor);
+                                    if let Err(error) = builder
+                                        .serve_connection(ConnectionWrapper(stream), service)
+                                        .await
+                                    {
+                                        error!("Hyper h2 connection error: {error}");
+                                    }
+                                })
+                                .detach();
+                        } else {
+                            let service = IntoService::new(endpoint);
+                            DefaultExecutor
+                                .spawn(async move {
+                                    let builder = http1::Builder::new();
+                                    if let Err(error) = builder
+                                        .serve_connection(ConnectionWrapper(stream), service)
+                                        .with_upgrades()
+                                        .await
+                                    {
+                                        error!("Hyper h1 connection error: {error}");
+                                    }
+                                })
+                                .detach();
+                        }
                     }
                     Some(Err(error)) => error!("Accept error: {error}"),
                     None => break,
@@ -306,6 +404,17 @@ fn server_addr() -> SocketAddr {
                 .unwrap_or_else(|error| panic!("Invalid SKYZEN_ADDRESS value: {error}"))
         },
     )
+}
+
+async fn sniff_protocol<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Prefixed<C>, bool)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; preface.len()];
+    let n = stream.read(&mut buf).await?;
+    buf.truncate(n);
+    let is_h2 = buf.starts_with(preface);
+    Ok((Prefixed::new(stream, buf), is_h2))
 }
 
 #[derive(Debug)]

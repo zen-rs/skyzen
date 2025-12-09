@@ -3,8 +3,8 @@
 //! The hyper backend of skyzen
 
 use executor_core::Task;
-use hyper::server::conn::http1::Builder;
-use skyzen::utils::{AsyncRead, StreamExt};
+use hyper::server::conn::{http1::Builder as Http1Builder, http2::Builder as Http2Builder};
+use skyzen::utils::{AsyncRead, AsyncReadExt, StreamExt};
 use skyzen::Endpoint;
 use skyzen::{
     utils::{AsyncWrite, Stream},
@@ -26,6 +26,31 @@ pub const fn use_hyper<E: skyzen::Endpoint + Sync + Clone>(endpoint: E) -> servi
 /// Hyper-based [`Server`] implementation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Hyper;
+
+struct ExecutorWrapper<E>(Arc<E>);
+
+impl<E> ExecutorWrapper<E> {
+    fn new(executor: Arc<E>) -> Self {
+        Self(executor)
+    }
+}
+
+impl<E> Clone for ExecutorWrapper<E> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<Fut, E> hyper::rt::Executor<Fut> for ExecutorWrapper<E>
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+    E: executor_core::Executor + 'static,
+{
+    fn execute(&self, fut: Fut) {
+        let _ = self.0.spawn(fut);
+    }
+}
 
 struct ConnectionWrapper<C>(C);
 
@@ -79,6 +104,66 @@ impl<C: AsyncWrite + Unpin> hyper::rt::Write for ConnectionWrapper<C> {
     }
 }
 
+#[derive(Debug)]
+struct Prefixed<C> {
+    buffer: Vec<u8>,
+    pos: usize,
+    inner: C,
+}
+
+impl<C> Prefixed<C> {
+    fn new(inner: C, buffer: Vec<u8>) -> Self {
+        Self {
+            buffer,
+            pos: 0,
+            inner,
+        }
+    }
+}
+
+impl<C: Unpin> Unpin for Prefixed<C> {}
+
+impl<C: AsyncRead + Unpin> AsyncRead for Prefixed<C> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+        if this.pos < this.buffer.len() {
+            let available = this.buffer.len() - this.pos;
+            let n = available.min(buf.len());
+            buf[..n].copy_from_slice(&this.buffer[this.pos..this.pos + n]);
+            this.pos += n;
+            if this.pos == this.buffer.len() {
+                this.buffer.clear();
+                this.pos = 0;
+            }
+            return Poll::Ready(Ok(n));
+        }
+
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for Prefixed<C> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+}
+
 impl Server for Hyper {
     async fn serve<Fut, C, E>(
         self,
@@ -93,20 +178,48 @@ impl Server for Hyper {
         Fut::Output: Send + 'static,
     {
         let executor = Arc::new(executor);
+        let hyper_executor = ExecutorWrapper::new(executor.clone());
+        const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
         while let Some(connection) = connectons.next().await {
             match connection {
                 Ok(connection) => {
                     let serve_executor = executor.clone();
                     let endpoint = endpoint.clone();
+                    let hyper_executor = hyper_executor.clone();
                     let serve_future = async move {
-                        let builder = Builder::new();
-                        let connection_future = builder
-                            .serve_connection(ConnectionWrapper(connection), use_hyper(endpoint))
-                            .with_upgrades();
-                        connection_future
-                            .await
-                            .map_err(|error| error!("Failed to serve Hyper connection: {error}"))
-                            .ok();
+                        let (connection, is_h2) =
+                            match sniff_protocol(connection, HTTP2_PREFACE).await {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    error!("Failed to read connection preface: {error}");
+                                    return;
+                                }
+                            };
+
+                        if is_h2 {
+                            let builder = Http2Builder::new(hyper_executor);
+                            if let Err(error) = builder
+                                .serve_connection(
+                                    ConnectionWrapper(connection),
+                                    use_hyper(endpoint),
+                                )
+                                .await
+                            {
+                                error!("Failed to serve Hyper h2 connection: {error}");
+                            }
+                        } else {
+                            let builder = Http1Builder::new();
+                            if let Err(error) = builder
+                                .serve_connection(
+                                    ConnectionWrapper(connection),
+                                    use_hyper(endpoint),
+                                )
+                                .with_upgrades()
+                                .await
+                            {
+                                error!("Failed to serve Hyper h1 connection: {error}");
+                            }
+                        }
                     };
                     serve_executor.spawn(serve_future).detach();
                 }
@@ -114,4 +227,15 @@ impl Server for Hyper {
             }
         }
     }
+}
+
+async fn sniff_protocol<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Prefixed<C>, bool)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; preface.len()];
+    let n = stream.read(&mut buf).await?;
+    buf.truncate(n);
+    let is_h2 = buf.starts_with(preface);
+    Ok((Prefixed::new(stream, buf), is_h2))
 }
