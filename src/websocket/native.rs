@@ -203,7 +203,8 @@ impl WebSocket {
         config: WebSocketConfig,
     ) -> Self {
         let inner =
-            WebSocketStream::from_raw_socket(stream, role, to_tungstenite_config(&config)).await;
+            WebSocketStream::from_raw_socket(stream, role, Some(to_tungstenite_config(&config)))
+                .await;
         Self { inner, config }
     }
 
