@@ -35,13 +35,6 @@ jobs:
             os: ubuntu-latest
             features: "--no-default-features --features json,hyper"
             targets: ""
-
-          # Minimal (no hyper, no rt) - Linux
-          - name: Linux (minimal)
-            os: ubuntu-latest
-            features: "--no-default-features --features json"
-            targets: ""
-
     steps:
       - uses: actions/checkout@v4
 

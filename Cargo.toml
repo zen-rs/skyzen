@@ -9,8 +9,6 @@ skyzen-macros = { path = "macros" }
 http-kit = "0.4.2"
 executor-core = { version = "0.7.1", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper" }
-
-
 tracing = "0.1.40"
 skyzen = { path = "."}
 async-executor = "1.13"
