@@ -200,9 +200,8 @@ impl WebSocket {
     pub(crate) async fn from_raw_socket(
         stream: NativeIo,
         role: Role,
-        config: Option<WebSocketConfig>,
+        config: WebSocketConfig,
     ) -> Self {
-        let config = config.unwrap_or_default();
         let inner =
             WebSocketStream::from_raw_socket(stream, role, to_tungstenite_config(&config)).await;
         Self { inner, config }
@@ -808,12 +807,9 @@ impl Responder for WebSocketUpgradeResponder {
                 match on_upgrade.await {
                     Ok(upgraded) => {
                         let io = UpgradedIo(upgraded);
-                        let stream = WebSocket::from_raw_socket(
-                            TokioAdapter::new(io),
-                            Role::Server,
-                            Some(config),
-                        )
-                        .await;
+                        let stream =
+                            WebSocket::from_raw_socket(TokioAdapter::new(io), Role::Server, config)
+                                .await;
                         callback(stream).await;
                     }
                     Err(error) => {
