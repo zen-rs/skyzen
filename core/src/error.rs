@@ -18,9 +18,9 @@ pub type Result<T> = core::result::Result<T, Error>;
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use skyzen::Error;
-/// use http::StatusCode;
+/// ```rust
+/// # use skyzen_core::Error;
+/// # use http::StatusCode;
 ///
 /// // Create from a string message
 /// let err = Error::msg("Something went wrong");
