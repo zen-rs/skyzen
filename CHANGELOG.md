@@ -120,5 +120,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - dependency update
 - move skyzen to a subfolder
 - Hyper backend
-- The inital implement of skyzen crate
+- The initial implement of skyzen crate
 - Core implement
