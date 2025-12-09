@@ -3,14 +3,14 @@ members = ["core","hyper", "macros"]
 resolver = "2"
 
 [workspace.dependencies]
-skyzen-core = { path = "core" }
-skyzen-macros = { path = "macros" }
+skyzen-core = { path = "core", version = "0.1.0" }
+skyzen-macros = { path = "macros", version = "0.1.0" }
 
 http-kit = "0.4.2"
 executor-core = { version = "0.7.1", default-features = false, features = ["std", "async-executor"] }
-skyzen-hyper = { path = "hyper" }
+skyzen-hyper = { path = "hyper", version = "0.1.0" }
 tracing = "0.1.40"
-skyzen = { path = "."}
+skyzen = { path = ".", version = "0.1.0"}
 async-executor = "1.13"
 async-io = "2.6"
 async-net = "2.0"
