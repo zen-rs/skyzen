@@ -82,7 +82,7 @@ pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
 
 // Re-exported for macro-generated registrations without requiring downstream crates to depend on
 // `linkme` directly.
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
 pub use linkme;
 
 mod builtins;
@@ -180,7 +180,7 @@ where
     }
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
 #[linkme::distributed_slice]
 #[linkme(crate = ::skyzen::openapi::linkme)]
@@ -208,7 +208,7 @@ pub struct HandlerSpec {
     pub schemas: &'static [SchemaCollector],
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
 fn find_handler_spec(type_name: &str) -> Option<&'static HandlerSpec> {
     HANDLER_SPECS
         .iter()
@@ -258,7 +258,7 @@ where
     }
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
 fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, SchemaRef>) {
     for collector in collectors {
         collector(defs);
@@ -268,19 +268,19 @@ fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, S
 /// Handler metadata attached to each endpoint.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteHandlerDoc {
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
     type_name: &'static str,
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
     spec: Option<&'static HandlerSpec>,
 }
 
 impl RouteHandlerDoc {
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
     const fn new(type_name: &'static str, spec: Option<&'static HandlerSpec>) -> Self {
         Self { type_name, spec }
     }
 
-    #[cfg(not(all(debug_assertions, feature = "openapi")))]
+    #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
     const fn new() -> Self {
         Self {}
     }
@@ -291,14 +291,14 @@ impl RouteHandlerDoc {
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
 pub fn describe_handler<H: 'static>() -> RouteHandlerDoc {
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
     {
         let type_name = std::any::type_name::<H>();
         let spec = find_handler_spec(type_name);
         RouteHandlerDoc::new(type_name, spec)
     }
 
-    #[cfg(not(all(debug_assertions, feature = "openapi")))]
+    #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
     {
         let _ = ::core::marker::PhantomData::<H>;
         RouteHandlerDoc::new()
@@ -350,7 +350,7 @@ impl Debug for OpenApi {
 
 impl OpenApi {
     /// Build an [`OpenApi`] instance from the collected route metadata.
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
     #[must_use]
     pub(crate) fn from_entries(entries: &[RouteOpenApiEntry]) -> Self {
         let mut schema_defs = BTreeMap::new();

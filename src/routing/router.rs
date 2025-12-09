@@ -156,12 +156,12 @@ impl Router {
     /// Build an [`OpenApi`] definition containing every route registered on this router.
     #[must_use]
     pub fn openapi(&self) -> OpenApi {
-        #[cfg(all(debug_assertions, feature = "openapi"))]
+        #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
         {
             OpenApi::from_entries(&self.openapi_entries)
         }
 
-        #[cfg(not(all(debug_assertions, feature = "openapi")))]
+        #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
         {
             OpenApi::default()
         }

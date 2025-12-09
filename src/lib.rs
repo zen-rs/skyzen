@@ -26,7 +26,9 @@ pub mod runtime;
 pub use skyzen_macros::{error, main, openapi, HttpError};
 
 /// Static asset helpers for building file servers.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod static_files;
+#[cfg(not(target_arch = "wasm32"))]
 pub use static_files::StaticDir;
 
 #[doc(inline)]
@@ -40,7 +42,7 @@ pub use skyzen_core::error::*;
 pub use skyzen_core::Server;
 
 /// Hyper-based server backend.
-#[cfg(feature = "hyper")]
+#[cfg(all(feature = "hyper", not(target_arch = "wasm32")))]
 pub use skyzen_hyper as hyper;
 
 #[doc(inline)]

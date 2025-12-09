@@ -36,6 +36,7 @@ use http_kit::{
     Body, BodyError, Request, Response,
 };
 use pin_project_lite::pin_project;
+#[cfg(feature = "json")]
 use serde::Serialize;
 use skyzen_core::Responder;
 use std::{
@@ -80,6 +81,7 @@ impl Event {
     /// # Errors
     ///
     /// Returns an error if serialization of the value to JSON fails.
+    #[cfg(feature = "json")]
     pub fn json(v: impl Serialize) -> serde_json::Result<Self> {
         let mut event = Self::empty();
         event.buffer.extend_from_slice(b"data:");
