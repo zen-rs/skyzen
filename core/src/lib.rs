@@ -19,3 +19,8 @@ pub mod error;
 pub use error::*;
 #[cfg(feature = "openapi")]
 pub mod openapi;
+
+pub use http_kit::{
+    endpoint, header, method, middleware, uri, version, Body, BodyError, Endpoint, Extensions,
+    Method, Middleware, Request, Response, Result, ResultExt, StatusCode, Uri, Version,
+};
