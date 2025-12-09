@@ -2,7 +2,8 @@
 
 //! The hyper backend of skyzen
 
-use hyper_util::server::conn::auto::Builder;
+use executor_core::Task;
+use hyper::server::conn::http1::Builder;
 use skyzen::utils::{AsyncRead, StreamExt};
 use skyzen::Endpoint;
 use skyzen::{
@@ -25,25 +26,6 @@ pub const fn use_hyper<E: skyzen::Endpoint + Sync + Clone>(endpoint: E) -> servi
 /// Hyper-based [`Server`] implementation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Hyper;
-
-#[derive(Debug)]
-struct ExecutorWrapper<E>(Arc<E>);
-
-impl<E> Clone for ExecutorWrapper<E> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<Fut, E: executor_core::Executor> hyper::rt::Executor<Fut> for ExecutorWrapper<E>
-where
-    Fut: Future + Send + 'static,
-    Fut::Output: Send + 'static,
-{
-    fn execute(&self, fut: Fut) {
-        drop((self.0).spawn(fut));
-    }
-}
 
 struct ConnectionWrapper<C>(C);
 
@@ -111,24 +93,22 @@ impl Server for Hyper {
         Fut::Output: Send + 'static,
     {
         let executor = Arc::new(executor);
-        let hyper_executor = ExecutorWrapper(executor.clone());
         while let Some(connection) = connectons.next().await {
             match connection {
                 Ok(connection) => {
                     let serve_executor = executor.clone();
-                    let builder_executor = hyper_executor.clone();
                     let endpoint = endpoint.clone();
                     let serve_future = async move {
-                        let builder = Builder::new(builder_executor);
-                        let connection_future = builder.serve_connection_with_upgrades(
-                            ConnectionWrapper(connection),
-                            use_hyper(endpoint),
-                        );
-                        if let Err(error) = connection_future.await {
-                            error!("Failed to serve Hyper connection: {error}");
-                        }
+                        let builder = Builder::new();
+                        let connection_future = builder
+                            .serve_connection(ConnectionWrapper(connection), use_hyper(endpoint))
+                            .with_upgrades();
+                        connection_future
+                            .await
+                            .map_err(|error| error!("Failed to serve Hyper connection: {error}"))
+                            .ok();
                     };
-                    drop(serve_executor.spawn(serve_future));
+                    serve_executor.spawn(serve_future).detach();
                 }
                 Err(error) => error_handler(error),
             }

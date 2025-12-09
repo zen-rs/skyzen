@@ -34,21 +34,26 @@ use async_tungstenite::{
     WebSocketReceiver as AsyncWebSocketReceiver, WebSocketSender as AsyncWebSocketSender,
     WebSocketStream,
 };
+use executor_core::{DefaultExecutor, Executor as CoreExecutor};
 use futures_core::Stream;
 use futures_util::Sink;
 use http_kit::{
     utils::{ByteStr, Bytes},
     ws::{WebSocketConfig, WebSocketMessage},
 };
-use hyper::upgrade::{OnUpgrade, Upgraded};
-use hyper_util::rt::TokioIo;
+use hyper::{
+    rt::{Read, ReadBuf, Write},
+    upgrade::{OnUpgrade, Upgraded},
+};
 use serde::Serialize;
 use skyzen_core::{Extractor, Responder};
 use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::task;
+use tokio::io::{
+    AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, ReadBuf as TokioReadBuf,
+};
 use tracing::error;
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -125,7 +130,64 @@ fn compute_accept_header(key: &header::HeaderValue) -> header::HeaderValue {
     header::HeaderValue::from_str(&encoded).expect("Fail to create Sec-WebSocket-Accept header")
 }
 
-type NativeIo = TokioAdapter<TokioIo<Upgraded>>;
+#[derive(Debug)]
+pub(crate) struct UpgradedIo(Upgraded);
+
+impl TokioAsyncRead for UpgradedIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut TokioReadBuf<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let this = self.get_mut();
+        let mut hyper_buf = ReadBuf::uninit(unsafe { buf.unfilled_mut() });
+        let cursor = hyper_buf.unfilled();
+        match Pin::new(&mut this.0).poll_read(cx, cursor) {
+            Poll::Ready(Ok(())) => {
+                let filled = hyper_buf.filled().len();
+                buf.advance(filled);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl TokioAsyncWrite for UpgradedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
+    }
+}
+
+type NativeIo = TokioAdapter<UpgradedIo>;
 
 /// Stream representing a WebSocket connection handled by `async-tungstenite`.
 pub struct WebSocket {
@@ -721,23 +783,25 @@ impl Responder for WebSocketUpgradeResponder {
         if let Some(callback) = self.callback.take() {
             let on_upgrade = self.upgrade.on_upgrade.clone();
             let config = self.upgrade.config.clone();
-            task::spawn(async move {
-                match on_upgrade.await {
-                    Ok(upgraded) => {
-                        let io = TokioIo::new(upgraded);
-                        let stream = WebSocket::from_raw_socket(
-                            TokioAdapter::new(io),
-                            Role::Server,
-                            Some(config),
-                        )
-                        .await;
-                        callback(stream).await;
+            DefaultExecutor
+                .spawn(async move {
+                    match on_upgrade.await {
+                        Ok(upgraded) => {
+                            let io = UpgradedIo(upgraded);
+                            let stream = WebSocket::from_raw_socket(
+                                TokioAdapter::new(io),
+                                Role::Server,
+                                Some(config),
+                            )
+                            .await;
+                            callback(stream).await;
+                        }
+                        Err(error) => {
+                            error!("WebSocket upgrade failed: {error}");
+                        }
                     }
-                    Err(error) => {
-                        error!("WebSocket upgrade failed: {error}");
-                    }
-                }
-            });
+                })
+                .detach();
         }
 
         Ok(())

@@ -1,6 +1,9 @@
 //! Runtime utilities used by `#[skyzen::main]`.
 
-#[cfg_attr(not(target_arch = "wasm32"), doc = "Tokio-backed runtime utilities.")]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    doc = "DefaultExecutor-backed runtime utilities."
+)]
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
 

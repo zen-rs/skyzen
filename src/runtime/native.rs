@@ -2,23 +2,84 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
+    ptr,
+    task::{Context, Poll},
 };
 
 use crate::Endpoint;
-use futures_util::{stream::MapOk, TryStreamExt};
+use async_channel::{bounded, Receiver};
+use async_executor::Executor as AsyncExecutor;
+use async_net::TcpListener;
+use executor_core::{try_init_global_executor, DefaultExecutor, Executor as CoreExecutor};
+use futures_util::{future::FutureExt, stream::MapOk, StreamExt, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
-use http_kit::{error::BoxHttpError, BodyError};
+use http_kit::{
+    error::BoxHttpError,
+    utils::{AsyncRead, AsyncWrite},
+    BodyError,
+};
 use hyper::{
     body::{Frame, Incoming},
+    server::conn::http1,
     service::Service,
 };
-use hyper_util::{rt::TokioIo, server::conn::auto::Builder as HyperBuilder};
-use tokio::{net::TcpListener, signal};
 use tracing::{debug, error, info, warn};
 use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
 
 type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
+
+struct ConnectionWrapper<C>(C);
+
+impl<C: Unpin + AsyncRead> hyper::rt::Read for ConnectionWrapper<C> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let inner = &mut self.get_mut().0;
+
+        // SAFETY: `buf.as_mut()` gives a `&mut [MaybeUninit<u8>]` which we cast to `&mut [u8]`
+        // because `AsyncRead` expects initialized memory. We advance the buffer by the number of
+        // bytes written to maintain correctness.
+        let buffer = unsafe { &mut *(ptr::from_mut(buf.as_mut()) as *mut [u8]) };
+
+        match Pin::new(inner).poll_read(cx, buffer) {
+            Poll::Ready(Ok(n)) => {
+                unsafe {
+                    buf.advance(n);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<C: AsyncWrite + Unpin> hyper::rt::Write for ConnectionWrapper<C> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let inner = &mut self.get_mut().0;
+        Pin::new(inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        let inner = &mut self.get_mut().0;
+        Pin::new(inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let inner = &mut self.get_mut().0;
+        Pin::new(inner).poll_close(cx)
+    }
+}
 
 /// Initialize the tracing subscriber + color-eyre once per process.
 /// # Panics
@@ -148,22 +209,32 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
     info!("Configured listener address via CLI: {candidate}");
 }
 
-/// Build the Tokio runtime and serve the provided endpoint over Hyper.
+fn shutdown_signal() -> Receiver<()> {
+    let (tx, rx) = bounded(1);
+    if let Err(error) = ctrlc::set_handler(move || {
+        let _ = tx.try_send(());
+    }) {
+        warn!("Unable to install Ctrl+C handler: {error}");
+    }
+    rx
+}
+
+/// Build the executor and serve the provided endpoint over Hyper.
 ///
 /// # Panics
 ///
-/// Panics if the Tokio runtime fails to initialize.
+/// Panics if the global executor fails to initialize.
 pub fn launch<Fut, E>(factory: impl FnOnce() -> Fut)
 where
     Fut: Future<Output = E> + Send + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
 {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to build Tokio runtime");
+    let executor = std::sync::Arc::new(AsyncExecutor::new());
+    if try_init_global_executor(executor.clone()).is_err() {
+        debug!("Global executor already initialized; reusing existing instance");
+    }
 
-    runtime.block_on(async move {
+    async_io::block_on(executor.run(async move {
         tracing::info!("Skyzen application starting up");
 
         let endpoint = factory().await;
@@ -171,7 +242,7 @@ where
             Ok(()) => info!("Skyzen server shut down gracefully"),
             Err(error) => error!("Skyzen server terminated: {error}"),
         }
-    });
+    }));
 }
 
 async fn run_server<E>(endpoint: E) -> std::io::Result<()>
@@ -184,29 +255,41 @@ where
         listener.local_addr().unwrap()
     );
 
-    let shutdown_signal = signal::ctrl_c();
-    tokio::pin!(shutdown_signal);
+    let mut incoming = listener.incoming();
+    let shutdown_rx = shutdown_signal();
+    let shutdown = shutdown_rx.recv().fuse();
+    futures_util::pin_mut!(shutdown);
 
     loop {
-        tokio::select! {
-            biased;
-            _ = shutdown_signal.as_mut() => {
+        futures_util::select! {
+            _ = shutdown => {
                 info!("Ctrl+C received, stopping accept loop");
                 break;
             }
-            accept_result = listener.accept() => {
-                let (stream, peer) = accept_result?;
-                debug!("Accepted connection from {peer}");
-                let service = IntoService::new(endpoint.clone());
-                tokio::spawn(async move {
-                    let builder = HyperBuilder::new(hyper_util::rt::TokioExecutor::new());
-                    if let Err(error) = builder
-                        .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                        .await
-                    {
-                        error!("Hyper connection error: {error}");
+            connection = incoming.next().fuse() => {
+                match connection {
+                    Some(Ok(stream)) => {
+                        if let Ok(peer) = stream.peer_addr() {
+                            debug!("Accepted connection from {peer}");
+                        }
+                        let endpoint = endpoint.clone();
+                        let builder = http1::Builder::new();
+                        DefaultExecutor
+                            .spawn(async move {
+                                let service = IntoService::new(endpoint);
+                                if let Err(error) = builder
+                                    .serve_connection(ConnectionWrapper(stream), service)
+                                    .with_upgrades()
+                                    .await
+                                {
+                                    error!("Hyper connection error: {error}");
+                                }
+                            })
+                            .detach();
                     }
-                });
+                    Some(Err(error)) => error!("Accept error: {error}"),
+                    None => break,
+                }
             }
         }
     }
