@@ -18,10 +18,8 @@ use std::task::{Context, Poll};
 use tracing::error;
 
 mod service;
-/// Transform the `Endpoint` of skyzen into the `Service` of hyper
-pub const fn use_hyper<E: skyzen::Endpoint + Sync + Clone>(endpoint: E) -> service::IntoService<E> {
-    service::IntoService::new(endpoint)
-}
+pub use service::IntoService;
+pub use skyzen::runtime::native::Spawner;
 
 /// Hyper-based [`Server`] implementation.
 #[derive(Debug, Default, Clone, Copy)]
@@ -30,7 +28,7 @@ pub struct Hyper;
 struct ExecutorWrapper<E>(Arc<E>);
 
 impl<E> ExecutorWrapper<E> {
-    fn new(executor: Arc<E>) -> Self {
+    const fn new(executor: Arc<E>) -> Self {
         Self(executor)
     }
 }
@@ -48,7 +46,7 @@ where
     E: executor_core::Executor + 'static,
 {
     fn execute(&self, fut: Fut) {
-        let _ = self.0.spawn(fut);
+        self.0.spawn(fut).detach();
     }
 }
 
@@ -112,7 +110,7 @@ struct Prefixed<C> {
 }
 
 impl<C> Prefixed<C> {
-    fn new(inner: C, buffer: Vec<u8>) -> Self {
+    const fn new(inner: C, buffer: Vec<u8>) -> Self {
         Self {
             buffer,
             pos: 0,
@@ -177,15 +175,18 @@ impl Server for Hyper {
         E: std::error::Error,
         Fut::Output: Send + 'static,
     {
+        const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
         let executor = Arc::new(executor);
         let hyper_executor = ExecutorWrapper::new(executor.clone());
-        const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let spawner = Spawner::new(executor.clone());
         while let Some(connection) = connectons.next().await {
             match connection {
                 Ok(connection) => {
                     let serve_executor = executor.clone();
                     let endpoint = endpoint.clone();
                     let hyper_executor = hyper_executor.clone();
+                    let spawner = spawner.clone();
                     let serve_future = async move {
                         let (connection, is_h2) =
                             match sniff_protocol(connection, HTTP2_PREFACE).await {
@@ -198,22 +199,18 @@ impl Server for Hyper {
 
                         if is_h2 {
                             let builder = Http2Builder::new(hyper_executor);
+                            let service = IntoService::new(endpoint, spawner);
                             if let Err(error) = builder
-                                .serve_connection(
-                                    ConnectionWrapper(connection),
-                                    use_hyper(endpoint),
-                                )
+                                .serve_connection(ConnectionWrapper(connection), service)
                                 .await
                             {
                                 error!("Failed to serve Hyper h2 connection: {error}");
                             }
                         } else {
                             let builder = Http1Builder::new();
+                            let service = IntoService::new(endpoint, spawner);
                             if let Err(error) = builder
-                                .serve_connection(
-                                    ConnectionWrapper(connection),
-                                    use_hyper(endpoint),
-                                )
+                                .serve_connection(ConnectionWrapper(connection), service)
                                 .with_upgrades()
                                 .await
                             {

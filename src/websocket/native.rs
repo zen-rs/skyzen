@@ -17,6 +17,7 @@
 //! }
 //! ```
 
+use crate::runtime::native::Spawner;
 use crate::{
     header,
     websocket::types::{WebSocketCloseFrame, WebSocketError, WebSocketResult},
@@ -34,7 +35,6 @@ use async_tungstenite::{
     WebSocketReceiver as AsyncWebSocketReceiver, WebSocketSender as AsyncWebSocketSender,
     WebSocketStream,
 };
-use executor_core::{DefaultExecutor, Executor as CoreExecutor};
 use futures_core::Stream;
 use futures_util::Sink;
 use http_kit::{
@@ -130,8 +130,9 @@ fn compute_accept_header(key: &header::HeaderValue) -> header::HeaderValue {
     header::HeaderValue::from_str(&encoded).expect("Fail to create Sec-WebSocket-Accept header")
 }
 
+/// Upgraded
 #[derive(Debug)]
-pub(crate) struct UpgradedIo(Upgraded);
+pub struct UpgradedIo(Upgraded);
 
 impl TokioAsyncRead for UpgradedIo {
     fn poll_read(
@@ -599,13 +600,23 @@ impl Stream for WebSocketReceiver {
 }
 
 /// Helper that contains the state required to accept a WebSocket connection.
-#[derive(Debug)]
 pub struct WebSocketUpgrade {
     key: header::HeaderValue,
     on_upgrade: OnUpgrade,
     requested_protocols: Vec<String>,
     response_protocol: Option<String>,
     config: WebSocketConfig,
+    spawner: Option<Spawner>,
+}
+
+impl std::fmt::Debug for WebSocketUpgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketUpgrade")
+            .field("requested_protocols", &self.requested_protocols)
+            .field("response_protocol", &self.response_protocol)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WebSocketUpgrade {
@@ -714,12 +725,16 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
         .remove::<OnUpgrade>()
         .ok_or(WebSocketUpgradeError::MissingOnUpgrade)?;
 
+    // Extract spawner from request extensions (injected by the runtime)
+    let spawner = request.extensions_mut().remove::<Spawner>();
+
     Ok(WebSocketUpgrade {
         key,
         on_upgrade,
         requested_protocols,
         response_protocol: None,
         config: WebSocketConfig::default(),
+        spawner,
     })
 }
 
@@ -783,25 +798,29 @@ impl Responder for WebSocketUpgradeResponder {
         if let Some(callback) = self.callback.take() {
             let on_upgrade = self.upgrade.on_upgrade.clone();
             let config = self.upgrade.config.clone();
-            DefaultExecutor
-                .spawn(async move {
-                    match on_upgrade.await {
-                        Ok(upgraded) => {
-                            let io = UpgradedIo(upgraded);
-                            let stream = WebSocket::from_raw_socket(
-                                TokioAdapter::new(io),
-                                Role::Server,
-                                Some(config),
-                            )
-                            .await;
-                            callback(stream).await;
-                        }
-                        Err(error) => {
-                            error!("WebSocket upgrade failed: {error}");
-                        }
+            let spawner = self
+                .upgrade
+                .spawner
+                .take()
+                .expect("Spawner must be set by the HTTP backend");
+
+            spawner.spawn(async move {
+                match on_upgrade.await {
+                    Ok(upgraded) => {
+                        let io = UpgradedIo(upgraded);
+                        let stream = WebSocket::from_raw_socket(
+                            TokioAdapter::new(io),
+                            Role::Server,
+                            Some(config),
+                        )
+                        .await;
+                        callback(stream).await;
                     }
-                })
-                .detach();
+                    Err(error) => {
+                        error!("WebSocket upgrade failed: {error}");
+                    }
+                }
+            });
         }
 
         Ok(())
@@ -881,6 +900,13 @@ mod tests {
     use super::*;
     use crate::Body;
 
+    fn create_spawner() -> Spawner {
+        // For tests running on tokio, we create a spawner that uses tokio::spawn
+        Spawner::from_fn(|fut| {
+            tokio::spawn(fut);
+        })
+    }
+
     fn build_request() -> Request {
         let mut request = Request::new(Body::empty());
         *request.method_mut() = Method::GET;
@@ -907,6 +933,8 @@ mod tests {
         );
         let on_upgrade = hyper::upgrade::on(&mut request);
         request.extensions_mut().insert(on_upgrade);
+        // Insert spawner like an HTTP backend would
+        request.extensions_mut().insert(create_spawner());
         let upgrade = WebSocketUpgrade::extract(&mut request).await.unwrap();
         (upgrade, request)
     }

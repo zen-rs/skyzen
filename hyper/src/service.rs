@@ -5,18 +5,22 @@ use hyper::{
     service::Service,
 };
 
-use skyzen::{utils::Bytes, BodyError, Endpoint};
+use skyzen::{runtime::native::Spawner, utils::Bytes, BodyError, Endpoint};
 use std::{future::Future, pin::Pin};
 
 type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
+
+/// Hyper service adapter for skyzen endpoints.
 #[derive(Debug)]
 pub struct IntoService<E> {
     endpoint: E,
+    spawner: Spawner,
 }
 
 impl<E: Endpoint + Clone> IntoService<E> {
-    pub const fn new(endpoint: E) -> Self {
-        Self { endpoint }
+    /// Create a new service with the given endpoint and spawner.
+    pub const fn new(endpoint: E, spawner: Spawner) -> Self {
+        Self { endpoint, spawner }
     }
 }
 
@@ -30,6 +34,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
     fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
         // TODO: Rewrite when impl Trait in associated types stablized
         let mut endpoint = self.endpoint.clone();
+        let spawner = self.spawner.clone();
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
             let mut request: skyzen::Request =
@@ -39,6 +44,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                     )
                 }));
             request.extensions_mut().insert(on_upgrade);
+            request.extensions_mut().insert(spawner);
             let response: Result<skyzen::Response, _> = endpoint.respond(&mut request).await;
 
             let response: Result<hyper::Response<skyzen::Body>, _> = response;

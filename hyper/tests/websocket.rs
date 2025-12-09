@@ -10,11 +10,69 @@ use async_tungstenite::{
 };
 use futures_util::StreamExt;
 use hyper::header::SEC_WEBSOCKET_PROTOCOL;
+use hyper::server::conn::http1;
 use skyzen::{
     routing::{CreateRouteNode, Route},
     websocket::WebSocketUpgrade,
 };
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::duplex;
+
+fn create_spawner() -> skyzen_hyper::Spawner {
+    // For tests running on tokio, we create a spawner that uses tokio::spawn
+    skyzen_hyper::Spawner::from_fn(|fut| {
+        tokio::spawn(fut);
+    })
+}
+
+/// Wrapper to adapt tokio's `DuplexStream` to hyper's Read/Write traits
+struct TokioIo(tokio::io::DuplexStream);
+
+impl hyper::rt::Read for TokioIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        use tokio::io::AsyncRead;
+        let inner = &mut self.get_mut().0;
+        let mut read_buf = tokio::io::ReadBuf::uninit(unsafe { buf.as_mut() });
+        match Pin::new(inner).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                let filled = read_buf.filled().len();
+                unsafe { buf.advance(filled) };
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl hyper::rt::Write for TokioIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        use tokio::io::AsyncWrite;
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        use tokio::io::AsyncWrite;
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        use tokio::io::AsyncWrite;
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
 
 async fn spawn_router<Req>(
     router: Route,
@@ -28,14 +86,16 @@ where
     Req: IntoClientRequest + Unpin,
 {
     let router = router.build();
+    let spawner = create_spawner();
     let (client_stream, server_stream) = duplex(1024);
     let handle = tokio::spawn(async move {
-        let io = hyper_util::rt::TokioIo::new(server_stream);
-        let service = skyzen_hyper::use_hyper(router);
-        let executor = hyper_util::rt::TokioExecutor::new();
+        let io = TokioIo(server_stream);
+        let service = skyzen_hyper::IntoService::new(router, spawner);
+        let builder = http1::Builder::new();
 
-        if let Err(error) = hyper_util::server::conn::auto::Builder::new(executor)
-            .serve_connection_with_upgrades(io, service)
+        if let Err(error) = builder
+            .serve_connection(io, service)
+            .with_upgrades()
             .await
         {
             panic!("websocket server failure: {error}");

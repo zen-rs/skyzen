@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     ptr,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -10,7 +11,7 @@ use crate::Endpoint;
 use async_channel::{bounded, Receiver};
 use async_executor::Executor as AsyncExecutor;
 use async_net::TcpListener;
-use executor_core::{try_init_global_executor, DefaultExecutor, Executor as CoreExecutor};
+use executor_core::{try_init_global_executor, Executor as CoreExecutor, Task};
 use futures_util::{future::FutureExt, stream::MapOk, StreamExt, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
 use http_kit::{
@@ -29,16 +30,62 @@ use tracing_subscriber::EnvFilter;
 
 type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
 
-#[derive(Clone, Copy, Debug)]
-struct HyperExecutor;
+/// Type-erased spawner that can be stored in request extensions.
+/// This allows WebSocket upgrade handlers to spawn tasks using the correct executor.
+#[derive(Clone)]
+pub struct Spawner(Arc<dyn Fn(BoxFuture<()>) + Send + Sync + 'static>);
 
-impl<Fut> hyper::rt::Executor<Fut> for HyperExecutor
+impl Spawner {
+    /// Create a new spawner from an executor.
+    pub fn new<E: CoreExecutor + 'static>(executor: Arc<E>) -> Self {
+        Self(Arc::new(move |fut| {
+            executor.spawn(fut).detach();
+        }))
+    }
+
+    /// Create a new spawner from a spawn function.
+    /// Useful for creating spawners that use different runtimes (e.g., tokio in tests).
+    pub fn from_fn<F>(spawn_fn: F) -> Self
+    where
+        F: Fn(BoxFuture<()>) + Send + Sync + 'static,
+    {
+        Self(Arc::new(spawn_fn))
+    }
+
+    /// Spawn a future using the underlying executor.
+    pub fn spawn(&self, fut: impl Future<Output = ()> + Send + 'static) {
+        (self.0)(Box::pin(fut));
+    }
+}
+
+impl std::fmt::Debug for Spawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Spawner").finish_non_exhaustive()
+    }
+}
+
+struct HyperExecutor<E>(Arc<E>);
+
+impl<E> Clone for HyperExecutor<E> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<E> std::fmt::Debug for HyperExecutor<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HyperExecutor").finish_non_exhaustive()
+    }
+}
+
+impl<Fut, E> hyper::rt::Executor<Fut> for HyperExecutor<E>
 where
     Fut: Future + Send + 'static,
     Fut::Output: Send + 'static,
+    E: CoreExecutor + 'static,
 {
     fn execute(&self, fut: Fut) {
-        DefaultExecutor.spawn(fut).detach();
+        self.0.spawn(fut).detach();
     }
 }
 
@@ -102,7 +149,7 @@ struct Prefixed<C> {
 }
 
 impl<C> Prefixed<C> {
-    fn new(inner: C, buffer: Vec<u8>) -> Self {
+    const fn new(inner: C, buffer: Vec<u8>) -> Self {
         Self {
             buffer,
             pos: 0,
@@ -302,24 +349,26 @@ where
     Fut: Future<Output = E> + Send + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
 {
-    let executor = std::sync::Arc::new(AsyncExecutor::new());
+    let executor = Arc::new(AsyncExecutor::new());
     if try_init_global_executor(executor.clone()).is_err() {
         debug!("Global executor already initialized; reusing existing instance");
     }
 
+    let executor_clone = Arc::clone(&executor);
     async_io::block_on(executor.run(async move {
         tracing::info!("Skyzen application starting up");
 
         let endpoint = factory().await;
-        match run_server(endpoint).await {
+        match run_server(executor_clone, endpoint).await {
             Ok(()) => info!("Skyzen server shut down gracefully"),
             Err(error) => error!("Skyzen server terminated: {error}"),
         }
     }));
 }
 
-async fn run_server<E>(endpoint: E) -> std::io::Result<()>
+async fn run_server<Exec, E>(executor: Arc<Exec>, endpoint: E) -> std::io::Result<()>
 where
+    Exec: CoreExecutor + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
 {
     const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -329,6 +378,9 @@ where
         "Skyzen listening on http://{}",
         listener.local_addr().unwrap()
     );
+
+    let hyper_executor = HyperExecutor(Arc::clone(&executor));
+    let spawner = Spawner::new(Arc::clone(&executor));
 
     let mut incoming = listener.incoming();
     let shutdown_rx = shutdown_signal();
@@ -357,10 +409,11 @@ where
                         };
 
                         if is_h2 {
-                            let service = IntoService::new(endpoint);
-                            DefaultExecutor
+                            let service = IntoService::new(endpoint, spawner.clone());
+                            let hyper_executor = hyper_executor.clone();
+                            executor
                                 .spawn(async move {
-                                    let builder = http2::Builder::new(HyperExecutor);
+                                    let builder = http2::Builder::new(hyper_executor);
                                     if let Err(error) = builder
                                         .serve_connection(ConnectionWrapper(stream), service)
                                         .await
@@ -370,8 +423,8 @@ where
                                 })
                                 .detach();
                         } else {
-                            let service = IntoService::new(endpoint);
-                            DefaultExecutor
+                            let service = IntoService::new(endpoint, spawner.clone());
+                            executor
                                 .spawn(async move {
                                     let builder = http1::Builder::new();
                                     if let Err(error) = builder
@@ -420,11 +473,12 @@ where
 #[derive(Debug)]
 struct IntoService<E> {
     endpoint: E,
+    spawner: Spawner,
 }
 
 impl<E: Endpoint + Clone> IntoService<E> {
-    const fn new(endpoint: E) -> Self {
-        Self { endpoint }
+    const fn new(endpoint: E, spawner: Spawner) -> Self {
+        Self { endpoint, spawner }
     }
 }
 
@@ -439,6 +493,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
 
     fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
         let mut endpoint = self.endpoint.clone();
+        let spawner = self.spawner.clone();
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
             let method = req.method().clone();
@@ -450,6 +505,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                     )
                 }));
             request.extensions_mut().insert(on_upgrade);
+            request.extensions_mut().insert(spawner);
             let response = endpoint.respond(&mut request).await;
             let response: Result<hyper::Response<crate::Body>, Self::Error> =
                 response.map_err(|error| Box::new(error) as BoxHttpError);
