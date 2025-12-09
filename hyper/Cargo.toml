@@ -10,7 +10,8 @@ keywords = ["http", "web", "framework"]
 categories = ["web-programming::http-server"]
 
 [dependencies]
-skyzen.workspace = true
+skyzen-core.workspace = true
+http-kit.workspace = true
 tower-service = "0.3.3"
 futures-util = "0.3.31"
 http-body-util = "0.1.3"
@@ -24,9 +25,11 @@ default-features = false
 [dev-dependencies]
 async-tungstenite = { version = "0.32.0", features = ["tokio-runtime"] }
 tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "signal", "io-util"] }
+executor-core = { version = "0.7.0", features = ["tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-executor = "1.13"
+skyzen.workspace = true
 
 [lints]
 workspace = true

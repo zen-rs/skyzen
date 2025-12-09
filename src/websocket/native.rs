@@ -17,7 +17,6 @@
 //! }
 //! ```
 
-use crate::runtime::native::Spawner;
 use crate::{
     header,
     websocket::types::{WebSocketCloseFrame, WebSocketError, WebSocketResult},
@@ -34,8 +33,10 @@ use async_tungstenite::{
     WebSocketReceiver as AsyncWebSocketReceiver, WebSocketSender as AsyncWebSocketSender,
     WebSocketStream,
 };
+use executor_core::{AnyExecutor, Executor};
 use futures_core::Stream;
 use futures_util::Sink;
+use http_kit::utils::{AsyncRead, AsyncWrite};
 use http_kit::{
     utils::{ByteStr, Bytes},
     ws::{WebSocketConfig, WebSocketMessage},
@@ -46,11 +47,11 @@ use hyper::{
 };
 use serde::Serialize;
 use skyzen_core::{Extractor, Responder};
+use std::sync::Arc;
 use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use http_kit::utils::{AsyncRead, AsyncWrite};
 use tracing::error;
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -588,7 +589,7 @@ pub struct WebSocketUpgrade {
     requested_protocols: Vec<String>,
     response_protocol: Option<String>,
     config: WebSocketConfig,
-    spawner: Option<Spawner>,
+    executor: Option<Arc<AnyExecutor>>,
 }
 
 impl std::fmt::Debug for WebSocketUpgrade {
@@ -707,8 +708,8 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
         .remove::<OnUpgrade>()
         .ok_or(WebSocketUpgradeError::MissingOnUpgrade)?;
 
-    // Extract spawner from request extensions (injected by the runtime)
-    let spawner = request.extensions_mut().remove::<Spawner>();
+    // Extract executor from request extensions (injected by the runtime)
+    let executor = request.extensions_mut().remove::<Arc<AnyExecutor>>();
 
     Ok(WebSocketUpgrade {
         key,
@@ -716,7 +717,7 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
         requested_protocols,
         response_protocol: None,
         config: WebSocketConfig::default(),
-        spawner,
+        executor,
     })
 }
 
@@ -780,24 +781,26 @@ impl Responder for WebSocketUpgradeResponder {
         if let Some(callback) = self.callback.take() {
             let on_upgrade = self.upgrade.on_upgrade.clone();
             let config = self.upgrade.config.clone();
-            let spawner = self
+            let executor = self
                 .upgrade
-                .spawner
+                .executor
                 .take()
-                .expect("Spawner must be set by the HTTP backend");
+                .expect("Executor must be set by the HTTP backend");
 
-            spawner.spawn(async move {
-                match on_upgrade.await {
-                    Ok(upgraded) => {
-                        let io = UpgradedIo(upgraded);
-                        let stream = WebSocket::from_raw_socket(io, Role::Server, config).await;
-                        callback(stream).await;
+            executor
+                .spawn(async move {
+                    match on_upgrade.await {
+                        Ok(upgraded) => {
+                            let io = UpgradedIo(upgraded);
+                            let stream = WebSocket::from_raw_socket(io, Role::Server, config).await;
+                            callback(stream).await;
+                        }
+                        Err(error) => {
+                            error!("WebSocket upgrade failed: {error}");
+                        }
                     }
-                    Err(error) => {
-                        error!("WebSocket upgrade failed: {error}");
-                    }
-                }
-            });
+                })
+                .detach();
         }
 
         Ok(())
@@ -876,12 +879,59 @@ fn to_tungstenite_config(config: &WebSocketConfig) -> TungsteniteConfig {
 mod tests {
     use super::*;
     use crate::Body;
+    use executor_core::Task;
+    use std::future::Future;
 
-    fn create_spawner() -> Spawner {
-        // For tests running on tokio, we create a spawner that uses tokio::spawn
-        Spawner::from_fn(|fut| {
-            tokio::spawn(fut);
-        })
+    type Error = Box<dyn std::any::Any + Send>;
+
+    /// Test executor that uses `tokio::spawn` to dispatch tasks
+    struct TestTokioExecutor;
+
+    impl executor_core::Executor for TestTokioExecutor {
+        type Task<T: Send + 'static> = TestTokioTask<T>;
+
+        fn spawn<Fut>(&self, fut: Fut) -> Self::Task<Fut::Output>
+        where
+            Fut: std::future::Future<Output: Send> + Send + 'static,
+        {
+            TestTokioTask(tokio::spawn(fut))
+        }
+    }
+
+    struct TestTokioTask<T>(tokio::task::JoinHandle<T>);
+
+    impl<T: Send + 'static> Future for TestTokioTask<T> {
+        type Output = T;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            use std::task::Poll;
+            match std::pin::Pin::new(&mut self.0).poll(cx) {
+                Poll::Ready(Ok(v)) => Poll::Ready(v),
+                Poll::Ready(Err(e)) => std::panic::resume_unwind(e.into_panic()),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl<T: Send + 'static> Task<T> for TestTokioTask<T> {
+        fn poll_result(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<T, Error>> {
+            use std::task::Poll;
+            match std::pin::Pin::new(&mut self.0).poll(cx) {
+                Poll::Ready(Ok(v)) => Poll::Ready(Ok(v)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e.into_panic())),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    fn create_executor() -> Arc<AnyExecutor> {
+        // For tests running on tokio, we use the current tokio runtime via tokio::spawn
+        Arc::new(AnyExecutor::new(TestTokioExecutor))
     }
 
     fn build_request() -> Request {
@@ -910,8 +960,8 @@ mod tests {
         );
         let on_upgrade = hyper::upgrade::on(&mut request);
         request.extensions_mut().insert(on_upgrade);
-        // Insert spawner like an HTTP backend would
-        request.extensions_mut().insert(create_spawner());
+        // Insert executor like an HTTP backend would
+        request.extensions_mut().insert(create_executor());
         let upgrade = WebSocketUpgrade::extract(&mut request).await.unwrap();
         (upgrade, request)
     }

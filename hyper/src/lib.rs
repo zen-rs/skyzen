@@ -2,15 +2,11 @@
 
 //! The hyper backend of skyzen
 
-use executor_core::Task;
+use core::future::Future;
+use executor_core::{AnyExecutor, Executor, Task};
+use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, Stream, StreamExt};
 use hyper::server::conn::{http1::Builder as Http1Builder, http2::Builder as Http2Builder};
-use skyzen::utils::{AsyncRead, AsyncReadExt, StreamExt};
-use skyzen::Endpoint;
-use skyzen::{
-    utils::{AsyncWrite, Stream},
-    Server,
-};
-use std::future::Future;
+use skyzen_core::{Endpoint, Server};
 use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
@@ -19,7 +15,6 @@ use tracing::error;
 
 mod service;
 pub use service::IntoService;
-pub use skyzen::runtime::native::Spawner;
 
 /// Hyper-based [`Server`] implementation.
 #[derive(Debug, Default, Clone, Copy)]
@@ -163,30 +158,28 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for Prefixed<C> {
 }
 
 impl Server for Hyper {
-    async fn serve<Fut, C, E>(
+    async fn serve<C, E>(
         self,
         executor: impl executor_core::Executor + 'static,
         error_handler: impl Fn(E) + Send + Sync + 'static,
         mut connectons: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
         endpoint: impl Endpoint + Sync + Clone + 'static,
     ) where
-        Fut: Future + Send + 'static,
         C: Unpin + Send + AsyncRead + AsyncWrite + 'static,
         E: std::error::Error,
-        Fut::Output: Send + 'static,
     {
         const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
         let executor = Arc::new(executor);
         let hyper_executor = ExecutorWrapper::new(executor.clone());
-        let spawner = Spawner::new(executor.clone());
+        let shared_executor: Arc<AnyExecutor> = Arc::new(AnyExecutor::new(executor.clone()));
         while let Some(connection) = connectons.next().await {
             match connection {
                 Ok(connection) => {
                     let serve_executor = executor.clone();
                     let endpoint = endpoint.clone();
                     let hyper_executor = hyper_executor.clone();
-                    let spawner = spawner.clone();
+                    let shared_executor = shared_executor.clone();
                     let serve_future = async move {
                         let (connection, is_h2) =
                             match sniff_protocol(connection, HTTP2_PREFACE).await {
@@ -199,7 +192,7 @@ impl Server for Hyper {
 
                         if is_h2 {
                             let builder = Http2Builder::new(hyper_executor);
-                            let service = IntoService::new(endpoint, spawner);
+                            let service = IntoService::new(endpoint, shared_executor);
                             if let Err(error) = builder
                                 .serve_connection(ConnectionWrapper(connection), service)
                                 .await
@@ -208,7 +201,7 @@ impl Server for Hyper {
                             }
                         } else {
                             let builder = Http1Builder::new();
-                            let service = IntoService::new(endpoint, spawner);
+                            let service = IntoService::new(endpoint, shared_executor);
                             if let Err(error) = builder
                                 .serve_connection(ConnectionWrapper(connection), service)
                                 .with_upgrades()

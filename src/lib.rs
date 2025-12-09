@@ -1,5 +1,3 @@
-#![warn(missing_docs, missing_debug_implementations)]
-
 //! A simple and fast web server framework.
 
 extern crate self as skyzen;
@@ -40,6 +38,10 @@ pub use http_kit::{
 pub use routing::{CreateRouteNode, Route};
 pub use skyzen_core::error::*;
 pub use skyzen_core::Server;
+
+/// Hyper-based server backend.
+#[cfg(feature = "hyper")]
+pub use skyzen_hyper as hyper;
 
 #[doc(inline)]
 pub use openapi::{IgnoreOpenApi, OpenApi, OpenApiOperation};

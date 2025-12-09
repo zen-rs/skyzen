@@ -8,6 +8,7 @@ use async_tungstenite::{
     },
     WebSocketStream,
 };
+use executor_core::AnyExecutor;
 use futures_util::StreamExt;
 use hyper::header::SEC_WEBSOCKET_PROTOCOL;
 use hyper::server::conn::http1;
@@ -16,14 +17,61 @@ use skyzen::{
     websocket::WebSocketUpgrade,
 };
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::duplex;
 
-fn create_spawner() -> skyzen_hyper::Spawner {
-    // For tests running on tokio, we create a spawner that uses tokio::spawn
-    skyzen_hyper::Spawner::from_fn(|fut| {
-        tokio::spawn(fut);
-    })
+type Error = Box<dyn std::any::Any + Send>;
+
+/// Test executor that uses `tokio::spawn` to dispatch tasks within the current runtime
+struct TestTokioExecutor;
+
+impl executor_core::Executor for TestTokioExecutor {
+    type Task<T: Send + 'static> = TestTokioTask<T>;
+
+    fn spawn<Fut>(&self, fut: Fut) -> Self::Task<Fut::Output>
+    where
+        Fut: std::future::Future<Output: Send> + Send + 'static,
+    {
+        TestTokioTask(tokio::spawn(fut))
+    }
+}
+
+struct TestTokioTask<T>(tokio::task::JoinHandle<T>);
+
+impl<T: Send + 'static> std::future::Future for TestTokioTask<T> {
+    type Output = T;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.0).poll(cx) {
+            Poll::Ready(Ok(v)) => Poll::Ready(v),
+            Poll::Ready(Err(e)) => std::panic::resume_unwind(e.into_panic()),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T: Send + 'static> executor_core::Task<T> for TestTokioTask<T> {
+    fn poll_result(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<T, Error>> {
+        use std::future::Future;
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.0).poll(cx) {
+            Poll::Ready(Ok(v)) => Poll::Ready(Ok(v)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into_panic())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn create_executor() -> Arc<AnyExecutor> {
+    // For tests running on tokio, we use the current tokio runtime via tokio::spawn
+    Arc::new(AnyExecutor::new(TestTokioExecutor))
 }
 
 /// Wrapper to adapt tokio's `DuplexStream` to hyper's Read/Write traits
@@ -86,11 +134,11 @@ where
     Req: IntoClientRequest + Unpin,
 {
     let router = router.build();
-    let spawner = create_spawner();
+    let executor = create_executor();
     let (client_stream, server_stream) = duplex(1024);
     let handle = tokio::spawn(async move {
         let io = TokioIo(server_stream);
-        let service = skyzen_hyper::IntoService::new(router, spawner);
+        let service = skyzen_hyper::IntoService::new(router, executor);
         let builder = http1::Builder::new();
 
         if let Err(error) = builder.serve_connection(io, service).with_upgrades().await {

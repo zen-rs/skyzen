@@ -11,7 +11,7 @@ use crate::Endpoint;
 use async_channel::{bounded, Receiver};
 use async_executor::Executor as AsyncExecutor;
 use async_net::TcpListener;
-use executor_core::{try_init_global_executor, Executor as CoreExecutor, Task};
+use executor_core::{try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task};
 use futures_util::{future::FutureExt, stream::MapOk, StreamExt, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
 use http_kit::{
@@ -29,40 +29,6 @@ use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
 
 type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
-
-/// Type-erased spawner that can be stored in request extensions.
-/// This allows WebSocket upgrade handlers to spawn tasks using the correct executor.
-#[derive(Clone)]
-pub struct Spawner(Arc<dyn Fn(BoxFuture<()>) + Send + Sync + 'static>);
-
-impl Spawner {
-    /// Create a new spawner from an executor.
-    pub fn new<E: CoreExecutor + 'static>(executor: Arc<E>) -> Self {
-        Self(Arc::new(move |fut| {
-            executor.spawn(fut).detach();
-        }))
-    }
-
-    /// Create a new spawner from a spawn function.
-    /// Useful for creating spawners that use different runtimes (e.g., tokio in tests).
-    pub fn from_fn<F>(spawn_fn: F) -> Self
-    where
-        F: Fn(BoxFuture<()>) + Send + Sync + 'static,
-    {
-        Self(Arc::new(spawn_fn))
-    }
-
-    /// Spawn a future using the underlying executor.
-    pub fn spawn(&self, fut: impl Future<Output = ()> + Send + 'static) {
-        (self.0)(Box::pin(fut));
-    }
-}
-
-impl std::fmt::Debug for Spawner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Spawner").finish_non_exhaustive()
-    }
-}
 
 struct HyperExecutor<E>(Arc<E>);
 
@@ -380,7 +346,7 @@ where
     );
 
     let hyper_executor = HyperExecutor(Arc::clone(&executor));
-    let spawner = Spawner::new(Arc::clone(&executor));
+    let shared_executor: Arc<AnyExecutor> = Arc::new(AnyExecutor::new(Arc::clone(&executor)));
 
     let mut incoming = listener.incoming();
     let shutdown_rx = shutdown_signal();
@@ -409,7 +375,7 @@ where
                         };
 
                         if is_h2 {
-                            let service = IntoService::new(endpoint, spawner.clone());
+                            let service = IntoService::new(endpoint, shared_executor.clone());
                             let hyper_executor = hyper_executor.clone();
                             executor
                                 .spawn(async move {
@@ -423,7 +389,7 @@ where
                                 })
                                 .detach();
                         } else {
-                            let service = IntoService::new(endpoint, spawner.clone());
+                            let service = IntoService::new(endpoint, shared_executor.clone());
                             executor
                                 .spawn(async move {
                                     let builder = http1::Builder::new();
@@ -473,12 +439,12 @@ where
 #[derive(Debug)]
 struct IntoService<E> {
     endpoint: E,
-    spawner: Spawner,
+    executor: Arc<AnyExecutor>,
 }
 
 impl<E: Endpoint + Clone> IntoService<E> {
-    const fn new(endpoint: E, spawner: Spawner) -> Self {
-        Self { endpoint, spawner }
+    const fn new(endpoint: E, executor: Arc<AnyExecutor>) -> Self {
+        Self { endpoint, executor }
     }
 }
 
@@ -493,7 +459,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
 
     fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
         let mut endpoint = self.endpoint.clone();
-        let spawner = self.spawner.clone();
+        let executor = self.executor.clone();
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
             let method = req.method().clone();
@@ -505,7 +471,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                     )
                 }));
             request.extensions_mut().insert(on_upgrade);
-            request.extensions_mut().insert(spawner);
+            request.extensions_mut().insert(executor);
             let response = endpoint.respond(&mut request).await;
             let response: Result<hyper::Response<crate::Body>, Self::Error> =
                 response.map_err(|error| Box::new(error) as BoxHttpError);

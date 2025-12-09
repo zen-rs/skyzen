@@ -11,7 +11,7 @@ pub trait Server {
     ///
     /// The provided `executor` runs background tasks created by the server while the `error_handler`
     /// is used to report connection-accept errors surfaced by `connectons`.
-    fn serve<Fut, C, E>(
+    fn serve<C, E>(
         self,
         executor: impl Executor + 'static,
         error_handler: impl Fn(E) + Send + Sync + 'static,
@@ -19,8 +19,6 @@ pub trait Server {
         endpoint: impl Endpoint + Sync + Clone + 'static,
     ) -> impl Future<Output = ()>
     where
-        Fut: Future + Send + 'static,
         C: Unpin + Send + AsyncRead + AsyncWrite + 'static,
-        E: Error,
-        Fut::Output: Send + 'static;
+        E: Error;
 }
