@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-hyper"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Hyper server backend for the Skyzen framework"
 license = "MIT OR Apache-2.0"
