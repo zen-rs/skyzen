@@ -34,7 +34,7 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1 }
 name = "skyzen"
 version = "0.1.0"
 edition = "2021"
-description = "A fast, ergonomic HTTP framework for Rust that works everywhere"
+description = "A fast, ergonomic HTTP framework that works everywhere"
 license = "MIT"
 repository = "https://github.com/zen-rs/skyzen"
 readme = "README.md"
