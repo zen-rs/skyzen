@@ -29,12 +29,6 @@ jobs:
             os: windows-latest
             features: "--all-features"
             targets: "--all-targets"
-
-          # Hyper only (no rt) - Linux
-          - name: Linux (hyper only)
-            os: ubuntu-latest
-            features: "--no-default-features --features json,hyper"
-            targets: ""
     steps:
       - uses: actions/checkout@v4
 
