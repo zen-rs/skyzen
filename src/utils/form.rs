@@ -52,32 +52,46 @@ impl<T: Send + Sync + Serialize + DeserializeOwned + 'static> Responder for Form
     }
 }
 
-http_error!(
-    /// Raised when the request content-type is not `application/x-www-form-urlencoded`.
-    pub FormContentTypeError, StatusCode::UNSUPPORTED_MEDIA_TYPE, "Expected content type `application/x-www-form-urlencoded`"
-);
+/// Errors raised when parsing `application/x-www-form-urlencoded` data.
+#[skyzen::error]
+pub enum FormContentTypeError {
+    /// The content type header is missing.
+    #[error(
+        "Expected content type `application/x-www-form-urlencoded`",
+        status = StatusCode::BAD_REQUEST
+    )]
+    Missing,
+    /// The content type does not match `application/x-www-form-urlencoded`.
+    #[error(
+        "Expected content type `application/x-www-form-urlencoded`",
+        status = StatusCode::UNSUPPORTED_MEDIA_TYPE
+    )]
+    Unsupported,
+    /// The payload could not be parsed as form data.
+    #[error("Failed to parse form data", status = StatusCode::BAD_REQUEST)]
+    InvalidPayload,
+}
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
     type Error = FormContentTypeError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        /*if request
-            .get_header(CONTENT_TYPE)
-            .ok_or(FormContentTypeError)?
-            != APPLICATION_WWW_FORM_URLENCODED
-        {
-            return Err(FormContentTypeError).status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        }*/
-        // TODO!
-
         if request.method() == Method::GET {
             let data = request.uri().query().unwrap_or_default();
             extract(data)
         } else {
+            if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
+                if !is_form_content_type(content_type) {
+                    return Err(FormContentTypeError::Unsupported);
+                }
+            } else {
+                return Err(FormContentTypeError::Missing);
+            }
+
             let body = core::mem::replace(request.body_mut(), http_kit::Body::empty());
             let data = body
                 .into_string()
                 .await
-                .map_err(|_| FormContentTypeError::new())?;
+                .map_err(|_| FormContentTypeError::InvalidPayload)?;
             extract(&data)
         }
     }
@@ -100,7 +114,112 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
 fn extract<T: Send + Sync + DeserializeOwned>(data: &str) -> Result<Form<T>, FormContentTypeError> {
     from_str(data)
         .map(Form)
-        .map_err(|_| FormContentTypeError::new())
+        .map_err(|_| FormContentTypeError::InvalidPayload)
 }
 
 impl_deref!(Form);
+
+fn is_form_content_type(value: &HeaderValue) -> bool {
+    value
+        .to_str()
+        .ok()
+        .and_then(|raw| raw.split(';').next())
+        .map(|mime| {
+            mime.trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Form, FormContentTypeError};
+    use crate::{Body, Method};
+    use http_kit::{header::CONTENT_TYPE, Request};
+    use serde::Deserialize;
+    use skyzen_core::Extractor;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Payload {
+        name: String,
+        age: u8,
+    }
+
+    fn request_with_body(body: &'static [u8]) -> Request {
+        let mut request = Request::new(Body::from_bytes(body.to_vec()));
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = "http://localhost/".parse().expect("invalid uri");
+        request
+    }
+
+    #[tokio::test]
+    async fn accepts_charset_param() {
+        let mut request = request_with_body(b"name=Lexo&age=17");
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static(
+                "application/x-www-form-urlencoded; charset=utf-8",
+            ),
+        );
+
+        let Form(payload) = Form::<Payload>::extract(&mut request)
+            .await
+            .expect("form should parse");
+        assert_eq!(
+            payload,
+            Payload {
+                name: "Lexo".to_string(),
+                age: 17
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_content_type_on_body() {
+        let mut request = request_with_body(b"name=Lexo&age=17");
+        let error = Form::<Payload>::extract(&mut request).await.unwrap_err();
+        assert!(matches!(error, FormContentTypeError::Missing));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_payload() {
+        let mut request = request_with_body(b"name=Lexo&age=oops");
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let error = Form::<Payload>::extract(&mut request).await.unwrap_err();
+        assert!(matches!(error, FormContentTypeError::InvalidPayload));
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_content_type() {
+        let mut request = request_with_body(b"name=Lexo&age=17");
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("text/plain"),
+        );
+        let error = Form::<Payload>::extract(&mut request).await.unwrap_err();
+        assert!(matches!(error, FormContentTypeError::Unsupported));
+    }
+
+    #[tokio::test]
+    async fn parses_get_query_without_content_type() {
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = Method::GET;
+        *request.uri_mut() = "http://localhost/?name=Lexo&age=17"
+            .parse()
+            .expect("invalid uri");
+
+        let Form(payload) = Form::<Payload>::extract(&mut request)
+            .await
+            .expect("query form should parse");
+        assert_eq!(
+            payload,
+            Payload {
+                name: "Lexo".to_string(),
+                age: 17
+            }
+        );
+    }
+}

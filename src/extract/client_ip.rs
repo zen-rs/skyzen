@@ -219,7 +219,10 @@ fn get_ipv6_str(s: &[u8]) -> Option<&[u8]> {
 mod tests {
     use std::{net::IpAddr, str::FromStr};
 
-    use super::{parse_forwarded, parse_x_forwarded_for};
+    use super::{parse_forwarded, parse_x_forwarded_for, ClientIp, ClientIpError};
+    use crate::{Body, Method, Request};
+    use http_kit::header::HeaderValue;
+    use skyzen_core::Extractor;
 
     #[test]
     fn test_forwarded_1() {
@@ -257,5 +260,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(addr, IpAddr::from_str("2001:db8:cafe::17").unwrap());
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_forwarded_header() {
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = Method::GET;
+        request.headers_mut().insert(
+            crate::header::FORWARDED,
+            HeaderValue::from_static("for"),
+        );
+
+        let error = ClientIp::extract(&mut request).await.unwrap_err();
+        assert!(matches!(error, ClientIpError::InvalidForwardedHeader));
+    }
+
+    #[tokio::test]
+    async fn rejects_unparseable_forwarded_address() {
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = Method::GET;
+        request.headers_mut().insert(
+            crate::header::FORWARDED,
+            HeaderValue::from_static("for=_hidden"),
+        );
+
+        let error = ClientIp::extract(&mut request).await.unwrap_err();
+        assert!(matches!(error, ClientIpError::AddrParseError(_)));
     }
 }

@@ -71,7 +71,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
     type Error = JsonContentTypeError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
-            if content_type != "application/json" {
+            if !is_json_content_type(content_type) {
                 return Err(JsonContentTypeError::Unsupported);
             }
         } else {
@@ -101,8 +101,68 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
     }
 }
 
+fn is_json_content_type(value: &HeaderValue) -> bool {
+    value
+        .to_str()
+        .ok()
+        .and_then(|raw| raw.split(';').next())
+        .map(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod test {
+    use super::Json;
+    use crate::{Body, Method, StatusCode};
+    use http_kit::{header::CONTENT_TYPE, HttpError, Request};
+    use serde::Deserialize;
+    use skyzen_core::Extractor;
+
+    #[derive(Debug, Deserialize)]
+    struct Payload {
+        ok: bool,
+    }
+
+    fn request_with_body(body: &'static [u8]) -> Request {
+        let mut request = Request::new(Body::from_bytes(body.to_vec()));
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = "http://localhost/".parse().expect("invalid uri");
+        request
+    }
+
+    #[tokio::test]
+    async fn accepts_charset_param() {
+        let mut request = request_with_body(br#"{"ok":true}"#);
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+
+        let Json(payload) = Json::<Payload>::extract(&mut request)
+            .await
+            .expect("json should parse");
+        assert!(payload.ok);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_json_content_type() {
+        let mut request = request_with_body(br#"{"ok":true}"#);
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("text/plain"),
+        );
+
+        let error = Json::<Payload>::extract(&mut request).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_content_type() {
+        let mut request = request_with_body(br#"{"ok":true}"#);
+        let error = Json::<Payload>::extract(&mut request).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
     /* use super::Json;
     use http_kit::Request;
     use serde::{Deserialize, Serialize};

@@ -223,9 +223,126 @@ async fn sniff_protocol<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Pr
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; preface.len()];
-    let n = stream.read(&mut buf).await?;
-    buf.truncate(n);
-    let is_h2 = buf.starts_with(preface);
+    let mut buf = Vec::with_capacity(preface.len());
+    while buf.len() < preface.len() {
+        let remaining = preface.len() - buf.len();
+        let mut chunk = vec![0u8; remaining];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        chunk.truncate(n);
+        buf.extend_from_slice(&chunk);
+        if !preface.starts_with(&buf) {
+            return Ok((Prefixed::new(stream, buf), false));
+        }
+    }
+    let is_h2 = buf.len() == preface.len() && buf.as_slice() == preface;
     Ok((Prefixed::new(stream, buf), is_h2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sniff_protocol;
+    use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite};
+    use std::collections::VecDeque;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    struct ChunkedStream {
+        chunks: VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl ChunkedStream {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: VecDeque::from(chunks),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for ChunkedStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            match this.chunks.pop_front() {
+                Some(mut chunk) => {
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        chunk.drain(..n);
+                        this.chunks.push_front(chunk);
+                    }
+                    Poll::Ready(Ok(n))
+                }
+                None => Poll::Ready(Ok(0)),
+            }
+        }
+    }
+
+    impl AsyncWrite for ChunkedStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn read_all<R: AsyncRead + Unpin>(mut reader: R) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 16];
+        loop {
+            let n = reader.read(&mut buf).await.expect("read failed");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn detects_split_h2_preface() {
+        let chunks = vec![PREFACE[..4].to_vec(), PREFACE[4..9].to_vec(), PREFACE[9..].to_vec()];
+        let stream = ChunkedStream::new(chunks);
+
+        let (_prefixed, is_h2) = sniff_protocol(stream, PREFACE).await.unwrap();
+        assert!(is_h2);
+    }
+
+    #[tokio::test]
+    async fn preserves_bytes_on_mismatch() {
+        let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let chunks = vec![payload[..2].to_vec(), payload[2..8].to_vec(), payload[8..].to_vec()];
+        let stream = ChunkedStream::new(chunks);
+
+        let (prefixed, is_h2) = sniff_protocol(stream, PREFACE).await.unwrap();
+        assert!(!is_h2);
+
+        let restored = read_all(prefixed).await;
+        assert_eq!(restored, payload);
+    }
 }
