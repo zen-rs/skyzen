@@ -50,3 +50,17 @@ macro_rules! impl_deref {
         }
     };
 }
+
+/// Implement empty OpenAPI schema for a type without requiring `utoipa` in downstream crates.
+#[macro_export]
+macro_rules! ignore_openapi {
+    ($ty:ty) => {
+        impl $crate::PartialSchema for $ty {
+            fn schema() -> $crate::openapi::SchemaRef {
+                <$crate::openapi::IgnoreOpenApi<$ty> as $crate::PartialSchema>::schema()
+            }
+        }
+
+        impl $crate::ToSchema for $ty {}
+    };
+}
