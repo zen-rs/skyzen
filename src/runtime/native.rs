@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::Endpoint;
+use crate::{extract::PeerAddr, Endpoint};
 use async_channel::{bounded, Receiver};
 use async_executor::Executor as AsyncExecutor;
 use async_net::TcpListener;
@@ -362,9 +362,13 @@ where
             connection = incoming.next().fuse() => {
                 match connection {
                     Some(Ok(stream)) => {
-                        if let Ok(peer) = stream.peer_addr() {
-                            debug!("Accepted connection from {peer}");
-                        }
+                        let peer_addr = match stream.peer_addr() {
+                            Ok(peer) => {
+                                debug!("Accepted connection from {peer}");
+                                Some(peer)
+                            }
+                            Err(_) => None,
+                        };
                         let endpoint = endpoint.clone();
                         let (stream, is_h2) = match sniff_protocol(stream, HTTP2_PREFACE).await {
                             Ok(result) => result,
@@ -375,7 +379,8 @@ where
                         };
 
                         if is_h2 {
-                            let service = IntoService::new(endpoint, shared_executor.clone());
+                            let service =
+                                IntoService::new(endpoint, shared_executor.clone(), peer_addr);
                             let hyper_executor = hyper_executor.clone();
                             executor
                                 .spawn(async move {
@@ -389,7 +394,8 @@ where
                                 })
                                 .detach();
                         } else {
-                            let service = IntoService::new(endpoint, shared_executor.clone());
+                            let service =
+                                IntoService::new(endpoint, shared_executor.clone(), peer_addr);
                             executor
                                 .spawn(async move {
                                     let builder = http1::Builder::new();
@@ -440,11 +446,16 @@ where
 struct IntoService<E> {
     endpoint: E,
     executor: Arc<AnyExecutor>,
+    peer_addr: Option<SocketAddr>,
 }
 
 impl<E: Endpoint + Clone> IntoService<E> {
-    const fn new(endpoint: E, executor: Arc<AnyExecutor>) -> Self {
-        Self { endpoint, executor }
+    const fn new(endpoint: E, executor: Arc<AnyExecutor>, peer_addr: Option<SocketAddr>) -> Self {
+        Self {
+            endpoint,
+            executor,
+            peer_addr,
+        }
     }
 }
 
@@ -472,6 +483,9 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 }));
             request.extensions_mut().insert(on_upgrade);
             request.extensions_mut().insert(executor);
+            if let Some(peer_addr) = self.peer_addr {
+                request.extensions_mut().insert(PeerAddr(peer_addr));
+            }
             let response = endpoint.respond(&mut request).await;
             let response: Result<hyper::Response<crate::Body>, Self::Error> =
                 response.map_err(|error| Box::new(error) as BoxHttpError);
