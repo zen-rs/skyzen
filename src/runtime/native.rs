@@ -471,6 +471,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
     fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
         let mut endpoint = self.endpoint.clone();
         let executor = self.executor.clone();
+        let peer_addr = self.peer_addr;
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
             let method = req.method().clone();
@@ -483,7 +484,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 }));
             request.extensions_mut().insert(on_upgrade);
             request.extensions_mut().insert(executor);
-            if let Some(peer_addr) = self.peer_addr {
+            if let Some(peer_addr) = peer_addr {
                 request.extensions_mut().insert(PeerAddr(peer_addr));
             }
             let response = endpoint.respond(&mut request).await;
