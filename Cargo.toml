@@ -81,6 +81,7 @@ http-body-util = "0.1.3"
 # Optional native dependencies
 tokio = { version = "1.45", features = ["rt", "rt-multi-thread", "signal"], optional = true }
 skyzen-hyper = { workspace = true, optional = true }
+jsonwebtoken = { version = "9", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "signal", "net"] }
@@ -118,9 +119,12 @@ optional = true
 version = "0.2.16"
 optional = true
 
+
 [features]
 default = ["json", "form", "multipart", "sse", "rt", "openapi", "ws"]
 openapi = ["skyzen-core/openapi"]
+auth = []
+jwt = ["auth", "dep:jsonwebtoken"]
 json = ["dep:serde_json", "http-kit/json"]
 form = ["dep:serde_urlencoded", "http-kit/form"]
 multipart = ["dep:multer", "dep:pin-project-lite"]

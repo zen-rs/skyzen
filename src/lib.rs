@@ -53,6 +53,10 @@ pub use utoipa::{PartialSchema, ToSchema};
 /// Extract strong-typed object from your request.
 pub mod extract;
 
+/// Authentication and authorization utilities.
+#[cfg(feature = "auth")]
+pub mod auth;
+
 pub mod responder;
 pub use responder::Responder;
 

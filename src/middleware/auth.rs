@@ -1,10 +1,29 @@
 //! Authentication middleware.
+//!
+//! This module provides the [`AuthMiddleware`] for authenticating requests,
+//! along with re-exports of authentication-related types.
+//!
+//! # Re-exports
+//!
+//! - [`BearerToken`]: Bearer token extractor (requires `auth` feature)
+//! - [`JwtConfig`], [`JwtAuthenticator`], [`JwtError`]: JWT support (requires `jwt` feature, native only)
+//! - [`Admin`], [`HasRoles`], [`AuthorizationError`]: Role-based guards (requires `auth` feature)
 
 use std::future::Future;
 
 use http_kit::{middleware::MiddlewareError, Endpoint, HttpError, Middleware, Request, Response};
 
 use crate::utils::State;
+
+// Re-export auth types for convenience
+#[cfg(feature = "auth")]
+pub use crate::extract::auth::BearerToken;
+
+#[cfg(all(feature = "jwt", not(target_arch = "wasm32")))]
+pub use crate::auth::jwt::{JwtAuthenticator, JwtConfig, JwtError};
+
+#[cfg(feature = "auth")]
+pub use crate::auth::guard::{Admin, AuthorizationError, HasRoles, RoleExtractor};
 
 /// Trait for authenticating users from requests.
 pub trait Authenticator {
