@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{extract::PeerAddr, Endpoint};
+use crate::{extract::PeerAddr, Endpoint, HttpError};
 use async_channel::{bounded, Receiver};
 use async_executor::Executor as AsyncExecutor;
 use async_net::TcpListener;
@@ -487,39 +487,67 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
             if let Some(peer_addr) = peer_addr {
                 request.extensions_mut().insert(PeerAddr(peer_addr));
             }
-            let response = endpoint.respond(&mut request).await;
-            let response: Result<hyper::Response<crate::Body>, Self::Error> =
-                response.map_err(|error| Box::new(error) as BoxHttpError);
 
-            match &response {
-                Ok(ok) => {
+            // Convert errors to HTTP responses at the runtime level
+            let response: crate::Response = match endpoint.respond(&mut request).await {
+                Ok(response) => {
                     info!(
                         method = method.as_str(),
                         path = path.as_str(),
-                        status = ok.status().as_u16(),
+                        status = response.status().as_u16(),
                         "request completed"
                     );
+                    response
                 }
                 Err(err) => {
-                    let status = err.status().as_u16();
-                    error!(
-                        method = method.as_str(),
-                        path = path.as_str(),
-                        status = status,
-                        "request failed: {err}"
-                    );
-                }
-            }
+                    let status = err.status();
+                    let error_message = err.to_string();
 
-            response.map(|response| {
-                response.map(|body| {
-                    let body: MapOk<
-                        crate::Body,
-                        fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>,
-                    > = body.map_ok(Frame::data);
-                    StreamBody::new(body)
-                })
-            })
+                    // For 5xx server errors, hide internal details
+                    // For 4xx client errors and others, show the error message
+                    let body_message = if status.is_server_error() {
+                        error!(
+                            method = method.as_str(),
+                            path = path.as_str(),
+                            status = status.as_u16(),
+                            error = %error_message,
+                            "internal server error"
+                        );
+                        "Internal server error".to_string()
+                    } else {
+                        warn!(
+                            method = method.as_str(),
+                            path = path.as_str(),
+                            status = status.as_u16(),
+                            error = %error_message,
+                            "client error"
+                        );
+                        error_message
+                    };
+
+                    // Create JSON error response
+                    let body = format!(
+                        r#"{{"error":"{}"}}"#,
+                        body_message.replace('\\', r"\\").replace('"', r#"\""#)
+                    );
+
+                    let mut response = crate::Response::new(crate::Body::from(body));
+                    *response.status_mut() = status;
+                    response.headers_mut().insert(
+                        http::header::CONTENT_TYPE,
+                        http::header::HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            };
+
+            Ok(response.map(|body| {
+                let body: MapOk<
+                    crate::Body,
+                    fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>,
+                > = body.map_ok(Frame::data);
+                StreamBody::new(body)
+            }))
         };
 
         Box::pin(fut)

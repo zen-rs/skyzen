@@ -13,7 +13,7 @@ use http_kit::error::BoxHttpError;
 use http_kit::http_error;
 use matchit::Match;
 use skyzen_core::Extractor;
-use tracing::{error, info};
+use tracing::info;
 
 // The entrance of request,composing of endpoint
 pub struct App {
@@ -342,24 +342,8 @@ impl Endpoint for Router {
             path = request.uri().path(),
             "request received"
         );
-        Ok(self.call(request).await.unwrap_or_else(|error| {
-            let mut response = Response::new(http_kit::Body::empty());
-            let status = error.status();
-            *response.status_mut() = status;
-            let error_name = if status.is_server_error() {
-                "Server Error"
-            } else if status.is_client_error() {
-                "Client Error"
-            } else {
-                "Error"
-            };
-            error!(
-                message = error.to_string().as_str(),
-                status = status.as_str(),
-                "{error_name}"
-            );
-            response
-        }))
+        // Propagate errors to let middleware or runtime handle them
+        self.call(request).await
     }
 }
 
