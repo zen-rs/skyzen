@@ -1,0 +1,30 @@
+[package]
+name = "skyzen-azure"
+version = "0.1.0"
+edition = "2021"
+description = "Azure service implementations for the Skyzen framework"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "../README.md"
+keywords = ["azure", "cosmos", "blob", "skyzen", "services"]
+categories = ["web-programming::http-server", "database"]
+
+[dependencies]
+skyzen-services = { path = "../services" }
+azure_data_cosmos = { version = "0.30", optional = true }
+azure_storage_blob = { version = "0.8", optional = true }
+azure_messaging_servicebus = { version = "0.21", optional = true }
+azure_core = { version = "0.31", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+base64 = "0.22"
+
+[features]
+default = ["cosmos", "blob", "servicebus"]
+cosmos = ["dep:azure_data_cosmos", "dep:azure_core"]
+blob = ["dep:azure_storage_blob", "dep:azure_core"]
+servicebus = ["dep:azure_messaging_servicebus"]
+
+[lints]
+workspace = true

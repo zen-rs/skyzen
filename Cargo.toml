@@ -1,10 +1,17 @@
 [workspace]
-members = ["core","hyper", "macros"]
+members = ["core", "hyper", "macros", "services", "test", "redis", "s3", "cloudflare", "aws", "azure"]
+# cloudflare is wasm32-only — exclude from default builds, build with:
+#   cargo check -p skyzen-cloudflare --target wasm32-unknown-unknown
+default-members = ["core", "hyper", "macros", "services", "test", "redis", "s3", "aws", "azure", "."]
 resolver = "2"
 
 [workspace.dependencies]
 skyzen-core = { path = "core" }
 skyzen-macros = { path = "macros" }
+skyzen-services = { path = "services" }
+skyzen-test = { path = "test" }
+skyzen-redis = { path = "redis" }
+skyzen-s3 = { path = "s3" }
 
 http-kit = "0.4.2"
 executor-core = { version = "0.7.1", default-features = false, features = ["std", "async-executor"] }

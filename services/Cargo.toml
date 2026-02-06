@@ -1,0 +1,34 @@
+[package]
+name = "skyzen-services"
+version = "0.1.0"
+edition = "2021"
+description = "Portable service abstractions for the Skyzen framework"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "../README.md"
+keywords = ["http", "web", "framework", "services"]
+categories = ["web-programming::http-server"]
+
+[dependencies]
+skyzen-core = { path = "../core" }
+http-kit.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+futures-core = "0.3"
+
+# SeaORM for database abstraction - re-exported for user convenience
+sea-orm = { version = "1", default-features = false }
+
+[features]
+# Runtime features - user selects in their application
+runtime-tokio-native-tls = ["sea-orm/runtime-tokio-native-tls"]
+runtime-tokio-rustls = ["sea-orm/runtime-tokio-rustls"]
+runtime-async-std-native-tls = ["sea-orm/runtime-async-std-native-tls"]
+# Database backends
+postgres = ["sea-orm/sqlx-postgres"]
+mysql = ["sea-orm/sqlx-mysql"]
+sqlite = ["sea-orm/sqlx-sqlite"]
+
+[lints]
+workspace = true

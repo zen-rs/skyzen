@@ -1,0 +1,29 @@
+[package]
+name = "skyzen-aws"
+version = "0.1.0"
+edition = "2021"
+description = "AWS service implementations for the Skyzen framework"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "../README.md"
+keywords = ["aws", "dynamodb", "sqs", "skyzen", "services"]
+categories = ["web-programming::http-server", "database"]
+
+[dependencies]
+skyzen-services = { path = "../services" }
+skyzen-s3 = { path = "../s3", optional = true }
+aws-config = "1"
+aws-sdk-dynamodb = { version = "1", optional = true }
+aws-sdk-sqs = { version = "1", optional = true }
+serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+1"], optional = true }
+serde_json = "1"
+base64 = { version = "0.22", optional = true }
+
+[features]
+default = ["dynamodb", "s3", "sqs"]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:serde_dynamo"]
+s3 = ["dep:skyzen-s3"]
+sqs = ["dep:aws-sdk-sqs", "dep:base64"]
+
+[lints]
+workspace = true

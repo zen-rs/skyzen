@@ -51,7 +51,7 @@ macro_rules! impl_deref {
     };
 }
 
-/// Implement empty OpenAPI schema for a type without requiring `utoipa` in downstream crates.
+/// Implement empty `OpenAPI` schema for a type without requiring `utoipa` in downstream crates.
 #[macro_export]
 macro_rules! ignore_openapi {
     ($ty:ty) => {

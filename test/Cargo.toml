@@ -1,0 +1,27 @@
+[package]
+name = "skyzen-test"
+version = "0.1.0"
+edition = "2021"
+description = "Testing utilities and mock implementations for the Skyzen framework"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "../README.md"
+keywords = ["http", "web", "framework", "testing"]
+categories = ["web-programming::http-server", "development-tools::testing"]
+
+[dependencies]
+skyzen.workspace = true
+skyzen-services.workspace = true
+http-kit.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+insta = { version = "1", features = ["json"] }
+
+[features]
+# Inherit SeaORM runtime features from user's application.
+# Users must enable at least one runtime + sqlite for InMemoryDb.
+runtime-tokio-native-tls = ["skyzen-services/runtime-tokio-native-tls", "skyzen-services/sqlite"]
+runtime-tokio-rustls = ["skyzen-services/runtime-tokio-rustls", "skyzen-services/sqlite"]
+
+[lints]
+workspace = true
