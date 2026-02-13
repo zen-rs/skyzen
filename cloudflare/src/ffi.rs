@@ -1,7 +1,7 @@
 //! Low-level FFI bindings for Cloudflare Workers APIs.
 //!
 //! These bindings provide access to Cloudflare Workers service APIs
-//! (KV, R2, Queues, D1) via `wasm-bindgen`.
+//! (KV, R2, Queues, D1, Durable Object SQLite) via `wasm-bindgen`.
 
 use js_sys::{Promise, Uint8Array};
 use wasm_bindgen::prelude::*;
@@ -16,19 +16,11 @@ extern "C" {
 
     /// Get a value by key. Returns a promise that resolves to the value or null.
     #[wasm_bindgen(method, catch)]
-    pub fn get(
-        this: &KvNamespace,
-        key: &str,
-        options: &JsValue,
-    ) -> Result<Promise, JsValue>;
+    pub fn get(this: &KvNamespace, key: &str, options: &JsValue) -> Result<Promise, JsValue>;
 
     /// Put a key-value pair. Returns a promise.
     #[wasm_bindgen(method, catch)]
-    pub fn put(
-        this: &KvNamespace,
-        key: &str,
-        value: &JsValue,
-    ) -> Result<Promise, JsValue>;
+    pub fn put(this: &KvNamespace, key: &str, value: &JsValue) -> Result<Promise, JsValue>;
 
     /// Delete a key. Returns a promise.
     #[wasm_bindgen(method, catch)]
@@ -53,11 +45,7 @@ extern "C" {
 
     /// Put an object.
     #[wasm_bindgen(method, catch)]
-    pub fn put(
-        this: &R2Bucket,
-        key: &str,
-        value: &Uint8Array,
-    ) -> Result<Promise, JsValue>;
+    pub fn put(this: &R2Bucket, key: &str, value: &Uint8Array) -> Result<Promise, JsValue>;
 
     /// Delete an object by key.
     #[wasm_bindgen(method, catch)]
@@ -142,6 +130,59 @@ extern "C" {
     /// Send a batch of messages. Returns a promise.
     #[wasm_bindgen(method, catch, js_name = sendBatch)]
     pub fn send_batch(this: &Queue, messages: &js_sys::Array) -> Result<Promise, JsValue>;
+}
+
+// ── D1 Database ──
+
+/// Cloudflare D1 database binding.
+#[wasm_bindgen]
+extern "C" {
+    /// D1 database type from the Workers runtime.
+    pub type D1Database;
+
+    /// Prepare a SQL statement.
+    #[wasm_bindgen(method, catch)]
+    pub fn prepare(this: &D1Database, query: &str) -> Result<D1PreparedStatement, JsValue>;
+
+    /// Execute SQL directly.
+    #[wasm_bindgen(method, catch)]
+    pub fn exec(this: &D1Database, query: &str) -> Result<Promise, JsValue>;
+}
+
+/// Prepared D1 SQL statement.
+#[wasm_bindgen]
+extern "C" {
+    /// D1 prepared statement type.
+    pub type D1PreparedStatement;
+
+    /// Execute and return all rows.
+    #[wasm_bindgen(method, catch)]
+    pub fn all(this: &D1PreparedStatement) -> Result<Promise, JsValue>;
+
+    /// Execute and return first row.
+    #[wasm_bindgen(method, catch)]
+    pub fn first(this: &D1PreparedStatement) -> Result<Promise, JsValue>;
+
+    /// Execute and return raw row arrays.
+    #[wasm_bindgen(method, catch)]
+    pub fn raw(this: &D1PreparedStatement) -> Result<Promise, JsValue>;
+
+    /// Execute write statement.
+    #[wasm_bindgen(method, catch)]
+    pub fn run(this: &D1PreparedStatement) -> Result<Promise, JsValue>;
+}
+
+// ── Durable Object SQLite ──
+
+/// Durable Object SQLite storage (`state.storage.sql`).
+#[wasm_bindgen]
+extern "C" {
+    /// SqlStorage type from Durable Object runtime.
+    pub type SqlStorage;
+
+    /// Execute SQL.
+    #[wasm_bindgen(method, catch)]
+    pub fn exec(this: &SqlStorage, query: &str) -> Result<JsValue, JsValue>;
 }
 
 // ── Helpers ──

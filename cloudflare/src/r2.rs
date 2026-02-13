@@ -61,9 +61,7 @@ impl CfR2 {
     /// Returns [`StorageError::Backend`] if the binding cannot be found.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, StorageError> {
         let binding = ffi::get_binding(env, binding_name).map_err(|e| {
-            StorageError::Backend(format!(
-                "failed to get R2 binding '{binding_name}': {e:?}"
-            ))
+            StorageError::Backend(format!("failed to get R2 binding '{binding_name}': {e:?}"))
         })?;
         Ok(Self::new(binding))
     }
@@ -137,9 +135,14 @@ impl ObjectStorage for CfR2 {
         }
 
         if let Some(limit) = options.limit {
-            #[allow(clippy::cast_precision_loss)] // JS numbers are f64; usize limit won't exceed 2^53
-            js_sys::Reflect::set(&js_options, &"limit".into(), &JsValue::from_f64(limit as f64))
-                .map_err(|e| StorageError::Backend(format!("{e:?}")))?;
+            #[allow(clippy::cast_precision_loss)]
+            // JS numbers are f64; usize limit won't exceed 2^53
+            js_sys::Reflect::set(
+                &js_options,
+                &"limit".into(),
+                &JsValue::from_f64(limit as f64),
+            )
+            .map_err(|e| StorageError::Backend(format!("{e:?}")))?;
         }
 
         if let Some(ref cursor) = options.cursor {

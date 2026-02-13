@@ -10,6 +10,8 @@
 //! - [`CfKv`] — Cloudflare KV (implements [`KeyValueStore`])
 //! - [`CfR2`] — Cloudflare R2 (implements [`ObjectStorage`])
 //! - [`CfQueue`] — Cloudflare Queues (implements [`MessageQueue`])
+//! - [`CfD1`] — Cloudflare D1 SQL database
+//! - [`CfDurableSqlite`] — Durable Object SQLite (`state.storage.sql`)
 //!
 //! **This crate only works on `wasm32` targets.** On native targets it compiles
 //! as an empty crate.
@@ -17,19 +19,26 @@
 //! # Example
 //!
 //! ```ignore
-//! use skyzen_cloudflare::{CfKv, CfR2, CfQueue};
+//! use skyzen_cloudflare::{CfD1, CfKv, CfQueue, CfR2};
 //! use skyzen_services::{Kv, Storage, Queue};
 //!
 //! // From a Workers env binding
 //! let kv = Kv::new(CfKv::from_env(&env, "MY_KV")?);
 //! let storage = Storage::new(CfR2::from_env(&env, "MY_BUCKET")?);
 //! let queue = Queue::new(CfQueue::from_env(&env, "MY_QUEUE")?);
+//! let d1 = CfD1::from_env(&env, "MY_D1")?;
 //! ```
 //!
 //! [`KeyValueStore`]: skyzen_services::kv::KeyValueStore
 //! [`ObjectStorage`]: skyzen_services::storage::ObjectStorage
 //! [`MessageQueue`]: skyzen_services::queue::MessageQueue
 
+#[cfg(target_arch = "wasm32")]
+pub mod d1;
+#[cfg(target_arch = "wasm32")]
+pub mod database_error;
+#[cfg(target_arch = "wasm32")]
+pub mod durable_sqlite;
 #[cfg(target_arch = "wasm32")]
 pub mod ffi;
 #[cfg(target_arch = "wasm32")]
@@ -39,6 +48,12 @@ pub mod queues;
 #[cfg(target_arch = "wasm32")]
 pub mod r2;
 
+#[cfg(target_arch = "wasm32")]
+pub use d1::{CfD1, CfD1Statement};
+#[cfg(target_arch = "wasm32")]
+pub use database_error::CfDatabaseError;
+#[cfg(target_arch = "wasm32")]
+pub use durable_sqlite::CfDurableSqlite;
 #[cfg(target_arch = "wasm32")]
 pub use kv::CfKv;
 #[cfg(target_arch = "wasm32")]

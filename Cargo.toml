@@ -57,6 +57,7 @@ cookie = { version = "0.18.1", features = ["percent-encode"] }
 tracing.workspace = true
 smallvec = "1.15"
 mime_guess = "2.0"
+include_dir = "0.7"
 skyzen-macros.workspace = true
 base64 = { version = "0.22", optional = true }
 sha1 = { version = "0.10", optional = true }
@@ -128,7 +129,7 @@ optional = true
 
 
 [features]
-default = ["json", "form", "multipart", "sse", "rt", "openapi", "ws"]
+default = ["json", "form", "multipart", "sse", "rt", "openapi", "ws", "static-files"]
 openapi = ["skyzen-core/openapi"]
 auth = []
 jwt = ["auth", "dep:jsonwebtoken"]
@@ -136,6 +137,7 @@ json = ["dep:serde_json", "http-kit/json"]
 form = ["dep:serde_urlencoded", "http-kit/form"]
 multipart = ["dep:multer", "dep:pin-project-lite"]
 sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
+static-files = []
 ws = [
     "json",
     "dep:futures-channel",

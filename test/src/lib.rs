@@ -2,6 +2,7 @@
 //!
 //! This crate provides:
 //! - **Mock implementations** for all service traits (`InMemoryKv`, `InMemoryStorage`, `InMemoryQueue`)
+//! - **`InMemoryDb`** for SQLite in-memory database tests (requires a runtime feature)
 //! - **`TestContext`** for creating HTTP test clients
 //! - **`TestClient`** for sending requests to endpoints without network I/O
 //! - **Response assertions** for validating status codes, headers, and body content

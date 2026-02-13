@@ -98,17 +98,17 @@ impl KeyValueStore for DynamoKv {
                 scan = scan
                     .filter_expression("begins_with(#pk, :prefix)")
                     .expression_attribute_names("#pk", &self.key_attribute)
-                    .expression_attribute_values(
-                        ":prefix",
-                        AttributeValue::S(p.to_owned()),
-                    );
+                    .expression_attribute_values(":prefix", AttributeValue::S(p.to_owned()));
             }
 
             if let Some(ref start) = exclusive_start_key {
                 scan = scan.set_exclusive_start_key(Some(start.clone()));
             }
 
-            let output = scan.send().await.map_err(|e| KvError::Backend(e.to_string()))?;
+            let output = scan
+                .send()
+                .await
+                .map_err(|e| KvError::Backend(e.to_string()))?;
 
             if let Some(items) = output.items {
                 for item in &items {

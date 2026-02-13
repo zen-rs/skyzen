@@ -23,14 +23,23 @@ pub mod utils;
 pub mod runtime;
 
 /// Attribute & derive macros exported by Skyzen.
-pub use skyzen_macros::{error, main, openapi, HttpError};
+pub use skyzen_macros::{error, import_config, main, openapi, HttpError};
 
 /// Static asset helpers for building file servers.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "static-files")]
 pub mod static_files;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "static-files")]
+pub use static_files::EmbeddedStaticDir;
+#[cfg(all(feature = "static-files", not(target_arch = "wasm32")))]
 pub use static_files::StaticDir;
 
+/// Re-exported so the [`embed_dir!`] macro expansion can resolve `include_dir::` types.
+#[doc(hidden)]
+#[cfg(feature = "static-files")]
+pub use include_dir;
+
+#[doc(hidden)]
+pub use http_kit;
 #[doc(inline)]
 pub use http_kit::{
     header, Body, BodyError, Endpoint, HttpError, Method, Middleware, Request, Response,
@@ -40,6 +49,12 @@ pub use http_kit::{
 pub use routing::{CreateRouteNode, Route};
 pub use skyzen_core::error::*;
 pub use skyzen_core::Server;
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub use wasm_bindgen;
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub use wasm_bindgen_futures;
 
 /// Hyper-based server backend.
 #[cfg(all(feature = "hyper", not(target_arch = "wasm32")))]
@@ -61,6 +76,22 @@ pub mod responder;
 pub use responder::Responder;
 
 pub mod middleware;
+
+#[doc(hidden)]
+pub mod __private {
+    use crate::{Endpoint, Middleware};
+
+    pub fn with_middleware<E, M>(
+        endpoint: E,
+        middleware: M,
+    ) -> http_kit::endpoint::WithMiddleware<E, M>
+    where
+        E: Endpoint,
+        M: Middleware,
+    {
+        http_kit::endpoint::WithMiddleware::new(endpoint, middleware)
+    }
+}
 
 #[cfg(feature = "ws")]
 pub mod websocket;

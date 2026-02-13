@@ -2,6 +2,7 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
+use std::{collections::HashSet, fs, path::PathBuf};
 use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
@@ -34,10 +35,21 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         original_ident
     };
 
-    let native_factory = if is_async {
-        quote! { #entry_ident() }
+    let entry_call = if is_async {
+        quote! { #entry_ident().await }
     } else {
-        quote! { async move { #entry_ident() } }
+        quote! { #entry_ident() }
+    };
+    let datasource_wrap_steps = match datasource_wrap_steps() {
+        Ok(steps) => steps,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let native_factory = quote! {
+        async move {
+            let endpoint = #entry_call;
+            #(#datasource_wrap_steps)*
+            endpoint
+        }
     };
     let wasm_factory = native_factory.clone();
 
@@ -48,6 +60,8 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let output = quote! {
+        ::skyzen::import_config!();
+
         #function
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -58,17 +72,42 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #[cfg(target_arch = "wasm32")]
-        #[wasm_bindgen::prelude::wasm_bindgen]
+        use ::skyzen::wasm_bindgen as wasm_bindgen;
+        #[cfg(target_arch = "wasm32")]
+        use ::skyzen::wasm_bindgen_futures as wasm_bindgen_futures;
+        #[cfg(target_arch = "wasm32")]
+        #[::skyzen::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::skyzen::wasm_bindgen)]
         pub async fn fetch(
             request: ::skyzen::runtime::wasm::Request,
             env: ::skyzen::runtime::wasm::Env,
             ctx: ::skyzen::runtime::wasm::ExecutionContext,
-        ) -> Result<::skyzen::runtime::wasm::Response, wasm_bindgen::JsValue> {
+        ) -> Result<::skyzen::runtime::wasm::Response, ::skyzen::wasm_bindgen::JsValue> {
             ::skyzen::runtime::wasm::launch(|| #wasm_factory, request, env, ctx).await
         }
     };
 
     output.into()
+}
+
+/// Import datasource declarations from `Skyzen.toml` and generate strong-typed extractors.
+///
+/// This macro has no runtime side effects. It only generates types, initialization methods,
+/// middleware implementations, and extractors.
+#[proc_macro]
+pub fn import_config(input: TokenStream) -> TokenStream {
+    if !input.is_empty() {
+        return Error::new(
+            proc_macro2::Span::call_site(),
+            "import_config!() does not take arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    match expand_import_config() {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
 }
 
 /// Annotate handlers that should appear in generated `OpenAPI` documentation.
@@ -784,6 +823,386 @@ fn doc_string(attrs: &[Attribute]) -> Option<String> {
     } else {
         Some(docs.join("\n"))
     }
+}
+
+#[derive(Debug, Clone)]
+struct DatasourceConfig {
+    name: String,
+    engine: String,
+    strategy: String,
+    url_env: String,
+    key_env: Option<String>,
+}
+
+fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
+    let datasources = load_datasources()?;
+    let mut generated_items = Vec::with_capacity(datasources.len());
+    let mut seen_idents = HashSet::new();
+
+    for datasource in datasources {
+        let ident = ident_from_name(&datasource.name)?;
+        if !seen_idents.insert(ident.to_string()) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "duplicate datasource type name after normalization: `{}`",
+                    ident
+                ),
+            ));
+        }
+
+        let init_error_ident = format_ident!("{ident}InitError");
+        let missing_ident = format_ident!("{ident}NotConfigured");
+
+        let name_lit = LitStr::new(&datasource.name, proc_macro2::Span::call_site());
+        let engine_lit = LitStr::new(&datasource.engine, proc_macro2::Span::call_site());
+        let strategy_lit = LitStr::new(&datasource.strategy, proc_macro2::Span::call_site());
+        let url_env_lit = LitStr::new(&datasource.url_env, proc_macro2::Span::call_site());
+        let key_env_const = datasource.key_env.as_ref().map_or_else(
+            || quote! { None },
+            |value| {
+                let lit = LitStr::new(value, proc_macro2::Span::call_site());
+                quote! { Some(#lit) }
+            },
+        );
+        let missing_message = LitStr::new(
+            &format!(
+                "{} not configured. Ensure {}::init() is called and middleware is installed.",
+                datasource.name, datasource.name
+            ),
+            proc_macro2::Span::call_site(),
+        );
+        generated_items.push(quote! {
+            #[derive(Debug, Clone)]
+            pub struct #ident {
+                url: ::std::sync::Arc<str>,
+                key: ::std::option::Option<::std::sync::Arc<str>>,
+            }
+
+            #[derive(Debug, Clone)]
+            pub enum #init_error_ident {
+                MissingEnv(&'static str),
+                EmptyEnv(&'static str),
+            }
+
+            impl ::std::fmt::Display for #init_error_ident {
+                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                    match self {
+                        Self::MissingEnv(key) => write!(f, "missing environment variable: {key}"),
+                        Self::EmptyEnv(key) => write!(f, "environment variable is empty: {key}"),
+                    }
+                }
+            }
+
+            impl ::std::error::Error for #init_error_ident {}
+
+            impl #ident {
+                pub const NAME: &'static str = #name_lit;
+                pub const ENGINE: &'static str = #engine_lit;
+                pub const STRATEGY: &'static str = #strategy_lit;
+                pub const URL_ENV: &'static str = #url_env_lit;
+                pub const KEY_ENV: ::std::option::Option<&'static str> = #key_env_const;
+
+                pub fn init() -> ::std::result::Result<Self, #init_error_ident> {
+                    static INSTANCE: ::std::sync::OnceLock<
+                        ::std::result::Result<#ident, #init_error_ident>
+                    > = ::std::sync::OnceLock::new();
+                    INSTANCE.get_or_init(|| {
+                        let url = ::std::env::var(Self::URL_ENV)
+                            .map_err(|_| #init_error_ident::MissingEnv(Self::URL_ENV))?;
+                        if url.trim().is_empty() {
+                            return Err(#init_error_ident::EmptyEnv(Self::URL_ENV));
+                        }
+
+                        let key = match Self::KEY_ENV {
+                            Some(key_env) => {
+                                let value = ::std::env::var(key_env)
+                                    .map_err(|_| #init_error_ident::MissingEnv(key_env))?;
+                                if value.trim().is_empty() {
+                                    return Err(#init_error_ident::EmptyEnv(key_env));
+                                }
+                                Some(value.into())
+                            }
+                            None => None,
+                        };
+
+                        Ok(Self {
+                            url: url.into(),
+                            key,
+                        })
+                    }).clone()
+                }
+
+                #[must_use]
+                pub fn url(&self) -> &str {
+                    &self.url
+                }
+
+                #[must_use]
+                pub fn key(&self) -> ::std::option::Option<&str> {
+                    self.key.as_deref()
+                }
+            }
+
+            ::skyzen::http_kit::http_error!(
+                pub #missing_ident,
+                ::skyzen::StatusCode::INTERNAL_SERVER_ERROR,
+                #missing_message
+            );
+
+            impl ::skyzen::extract::Extractor for #ident {
+                type Error = #missing_ident;
+
+                async fn extract(
+                    request: &mut ::skyzen::Request,
+                ) -> ::std::result::Result<Self, Self::Error> {
+                    request
+                        .extensions()
+                        .get::<Self>()
+                        .cloned()
+                        .ok_or_else(#missing_ident::new)
+                }
+            }
+
+            impl ::skyzen::middleware::Middleware for #ident {
+                type Error = ::std::convert::Infallible;
+
+                async fn handle<N: ::skyzen::Endpoint>(
+                    &mut self,
+                    request: &mut ::skyzen::Request,
+                    mut next: N,
+                ) -> ::std::result::Result<
+                    ::skyzen::Response,
+                    ::skyzen::http_kit::middleware::MiddlewareError<N::Error, Self::Error>,
+                > {
+                    request.extensions_mut().insert(self.clone());
+                    next.respond(request)
+                        .await
+                        .map_err(::skyzen::http_kit::middleware::MiddlewareError::Endpoint)
+                }
+            }
+
+            #[cfg(test)]
+            impl #ident {
+                #[must_use]
+                pub fn from_raw_parts(
+                    url: impl Into<::std::sync::Arc<str>>,
+                    key: ::std::option::Option<::std::sync::Arc<str>>,
+                ) -> Self {
+                    Self {
+                        url: url.into(),
+                        key,
+                    }
+                }
+            }
+        });
+    }
+
+    Ok(quote! {
+        #[doc(hidden)]
+        pub mod __skyzen_config {
+            #(#generated_items)*
+        }
+
+        pub use __skyzen_config::*;
+    })
+}
+
+fn datasource_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let datasources = load_datasources()?;
+    let mut steps = Vec::with_capacity(datasources.len());
+    let mut seen_idents = HashSet::new();
+
+    for datasource in datasources {
+        let ident = ident_from_name(&datasource.name)?;
+        if !seen_idents.insert(ident.to_string()) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "duplicate datasource type name after normalization: `{}`",
+                    ident
+                ),
+            ));
+        }
+
+        let panic_message = LitStr::new(
+            &format!("failed to initialize datasource `{}`", datasource.name),
+            proc_macro2::Span::call_site(),
+        );
+
+        steps.push(quote! {
+            let endpoint = ::skyzen::__private::with_middleware(
+                endpoint,
+                #ident::init().unwrap_or_else(|error| panic!("{}: {error}", #panic_message)),
+            );
+        });
+    }
+
+    Ok(steps)
+}
+
+fn load_datasources() -> syn::Result<Vec<DatasourceConfig>> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|error| {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            format!("failed to read CARGO_MANIFEST_DIR: {error}"),
+        )
+    })?;
+    let config_path = PathBuf::from(manifest_dir).join("Skyzen.toml");
+    if !config_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(&config_path).map_err(|error| {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            format!("failed to read {}: {error}", config_path.display()),
+        )
+    })?;
+    let value: toml::Value = content.parse().map_err(|error| {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            format!("failed to parse {}: {error}", config_path.display()),
+        )
+    })?;
+
+    let Some(entries) = value.get("datasource").and_then(toml::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_datasource(entry, index))
+        .collect()
+}
+
+fn parse_datasource(entry: &toml::Value, index: usize) -> syn::Result<DatasourceConfig> {
+    let Some(table) = entry.as_table() else {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            format!("datasource[{index}] must be a TOML table"),
+        ));
+    };
+
+    let name = required_string(table, "name", index)?;
+    let engine = optional_string(table, &["engine"]).unwrap_or_else(|| "custom".to_owned());
+    let strategy = optional_string(table, &["strategy"]).unwrap_or_else(|| "tcp".to_owned());
+    let url_env = required_url_env(table, index)?;
+    let key_env = optional_string(
+        table,
+        &[
+            "key_from_env",
+            "auth_from_env",
+            "secret_from_env",
+            "password_from_env",
+        ],
+    );
+
+    Ok(DatasourceConfig {
+        name,
+        engine,
+        strategy,
+        url_env,
+        key_env,
+    })
+}
+
+fn required_string(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    index: usize,
+) -> syn::Result<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            Error::new(
+                proc_macro2::Span::call_site(),
+                format!("datasource[{index}] is missing `{key}`"),
+            )
+        })
+}
+
+fn optional_string(table: &toml::map::Map<String, toml::Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| table.get(*key).and_then(toml::Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn required_url_env(
+    table: &toml::map::Map<String, toml::Value>,
+    index: usize,
+) -> syn::Result<String> {
+    if let Some(env) = optional_string(table, &["url_from_env", "url_env", "url_env_var"]) {
+        return Ok(env);
+    }
+
+    if let Some(url_value) = table.get("url") {
+        if let Some(url_table) = url_value.as_table() {
+            if let Some(env) = url_table.get("env").and_then(toml::Value::as_str) {
+                return Ok(env.to_owned());
+            }
+        } else if let Some(url_str) = url_value.as_str() {
+            if let Some(stripped) = parse_env_ref(url_str) {
+                return Ok(stripped);
+            }
+            if looks_like_env_name(url_str) {
+                return Ok(url_str.to_owned());
+            }
+        }
+    }
+
+    Err(Error::new(
+        proc_macro2::Span::call_site(),
+        format!(
+            "datasource[{index}] is missing URL env reference; use `url_from_env = \"ENV_KEY\"` \
+or `url = {{ env = \"ENV_KEY\" }}`"
+        ),
+    ))
+}
+
+fn parse_env_ref(value: &str) -> Option<String> {
+    value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .map(ToOwned::to_owned)
+}
+
+fn looks_like_env_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
+    let mut normalized = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            normalized.push(ch);
+        } else {
+            normalized.push('_');
+        }
+    }
+
+    if normalized.is_empty() {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            "datasource name must contain at least one alphanumeric character",
+        ));
+    }
+
+    if normalized
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_digit())
+    {
+        normalized.insert(0, '_');
+    }
+
+    Ok(format_ident!("{normalized}"))
 }
 
 struct MainOptions {

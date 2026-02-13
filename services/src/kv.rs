@@ -36,11 +36,8 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
     fn get(&self, key: &str) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + MaybeSend;
 
     /// Store a value under a key.
-    fn put(
-        &self,
-        key: &str,
-        value: &[u8],
-    ) -> impl Future<Output = Result<(), KvError>> + MaybeSend;
+    fn put(&self, key: &str, value: &[u8])
+        -> impl Future<Output = Result<(), KvError>> + MaybeSend;
 
     /// Remove a value by key.
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), KvError>> + MaybeSend;

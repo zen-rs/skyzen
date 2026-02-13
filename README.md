@@ -127,6 +127,34 @@ cargo build --target wasm32-unknown-unknown --release
 
 On WASM targets, `#[skyzen::main]` exports a WinterCG-compatible `fetch` handler that works on Cloudflare Workers, Deno Deploy, and other edge runtimes.
 
+### `Skyzen.toml` Datasource Sugar
+
+`Skyzen.toml` is optional sugar for datasource declarations. Users can still wire everything manually in Rust.
+
+```toml
+[[datasource]]
+name = "GlobalDb"
+engine = "postgres"
+strategy = "tcp"
+url_from_env = "DATABASE_URL"
+key_from_env = "DATABASE_TOKEN"
+```
+
+Generate strong-typed datasource code:
+
+```rust
+skyzen::import_config!();
+```
+
+`import_config!()` only generates code (types, `init()`, middleware, extractor). It does **not** execute initialization and does **not** auto-inject context.
+
+When you use `#[skyzen::main]`, Skyzen will:
+- expand `import_config!()` automatically
+- call each generated `DatasourceType::init()` once during app startup
+- install datasource middleware so handlers can extract typed datasource directly
+
+If you do not use `#[skyzen::main]`, call `import_config!()` and wire middleware yourself.
+
 ## Custom Server Usage
 
 For advanced scenarios like embedding Skyzen or using a custom runtime, implement the `Server` trait directly:
@@ -175,6 +203,141 @@ Return anything that implements `Responder`:
 ```rust
 async fn handler() -> impl Responder {
     Json(data)  // or String, &str, Response, Result<T>, etc.
+}
+```
+
+## Services Abstraction
+
+Skyzen provides portable service abstractions that let you write platform-agnostic business logic. The same handler code runs on Cloudflare Workers, AWS Lambda, Azure Functions, or a native server with Redis/SQL databases.
+
+```rust
+use skyzen_services::{Kv, Storage, Queue};
+
+async fn handler(kv: Kv, storage: Storage) -> Result<Json<Data>> {
+    // No knowledge of underlying implementation (Redis/CF KV/DynamoDB)
+    let cached = kv.get_json::<Data>("cache:key").await?;
+    let file = storage.get("assets/logo.png").await?;
+    Ok(Json(cached.unwrap_or_default()))
+}
+```
+
+**Service traits:**
+
+| Trait | Wrapper | Purpose |
+|-------|---------|---------|
+| `KeyValueStore` | `Kv` | Key-value storage (get, put, delete, list) |
+| `ObjectStorage` | `Storage` | Blob/object storage (get, put, delete, list, head) |
+| `MessageQueue` | `Queue` | Message queues (send, send_batch) |
+| SeaORM | `Db` | Database via SeaORM (re-exported) |
+
+**Platform implementations:**
+
+| Crate | Backends |
+|-------|----------|
+| `skyzen-redis` | Redis (KeyValueStore) |
+| `skyzen-s3` | S3-compatible (ObjectStorage) |
+| `skyzen-cloudflare` | CF KV, R2, Queues, D1, Durable Object SQLite |
+| `skyzen-aws` | DynamoDB, SQS |
+| `skyzen-azure` | Cosmos DB, Blob Storage, Service Bus |
+| `skyzen-test` | In-memory mocks for all services (including SQLite test DB) |
+
+Cloudflare SQL note:
+- `CfD1`: D1 managed SQL database (Workers env binding)
+- `CfDurableSqlite`: Durable Object `state.storage.sql` (inside Durable Object code)
+
+### SQL Databases (SeaORM + `Db`)
+
+Enable `skyzen-services` with one runtime feature plus a database backend feature:
+
+```toml
+[dependencies]
+skyzen-services = { version = "0.1", features = ["runtime-tokio-rustls", "sqlite"] }
+```
+
+Database backend features:
+- `sqlite` -> local SQLite (`sqlite::memory:` or file path)
+- `postgres` -> PostgreSQL
+- `mysql` -> MySQL/MariaDB
+
+WASM restriction:
+- Building `skyzen-services` with `sqlite` on `wasm32` is intentionally rejected at compile time.
+- For WASM deployments, use cloud vendor database services (for Cloudflare: `CfD1` / `CfDurableSqlite`).
+
+Native SQLite setup example:
+
+```rust
+use skyzen_services::{sea_orm::Database, Db};
+
+async fn build_db() -> Result<Db, skyzen_services::sea_orm::DbErr> {
+    // In-memory:
+    let conn = Database::connect("sqlite::memory:").await?;
+
+    // File-based local DB (example):
+    // let conn = Database::connect("sqlite://skyzen.db?mode=rwc").await?;
+
+    Ok(Db::new(conn))
+}
+```
+
+### Message Queues (`Queue`)
+
+Queue support is provided by `MessageQueue` + `Queue`, with current platform implementations:
+- AWS SQS (`skyzen-aws`)
+- Cloudflare Queues (`skyzen-cloudflare`)
+- Azure Service Bus (`skyzen-azure`)
+- In-memory queue for tests (`skyzen-test::mock::InMemoryQueue`)
+
+The same handler API works across all queue backends:
+
+```rust
+use skyzen_services::Queue;
+
+async fn enqueue(queue: Queue) -> Result<(), skyzen_services::QueueError> {
+    queue.send_json(&serde_json::json!({ "event": "user.created" })).await?;
+    Ok(())
+}
+```
+
+### Cloudflare SQL Backends: D1 vs Durable Object SQLite
+
+Use `skyzen-cloudflare` for Cloudflare-native SQL in WASM:
+
+```rust
+use skyzen_cloudflare::{CfD1, CfDurableSqlite};
+
+// In a Worker request handler (from env bindings):
+let d1 = CfD1::from_env(&env, "MY_D1")?;
+let rows = d1.prepare("SELECT * FROM users")?.all().await?;
+
+// Inside a Durable Object class (from `state`):
+let do_sql = CfDurableSqlite::from_state(&state)?;
+let cursor = do_sql.exec("SELECT * FROM users")?;
+```
+
+### Testing SQLite Locally (`skyzen-test::mock::InMemoryDb`)
+
+`skyzen-test` now includes `InMemoryDb`, a SQLite memory-mode helper for integration tests.
+
+```toml
+[dev-dependencies]
+skyzen-test = { version = "0.1", features = ["runtime-tokio-rustls"] }
+```
+
+```rust
+use skyzen_test::mock::InMemoryDb;
+use skyzen_services::sea_orm::ConnectionTrait;
+
+async fn test_db_bootstrap() -> Result<(), skyzen_services::sea_orm::DbErr> {
+    let db = InMemoryDb::with_schema(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+    )
+    .await?;
+
+    db.db()
+        .execute_unprepared("INSERT INTO users (name) VALUES ('alice');")
+        .await?;
+
+    Ok(())
 }
 ```
 

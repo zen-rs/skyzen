@@ -56,8 +56,9 @@ impl CfKv {
     ///
     /// Returns [`KvError::Backend`] if the binding cannot be found.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, KvError> {
-        let binding = ffi::get_binding(env, binding_name)
-            .map_err(|e| KvError::Backend(format!("failed to get KV binding '{binding_name}': {e:?}")))?;
+        let binding = ffi::get_binding(env, binding_name).map_err(|e| {
+            KvError::Backend(format!("failed to get KV binding '{binding_name}': {e:?}"))
+        })?;
         Ok(Self::new(binding))
     }
 }

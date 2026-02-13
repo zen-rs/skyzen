@@ -96,9 +96,7 @@ impl ObjectStorage for AzureBlob {
         #[allow(clippy::cast_possible_truncation)]
         let len = body.len() as u64;
         let data = azure_core::http::RequestContent::from(body);
-        blob.upload(data, true, len, None)
-            .await
-            .map_err(az_err)?;
+        blob.upload(data, true, len, None).await.map_err(az_err)?;
         Ok(())
     }
 

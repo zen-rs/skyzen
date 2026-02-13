@@ -93,11 +93,7 @@ impl KeyValueStore for CosmosKv {
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
-        match self
-            .container
-            .delete_item(key.to_string(), key, None)
-            .await
-        {
+        match self.container.delete_item(key.to_string(), key, None).await {
             Ok(_) => Ok(()),
             Err(e) if is_not_found(&e) => Ok(()),
             Err(e) => Err(az_err(e)),

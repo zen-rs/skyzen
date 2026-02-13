@@ -52,10 +52,7 @@ impl MessageQueue for SqsQueue {
     async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<(), QueueError> {
         // SQS supports up to 10 messages per batch
         for chunk in messages.chunks(10) {
-            let mut batch = self
-                .client
-                .send_message_batch()
-                .queue_url(&self.queue_url);
+            let mut batch = self.client.send_message_batch().queue_url(&self.queue_url);
 
             for (i, msg) in chunk.iter().enumerate() {
                 let entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()

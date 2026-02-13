@@ -26,12 +26,20 @@
 //! }
 //! ```
 
+#[cfg(all(target_arch = "wasm32", feature = "sqlite"))]
+compile_error!(
+    "Feature `sqlite` is not supported on wasm32 targets. \
+Use cloud vendor database services instead (for Cloudflare, use skyzen-cloudflare::CfD1 or CfDurableSqlite)."
+);
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod database;
 pub mod kv;
 mod maybe_send;
 pub mod queue;
 pub mod storage;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use database::Db;
 pub use kv::{KeyValueStore, Kv, KvError};
 pub use queue::{MessageQueue, Queue, QueueError};
@@ -42,4 +50,5 @@ pub use storage::{
 /// Re-export `SeaORM` for user convenience.
 ///
 /// Users can write `use skyzen_services::sea_orm::*;` to access the full `SeaORM` API.
+#[cfg(not(target_arch = "wasm32"))]
 pub use sea_orm;
