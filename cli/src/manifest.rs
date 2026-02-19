@@ -1,0 +1,139 @@
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SkyzenManifest {
+    #[serde(default)]
+    pub cloudflare: Option<CloudflareSection>,
+    #[serde(default)]
+    pub aws: Option<AwsSection>,
+    #[serde(default)]
+    pub azure: Option<AzureSection>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CloudflareSection {
+    pub name: Option<String>,
+    pub main: Option<String>,
+    pub compatibility_date: Option<String>,
+    #[serde(default)]
+    pub compatibility_flags: Vec<String>,
+    pub account_id: Option<String>,
+    pub workers_dev: Option<bool>,
+    pub route: Option<String>,
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+    #[serde(default)]
+    pub kv_namespaces: Vec<CfKvNamespace>,
+    #[serde(default)]
+    pub r2_buckets: Vec<CfR2Bucket>,
+    #[serde(default)]
+    pub d1_databases: Vec<CfD1Database>,
+    #[serde(default)]
+    pub queues: CfQueues,
+    #[serde(default)]
+    pub durable_objects: CfDurableObjects,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfKvNamespace {
+    pub binding: String,
+    pub id: String,
+    pub preview_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfR2Bucket {
+    pub binding: String,
+    pub bucket_name: String,
+    pub preview_bucket_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfD1Database {
+    pub binding: String,
+    pub database_name: String,
+    pub database_id: String,
+    pub preview_database_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfQueues {
+    #[serde(default)]
+    pub producers: Vec<CfQueueProducer>,
+    #[serde(default)]
+    pub consumers: Vec<CfQueueConsumer>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfQueueProducer {
+    pub binding: String,
+    pub queue: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfQueueConsumer {
+    pub queue: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfDurableObjects {
+    #[serde(default)]
+    pub bindings: Vec<CfDurableBinding>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfDurableBinding {
+    pub name: String,
+    pub class_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AwsSection {
+    pub template: Option<String>,
+    pub stack_name: Option<String>,
+    pub region: Option<String>,
+    pub profile: Option<String>,
+    pub local_port: Option<u16>,
+    pub env_vars: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AzureSection {
+    pub project: Option<String>,
+    pub app_name: Option<String>,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedManifest {
+    pub root_dir: PathBuf,
+    pub data: SkyzenManifest,
+}
+
+impl LoadedManifest {
+    pub fn load(path: &Path) -> Result<Self> {
+        let full_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .context("failed to read current directory")?
+                .join(path)
+        };
+        let root_dir = full_path
+            .parent()
+            .context("manifest path has no parent directory")?
+            .to_path_buf();
+        let content = fs::read_to_string(&full_path)
+            .with_context(|| format!("failed to read {}", full_path.display()))?;
+        let data: SkyzenManifest = toml::from_str(&content)
+            .with_context(|| format!("failed to parse {}", full_path.display()))?;
+        Ok(Self { root_dir, data })
+    }
+}

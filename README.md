@@ -119,13 +119,84 @@ async fn main() -> Router {
 
 ### WASM Deployment
 
-The same code compiles to WebAssembly for edge platforms:
+For production serverless deployments, use a `lib` crate (typically `cdylib`) instead of a binary target.
+
+`Cargo.toml`:
+
+```toml
+[lib]
+crate-type = ["cdylib", "rlib"]
+```
+
+`src/lib.rs`:
+
+```rust
+#[skyzen::main]
+fn app() -> Router {
+    router()
+}
+```
+
+Then build WebAssembly for edge platforms:
 
 ```sh
 cargo build --target wasm32-unknown-unknown --release
 ```
 
 On WASM targets, `#[skyzen::main]` exports a WinterCG-compatible `fetch` handler that works on Cloudflare Workers, Deno Deploy, and other edge runtimes.
+
+### Unified Emulator & Deploy CLI
+
+Skyzen now includes a unified CLI (`skyzen`) to run local emulators and deployments without writing provider-specific config files by hand.
+
+Commands:
+
+```sh
+skyzen doctor
+skyzen dev --provider cloudflare
+skyzen deploy --provider cloudflare
+skyzen dev --provider aws
+skyzen deploy --provider aws
+skyzen dev --provider azure
+skyzen deploy --provider azure
+```
+
+You can also run it from source:
+
+```sh
+cargo run -p skyzen-cli -- dev --provider cloudflare --manifest ./Skyzen.toml
+```
+
+`Skyzen.toml` provider example:
+
+```toml
+[cloudflare]
+name = "my-worker"
+main = "dist/worker.js"
+compatibility_date = "2025-02-01"
+workers_dev = true
+
+[[cloudflare.d1_databases]]
+binding = "DB"
+database_name = "app"
+database_id = "your-d1-id"
+
+[aws]
+template = "template.yaml"
+stack_name = "my-stack"
+region = "us-east-1"
+local_port = 3001
+
+[azure]
+project = "."
+app_name = "my-function-app"
+port = 7071
+```
+
+How providers map:
+- Cloudflare: generates `.skyzen/gen/wrangler.toml`, then runs `wrangler dev/deploy`
+- AWS: runs `sam local start-api` and `sam deploy`
+- Azure: runs `func start` and `func azure functionapp publish`
 
 ### `Skyzen.toml` Datasource Sugar
 

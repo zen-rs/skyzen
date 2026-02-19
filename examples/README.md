@@ -25,6 +25,14 @@ Features:
 - Single `#[skyzen::main]` entry that compiles to both native binaries and WinterCG `fetch` handlers.
 - Simple text routes you can interrogate via `curl` or Cloudflare Worker previews.
 
+Note: this file is an `example` target, so Cargo treats it as a binary.  
+For real serverless deployment, prefer a normal `lib` crate with:
+
+```toml
+[lib]
+crate-type = ["cdylib", "rlib"]
+```
+
 Run natively (helpful during development because you get logging, CLI overrides, and Ctrl+C handling automatically):
 
 ```sh
@@ -40,6 +48,12 @@ wasm-bindgen --target web target/wasm32-unknown-unknown/release/examples/worker.
 ```
 
 Deploy the generated artifacts with `wrangler publish worker-dist/worker.js` (create `worker.js` that imports the wasm bundle and forwards `fetch` to it).
+
+If you use `Skyzen.toml`, you can run Cloudflare local simulation via Skyzen CLI:
+
+```sh
+cargo run -p skyzen-cli -- dev --provider cloudflare --manifest ./Skyzen.toml --dry-run
+```
 
 ## `openapi.rs`
 

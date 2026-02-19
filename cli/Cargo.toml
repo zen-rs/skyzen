@@ -1,0 +1,22 @@
+[package]
+name = "skyzen-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Unified local emulation and deployment CLI for Skyzen"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "../README.md"
+keywords = ["skyzen", "cli", "serverless", "deploy"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "skyzen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[lints]
+workspace = true
