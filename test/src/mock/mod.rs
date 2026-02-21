@@ -1,7 +1,7 @@
 //! Mock service implementations for testing.
 //!
 //! All mocks are in-memory and isolated per instance.
-//! `InMemoryDb` uses SQLite memory mode and requires the crate runtime feature.
+//! `InMemoryDb` uses `SQLite` memory mode and requires the crate runtime feature.
 
 #[cfg(any(feature = "runtime-tokio-native-tls", feature = "runtime-tokio-rustls"))]
 pub mod db;

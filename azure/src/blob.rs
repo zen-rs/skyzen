@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use base64::Engine;
 use azure_core::http::headers::CONTENT_TYPE;
 use azure_core::http::pager::PagerOptions;
 use azure_core::http::StatusCode;
@@ -12,6 +11,7 @@ use azure_storage_blob::models::{
     BlobItemInternal,
 };
 use azure_storage_blob::BlobContainerClient;
+use base64::Engine;
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use skyzen_services::storage::{
@@ -244,8 +244,9 @@ fn decode_blob_list_cursor(cursor: Option<&str>) -> Result<AzureBlobListCursor, 
 }
 
 fn encode_blob_list_cursor(cursor: &AzureBlobListCursor) -> Result<String, StorageError> {
-    let payload = serde_json::to_vec(cursor)
-        .map_err(|e| StorageError::Backend(format!("failed to serialize Azure blob cursor: {e}")))?;
+    let payload = serde_json::to_vec(cursor).map_err(|e| {
+        StorageError::Backend(format!("failed to serialize Azure blob cursor: {e}"))
+    })?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
 }
 

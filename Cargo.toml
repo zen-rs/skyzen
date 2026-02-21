@@ -156,5 +156,9 @@ rt = []
 # enables the skyzen-hyper convenience wrapper.
 hyper = ["dep:skyzen-hyper"]
 
+[[example]]
+name = "embed_hyper"
+required-features = ["hyper"]
+
 [lints]
 workspace = true

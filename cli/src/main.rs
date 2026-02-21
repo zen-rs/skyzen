@@ -22,10 +22,10 @@ fn main() {
 fn run() -> Result<()> {
     let options = CliOptions::parse(std::env::args())?;
     let prepared = prepare(&options)?;
-    execute(prepared, options.dry_run)
+    execute(&prepared, options.dry_run)
 }
 
-fn execute(prepared: PreparedRun, dry_run: bool) -> Result<()> {
+fn execute(prepared: &PreparedRun, dry_run: bool) -> Result<()> {
     for file in &prepared.generated_files {
         if dry_run {
             println!("[dry-run] write {}", file.path.display());

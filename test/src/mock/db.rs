@@ -1,6 +1,6 @@
-//! In-memory SQLite database helper for testing.
+//! In-memory `SQLite` database helper for testing.
 //!
-//! This utility creates a [`skyzen_services::Db`] backed by SQLite in-memory
+//! This utility creates a [`skyzen_services::Db`] backed by `SQLite` in-memory
 //! storage (`sqlite::memory:`). It is useful for integration tests that need
 //! real SQL behavior without external infrastructure.
 
@@ -18,17 +18,17 @@ pub struct InMemoryDb {
 }
 
 impl InMemoryDb {
-    /// Create a new in-memory SQLite database.
+    /// Create a new in-memory `SQLite` database.
     ///
     /// # Errors
     ///
-    /// Returns an error if the SQLite connection cannot be established.
+    /// Returns an error if the `SQLite` connection cannot be established.
     pub async fn new() -> Result<Self, DbErr> {
         let conn = Database::connect("sqlite::memory:").await?;
         Ok(Self { db: Db::new(conn) })
     }
 
-    /// Create a new in-memory SQLite database and run schema SQL.
+    /// Create a new in-memory `SQLite` database and run schema SQL.
     ///
     /// This is convenient for tests that need quick table setup.
     ///

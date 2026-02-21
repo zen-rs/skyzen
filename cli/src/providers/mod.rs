@@ -47,7 +47,7 @@ pub struct PreparedRun {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ProviderPlan {
+pub struct ProviderPlan {
     commands: Vec<CommandPlan>,
     generated_files: Vec<GeneratedFile>,
 }
@@ -88,10 +88,10 @@ pub fn prepare(options: &CliOptions) -> Result<PreparedRun> {
 }
 
 fn run_doctor(provider: Option<Provider>) -> Result<()> {
-    let providers = match provider {
-        Some(p) => vec![p],
-        None => vec![Provider::Cloudflare, Provider::Aws, Provider::Azure],
-    };
+    let providers = provider.map_or_else(
+        || vec![Provider::Cloudflare, Provider::Aws, Provider::Azure],
+        |p| vec![p],
+    );
 
     let mut missing = Vec::new();
     for provider in providers {

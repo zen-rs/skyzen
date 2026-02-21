@@ -834,6 +834,7 @@ struct DatasourceConfig {
     key_env: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
     let datasources = load_datasources()?;
     let mut generated_items = Vec::with_capacity(datasources.len());
@@ -844,10 +845,7 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
         if !seen_idents.insert(ident.to_string()) {
             return Err(Error::new(
                 proc_macro2::Span::call_site(),
-                format!(
-                    "duplicate datasource type name after normalization: `{}`",
-                    ident
-                ),
+                format!("duplicate datasource type name after normalization: `{ident}`"),
             ));
         }
 
@@ -1018,10 +1016,7 @@ fn datasource_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>> {
         if !seen_idents.insert(ident.to_string()) {
             return Err(Error::new(
                 proc_macro2::Span::call_site(),
-                format!(
-                    "duplicate datasource type name after normalization: `{}`",
-                    ident
-                ),
+                format!("duplicate datasource type name after normalization: `{ident}`"),
             ));
         }
 

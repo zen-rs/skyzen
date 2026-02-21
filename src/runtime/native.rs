@@ -362,13 +362,10 @@ where
             connection = incoming.next().fuse() => {
                 match connection {
                     Some(Ok(stream)) => {
-                        let peer_addr = match stream.peer_addr() {
-                            Ok(peer) => {
-                                debug!("Accepted connection from {peer}");
-                                Some(peer)
-                            }
-                            Err(_) => None,
-                        };
+                        let peer_addr = stream.peer_addr().map_or(None, |peer| {
+                            debug!("Accepted connection from {peer}");
+                            Some(peer)
+                        });
                         let endpoint = endpoint.clone();
                         let (stream, is_h2) = match sniff_protocol(stream, HTTP2_PREFACE).await {
                             Ok(result) => result,

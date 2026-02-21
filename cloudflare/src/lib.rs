@@ -11,7 +11,7 @@
 //! - [`CfR2`] — Cloudflare R2 (implements [`ObjectStorage`])
 //! - [`CfQueue`] — Cloudflare Queues (implements [`MessageQueue`])
 //! - [`CfD1`] — Cloudflare D1 SQL database
-//! - [`CfDurableSqlite`] — Durable Object SQLite (`state.storage.sql`)
+//! - [`CfDurableSqlite`] — Durable Object `SQLite` (`state.storage.sql`)
 //!
 //! **This crate only works on `wasm32` targets.** On native targets it compiles
 //! as an empty crate.

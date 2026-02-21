@@ -121,7 +121,9 @@ mod test {
 
     #[test]
     fn accepts_content_type_without_parameters() {
-        assert!(is_application_json(&HeaderValue::from_static("application/json")));
+        assert!(is_application_json(&HeaderValue::from_static(
+            "application/json"
+        )));
     }
 
     #[test]
@@ -133,6 +135,8 @@ mod test {
 
     #[test]
     fn rejects_non_json_content_type() {
-        assert!(!is_application_json(&HeaderValue::from_static("text/plain")));
+        assert!(!is_application_json(&HeaderValue::from_static(
+            "text/plain"
+        )));
     }
 }

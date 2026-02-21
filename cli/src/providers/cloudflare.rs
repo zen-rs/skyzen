@@ -7,7 +7,7 @@ use crate::{
     providers::{CommandPlan, GeneratedFile, ProviderPlan},
 };
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::Path;
 
 pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan> {
     let config = manifest
@@ -50,7 +50,7 @@ pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan
     })
 }
 
-fn render_wrangler(config: &CloudflareSection, root_dir: &PathBuf) -> Result<String> {
+fn render_wrangler(config: &CloudflareSection, root_dir: &Path) -> Result<String> {
     let name = config.name.clone().unwrap_or_else(|| {
         root_dir
             .file_name()
@@ -70,12 +70,9 @@ fn render_wrangler(config: &CloudflareSection, root_dir: &PathBuf) -> Result<Str
     let main = config.main.as_deref().unwrap_or("worker.js");
 
     let mut out = String::new();
-    out.push_str(&format!("name = {}\n", quoted(&name)));
-    out.push_str(&format!("main = {}\n", quoted(main)));
-    out.push_str(&format!(
-        "compatibility_date = {}\n",
-        quoted(compatibility_date)
-    ));
+    push_quoted_assignment(&mut out, "name", &name);
+    push_quoted_assignment(&mut out, "main", main);
+    push_quoted_assignment(&mut out, "compatibility_date", compatibility_date);
 
     if !config.compatibility_flags.is_empty() {
         out.push_str("compatibility_flags = [");
@@ -88,16 +85,20 @@ fn render_wrangler(config: &CloudflareSection, root_dir: &PathBuf) -> Result<Str
         out.push_str("]\n");
     }
     if let Some(account_id) = &config.account_id {
-        out.push_str(&format!("account_id = {}\n", quoted(account_id)));
+        push_quoted_assignment(&mut out, "account_id", account_id);
     }
     if let Some(workers_dev) = config.workers_dev {
-        out.push_str(&format!("workers_dev = {workers_dev}\n"));
+        push_assignment(
+            &mut out,
+            "workers_dev",
+            if workers_dev { "true" } else { "false" },
+        );
     }
     if let Some(route) = &config.route {
-        out.push_str(&format!("route = {}\n", quoted(route)));
+        push_quoted_assignment(&mut out, "route", route);
     }
     if let Some(zone_id) = &config.zone_id {
-        out.push_str(&format!("zone_id = {}\n", quoted(zone_id)));
+        push_quoted_assignment(&mut out, "zone_id", zone_id);
     }
 
     append_vars(&mut out, &config.vars);
@@ -116,17 +117,17 @@ fn append_vars(out: &mut String, vars: &std::collections::BTreeMap<String, Strin
     }
     out.push_str("\n[vars]\n");
     for (key, value) in vars {
-        out.push_str(&format!("{key} = {}\n", quoted(value)));
+        push_quoted_assignment(out, key, value);
     }
 }
 
 fn append_kv(out: &mut String, entries: &[CfKvNamespace]) {
     for entry in entries {
         out.push_str("\n[[kv_namespaces]]\n");
-        out.push_str(&format!("binding = {}\n", quoted(&entry.binding)));
-        out.push_str(&format!("id = {}\n", quoted(&entry.id)));
+        push_quoted_assignment(out, "binding", &entry.binding);
+        push_quoted_assignment(out, "id", &entry.id);
         if let Some(preview_id) = &entry.preview_id {
-            out.push_str(&format!("preview_id = {}\n", quoted(preview_id)));
+            push_quoted_assignment(out, "preview_id", preview_id);
         }
     }
 }
@@ -134,13 +135,10 @@ fn append_kv(out: &mut String, entries: &[CfKvNamespace]) {
 fn append_r2(out: &mut String, entries: &[CfR2Bucket]) {
     for entry in entries {
         out.push_str("\n[[r2_buckets]]\n");
-        out.push_str(&format!("binding = {}\n", quoted(&entry.binding)));
-        out.push_str(&format!("bucket_name = {}\n", quoted(&entry.bucket_name)));
+        push_quoted_assignment(out, "binding", &entry.binding);
+        push_quoted_assignment(out, "bucket_name", &entry.bucket_name);
         if let Some(preview_bucket_name) = &entry.preview_bucket_name {
-            out.push_str(&format!(
-                "preview_bucket_name = {}\n",
-                quoted(preview_bucket_name)
-            ));
+            push_quoted_assignment(out, "preview_bucket_name", preview_bucket_name);
         }
     }
 }
@@ -148,17 +146,11 @@ fn append_r2(out: &mut String, entries: &[CfR2Bucket]) {
 fn append_d1(out: &mut String, entries: &[CfD1Database]) {
     for entry in entries {
         out.push_str("\n[[d1_databases]]\n");
-        out.push_str(&format!("binding = {}\n", quoted(&entry.binding)));
-        out.push_str(&format!(
-            "database_name = {}\n",
-            quoted(&entry.database_name)
-        ));
-        out.push_str(&format!("database_id = {}\n", quoted(&entry.database_id)));
+        push_quoted_assignment(out, "binding", &entry.binding);
+        push_quoted_assignment(out, "database_name", &entry.database_name);
+        push_quoted_assignment(out, "database_id", &entry.database_id);
         if let Some(preview_database_id) = &entry.preview_database_id {
-            out.push_str(&format!(
-                "preview_database_id = {}\n",
-                quoted(preview_database_id)
-            ));
+            push_quoted_assignment(out, "preview_database_id", preview_database_id);
         }
     }
 }
@@ -166,31 +158,43 @@ fn append_d1(out: &mut String, entries: &[CfD1Database]) {
 fn append_queue_producers(out: &mut String, entries: &[CfQueueProducer]) {
     for entry in entries {
         out.push_str("\n[[queues.producers]]\n");
-        out.push_str(&format!("binding = {}\n", quoted(&entry.binding)));
-        out.push_str(&format!("queue = {}\n", quoted(&entry.queue)));
+        push_quoted_assignment(out, "binding", &entry.binding);
+        push_quoted_assignment(out, "queue", &entry.queue);
     }
 }
 
 fn append_queue_consumers(out: &mut String, entries: &[CfQueueConsumer]) {
     for entry in entries {
         out.push_str("\n[[queues.consumers]]\n");
-        out.push_str(&format!("queue = {}\n", quoted(&entry.queue)));
+        push_quoted_assignment(out, "queue", &entry.queue);
     }
 }
 
 fn append_durable_bindings(out: &mut String, entries: &[CfDurableBinding]) {
     for entry in entries {
         out.push_str("\n[[durable_objects.bindings]]\n");
-        out.push_str(&format!("name = {}\n", quoted(&entry.name)));
-        out.push_str(&format!("class_name = {}\n", quoted(&entry.class_name)));
+        push_quoted_assignment(out, "name", &entry.name);
+        push_quoted_assignment(out, "class_name", &entry.class_name);
     }
+}
+
+fn push_assignment(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push_str(" = ");
+    out.push_str(value);
+    out.push('\n');
+}
+
+fn push_quoted_assignment(out: &mut String, key: &str, value: &str) {
+    let value = quoted(value);
+    push_assignment(out, key, &value);
 }
 
 fn quoted(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
-fn path_string(path: &PathBuf) -> Result<String> {
+fn path_string(path: &Path) -> Result<String> {
     path.to_str()
         .map(ToOwned::to_owned)
         .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
@@ -200,7 +204,7 @@ fn path_string(path: &PathBuf) -> Result<String> {
 mod tests {
     use super::*;
     use crate::manifest::{CfDurableObjects, CfQueues};
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     #[test]
     fn renders_wrangler_with_bindings() {
