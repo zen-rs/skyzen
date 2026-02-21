@@ -14,14 +14,14 @@ skyzen-redis = { path = "redis" }
 skyzen-s3 = { path = "s3" }
 
 http-kit = "0.4.2"
-executor-core = { version = "0.7.1", default-features = false, features = ["std", "async-executor"] }
+executor-core = { version = "0.7.1", default-features = false, features = ["std"] }
 skyzen-hyper = { path = "hyper" }
-tracing = "0.1.40"
+tracing = "0.1.44"
 skyzen = { path = "."}
-async-executor = "1.13"
+smol = "2.0"
 async-io = "2.6"
 async-net = "2.0"
-ctrlc = "3.4"
+ctrlc = "3.5"
 
 [workspace.lints]
 rust.missing_docs = "warn"
@@ -51,7 +51,7 @@ categories = ["web-programming::http-server"]
 [dependencies]
 skyzen-core.workspace = true
 http-kit.workspace = true
-matchit = "0.9.0"
+matchit = "0.9.1"
 serde = { version = "1.0", features = ["derive"] }
 cookie = { version = "0.18.1", features = ["percent-encode"] }
 tracing.workspace = true
@@ -61,51 +61,50 @@ include_dir = "0.7"
 skyzen-macros.workspace = true
 base64 = { version = "0.22", optional = true }
 sha1 = { version = "0.10", optional = true }
-futures-util = { version = "0.3.31" }
-futures-core = { version = "0.3.31" }
-multer = { version = "3.0", optional = true }
-http = "1.3"
+futures-util = { version = "0.3.32" }
+futures-core = { version = "0.3.32" }
+multer = { version = "3.1", optional = true }
+http = "1.4"
 utoipa = { version = "5.4", default-features = false }
 utoipa-redoc = "6.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-async-tungstenite = { version = "0.32.0", optional = true }
+async-tungstenite = { version = "0.33.0", optional = true }
 color-eyre = "0.6"
 linkme = "0.3"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 # Native-only dependencies (always available, not gated by features)
-executor-core.workspace = true
-async-executor.workspace = true
+executor-core = { workspace = true, features = ["smol"] }
 async-fs = "2.2.0"
 async-net.workspace = true
 async-io.workspace = true
+smol.workspace = true
 # async-channel is always available on native (used by runtime) and is also
 # available on WASM when the `sse` feature is enabled
-async-channel = "2.3"
+async-channel = "2.5"
 ctrlc.workspace = true
-hyper = { version = "1.6", features = ["server", "http1", "http2"] }
+hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 http-body-util = "0.1.3"
 # Optional native dependencies
-tokio = { version = "1.45", features = ["rt", "rt-multi-thread", "signal"], optional = true }
+tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "signal"], optional = true }
 skyzen-hyper = { workspace = true, optional = true }
-jsonwebtoken = { version = "9", optional = true }
+jsonwebtoken = { version = "10", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "net"] }
 executor-core = { version = "0.7.1", features = ["tokio"] }
 femme = "2.2.1"
 skyzen-hyper.workspace = true
-tempfile = "3.12"
-smol = "2.0"
+tempfile = "3.25"
 futures-lite = "2.6"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { version = "0.2.92", features = ["spans"] }
-wasm-bindgen-futures = "0.4.42"
-js-sys = "0.3.69"
-web-sys = { version = "0.3.69", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController"] }
-futures-channel = { version = "0.3.31", optional = true }
+wasm-bindgen = { version = "0.2.110", features = ["spans"] }
+wasm-bindgen-futures = "0.4.60"
+js-sys = "0.3.87"
+web-sys = { version = "0.3.87", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController"] }
+futures-channel = { version = "0.3.32", optional = true }
 
 [dependencies.serde_json]
 version = "1.0"
@@ -120,7 +119,7 @@ version = "1.0"
 optional = true
 
 [dependencies.async-channel]
-version = "2.3"
+version = "2.5"
 optional = true
 
 [dependencies.pin-project-lite]

@@ -9,9 +9,10 @@ use std::{
 
 use crate::{extract::PeerAddr, Endpoint, HttpError};
 use async_channel::{bounded, Receiver};
-use async_executor::Executor as AsyncExecutor;
 use async_net::TcpListener;
-use executor_core::{try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task};
+use executor_core::{
+    smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
+};
 use futures_util::{future::FutureExt, stream::MapOk, StreamExt, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
 use http_kit::{
@@ -315,24 +316,23 @@ where
     Fut: Future<Output = E> + Send + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
 {
-    let executor = Arc::new(AsyncExecutor::new());
-    if try_init_global_executor(executor.clone()).is_err() {
+    let executor = SmolGlobal;
+    if try_init_global_executor(executor).is_err() {
         debug!("Global executor already initialized; reusing existing instance");
     }
 
-    let executor_clone = Arc::clone(&executor);
-    async_io::block_on(executor.run(async move {
+    smol::block_on(async move {
         tracing::info!("Skyzen application starting up");
 
         let endpoint = factory().await;
-        match run_server(executor_clone, endpoint).await {
+        match run_server(executor, endpoint).await {
             Ok(()) => info!("Skyzen server shut down gracefully"),
             Err(error) => error!("Skyzen server terminated: {error}"),
         }
-    }));
+    });
 }
 
-async fn run_server<Exec, E>(executor: Arc<Exec>, endpoint: E) -> std::io::Result<()>
+async fn run_server<Exec, E>(executor: Exec, endpoint: E) -> std::io::Result<()>
 where
     Exec: CoreExecutor + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
@@ -345,6 +345,7 @@ where
         listener.local_addr().unwrap()
     );
 
+    let executor = Arc::new(executor);
     let hyper_executor = HyperExecutor(Arc::clone(&executor));
     let shared_executor: Arc<AnyExecutor> = Arc::new(AnyExecutor::new(Arc::clone(&executor)));
 

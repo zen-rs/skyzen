@@ -1,6 +1,6 @@
 //! Runtime utilities used by `#[skyzen::main]`.
 
-/// Native (async-executor backed) runtime utilities.
+/// Native (smol backed) runtime utilities.
 #[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
 pub mod native;
 

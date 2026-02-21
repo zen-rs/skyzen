@@ -4,7 +4,6 @@
 //! Values are stored as JSON documents with an `id` field (the key)
 //! and a `value` field (base64-encoded bytes).
 
-use azure_core::http::StatusCode;
 use azure_data_cosmos::clients::ContainerClient;
 use base64::Engine;
 use futures_util::TryStreamExt;
@@ -70,11 +69,11 @@ impl KeyValueStore for CosmosKv {
             .await
         {
             Ok(response) => {
-                let doc = response.into_model().map_err(az_err)?;
+                let doc = response.into_model().map_err(kv_backend_err)?;
                 decode_value(&doc.value).map(Some)
             }
-            Err(e) if is_not_found(&e) => Ok(None),
-            Err(e) => Err(az_err(e)),
+            Err(e) if is_not_found_status(e.http_status()) => Ok(None),
+            Err(e) => Err(kv_backend_err(e)),
         }
     }
 
@@ -88,15 +87,15 @@ impl KeyValueStore for CosmosKv {
         self.container
             .upsert_item(key.to_string(), doc, None)
             .await
-            .map_err(az_err)?;
+            .map_err(kv_backend_err)?;
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         match self.container.delete_item(key.to_string(), key, None).await {
             Ok(_) => Ok(()),
-            Err(e) if is_not_found(&e) => Ok(()),
-            Err(e) => Err(az_err(e)),
+            Err(e) if is_not_found_status(e.http_status()) => Ok(()),
+            Err(e) => Err(kv_backend_err(e)),
         }
     }
 
@@ -115,10 +114,10 @@ impl KeyValueStore for CosmosKv {
         let mut pager = self
             .container
             .query_items::<serde_json::Value>(query, (), None)
-            .map_err(az_err)?;
+            .map_err(kv_backend_err)?;
 
         let mut keys = Vec::new();
-        while let Some(item) = pager.try_next().await.map_err(az_err)? {
+        while let Some(item) = pager.try_next().await.map_err(kv_backend_err)? {
             if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
                 keys.push(id.to_owned());
             }
@@ -128,15 +127,13 @@ impl KeyValueStore for CosmosKv {
     }
 }
 
-/// Convert an Azure error to a [`KvError`].
-///
-/// Takes ownership to match `Result<_, Error>::map_err` signature.
-#[allow(clippy::needless_pass_by_value)]
-fn az_err(e: azure_core::Error) -> KvError {
+fn kv_backend_err<E: std::fmt::Display>(e: E) -> KvError {
     KvError::Backend(e.to_string())
 }
 
-/// Check if an Azure error is a 404 Not Found.
-fn is_not_found(err: &azure_core::Error) -> bool {
-    err.http_status() == Some(StatusCode::NotFound)
+fn is_not_found_status<S>(status: Option<S>) -> bool
+where
+    u16: From<S>,
+{
+    status.map(u16::from) == Some(404)
 }

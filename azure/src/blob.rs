@@ -4,11 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use azure_core::http::headers::CONTENT_TYPE;
-use azure_core::http::pager::PagerOptions;
 use azure_core::http::StatusCode;
 use azure_storage_blob::models::{
-    BlobClientGetPropertiesResultHeaders, BlobContainerClientListBlobFlatSegmentOptions,
-    BlobItemInternal,
+    BlobClientGetPropertiesResultHeaders, BlobContainerClientListBlobsOptions, BlobItem,
 };
 use azure_storage_blob::BlobContainerClient;
 use base64::Engine;
@@ -51,16 +49,16 @@ impl AzureBlob {
     }
 }
 
-/// Extract the blob name from a [`BlobItemInternal`], falling back to an empty string.
-fn blob_name(blob: &BlobItemInternal) -> String {
+/// Extract the blob name from a [`BlobItem`], falling back to an empty string.
+fn blob_name(blob: &BlobItem) -> String {
     blob.name
         .as_ref()
         .and_then(|n| n.content.clone())
         .unwrap_or_default()
 }
 
-/// Extract content length from a [`BlobItemInternal`], defaulting to 0.
-fn blob_content_length(blob: &BlobItemInternal) -> u64 {
+/// Extract content length from a [`BlobItem`], defaulting to 0.
+fn blob_content_length(blob: &BlobItem) -> u64 {
     blob.properties
         .as_ref()
         .and_then(|p| p.content_length)
@@ -125,13 +123,10 @@ impl ObjectStorage for AzureBlob {
         let incoming_cursor = decode_blob_list_cursor(options.cursor.as_deref())?;
         let mut pager = self
             .container
-            .list_blobs(Some(BlobContainerClientListBlobFlatSegmentOptions {
+            .list_blobs(Some(BlobContainerClientListBlobsOptions {
                 prefix: options.prefix.clone(),
+                marker: incoming_cursor.marker.clone(),
                 maxresults: options.limit.map(limit_to_i32).transpose()?,
-                method_options: PagerOptions {
-                    continuation_token: incoming_cursor.marker.clone(),
-                    ..Default::default()
-                },
                 ..Default::default()
             }))
             .map_err(az_err)?;
@@ -149,7 +144,7 @@ impl ObjectStorage for AzureBlob {
             advance_blob_cursor(
                 &mut current_marker,
                 &mut offset_in_page,
-                pager.continuation_token().cloned(),
+                pager.continuation().cloned().map(String::from),
             )?;
         }
 
@@ -167,7 +162,7 @@ impl ObjectStorage for AzureBlob {
             advance_blob_cursor(
                 &mut current_marker,
                 &mut offset_in_page,
-                pager.continuation_token().cloned(),
+                pager.continuation().cloned().map(String::from),
             )?;
 
             objects.push(ObjectMetadata {
