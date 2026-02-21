@@ -191,7 +191,13 @@ extern "C" {
 ///
 /// # Errors
 ///
-/// Returns `JsValue` error if the binding cannot be accessed.
+/// Returns `JsValue` error if the binding cannot be accessed or does not exist.
 pub fn get_binding(env: &JsValue, name: &str) -> Result<JsValue, JsValue> {
-    js_sys::Reflect::get(env, &JsValue::from_str(name))
+    let binding = js_sys::Reflect::get(env, &JsValue::from_str(name))?;
+    if binding.is_undefined() || binding.is_null() {
+        return Err(JsValue::from_str(&format!(
+            "missing Cloudflare Workers binding '{name}'"
+        )));
+    }
+    Ok(binding)
 }

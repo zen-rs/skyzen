@@ -28,16 +28,22 @@ impl CliOptions {
         let mut args = args.into_iter();
         let _ = args.next();
 
-        let Some(action_raw) = args.next() else {
-            print_usage_and_exit();
-        };
-        let action = parse_action(&action_raw)?;
-
+        let mut action = None;
         let mut provider = None;
         let mut manifest = PathBuf::from("Skyzen.toml");
         let mut dry_run = false;
 
         while let Some(arg) = args.next() {
+            if let Some(value) = arg.strip_prefix("--provider=") {
+                provider = Some(parse_provider(value)?);
+                continue;
+            }
+
+            if let Some(value) = arg.strip_prefix("--manifest=") {
+                manifest = PathBuf::from(value);
+                continue;
+            }
+
             match arg.as_str() {
                 "--provider" | "-p" => {
                     let value = args
@@ -57,11 +63,21 @@ impl CliOptions {
                 "--help" | "-h" => {
                     print_usage_and_exit();
                 }
-                unknown => {
+                unknown if unknown.starts_with('-') => {
                     anyhow::bail!("unsupported argument: {unknown}");
+                }
+                action_raw => {
+                    if action.is_some() {
+                        anyhow::bail!("action already specified: {action_raw}");
+                    }
+                    action = Some(parse_action(action_raw)?);
                 }
             }
         }
+
+        let Some(action) = action else {
+            print_usage_and_exit();
+        };
 
         match action {
             Action::Doctor => {}
@@ -133,5 +149,31 @@ mod tests {
         let args = vec!["skyzen".to_string(), "deploy".to_string()];
         let error = CliOptions::parse(args).expect_err("parse should fail");
         assert!(error.to_string().contains("--provider"));
+    }
+
+    #[test]
+    fn parses_global_flag_before_action() {
+        let args = vec![
+            "skyzen".to_string(),
+            "--dry-run".to_string(),
+            "doctor".to_string(),
+        ];
+        let parsed = CliOptions::parse(args).expect("parse should succeed");
+        assert_eq!(parsed.action, Action::Doctor);
+        assert!(parsed.dry_run);
+    }
+
+    #[test]
+    fn parses_equals_style_flags() {
+        let args = vec![
+            "skyzen".to_string(),
+            "--provider=aws".to_string(),
+            "--manifest=custom.toml".to_string(),
+            "deploy".to_string(),
+        ];
+        let parsed = CliOptions::parse(args).expect("parse should succeed");
+        assert_eq!(parsed.action, Action::Deploy);
+        assert_eq!(parsed.provider, Some(Provider::Aws));
+        assert_eq!(parsed.manifest, PathBuf::from("custom.toml"));
     }
 }

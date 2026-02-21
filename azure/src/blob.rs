@@ -3,11 +3,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use base64::Engine;
 use azure_core::http::headers::CONTENT_TYPE;
+use azure_core::http::pager::PagerOptions;
 use azure_core::http::StatusCode;
-use azure_storage_blob::models::{BlobClientGetPropertiesResultHeaders, BlobItemInternal};
+use azure_storage_blob::models::{
+    BlobClientGetPropertiesResultHeaders, BlobContainerClientListBlobFlatSegmentOptions,
+    BlobItemInternal,
+};
 use azure_storage_blob::BlobContainerClient;
 use futures_util::TryStreamExt;
+use serde::{Deserialize, Serialize};
 use skyzen_services::storage::{
     ListOptions, ListResult, ObjectMetadata, ObjectStorage, StorageError, StorageObject,
 };
@@ -110,40 +116,78 @@ impl ObjectStorage for AzureBlob {
     }
 
     async fn list(&self, options: ListOptions) -> Result<ListResult, StorageError> {
-        let mut pager = self.container.list_blobs(None).map_err(az_err)?;
+        if options.limit == Some(0) {
+            return Err(StorageError::Backend(
+                "list limit must be greater than zero".to_owned(),
+            ));
+        }
 
-        let mut objects = Vec::new();
+        let incoming_cursor = decode_blob_list_cursor(options.cursor.as_deref())?;
+        let mut pager = self
+            .container
+            .list_blobs(Some(BlobContainerClientListBlobFlatSegmentOptions {
+                prefix: options.prefix.clone(),
+                maxresults: options.limit.map(limit_to_i32).transpose()?,
+                method_options: PagerOptions {
+                    continuation_token: incoming_cursor.marker.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .map_err(az_err)?;
 
-        while let Some(blob) = pager.try_next().await.map_err(az_err)? {
-            let name = blob_name(&blob);
+        let mut current_marker = incoming_cursor.marker;
+        let mut offset_in_page = 0usize;
 
-            // Apply prefix filter if specified
-            if let Some(ref prefix) = options.prefix {
-                if !name.starts_with(prefix.as_str()) {
-                    continue;
-                }
+        for _ in 0..incoming_cursor.offset {
+            if pager.try_next().await.map_err(az_err)?.is_none() {
+                return Err(StorageError::Backend(
+                    "invalid Azure blob cursor: offset exceeds available items".to_owned(),
+                ));
             }
 
+            advance_blob_cursor(
+                &mut current_marker,
+                &mut offset_in_page,
+                pager.continuation_token().cloned(),
+            )?;
+        }
+
+        let limit = options.limit.unwrap_or(usize::MAX);
+        let mut objects = Vec::new();
+
+        loop {
+            let Some(blob) = pager.try_next().await.map_err(az_err)? else {
+                return Ok(ListResult {
+                    objects,
+                    cursor: None,
+                });
+            };
+
+            advance_blob_cursor(
+                &mut current_marker,
+                &mut offset_in_page,
+                pager.continuation_token().cloned(),
+            )?;
+
             objects.push(ObjectMetadata {
-                key: name,
+                key: blob_name(&blob),
                 size: blob_content_length(&blob),
                 content_type: None,
                 last_modified: None,
                 metadata: HashMap::new(),
             });
 
-            // Stop at the limit
-            if let Some(limit) = options.limit {
-                if objects.len() >= limit {
-                    break;
-                }
+            if objects.len() >= limit {
+                return Ok(ListResult {
+                    objects,
+                    cursor: Some(encode_blob_list_cursor(&AzureBlobListCursor {
+                        marker: current_marker.clone(),
+                        offset: offset_in_page,
+                    })?),
+                });
             }
         }
-
-        Ok(ListResult {
-            objects,
-            cursor: None,
-        })
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMetadata>, StorageError> {
@@ -180,7 +224,92 @@ fn az_err(e: azure_core::Error) -> StorageError {
     StorageError::Backend(e.to_string())
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct AzureBlobListCursor {
+    marker: Option<String>,
+    offset: usize,
+}
+
+fn decode_blob_list_cursor(cursor: Option<&str>) -> Result<AzureBlobListCursor, StorageError> {
+    let Some(cursor) = cursor else {
+        return Ok(AzureBlobListCursor::default());
+    };
+
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|e| StorageError::Backend(format!("invalid Azure blob cursor encoding: {e}")))?;
+
+    serde_json::from_slice(&bytes)
+        .map_err(|e| StorageError::Backend(format!("invalid Azure blob cursor payload: {e}")))
+}
+
+fn encode_blob_list_cursor(cursor: &AzureBlobListCursor) -> Result<String, StorageError> {
+    let payload = serde_json::to_vec(cursor)
+        .map_err(|e| StorageError::Backend(format!("failed to serialize Azure blob cursor: {e}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
+}
+
+fn advance_blob_cursor(
+    current_marker: &mut Option<String>,
+    offset_in_page: &mut usize,
+    marker_after_item: Option<String>,
+) -> Result<(), StorageError> {
+    if *current_marker != marker_after_item {
+        *current_marker = marker_after_item;
+        *offset_in_page = 0;
+    }
+    *offset_in_page = offset_in_page
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Backend("Azure blob cursor offset overflow".to_owned()))?;
+    Ok(())
+}
+
+fn limit_to_i32(limit: usize) -> Result<i32, StorageError> {
+    i32::try_from(limit)
+        .map_err(|_| StorageError::Backend(format!("list limit too large for Azure Blob: {limit}")))
+}
+
 /// Check if an Azure error is a 404 Not Found.
 fn is_not_found(err: &azure_core::Error) -> bool {
     err.http_status() == Some(StatusCode::NotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        advance_blob_cursor, decode_blob_list_cursor, encode_blob_list_cursor, AzureBlobListCursor,
+    };
+
+    #[test]
+    fn cursor_round_trip() {
+        let cursor = AzureBlobListCursor {
+            marker: Some("opaque-marker".to_owned()),
+            offset: 42,
+        };
+        let encoded = encode_blob_list_cursor(&cursor).expect("cursor should encode");
+        let decoded = decode_blob_list_cursor(Some(&encoded)).expect("cursor should decode");
+        assert_eq!(decoded, cursor);
+    }
+
+    #[test]
+    fn invalid_cursor_is_rejected() {
+        let err = decode_blob_list_cursor(Some("not-a-valid-cursor"))
+            .expect_err("invalid cursor should fail");
+        assert!(err.to_string().contains("invalid Azure blob cursor"));
+    }
+
+    #[test]
+    fn cursor_offset_resets_on_marker_change() {
+        let mut marker = None;
+        let mut offset = 0usize;
+
+        advance_blob_cursor(&mut marker, &mut offset, None).expect("advance should work");
+        assert_eq!(marker, None);
+        assert_eq!(offset, 1);
+
+        advance_blob_cursor(&mut marker, &mut offset, Some("next-page".to_owned()))
+            .expect("advance should work");
+        assert_eq!(marker, Some("next-page".to_owned()));
+        assert_eq!(offset, 1);
+    }
 }

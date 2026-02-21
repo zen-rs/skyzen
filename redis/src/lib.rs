@@ -79,8 +79,15 @@ impl KeyValueStore for Redis {
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, KvError> {
         let mut conn = self.conn.clone();
         let pattern = prefix.map_or_else(|| "*".to_owned(), |p| format!("{p}*"));
-        conn.keys(pattern)
+        let mut iter: redis::AsyncIter<String> = conn
+            .scan_match(pattern)
             .await
-            .map_err(|e| KvError::Backend(e.to_string()))
+            .map_err(|e| KvError::Backend(e.to_string()))?;
+
+        let mut keys = Vec::new();
+        while let Some(key) = iter.next_item().await {
+            keys.push(key.map_err(|e| KvError::Backend(e.to_string()))?);
+        }
+        Ok(keys)
     }
 }

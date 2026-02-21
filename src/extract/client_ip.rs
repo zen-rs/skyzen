@@ -1,7 +1,7 @@
 //! Look up the IP address of client.
 
 use std::{
-    net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr},
     str::{FromStr, Utf8Error},
 };
 
@@ -138,23 +138,65 @@ fn parse_forwarded(v: &[u8]) -> Result<Option<IpAddr>, ClientIpError> {
             }
 
             trim(&mut value);
-
-            if strip_once(&mut value, b"\"") {
-                if let Some(value) = get_ipv6_str(value) {
-                    return Ok(Some(
-                        Ipv6Addr::from_str(std::str::from_utf8(value)?)?.into(),
-                    ));
-                }
-                return Ok(Some(
-                    Ipv4Addr::from_str(std::str::from_utf8(value)?)?.into(),
-                ));
-            }
-            return Ok(Some(
-                Ipv4Addr::from_str(std::str::from_utf8(value)?)?.into(),
-            ));
+            return Ok(Some(parse_forwarded_for_value(value)?));
         }
     }
     Ok(None)
+}
+
+fn parse_forwarded_for_value(mut value: &[u8]) -> Result<IpAddr, ClientIpError> {
+    trim(&mut value);
+    if let Some(unquoted) = value.strip_prefix(b"\"") {
+        let Some(unquoted) = unquoted.strip_suffix(b"\"") else {
+            return Err(ClientIpError::InvalidForwardedHeader);
+        };
+        return parse_ip_addr_with_optional_port(unquoted);
+    }
+    parse_ip_addr_with_optional_port(value)
+}
+
+fn parse_ip_addr_with_optional_port(value: &[u8]) -> Result<IpAddr, ClientIpError> {
+    let value = std::str::from_utf8(value)?;
+
+    if let Some(ipv6) = parse_bracketed_ipv6(value)? {
+        return Ok(ipv6.into());
+    }
+
+    match IpAddr::from_str(value) {
+        Ok(addr) => Ok(addr),
+        Err(parse_err) => {
+            if let Some((host, port)) = value.rsplit_once(':') {
+                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                    return Ok(IpAddr::from_str(host)?);
+                }
+            }
+            Err(parse_err.into())
+        }
+    }
+}
+
+fn parse_bracketed_ipv6(value: &str) -> Result<Option<Ipv6Addr>, ClientIpError> {
+    if !value.starts_with('[') {
+        return Ok(None);
+    }
+
+    let Some(end_bracket) = value.find(']') else {
+        return Err(ClientIpError::InvalidForwardedHeader);
+    };
+
+    let host = &value[1..end_bracket];
+    let remainder = &value[end_bracket + 1..];
+
+    if !remainder.is_empty() {
+        let Some(port) = remainder.strip_prefix(':') else {
+            return Err(ClientIpError::InvalidForwardedHeader);
+        };
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ClientIpError::InvalidForwardedHeader);
+        }
+    }
+
+    Ok(Some(Ipv6Addr::from_str(host)?))
 }
 
 fn parse_x_forwarded_for(v: &[u8]) -> Result<Option<IpAddr>, ClientIpError> {
@@ -185,36 +227,6 @@ fn trim(s: &mut &[u8]) {
     }
 }
 
-fn strip_once(s: &mut &[u8], pat: &[u8]) -> bool {
-    if let Some(s2) = s.strip_prefix(pat) {
-        *s = s2;
-    } else {
-        return false;
-    }
-
-    if let Some(s2) = s.strip_suffix(pat) {
-        *s = s2;
-    } else {
-        return false;
-    }
-
-    true
-}
-
-fn get_ipv6_str(s: &[u8]) -> Option<&[u8]> {
-    if *s.first()? != b'[' {
-        return None;
-    }
-
-    for (i, ss) in s.iter().enumerate() {
-        if *ss == b']' {
-            return Some(&s[1..i]);
-        }
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use std::{net::IpAddr, str::FromStr};
@@ -241,6 +253,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(addr, IpAddr::from([192, 0, 2, 55]));
+    }
+
+    #[test]
+    fn test_forwarded_with_ipv4_port() {
+        let addr = parse_forwarded(b"for=198.51.100.17:443").unwrap().unwrap();
+        assert_eq!(addr, IpAddr::from([198, 51, 100, 17]));
+    }
+
+    #[test]
+    fn test_forwarded_with_unquoted_ipv6_port() {
+        let addr = parse_forwarded(b"for=[2001:db8:cafe::17]:4711")
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr, IpAddr::from_str("2001:db8:cafe::17").unwrap());
     }
 
     #[test]

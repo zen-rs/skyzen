@@ -67,11 +67,23 @@ pub enum JsonContentTypeError {
     InvalidPayload,
 }
 
+fn is_application_json(content_type: &HeaderValue) -> bool {
+    let Ok(value) = content_type.to_str() else {
+        return false;
+    };
+
+    let Some(media_type) = value.split(';').next().map(str::trim) else {
+        return false;
+    };
+
+    media_type.eq_ignore_ascii_case("application/json")
+}
+
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
     type Error = JsonContentTypeError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
-            if content_type != "application/json" {
+            if !is_application_json(content_type) {
                 return Err(JsonContentTypeError::Unsupported);
             }
         } else {
@@ -103,43 +115,24 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
 
 #[cfg(test)]
 mod test {
-    /* use super::Json;
-    use http_kit::Request;
-    use serde::{Deserialize, Serialize};
-    #[derive(Debug, Serialize, Deserialize)]
-    struct Lexo {
-        firstname: String,
-        age: u8,
+    use http_kit::header::HeaderValue;
+
+    use super::is_application_json;
+
+    #[test]
+    fn accepts_content_type_without_parameters() {
+        assert!(is_application_json(&HeaderValue::from_static("application/json")));
     }
 
     #[test]
-    fn serialize() {
-        async fn handler() -> Json<Lexo> {
-            Json(Lexo {
-                firstname: "Lexo".to_string(),
-                age: 17,
-            })
-        }
-
-        test_handler!(handler, r#"{"firstname":"Lexo","age":17}"#.to_string());
+    fn accepts_content_type_with_parameters() {
+        assert!(is_application_json(&HeaderValue::from_static(
+            "application/json; charset=utf-8"
+        )));
     }
 
     #[test]
-    fn deserialize() {
-        async fn handler(Json(lexo): Json<Lexo>) -> String {
-            let firstname = lexo.firstname;
-            format!("Hello,{firstname}!")
-        }
-
-        test_handler!(
-            handler,
-            "Hello,Lexo!",
-            request = Request::post("http://localhost:8080/")
-                .json(Lexo {
-                    firstname: "Lexo".to_string(),
-                    age: 17
-                })
-                .unwrap()
-        );
-    }*/
+    fn rejects_non_json_content_type() {
+        assert!(!is_application_json(&HeaderValue::from_static("text/plain")));
+    }
 }
