@@ -43,7 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
-      - run: cargo build --target wasm32-unknown-unknown
+      - run: cargo build -p skyzen --target wasm32-unknown-unknown
 
   coverage:
     name: Coverage
