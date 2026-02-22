@@ -1,4 +1,32 @@
-//! A simple and fast web server framework.
+//! Skyzen — a fast, ergonomic HTTP framework for Rust that works everywhere.
+//!
+//! Skyzen targets both native servers (Tokio + Hyper) and WebAssembly edge platforms
+//! (Cloudflare Workers, Deno Deploy). Write your handlers once, deploy anywhere.
+//!
+//! # Key Modules
+//!
+//! - [`routing`] — Tree-based routing with path parameters and HTTP method matching
+//! - [`extract`] — Extract typed data from requests (JSON, query strings, path params, headers)
+//! - [`responder`] — Convert types into HTTP responses (`Json<T>`, `String`, `StatusCode`, etc.)
+//! - [`handler`] — Async functions with extractors as arguments become endpoints automatically
+//! - [`utils`] — Common utilities including `Json<T>` and `Redirect`
+//! - [`mod@openapi`] — Automatic `OpenAPI` documentation from annotated handlers
+//! - [`runtime`] — Runtime primitives for `#[skyzen::main]`
+//! - [`websocket`] — Unified WebSocket API across native and WASM (requires `ws` feature)
+//!
+//! # Getting Started
+//!
+//! ```rust,ignore
+//! use skyzen::routing::{CreateRouteNode, Route, Router};
+//!
+//! #[skyzen::main]
+//! fn main() -> Router {
+//!     Route::new((
+//!         "/".at(|| async { "Hello, World!" }),
+//!     ))
+//!     .build()
+//! }
+//! ```
 
 extern crate self as skyzen;
 

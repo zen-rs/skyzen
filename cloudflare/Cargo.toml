@@ -5,7 +5,7 @@ edition = "2021"
 description = "Cloudflare Workers service implementations for the Skyzen framework"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zen-rs/skyzen"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["cloudflare", "workers", "skyzen", "services"]
 categories = ["web-programming::http-server", "wasm"]
 

@@ -1,0 +1,96 @@
+# skyzen-services
+
+[![Crates.io](https://img.shields.io/crates/v/skyzen-services.svg)](https://crates.io/crates/skyzen-services)
+[![Documentation](https://docs.rs/skyzen-services/badge.svg)](https://docs.rs/skyzen-services)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](https://github.com/zen-rs/skyzen/blob/main/LICENSE-MIT)
+
+Portable service abstractions for the Skyzen HTTP framework.
+
+## Overview
+
+`skyzen-services` provides a set of platform-agnostic traits and extractors for common backend services. By using these abstractions, your request handlers remain decoupled from specific cloud providers or storage backends, allowing the same code to run on native servers (Redis/S3/Postgres) or at the edge (Cloudflare KV/R2/D1).
+
+## Two-Trait Pattern
+
+To enable type-erased dynamic dispatch while maintaining an ergonomic API for implementors, this crate employs a two-layer design:
+
+1.  **Public Trait** (e.g., `KeyValueStore`): Ergonomic for backend implementors, using `impl Future` and standard bounds.
+2.  **Private `*Obj` Trait**: Object-safe version using `BoxFuture` for dynamic dispatch.
+3.  **Bridge**: A blanket implementation that automatically adapts any `T: PublicTrait` to the object-safe version.
+4.  **User-facing Wrapper** (e.g., `Kv`): A struct holding the boxed trait that implements `Extractor`, allowing it to be injected directly into handlers.
+
+## Service Traits
+
+| Trait | Wrapper | Key Methods |
+| :--- | :--- | :--- |
+| `KeyValueStore` | `Kv` | `get`, `put`, `delete`, `list` + `get_json`, `get_text`, `put_json` |
+| `ObjectStorage` | `Storage` | `get`, `put`, `delete`, `list`, `head` |
+| `MessageQueue` | `Queue` | `send`, `send_batch` + `send_json`, `send_json_batch` |
+
+### Database (`Db`)
+
+`Db` wraps a `sea_orm::DatabaseConnection` and implements `Extractor`. It is **not** a Skyzen service trait — it re-exports [SeaORM](https://www.sea-ql.org/SeaORM/) directly for SQL database access. Native-only (not available on WASM targets).
+
+## Quick Start
+
+Handlers pull in services as extractors. The framework automatically retrieves the configured implementation from request extensions.
+
+```rust
+use skyzen_services::{Kv, Storage};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct UserProfile {
+    name: String,
+    avatar_url: String,
+}
+
+async fn update_profile(
+    kv: Kv,
+    storage: Storage,
+    // Note: Json extractor is provided by the main skyzen crate
+) -> Result<(), Box<dyn std::error::Error>> {
+    let profile = UserProfile {
+        name: "Alice".into(),
+        avatar_url: "avatars/alice.png".into()
+    };
+
+    // Store metadata in KV
+    kv.put_json("user:123", &profile).await?;
+
+    // Check if avatar exists in object storage
+    let _exists = storage.head(&profile.avatar_url).await?.is_some();
+
+    Ok(())
+}
+```
+
+## Platform Compatibility (`MaybeSend`)
+
+Skyzen supports both multi-threaded native runtimes and single-threaded WASM environments. To handle this, `skyzen-services` uses the `MaybeSend` pattern:
+
+- **Native**: `MaybeSend` resolves to `Send`. All futures and traits require `Send` bounds for thread safety.
+- **WASM**: `MaybeSend` is a no-op. This allows using JS-backed types (like `WebSocket` or `ReadableStream`) which are inherently `!Send`.
+
+## Feature Flags
+
+### Runtime Selection
+- `runtime-tokio-native-tls`: Use Tokio with `native-tls` for SeaORM.
+- `runtime-tokio-rustls`: Use Tokio with `rustls` for SeaORM.
+- `runtime-async-std-native-tls`: Use `async-std` with `native-tls`.
+
+### Database Backends
+- `postgres`, `mysql`, `sqlite`: Enable specific SeaORM drivers.
+
+> **WASM Note**: The `sqlite` feature is rejected at compile-time on `wasm32` targets. For edge environments like Cloudflare, use vendor-specific databases via `skyzen-cloudflare` (e.g., D1 or Durable Object SQLite).
+
+## Related Crates
+
+These crates provide concrete implementations for the traits defined here:
+
+- [`skyzen-redis`](../redis): Redis implementation for `KeyValueStore`.
+- [`skyzen-s3`](../s3): S3-compatible implementation for `ObjectStorage`.
+- [`skyzen-cloudflare`](../cloudflare): Cloudflare Workers (KV, R2, Queues, D1).
+- [`skyzen-aws`](../aws): AWS (DynamoDB, SQS).
+- [`skyzen-azure`](../azure): Azure (Cosmos DB, Blob Storage, Service Bus).
+- [`skyzen-test`](../test): In-memory mocks for unit testing.

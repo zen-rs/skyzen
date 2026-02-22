@@ -1,6 +1,17 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
-//! The hyper backend of skyzen
+//! Hyper server backend for the Skyzen framework.
+//!
+//! This crate provides [`Hyper`], which implements the [`Server`] trait from
+//! `skyzen-core`, bridging Skyzen's [`Endpoint`] abstraction with Hyper's
+//! HTTP/1 and HTTP/2 server implementation.
+//!
+//! Most users don't need this crate directly — `#[skyzen::main]` sets up Hyper
+//! automatically. Use this crate when embedding Skyzen into an existing application
+//! with a custom async runtime.
+//!
+//! See the [`embed_hyper.rs`](https://github.com/zen-rs/skyzen/blob/main/examples/embed_hyper.rs)
+//! example for a complete setup using `smol` as the async runtime.
 
 use core::future::Future;
 use executor_core::{AnyExecutor, Executor, Task};

@@ -5,7 +5,7 @@ edition = "2021"
 description = "Unified local emulation and deployment CLI for Skyzen"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zen-rs/skyzen"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["skyzen", "cli", "serverless", "deploy"]
 categories = ["command-line-utilities", "development-tools"]
 

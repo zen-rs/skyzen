@@ -1,6 +1,6 @@
 # Examples
 
-The `examples` directory demonstrates how to target both native and wasm runtimes with the same Skyzen APIs. Run them from the repository root.
+The `examples` directory demonstrates how to target both native and WASM runtimes with the same Skyzen APIs. Run them from the repository root.
 
 ## `native.rs`
 
@@ -25,7 +25,7 @@ Features:
 - Single `#[skyzen::main]` entry that compiles to both native binaries and WinterCG `fetch` handlers.
 - Simple text routes you can interrogate via `curl` or Cloudflare Worker previews.
 
-Note: this file is an `example` target, so Cargo treats it as a binary.  
+Note: this file is an `example` target, so Cargo treats it as a binary.
 For real serverless deployment, prefer a normal `lib` crate with:
 
 ```toml
@@ -67,4 +67,54 @@ Run it locally:
 
 ```sh
 cargo run --example openapi
+```
+
+## `openapi_full.rs`
+
+Features:
+
+- Extended OpenAPI example with multiple annotated handlers.
+- Demonstrates `enable_api_doc()` to serve ReDoc documentation at `/api-docs`.
+- Shows typed request/response schemas with `#[skyzen::openapi]`.
+
+```sh
+cargo run --example openapi_full
+```
+
+## `websocket_echo.rs`
+
+Features:
+
+- Unified WebSocket API that works on both native and WASM targets.
+- Demonstrates text, JSON (`recv_json`/`send`), and binary message handling.
+- Uses the `.ws()` route convenience method.
+
+```sh
+cargo run --example websocket_echo
+```
+
+## `embed_hyper.rs`
+
+Features:
+
+- Demonstrates embedding Skyzen into a custom runtime without the `#[skyzen::main]` macro.
+- Uses `smol` as the async runtime instead of Tokio.
+- Shows direct use of `Hyper.serve()` with a custom executor and TCP listener.
+
+Requires the `hyper` feature:
+
+```sh
+cargo run --example embed_hyper
+```
+
+## `services.rs`
+
+Features:
+
+- Demonstrates portable service abstractions with `Kv` and `Storage` as handler extractors.
+- Uses `InMemoryKv` and `InMemoryStorage` for local development.
+- Shows how to swap to Redis/S3 with a one-line change (commented examples in code).
+
+```sh
+cargo run --example services
 ```
