@@ -181,6 +181,14 @@ binding = "DB"
 database_name = "app"
 database_id = "your-d1-id"
 
+[[cloudflare.durable_objects.bindings]]
+name = "STATE"
+class_name = "State"
+
+[[cloudflare.durable_objects.migrations]]
+tag = "v1"
+new_sqlite_classes = ["State"]
+
 [aws]
 template = "template.yaml"
 stack_name = "my-stack"
@@ -192,6 +200,8 @@ project = "."
 app_name = "my-function-app"
 port = 7071
 ```
+
+For Durable Objects, bump the migration `tag` (`v2`, `v3`, ...) whenever class definitions change.
 
 How providers map:
 - Cloudflare: generates `.skyzen/gen/wrangler.toml`, then runs `wrangler dev/deploy`

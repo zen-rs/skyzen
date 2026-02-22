@@ -86,12 +86,34 @@ pub struct CfQueueConsumer {
 pub struct CfDurableObjects {
     #[serde(default)]
     pub bindings: Vec<CfDurableBinding>,
+    #[serde(default)]
+    pub migrations: Vec<CfDurableMigration>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct CfDurableBinding {
     pub name: String,
     pub class_name: String,
+    pub script_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfDurableMigration {
+    pub tag: String,
+    #[serde(default)]
+    pub new_classes: Vec<String>,
+    #[serde(default)]
+    pub new_sqlite_classes: Vec<String>,
+    #[serde(default)]
+    pub deleted_classes: Vec<String>,
+    #[serde(default)]
+    pub renamed_classes: Vec<CfDurableRenamedClass>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfDurableRenamedClass {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

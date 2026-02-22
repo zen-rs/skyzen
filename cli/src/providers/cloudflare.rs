@@ -1,8 +1,8 @@
 use crate::{
     args::Action,
     manifest::{
-        CfD1Database, CfDurableBinding, CfKvNamespace, CfQueueConsumer, CfQueueProducer,
-        CfR2Bucket, CloudflareSection, LoadedManifest,
+        CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableRenamedClass, CfKvNamespace,
+        CfQueueConsumer, CfQueueProducer, CfR2Bucket, CloudflareSection, LoadedManifest,
     },
     providers::{CommandPlan, GeneratedFile, ProviderPlan},
 };
@@ -108,6 +108,7 @@ fn render_wrangler(config: &CloudflareSection, root_dir: &Path) -> Result<String
     append_queue_producers(&mut out, &config.queues.producers);
     append_queue_consumers(&mut out, &config.queues.consumers);
     append_durable_bindings(&mut out, &config.durable_objects.bindings);
+    append_durable_migrations(&mut out, &config.durable_objects.migrations);
     Ok(out)
 }
 
@@ -175,7 +176,54 @@ fn append_durable_bindings(out: &mut String, entries: &[CfDurableBinding]) {
         out.push_str("\n[[durable_objects.bindings]]\n");
         push_quoted_assignment(out, "name", &entry.name);
         push_quoted_assignment(out, "class_name", &entry.class_name);
+        if let Some(script_name) = &entry.script_name {
+            push_quoted_assignment(out, "script_name", script_name);
+        }
     }
+}
+
+fn append_durable_migrations(out: &mut String, entries: &[CfDurableMigration]) {
+    for entry in entries {
+        out.push_str("\n[[migrations]]\n");
+        push_quoted_assignment(out, "tag", &entry.tag);
+        push_quoted_array_assignment(out, "new_classes", &entry.new_classes);
+        push_quoted_array_assignment(out, "new_sqlite_classes", &entry.new_sqlite_classes);
+        push_quoted_array_assignment(out, "deleted_classes", &entry.deleted_classes);
+        push_renamed_classes_assignment(out, &entry.renamed_classes);
+    }
+}
+
+fn push_quoted_array_assignment(out: &mut String, key: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    out.push_str(key);
+    out.push_str(" = [");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&quoted(value));
+    }
+    out.push_str("]\n");
+}
+
+fn push_renamed_classes_assignment(out: &mut String, values: &[CfDurableRenamedClass]) {
+    if values.is_empty() {
+        return;
+    }
+    out.push_str("renamed_classes = [");
+    for (index, item) in values.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str("{ from = ");
+        out.push_str(&quoted(&item.from));
+        out.push_str(", to = ");
+        out.push_str(&quoted(&item.to));
+        out.push_str(" }");
+    }
+    out.push_str("]\n");
 }
 
 fn push_assignment(out: &mut String, key: &str, value: &str) {
@@ -244,6 +292,14 @@ mod tests {
                 bindings: vec![CfDurableBinding {
                     name: "STATE".to_owned(),
                     class_name: "State".to_owned(),
+                    script_name: None,
+                }],
+                migrations: vec![CfDurableMigration {
+                    tag: "v1".to_owned(),
+                    new_classes: vec!["State".to_owned()],
+                    new_sqlite_classes: Vec::new(),
+                    deleted_classes: Vec::new(),
+                    renamed_classes: Vec::new(),
                 }],
             },
         };
@@ -253,6 +309,53 @@ mod tests {
         assert!(rendered.contains("[[d1_databases]]"));
         assert!(rendered.contains("binding = \"DB\""));
         assert!(rendered.contains("[[durable_objects.bindings]]"));
+        assert!(rendered.contains("[[migrations]]"));
+        assert!(rendered.contains("tag = \"v1\""));
+        assert!(rendered.contains("new_classes = [\"State\"]"));
         assert!(rendered.contains("[vars]"));
+    }
+
+    #[test]
+    fn renders_durable_object_script_name_and_sqlite_migrations() {
+        let section = CloudflareSection {
+            name: None,
+            main: None,
+            compatibility_date: Some("2025-02-01".to_owned()),
+            compatibility_flags: Vec::new(),
+            account_id: None,
+            workers_dev: None,
+            route: None,
+            zone_id: None,
+            vars: BTreeMap::new(),
+            kv_namespaces: Vec::new(),
+            r2_buckets: Vec::new(),
+            d1_databases: Vec::new(),
+            queues: CfQueues::default(),
+            durable_objects: CfDurableObjects {
+                bindings: vec![CfDurableBinding {
+                    name: "STATE".to_owned(),
+                    class_name: "SqliteState".to_owned(),
+                    script_name: Some("shared-do-worker".to_owned()),
+                }],
+                migrations: vec![CfDurableMigration {
+                    tag: "v2".to_owned(),
+                    new_classes: Vec::new(),
+                    new_sqlite_classes: vec!["SqliteState".to_owned()],
+                    deleted_classes: vec!["LegacyState".to_owned()],
+                    renamed_classes: vec![CfDurableRenamedClass {
+                        from: "OldState".to_owned(),
+                        to: "SqliteState".to_owned(),
+                    }],
+                }],
+            },
+        };
+
+        let rendered = render_wrangler(&section, &PathBuf::from("/tmp/app")).expect("render");
+        assert!(rendered.contains("script_name = \"shared-do-worker\""));
+        assert!(rendered.contains("new_sqlite_classes = [\"SqliteState\"]"));
+        assert!(rendered.contains("deleted_classes = [\"LegacyState\"]"));
+        assert!(
+            rendered.contains("renamed_classes = [{ from = \"OldState\", to = \"SqliteState\" }]")
+        );
     }
 }
