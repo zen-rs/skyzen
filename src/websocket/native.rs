@@ -92,14 +92,11 @@ pub enum WebSocketUpgradeError {
 }
 
 fn header_has_token(value: &header::HeaderValue, token: &str) -> bool {
-    value
-        .to_str()
-        .map(|value| {
-            value
-                .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case(token))
-        })
-        .unwrap_or(false)
+    value.to_str().is_ok_and(|value| {
+        value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case(token))
+    })
 }
 
 fn parse_protocols(value: Option<&header::HeaderValue>) -> Vec<String> {
@@ -685,8 +682,7 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
 
         if !upgrade_header
             .to_str()
-            .map(|value| value.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false)
+            .is_ok_and(|value| value.eq_ignore_ascii_case("websocket"))
         {
             return Err(WebSocketUpgradeError::InvalidUpgradeHeader);
         }

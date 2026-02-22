@@ -11,7 +11,7 @@ categories = ["web-programming::http-server", "database"]
 
 [dependencies]
 skyzen-services = { path = "../services" }
-redis = { version = "1", default-features = false, features = ["aio", "connection-manager"] }
+redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "smol-comp"] }
 
 [features]
 default = ["runtime-tokio"]

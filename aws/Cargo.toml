@@ -15,13 +15,11 @@ skyzen-s3 = { path = "../s3", optional = true }
 aws-config = "1"
 aws-sdk-dynamodb = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
-serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+1"], optional = true }
-serde_json = "1"
 base64 = { version = "0.22", optional = true }
 
 [features]
 default = ["dynamodb", "s3", "sqs"]
-dynamodb = ["dep:aws-sdk-dynamodb", "dep:serde_dynamo"]
+dynamodb = ["dep:aws-sdk-dynamodb"]
 s3 = ["dep:skyzen-s3"]
 sqs = ["dep:aws-sdk-sqs", "dep:base64"]
 

@@ -67,10 +67,10 @@ jobs:
           shared-key: ci-wasm
 
       - name: Check WASM build (minimal)
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features json
+        run: cargo check -p skyzen --target wasm32-unknown-unknown --no-default-features --features json
 
       - name: Check WASM build (with ws)
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features json,ws
+        run: cargo check -p skyzen --target wasm32-unknown-unknown --no-default-features --features json,ws
 
   wasm-workerd:
     name: WASM (workerd)
@@ -87,7 +87,12 @@ jobs:
           shared-key: ci-wasm
 
       - name: Install wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.106
+        run: |
+          WASM_BINDGEN_VERSION="$(cargo tree -p skyzen --target wasm32-unknown-unknown --no-default-features --features json,form \
+            | grep -m1 "wasm-bindgen v" \
+            | sed -E 's/.*wasm-bindgen v([0-9.]+).*/\1/')"
+          echo "Installing wasm-bindgen-cli ${WASM_BINDGEN_VERSION}"
+          cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}"
 
       - name: Build worker example
         run: cargo build --example worker --release --target wasm32-unknown-unknown --no-default-features --features json,form

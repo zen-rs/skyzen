@@ -10,7 +10,6 @@ keywords = ["http", "web", "framework", "testing"]
 categories = ["web-programming::http-server", "development-tools::testing"]
 
 [dependencies]
-skyzen.workspace = true
 skyzen-services.workspace = true
 http-kit.workspace = true
 serde = { version = "1", features = ["derive"] }
