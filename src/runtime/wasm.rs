@@ -34,7 +34,7 @@ fn clear_current_env() {
 
 /// Wrapper for WinterCG env, usable in request extensions.
 /// SAFETY: WASM is single-threaded, so Send+Sync is safe.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WasmEnv(JsValue);
 
 unsafe impl Send for WasmEnv {}

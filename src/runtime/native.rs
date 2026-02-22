@@ -340,9 +340,10 @@ where
     const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
     let listener = TcpListener::bind(server_addr()).await?;
+    let local_addr = listener.local_addr()?;
     info!(
         "Skyzen listening on http://{}",
-        listener.local_addr().unwrap()
+        local_addr
     );
 
     let executor = Arc::new(executor);

@@ -113,11 +113,11 @@ extern "C" {
 
 impl ResponseInit {
     /// Create a new ResponseInit with WebSocket upgrade configuration.
-    pub fn new_websocket(status: u16, websocket: &WebSocket) -> Self {
+    pub fn new_websocket(status: u16, websocket: &WebSocket) -> Result<Self, JsValue> {
         let init = js_sys::Object::new();
-        js_sys::Reflect::set(&init, &"status".into(), &status.into()).unwrap();
-        js_sys::Reflect::set(&init, &"webSocket".into(), websocket).unwrap();
-        init.unchecked_into()
+        js_sys::Reflect::set(&init, &"status".into(), &status.into())?;
+        js_sys::Reflect::set(&init, &"webSocket".into(), websocket)?;
+        Ok(init.unchecked_into())
     }
 }
 
@@ -137,6 +137,6 @@ extern "C" {
 
 /// Create a WebSocket upgrade response.
 pub fn create_websocket_response(client: &WebSocket) -> Result<web_sys::Response, JsValue> {
-    let init = ResponseInit::new_websocket(101, client);
+    let init = ResponseInit::new_websocket(101, client)?;
     response_new_with_init(JsValue::NULL, &init)
 }
