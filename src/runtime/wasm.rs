@@ -168,6 +168,16 @@ async fn convert_response(mut response: crate::Response) -> Result<Response, JsV
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         if let Some(ws) = response
             .extensions_mut()
+            .remove::<crate::durable::DurableClientWebSocket>()
+        {
+            let init = web_sys::ResponseInit::new();
+            init.set_status(StatusCode::SWITCHING_PROTOCOLS.as_u16());
+            js_sys::Reflect::set(init.as_ref(), &"webSocket".into(), ws.0.as_ref())?;
+            return web_sys::Response::new_with_opt_buffer_source_and_init(None, &init);
+        }
+
+        if let Some(ws) = response
+            .extensions_mut()
             .remove::<crate::websocket::SendSyncWebSocket>()
         {
             return crate::websocket::create_websocket_response(&ws.into_inner());

@@ -5,12 +5,11 @@ use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+use worker_sys::{R2Bucket, R2Object, R2ObjectBody};
 
 use skyzen_services::storage::{
     ListOptions, ListResult, ObjectMetadata, ObjectStorage, StorageError, StorageObject,
 };
-
-use crate::ffi;
 
 /// A Cloudflare R2 bucket.
 ///
@@ -20,7 +19,7 @@ use crate::ffi;
 ///
 /// WASM in Workers is single-threaded, so `Send` and `Sync` are safe.
 pub struct CfR2 {
-    bucket: ffi::R2Bucket,
+    bucket: R2Bucket,
 }
 
 impl Clone for CfR2 {
@@ -60,53 +59,57 @@ impl CfR2 {
     ///
     /// Returns [`StorageError::Backend`] if the binding cannot be found.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, StorageError> {
-        let binding = ffi::get_binding(env, binding_name).map_err(|e| {
+        let binding = crate::ffi::get_binding(env, binding_name).map_err(|e| {
             StorageError::Backend(format!("failed to get R2 binding '{binding_name}': {e:?}"))
         })?;
         Ok(Self::new(binding))
     }
 }
 
-/// Extract metadata from an R2 object's HTTP metadata.
-fn extract_content_type(http_metadata: &JsValue) -> Option<String> {
-    if http_metadata.is_undefined() || http_metadata.is_null() {
-        return None;
-    }
-    js_sys::Reflect::get(http_metadata, &"contentType".into())
+/// Extract content type from an R2 object's HTTP metadata.
+fn extract_content_type(obj: &R2Object) -> Option<String> {
+    let http_metadata = obj.http_metadata().ok()?;
+    let js: &JsValue = http_metadata.as_ref();
+    js_sys::Reflect::get(js, &"contentType".into())
         .ok()
         .and_then(|v| v.as_string())
 }
 
-/// Extract custom metadata from a JS object into a `HashMap`.
-fn extract_custom_metadata(js_metadata: &JsValue) -> HashMap<String, String> {
-    if js_metadata.is_undefined() || js_metadata.is_null() {
-        return HashMap::new();
-    }
-    serde_wasm_bindgen::from_value(js_metadata.clone()).unwrap_or_default()
+/// Extract custom metadata from an R2 object.
+fn extract_custom_metadata(obj: &R2Object) -> HashMap<String, String> {
+    obj.custom_metadata()
+        .ok()
+        .and_then(|m| serde_wasm_bindgen::from_value(m.into()).ok())
+        .unwrap_or_default()
 }
 
 impl ObjectStorage for CfR2 {
     async fn get(&self, key: &str) -> Result<Option<StorageObject>, StorageError> {
-        let promise = self.bucket.get(key).map_err(js_err)?;
+        let promise = self
+            .bucket
+            .get(key.to_owned(), JsValue::UNDEFINED)
+            .map_err(js_err)?;
         let result = JsFuture::from(promise).await.map_err(js_err)?;
 
         if result.is_null() || result.is_undefined() {
             return Ok(None);
         }
 
-        let obj: ffi::R2Object = result.unchecked_into();
-        let content_type = extract_content_type(&obj.http_metadata());
-        let custom = extract_custom_metadata(&obj.custom_metadata());
+        let obj: R2ObjectBody = result.unchecked_into();
+        // R2ObjectBody extends R2Object, so we can upcast to access metadata
+        let base: &R2Object = obj.unchecked_ref();
+        let content_type = extract_content_type(base);
+        let custom = extract_custom_metadata(base);
 
         let body_promise = obj.array_buffer().map_err(js_err)?;
         let body_buffer = JsFuture::from(body_promise).await.map_err(js_err)?;
         let body = js_sys::Uint8Array::new(&body_buffer).to_vec();
 
         let metadata = ObjectMetadata {
-            key: obj.key(),
-            size: f64_to_u64(obj.size()),
+            key: base.key().map_err(js_err)?,
+            size: f64_to_u64(base.size().map_err(js_err)?),
             content_type,
-            last_modified: None, // R2 does not expose last_modified on get
+            last_modified: None,
             metadata: custom,
         };
 
@@ -115,13 +118,16 @@ impl ObjectStorage for CfR2 {
 
     async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StorageError> {
         let array = js_sys::Uint8Array::from(body.as_slice());
-        let promise = self.bucket.put(key, &array).map_err(js_err)?;
+        let promise = self
+            .bucket
+            .put(key.to_owned(), array.into(), JsValue::UNDEFINED)
+            .map_err(js_err)?;
         JsFuture::from(promise).await.map_err(js_err)?;
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        let promise = self.bucket.delete(key).map_err(js_err)?;
+        let promise = self.bucket.delete(key.to_owned()).map_err(js_err)?;
         JsFuture::from(promise).await.map_err(js_err)?;
         Ok(())
     }
@@ -150,7 +156,7 @@ impl ObjectStorage for CfR2 {
                 .map_err(|e| StorageError::Backend(format!("{e:?}")))?;
         }
 
-        let promise = self.bucket.list(&js_options).map_err(js_err)?;
+        let promise = self.bucket.list(js_options.into()).map_err(js_err)?;
         let result = JsFuture::from(promise).await.map_err(js_err)?;
 
         // Result is { objects: [...], truncated, cursor }
@@ -188,20 +194,20 @@ impl ObjectStorage for CfR2 {
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMetadata>, StorageError> {
-        let promise = self.bucket.head(key).map_err(js_err)?;
+        let promise = self.bucket.head(key.to_owned()).map_err(js_err)?;
         let result = JsFuture::from(promise).await.map_err(js_err)?;
 
         if result.is_null() || result.is_undefined() {
             return Ok(None);
         }
 
-        let obj: ffi::R2ObjectHead = result.unchecked_into();
-        let content_type = extract_content_type(&obj.http_metadata());
-        let custom = extract_custom_metadata(&obj.custom_metadata());
+        let obj: R2Object = result.unchecked_into();
+        let content_type = extract_content_type(&obj);
+        let custom = extract_custom_metadata(&obj);
 
         Ok(Some(ObjectMetadata {
-            key: obj.key(),
-            size: f64_to_u64(obj.size()),
+            key: obj.key().map_err(js_err)?,
+            size: f64_to_u64(obj.size().map_err(js_err)?),
             content_type,
             last_modified: None,
             metadata: custom,

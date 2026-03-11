@@ -38,6 +38,8 @@ pub mod d1;
 #[cfg(target_arch = "wasm32")]
 pub mod database_error;
 #[cfg(target_arch = "wasm32")]
+pub mod durable;
+#[cfg(target_arch = "wasm32")]
 pub mod durable_sqlite;
 #[cfg(target_arch = "wasm32")]
 pub mod ffi;
@@ -52,6 +54,11 @@ pub mod r2;
 pub use d1::{CfD1, CfD1Statement};
 #[cfg(target_arch = "wasm32")]
 pub use database_error::CfDatabaseError;
+#[cfg(target_arch = "wasm32")]
+pub use durable::{
+    CfAlarm, CfDurableConnections, CfDurableKv, CfDurableNamespace, CfDurableObjectStub,
+    CfDurableSql, CfDurableState, CfWebSocketConnection, DurableObjectRuntime,
+};
 #[cfg(target_arch = "wasm32")]
 pub use durable_sqlite::CfDurableSqlite;
 #[cfg(target_arch = "wasm32")]

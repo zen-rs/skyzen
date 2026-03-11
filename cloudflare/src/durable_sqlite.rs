@@ -1,20 +1,18 @@
-//! Durable Object SQLite wrapper for Cloudflare Workers.
+//! Durable Object `SQLite` wrapper for Cloudflare Workers.
 
 use serde::de::DeserializeOwned;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use worker_sys::SqlStorage;
 
-use crate::{
-    database_error::{js_err, CfDatabaseError},
-    ffi,
-};
+use crate::database_error::{js_err, CfDatabaseError};
 
-/// A Durable Object SQLite handle (`state.storage.sql`).
+/// A Durable Object `SQLite` handle (`state.storage.sql`).
 ///
 /// This wrapper is designed for code running inside a Durable Object, where
 /// the `state` object is available.
 pub struct CfDurableSqlite {
-    sql: ffi::SqlStorage,
+    sql: SqlStorage,
 }
 
 impl Clone for CfDurableSqlite {
@@ -40,7 +38,7 @@ impl CfDurableSqlite {
     ///
     /// # Panics
     ///
-    /// Panics if the binding is not a valid SqlStorage object.
+    /// Panics if the binding is not a valid `SqlStorage` object.
     #[must_use]
     pub fn new(binding: JsValue) -> Self {
         Self {
@@ -54,19 +52,21 @@ impl CfDurableSqlite {
     ///
     /// Returns [`CfDatabaseError::Backend`] when `storage` or `storage.sql`
     /// cannot be read.
-    pub fn from_state(state: &JsValue) -> Result<Self, CfDatabaseError> {
-        let storage = js_sys::Reflect::get(state, &"storage".into()).map_err(js_err)?;
-        let sql = js_sys::Reflect::get(&storage, &"sql".into()).map_err(js_err)?;
-        Ok(Self::new(sql))
+    pub fn from_state(state: &worker_sys::DurableObjectState) -> Result<Self, CfDatabaseError> {
+        let storage = state.storage().map_err(js_err)?;
+        Ok(Self { sql: storage.sql() })
     }
 
-    /// Execute SQL against Durable Object SQLite.
+    /// Execute SQL against Durable Object `SQLite`.
+    ///
+    /// Returns the cursor as a `JsValue` for flexible consumption.
     ///
     /// # Errors
     ///
     /// Returns [`CfDatabaseError`] when execution fails.
     pub fn exec(&self, query: &str) -> Result<JsValue, CfDatabaseError> {
-        self.sql.exec(query).map_err(js_err)
+        let cursor = self.sql.exec(query, js_sys::Array::new()).map_err(js_err)?;
+        Ok(cursor.into())
     }
 
     /// Execute SQL and deserialize the result into a Rust type.

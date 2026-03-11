@@ -57,6 +57,8 @@ impl App {
 pub struct Router {
     inner: Arc<matchit::Router<Vec<(Method, App)>>>,
     already_router_enabled: bool,
+    /// Optional alarm handler for Durable Object alarm events.
+    pub(crate) alarm_handler: Option<EndpointFactory>,
     #[cfg(all(debug_assertions, feature = "openapi"))]
     openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
 }
@@ -66,7 +68,8 @@ impl Debug for Router {
         let mut debug_struct = f.debug_struct("Router");
         debug_struct
             .field("inner", &self.inner)
-            .field("already_router_enabled", &self.already_router_enabled);
+            .field("already_router_enabled", &self.already_router_enabled)
+            .field("has_alarm_handler", &self.alarm_handler.is_some());
         #[cfg(all(debug_assertions, feature = "openapi"))]
         {
             debug_struct.field("openapi_entries", &self.openapi_entries.len());
@@ -165,6 +168,12 @@ impl Router {
         {
             OpenApi::default()
         }
+    }
+
+    /// Create a fresh alarm endpoint, if one was registered via [`Route::on_alarm`].
+    #[must_use]
+    pub fn alarm_endpoint(&self) -> Option<BoxEndpoint> {
+        self.alarm_handler.as_ref().map(|factory| factory())
     }
 }
 
@@ -306,6 +315,7 @@ fn finalize_router(
     Ok(Router {
         inner: Arc::new(router),
         already_router_enabled: false,
+        alarm_handler: None,
         openapi_entries: Arc::new(openapi_entries.unwrap_or_default()),
     })
 }
@@ -331,6 +341,7 @@ fn finalize_router(
     Ok(Router {
         inner: Arc::new(router),
         already_router_enabled: false,
+        alarm_handler: None,
     })
 }
 

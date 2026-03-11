@@ -341,10 +341,7 @@ where
 
     let listener = TcpListener::bind(server_addr()).await?;
     let local_addr = listener.local_addr()?;
-    info!(
-        "Skyzen listening on http://{}",
-        local_addr
-    );
+    info!("Skyzen listening on http://{}", local_addr);
 
     let executor = Arc::new(executor);
     let hyper_executor = HyperExecutor(Arc::clone(&executor));

@@ -4,17 +4,15 @@ use serde::de::DeserializeOwned;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+use worker_sys::{D1Database, D1PreparedStatement};
 
-use crate::{
-    database_error::{js_err, CfDatabaseError},
-    ffi,
-};
+use crate::database_error::{js_err, CfDatabaseError};
 
 /// A Cloudflare D1 database binding.
 ///
 /// Wraps the `D1Database` binding from the Workers environment.
 pub struct CfD1 {
-    db: ffi::D1Database,
+    db: D1Database,
 }
 
 impl Clone for CfD1 {
@@ -41,6 +39,11 @@ impl CfD1 {
     /// # Panics
     ///
     /// Panics if the binding is not a valid `D1Database`.
+    /// Create a `CfD1` from a D1 binding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the binding is not a valid `D1Database`.
     #[must_use]
     pub fn new(binding: JsValue) -> Self {
         Self {
@@ -54,7 +57,7 @@ impl CfD1 {
     ///
     /// Returns [`CfDatabaseError::Backend`] if the binding cannot be found.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, CfDatabaseError> {
-        let binding = ffi::get_binding(env, binding_name).map_err(|e| {
+        let binding = crate::ffi::get_binding(env, binding_name).map_err(|e| {
             CfDatabaseError::Backend(format!("failed to get D1 binding '{binding_name}': {e:?}"))
         })?;
         Ok(Self::new(binding))
@@ -83,7 +86,7 @@ impl CfD1 {
 
 /// A prepared D1 SQL statement.
 pub struct CfD1Statement {
-    stmt: ffi::D1PreparedStatement,
+    stmt: D1PreparedStatement,
 }
 
 impl Clone for CfD1Statement {
@@ -121,7 +124,7 @@ impl CfD1Statement {
     ///
     /// Returns [`CfDatabaseError`] when execution fails.
     pub async fn first(&self) -> Result<JsValue, CfDatabaseError> {
-        let promise = self.stmt.first().map_err(js_err)?;
+        let promise = self.stmt.first(None).map_err(js_err)?;
         JsFuture::from(promise).await.map_err(js_err)
     }
 

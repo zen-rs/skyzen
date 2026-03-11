@@ -50,6 +50,7 @@ categories = ["web-programming::http-server"]
 
 [dependencies]
 skyzen-core.workspace = true
+skyzen-services.workspace = true
 http-kit.workspace = true
 matchit = "0.9.1"
 serde = { version = "1.0", features = ["derive"] }

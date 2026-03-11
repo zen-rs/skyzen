@@ -2,7 +2,7 @@
 
 use wasm_bindgen::prelude::*;
 
-/// Errors returned by Cloudflare database wrappers (`D1`, Durable SQLite).
+/// Errors returned by Cloudflare database wrappers (`D1`, Durable `SQLite`).
 #[derive(Debug, thiserror::Error)]
 pub enum CfDatabaseError {
     /// The underlying Cloudflare runtime/JS API returned an error.

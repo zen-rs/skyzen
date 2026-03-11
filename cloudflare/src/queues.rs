@@ -6,8 +6,6 @@ use wasm_bindgen_futures::JsFuture;
 
 use skyzen_services::queue::{MessageQueue, QueueError};
 
-use crate::ffi;
-
 /// A Cloudflare Workers Queue.
 ///
 /// Wraps the Queue binding from the Workers environment.
@@ -16,7 +14,7 @@ use crate::ffi;
 ///
 /// WASM in Workers is single-threaded, so `Send` and `Sync` are safe.
 pub struct CfQueue {
-    queue: ffi::Queue,
+    queue: worker_sys::Queue,
 }
 
 impl Clone for CfQueue {
@@ -56,7 +54,7 @@ impl CfQueue {
     ///
     /// Returns [`QueueError::Backend`] if the binding cannot be found.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, QueueError> {
-        let binding = ffi::get_binding(env, binding_name).map_err(|e| {
+        let binding = crate::ffi::get_binding(env, binding_name).map_err(|e| {
             QueueError::Backend(format!(
                 "failed to get Queue binding '{binding_name}': {e:?}"
             ))
@@ -68,7 +66,10 @@ impl CfQueue {
 impl MessageQueue for CfQueue {
     async fn send(&self, message: &[u8]) -> Result<(), QueueError> {
         let array = js_sys::Uint8Array::from(message);
-        let promise = self.queue.send(&array).map_err(js_err)?;
+        let promise = self
+            .queue
+            .send(array.into(), JsValue::UNDEFINED)
+            .map_err(js_err)?;
         JsFuture::from(promise).await.map_err(js_err)?;
         Ok(())
     }
@@ -86,7 +87,10 @@ impl MessageQueue for CfQueue {
             batch.set(i as u32, item.into());
         }
 
-        let promise = self.queue.send_batch(&batch).map_err(js_err)?;
+        let promise = self
+            .queue
+            .send_batch(batch, JsValue::UNDEFINED)
+            .map_err(js_err)?;
         JsFuture::from(promise).await.map_err(js_err)?;
         Ok(())
     }

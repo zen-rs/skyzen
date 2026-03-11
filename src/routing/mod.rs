@@ -181,6 +181,24 @@ impl Route {
         }
     }
 
+    /// Register an alarm handler for Durable Object alarm events.
+    ///
+    /// The handler is an async function with extractors as arguments,
+    /// just like a regular route handler.
+    #[must_use]
+    pub fn on_alarm<H, T, R>(self, handler: H) -> RouteWithAlarm
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        let endpoint = handler::into_endpoint(handler);
+        RouteWithAlarm {
+            route: self,
+            alarm_endpoint: Arc::new(move || AnyEndpoint::new(endpoint.clone())),
+        }
+    }
+
     /// Attach middleware to this route and all nested endpoints.
     #[must_use]
     pub fn middleware<M>(mut self, middleware: M) -> Self
@@ -231,6 +249,56 @@ impl Route {
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.openapi();
         self.nodes.push(openapi.redoc_route("/api-docs"));
+        self
+    }
+}
+
+/// A [`Route`] with an attached alarm handler.
+///
+/// Created by [`Route::on_alarm`]. Call [`build`](Self::build) to produce a [`Router`].
+pub struct RouteWithAlarm {
+    route: Route,
+    alarm_endpoint: EndpointFactory,
+}
+
+#[allow(clippy::missing_fields_in_debug)]
+impl fmt::Debug for RouteWithAlarm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouteWithAlarm")
+            .field("route", &self.route)
+            .field("has_alarm", &true)
+            .finish()
+    }
+}
+
+impl RouteWithAlarm {
+    /// Attach middleware to this route and all nested endpoints.
+    #[must_use]
+    pub fn middleware<M>(mut self, middleware: M) -> Self
+    where
+        M: Middleware + Sync + Clone + 'static,
+    {
+        self.route.apply_middleware(middleware);
+        self
+    }
+
+    /// Build the route, panicking on error.
+    ///
+    /// # Panics
+    /// Panics if the route is invalid.
+    #[must_use]
+    pub fn build(self) -> Router {
+        let alarm_factory = self.alarm_endpoint;
+        let mut router = self.route.build();
+        router.alarm_handler = Some(alarm_factory);
+        router
+    }
+
+    /// Enable the Redoc API documentation endpoint at `/api-docs`.
+    #[must_use]
+    pub fn enable_api_doc(mut self) -> Self {
+        let openapi = self.route.openapi();
+        self.route.nodes.push(openapi.redoc_route("/api-docs"));
         self
     }
 }

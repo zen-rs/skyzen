@@ -112,7 +112,7 @@
 mod types;
 
 #[cfg(target_arch = "wasm32")]
-mod ffi;
+pub(crate) mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(target_arch = "wasm32")]

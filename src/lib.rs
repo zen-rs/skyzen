@@ -41,6 +41,9 @@ pub mod handler;
 
 pub mod routing;
 
+/// Durable Object abstraction for stateful edge computing.
+pub mod durable;
+
 /// OpenAPI helpers.
 pub mod openapi;
 

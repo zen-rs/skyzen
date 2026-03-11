@@ -34,6 +34,7 @@ Use cloud vendor database services instead (for Cloudflare, use skyzen-cloudflar
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod database;
+pub mod durable;
 pub mod kv;
 mod maybe_send;
 pub mod queue;
