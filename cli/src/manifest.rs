@@ -9,11 +9,54 @@ use std::{
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct SkyzenManifest {
     #[serde(default)]
+    pub service: Vec<ServiceEntry>,
+    #[serde(default)]
+    pub database: Vec<DatabaseEntry>,
+    #[serde(default)]
+    pub native: Option<NativeSection>,
+    #[serde(default)]
     pub cloudflare: Option<CloudflareSection>,
     #[serde(default)]
     pub aws: Option<AwsSection>,
     #[serde(default)]
     pub azure: Option<AzureSection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub service_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatabaseEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub database_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NativeSection {
+    #[serde(default)]
+    pub service: BTreeMap<String, NativeServiceSection>,
+    #[serde(default)]
+    pub database: BTreeMap<String, NativeDatabaseSection>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
+pub struct NativeServiceSection {
+    pub backend: String,
+    pub url_env: Option<String>,
+    pub bucket_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
+pub struct NativeDatabaseSection {
+    pub backend: String,
+    pub url_env: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -30,6 +73,12 @@ pub struct CloudflareSection {
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
     #[serde(default)]
+    pub triggers: CfTriggers,
+    #[serde(default)]
+    pub service: BTreeMap<String, CloudflareServiceSection>,
+    #[serde(default)]
+    pub database: BTreeMap<String, CloudflareDatabaseSection>,
+    #[serde(default)]
     pub kv_namespaces: Vec<CfKvNamespace>,
     #[serde(default)]
     pub r2_buckets: Vec<CfR2Bucket>,
@@ -39,6 +88,22 @@ pub struct CloudflareSection {
     pub queues: CfQueues,
     #[serde(default)]
     pub durable_objects: CfDurableObjects,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfTriggers {
+    #[serde(default)]
+    pub crons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CloudflareServiceSection {
+    pub binding: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CloudflareDatabaseSection {
+    pub binding: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

@@ -47,6 +47,9 @@ pub mod durable;
 /// OpenAPI helpers.
 pub mod openapi;
 
+/// Portable event payloads.
+pub mod events;
+
 /// Utilities.
 pub mod utils;
 
@@ -54,7 +57,9 @@ pub mod utils;
 pub mod runtime;
 
 /// Attribute & derive macros exported by Skyzen.
-pub use skyzen_macros::{error, import_config, main, openapi, HttpError};
+pub use skyzen_macros::{
+    durable_object, error, import_config, main, openapi, queue, scheduled, HttpError,
+};
 
 /// Static asset helpers for building file servers.
 #[cfg(feature = "static-files")]
@@ -76,6 +81,9 @@ pub use http_kit::{
     header, Body, BodyError, Endpoint, HttpError, Method, Middleware, Request, Response,
     StatusCode, Uri,
 };
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub use js_sys;
 #[doc(inline)]
 pub use routing::{CreateRouteNode, Route};
 pub use skyzen_core::error::*;

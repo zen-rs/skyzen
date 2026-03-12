@@ -1,8 +1,12 @@
 //! Durable Object alarm scheduling abstraction.
 
-use core::future::Future;
+use core::{convert::Infallible, future::Future};
 
-use http_kit::http_error;
+use http_kit::{
+    http_error,
+    middleware::{Middleware, MiddlewareError},
+    Endpoint, Response,
+};
 use skyzen_core::{Extractor, StatusCode};
 
 use crate::maybe_send::{BoxFuture, MaybeSend};
@@ -132,5 +136,20 @@ impl Extractor for Alarm {
             .get::<Self>()
             .cloned()
             .ok_or(AlarmNotConfigured::new())
+    }
+}
+
+impl Middleware for Alarm {
+    type Error = Infallible;
+
+    async fn handle<N: Endpoint>(
+        &mut self,
+        request: &mut http_kit::Request,
+        mut next: N,
+    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
+        request.extensions_mut().insert(self.clone());
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)
     }
 }

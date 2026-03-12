@@ -1,8 +1,12 @@
 //! Durable Object key-value store abstraction.
 
-use core::future::Future;
+use core::{convert::Infallible, future::Future};
 
-use http_kit::http_error;
+use http_kit::{
+    http_error,
+    middleware::{Middleware, MiddlewareError},
+    Endpoint, Response,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use skyzen_core::{Extractor, StatusCode};
 
@@ -319,5 +323,20 @@ impl Extractor for DurableKv {
             .get::<Self>()
             .cloned()
             .ok_or(DurableKvNotConfigured::new())
+    }
+}
+
+impl Middleware for DurableKv {
+    type Error = Infallible;
+
+    async fn handle<N: Endpoint>(
+        &mut self,
+        request: &mut http_kit::Request,
+        mut next: N,
+    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
+        request.extensions_mut().insert(self.clone());
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)
     }
 }

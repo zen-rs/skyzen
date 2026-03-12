@@ -3,10 +3,14 @@
 //! Provides a platform-agnostic interface for object/blob storage.
 //! Implementations include S3, Cloudflare R2, Azure Blob, and in-memory (for testing).
 
-use core::future::Future;
+use core::{convert::Infallible, future::Future};
 use std::collections::HashMap;
 
-use http_kit::http_error;
+use http_kit::{
+    http_error,
+    middleware::{Middleware, MiddlewareError},
+    Endpoint, Response,
+};
 use skyzen_core::{Extractor, StatusCode};
 
 use crate::maybe_send::{BoxFuture, MaybeSend};
@@ -246,5 +250,20 @@ impl Extractor for Storage {
             .get::<Self>()
             .cloned()
             .ok_or(StorageNotConfigured::new())
+    }
+}
+
+impl Middleware for Storage {
+    type Error = Infallible;
+
+    async fn handle<N: Endpoint>(
+        &mut self,
+        request: &mut http_kit::Request,
+        mut next: N,
+    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
+        request.extensions_mut().insert(self.clone());
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)
     }
 }

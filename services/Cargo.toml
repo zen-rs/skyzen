@@ -20,7 +20,7 @@ futures-core = "0.3"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # SeaORM is native-only in Skyzen services. For wasm targets, use cloud-vendor
 # databases (e.g. Cloudflare D1 / Durable Object SQLite) instead.
-sea-orm = { version = "1", default-features = false }
+sea-orm = { version = "1", default-features = false, features = ["with-json"] }
 
 [features]
 # Runtime features - user selects in their application

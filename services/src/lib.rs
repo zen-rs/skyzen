@@ -11,17 +11,17 @@
 //! - A **wrapper struct** (e.g. [`Kv`]) that provides type-erased dynamic dispatch
 //!   and implements [`skyzen_core::Extractor`] for use in handlers
 //!
-//! Database support is provided through `SeaORM`, re-exported for convenience.
+//! Portable SQL support is provided through [`SqlDb`], while `Db` remains available
+//! as the native-only `SeaORM` escape hatch.
 //!
 //! # Example
 //!
 //! ```ignore
-//! use skyzen_services::{Kv, Db, Storage, Queue};
-//! use skyzen_services::sea_orm::*;
+//! use skyzen_services::{Kv, SqlDb, Storage};
 //!
-//! async fn handler(kv: Kv, db: Db) -> Result<Json<Value>> {
+//! async fn handler(kv: Kv, db: SqlDb) -> Result<Json<Value>> {
 //!     kv.put_json("cache:key", &json!({"hello": "world"})).await?;
-//!     let result = entity::Entity::find().all(&*db).await?;
+//!     let result: Vec<Value> = db.query("SELECT * FROM users", &[]).await?;
 //!     Ok(Json(result))
 //! }
 //! ```
@@ -35,15 +35,22 @@ Use cloud vendor database services instead (for Cloudflare, use skyzen-cloudflar
 #[cfg(not(target_arch = "wasm32"))]
 pub mod database;
 pub mod durable;
+pub mod events;
 pub mod kv;
 mod maybe_send;
 pub mod queue;
+pub mod sql;
 pub mod storage;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use database::Db;
+pub use events::ScheduledTick;
 pub use kv::{KeyValueStore, Kv, KvError};
-pub use queue::{MessageQueue, Queue, QueueError};
+pub use queue::{
+    MessageQueue, Queue, QueueBatch, QueueBatchDisposition, QueueError, QueueMessage,
+    QueueMessageDisposition, QueueRetry,
+};
+pub use sql::{SqlDatabase, SqlDb, SqlError, SqlResult, SqlValue};
 pub use storage::{
     ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError, StorageObject,
 };

@@ -19,7 +19,7 @@ Cloudflare Workers service implementations for the Skyzen framework.
 | `CfKv` | `KeyValueStore` | [Workers KV](https://developers.cloudflare.com/kv/) |
 | `CfR2` | `ObjectStorage` | [R2](https://developers.cloudflare.com/r2/) |
 | `CfQueue` | `MessageQueue` | [Queues](https://developers.cloudflare.com/queues/) |
-| `CfD1` | — (direct SQL API) | [D1](https://developers.cloudflare.com/d1/) |
+| `CfD1` | `SqlDatabase` + raw D1 API | [D1](https://developers.cloudflare.com/d1/) |
 | `CfDurableSqlite` | — (direct SQL API) | [Durable Objects SQLite](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
 
 ## Usage
@@ -67,11 +67,26 @@ queue.send_json(&json!({"event": "user.created"})).await?;
 
 ### D1 SQL Database
 
-D1 provides a managed SQL database accessed via prepared statements:
+D1 can be used either through the portable `SqlDb` wrapper or through the raw `CfD1` API:
+
+```rust
+use skyzen_services::{SqlDb, SqlValue};
+
+let db = SqlDb::new(CfD1::from_env(&env, "DB")?);
+let rows = db
+    .query::<User>("SELECT * FROM users WHERE id = ?", &[SqlValue::Integer(id)])
+    .await?;
+```
+
+Raw D1 access remains available when you need provider-specific behavior:
 
 ```rust
 let d1 = CfD1::from_env(&env, "DB")?;
-let rows = d1.prepare("SELECT * FROM users WHERE id = ?")?.bind(&[id.into()])?.all().await?;
+let rows = d1
+    .prepare("SELECT * FROM users WHERE id = ?")?
+    .bind(&[id.into()])?
+    .all()
+    .await?;
 ```
 
 ### Durable Object SQLite
@@ -98,6 +113,12 @@ let cursor = sql.exec("CREATE TABLE IF NOT EXISTS counter (id TEXT PRIMARY KEY, 
 name = "my-worker"
 main = "dist/worker.js"
 compatibility_date = "2025-02-01"
+
+[cloudflare.service.cache]
+binding = "CACHE"
+
+[cloudflare.database.main]
+binding = "DB"
 
 [[cloudflare.kv_namespaces]]
 binding = "CACHE"

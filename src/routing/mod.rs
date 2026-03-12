@@ -59,7 +59,7 @@
 //! };
 //!
 //! let route = Route::new(("/counter".at(|| async { Result::Ok("0") }),))
-//! .middleware(State(0usize));
+//! .with(State(0usize));
 //! ```
 //!
 //! Error handling can also be expressed as middleware. For example, you can catch endpoint errors
@@ -76,7 +76,7 @@
 //! }
 //!
 //! let router = Route::new(("/panic".at(boom),))
-//! .middleware(ErrorHandlingMiddleware::new(|error| async move {
+//! .with(ErrorHandlingMiddleware::new(|error| async move {
 //!     format!("Recovered from {error}")
 //! }))
 //! .build();
@@ -209,6 +209,17 @@ impl Route {
         self
     }
 
+    /// Attach middleware to this route and all nested endpoints.
+    ///
+    /// This is an ergonomic alias for [`Route::middleware`].
+    #[must_use]
+    pub fn with<M>(self, middleware: M) -> Self
+    where
+        M: Middleware + Sync + Clone + 'static,
+    {
+        self.middleware(middleware)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn apply_middleware<M>(&mut self, middleware: M)
     where
@@ -280,6 +291,17 @@ impl RouteWithAlarm {
     {
         self.route.apply_middleware(middleware);
         self
+    }
+
+    /// Attach middleware to this route and all nested endpoints.
+    ///
+    /// This is an ergonomic alias for [`RouteWithAlarm::middleware`].
+    #[must_use]
+    pub fn with<M>(self, middleware: M) -> Self
+    where
+        M: Middleware + Sync + Clone + 'static,
+    {
+        self.middleware(middleware)
     }
 
     /// Build the route, panicking on error.

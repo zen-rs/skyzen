@@ -4,7 +4,7 @@ use crate::{
         CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableRenamedClass, CfKvNamespace,
         CfQueueConsumer, CfQueueProducer, CfR2Bucket, CloudflareSection, LoadedManifest,
     },
-    providers::{CommandPlan, GeneratedFile, ProviderPlan},
+    providers::{CommandPlan, GeneratedFile, ProviderPlan, RunMode},
 };
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -15,6 +15,7 @@ pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan
         .cloudflare
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing [cloudflare] section in Skyzen.toml"))?;
+    warn_missing_portable_bindings(manifest, config);
     let wrangler = render_wrangler(config, &manifest.root_dir)?;
     let wrangler_path = manifest.root_dir.join(".skyzen/gen/wrangler.toml");
 
@@ -39,6 +40,7 @@ pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan
             cwd: Some(manifest.root_dir.clone()),
         },
         Action::Doctor => unreachable!("doctor is handled in providers::prepare"),
+        Action::New => unreachable!("new is handled in the CLI entrypoint"),
     };
 
     Ok(ProviderPlan {
@@ -47,7 +49,80 @@ pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan
             path: wrangler_path,
             contents: wrangler,
         }],
+        run_mode: RunMode::Once,
     })
+}
+
+fn warn_missing_portable_bindings(manifest: &LoadedManifest, config: &CloudflareSection) {
+    for service in &manifest.data.service {
+        let Some(wiring) = config.service.get(&service.name) else {
+            eprintln!(
+                "[skyzen] warning: missing [cloudflare.service.{}] wiring for portable service `{}`",
+                service.name, service.name
+            );
+            continue;
+        };
+
+        let binding = &wiring.binding;
+        let exists = match service.service_type.as_str() {
+            "kv" => config
+                .kv_namespaces
+                .iter()
+                .any(|entry| entry.binding == *binding),
+            "storage" => config
+                .r2_buckets
+                .iter()
+                .any(|entry| entry.binding == *binding),
+            "queue" => config
+                .queues
+                .producers
+                .iter()
+                .any(|entry| entry.binding == *binding),
+            other => {
+                eprintln!(
+                    "[skyzen] warning: unsupported portable service type `{other}` for `{}`",
+                    service.name
+                );
+                continue;
+            }
+        };
+
+        if !exists {
+            eprintln!(
+                "[skyzen] warning: binding `{binding}` for portable service `{}` is not declared in the matching Cloudflare binding section",
+                service.name
+            );
+        }
+    }
+
+    for database in &manifest.data.database {
+        if database.database_type != "sql" {
+            eprintln!(
+                "[skyzen] warning: unsupported portable database type `{}` for `{}`",
+                database.database_type, database.name
+            );
+            continue;
+        }
+
+        let Some(wiring) = config.database.get(&database.name) else {
+            eprintln!(
+                "[skyzen] warning: missing [cloudflare.database.{}] wiring for portable database `{}`",
+                database.name, database.name
+            );
+            continue;
+        };
+
+        if !config
+            .d1_databases
+            .iter()
+            .any(|entry| entry.binding == wiring.binding)
+        {
+            eprintln!(
+                "[skyzen] warning: binding `{}` for portable database `{}` is not declared in [[cloudflare.d1_databases]]",
+                wiring.binding, database.name
+            );
+        }
+    }
 }
 
 fn render_wrangler(config: &CloudflareSection, root_dir: &Path) -> Result<String> {
@@ -102,6 +177,7 @@ fn render_wrangler(config: &CloudflareSection, root_dir: &Path) -> Result<String
     }
 
     append_vars(&mut out, &config.vars);
+    append_triggers(&mut out, &config.triggers.crons);
     append_kv(&mut out, &config.kv_namespaces);
     append_r2(&mut out, &config.r2_buckets);
     append_d1(&mut out, &config.d1_databases);
@@ -120,6 +196,14 @@ fn append_vars(out: &mut String, vars: &std::collections::BTreeMap<String, Strin
     for (key, value) in vars {
         push_quoted_assignment(out, key, value);
     }
+}
+
+fn append_triggers(out: &mut String, crons: &[String]) {
+    if crons.is_empty() {
+        return;
+    }
+    out.push_str("\n[triggers]\n");
+    push_quoted_array_assignment(out, "crons", crons);
 }
 
 fn append_kv(out: &mut String, entries: &[CfKvNamespace]) {
@@ -251,7 +335,7 @@ fn path_string(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{CfDurableObjects, CfQueues};
+    use crate::manifest::{CfDurableObjects, CfQueues, CfTriggers};
     use std::{collections::BTreeMap, path::PathBuf};
 
     #[test]
@@ -269,6 +353,9 @@ mod tests {
             route: None,
             zone_id: None,
             vars,
+            triggers: CfTriggers::default(),
+            service: BTreeMap::new(),
+            database: BTreeMap::new(),
             kv_namespaces: vec![CfKvNamespace {
                 binding: "CACHE".to_owned(),
                 id: "123".to_owned(),
@@ -327,6 +414,9 @@ mod tests {
             route: None,
             zone_id: None,
             vars: BTreeMap::new(),
+            triggers: CfTriggers::default(),
+            service: BTreeMap::new(),
+            database: BTreeMap::new(),
             kv_namespaces: Vec::new(),
             r2_buckets: Vec::new(),
             d1_databases: Vec::new(),
@@ -357,5 +447,20 @@ mod tests {
         assert!(
             rendered.contains("renamed_classes = [{ from = \"OldState\", to = \"SqliteState\" }]")
         );
+    }
+
+    #[test]
+    fn renders_cron_triggers() {
+        let section = CloudflareSection {
+            compatibility_date: Some("2025-02-01".to_owned()),
+            triggers: CfTriggers {
+                crons: vec!["*/10 * * * *".to_owned()],
+            },
+            ..CloudflareSection::default()
+        };
+
+        let rendered = render_wrangler(&section, &PathBuf::from("/tmp/app")).expect("render");
+        assert!(rendered.contains("[triggers]"));
+        assert!(rendered.contains("crons = [\"*/10 * * * *\"]"));
     }
 }

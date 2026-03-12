@@ -47,7 +47,7 @@ Stores key-value pairs as JSON documents with `id`, base64-encoded `value`, and 
 use skyzen_azure::CosmosKv;
 use skyzen_services::Kv;
 
-let cosmos = CosmosKv::new(client, "my-database", "my-container");
+let cosmos = CosmosKv::new(container_client);
 let kv = Kv::new(cosmos);
 
 kv.put_json("user:1", &user).await?;
@@ -60,7 +60,7 @@ let user: Option<User> = kv.get_json("user:1").await?;
 use skyzen_azure::AzureBlob;
 use skyzen_services::Storage;
 
-let blob = AzureBlob::new(client, "my-container");
+let blob = AzureBlob::new(container_client);
 let storage = Storage::new(blob);
 
 storage.put("images/photo.png", image_bytes).await?;
@@ -75,7 +75,7 @@ let obj = storage.get("images/photo.png").await?;
 use skyzen_azure::ServiceBusQueue;
 use skyzen_services::Queue;
 
-let sb = ServiceBusQueue::new(client, "my-queue");
+let sb = ServiceBusQueue::new(queue_client);
 let queue = Queue::new(sb);
 
 queue.send_json(&event).await?;

@@ -80,6 +80,7 @@ impl DurableSqlStore for CfDurableSql {
 fn sql_value_to_js(value: &SqlValue) -> JsValue {
     match value {
         SqlValue::Null => JsValue::NULL,
+        SqlValue::Boolean(v) => JsValue::from_bool(*v),
         #[allow(clippy::cast_precision_loss)]
         SqlValue::Integer(v) => JsValue::from_f64(*v as f64),
         SqlValue::Real(v) => JsValue::from_f64(*v),

@@ -1,12 +1,15 @@
 //! Skyzen unified CLI for local emulation and deployment.
 
 mod args;
+mod deps;
+mod dev;
 mod manifest;
 mod providers;
+mod scaffold;
 
 use anyhow::{Context, Result};
 use args::{Action, CliOptions};
-use providers::{prepare, PreparedRun};
+use providers::{prepare, PreparedRun, RunMode};
 use std::{
     fs,
     process::{Command, Stdio},
@@ -21,6 +24,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let options = CliOptions::parse(std::env::args())?;
+    if options.action == Action::New {
+        return scaffold::create_project(&options);
+    }
     let prepared = prepare(&options)?;
     execute(&prepared, options.dry_run)
 }
@@ -74,10 +80,18 @@ fn execute(prepared: &PreparedRun, dry_run: bool) -> Result<()> {
     if prepared.commands.is_empty() {
         match prepared.action {
             Action::Doctor => {}
+            Action::New => unreachable!("new is handled before prepare"),
             Action::Dev | Action::Deploy => {
                 anyhow::bail!("no command prepared");
             }
         }
+    }
+
+    if prepared.run_mode == RunMode::Watch {
+        let Some(command) = prepared.commands.first() else {
+            anyhow::bail!("watch mode requires at least one command");
+        };
+        return dev::run_native_watch(command, dry_run);
     }
 
     Ok(())

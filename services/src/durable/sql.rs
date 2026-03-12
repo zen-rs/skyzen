@@ -1,12 +1,17 @@
 //! Durable Object SQL storage abstraction.
 
-use core::future::Future;
+use core::{convert::Infallible, future::Future};
 
-use http_kit::http_error;
+use http_kit::{
+    http_error,
+    middleware::{Middleware, MiddlewareError},
+    Endpoint, Response,
+};
 use serde::de::DeserializeOwned;
 use skyzen_core::{Extractor, StatusCode};
 
 use crate::maybe_send::{BoxFuture, MaybeSend};
+pub use crate::sql::{SqlResult, SqlValue};
 
 // ── Error type ──
 
@@ -20,32 +25,6 @@ pub enum DurableSqlError {
     /// Serialization or deserialization failed.
     #[error("durable sql serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-}
-
-/// A SQL parameter value.
-#[derive(Debug, Clone)]
-pub enum SqlValue {
-    /// A null value.
-    Null,
-    /// An integer value.
-    Integer(i64),
-    /// A floating-point value.
-    Real(f64),
-    /// A text value.
-    Text(String),
-    /// A blob value.
-    Blob(Vec<u8>),
-}
-
-/// Result of a SQL execution.
-#[derive(Debug, Clone, Default)]
-pub struct SqlResult {
-    /// Rows returned by the query, each as a JSON-like map.
-    pub rows: Vec<serde_json::Value>,
-    /// Number of rows read.
-    pub rows_read: u64,
-    /// Number of rows written.
-    pub rows_written: u64,
 }
 
 // ── Layer 1: Public trait ──
@@ -198,5 +177,20 @@ impl Extractor for DurableSql {
             .get::<Self>()
             .cloned()
             .ok_or(DurableSqlNotConfigured::new())
+    }
+}
+
+impl Middleware for DurableSql {
+    type Error = Infallible;
+
+    async fn handle<N: Endpoint>(
+        &mut self,
+        request: &mut http_kit::Request,
+        mut next: N,
+    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
+        request.extensions_mut().insert(self.clone());
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)
     }
 }

@@ -8,7 +8,7 @@ Portable service abstractions for the Skyzen HTTP framework.
 
 ## Overview
 
-`skyzen-services` provides a set of platform-agnostic traits and extractors for common backend services. By using these abstractions, your request handlers remain decoupled from specific cloud providers or storage backends, allowing the same code to run on native servers (Redis/S3/Postgres) or at the edge (Cloudflare KV/R2/D1).
+`skyzen-services` provides a set of portable capability wrappers for common backend services. Business logic depends on those wrappers instead of provider SDK types, so the same code can target native backends and Cloudflare edge backends without rewriting handlers.
 
 ## Two-Trait Pattern
 
@@ -26,10 +26,11 @@ To enable type-erased dynamic dispatch while maintaining an ergonomic API for im
 | `KeyValueStore` | `Kv` | `get`, `put`, `delete`, `list` + `get_json`, `get_text`, `put_json` |
 | `ObjectStorage` | `Storage` | `get`, `put`, `delete`, `list`, `head` |
 | `MessageQueue` | `Queue` | `send`, `send_batch` + `send_json`, `send_json_batch` |
+| `SqlDatabase` | `SqlDb` | `exec`, `query`, `query_one` |
 
 ### Database (`Db`)
 
-`Db` wraps a `sea_orm::DatabaseConnection` and implements `Extractor`. It is **not** a Skyzen service trait — it re-exports [SeaORM](https://www.sea-ql.org/SeaORM/) directly for SQL database access. Native-only (not available on WASM targets).
+`Db` wraps a `sea_orm::DatabaseConnection` and implements `Extractor`. It is **not** the portable SQL abstraction — it is the native-only [SeaORM](https://www.sea-ql.org/SeaORM/) escape hatch.
 
 ## Quick Start
 

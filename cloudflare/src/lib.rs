@@ -42,6 +42,8 @@ pub mod durable;
 #[cfg(target_arch = "wasm32")]
 pub mod durable_sqlite;
 #[cfg(target_arch = "wasm32")]
+pub mod events;
+#[cfg(target_arch = "wasm32")]
 pub mod ffi;
 #[cfg(target_arch = "wasm32")]
 pub mod kv;
@@ -56,14 +58,26 @@ pub use d1::{CfD1, CfD1Statement};
 pub use database_error::CfDatabaseError;
 #[cfg(target_arch = "wasm32")]
 pub use durable::{
+    invoke_alarm, invoke_websocket_close, invoke_websocket_error, invoke_websocket_message,
     CfAlarm, CfDurableConnections, CfDurableKv, CfDurableNamespace, CfDurableObjectStub,
     CfDurableSql, CfDurableState, CfWebSocketConnection, DurableObjectRuntime,
 };
 #[cfg(target_arch = "wasm32")]
 pub use durable_sqlite::CfDurableSqlite;
 #[cfg(target_arch = "wasm32")]
+pub use events::{
+    CfEventError, CfQueueBatch, CfQueueContext, CfQueueMessage, CfQueueRetryOptions,
+    CfScheduleContext, CfScheduledEvent, IntoQueueWorkerResult, IntoWorkerResult,
+};
+#[cfg(target_arch = "wasm32")]
 pub use kv::CfKv;
 #[cfg(target_arch = "wasm32")]
 pub use queues::CfQueue;
 #[cfg(target_arch = "wasm32")]
 pub use r2::CfR2;
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub use worker;
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub use worker_sys;

@@ -3,9 +3,13 @@
 //! Provides a platform-agnostic interface for key-value storage.
 //! Implementations include Redis, Cloudflare KV, `DynamoDB`, and in-memory (for testing).
 
-use core::future::Future;
+use core::{convert::Infallible, future::Future};
 
-use http_kit::http_error;
+use http_kit::{
+    http_error,
+    middleware::{Middleware, MiddlewareError},
+    Endpoint, Response,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use skyzen_core::{Extractor, StatusCode};
 
@@ -209,5 +213,20 @@ impl Extractor for Kv {
             .get::<Self>()
             .cloned()
             .ok_or(KvNotConfigured::new())
+    }
+}
+
+impl Middleware for Kv {
+    type Error = Infallible;
+
+    async fn handle<N: Endpoint>(
+        &mut self,
+        request: &mut http_kit::Request,
+        mut next: N,
+    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
+        request.extensions_mut().insert(self.clone());
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)
     }
 }

@@ -1,6 +1,6 @@
 # Deploying Skyzen Apps
 
-Skyzen apps can be deployed to native servers, Cloudflare Workers, AWS Lambda, and Azure Functions. This guide covers each target platform.
+Skyzen is production-complete for native servers and Cloudflare Workers. This guide covers those paths directly and also documents the current AWS/Azure CLI orchestration hooks, which are not runtime-parity features.
 
 ## Prerequisites
 
@@ -130,7 +130,9 @@ new_sqlite_classes = ["AppState"]
 
 Bump the migration `tag` (`v2`, `v3`, ...) whenever class definitions change.
 
-## AWS Lambda
+## AWS CLI Integration
+
+Skyzen currently provides CLI orchestration for AWS tooling. It does not yet provide first-class AWS runtime parity.
 
 ### Project Setup
 
@@ -187,7 +189,9 @@ skyzen deploy --provider aws
 
 Runs `sam deploy` with the configured stack name and region.
 
-## Azure Functions
+## Azure CLI Integration
+
+Skyzen currently provides CLI orchestration for Azure Functions tooling. It does not yet provide first-class Azure runtime parity.
 
 ### Skyzen.toml
 

@@ -452,6 +452,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_alias_applies_route_middleware_to_endpoints() {
+        let route =
+            Route::new(("/ping".at(|| async { Result::Ok("pong") }),)).with(HeaderMiddleware);
+
+        let router = build(route).unwrap();
+        let request = get_request("/ping");
+        let response = router.clone().go(request).await.unwrap();
+        let header = response
+            .headers()
+            .get("x-middleware")
+            .expect("header missing");
+        assert_eq!(header.to_str().unwrap(), "applied");
+    }
+
+    #[tokio::test]
     async fn wraps_handlers_with_error_handling_middleware() {
         async fn fail() -> Result<&'static str> {
             Err(Error::msg("boom"))

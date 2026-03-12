@@ -1,6 +1,6 @@
 # Using Portable Services
 
-Skyzen's services abstraction lets you write platform-agnostic business logic that runs unchanged on Cloudflare Workers, AWS Lambda, Azure Functions, or a native server with Redis and S3.
+Skyzen's portable capability layer lets you write business logic against `Kv`, `Storage`, `Queue`, and `SqlDb` instead of provider SDK types. Native and Cloudflare automatic wiring are built in today; provider-specific extensions remain available when you intentionally need more than the portable minimum.
 
 ## Mental Model
 
@@ -25,8 +25,9 @@ Extractor (handler arg)     ← Pulled from request extensions automatically
 | `KeyValueStore` | `Kv` | `get`, `put`, `delete`, `list` + `get_json`, `get_text`, `put_json` |
 | `ObjectStorage` | `Storage` | `get`, `put`, `delete`, `list`, `head` |
 | `MessageQueue` | `Queue` | `send`, `send_batch` + `send_json`, `send_json_batch` |
+| `SqlDatabase` | `SqlDb` | `exec`, `query`, `query_one` |
 
-`Db` wraps a `sea_orm::DatabaseConnection` and implements `Extractor` for SQL database access (native-only). It is not a Skyzen service trait — it re-exports SeaORM directly.
+`Db` remains available as a native-only `SeaORM` escape hatch. Cloudflare-specific primitives such as `CfD1`, `DurableSql`, and Durable Objects are provider extensions, not part of the portable core.
 
 ## Writing a Handler
 
@@ -80,60 +81,54 @@ async fn main() -> Router {
 
 ## Wiring via `Skyzen.toml`
 
-For projects using the Skyzen CLI, `Skyzen.toml` can declare datasources and `import_config!()` generates the wiring code:
+For projects using `#[skyzen::main]`, declare logical capabilities once and provide target-specific wiring:
 
 ```toml
-[[datasource]]
-name = "MainDb"
-engine = "postgres"
-strategy = "tcp"
-url_from_env = "DATABASE_URL"
+[[service]]
+name = "cache"
+type = "kv"
+
+[[service]]
+name = "uploads"
+type = "storage"
+
+[[database]]
+name = "main"
+type = "sql"
+
+[native.service.cache]
+backend = "redis"
+url_env = "CACHE_URL"
+
+[native.service.uploads]
+backend = "s3"
+bucket_env = "UPLOADS_BUCKET"
+
+[native.database.main]
+backend = "postgres"
+url_env = "DATABASE_URL"
+
+[cloudflare.service.cache]
+binding = "CACHE"
+
+[cloudflare.service.uploads]
+binding = "UPLOADS"
+
+[cloudflare.database.main]
+binding = "DB"
 ```
 
-```rust
-skyzen::import_config!();
-
-#[skyzen::main]
-fn main() -> Router {
-    // import_config!() is expanded automatically by #[skyzen::main].
-    // Datasources are initialized and injected as middleware.
-    Route::new((
-        "/users".get(list_users),
-    ))
-    .build()
-}
-```
-
-When you use `#[skyzen::main]`, Skyzen will:
-- Expand `import_config!()` automatically
-- Call each generated datasource's `init()` during startup
-- Install datasource middleware so handlers can extract typed datasources
-
-If you don't use `#[skyzen::main]`, call `import_config!()` and wire middleware yourself.
+`#[skyzen::main]` reads these declarations and injects the portable wrappers automatically. Provider SDK types stay in generated wiring; handlers keep using `Kv`, `Storage`, and `SqlDb`.
 
 ## Platform Switching
 
-The same handler code runs on any platform — you only change the wiring:
+The same handler code runs against the same wrapper types. Only the wiring changes:
 
 ### Native (Redis + S3)
 
 ```rust
 let kv = Kv::new(Redis::connect("redis://localhost:6379").await?);
 let storage = Storage::new(S3Storage::from_env("my-bucket"));
-```
-
-### AWS (DynamoDB + S3)
-
-```rust
-let kv = Kv::new(DynamoKv::from_env("my-table").await);
-let storage = Storage::new(S3Storage::from_env("my-bucket"));
-```
-
-### Azure (Cosmos DB + Blob)
-
-```rust
-let kv = Kv::new(CosmosKv::new(client, "my-db", "my-container"));
-let storage = Storage::new(AzureBlob::new(client, "my-container"));
 ```
 
 ### Cloudflare Workers (KV + R2)
@@ -154,6 +149,8 @@ let storage = Storage::new(InMemoryStorage::new());
 
 Notice the handler function (`upload`) never changes. Only the one-line construction of each backend differs.
 
+Provider crates for AWS and Azure are still available, but they are infrastructure-layer backends today. Runtime parity for those targets is not yet part of the portable core.
+
 ## Platform Implementations
 
 | Service | Native | Cloudflare | AWS | Azure | Test |
@@ -161,7 +158,7 @@ Notice the handler function (`upload`) never changes. Only the one-line construc
 | Key-Value | [`skyzen-redis`](../redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
 | Object Storage | [`skyzen-s3`](../s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
 | Message Queue | — | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
-| SQL Database | SeaORM | `CfD1` / `CfDurableSqlite` | SeaORM | SeaORM | `InMemoryDb` |
+| Portable SQL | `SqlDb` via Postgres | `SqlDb` via D1 | planned wiring | planned wiring | — |
 
 ## The `MaybeSend` Pattern
 
@@ -185,7 +182,17 @@ The same trait definition compiles on both targets without `#[cfg]` in user code
 
 ## Database Access
 
-SQL databases use SeaORM through the `Db` wrapper (native-only):
+Portable SQL uses `SqlDb`:
+
+```rust
+use skyzen_services::{SqlDb, SqlValue};
+
+let users = db
+    .query::<User>("SELECT id, name FROM users WHERE active = $1", &[SqlValue::Boolean(true)])
+    .await?;
+```
+
+Native-only ORM access still uses `Db` through SeaORM:
 
 ```rust
 use skyzen_services::{sea_orm::Database, Db};
@@ -201,6 +208,4 @@ Enable the required runtime and database features:
 skyzen-services = { version = "0.1", features = ["runtime-tokio-rustls", "postgres"] }
 ```
 
-Available database backends: `postgres`, `mysql`, `sqlite`.
-
-**WASM restriction**: The `sqlite` feature is rejected at compile time on `wasm32` targets. For WASM deployments, use cloud vendor SQL services (`CfD1`, `CfDurableSqlite`).
+Portable SQL is intentionally the minimum common surface. When you need provider-specific features such as Durable Object local SQLite, D1-specific metadata, or full ORM behavior, drop down to the provider/native APIs explicitly.

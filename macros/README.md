@@ -30,6 +30,43 @@ fn main() -> Router {
 Options:
 - `default_logger = false` — Disable the built-in tracing subscriber
 
+### `#[skyzen::queue]`
+
+Exports a Cloudflare queue-consumer entrypoint on wasm targets while leaving the original async function available for normal Rust use:
+
+```rust
+#[cfg(target_arch = "wasm32")]
+#[skyzen::queue]
+async fn queue(
+    batch: skyzen_cloudflare::CfQueueBatch,
+    env: skyzen::runtime::wasm::Env,
+    ctx: skyzen_cloudflare::CfQueueContext,
+) -> Result<(), skyzen_cloudflare::CfEventError> {
+    batch.ack_all()?;
+    Ok(())
+}
+```
+
+### `#[skyzen::scheduled]`
+
+Exports a Cloudflare scheduled/cron entrypoint on wasm targets:
+
+```rust
+#[cfg(target_arch = "wasm32")]
+#[skyzen::scheduled]
+async fn scheduled(
+    event: skyzen_cloudflare::CfScheduledEvent,
+    env: skyzen::runtime::wasm::Env,
+    ctx: skyzen_cloudflare::CfScheduleContext,
+) -> Result<(), skyzen_cloudflare::CfEventError> {
+    Ok(())
+}
+```
+
+### `#[skyzen::durable_object]`
+
+Applied to a `DurableObject` impl block, this exports a Cloudflare Durable Object class wrapper that forwards `fetch`, `alarm`, and hibernation websocket events into Skyzen's `DurableObjectRuntime`.
+
 ### `#[skyzen::openapi]`
 
 Annotates a handler for OpenAPI documentation generation.

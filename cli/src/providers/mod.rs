@@ -1,13 +1,16 @@
 mod aws;
 mod azure;
 mod cloudflare;
+mod native;
 
 use crate::{
     args::{Action, CliOptions, Provider},
+    deps::ensure_capability_deps,
     manifest::LoadedManifest,
 };
 use anyhow::Result;
 use std::{
+    env,
     path::PathBuf,
     process::{Command, Stdio},
 };
@@ -44,12 +47,21 @@ pub struct PreparedRun {
     pub action: Action,
     pub commands: Vec<CommandPlan>,
     pub generated_files: Vec<GeneratedFile>,
+    pub run_mode: RunMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunMode {
+    #[default]
+    Once,
+    Watch,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderPlan {
     commands: Vec<CommandPlan>,
     generated_files: Vec<GeneratedFile>,
+    run_mode: RunMode,
 }
 
 impl ProviderPlan {
@@ -58,26 +70,43 @@ impl ProviderPlan {
             action,
             commands: self.commands,
             generated_files: self.generated_files,
+            run_mode: self.run_mode,
         }
     }
 }
 
 pub fn prepare(options: &CliOptions) -> Result<PreparedRun> {
     match options.action {
+        Action::New => unreachable!("new is handled by the CLI entrypoint"),
         Action::Doctor => {
             run_doctor(options.provider)?;
             Ok(PreparedRun {
                 action: Action::Doctor,
                 commands: Vec::new(),
                 generated_files: Vec::new(),
+                run_mode: RunMode::Once,
             })
         }
         Action::Dev | Action::Deploy => {
+            let provider = options.provider.unwrap_or(Provider::Native);
+            if matches!(options.action, Action::Deploy) && provider == Provider::Native {
+                anyhow::bail!("`skyzen deploy` requires a cloud provider");
+            }
+
+            if matches!(options.action, Action::Dev) && provider == Provider::Native {
+                let root_dir = if options.manifest.exists() {
+                    LoadedManifest::load(&options.manifest)?.root_dir
+                } else {
+                    env::current_dir()?
+                };
+                let plan = native::prepare(options.action, root_dir)?;
+                return Ok(plan.into_prepared(options.action));
+            }
+
             let manifest = LoadedManifest::load(&options.manifest)?;
-            let provider = options
-                .provider
-                .ok_or_else(|| anyhow::anyhow!("--provider is required"))?;
+            ensure_capability_deps(&manifest, Some(provider))?;
             let plan = match provider {
+                Provider::Native => unreachable!("native dev is handled above"),
                 Provider::Cloudflare => cloudflare::prepare(options.action, &manifest)?,
                 Provider::Aws => aws::prepare(options.action, &manifest)?,
                 Provider::Azure => azure::prepare(options.action, &manifest)?,
@@ -89,13 +118,21 @@ pub fn prepare(options: &CliOptions) -> Result<PreparedRun> {
 
 fn run_doctor(provider: Option<Provider>) -> Result<()> {
     let providers = provider.map_or_else(
-        || vec![Provider::Cloudflare, Provider::Aws, Provider::Azure],
+        || {
+            vec![
+                Provider::Native,
+                Provider::Cloudflare,
+                Provider::Aws,
+                Provider::Azure,
+            ]
+        },
         |p| vec![p],
     );
 
     let mut missing = Vec::new();
     for provider in providers {
         let (label, binary) = match provider {
+            Provider::Native => ("native", "cargo"),
             Provider::Cloudflare => ("cloudflare", "wrangler"),
             Provider::Aws => ("aws", "sam"),
             Provider::Azure => ("azure", "func"),

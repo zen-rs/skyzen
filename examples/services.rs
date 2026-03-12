@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use skyzen::{
     routing::{CreateRouteNode, Params, Route, Router},
-    utils::{Json, State},
+    utils::Json,
     Result as SkyResult,
 };
 use skyzen_services::{Kv, Storage};
@@ -33,7 +33,7 @@ struct UploadRequest {
 }
 
 /// List all file metadata keys stored in KV.
-async fn list_files(State(kv): State<Kv>) -> SkyResult<Json<Vec<String>>> {
+async fn list_files(kv: Kv) -> SkyResult<Json<Vec<String>>> {
     let keys = kv
         .list(Some("file:"))
         .await
@@ -42,7 +42,7 @@ async fn list_files(State(kv): State<Kv>) -> SkyResult<Json<Vec<String>>> {
 }
 
 /// Get metadata for a single file from KV.
-async fn get_file(State(kv): State<Kv>, params: Params) -> SkyResult<Json<Option<FileMetadata>>> {
+async fn get_file(kv: Kv, params: Params) -> SkyResult<Json<Option<FileMetadata>>> {
     let name = params.get("name")?;
     let meta = kv
         .get_json::<FileMetadata>(&format!("file:{name}"))
@@ -53,8 +53,8 @@ async fn get_file(State(kv): State<Kv>, params: Params) -> SkyResult<Json<Option
 
 /// Upload a file: store bytes in object storage and metadata in KV.
 async fn upload_file(
-    State(kv): State<Kv>,
-    State(storage): State<Storage>,
+    kv: Kv,
+    storage: Storage,
     Json(body): Json<UploadRequest>,
 ) -> SkyResult<&'static str> {
     let data = body.content.into_bytes();
@@ -83,8 +83,8 @@ fn build_router(kv: Kv, storage: Storage) -> Router {
         "/files".post(upload_file),
         "/files".route(("/{name}".at(get_file),)),
     ))
-    .middleware(State(kv))
-    .middleware(State(storage))
+    .with(kv)
+    .with(storage)
     .build()
 }
 

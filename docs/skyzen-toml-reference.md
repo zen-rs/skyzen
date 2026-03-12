@@ -1,10 +1,117 @@
 # Skyzen.toml Reference
 
-`Skyzen.toml` is an optional manifest file that declares datasources and platform-specific deployment configuration. It is used by the `skyzen` CLI for local emulation (`skyzen dev`) and deployment (`skyzen deploy`).
+`Skyzen.toml` is an optional manifest file that declares portable capabilities plus platform-specific wiring and deployment configuration. It is used by `#[skyzen::main]` for generated wiring and by the `skyzen` CLI for local emulation (`skyzen dev`) and deployment (`skyzen deploy`).
 
 Users can always wire services manually in Rust without using `Skyzen.toml`.
 
-## Datasources
+## Portable Services
+
+Declare logical portable services once:
+
+```toml
+[[service]]
+name = "cache"
+type = "kv"
+
+[[service]]
+name = "uploads"
+type = "storage"
+
+[[service]]
+name = "jobs"
+type = "queue"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | string | **Required.** Logical service name used in wiring sections |
+| `type` | string | **Required.** `kv`, `storage`, or `queue` |
+
+### Native Service Wiring
+
+Wire each declared service for native targets:
+
+```toml
+[native.service.cache]
+backend = "redis"
+url_env = "CACHE_URL"
+
+[native.service.uploads]
+backend = "s3"
+bucket_env = "UPLOADS_BUCKET"
+
+[native.service.jobs]
+backend = "sqs"
+url_env = "JOBS_QUEUE_URL"
+```
+
+Supported native backends:
+
+| Service Type | Backends | Required Keys |
+|--------------|----------|---------------|
+| `kv` | `redis`, `memory` | `url_env` for `redis` |
+| `storage` | `s3`, `memory` | `bucket_env` for `s3` |
+| `queue` | `sqs`, `memory` | `url_env` for `sqs` |
+
+### Cloudflare Service Wiring
+
+Wire each declared service for Cloudflare/WASM targets:
+
+```toml
+[cloudflare.service.cache]
+binding = "CACHE"
+
+[cloudflare.service.uploads]
+binding = "UPLOADS"
+
+[cloudflare.service.jobs]
+binding = "JOBS"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `binding` | string | **Required.** Cloudflare binding name used to initialize the provider backend |
+
+## Portable Databases
+
+Declare a logical portable SQL database:
+
+```toml
+[[database]]
+name = "main"
+type = "sql"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | string | **Required.** Logical database name used in wiring sections |
+| `type` | string | **Required.** Currently only `sql` |
+
+### Native Database Wiring
+
+```toml
+[native.database.main]
+backend = "postgres"
+url_env = "DATABASE_URL"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `backend` | string | **Required.** Currently only `postgres` |
+| `url_env` | string | **Required.** Environment variable containing the connection URL |
+
+### Cloudflare Database Wiring
+
+```toml
+[cloudflare.database.main]
+binding = "DB"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `binding` | string | **Required.** Cloudflare D1 binding name |
+
+## Legacy Datasources
 
 Declare datasources that `import_config!()` will generate typed code for:
 
@@ -25,7 +132,7 @@ key_from_env = "DATABASE_TOKEN"
 | `url_from_env` | string | **Required.** Environment variable containing the connection URL |
 | `key_from_env` | string | Optional. Environment variable containing an auth token or key |
 
-When you use `#[skyzen::main]`, datasources are automatically initialized and injected as middleware. Without `#[skyzen::main]`, call `import_config!()` and wire middleware yourself.
+`[[datasource]]` remains available for legacy typed env-wrapper generation. New portable capability wiring should use `[[service]]` and `[[database]]`.
 
 ## Cloudflare Section
 
@@ -172,6 +279,8 @@ renamed_classes = [{ from = "Old", to = "New" }]
 
 ## AWS Section
 
+The AWS section currently configures CLI orchestration only. It does not imply AWS runtime parity with the Cloudflare/native path.
+
 ```toml
 [aws]
 template = "template.yaml"
@@ -197,6 +306,8 @@ The `skyzen` CLI runs:
 
 ## Azure Section
 
+The Azure section currently configures CLI orchestration only. It does not imply Azure runtime parity with the Cloudflare/native path.
+
 ```toml
 [azure]
 project = "."
@@ -217,17 +328,44 @@ The `skyzen` CLI runs:
 ## Full Example
 
 ```toml
-[[datasource]]
-name = "MainDb"
-engine = "postgres"
-strategy = "tcp"
-url_from_env = "DATABASE_URL"
+[[service]]
+name = "cache"
+type = "kv"
+
+[[service]]
+name = "uploads"
+type = "storage"
+
+[[database]]
+name = "main"
+type = "sql"
+
+[native.service.cache]
+backend = "redis"
+url_env = "CACHE_URL"
+
+[native.service.uploads]
+backend = "s3"
+bucket_env = "UPLOADS_BUCKET"
+
+[native.database.main]
+backend = "postgres"
+url_env = "DATABASE_URL"
 
 [cloudflare]
 name = "my-app"
 main = "dist/worker.js"
 compatibility_date = "2025-02-01"
 workers_dev = true
+
+[cloudflare.service.cache]
+binding = "CACHE"
+
+[cloudflare.service.uploads]
+binding = "UPLOADS"
+
+[cloudflare.database.main]
+binding = "DB"
 
 [[cloudflare.kv_namespaces]]
 binding = "CACHE"
@@ -254,11 +392,6 @@ new_sqlite_classes = ["AppState"]
 template = "template.yaml"
 stack_name = "my-app-stack"
 region = "us-east-1"
-
-[azure]
-project = "."
-app_name = "my-app"
-port = 7071
 ```
 
 ## Provider Mapping

@@ -190,6 +190,94 @@ where
     }
 }
 
+/// Invoke a Skyzen Durable Object alarm handler from an external runtime wrapper.
+///
+/// # Errors
+///
+/// Returns `JsValue` when state I/O, alarm dispatch, or persistence fails.
+pub async fn invoke_alarm<T>(state: worker_sys::DurableObjectState) -> Result<(), JsValue>
+where
+    T: DurableObject,
+{
+    DurableObjectRuntime::<T>::alarm(state).await
+}
+
+/// Invoke a Skyzen Durable Object websocket message handler from an external runtime wrapper.
+///
+/// # Errors
+///
+/// Returns `JsValue` when state I/O, handler execution, or persistence fails.
+pub async fn invoke_websocket_message<T>(
+    state: worker_sys::DurableObjectState,
+    websocket: web_sys::WebSocket,
+    message: skyzen::http_kit::ws::WebSocketMessage,
+) -> Result<(), JsValue>
+where
+    T: DurableObject,
+{
+    let mut object = load_state::<T>(&state).await?;
+    let durable_state = CfDurableState::new(clone_state(&state));
+    let context = durable_state.context().map_err(to_js)?;
+    let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
+        websocket,
+        clone_state(&state),
+    )));
+
+    object
+        .websocket(&connection, WebSocketEvent::Message(message), &context)
+        .await
+        .map_err(to_js)?;
+
+    save_state(&state, &object).await
+}
+
+/// Invoke a Skyzen Durable Object websocket close handler from an external runtime wrapper.
+///
+/// # Errors
+///
+/// Returns `JsValue` when state I/O, handler execution, or persistence fails.
+pub async fn invoke_websocket_close<T>(
+    state: worker_sys::DurableObjectState,
+    websocket: web_sys::WebSocket,
+    code: u16,
+    reason: String,
+    was_clean: bool,
+) -> Result<(), JsValue>
+where
+    T: DurableObject,
+{
+    DurableObjectRuntime::<T>::websocket_close(state, websocket, code, reason, was_clean).await
+}
+
+/// Invoke a Skyzen Durable Object websocket error handler from an external runtime wrapper.
+///
+/// # Errors
+///
+/// Returns `JsValue` when state I/O, handler execution, or persistence fails.
+pub async fn invoke_websocket_error<T>(
+    state: worker_sys::DurableObjectState,
+    websocket: web_sys::WebSocket,
+    error: String,
+) -> Result<(), JsValue>
+where
+    T: DurableObject,
+{
+    let mut object = load_state::<T>(&state).await?;
+    let durable_state = CfDurableState::new(clone_state(&state));
+    let context = durable_state.context().map_err(to_js)?;
+    let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
+        websocket,
+        clone_state(&state),
+    )));
+
+    object
+        .websocket(&connection, WebSocketEvent::Error(error), &context)
+        .await
+        .map_err(to_js)?;
+
+    save_state(&state, &object).await
+}
+
 async fn load_state<T>(state: &worker_sys::DurableObjectState) -> Result<T, JsValue>
 where
     T: DurableObject,

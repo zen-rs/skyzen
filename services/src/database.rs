@@ -3,9 +3,16 @@
 //! The [`Db`] extractor wraps a [`sea_orm::DatabaseConnection`], providing
 //! a thin extraction layer while delegating all ORM functionality to `SeaORM`.
 
-use std::ops::{Deref, DerefMut};
+use std::{
+    convert::Infallible,
+    ops::{Deref, DerefMut},
+};
 
-use http_kit::http_error;
+use http_kit::{
+    http_error,
+    middleware::{Middleware, MiddlewareError},
+    Endpoint, Response,
+};
 use skyzen_core::{Extractor, StatusCode};
 
 /// A database connection extractor wrapping [`sea_orm::DatabaseConnection`].
@@ -80,5 +87,20 @@ impl Extractor for Db {
             .get::<Self>()
             .cloned()
             .ok_or(DbNotConfigured::new())
+    }
+}
+
+impl Middleware for Db {
+    type Error = Infallible;
+
+    async fn handle<N: Endpoint>(
+        &mut self,
+        request: &mut http_kit::Request,
+        mut next: N,
+    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
+        request.extensions_mut().insert(self.clone());
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)
     }
 }

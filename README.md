@@ -5,18 +5,19 @@
 [![License](https://img.shields.io/crates/l/skyzen.svg)](LICENSE)
 [![Coverage](https://img.shields.io/codecov/c/github/zen-rs/skyzen?logo=codecov)](https://app.codecov.io/gh/zen-rs/skyzen)
 
-A fast, ergonomic HTTP framework for Rust that works everywhere — from native servers to WebAssembly edge platforms.
+A fast, ergonomic HTTP framework for Rust focused on native servers and Cloudflare-compatible edge/serverless platforms.
 
 ## Features
 
-- **Write once, deploy everywhere** — The same handler code runs on native servers, Cloudflare Workers, AWS Lambda, and Azure Functions
-- **Portable services** — Platform-agnostic abstractions for key-value stores, object storage, message queues, and databases
+- **Portable core** — Write handlers against `Kv`, `Storage`, `Queue`, and `SqlDb` instead of provider SDK types
+- **Stable runtimes today** — Native servers and WinterCG/Cloudflare Workers share the same handler model
+- **Provider extensions** — Opt into raw/provider-specific APIs such as `Db`, `CfD1`, queue/scheduled event handlers, and Durable Object capabilities only when you need more than the portable minimum
 - **Extractor/Responder pattern** — Type-safe request parsing and response generation via function arguments and return types
 - **Tree-based routing** — Fast, composable routing with path parameters, HTTP method matching, and nested routes
 - **WebSocket support** — Unified WebSocket API across native (async-tungstenite) and WASM (WebSocketPair)
 - **OpenAPI generation** — Automatic API documentation from annotated handlers
 - **`#[skyzen::main]`** — One macro for both native (Tokio + Hyper + logging + graceful shutdown) and WASM (WinterCG `fetch` export)
-- **Unified CLI** — `skyzen dev/deploy` for Cloudflare Workers, AWS Lambda, and Azure Functions
+- **Unified CLI** — `skyzen new/dev/deploy` scaffolds projects, runs native watch/restart, and orchestrates Cloudflare-first deployment flows
 
 ## Getting Started
 
@@ -110,37 +111,47 @@ WebSocket works on both native (via `async-tungstenite`) and WASM (via `WebSocke
 
 ## Platform Comparison
 
-The same handler code runs unchanged across all platforms — only the service wiring differs:
+Portable handlers run against the same capability wrappers. Native and Cloudflare automatic wiring are built in today; AWS and Azure provider crates remain available as infrastructure backends, but runtime parity for those targets is not part of the finished scope.
 
 | Service | Native | Cloudflare | AWS | Azure | Test |
 |---------|--------|------------|-----|-------|------|
 | Key-Value | [`skyzen-redis`](redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
 | Object Storage | [`skyzen-s3`](s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
 | Message Queue | — | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
-| SQL Database | SeaORM | `CfD1` / `CfDurableSqlite` | SeaORM | SeaORM | `InMemoryDb` |
+| Portable SQL | `SqlDb` via Postgres | `SqlDb` via D1 | planned wiring | planned wiring | — |
+
+Provider-specific escape hatches remain available when you need more than the portable minimum:
+
+- Native ORM: `Db` (`SeaORM`)
+- Cloudflare raw SQL and stateful primitives: `CfD1`, `DurableKv`, `DurableSql`, `Alarm`, Durable Objects
 
 See the [Services Guide](docs/services-guide.md) for how to write platform-agnostic handlers and switch between backends.
 
 ## Services Abstraction
 
-Skyzen provides portable service abstractions through `skyzen-services`. The same handler code runs on any platform:
+Skyzen provides portable capability wrappers through `skyzen-services`. Application code depends on those wrappers, not on provider SDK types:
 
 ```rust
-use skyzen_services::{Kv, Storage, Queue};
+use skyzen_services::{Kv, SqlDb, Storage};
 
-async fn handler(kv: Kv, storage: Storage) -> Result<Json<Data>> {
+async fn handler(kv: Kv, storage: Storage, db: SqlDb) -> Result<Json<Data>> {
     let cached = kv.get_json::<Data>("cache:key").await?;
     let file = storage.get("assets/logo.png").await?;
+    let users = db.query::<User>("SELECT id, name FROM users", &[]).await?;
     Ok(Json(cached.unwrap_or_default()))
 }
 ```
 
-Wire different backends depending on your deployment target:
+Wire different backends depending on your deployment target. The wrapper type stays the same:
 
 ```rust
 // Native: Redis + S3
 let kv = Kv::new(Redis::connect("redis://localhost:6379").await?);
 let storage = Storage::new(S3Storage::from_env("my-bucket"));
+
+// Cloudflare: Workers KV + R2
+let kv = Kv::new(CfKv::from_env(&env, "CACHE")?);
+let storage = Storage::new(CfR2::from_env(&env, "UPLOADS")?);
 
 // Testing: In-memory mocks
 let kv = Kv::new(InMemoryKv::new());
@@ -195,11 +206,15 @@ See the [Deployment Guide](docs/deployment-guide.md) for full setup instructions
 
 ## CLI
 
-The `skyzen` CLI provides unified local emulation and deployment:
+The `skyzen` CLI scaffolds projects, runs native watch/restart development, and orchestrates deployment:
 
 ```sh
+skyzen new my-app --template api
+skyzen new jobs-app --template serverless-events
+skyzen new room-app --template durable-realtime
 skyzen doctor                          # Check toolchain
-skyzen dev --provider cloudflare       # Local Workers emulation
+skyzen dev                             # Native watch + restart
+skyzen dev --provider cloudflare       # Wrangler-driven Cloudflare dev
 skyzen deploy --provider cloudflare    # Deploy to Workers
 skyzen dev --provider aws              # SAM local API
 skyzen deploy --provider aws           # SAM deploy
@@ -207,7 +222,36 @@ skyzen dev --provider azure            # Azure Functions local
 skyzen deploy --provider azure         # Publish to Azure
 ```
 
-Configure platforms via [`Skyzen.toml`](docs/skyzen-toml-reference.md).
+Configure platforms via [`Skyzen.toml`](docs/skyzen-toml-reference.md). For Cloudflare, Skyzen generates `.skyzen/gen/wrangler.toml` automatically; users do not hand-maintain `wrangler.toml`.
+
+## Cloudflare Event Handlers
+
+Skyzen also supports Cloudflare-specific queue and scheduled entrypoints:
+
+```rust
+#[cfg(target_arch = "wasm32")]
+#[skyzen::queue]
+async fn queue(
+    batch: skyzen_cloudflare::CfQueueBatch,
+    env: skyzen::runtime::wasm::Env,
+    ctx: skyzen_cloudflare::CfQueueContext,
+) -> Result<(), skyzen_cloudflare::CfEventError> {
+    batch.ack_all()?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[skyzen::scheduled]
+async fn scheduled(
+    event: skyzen_cloudflare::CfScheduledEvent,
+    env: skyzen::runtime::wasm::Env,
+    ctx: skyzen_cloudflare::CfScheduleContext,
+) -> Result<(), skyzen_cloudflare::CfEventError> {
+    Ok(())
+}
+```
+
+For stateful Cloudflare-specific workflows, use `#[skyzen::durable_object]` with the `DurableObject` trait.
 
 ## Custom Server
 
@@ -261,15 +305,15 @@ fn router() -> Router {
 | [`skyzen-redis`](redis/) | Redis `KeyValueStore` implementation | [README](redis/README.md) |
 | [`skyzen-s3`](s3/) | S3-compatible `ObjectStorage` implementation | [README](s3/README.md) |
 | [`skyzen-cloudflare`](cloudflare/) | Cloudflare Workers implementations (KV, R2, Queues, D1, Durable Objects) | [README](cloudflare/README.md) |
-| [`skyzen-aws`](aws/) | AWS implementations (DynamoDB, SQS, S3) | [README](aws/README.md) |
-| [`skyzen-azure`](azure/) | Azure implementations (Cosmos DB, Blob Storage, Service Bus) | [README](azure/README.md) |
+| [`skyzen-aws`](aws/) | AWS infrastructure backends (DynamoDB, SQS, S3) | [README](aws/README.md) |
+| [`skyzen-azure`](azure/) | Azure infrastructure backends (Cosmos DB, Blob Storage, Service Bus) | [README](azure/README.md) |
 | [`skyzen-cli`](cli/) | Unified CLI for local emulation and deployment | [README](cli/README.md) |
 
 ## Guides
 
 - [Using Portable Services](docs/services-guide.md) — How to write platform-agnostic handlers and switch backends
 - [Testing with Skyzen](docs/testing-guide.md) — Mock services, TestClient, assertions, and snapshot testing
-- [Deploying Skyzen Apps](docs/deployment-guide.md) — Native, Cloudflare Workers, AWS Lambda, Azure Functions
+- [Deploying Skyzen Apps](docs/deployment-guide.md) — Native and Cloudflare-first deployment, plus AWS/Azure CLI orchestration notes
 - [Skyzen.toml Reference](docs/skyzen-toml-reference.md) — Full configuration reference
 
 ## License

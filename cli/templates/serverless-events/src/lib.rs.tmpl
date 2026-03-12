@@ -1,0 +1,43 @@
+mod app;
+
+use skyzen::routing::Router;
+
+#[skyzen::main]
+fn worker() -> Router {
+    app::router()
+}
+
+use skyzen::events::ScheduledTick;
+use skyzen_services::{QueueBatch, QueueBatchDisposition, QueueMessageDisposition, QueueRetry};
+
+#[derive(serde::Deserialize)]
+struct Job {
+    kind: String,
+}
+
+fn handle_jobs(batch: QueueBatch<Job>) -> QueueBatchDisposition {
+    let actions = batch
+        .messages
+        .iter()
+        .map(|message| {
+            if message.body.kind == "retry" {
+                QueueMessageDisposition::Retry(QueueRetry::new().with_delay_seconds(10))
+            } else {
+                QueueMessageDisposition::Ack
+            }
+        })
+        .collect();
+
+    QueueBatchDisposition::PerMessage(actions)
+}
+
+#[skyzen::queue]
+async fn queue(batch: QueueBatch<Job>) -> QueueBatchDisposition {
+    handle_jobs(batch)
+}
+
+#[skyzen::scheduled]
+async fn scheduled(event: ScheduledTick) {
+    let cron = event.cron;
+    tracing::info!("scheduled trigger fired: {cron}");
+}

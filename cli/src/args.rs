@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    New,
     Dev,
     Deploy,
     Doctor,
@@ -10,9 +11,17 @@ pub enum Action {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
+    Native,
     Cloudflare,
     Aws,
     Azure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Template {
+    Api,
+    ServerlessEvents,
+    DurableRealtime,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +30,9 @@ pub struct CliOptions {
     pub provider: Option<Provider>,
     pub manifest: PathBuf,
     pub dry_run: bool,
+    pub template: Template,
+    pub path: Option<PathBuf>,
+    pub force: bool,
 }
 
 impl CliOptions {
@@ -32,6 +44,9 @@ impl CliOptions {
         let mut provider = None;
         let mut manifest = PathBuf::from("Skyzen.toml");
         let mut dry_run = false;
+        let mut template = Template::Api;
+        let mut path = None;
+        let mut force = false;
 
         while let Some(arg) = args.next() {
             if let Some(value) = arg.strip_prefix("--provider=") {
@@ -44,11 +59,16 @@ impl CliOptions {
                 continue;
             }
 
+            if let Some(value) = arg.strip_prefix("--template=") {
+                template = parse_template(value)?;
+                continue;
+            }
+
             match arg.as_str() {
                 "--provider" | "-p" => {
-                    let value = args
-                        .next()
-                        .context("missing value for --provider (expected cloudflare|aws|azure)")?;
+                    let value = args.next().context(
+                        "missing value for --provider (expected native|cloudflare|aws|azure)",
+                    )?;
                     provider = Some(parse_provider(&value)?);
                 }
                 "--manifest" | "-m" => {
@@ -57,8 +77,17 @@ impl CliOptions {
                         .context("missing value for --manifest (expected path)")?;
                     manifest = PathBuf::from(value);
                 }
+                "--template" | "-t" => {
+                    let value = args
+                        .next()
+                        .context("missing value for --template (expected api)")?;
+                    template = parse_template(&value)?;
+                }
                 "--dry-run" => {
                     dry_run = true;
+                }
+                "--force" | "-f" => {
+                    force = true;
                 }
                 "--help" | "-h" => {
                     print_usage_and_exit();
@@ -67,10 +96,13 @@ impl CliOptions {
                     anyhow::bail!("unsupported argument: {unknown}");
                 }
                 action_raw => {
-                    if action.is_some() {
-                        anyhow::bail!("action already specified: {action_raw}");
+                    if action.is_none() {
+                        action = Some(parse_action(action_raw)?);
+                    } else if path.is_none() {
+                        path = Some(PathBuf::from(action_raw));
+                    } else {
+                        anyhow::bail!("unexpected positional argument: {action_raw}");
                     }
-                    action = Some(parse_action(action_raw)?);
                 }
             }
         }
@@ -80,10 +112,15 @@ impl CliOptions {
         };
 
         match action {
+            Action::New => {
+                if path.is_none() {
+                    anyhow::bail!("project path is required for `skyzen new`");
+                }
+            }
             Action::Doctor => {}
             Action::Dev | Action::Deploy => {
-                if provider.is_none() {
-                    anyhow::bail!("--provider is required for dev/deploy");
+                if action == Action::Deploy && provider.is_none() {
+                    anyhow::bail!("--provider is required for deploy");
                 }
             }
         }
@@ -93,34 +130,51 @@ impl CliOptions {
             provider,
             manifest,
             dry_run,
+            template,
+            path,
+            force,
         })
     }
 }
 
 fn parse_action(value: &str) -> Result<Action> {
     match value {
+        "new" => Ok(Action::New),
         "dev" => Ok(Action::Dev),
         "deploy" => Ok(Action::Deploy),
         "doctor" => Ok(Action::Doctor),
-        _ => anyhow::bail!("unsupported action: {value} (expected dev|deploy|doctor)"),
+        _ => anyhow::bail!("unsupported action: {value} (expected new|dev|deploy|doctor)"),
     }
 }
 
 fn parse_provider(value: &str) -> Result<Provider> {
     match value {
+        "native" => Ok(Provider::Native),
         "cloudflare" => Ok(Provider::Cloudflare),
         "aws" => Ok(Provider::Aws),
         "azure" => Ok(Provider::Azure),
-        _ => anyhow::bail!("unsupported provider: {value} (expected cloudflare|aws|azure)"),
+        _ => anyhow::bail!("unsupported provider: {value} (expected native|cloudflare|aws|azure)"),
+    }
+}
+
+fn parse_template(value: &str) -> Result<Template> {
+    match value {
+        "api" => Ok(Template::Api),
+        "serverless-events" => Ok(Template::ServerlessEvents),
+        "durable-realtime" => Ok(Template::DurableRealtime),
+        _ => anyhow::bail!(
+            "unsupported template: {value} (expected api|serverless-events|durable-realtime)"
+        ),
     }
 }
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
         "Usage:
-  skyzen dev --provider <cloudflare|aws|azure> [--manifest Skyzen.toml] [--dry-run]
+  skyzen new <path> [--template api|serverless-events|durable-realtime] [--force]
+  skyzen dev [--provider <native|cloudflare|aws|azure>] [--manifest Skyzen.toml] [--dry-run]
   skyzen deploy --provider <cloudflare|aws|azure> [--manifest Skyzen.toml] [--dry-run]
-  skyzen doctor [--provider <cloudflare|aws|azure>]"
+  skyzen doctor [--provider <native|cloudflare|aws|azure>]"
     );
     std::process::exit(2);
 }
@@ -134,13 +188,11 @@ mod tests {
         let args = vec![
             "skyzen".to_string(),
             "dev".to_string(),
-            "--provider".to_string(),
-            "cloudflare".to_string(),
             "--dry-run".to_string(),
         ];
         let parsed = CliOptions::parse(args).expect("parse should succeed");
         assert_eq!(parsed.action, Action::Dev);
-        assert_eq!(parsed.provider, Some(Provider::Cloudflare));
+        assert_eq!(parsed.provider, None);
         assert!(parsed.dry_run);
     }
 
@@ -175,5 +227,22 @@ mod tests {
         assert_eq!(parsed.action, Action::Deploy);
         assert_eq!(parsed.provider, Some(Provider::Aws));
         assert_eq!(parsed.manifest, PathBuf::from("custom.toml"));
+    }
+
+    #[test]
+    fn parses_new_options() {
+        let args = vec![
+            "skyzen".to_string(),
+            "new".to_string(),
+            "demo-app".to_string(),
+            "--template".to_string(),
+            "serverless-events".to_string(),
+            "--force".to_string(),
+        ];
+        let parsed = CliOptions::parse(args).expect("parse should succeed");
+        assert_eq!(parsed.action, Action::New);
+        assert_eq!(parsed.template, Template::ServerlessEvents);
+        assert_eq!(parsed.path, Some(PathBuf::from("demo-app")));
+        assert!(parsed.force);
     }
 }

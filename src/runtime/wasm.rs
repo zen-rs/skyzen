@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::future::Future;
 
 use crate::{Body, Endpoint, HttpError, StatusCode};
@@ -15,21 +15,21 @@ pub type Env = JsValue;
 pub type ExecutionContext = JsValue;
 
 thread_local! {
-    static CURRENT_ENV: Cell<Option<JsValue>> = const { Cell::new(None) };
+    static CURRENT_ENV: RefCell<Option<JsValue>> = const { RefCell::new(None) };
 }
 
 /// Get the current WinterCG env during endpoint construction.
-/// Only valid during the factory call in the fetch handler.
+/// Can be called multiple times during the factory call in the fetch handler.
 pub fn current_env() -> Option<JsValue> {
-    CURRENT_ENV.with(|cell| cell.take())
+    CURRENT_ENV.with_borrow(|env| env.clone())
 }
 
 fn set_current_env(env: JsValue) {
-    CURRENT_ENV.with(|cell| cell.set(Some(env)));
+    CURRENT_ENV.with_borrow_mut(|slot| *slot = Some(env));
 }
 
 fn clear_current_env() {
-    CURRENT_ENV.with(|cell| cell.set(None));
+    CURRENT_ENV.with_borrow_mut(|slot| *slot = None);
 }
 
 /// Wrapper for WinterCG env, usable in request extensions.

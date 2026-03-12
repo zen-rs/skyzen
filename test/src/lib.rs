@@ -27,6 +27,7 @@
 pub mod assertions;
 pub mod client;
 pub mod context;
+pub mod events;
 pub mod fixtures;
 pub mod mock;
 pub mod snapshot;
@@ -34,4 +35,5 @@ pub mod snapshot;
 pub use assertions::TestResponse;
 pub use client::TestClient;
 pub use context::TestContext;
+pub use events::{queue_batch, queue_message, scheduled_tick};
 pub use snapshot::SnapshotExt;

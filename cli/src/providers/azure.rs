@@ -1,7 +1,7 @@
 use crate::{
     args::Action,
     manifest::LoadedManifest,
-    providers::{CommandPlan, ProviderPlan},
+    providers::{CommandPlan, ProviderPlan, RunMode},
 };
 use anyhow::{Context, Result};
 
@@ -47,10 +47,12 @@ pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan
             }
         }
         Action::Doctor => unreachable!("doctor is handled in providers::prepare"),
+        Action::New => unreachable!("new is handled in the CLI entrypoint"),
     };
 
     Ok(ProviderPlan {
         commands: vec![command],
         generated_files: Vec::new(),
+        run_mode: RunMode::Once,
     })
 }

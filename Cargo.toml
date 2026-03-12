@@ -106,7 +106,7 @@ futures-lite = "2.6"
 wasm-bindgen = { version = "0.2.110", features = ["spans"] }
 wasm-bindgen-futures = "0.4.60"
 js-sys = "0.3.87"
-web-sys = { version = "0.3.87", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController"] }
+web-sys = { version = "0.3.87", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
 futures-channel = { version = "0.3.32", optional = true }
 
 [dependencies.serde_json]

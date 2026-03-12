@@ -44,10 +44,15 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(steps) => steps,
         Err(error) => return error.to_compile_error().into(),
     };
+    let portable_injection_wrap_steps = match portable_injection_wrap_steps() {
+        Ok(steps) => steps,
+        Err(error) => return error.to_compile_error().into(),
+    };
     let native_factory = quote! {
         async move {
             let endpoint = #entry_call;
             #(#datasource_wrap_steps)*
+            #(#portable_injection_wrap_steps)*
             endpoint
         }
     };
@@ -134,6 +139,64 @@ pub fn openapi(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error()
             .into(),
     }
+}
+
+/// Export a Cloudflare queue consumer entrypoint on wasm targets.
+#[proc_macro_attribute]
+pub fn queue(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args =
+        parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
+    if !args.is_empty() {
+        return Error::new_spanned(
+            quote! { #args },
+            "#[skyzen::queue] does not take arguments; remove them",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let function = parse_macro_input!(item as ItemFn);
+    expand_cloudflare_event(function, CloudflareEventKind::Queue)
+        .unwrap_or_else(|error| error.to_compile_error())
+        .into()
+}
+
+/// Export a Cloudflare scheduled entrypoint on wasm targets.
+#[proc_macro_attribute]
+pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args =
+        parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
+    if !args.is_empty() {
+        return Error::new_spanned(
+            quote! { #args },
+            "#[skyzen::scheduled] does not take arguments; remove them",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let function = parse_macro_input!(item as ItemFn);
+    expand_cloudflare_event(function, CloudflareEventKind::Scheduled)
+        .unwrap_or_else(|error| error.to_compile_error())
+        .into()
+}
+
+/// Export a Cloudflare Durable Object class for a `DurableObject` impl block.
+#[proc_macro_attribute]
+pub fn durable_object(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args =
+        parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
+    if !args.is_empty() {
+        return Error::new_spanned(
+            quote! { #args },
+            "#[skyzen::durable_object] does not take arguments; remove them",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let item_struct = parse_macro_input!(item as ItemStruct);
+    expand_durable_object(item_struct).into()
 }
 
 /// Error helper that implements `Display`, `Error`, and `HttpError`.
@@ -834,6 +897,48 @@ struct DatasourceConfig {
     key_env: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ServiceConfig {
+    name: String,
+    service_type: ServiceType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ServiceType {
+    Kv,
+    Storage,
+    Queue,
+}
+
+impl ServiceType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kv => "kv",
+            Self::Storage => "storage",
+            Self::Queue => "queue",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DatabaseConfig {
+    name: String,
+    database_type: DatabaseType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DatabaseType {
+    Sql,
+}
+
+impl DatabaseType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sql => "sql",
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
     let datasources = load_datasources()?;
@@ -1036,30 +1141,94 @@ fn datasource_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>> {
     Ok(steps)
 }
 
-fn load_datasources() -> syn::Result<Vec<DatasourceConfig>> {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|error| {
-        Error::new(
-            proc_macro2::Span::call_site(),
-            format!("failed to read CARGO_MANIFEST_DIR: {error}"),
-        )
-    })?;
-    let config_path = PathBuf::from(manifest_dir).join("Skyzen.toml");
-    if !config_path.exists() {
+fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let Some(value) = load_manifest_value()? else {
+        return Ok(Vec::new());
+    };
+
+    let services = load_services_from_value(&value)?;
+    let databases = load_databases_from_value(&value)?;
+    if services.is_empty() && databases.is_empty() {
         return Ok(Vec::new());
     }
 
-    let content = fs::read_to_string(&config_path).map_err(|error| {
-        Error::new(
-            proc_macro2::Span::call_site(),
-            format!("failed to read {}: {error}", config_path.display()),
-        )
-    })?;
-    let value: toml::Value = content.parse().map_err(|error| {
-        Error::new(
-            proc_macro2::Span::call_site(),
-            format!("failed to parse {}: {error}", config_path.display()),
-        )
-    })?;
+    let mut steps = Vec::with_capacity(services.len() + databases.len() + 1);
+    let mut seen_service_types = HashSet::new();
+    let mut seen_database_types = HashSet::new();
+
+    steps.push(quote! {
+        #[cfg(target_arch = "wasm32")]
+        let __skyzen_wasm_env = ::skyzen::runtime::wasm::current_env()
+            .expect("WinterCG env not available during portable capability initialization");
+    });
+
+    for service in &services {
+        if !seen_service_types.insert(service.service_type) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "duplicate portable service type `{}` detected; Skyzen currently supports only one default `{}` capability",
+                    service.service_type.as_str(),
+                    service.service_type.as_str()
+                ),
+            ));
+        }
+
+        let native_init = generate_native_service_init(service, &value)?;
+        let cloudflare_init = generate_cloudflare_service_init(service, &value)?;
+        steps.push(quote! {
+            let endpoint = {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let __svc = #native_init;
+                    ::skyzen::__private::with_middleware(endpoint, __svc)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let __svc = #cloudflare_init;
+                    ::skyzen::__private::with_middleware(endpoint, __svc)
+                }
+            };
+        });
+    }
+
+    for database in &databases {
+        if !seen_database_types.insert(database.database_type) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "duplicate portable database type `{}` detected; Skyzen currently supports only one default `{}` capability",
+                    database.database_type.as_str(),
+                    database.database_type.as_str()
+                ),
+            ));
+        }
+
+        let native_init = generate_native_database_init(database, &value)?;
+        let cloudflare_init = generate_cloudflare_database_init(database, &value)?;
+        steps.push(quote! {
+            let endpoint = {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let __db = #native_init;
+                    ::skyzen::__private::with_middleware(endpoint, __db)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let __db = #cloudflare_init;
+                    ::skyzen::__private::with_middleware(endpoint, __db)
+                }
+            };
+        });
+    }
+
+    Ok(steps)
+}
+
+fn load_datasources() -> syn::Result<Vec<DatasourceConfig>> {
+    let Some(value) = load_manifest_value()? else {
+        return Ok(Vec::new());
+    };
 
     let Some(entries) = value.get("datasource").and_then(toml::Value::as_array) else {
         return Ok(Vec::new());
@@ -1080,10 +1249,11 @@ fn parse_datasource(entry: &toml::Value, index: usize) -> syn::Result<Datasource
         ));
     };
 
-    let name = required_string(table, "name", index)?;
+    let label = format!("datasource[{index}]");
+    let name = required_string(table, "name", &label)?;
     let engine = optional_string(table, &["engine"]).unwrap_or_else(|| "custom".to_owned());
     let strategy = optional_string(table, &["strategy"]).unwrap_or_else(|| "tcp".to_owned());
-    let url_env = required_url_env(table, index)?;
+    let url_env = required_url_env(table, &label)?;
     let key_env = optional_string(
         table,
         &[
@@ -1106,7 +1276,7 @@ fn parse_datasource(entry: &toml::Value, index: usize) -> syn::Result<Datasource
 fn required_string(
     table: &toml::map::Map<String, toml::Value>,
     key: &str,
-    index: usize,
+    label: &str,
 ) -> syn::Result<String> {
     table
         .get(key)
@@ -1115,7 +1285,7 @@ fn required_string(
         .ok_or_else(|| {
             Error::new(
                 proc_macro2::Span::call_site(),
-                format!("datasource[{index}] is missing `{key}`"),
+                format!("{label} is missing `{key}`"),
             )
         })
 }
@@ -1128,7 +1298,7 @@ fn optional_string(table: &toml::map::Map<String, toml::Value>, keys: &[&str]) -
 
 fn required_url_env(
     table: &toml::map::Map<String, toml::Value>,
-    index: usize,
+    label: &str,
 ) -> syn::Result<String> {
     if let Some(env) = optional_string(table, &["url_from_env", "url_env", "url_env_var"]) {
         return Ok(env);
@@ -1152,10 +1322,348 @@ fn required_url_env(
     Err(Error::new(
         proc_macro2::Span::call_site(),
         format!(
-            "datasource[{index}] is missing URL env reference; use `url_from_env = \"ENV_KEY\"` \
+            "{label} is missing URL env reference; use `url_from_env = \"ENV_KEY\"` \
 or `url = {{ env = \"ENV_KEY\" }}`"
         ),
     ))
+}
+
+fn load_manifest_value() -> syn::Result<Option<toml::Value>> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|error| {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            format!("failed to read CARGO_MANIFEST_DIR: {error}"),
+        )
+    })?;
+    let config_path = PathBuf::from(manifest_dir).join("Skyzen.toml");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&config_path).map_err(|error| {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            format!("failed to read {}: {error}", config_path.display()),
+        )
+    })?;
+    let value: toml::Value = toml::from_str(&content).map_err(|error| {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            format!("failed to parse {}: {error}", config_path.display()),
+        )
+    })?;
+    Ok(Some(value))
+}
+
+fn load_services_from_value(value: &toml::Value) -> syn::Result<Vec<ServiceConfig>> {
+    let Some(entries) = value.get("service").and_then(toml::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_service(entry, index))
+        .collect()
+}
+
+fn parse_service(entry: &toml::Value, index: usize) -> syn::Result<ServiceConfig> {
+    let Some(table) = entry.as_table() else {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            format!("service[{index}] must be a TOML table"),
+        ));
+    };
+
+    let label = format!("service[{index}]");
+    let name = required_string(table, "name", &label)?;
+    let type_name = required_string(table, "type", &label)?;
+    let service_type = match type_name.as_str() {
+        "kv" => ServiceType::Kv,
+        "storage" => ServiceType::Storage,
+        "queue" => ServiceType::Queue,
+        other => {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!("{label} has unsupported type `{other}`; expected kv|storage|queue"),
+            ));
+        }
+    };
+
+    Ok(ServiceConfig { name, service_type })
+}
+
+fn load_databases_from_value(value: &toml::Value) -> syn::Result<Vec<DatabaseConfig>> {
+    let Some(entries) = value.get("database").and_then(toml::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_database(entry, index))
+        .collect()
+}
+
+fn parse_database(entry: &toml::Value, index: usize) -> syn::Result<DatabaseConfig> {
+    let Some(table) = entry.as_table() else {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            format!("database[{index}] must be a TOML table"),
+        ));
+    };
+
+    let label = format!("database[{index}]");
+    let name = required_string(table, "name", &label)?;
+    let type_name = required_string(table, "type", &label)?;
+    let database_type = match type_name.as_str() {
+        "sql" => DatabaseType::Sql,
+        other => {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!("{label} has unsupported type `{other}`; expected sql"),
+            ));
+        }
+    };
+
+    Ok(DatabaseConfig {
+        name,
+        database_type,
+    })
+}
+
+fn generate_native_service_init(
+    service: &ServiceConfig,
+    value: &toml::Value,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let Some(table) = lookup_table(value, &["native", "service", service.name.as_str()]) else {
+        return Ok(compile_error_block(&format!(
+            "missing [native.service.{}] wiring for portable service `{}`",
+            service.name, service.name
+        )));
+    };
+
+    let label = format!("[native.service.{}]", service.name);
+    let backend = required_string(table, "backend", &label)?;
+
+    match (service.service_type, backend.as_str()) {
+        (ServiceType::Kv, "redis") => {
+            let env_key = required_string(table, "url_env", &label)?;
+            let env_lit = LitStr::new(&env_key, proc_macro2::Span::call_site());
+            let missing_message = LitStr::new(
+                &format!(
+                    "portable service `{}` missing native env var `{}`",
+                    service.name, env_key
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            let connect_message = LitStr::new(
+                &format!(
+                    "portable service `{}` failed to connect to Redis using `{}`",
+                    service.name, env_key
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            Ok(quote! {{
+                let url = ::std::env::var(#env_lit)
+                    .unwrap_or_else(|_| panic!("{}", #missing_message));
+                let backend = ::skyzen_redis::Redis::connect(&url)
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message));
+                ::skyzen_services::Kv::new(backend)
+            }})
+        }
+        (ServiceType::Kv, "memory") => Ok(quote! {
+            ::skyzen_services::Kv::new(::skyzen_test::mock::InMemoryKv::new())
+        }),
+        (ServiceType::Storage, "s3") => {
+            let env_key = required_string(table, "bucket_env", &label)?;
+            let env_lit = LitStr::new(&env_key, proc_macro2::Span::call_site());
+            let missing_message = LitStr::new(
+                &format!(
+                    "portable service `{}` missing native env var `{}`",
+                    service.name, env_key
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            Ok(quote! {{
+                let bucket = ::std::env::var(#env_lit)
+                    .unwrap_or_else(|_| panic!("{}", #missing_message));
+                let backend = ::skyzen_s3::S3Storage::from_env(&bucket).await;
+                ::skyzen_services::Storage::new(backend)
+            }})
+        }
+        (ServiceType::Storage, "memory") => Ok(quote! {
+            ::skyzen_services::Storage::new(::skyzen_test::mock::InMemoryStorage::new())
+        }),
+        (ServiceType::Queue, "sqs") => {
+            let env_key = required_string(table, "url_env", &label)?;
+            let env_lit = LitStr::new(&env_key, proc_macro2::Span::call_site());
+            let missing_message = LitStr::new(
+                &format!(
+                    "portable service `{}` missing native env var `{}`",
+                    service.name, env_key
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            Ok(quote! {{
+                let url = ::std::env::var(#env_lit)
+                    .unwrap_or_else(|_| panic!("{}", #missing_message));
+                let backend = ::skyzen_aws::SqsQueue::from_env(&url).await;
+                ::skyzen_services::Queue::new(backend)
+            }})
+        }
+        (ServiceType::Queue, "memory") => Ok(quote! {
+            ::skyzen_services::Queue::new(::skyzen_test::mock::InMemoryQueue::new())
+        }),
+        (service_type, other) => Ok(compile_error_block(&format!(
+            "unsupported native backend `{other}` for portable service `{}` of type `{}`",
+            service.name,
+            service_type.as_str()
+        ))),
+    }
+}
+
+fn generate_cloudflare_service_init(
+    service: &ServiceConfig,
+    value: &toml::Value,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let Some(table) = lookup_table(value, &["cloudflare", "service", service.name.as_str()]) else {
+        return Ok(compile_error_block(&format!(
+            "missing [cloudflare.service.{}] wiring for portable service `{}`",
+            service.name, service.name
+        )));
+    };
+
+    let label = format!("[cloudflare.service.{}]", service.name);
+    let binding = required_string(table, "binding", &label)?;
+    let binding_lit = LitStr::new(&binding, proc_macro2::Span::call_site());
+    let failure_message = LitStr::new(
+        &format!(
+            "portable service `{}` failed to resolve Cloudflare binding `{}`",
+            service.name, binding
+        ),
+        proc_macro2::Span::call_site(),
+    );
+
+    match service.service_type {
+        ServiceType::Kv => Ok(quote! {{
+            let backend = ::skyzen_cloudflare::CfKv::from_env(&__skyzen_wasm_env, #binding_lit)
+                .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
+            ::skyzen_services::Kv::new(backend)
+        }}),
+        ServiceType::Storage => Ok(quote! {{
+            let backend = ::skyzen_cloudflare::CfR2::from_env(&__skyzen_wasm_env, #binding_lit)
+                .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
+            ::skyzen_services::Storage::new(backend)
+        }}),
+        ServiceType::Queue => Ok(quote! {{
+            let backend = ::skyzen_cloudflare::CfQueue::from_env(&__skyzen_wasm_env, #binding_lit)
+                .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
+            ::skyzen_services::Queue::new(backend)
+        }}),
+    }
+}
+
+fn generate_native_database_init(
+    database: &DatabaseConfig,
+    value: &toml::Value,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let Some(table) = lookup_table(value, &["native", "database", database.name.as_str()]) else {
+        return Ok(compile_error_block(&format!(
+            "missing [native.database.{}] wiring for portable database `{}`",
+            database.name, database.name
+        )));
+    };
+
+    let label = format!("[native.database.{}]", database.name);
+    let backend = required_string(table, "backend", &label)?;
+    let url_env = required_string(table, "url_env", &label)?;
+
+    match (database.database_type, backend.as_str()) {
+        (DatabaseType::Sql, "postgres") => {
+            let env_lit = LitStr::new(&url_env, proc_macro2::Span::call_site());
+            let missing_message = LitStr::new(
+                &format!(
+                    "portable database `{}` missing native env var `{}`",
+                    database.name, url_env
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            let connect_message = LitStr::new(
+                &format!(
+                    "portable database `{}` failed to connect using `{}`",
+                    database.name, url_env
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            Ok(quote! {{
+                let url = ::std::env::var(#env_lit)
+                    .unwrap_or_else(|_| panic!("{}", #missing_message));
+                let conn = ::skyzen_services::sea_orm::Database::connect(&url)
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message));
+                let backend = ::skyzen_services::Db::new(conn);
+                ::skyzen_services::SqlDb::new(backend)
+            }})
+        }
+        (database_type, other) => Ok(compile_error_block(&format!(
+            "unsupported native backend `{other}` for portable database `{}` of type `{}`",
+            database.name,
+            database_type.as_str()
+        ))),
+    }
+}
+
+fn generate_cloudflare_database_init(
+    database: &DatabaseConfig,
+    value: &toml::Value,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let Some(table) = lookup_table(value, &["cloudflare", "database", database.name.as_str()])
+    else {
+        return Ok(compile_error_block(&format!(
+            "missing [cloudflare.database.{}] wiring for portable database `{}`",
+            database.name, database.name
+        )));
+    };
+
+    let label = format!("[cloudflare.database.{}]", database.name);
+    let binding = required_string(table, "binding", &label)?;
+    let binding_lit = LitStr::new(&binding, proc_macro2::Span::call_site());
+    let failure_message = LitStr::new(
+        &format!(
+            "portable database `{}` failed to resolve Cloudflare binding `{}`",
+            database.name, binding
+        ),
+        proc_macro2::Span::call_site(),
+    );
+
+    match database.database_type {
+        DatabaseType::Sql => Ok(quote! {{
+            let backend = ::skyzen_cloudflare::CfD1::from_env(&__skyzen_wasm_env, #binding_lit)
+                .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
+            ::skyzen_services::SqlDb::new(backend)
+        }}),
+    }
+}
+
+fn lookup_table<'a>(
+    value: &'a toml::Value,
+    path: &[&str],
+) -> Option<&'a toml::map::Map<String, toml::Value>> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current.as_table()
+}
+
+fn compile_error_block(message: &str) -> proc_macro2::TokenStream {
+    let message = LitStr::new(message, proc_macro2::Span::call_site());
+    quote! {{
+        compile_error!(#message);
+        unreachable!()
+    }}
 }
 
 fn parse_env_ref(value: &str) -> Option<String> {
@@ -1231,5 +1739,499 @@ impl MainOptions {
         }
 
         Ok(options)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CloudflareEventKind {
+    Queue,
+    Scheduled,
+}
+
+fn expand_cloudflare_event(
+    mut function: ItemFn,
+    kind: CloudflareEventKind,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let is_async = function.sig.asyncness.is_some();
+    let original_ident = function.sig.ident.clone();
+    let internal_ident = match kind {
+        CloudflareEventKind::Queue if original_ident == "queue" => {
+            format_ident!("__skyzen_entry_queue")
+        }
+        CloudflareEventKind::Scheduled if original_ident == "scheduled" => {
+            format_ident!("__skyzen_entry_scheduled")
+        }
+        _ => original_ident,
+    };
+    function.sig.ident = internal_ident.clone();
+
+    let wrapper_ident = match kind {
+        CloudflareEventKind::Queue => format_ident!("queue"),
+        CloudflareEventKind::Scheduled => format_ident!("scheduled"),
+    };
+
+    let (wrapper_signature, wrapper_args) = build_cloudflare_event_wrapper(&function, kind)?;
+
+    let call = if is_async {
+        quote! { #internal_ident(#wrapper_args).await }
+    } else {
+        quote! { #internal_ident(#wrapper_args) }
+    };
+
+    let wrapper_return = match kind {
+        CloudflareEventKind::Queue => quote! {{
+            let __skyzen_raw_cf_batch =
+                ::skyzen_cloudflare::CfQueueBatch::new(__skyzen_raw_batch.clone());
+            ::skyzen_cloudflare::IntoQueueWorkerResult::into_queue_worker_result(
+                #call,
+                &__skyzen_raw_cf_batch,
+            )
+        }},
+        CloudflareEventKind::Scheduled => {
+            quote! { ::skyzen_cloudflare::IntoWorkerResult::into_worker_result(#call) }
+        }
+    };
+
+    Ok(quote! {
+        #function
+
+        #[cfg(target_arch = "wasm32")]
+        #[::skyzen::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::skyzen::wasm_bindgen)]
+        pub async fn #wrapper_ident(
+            #wrapper_signature
+        ) -> Result<(), ::skyzen::wasm_bindgen::JsValue> {
+            #wrapper_return
+        }
+    })
+}
+
+fn build_cloudflare_event_wrapper(
+    function: &ItemFn,
+    kind: CloudflareEventKind,
+) -> syn::Result<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
+    let args = function
+        .sig
+        .inputs
+        .iter()
+        .map(|arg| match arg {
+            FnArg::Typed(pat_type) => Ok(pat_type),
+            FnArg::Receiver(receiver) => Err(Error::new_spanned(
+                receiver,
+                "cloudflare event handlers may not take self arguments",
+            )),
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+
+    if args.is_empty() || args.len() > 3 {
+        return Err(Error::new_spanned(
+            &function.sig.inputs,
+            "cloudflare event handlers must take `event_or_batch`, optional `Env`, and optional context",
+        ));
+    }
+
+    let first_arg = event_argument_expr(&args[0].ty, kind)?;
+    let mut call_args = vec![first_arg];
+
+    if let Some(arg) = args.get(1) {
+        let ident = last_type_ident(&arg.ty)?;
+        if ident != "Env" {
+            return Err(Error::new_spanned(
+                &arg.ty,
+                "the second event handler argument must be `skyzen::runtime::wasm::Env`",
+            ));
+        }
+        call_args.push(quote! { __skyzen_event_env.clone() });
+    }
+
+    if let Some(arg) = args.get(2) {
+        let ctx_expr = context_argument_expr(&arg.ty, kind)?;
+        call_args.push(ctx_expr);
+    }
+
+    let wrapper_signature = match kind {
+        CloudflareEventKind::Queue => quote! {
+            __skyzen_raw_batch: ::skyzen_cloudflare::worker_sys::MessageBatch,
+            __skyzen_event_env: ::skyzen::runtime::wasm::Env,
+            __skyzen_raw_ctx: ::skyzen_cloudflare::worker_sys::Context
+        },
+        CloudflareEventKind::Scheduled => quote! {
+            __skyzen_raw_event: ::skyzen_cloudflare::worker_sys::ScheduledEvent,
+            __skyzen_event_env: ::skyzen::runtime::wasm::Env,
+            __skyzen_raw_ctx: ::skyzen_cloudflare::worker_sys::ScheduleContext
+        },
+    };
+
+    Ok((wrapper_signature, quote! { #(#call_args),* }))
+}
+
+fn event_argument_expr(
+    ty: &Type,
+    kind: CloudflareEventKind,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let ident = last_type_ident(ty)?;
+    match kind {
+        CloudflareEventKind::Queue if ident == "CfQueueBatch" => {
+            Ok(quote! { ::skyzen_cloudflare::CfQueueBatch::new(__skyzen_raw_batch.clone()) })
+        }
+        CloudflareEventKind::Queue if ident == "QueueBatch" => {
+            let batch_inner = single_generic_type(ty)?;
+            Ok(quote! {
+                ::skyzen_cloudflare::CfQueueBatch::new(__skyzen_raw_batch.clone())
+                    .decode_json::<#batch_inner>()
+                    .map_err(|error| ::skyzen::wasm_bindgen::JsValue::from_str(&error.to_string()))?
+            })
+        }
+        CloudflareEventKind::Scheduled if ident == "CfScheduledEvent" => Ok(quote! {
+            ::skyzen_cloudflare::CfScheduledEvent::new(__skyzen_raw_event.clone())
+        }),
+        CloudflareEventKind::Scheduled if ident == "ScheduledTick" => Ok(quote! {
+            ::skyzen::events::ScheduledTick::new(
+                ::skyzen_cloudflare::CfScheduledEvent::new(__skyzen_raw_event.clone())
+                    .cron()
+                    .map_err(|error| ::skyzen::wasm_bindgen::JsValue::from_str(&error.to_string()))?,
+                ::skyzen_cloudflare::CfScheduledEvent::new(__skyzen_raw_event.clone())
+                    .scheduled_time_ms()
+                    .map_err(|error| ::skyzen::wasm_bindgen::JsValue::from_str(&error.to_string()))?,
+            )
+        }),
+        CloudflareEventKind::Queue => Err(Error::new_spanned(
+            ty,
+            "the first #[skyzen::queue] argument must be `CfQueueBatch` or `QueueBatch<T>`",
+        )),
+        CloudflareEventKind::Scheduled => Err(Error::new_spanned(
+            ty,
+            "the first #[skyzen::scheduled] argument must be `CfScheduledEvent` or `ScheduledTick`",
+        )),
+    }
+}
+
+fn context_argument_expr(
+    ty: &Type,
+    kind: CloudflareEventKind,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let ident = last_type_ident(ty)?;
+    match (kind, ident.as_str()) {
+        (CloudflareEventKind::Queue, "CfQueueContext") => {
+            Ok(quote! { ::skyzen_cloudflare::CfQueueContext::new(__skyzen_raw_ctx) })
+        }
+        (CloudflareEventKind::Scheduled, "CfScheduleContext") => {
+            Ok(quote! { ::skyzen_cloudflare::CfScheduleContext::new(__skyzen_raw_ctx) })
+        }
+        (CloudflareEventKind::Queue, _) => Err(Error::new_spanned(
+            ty,
+            "the third #[skyzen::queue] argument must be `CfQueueContext`",
+        )),
+        (CloudflareEventKind::Scheduled, _) => Err(Error::new_spanned(
+            ty,
+            "the third #[skyzen::scheduled] argument must be `CfScheduleContext`",
+        )),
+    }
+}
+
+fn last_type_ident(ty: &Type) -> syn::Result<String> {
+    let Type::Path(type_path) = ty else {
+        return Err(Error::new_spanned(
+            ty,
+            "unsupported event handler argument type",
+        ));
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+        .ok_or_else(|| Error::new_spanned(ty, "unsupported event handler argument type"))
+}
+
+fn single_generic_type(ty: &Type) -> syn::Result<Type> {
+    let Type::Path(type_path) = ty else {
+        return Err(Error::new_spanned(ty, "expected a generic type parameter"));
+    };
+    let segment = type_path
+        .path
+        .segments
+        .last()
+        .ok_or_else(|| Error::new_spanned(ty, "expected a generic type parameter"))?;
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(Error::new_spanned(
+            ty,
+            "expected a single generic argument, for example `QueueBatch<Job>`",
+        ));
+    };
+    if args.args.len() != 1 {
+        return Err(Error::new_spanned(
+            ty,
+            "expected a single generic argument, for example `QueueBatch<Job>`",
+        ));
+    }
+    match args.args.first() {
+        Some(syn::GenericArgument::Type(inner)) => Ok(inner.clone()),
+        _ => Err(Error::new_spanned(
+            ty,
+            "expected a single generic type argument",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
+    let self_ident = item_struct.ident.clone();
+    let export_ident = format_ident!("{self_ident}Object");
+    let clone_state_ident = format_ident!(
+        "__skyzen_clone_do_state_{}",
+        self_ident.to_string().to_lowercase()
+    );
+
+    quote! {
+        #item_struct
+
+        #[cfg(target_arch = "wasm32")]
+        const _: () = {
+            use ::skyzen::wasm_bindgen as wasm_bindgen;
+            use ::skyzen::wasm_bindgen::prelude::*;
+
+            fn #clone_state_ident(
+                state: &::skyzen_cloudflare::worker_sys::DurableObjectState
+            ) -> ::skyzen_cloudflare::worker_sys::DurableObjectState {
+                use ::core::convert::AsRef;
+                use ::skyzen::wasm_bindgen::JsCast;
+
+                let js: &::skyzen::wasm_bindgen::JsValue = state.as_ref();
+                js.clone().unchecked_into()
+            }
+
+            #[wasm_bindgen(wasm_bindgen = ::skyzen::wasm_bindgen)]
+            pub struct #export_ident {
+                state: ::skyzen_cloudflare::worker_sys::DurableObjectState,
+            }
+
+            #[wasm_bindgen(wasm_bindgen = ::skyzen::wasm_bindgen)]
+            impl #export_ident {
+                #[wasm_bindgen(constructor, wasm_bindgen = ::skyzen::wasm_bindgen)]
+                pub fn new(
+                    state: ::skyzen_cloudflare::worker_sys::DurableObjectState,
+                    _env: ::skyzen::runtime::wasm::Env,
+                ) -> Self {
+                    Self { state }
+                }
+
+                #[wasm_bindgen(js_name = fetch, wasm_bindgen = ::skyzen::wasm_bindgen)]
+                pub fn fetch(
+                    &self,
+                    request: ::skyzen_cloudflare::worker_sys::web_sys::Request,
+                ) -> ::skyzen::js_sys::Promise {
+                    let state = #clone_state_ident(&self.state);
+                    ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
+                        ::skyzen_cloudflare::DurableObjectRuntime::<#self_ident>::fetch(
+                            state,
+                            request,
+                        )
+                        .await
+                        .map(::skyzen::wasm_bindgen::JsValue::from)
+                    })
+                }
+
+                #[wasm_bindgen(js_name = alarm, wasm_bindgen = ::skyzen::wasm_bindgen)]
+                pub fn alarm(&self) -> ::skyzen::js_sys::Promise {
+                    let state = #clone_state_ident(&self.state);
+                    ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
+                        ::skyzen_cloudflare::durable::invoke_alarm::<#self_ident>(state)
+                            .await
+                            .map(|_| ::skyzen::wasm_bindgen::JsValue::NULL)
+                    })
+                }
+
+                #[wasm_bindgen(js_name = webSocketMessage, wasm_bindgen = ::skyzen::wasm_bindgen)]
+                pub fn websocket_message(
+                    &self,
+                    websocket: ::skyzen_cloudflare::worker_sys::web_sys::WebSocket,
+                    message: ::skyzen::wasm_bindgen::JsValue,
+                ) -> ::skyzen::js_sys::Promise {
+                    let state = #clone_state_ident(&self.state);
+                    ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
+                        let message = if let Some(text) = message.as_string() {
+                            ::skyzen::http_kit::ws::WebSocketMessage::Text(text.into())
+                        } else {
+                            ::skyzen::http_kit::ws::WebSocketMessage::Binary(
+                                ::skyzen::js_sys::Uint8Array::new(&message).to_vec().into(),
+                            )
+                        };
+
+                        ::skyzen_cloudflare::durable::invoke_websocket_message::<#self_ident>(
+                            state,
+                            websocket,
+                            message,
+                        )
+                        .await
+                        .map(|_| ::skyzen::wasm_bindgen::JsValue::NULL)
+                    })
+                }
+
+                #[wasm_bindgen(js_name = webSocketClose, wasm_bindgen = ::skyzen::wasm_bindgen)]
+                pub fn websocket_close(
+                    &self,
+                    websocket: ::skyzen_cloudflare::worker_sys::web_sys::WebSocket,
+                    code: usize,
+                    reason: String,
+                    was_clean: bool,
+                ) -> ::skyzen::js_sys::Promise {
+                    let state = #clone_state_ident(&self.state);
+                    ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
+                        let code = u16::try_from(code)
+                            .expect("Cloudflare websocket close code must fit within u16");
+                        ::skyzen_cloudflare::durable::invoke_websocket_close::<#self_ident>(
+                            state,
+                            websocket,
+                            code,
+                            reason,
+                            was_clean,
+                        )
+                        .await
+                        .map(|_| ::skyzen::wasm_bindgen::JsValue::NULL)
+                    })
+                }
+
+                #[wasm_bindgen(js_name = webSocketError, wasm_bindgen = ::skyzen::wasm_bindgen)]
+                pub fn websocket_error(
+                    &self,
+                    websocket: ::skyzen_cloudflare::worker_sys::web_sys::WebSocket,
+                    error: ::skyzen::wasm_bindgen::JsValue,
+                ) -> ::skyzen::js_sys::Promise {
+                    let state = #clone_state_ident(&self.state);
+                    ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
+                        ::skyzen_cloudflare::durable::invoke_websocket_error::<#self_ident>(
+                            state,
+                            websocket,
+                            format!("{error:?}"),
+                        )
+                        .await
+                        .map(|_| ::skyzen::wasm_bindgen::JsValue::NULL)
+                    })
+                }
+            }
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        generate_cloudflare_database_init, generate_native_service_init, load_databases_from_value,
+        load_services_from_value, lookup_table, DatabaseType, ServiceType,
+    };
+
+    #[test]
+    fn parses_portable_services_and_databases() {
+        let value: toml::Value = toml::from_str(
+            r#"[[service]]
+name = "cache"
+type = "kv"
+
+[[service]]
+name = "uploads"
+type = "storage"
+
+[[database]]
+name = "main"
+type = "sql"
+"#,
+        )
+        .expect("valid toml");
+
+        let services = load_services_from_value(&value).expect("services");
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].name, "cache");
+        assert_eq!(services[0].service_type, ServiceType::Kv);
+        assert_eq!(services[1].service_type, ServiceType::Storage);
+
+        let databases = load_databases_from_value(&value).expect("databases");
+        assert_eq!(databases.len(), 1);
+        assert_eq!(databases[0].name, "main");
+        assert_eq!(databases[0].database_type, DatabaseType::Sql);
+    }
+
+    #[test]
+    fn locates_named_wiring_tables() {
+        let value: toml::Value = toml::from_str(
+            r#"[native.service.cache]
+backend = "redis"
+url_env = "CACHE_URL"
+
+[cloudflare.service.cache]
+binding = "CACHE"
+
+[native.database.main]
+backend = "postgres"
+url_env = "DATABASE_URL"
+"#,
+        )
+        .expect("valid toml");
+
+        let native_cache =
+            lookup_table(&value, &["native", "service", "cache"]).expect("native cache section");
+        assert_eq!(
+            native_cache
+                .get("backend")
+                .and_then(toml::Value::as_str)
+                .expect("backend"),
+            "redis"
+        );
+
+        let cloudflare_cache = lookup_table(&value, &["cloudflare", "service", "cache"])
+            .expect("cloudflare cache section");
+        assert_eq!(
+            cloudflare_cache
+                .get("binding")
+                .and_then(toml::Value::as_str)
+                .expect("binding"),
+            "CACHE"
+        );
+
+        let native_database =
+            lookup_table(&value, &["native", "database", "main"]).expect("native db section");
+        assert_eq!(
+            native_database
+                .get("url_env")
+                .and_then(toml::Value::as_str)
+                .expect("url_env"),
+            "DATABASE_URL"
+        );
+    }
+
+    #[test]
+    fn generates_portable_wrapper_inits() {
+        let value: toml::Value = toml::from_str(
+            r#"[[service]]
+name = "cache"
+type = "kv"
+
+[[database]]
+name = "main"
+type = "sql"
+
+[native.service.cache]
+backend = "redis"
+url_env = "CACHE_URL"
+
+[cloudflare.database.main]
+binding = "DB"
+"#,
+        )
+        .expect("valid toml");
+
+        let services = load_services_from_value(&value).expect("services");
+        let databases = load_databases_from_value(&value).expect("databases");
+
+        let native_service = generate_native_service_init(&services[0], &value)
+            .expect("native service init")
+            .to_string();
+        assert!(native_service.contains("skyzen_services :: Kv :: new"));
+        assert!(native_service.contains("skyzen_redis :: Redis :: connect"));
+
+        let cloudflare_database = generate_cloudflare_database_init(&databases[0], &value)
+            .expect("cloudflare database init")
+            .to_string();
+        assert!(cloudflare_database.contains("skyzen_services :: SqlDb :: new"));
+        assert!(cloudflare_database.contains("skyzen_cloudflare :: CfD1 :: from_env"));
     }
 }

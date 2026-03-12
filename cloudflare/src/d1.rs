@@ -1,10 +1,11 @@
 //! Cloudflare D1 database wrapper.
 
 use serde::de::DeserializeOwned;
+use skyzen_services::sql::{statement_returns_rows, SqlDatabase, SqlError, SqlResult, SqlValue};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use worker_sys::{D1Database, D1PreparedStatement};
+use worker_sys::{D1Database, D1PreparedStatement, D1Result};
 
 use crate::database_error::{js_err, CfDatabaseError};
 
@@ -108,6 +109,21 @@ impl std::fmt::Debug for CfD1Statement {
 }
 
 impl CfD1Statement {
+    /// Bind parameters to this prepared statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] if any parameter cannot be represented for D1
+    /// or if D1 rejects the binding operation.
+    pub fn bind(&self, params: &[SqlValue]) -> Result<Self, CfDatabaseError> {
+        let values = js_sys::Array::new();
+        for value in params {
+            values.push(&sql_value_to_js(value)?);
+        }
+        let stmt = self.stmt.bind(values).map_err(js_err)?;
+        Ok(Self { stmt })
+    }
+
     /// Execute and return all rows (`stmt.all()`).
     ///
     /// # Errors
@@ -186,5 +202,106 @@ impl CfD1Statement {
     pub async fn run_json<T: DeserializeOwned>(&self) -> Result<T, CfDatabaseError> {
         let value = self.run().await?;
         serde_wasm_bindgen::from_value(value).map_err(Into::into)
+    }
+}
+
+impl SqlDatabase for CfD1 {
+    async fn exec(&self, query: &str, params: &[SqlValue]) -> Result<SqlResult, SqlError> {
+        let statement = self
+            .prepare(query)
+            .map_err(|error| SqlError::Backend(error.to_string()))?
+            .bind(params)
+            .map_err(|error| SqlError::Backend(error.to_string()))?;
+
+        let value = if statement_returns_rows(query) {
+            statement
+                .all()
+                .await
+                .map_err(|error| SqlError::Backend(error.to_string()))?
+        } else {
+            statement
+                .run()
+                .await
+                .map_err(|error| SqlError::Backend(error.to_string()))?
+        };
+
+        d1_result_to_sql_result(value)
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct D1Meta {
+    rows_read: Option<u64>,
+    rows_written: Option<u64>,
+    changes: Option<u64>,
+}
+
+fn d1_result_to_sql_result(value: JsValue) -> Result<SqlResult, SqlError> {
+    let result: D1Result = value.unchecked_into();
+    let success = result
+        .success()
+        .map_err(|error| SqlError::Backend(format!("{error:?}")))?;
+    if !success {
+        let message = result
+            .error()
+            .map_err(|error| SqlError::Backend(format!("{error:?}")))?
+            .unwrap_or_else(|| "unknown D1 error".to_owned());
+        return Err(SqlError::Backend(message));
+    }
+
+    let rows = result
+        .results()
+        .map_err(|error| SqlError::Backend(format!("{error:?}")))?
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    serde_wasm_bindgen::from_value(row)
+                        .map_err(|error| SqlError::Backend(error.to_string()))
+                })
+                .collect::<Result<Vec<serde_json::Value>, SqlError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let meta = result
+        .meta()
+        .map_err(|error| SqlError::Backend(format!("{error:?}")))
+        .and_then(|meta| {
+            serde_wasm_bindgen::from_value::<D1Meta>(meta.into())
+                .map_err(|error| SqlError::Backend(error.to_string()))
+        })
+        .unwrap_or_default();
+
+    Ok(SqlResult {
+        rows_read: meta.rows_read.unwrap_or(rows.len() as u64),
+        rows_written: meta.rows_written.or(meta.changes).unwrap_or(0),
+        rows,
+    })
+}
+
+fn sql_value_to_js(value: &SqlValue) -> Result<JsValue, CfDatabaseError> {
+    match value {
+        SqlValue::Null => Ok(JsValue::NULL),
+        SqlValue::Boolean(value) => Ok(JsValue::from_bool(*value)),
+        SqlValue::Integer(value) => integer_to_js(*value),
+        SqlValue::Real(value) => Ok(JsValue::from_f64(*value)),
+        SqlValue::Text(value) => Ok(JsValue::from_str(value)),
+        SqlValue::Blob(value) => Ok(js_sys::Uint8Array::from(value.as_slice()).into()),
+    }
+}
+
+fn integer_to_js(value: i64) -> Result<JsValue, CfDatabaseError> {
+    const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+    const MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
+
+    if !(MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value) {
+        return Err(CfDatabaseError::Backend(format!(
+            "D1 integer parameter exceeds JavaScript safe integer range: {value}"
+        )));
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    {
+        Ok(JsValue::from_f64(value as f64))
     }
 }
