@@ -17,7 +17,7 @@ serde_json = "1"
 insta = { version = "1", features = ["json"] }
 
 [features]
-# Inherit SeaORM runtime features from user's application.
+# Mirror the database runtime feature flags exposed by `skyzen-services`.
 # Users must enable at least one runtime + sqlite for InMemoryDb.
 runtime-tokio-native-tls = ["skyzen-services/runtime-tokio-native-tls", "skyzen-services/sqlite"]
 runtime-tokio-rustls = ["skyzen-services/runtime-tokio-rustls", "skyzen-services/sqlite"]

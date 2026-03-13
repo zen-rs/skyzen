@@ -14,4 +14,5 @@ pub mod sql;
 
 pub use alarm::{Alarm, AlarmError, AlarmScheduler};
 pub use kv::{DurableKv, DurableKvError, DurableKvStore, DurableListOptions};
-pub use sql::{DurableSql, DurableSqlError, DurableSqlStore, SqlResult, SqlValue};
+pub use crate::sql::{DbExecResult, DbValue};
+pub use sql::{DurableDb, DurableDbBackend, DurableDbError};

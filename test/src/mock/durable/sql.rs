@@ -2,18 +2,18 @@
 
 use std::sync::{Arc, RwLock};
 
-use skyzen_services::durable::sql::{DurableSqlError, DurableSqlStore, SqlResult, SqlValue};
+use skyzen_services::{durable::sql::{DurableDbBackend, DurableDbError}, DbExecResult, DbValue};
 
-/// In-memory implementation of [`DurableSqlStore`] for testing.
+/// In-memory implementation of [`DurableDbBackend`] for testing.
 ///
 /// This is a minimal stub that records executed queries.
 /// For full SQL testing, consider using `rusqlite` directly.
 #[derive(Debug, Clone, Default)]
-pub struct InMemoryDurableSql {
+pub struct InMemoryDurableDb {
     queries: Arc<RwLock<Vec<String>>>,
 }
 
-impl InMemoryDurableSql {
+impl InMemoryDurableDb {
     /// Create a new in-memory Durable SQL store.
     #[must_use]
     pub fn new() -> Self {
@@ -31,16 +31,20 @@ impl InMemoryDurableSql {
     }
 }
 
-impl DurableSqlStore for InMemoryDurableSql {
-    async fn exec(&self, query: &str, _params: &[SqlValue]) -> Result<SqlResult, DurableSqlError> {
+impl DurableDbBackend for InMemoryDurableDb {
+    async fn query(&self, query: &str, _params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
         self.queries
             .write()
-            .map_err(|_| DurableSqlError::Backend("lock poisoned".to_owned()))?
+            .map_err(|_| DurableDbError::Backend("lock poisoned".to_owned()))?
             .push(query.to_owned());
-        Ok(SqlResult::default())
+        Ok(DbExecResult::default())
     }
 
-    async fn database_size(&self) -> Result<u64, DurableSqlError> {
+    async fn execute(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        self.query(query, params).await
+    }
+
+    async fn database_size(&self) -> Result<u64, DurableDbError> {
         Ok(0)
     }
 }

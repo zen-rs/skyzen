@@ -68,14 +68,15 @@ SQLite in-memory database for SQL tests. Requires a runtime feature (`runtime-to
 
 ```rust
 use skyzen_test::mock::InMemoryDb;
-use skyzen_services::sea_orm::ConnectionTrait;
 
 let db = InMemoryDb::with_schema(
     "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
 ).await.unwrap();
 
 db.db()
-    .execute_unprepared("INSERT INTO users (name) VALUES ('alice');")
+    .query("INSERT INTO users (name) VALUES (?)")
+    .bind("alice")
+    .execute()
     .await
     .unwrap();
 ```

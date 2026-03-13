@@ -1,13 +1,8 @@
 //! In-memory `SQLite` database helper for testing.
 //!
-//! This utility creates a [`skyzen_services::Db`] backed by `SQLite` in-memory
-//! storage (`sqlite::memory:`). It is useful for integration tests that need
-//! real SQL behavior without external infrastructure.
+//! This utility creates a [`skyzen_services::Db`] backed by in-memory SQLite.
 
-use skyzen_services::{
-    sea_orm::{ConnectionTrait, Database, DbErr},
-    Db,
-};
+use skyzen_services::{Db, DbError};
 
 /// A test helper that owns an in-memory SQLite-backed [`Db`].
 ///
@@ -23,9 +18,9 @@ impl InMemoryDb {
     /// # Errors
     ///
     /// Returns an error if the `SQLite` connection cannot be established.
-    pub async fn new() -> Result<Self, DbErr> {
-        let conn = Database::connect("sqlite::memory:").await?;
-        Ok(Self { db: Db::new(conn) })
+    pub async fn new() -> Result<Self, DbError> {
+        let db = Db::connect_sqlite("sqlite::memory:").await?;
+        Ok(Self { db })
     }
 
     /// Create a new in-memory `SQLite` database and run schema SQL.
@@ -35,11 +30,11 @@ impl InMemoryDb {
     /// # Errors
     ///
     /// Returns an error if the connection fails or schema SQL is invalid.
-    pub async fn with_schema(schema_sql: &str) -> Result<Self, DbErr> {
+    pub async fn with_schema(schema_sql: &str) -> Result<Self, DbError> {
         let db = Self::new().await?;
 
         if !schema_sql.trim().is_empty() {
-            db.db.execute_unprepared(schema_sql).await?;
+            db.db.query(schema_sql).execute().await?;
         }
 
         Ok(db)

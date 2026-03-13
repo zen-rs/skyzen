@@ -6,4 +6,4 @@ pub mod sql;
 
 pub use alarm::InMemoryAlarm;
 pub use kv::InMemoryDurableKv;
-pub use sql::InMemoryDurableSql;
+pub use sql::InMemoryDurableDb;

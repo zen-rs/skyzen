@@ -9,9 +9,9 @@ A fast, ergonomic HTTP framework for Rust focused on native servers and Cloudfla
 
 ## Features
 
-- **Portable core** — Write handlers against `Kv`, `Storage`, `Queue`, and `SqlDb` instead of provider SDK types
+- **Portable core** — Write handlers against `Kv`, `Storage`, `Queue`, and `Db` instead of provider SDK types
 - **Stable runtimes today** — Native servers and WinterCG/Cloudflare Workers share the same handler model
-- **Provider extensions** — Opt into raw/provider-specific APIs such as `Db`, `CfD1`, queue/scheduled event handlers, and Durable Object capabilities only when you need more than the portable minimum
+- **Provider extensions** — Opt into raw/provider-specific APIs such as `CfD1`, queue/scheduled event handlers, and Durable Object capabilities only when you need more than the portable minimum
 - **Extractor/Responder pattern** — Type-safe request parsing and response generation via function arguments and return types
 - **Tree-based routing** — Fast, composable routing with path parameters, HTTP method matching, and nested routes
 - **WebSocket support** — Unified WebSocket API across native (async-tungstenite) and WASM (WebSocketPair)
@@ -118,12 +118,11 @@ Portable handlers run against the same capability wrappers. Native and Cloudflar
 | Key-Value | [`skyzen-redis`](redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
 | Object Storage | [`skyzen-s3`](s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
 | Message Queue | — | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
-| Portable SQL | `SqlDb` via Postgres | `SqlDb` via D1 | planned wiring | planned wiring | — |
+| Portable SQL | `Db` via sqlx | `Db` via D1 | planned wiring | planned wiring | — |
 
 Provider-specific escape hatches remain available when you need more than the portable minimum:
 
-- Native ORM: `Db` (`SeaORM`)
-- Cloudflare raw SQL and stateful primitives: `CfD1`, `DurableKv`, `DurableSql`, `Alarm`, Durable Objects
+- Cloudflare raw SQL and stateful primitives: `CfD1`, `DurableKv`, `DurableDb`, `Alarm`, Durable Objects
 
 See the [Services Guide](docs/services-guide.md) for how to write platform-agnostic handlers and switch between backends.
 
@@ -132,12 +131,15 @@ See the [Services Guide](docs/services-guide.md) for how to write platform-agnos
 Skyzen provides portable capability wrappers through `skyzen-services`. Application code depends on those wrappers, not on provider SDK types:
 
 ```rust
-use skyzen_services::{Kv, SqlDb, Storage};
+use skyzen_services::{Db, Kv, Storage};
 
-async fn handler(kv: Kv, storage: Storage, db: SqlDb) -> Result<Json<Data>> {
+async fn handler(kv: Kv, storage: Storage, db: Db) -> Result<Json<Data>> {
     let cached = kv.get_json::<Data>("cache:key").await?;
     let file = storage.get("assets/logo.png").await?;
-    let users = db.query::<User>("SELECT id, name FROM users", &[]).await?;
+    let users = db
+        .query("SELECT id, name FROM users")
+        .fetch_all::<User>()
+        .await?;
     Ok(Json(cached.unwrap_or_default()))
 }
 ```

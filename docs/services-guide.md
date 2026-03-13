@@ -1,6 +1,6 @@
 # Using Portable Services
 
-Skyzen's portable capability layer lets you write business logic against `Kv`, `Storage`, `Queue`, and `SqlDb` instead of provider SDK types. Native and Cloudflare automatic wiring are built in today; provider-specific extensions remain available when you intentionally need more than the portable minimum.
+Skyzen's portable capability layer lets you write business logic against `Kv`, `Storage`, `Queue`, and `Db` instead of provider SDK types. Native and Cloudflare automatic wiring are built in today; provider-specific extensions remain available when you intentionally need more than the portable minimum.
 
 ## Mental Model
 
@@ -25,9 +25,9 @@ Extractor (handler arg)     ← Pulled from request extensions automatically
 | `KeyValueStore` | `Kv` | `get`, `put`, `delete`, `list` + `get_json`, `get_text`, `put_json` |
 | `ObjectStorage` | `Storage` | `get`, `put`, `delete`, `list`, `head` |
 | `MessageQueue` | `Queue` | `send`, `send_batch` + `send_json`, `send_json_batch` |
-| `SqlDatabase` | `SqlDb` | `exec`, `query`, `query_one` |
+| `DbBackend` | `Db` | `query(...).bind(...).fetch_*`, `execute` |
 
-`Db` remains available as a native-only `SeaORM` escape hatch. Cloudflare-specific primitives such as `CfD1`, `DurableSql`, and Durable Objects are provider extensions, not part of the portable core.
+Cloudflare-specific primitives such as `CfD1`, `DurableDb`, and Durable Objects are provider extensions, not part of the portable core.
 
 ## Writing a Handler
 
@@ -118,7 +118,7 @@ binding = "UPLOADS"
 binding = "DB"
 ```
 
-`#[skyzen::main]` reads these declarations and injects the portable wrappers automatically. Provider SDK types stay in generated wiring; handlers keep using `Kv`, `Storage`, and `SqlDb`.
+`#[skyzen::main]` reads these declarations and injects the portable wrappers automatically. Provider SDK types stay in generated wiring; handlers keep using `Kv`, `Storage`, and `Db`.
 
 ## Platform Switching
 
@@ -158,7 +158,7 @@ Provider crates for AWS and Azure are still available, but they are infrastructu
 | Key-Value | [`skyzen-redis`](../redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
 | Object Storage | [`skyzen-s3`](../s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
 | Message Queue | — | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
-| Portable SQL | `SqlDb` via Postgres | `SqlDb` via D1 | planned wiring | planned wiring | — |
+| Portable SQL | `Db` via sqlx | `Db` via D1 | planned wiring | planned wiring | — |
 
 ## The `MaybeSend` Pattern
 
@@ -182,23 +182,16 @@ The same trait definition compiles on both targets without `#[cfg]` in user code
 
 ## Database Access
 
-Portable SQL uses `SqlDb`:
+Portable SQL uses `Db`:
 
 ```rust
-use skyzen_services::{SqlDb, SqlValue};
+use skyzen_services::Db;
 
 let users = db
-    .query::<User>("SELECT id, name FROM users WHERE active = $1", &[SqlValue::Boolean(true)])
+    .query("SELECT id, name FROM users WHERE active = ?")
+    .bind(true)
+    .fetch_all::<User>()
     .await?;
-```
-
-Native-only ORM access still uses `Db` through SeaORM:
-
-```rust
-use skyzen_services::{sea_orm::Database, Db};
-
-let conn = Database::connect("sqlite::memory:").await?;
-let db = Db::new(conn);
 ```
 
 Enable the required runtime and database features:
@@ -208,4 +201,4 @@ Enable the required runtime and database features:
 skyzen-services = { version = "0.1", features = ["runtime-tokio-rustls", "postgres"] }
 ```
 
-Portable SQL is intentionally the minimum common surface. When you need provider-specific features such as Durable Object local SQLite, D1-specific metadata, or full ORM behavior, drop down to the provider/native APIs explicitly.
+Portable SQL is intentionally the minimum common surface. When you need provider-specific features such as Durable Object local SQLite or D1-specific metadata, drop down to the provider APIs explicitly.

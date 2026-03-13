@@ -924,6 +924,7 @@ impl ServiceType {
 struct DatabaseConfig {
     name: String,
     database_type: DatabaseType,
+    default: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -942,6 +943,11 @@ impl DatabaseType {
 #[allow(clippy::too_many_lines)]
 fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
     let datasources = load_datasources()?;
+    let databases = if let Some(value) = load_manifest_value()? {
+        load_databases_from_value(&value)?
+    } else {
+        Vec::new()
+    };
     let mut generated_items = Vec::with_capacity(datasources.len());
     let mut seen_idents = HashSet::new();
 
@@ -1101,6 +1107,94 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
         });
     }
 
+    let mut seen_database_idents = HashSet::new();
+    for database in databases {
+        let ident = database_ident_from_name(&database.name)?;
+        if !seen_database_idents.insert(ident.to_string()) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!("duplicate database type name after normalization: `{ident}`"),
+            ));
+        }
+
+        let missing_ident = format_ident!("{ident}NotConfigured");
+        let display_name = database.name.clone();
+        let display_message = LitStr::new(
+            &format!(
+                "database `{display_name}` not configured. Ensure Skyzen.toml database wiring is installed."
+            ),
+            proc_macro2::Span::call_site(),
+        );
+
+        generated_items.push(quote! {
+            #[derive(Debug, Clone)]
+            pub struct #ident(::skyzen_services::Db);
+
+            impl #ident {
+                #[must_use]
+                pub const fn new(db: ::skyzen_services::Db) -> Self {
+                    Self(db)
+                }
+
+                #[must_use]
+                pub const fn inner(&self) -> &::skyzen_services::Db {
+                    &self.0
+                }
+
+                #[must_use]
+                pub fn into_inner(self) -> ::skyzen_services::Db {
+                    self.0
+                }
+            }
+
+            impl ::std::ops::Deref for #ident {
+                type Target = ::skyzen_services::Db;
+
+                fn deref(&self) -> &Self::Target {
+                    &self.0
+                }
+            }
+
+            ::skyzen::http_kit::http_error!(
+                pub #missing_ident,
+                ::skyzen::StatusCode::INTERNAL_SERVER_ERROR,
+                #display_message
+            );
+
+            impl ::skyzen::extract::Extractor for #ident {
+                type Error = #missing_ident;
+
+                async fn extract(
+                    request: &mut ::skyzen::Request,
+                ) -> ::std::result::Result<Self, Self::Error> {
+                    request
+                        .extensions()
+                        .get::<Self>()
+                        .cloned()
+                        .ok_or_else(#missing_ident::new)
+                }
+            }
+
+            impl ::skyzen::middleware::Middleware for #ident {
+                type Error = ::std::convert::Infallible;
+
+                async fn handle<N: ::skyzen::Endpoint>(
+                    &mut self,
+                    request: &mut ::skyzen::Request,
+                    mut next: N,
+                ) -> ::std::result::Result<
+                    ::skyzen::Response,
+                    ::skyzen::http_kit::middleware::MiddlewareError<N::Error, Self::Error>,
+                > {
+                    request.extensions_mut().insert(self.clone());
+                    next.respond(request)
+                        .await
+                        .map_err(::skyzen::http_kit::middleware::MiddlewareError::Endpoint)
+                }
+            }
+        });
+    }
+
     Ok(quote! {
         #[doc(hidden)]
         pub mod __skyzen_config {
@@ -1151,10 +1245,10 @@ fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>>
     if services.is_empty() && databases.is_empty() {
         return Ok(Vec::new());
     }
+    let default_database = default_database_index(&databases)?;
 
     let mut steps = Vec::with_capacity(services.len() + databases.len() + 1);
     let mut seen_service_types = HashSet::new();
-    let mut seen_database_types = HashSet::new();
 
     steps.push(quote! {
         #[cfg(target_arch = "wasm32")]
@@ -1192,31 +1286,32 @@ fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>>
         });
     }
 
-    for database in &databases {
-        if !seen_database_types.insert(database.database_type) {
-            return Err(Error::new(
-                proc_macro2::Span::call_site(),
-                format!(
-                    "duplicate portable database type `{}` detected; Skyzen currently supports only one default `{}` capability",
-                    database.database_type.as_str(),
-                    database.database_type.as_str()
-                ),
-            ));
-        }
-
+    for (index, database) in databases.iter().enumerate() {
+        let ident = database_ident_from_name(&database.name)?;
         let native_init = generate_native_database_init(database, &value)?;
         let cloudflare_init = generate_cloudflare_database_init(database, &value)?;
+        let inject_default = default_database == Some(index);
         steps.push(quote! {
             let endpoint = {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let __db = #native_init;
-                    ::skyzen::__private::with_middleware(endpoint, __db)
+                    let endpoint = ::skyzen::__private::with_middleware(endpoint, #ident::new(__db.clone()));
+                    if #inject_default {
+                        ::skyzen::__private::with_middleware(endpoint, __db)
+                    } else {
+                        endpoint
+                    }
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
                     let __db = #cloudflare_init;
-                    ::skyzen::__private::with_middleware(endpoint, __db)
+                    let endpoint = ::skyzen::__private::with_middleware(endpoint, #ident::new(__db.clone()));
+                    if #inject_default {
+                        ::skyzen::__private::with_middleware(endpoint, __db)
+                    } else {
+                        endpoint
+                    }
                 }
             };
         });
@@ -1416,6 +1511,10 @@ fn parse_database(entry: &toml::Value, index: usize) -> syn::Result<DatabaseConf
     let label = format!("database[{index}]");
     let name = required_string(table, "name", &label)?;
     let type_name = required_string(table, "type", &label)?;
+    let default = table
+        .get("default")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
     let database_type = match type_name.as_str() {
         "sql" => DatabaseType::Sql,
         other => {
@@ -1429,6 +1528,7 @@ fn parse_database(entry: &toml::Value, index: usize) -> syn::Result<DatabaseConf
     Ok(DatabaseConfig {
         name,
         database_type,
+        default,
     })
 }
 
@@ -1600,11 +1700,57 @@ fn generate_native_database_init(
             Ok(quote! {{
                 let url = ::std::env::var(#env_lit)
                     .unwrap_or_else(|_| panic!("{}", #missing_message));
-                let conn = ::skyzen_services::sea_orm::Database::connect(&url)
+                ::skyzen_services::Db::connect_postgres(&url)
                     .await
                     .unwrap_or_else(|error| panic!("{}: {error}", #connect_message));
-                let backend = ::skyzen_services::Db::new(conn);
-                ::skyzen_services::SqlDb::new(backend)
+            }})
+        }
+        (DatabaseType::Sql, "mysql") => {
+            let env_lit = LitStr::new(&url_env, proc_macro2::Span::call_site());
+            let missing_message = LitStr::new(
+                &format!(
+                    "portable database `{}` missing native env var `{}`",
+                    database.name, url_env
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            let connect_message = LitStr::new(
+                &format!(
+                    "portable database `{}` failed to connect using `{}`",
+                    database.name, url_env
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            Ok(quote! {{
+                let url = ::std::env::var(#env_lit)
+                    .unwrap_or_else(|_| panic!("{}", #missing_message));
+                ::skyzen_services::Db::connect_mysql(&url)
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
+            }})
+        }
+        (DatabaseType::Sql, "sqlite") => {
+            let env_lit = LitStr::new(&url_env, proc_macro2::Span::call_site());
+            let missing_message = LitStr::new(
+                &format!(
+                    "portable database `{}` missing native env var `{}`",
+                    database.name, url_env
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            let connect_message = LitStr::new(
+                &format!(
+                    "portable database `{}` failed to connect using `{}`",
+                    database.name, url_env
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            Ok(quote! {{
+                let url = ::std::env::var(#env_lit)
+                    .unwrap_or_else(|_| panic!("{}", #missing_message));
+                ::skyzen_services::Db::connect_sqlite(&url)
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
             }})
         }
         (database_type, other) => Ok(compile_error_block(&format!(
@@ -1642,7 +1788,7 @@ fn generate_cloudflare_database_init(
         DatabaseType::Sql => Ok(quote! {{
             let backend = ::skyzen_cloudflare::CfD1::from_env(&__skyzen_wasm_env, #binding_lit)
                 .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
-            ::skyzen_services::SqlDb::new(backend)
+            ::skyzen_services::Db::new(backend)
         }}),
     }
 }
@@ -1706,6 +1852,59 @@ fn ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
     }
 
     Ok(format_ident!("{normalized}"))
+}
+
+fn database_ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
+    let mut normalized = String::with_capacity(name.len() + 2);
+    let mut uppercase_next = true;
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if uppercase_next {
+                normalized.push(ch.to_ascii_uppercase());
+                uppercase_next = false;
+            } else {
+                normalized.push(ch);
+            }
+        } else {
+            uppercase_next = true;
+        }
+    }
+
+    if normalized.is_empty() {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            "database name must contain at least one alphanumeric character",
+        ));
+    }
+
+    normalized.push_str("Db");
+    Ok(format_ident!("{normalized}"))
+}
+
+fn default_database_index(databases: &[DatabaseConfig]) -> syn::Result<Option<usize>> {
+    if databases.is_empty() {
+        return Ok(None);
+    }
+
+    let defaults = databases
+        .iter()
+        .enumerate()
+        .filter_map(|(index, database)| database.default.then_some(index))
+        .collect::<Vec<_>>();
+
+    match defaults.as_slice() {
+        [] if databases.len() == 1 => Ok(Some(0)),
+        [] => Err(Error::new(
+            proc_macro2::Span::call_site(),
+            "multiple [[database]] entries require exactly one `default = true`",
+        )),
+        [index] => Ok(Some(*index)),
+        _ => Err(Error::new(
+            proc_macro2::Span::call_site(),
+            "multiple [[database]] entries cannot mark more than one database as `default = true`",
+        )),
+    }
 }
 
 struct MainOptions {
@@ -2148,6 +2347,7 @@ type = "sql"
         assert_eq!(databases.len(), 1);
         assert_eq!(databases[0].name, "main");
         assert_eq!(databases[0].database_type, DatabaseType::Sql);
+        assert!(!databases[0].default);
     }
 
     #[test]
@@ -2231,7 +2431,7 @@ binding = "DB"
         let cloudflare_database = generate_cloudflare_database_init(&databases[0], &value)
             .expect("cloudflare database init")
             .to_string();
-        assert!(cloudflare_database.contains("skyzen_services :: SqlDb :: new"));
+        assert!(cloudflare_database.contains("skyzen_services :: Db :: new"));
         assert!(cloudflare_database.contains("skyzen_cloudflare :: CfD1 :: from_env"));
     }
 }

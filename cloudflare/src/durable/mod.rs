@@ -15,6 +15,6 @@ pub use glue::{
 };
 pub use kv::CfDurableKv;
 pub use namespace::{CfDurableNamespace, CfDurableObjectStub};
-pub use sql::CfDurableSql;
+pub use sql::CfDurableDb;
 pub use state::CfDurableState;
 pub use websocket::{CfDurableConnections, CfWebSocketConnection};

@@ -1,6 +1,6 @@
 //! Durable Object context for non-routed methods.
 
-use skyzen_services::durable::{Alarm, DurableKv, DurableSql};
+use skyzen_services::durable::{Alarm, DurableDb, DurableKv};
 
 use super::connections::DurableConnections;
 use super::id::DurableObjectId;
@@ -11,7 +11,7 @@ use super::id::DurableObjectId;
 /// [`DurableObject::websocket`](super::DurableObject::websocket).
 pub struct DurableContext {
     kv: DurableKv,
-    sql: DurableSql,
+    db: DurableDb,
     alarm: Alarm,
     connections: DurableConnections,
     id: DurableObjectId,
@@ -31,14 +31,14 @@ impl DurableContext {
     #[allow(clippy::missing_const_for_fn)] // Box<dyn> fields prevent const
     pub fn new(
         kv: DurableKv,
-        sql: DurableSql,
+        db: DurableDb,
         alarm: Alarm,
         connections: DurableConnections,
         id: DurableObjectId,
     ) -> Self {
         Self {
             kv,
-            sql,
+            db,
             alarm,
             connections,
             id,
@@ -51,10 +51,10 @@ impl DurableContext {
         &self.kv
     }
 
-    /// Access the Durable Object's SQL storage.
+    /// Access the Durable Object's database.
     #[must_use]
-    pub const fn sql(&self) -> &DurableSql {
-        &self.sql
+    pub const fn db(&self) -> &DurableDb {
+        &self.db
     }
 
     /// Access the Durable Object's alarm scheduler.

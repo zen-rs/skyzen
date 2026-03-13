@@ -19,7 +19,7 @@ Cloudflare Workers service implementations for the Skyzen framework.
 | `CfKv` | `KeyValueStore` | [Workers KV](https://developers.cloudflare.com/kv/) |
 | `CfR2` | `ObjectStorage` | [R2](https://developers.cloudflare.com/r2/) |
 | `CfQueue` | `MessageQueue` | [Queues](https://developers.cloudflare.com/queues/) |
-| `CfD1` | `SqlDatabase` + raw D1 API | [D1](https://developers.cloudflare.com/d1/) |
+| `CfD1` | `DbBackend` + raw D1 API | [D1](https://developers.cloudflare.com/d1/) |
 | `CfDurableSqlite` | — (direct SQL API) | [Durable Objects SQLite](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
 
 ## Usage
@@ -67,14 +67,16 @@ queue.send_json(&json!({"event": "user.created"})).await?;
 
 ### D1 SQL Database
 
-D1 can be used either through the portable `SqlDb` wrapper or through the raw `CfD1` API:
+D1 can be used either through the portable `Db` wrapper or through the raw `CfD1` API:
 
 ```rust
-use skyzen_services::{SqlDb, SqlValue};
+use skyzen_services::Db;
 
-let db = SqlDb::new(CfD1::from_env(&env, "DB")?);
+let db = Db::new(CfD1::from_env(&env, "DB")?);
 let rows = db
-    .query::<User>("SELECT * FROM users WHERE id = ?", &[SqlValue::Integer(id)])
+    .query("SELECT * FROM users WHERE id = ?")
+    .bind(id)
+    .fetch_all::<User>()
     .await?;
 ```
 

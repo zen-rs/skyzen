@@ -52,7 +52,7 @@ use super::websocket::{WebSocketConnection, WebSocketEvent};
 pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'static {
     /// Build the endpoint for HTTP requests.
     ///
-    /// Services (`DurableKv`, `DurableSql`, `Alarm`, `DurableConnections`)
+    /// Services (`DurableKv`, `DurableDb`, `Alarm`, `DurableConnections`)
     /// are available as extractors in the handlers.
     fn fetch(&mut self) -> impl Endpoint + 'static;
 

@@ -26,11 +26,11 @@ To enable type-erased dynamic dispatch while maintaining an ergonomic API for im
 | `KeyValueStore` | `Kv` | `get`, `put`, `delete`, `list` + `get_json`, `get_text`, `put_json` |
 | `ObjectStorage` | `Storage` | `get`, `put`, `delete`, `list`, `head` |
 | `MessageQueue` | `Queue` | `send`, `send_batch` + `send_json`, `send_json_batch` |
-| `SqlDatabase` | `SqlDb` | `exec`, `query`, `query_one` |
+| `DbBackend` | `Db` | `query(...).bind(...).fetch_*`, `execute` |
 
 ### Database (`Db`)
 
-`Db` wraps a `sea_orm::DatabaseConnection` and implements `Extractor`. It is **not** the portable SQL abstraction — it is the native-only [SeaORM](https://www.sea-ql.org/SeaORM/) escape hatch.
+`Db` is Skyzen's portable SQL wrapper. It follows a `sqlx`-style query-builder pattern, keeps parameters bound separately from the SQL string, and works across native backends and Cloudflare D1.
 
 ## Quick Start
 
@@ -76,12 +76,12 @@ Skyzen supports both multi-threaded native runtimes and single-threaded WASM env
 ## Feature Flags
 
 ### Runtime Selection
-- `runtime-tokio-native-tls`: Use Tokio with `native-tls` for SeaORM.
-- `runtime-tokio-rustls`: Use Tokio with `rustls` for SeaORM.
-- `runtime-async-std-native-tls`: Use `async-std` with `native-tls`.
+- `runtime-tokio-native-tls`: Use Tokio with `native-tls` for `sqlx`.
+- `runtime-tokio-rustls`: Use Tokio with `rustls` for `sqlx`.
+- `runtime-async-std-native-tls`: Use `async-std` with `native-tls` for `sqlx`.
 
 ### Database Backends
-- `postgres`, `mysql`, `sqlite`: Enable specific SeaORM drivers.
+- `postgres`, `mysql`, `sqlite`: Compatibility feature flags for SQL backends.
 
 > **WASM Note**: The `sqlite` feature is rejected at compile-time on `wasm32` targets. For edge environments like Cloudflare, use vendor-specific databases via `skyzen-cloudflare` (e.g., D1 or Durable Object SQLite).
 

@@ -2,13 +2,13 @@
 
 use skyzen::durable::DurableObjectState as HibernationDurableObjectState;
 use skyzen::durable::{DurableConnections, DurableContext, DurableObjectError, DurableObjectId};
-use skyzen_services::durable::{Alarm, DurableKv, DurableSql};
+use skyzen_services::durable::{Alarm, DurableDb, DurableKv};
 use wasm_bindgen::JsValue;
 
 use super::{
     alarm::CfAlarm,
     kv::CfDurableKv,
-    sql::CfDurableSql,
+    sql::CfDurableDb,
     websocket::{clone_state, CfDurableConnections},
 };
 
@@ -69,14 +69,14 @@ impl CfDurableState {
         Ok(DurableKv::new(store))
     }
 
-    /// Build the Durable SQL extractor wrapper.
+    /// Build the Durable database extractor wrapper.
     ///
     /// # Errors
     ///
     /// Returns [`DurableObjectError`] if state storage cannot be accessed.
-    pub fn sql(&self) -> Result<DurableSql, DurableObjectError> {
-        let store = CfDurableSql::from_state(&self.state).map_err(to_runtime_error)?;
-        Ok(DurableSql::new(store))
+    pub fn db(&self) -> Result<DurableDb, DurableObjectError> {
+        let store = CfDurableDb::from_state(&self.state).map_err(to_runtime_error)?;
+        Ok(DurableDb::new(store))
     }
 
     /// Build the alarm extractor wrapper.
@@ -116,7 +116,7 @@ impl CfDurableState {
     pub fn context(&self) -> Result<DurableContext, DurableObjectError> {
         Ok(DurableContext::new(
             self.kv()?,
-            self.sql()?,
+            self.db()?,
             self.alarm()?,
             self.connections(),
             self.id()?,
@@ -133,7 +133,7 @@ impl CfDurableState {
         request: &mut skyzen::Request,
     ) -> Result<(), DurableObjectError> {
         request.extensions_mut().insert(self.kv()?);
-        request.extensions_mut().insert(self.sql()?);
+        request.extensions_mut().insert(self.db()?);
         request.extensions_mut().insert(self.alarm()?);
         request.extensions_mut().insert(self.connections());
 

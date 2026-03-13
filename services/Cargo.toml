@@ -16,21 +16,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 futures-core = "0.3"
+sqlparser = "0.58"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# SeaORM is native-only in Skyzen services. For wasm targets, use cloud-vendor
-# databases (e.g. Cloudflare D1 / Durable Object SQLite) instead.
-sea-orm = { version = "1", default-features = false, features = ["with-json"] }
+sqlx = { version = "0.8", default-features = false, features = ["json", "postgres", "mysql", "sqlite"] }
 
 [features]
 # Runtime features - user selects in their application
-runtime-tokio-native-tls = ["sea-orm/runtime-tokio-native-tls"]
-runtime-tokio-rustls = ["sea-orm/runtime-tokio-rustls"]
-runtime-async-std-native-tls = ["sea-orm/runtime-async-std-native-tls"]
+runtime-tokio-native-tls = ["sqlx/runtime-tokio-native-tls"]
+runtime-tokio-rustls = ["sqlx/runtime-tokio-rustls"]
+runtime-async-std-native-tls = ["sqlx/runtime-async-std-native-tls"]
 # Database backends
-postgres = ["sea-orm/sqlx-postgres"]
-mysql = ["sea-orm/sqlx-mysql"]
-sqlite = ["sea-orm/sqlx-sqlite"]
+postgres = []
+mysql = []
+sqlite = []
 
 [lints]
 workspace = true
