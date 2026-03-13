@@ -835,6 +835,7 @@ fn fallback_value_to_json(
     Ok(serde_json::Value::Null)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn option_to_json<T>(value: Option<T>) -> serde_json::Value
 where
     T: serde::Serialize,
@@ -842,10 +843,12 @@ where
     value.map_or(serde_json::Value::Null, |value| serde_json::json!(value))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn option_to_json_i64(value: Option<i64>) -> Result<serde_json::Value, DbError> {
     Ok(value.map_or(serde_json::Value::Null, |value| serde_json::json!(value)))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn option_to_json_f64(value: Option<f64>) -> Result<serde_json::Value, DbError> {
     Ok(value.map_or(serde_json::Value::Null, |value| serde_json::json!(value)))
 }
