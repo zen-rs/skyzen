@@ -19,7 +19,7 @@ impl InMemoryDb {
     ///
     /// Returns an error if the `SQLite` connection cannot be established.
     pub async fn new() -> Result<Self, DbError> {
-        let db = Db::connect_sqlite("sqlite::memory:").await?;
+        let db = Db::connect_sqlite_memory().await?;
         Ok(Self { db })
     }
 

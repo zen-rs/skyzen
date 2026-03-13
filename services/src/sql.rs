@@ -304,6 +304,18 @@ impl Db {
                 .map_err(sqlx_error)?,
         )))
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    /// Connect to an in-memory SQLite database using a single connection.
+    pub async fn connect_sqlite_memory() -> Result<Self, DbError> {
+        Ok(Self::new(NativeDbBackend::Sqlite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .map_err(sqlx_error)?,
+        )))
+    }
 }
 
 /// A query builder for [`Db`].
