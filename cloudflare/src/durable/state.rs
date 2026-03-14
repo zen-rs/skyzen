@@ -27,12 +27,14 @@ impl Clone for SendSyncDurableState {
 /// Cloudflare Durable Object state wrapper.
 pub struct CfDurableState {
     state: worker_sys::DurableObjectState,
+    env: JsValue,
 }
 
 impl Clone for CfDurableState {
     fn clone(&self) -> Self {
         Self {
             state: clone_state(&self.state),
+            env: self.env.clone(),
         }
     }
 }
@@ -49,8 +51,8 @@ impl std::fmt::Debug for CfDurableState {
 impl CfDurableState {
     /// Create from raw Cloudflare `DurableObjectState`.
     #[must_use]
-    pub const fn new(state: worker_sys::DurableObjectState) -> Self {
-        Self { state }
+    pub fn new(state: worker_sys::DurableObjectState, env: JsValue) -> Self {
+        Self { state, env }
     }
 
     /// Clone and return the raw state handle.
@@ -136,6 +138,9 @@ impl CfDurableState {
         request.extensions_mut().insert(self.db()?);
         request.extensions_mut().insert(self.alarm()?);
         request.extensions_mut().insert(self.connections());
+        request
+            .extensions_mut()
+            .insert(skyzen::runtime::wasm::WasmEnv::new(self.env.clone()));
 
         let state = SendSyncDurableState(clone_state(&self.state));
         request

@@ -2180,6 +2180,10 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
         "__skyzen_clone_do_state_{}",
         self_ident.to_string().to_lowercase()
     );
+    let clone_env_ident = format_ident!(
+        "__skyzen_clone_do_env_{}",
+        self_ident.to_string().to_lowercase()
+    );
 
     quote! {
         #item_struct
@@ -2199,9 +2203,16 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                 js.clone().unchecked_into()
             }
 
+            fn #clone_env_ident(
+                env: &::skyzen::runtime::wasm::Env
+            ) -> ::skyzen::runtime::wasm::Env {
+                env.clone()
+            }
+
             #[wasm_bindgen(wasm_bindgen = ::skyzen::wasm_bindgen)]
             pub struct #export_ident {
                 state: ::skyzen_cloudflare::worker_sys::DurableObjectState,
+                env: ::skyzen::runtime::wasm::Env,
             }
 
             #[wasm_bindgen(wasm_bindgen = ::skyzen::wasm_bindgen)]
@@ -2209,9 +2220,9 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                 #[wasm_bindgen(constructor, wasm_bindgen = ::skyzen::wasm_bindgen)]
                 pub fn new(
                     state: ::skyzen_cloudflare::worker_sys::DurableObjectState,
-                    _env: ::skyzen::runtime::wasm::Env,
+                    env: ::skyzen::runtime::wasm::Env,
                 ) -> Self {
-                    Self { state }
+                    Self { state, env }
                 }
 
                 #[wasm_bindgen(js_name = fetch, wasm_bindgen = ::skyzen::wasm_bindgen)]
@@ -2220,9 +2231,11 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                     request: ::skyzen_cloudflare::worker_sys::web_sys::Request,
                 ) -> ::skyzen::js_sys::Promise {
                     let state = #clone_state_ident(&self.state);
+                    let env = #clone_env_ident(&self.env);
                     ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
                         ::skyzen_cloudflare::DurableObjectRuntime::<#self_ident>::fetch(
                             state,
+                            env,
                             request,
                         )
                         .await
@@ -2233,8 +2246,9 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                 #[wasm_bindgen(js_name = alarm, wasm_bindgen = ::skyzen::wasm_bindgen)]
                 pub fn alarm(&self) -> ::skyzen::js_sys::Promise {
                     let state = #clone_state_ident(&self.state);
+                    let env = #clone_env_ident(&self.env);
                     ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
-                        ::skyzen_cloudflare::durable::invoke_alarm::<#self_ident>(state)
+                        ::skyzen_cloudflare::durable::invoke_alarm::<#self_ident>(state, env)
                             .await
                             .map(|_| ::skyzen::wasm_bindgen::JsValue::NULL)
                     })
@@ -2247,6 +2261,7 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                     message: ::skyzen::wasm_bindgen::JsValue,
                 ) -> ::skyzen::js_sys::Promise {
                     let state = #clone_state_ident(&self.state);
+                    let env = #clone_env_ident(&self.env);
                     ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
                         let message = if let Some(text) = message.as_string() {
                             ::skyzen::http_kit::ws::WebSocketMessage::Text(text.into())
@@ -2258,6 +2273,7 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
 
                         ::skyzen_cloudflare::durable::invoke_websocket_message::<#self_ident>(
                             state,
+                            env,
                             websocket,
                             message,
                         )
@@ -2275,11 +2291,13 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                     was_clean: bool,
                 ) -> ::skyzen::js_sys::Promise {
                     let state = #clone_state_ident(&self.state);
+                    let env = #clone_env_ident(&self.env);
                     ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
                         let code = u16::try_from(code)
                             .expect("Cloudflare websocket close code must fit within u16");
                         ::skyzen_cloudflare::durable::invoke_websocket_close::<#self_ident>(
                             state,
+                            env,
                             websocket,
                             code,
                             reason,
@@ -2297,9 +2315,11 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                     error: ::skyzen::wasm_bindgen::JsValue,
                 ) -> ::skyzen::js_sys::Promise {
                     let state = #clone_state_ident(&self.state);
+                    let env = #clone_env_ident(&self.env);
                     ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
                         ::skyzen_cloudflare::durable::invoke_websocket_error::<#self_ident>(
                             state,
+                            env,
                             websocket,
                             format!("{error:?}"),
                         )

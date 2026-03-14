@@ -34,10 +34,11 @@ where
     /// Returns `JsValue` when state I/O or request/response conversion fails.
     pub async fn fetch(
         state: worker_sys::DurableObjectState,
+        env: JsValue,
         request: web_sys::Request,
     ) -> Result<web_sys::Response, JsValue> {
         let mut object = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state));
+        let durable_state = CfDurableState::new(clone_state(&state), env.clone());
 
         let mut request = convert_request(request).await?;
         durable_state
@@ -45,7 +46,7 @@ where
             .map_err(to_js)?;
 
         let response = {
-            let mut endpoint = object.fetch();
+            let mut endpoint = skyzen::runtime::wasm::with_current_env(env, || object.fetch());
             match endpoint.respond(&mut request).await {
                 Ok(response) => response,
                 Err(error) => error_to_response(&error),
@@ -61,12 +62,15 @@ where
     /// # Errors
     ///
     /// Returns `JsValue` when state I/O, alarm dispatch, or persistence fails.
-    pub async fn alarm(state: worker_sys::DurableObjectState) -> Result<(), JsValue> {
+    pub async fn alarm(
+        state: worker_sys::DurableObjectState,
+        env: JsValue,
+    ) -> Result<(), JsValue> {
         let mut object = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state));
+        let durable_state = CfDurableState::new(clone_state(&state), env.clone());
 
         {
-            let mut endpoint = object.fetch();
+            let mut endpoint = skyzen::runtime::wasm::with_current_env(env, || object.fetch());
 
             let router = (&mut endpoint as &mut dyn Any)
                 .downcast_mut::<skyzen::routing::Router>()
@@ -102,11 +106,12 @@ where
     /// or persistence fails.
     pub async fn websocket_message(
         state: worker_sys::DurableObjectState,
+        env: JsValue,
         websocket: web_sys::WebSocket,
         event: web_sys::MessageEvent,
     ) -> Result<(), JsValue> {
         let mut object = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state));
+        let durable_state = CfDurableState::new(clone_state(&state), env);
         let context = durable_state.context().map_err(to_js)?;
         let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
             websocket,
@@ -130,13 +135,14 @@ where
     /// Returns `JsValue` when state I/O, handler execution, or persistence fails.
     pub async fn websocket_close(
         state: worker_sys::DurableObjectState,
+        env: JsValue,
         websocket: web_sys::WebSocket,
         code: u16,
         reason: String,
         was_clean: bool,
     ) -> Result<(), JsValue> {
         let mut object = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state));
+        let durable_state = CfDurableState::new(clone_state(&state), env);
         let context = durable_state.context().map_err(to_js)?;
         let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
             websocket,
@@ -166,11 +172,12 @@ where
     /// Returns `JsValue` when state I/O, handler execution, or persistence fails.
     pub async fn websocket_error(
         state: worker_sys::DurableObjectState,
+        env: JsValue,
         websocket: web_sys::WebSocket,
         error: JsValue,
     ) -> Result<(), JsValue> {
         let mut object = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state));
+        let durable_state = CfDurableState::new(clone_state(&state), env);
         let context = durable_state.context().map_err(to_js)?;
         let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
             websocket,
@@ -195,11 +202,14 @@ where
 /// # Errors
 ///
 /// Returns `JsValue` when state I/O, alarm dispatch, or persistence fails.
-pub async fn invoke_alarm<T>(state: worker_sys::DurableObjectState) -> Result<(), JsValue>
+pub async fn invoke_alarm<T>(
+    state: worker_sys::DurableObjectState,
+    env: JsValue,
+) -> Result<(), JsValue>
 where
     T: DurableObject,
 {
-    DurableObjectRuntime::<T>::alarm(state).await
+    DurableObjectRuntime::<T>::alarm(state, env).await
 }
 
 /// Invoke a Skyzen Durable Object websocket message handler from an external runtime wrapper.
@@ -209,6 +219,7 @@ where
 /// Returns `JsValue` when state I/O, handler execution, or persistence fails.
 pub async fn invoke_websocket_message<T>(
     state: worker_sys::DurableObjectState,
+    env: JsValue,
     websocket: web_sys::WebSocket,
     message: skyzen::http_kit::ws::WebSocketMessage,
 ) -> Result<(), JsValue>
@@ -216,7 +227,7 @@ where
     T: DurableObject,
 {
     let mut object = load_state::<T>(&state).await?;
-    let durable_state = CfDurableState::new(clone_state(&state));
+    let durable_state = CfDurableState::new(clone_state(&state), env);
     let context = durable_state.context().map_err(to_js)?;
     let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
         websocket,
@@ -238,6 +249,7 @@ where
 /// Returns `JsValue` when state I/O, handler execution, or persistence fails.
 pub async fn invoke_websocket_close<T>(
     state: worker_sys::DurableObjectState,
+    env: JsValue,
     websocket: web_sys::WebSocket,
     code: u16,
     reason: String,
@@ -246,7 +258,8 @@ pub async fn invoke_websocket_close<T>(
 where
     T: DurableObject,
 {
-    DurableObjectRuntime::<T>::websocket_close(state, websocket, code, reason, was_clean).await
+    DurableObjectRuntime::<T>::websocket_close(state, env, websocket, code, reason, was_clean)
+        .await
 }
 
 /// Invoke a Skyzen Durable Object websocket error handler from an external runtime wrapper.
@@ -256,6 +269,7 @@ where
 /// Returns `JsValue` when state I/O, handler execution, or persistence fails.
 pub async fn invoke_websocket_error<T>(
     state: worker_sys::DurableObjectState,
+    env: JsValue,
     websocket: web_sys::WebSocket,
     error: String,
 ) -> Result<(), JsValue>
@@ -263,7 +277,7 @@ where
     T: DurableObject,
 {
     let mut object = load_state::<T>(&state).await?;
-    let durable_state = CfDurableState::new(clone_state(&state));
+    let durable_state = CfDurableState::new(clone_state(&state), env);
     let context = durable_state.context().map_err(to_js)?;
     let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
         websocket,

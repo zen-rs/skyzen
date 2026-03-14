@@ -1,6 +1,9 @@
 use std::cell::RefCell;
 use std::future::Future;
 
+use http_kit::http_error;
+use skyzen_core::Extractor;
+
 use crate::{Body, Endpoint, HttpError, StatusCode};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -32,6 +35,14 @@ fn clear_current_env() {
     CURRENT_ENV.with_borrow_mut(|slot| *slot = None);
 }
 
+struct CurrentEnvGuard;
+
+impl Drop for CurrentEnvGuard {
+    fn drop(&mut self) {
+        clear_current_env();
+    }
+}
+
 /// Wrapper for WinterCG env, usable in request extensions.
 /// SAFETY: WASM is single-threaded, so Send+Sync is safe.
 #[derive(Clone, Debug)]
@@ -41,6 +52,12 @@ unsafe impl Send for WasmEnv {}
 unsafe impl Sync for WasmEnv {}
 
 impl WasmEnv {
+    /// Wrap a raw WinterCG environment value.
+    #[must_use]
+    pub fn new(env: JsValue) -> Self {
+        Self(env)
+    }
+
     /// Get the inner JsValue.
     pub fn into_inner(self) -> JsValue {
         self.0
@@ -50,6 +67,33 @@ impl WasmEnv {
     pub fn as_js(&self) -> &JsValue {
         &self.0
     }
+}
+
+http_error!(
+    /// The WinterCG environment was not found in request extensions.
+    pub WasmEnvNotConfigured,
+    StatusCode::INTERNAL_SERVER_ERROR,
+    "Wasm environment not configured. Ensure the runtime injected WasmEnv into request extensions."
+);
+
+impl Extractor for WasmEnv {
+    type Error = WasmEnvNotConfigured;
+
+    async fn extract(request: &mut crate::Request) -> Result<Self, Self::Error> {
+        request
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .ok_or(WasmEnvNotConfigured::new())
+    }
+}
+
+/// Temporarily make the WinterCG environment available via [`current_env`].
+#[doc(hidden)]
+pub fn with_current_env<T>(env: JsValue, f: impl FnOnce() -> T) -> T {
+    set_current_env(env);
+    let _guard = CurrentEnvGuard;
+    f()
 }
 
 /// Bridge the annotated endpoint into the WinterCG `fetch` contract.
@@ -82,7 +126,7 @@ where
 {
     let mut sky_request = convert_request(request).await?;
     // Make WinterCG env available via request extensions
-    sky_request.extensions_mut().insert(WasmEnv(env));
+    sky_request.extensions_mut().insert(WasmEnv::new(env));
 
     let response = match endpoint.respond(&mut sky_request).await {
         Ok(response) => response,
