@@ -3,6 +3,7 @@
 use skyzen::durable::{DurableObjectError, DurableObjectId};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
+use worker::send::{IntoSendFuture, SendWrapper};
 use worker_sys::{DurableObject, DurableObjectNamespace};
 
 /// Cloudflare Durable Object namespace binding.
@@ -132,17 +133,21 @@ impl CfDurableObjectStub {
     /// # Errors
     ///
     /// Returns [`DurableObjectError`] if the fetch call fails or returns an invalid response.
-    pub async fn fetch(
+    pub fn fetch(
         &self,
         request: &web_sys::Request,
-    ) -> Result<web_sys::Response, DurableObjectError> {
-        let promise = self.stub.fetch_with_request(request).map_err(runtime_err)?;
-        let value = JsFuture::from(promise).await.map_err(runtime_err)?;
-        value.dyn_into().map_err(|value| {
-            DurableObjectError::Runtime(format!(
-                "DurableObject.fetch returned non-Response value: {value:?}"
-            ))
-        })
+    ) -> impl core::future::Future<Output = Result<web_sys::Response, DurableObjectError>> + Send + '_ {
+        let request = SendWrapper::new(request.clone().map_err(runtime_err));
+        async move {
+            let request = request.0?;
+            let promise = self.stub.fetch_with_request(&request).map_err(runtime_err)?;
+            let value = JsFuture::from(promise).into_send().await.map_err(runtime_err)?;
+            value.dyn_into().map_err(|value| {
+                DurableObjectError::Runtime(format!(
+                    "DurableObject.fetch returned non-Response value: {value:?}"
+                ))
+            })
+        }
     }
 
     /// Dispatch request to the remote Durable Object by URL string.
@@ -150,14 +155,20 @@ impl CfDurableObjectStub {
     /// # Errors
     ///
     /// Returns [`DurableObjectError`] if the fetch call fails or returns an invalid response.
-    pub async fn fetch_url(&self, url: &str) -> Result<web_sys::Response, DurableObjectError> {
-        let promise = self.stub.fetch_with_str(url).map_err(runtime_err)?;
-        let value = JsFuture::from(promise).await.map_err(runtime_err)?;
-        value.dyn_into().map_err(|value| {
-            DurableObjectError::Runtime(format!(
-                "DurableObject.fetch returned non-Response value: {value:?}"
-            ))
-        })
+    pub fn fetch_url(
+        &self,
+        url: &str,
+    ) -> impl core::future::Future<Output = Result<web_sys::Response, DurableObjectError>> + Send + '_ {
+        let url = url.to_owned();
+        async move {
+            let promise = self.stub.fetch_with_str(&url).map_err(runtime_err)?;
+            let value = JsFuture::from(promise).into_send().await.map_err(runtime_err)?;
+            value.dyn_into().map_err(|value| {
+                DurableObjectError::Runtime(format!(
+                    "DurableObject.fetch returned non-Response value: {value:?}"
+                ))
+            })
+        }
     }
 }
 

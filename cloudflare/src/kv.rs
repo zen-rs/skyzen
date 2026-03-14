@@ -3,6 +3,7 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+use worker::send::IntoSendFuture;
 
 use skyzen_services::kv::{KeyValueStore, KvError};
 
@@ -70,7 +71,7 @@ impl KeyValueStore for CfKv {
             .map_err(|e| KvError::Backend(format!("{e:?}")))?;
 
         let promise = self.ns.get(key, &options).map_err(js_err)?;
-        let result = JsFuture::from(promise).await.map_err(js_err)?;
+        let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
 
         if result.is_null() || result.is_undefined() {
             return Ok(None);
@@ -83,13 +84,13 @@ impl KeyValueStore for CfKv {
     async fn put(&self, key: &str, value: &[u8]) -> Result<(), KvError> {
         let array = js_sys::Uint8Array::from(value);
         let promise = self.ns.put(key, &array).map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         let promise = self.ns.delete(key).map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 
@@ -101,7 +102,7 @@ impl KeyValueStore for CfKv {
         }
 
         let promise = self.ns.list(&options).map_err(js_err)?;
-        let result = JsFuture::from(promise).await.map_err(js_err)?;
+        let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
 
         // Result is { keys: [{name: "key1"}, {name: "key2"}, ...], ... }
         let keys_val = js_sys::Reflect::get(&result, &"keys".into()).map_err(js_err)?;

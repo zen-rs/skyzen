@@ -3,6 +3,7 @@
 use skyzen_services::durable::alarm::{AlarmError, AlarmScheduler};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
+use worker::send::IntoSendFuture;
 use worker_sys::{DurableObjectState, DurableObjectStorage};
 
 /// Cloudflare Durable Object alarm scheduler backed by `state.storage`.
@@ -50,7 +51,7 @@ impl AlarmScheduler for CfAlarm {
     async fn get_alarm(&self) -> Result<Option<i64>, AlarmError> {
         let options = js_sys::Object::new();
         let promise = self.storage.get_alarm(options).map_err(js_err)?;
-        let value = JsFuture::from(promise).await.map_err(js_err)?;
+        let value = JsFuture::from(promise).into_send().await.map_err(js_err)?;
 
         if value.is_null() || value.is_undefined() {
             return Ok(None);
@@ -76,14 +77,14 @@ impl AlarmScheduler for CfAlarm {
         let when = js_sys::Date::new(&JsValue::from_f64(scheduled_time_ms as f64));
         let options = js_sys::Object::new();
         let promise = self.storage.set_alarm(when, options).map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 
     async fn delete_alarm(&self) -> Result<(), AlarmError> {
         let options = js_sys::Object::new();
         let promise = self.storage.delete_alarm(options).map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 }

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+use worker::send::IntoSendFuture;
 use worker_sys::{R2Bucket, R2Object, R2ObjectBody};
 
 use skyzen_services::storage::{
@@ -89,7 +90,7 @@ impl ObjectStorage for CfR2 {
             .bucket
             .get(key.to_owned(), JsValue::UNDEFINED)
             .map_err(js_err)?;
-        let result = JsFuture::from(promise).await.map_err(js_err)?;
+        let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
 
         if result.is_null() || result.is_undefined() {
             return Ok(None);
@@ -102,7 +103,10 @@ impl ObjectStorage for CfR2 {
         let custom = extract_custom_metadata(base);
 
         let body_promise = obj.array_buffer().map_err(js_err)?;
-        let body_buffer = JsFuture::from(body_promise).await.map_err(js_err)?;
+        let body_buffer = JsFuture::from(body_promise)
+            .into_send()
+            .await
+            .map_err(js_err)?;
         let body = js_sys::Uint8Array::new(&body_buffer).to_vec();
 
         let metadata = ObjectMetadata {
@@ -122,13 +126,13 @@ impl ObjectStorage for CfR2 {
             .bucket
             .put(key.to_owned(), array.into(), JsValue::UNDEFINED)
             .map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
         let promise = self.bucket.delete(key.to_owned()).map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 
@@ -157,7 +161,7 @@ impl ObjectStorage for CfR2 {
         }
 
         let promise = self.bucket.list(js_options.into()).map_err(js_err)?;
-        let result = JsFuture::from(promise).await.map_err(js_err)?;
+        let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
 
         // Result is { objects: [...], truncated, cursor }
         let objects_val = js_sys::Reflect::get(&result, &"objects".into()).map_err(js_err)?;
@@ -195,7 +199,7 @@ impl ObjectStorage for CfR2 {
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMetadata>, StorageError> {
         let promise = self.bucket.head(key.to_owned()).map_err(js_err)?;
-        let result = JsFuture::from(promise).await.map_err(js_err)?;
+        let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
 
         if result.is_null() || result.is_undefined() {
             return Ok(None);

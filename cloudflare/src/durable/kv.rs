@@ -3,6 +3,7 @@
 use skyzen_services::durable::kv::{DurableKvError, DurableKvStore, DurableListOptions};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
+use worker::send::IntoSendFuture;
 use worker_sys::{DurableObjectState, DurableObjectStorage};
 
 /// Cloudflare Durable Object KV store backed by `state.storage`.
@@ -49,7 +50,7 @@ impl CfDurableKv {
 impl DurableKvStore for CfDurableKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, DurableKvError> {
         let promise = self.storage.get(key).map_err(js_err)?;
-        let value = JsFuture::from(promise).await.map_err(js_err)?;
+        let value = JsFuture::from(promise).into_send().await.map_err(js_err)?;
         decode_optional_bytes(&value)
     }
 
@@ -59,14 +60,14 @@ impl DurableKvStore for CfDurableKv {
             .map(|key| JsValue::from_str(key))
             .collect::<Vec<_>>();
         let promise = self.storage.get_multiple(keys).map_err(js_err)?;
-        let value = JsFuture::from(promise).await.map_err(js_err)?;
+        let value = JsFuture::from(promise).into_send().await.map_err(js_err)?;
         decode_map_entries(value)
     }
 
     async fn put(&self, key: &str, value: &[u8]) -> Result<(), DurableKvError> {
         let bytes = js_sys::Uint8Array::from(value);
         let promise = self.storage.put(key, bytes.into()).map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 
@@ -78,13 +79,13 @@ impl DurableKvStore for CfDurableKv {
             js_sys::Reflect::set(&object, &JsValue::from_str(key), &bytes_value).map_err(js_err)?;
         }
         let promise = self.storage.put_multiple(object.into()).map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<bool, DurableKvError> {
         let promise = self.storage.delete(key).map_err(js_err)?;
-        let value = JsFuture::from(promise).await.map_err(js_err)?;
+        let value = JsFuture::from(promise).into_send().await.map_err(js_err)?;
         value.as_bool().ok_or_else(|| {
             DurableKvError::Backend(format!(
                 "DurableObjectStorage.delete returned non-boolean value: {value:?}"
@@ -98,13 +99,13 @@ impl DurableKvStore for CfDurableKv {
             .map(|key| JsValue::from_str(key))
             .collect::<Vec<_>>();
         let promise = self.storage.delete_multiple(keys).map_err(js_err)?;
-        let value = JsFuture::from(promise).await.map_err(js_err)?;
+        let value = JsFuture::from(promise).into_send().await.map_err(js_err)?;
         to_usize(&value, "DurableObjectStorage.deleteMultiple")
     }
 
     async fn delete_all(&self) -> Result<(), DurableKvError> {
         let promise = self.storage.delete_all().map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 
@@ -153,7 +154,7 @@ impl DurableKvStore for CfDurableKv {
         }
 
         let promise = self.storage.list_with_options(js_options).map_err(js_err)?;
-        let value = JsFuture::from(promise).await.map_err(js_err)?;
+        let value = JsFuture::from(promise).into_send().await.map_err(js_err)?;
         decode_map_entries(value)
     }
 }

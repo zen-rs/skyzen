@@ -135,8 +135,33 @@ The runtime injects:
 - `DurableKv`
 - `Alarm`
 - `DurableConnections`
+- `WasmEnv`
 
 for the current object instance.
+
+If your Durable Object needs Cloudflare bindings or secrets inside `fetch` handlers or alarm handlers, extract `WasmEnv` directly:
+
+```rust
+use skyzen::runtime::wasm::WasmEnv;
+use skyzen_services::durable::DurableDb;
+
+async fn dispatch_job(env: WasmEnv, db: DurableDb) -> skyzen::Result<&'static str> {
+    let env = env.into_inner();
+
+    let github_token = skyzen_cloudflare::ffi::get_binding(&env, "GITHUB_TOKEN")
+        .map_err(|error| skyzen::Error::msg(format!("missing GITHUB_TOKEN binding: {error:?}")))?;
+
+    db.query("INSERT INTO job_log (status) VALUES (?)")
+        .bind("dispatched")
+        .execute()
+        .await?;
+
+    let _ = github_token;
+    Ok("ok")
+}
+```
+
+The same applies to `Route::on_alarm(...)` handlers inside a Durable Object router: `WasmEnv` is available there too.
 
 ## Running On Native
 

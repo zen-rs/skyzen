@@ -3,6 +3,7 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+use worker::send::IntoSendFuture;
 
 use skyzen_services::queue::{MessageQueue, QueueError};
 
@@ -70,7 +71,7 @@ impl MessageQueue for CfQueue {
             .queue
             .send(array.into(), JsValue::UNDEFINED)
             .map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 
@@ -91,7 +92,7 @@ impl MessageQueue for CfQueue {
             .queue
             .send_batch(batch, JsValue::UNDEFINED)
             .map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
     }
 }

@@ -20,6 +20,7 @@ Cloudflare Workers service implementations for the Skyzen framework.
 | `CfR2` | `ObjectStorage` | [R2](https://developers.cloudflare.com/r2/) |
 | `CfQueue` | `MessageQueue` | [Queues](https://developers.cloudflare.com/queues/) |
 | `CfD1` | `DbBackend` + raw D1 API | [D1](https://developers.cloudflare.com/d1/) |
+| `CfCache` | raw Cache API | [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) |
 | `CfDurableSqlite` | — (direct SQL API) | [Durable Objects SQLite](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
 
 ## Usage
@@ -27,13 +28,14 @@ Cloudflare Workers service implementations for the Skyzen framework.
 All types are created from the Workers environment using binding names:
 
 ```rust
-use skyzen_cloudflare::{CfKv, CfR2, CfQueue, CfD1, CfDurableSqlite};
+use skyzen_cloudflare::{CfCache, CfD1, CfDurableSqlite, CfKv, CfQueue, CfR2};
 
 // From a Workers request handler (env is a JsValue):
 let kv = CfKv::from_env(&env, "MY_KV")?;
 let r2 = CfR2::from_env(&env, "MY_BUCKET")?;
 let queue = CfQueue::from_env(&env, "MY_QUEUE")?;
 let d1 = CfD1::from_env(&env, "DB")?;
+let cache = CfCache::default();
 ```
 
 ### Key-Value (CfKv)
@@ -90,6 +92,28 @@ let rows = d1
     .all()
     .await?;
 ```
+
+### Cache API
+
+Cloudflare's HTTP Cache API is available through `CfCache`:
+
+```rust
+use skyzen_cloudflare::CfCache;
+use worker::Response;
+
+let cache = CfCache::default();
+
+cache
+    .put_url(
+        "https://example.com/data",
+        Response::from_json(&serde_json::json!({"ok": true}))?,
+    )
+    .await?;
+
+let cached = cache.get_url("https://example.com/data", false).await?;
+```
+
+`CfCache` methods return `Send` futures, so they can be awaited directly inside Skyzen handlers.
 
 ### Durable Object SQLite
 

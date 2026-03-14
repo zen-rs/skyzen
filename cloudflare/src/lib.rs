@@ -11,6 +11,7 @@
 //! - [`CfR2`] — Cloudflare R2 (implements [`ObjectStorage`])
 //! - [`CfQueue`] — Cloudflare Queues (implements [`MessageQueue`])
 //! - [`CfD1`] — Cloudflare D1 SQL database
+//! - [`CfCache`] — Cloudflare Cache API
 //! - [`CfDurableSqlite`] — Durable Object `SQLite` (`state.storage.sql`)
 //!
 //! **This crate only works on `wasm32` targets.** On native targets it compiles
@@ -34,6 +35,8 @@
 //! [`MessageQueue`]: skyzen_services::queue::MessageQueue
 
 #[cfg(target_arch = "wasm32")]
+pub mod cache;
+#[cfg(target_arch = "wasm32")]
 pub mod d1;
 #[cfg(target_arch = "wasm32")]
 pub mod database_error;
@@ -52,6 +55,8 @@ pub mod queues;
 #[cfg(target_arch = "wasm32")]
 pub mod r2;
 
+#[cfg(target_arch = "wasm32")]
+pub use cache::{CfCache, CfCacheDeletionOutcome, CfCacheError};
 #[cfg(target_arch = "wasm32")]
 pub use d1::{CfD1, CfD1Statement};
 #[cfg(target_arch = "wasm32")]
@@ -81,3 +86,24 @@ pub use worker;
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use worker_sys;
+
+#[cfg(target_arch = "wasm32")]
+const _: () = {
+    fn assert_send<T: Send>(_: T) {}
+
+    #[allow(dead_code)]
+    fn assert_cloudflare_handler_futures_are_send(
+        d1: crate::CfD1,
+        namespace: crate::CfDurableNamespace,
+        cache: crate::CfCache,
+    ) {
+        assert_send(d1.exec("SELECT 1"));
+        assert_send(crate::CfD1::new(wasm_bindgen::JsValue::NULL).prepare("SELECT 1").unwrap().all());
+        assert_send(namespace.get_by_name("room").unwrap().fetch_url("https://example.com"));
+        assert_send(cache.get_url("https://example.com", false));
+        assert_send(cache.put_url(
+            "https://example.com",
+            worker::Response::empty().unwrap(),
+        ));
+    }
+};

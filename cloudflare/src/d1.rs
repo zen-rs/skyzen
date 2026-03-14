@@ -5,6 +5,7 @@ use skyzen_services::{DbBackend, DbError, DbExecResult, DbValue};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+use worker::send::IntoSendFuture;
 use worker_sys::{D1Database, D1PreparedStatement, D1Result};
 
 use crate::database_error::{js_err, CfDatabaseError};
@@ -52,7 +53,7 @@ impl CfD1 {
     /// Run SQL directly via D1 `exec`.
     pub async fn exec(&self, query: &str) -> Result<JsValue, CfDatabaseError> {
         let promise = self.db.exec(query).map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)
+        JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
     /// Prepare a SQL statement.
@@ -99,25 +100,25 @@ impl CfD1Statement {
     /// Execute and return all rows (`stmt.all()`).
     pub async fn all(&self) -> Result<JsValue, CfDatabaseError> {
         let promise = self.stmt.all().map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)
+        JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
     /// Execute and return the first row (`stmt.first()`).
     pub async fn first(&self) -> Result<JsValue, CfDatabaseError> {
         let promise = self.stmt.first(None).map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)
+        JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
     /// Execute and return raw row arrays (`stmt.raw()`).
     pub async fn raw(&self) -> Result<JsValue, CfDatabaseError> {
         let promise = self.stmt.raw().map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)
+        JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
     /// Execute a write statement (`stmt.run()`).
     pub async fn run(&self) -> Result<JsValue, CfDatabaseError> {
         let promise = self.stmt.run().map_err(js_err)?;
-        JsFuture::from(promise).await.map_err(js_err)
+        JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
     /// Execute `all()` and deserialize the result into a Rust type.
