@@ -202,3 +202,5 @@ skyzen-services = { version = "0.1", features = ["runtime-tokio-rustls", "postgr
 ```
 
 Portable SQL is intentionally the minimum common surface. When you need provider-specific features such as Durable Object local SQLite or D1-specific metadata, drop down to the provider APIs explicitly.
+
+For object-scoped SQL that runs on both native and Cloudflare, continue with the [Durable Object + SQL Guide](durable-sql-guide.md).

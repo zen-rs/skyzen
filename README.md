@@ -125,6 +125,7 @@ Provider-specific escape hatches remain available when you need more than the po
 - Cloudflare raw SQL and stateful primitives: `CfD1`, `DurableKv`, `DurableDb`, `Alarm`, Durable Objects
 
 See the [Services Guide](docs/services-guide.md) for how to write platform-agnostic handlers and switch between backends.
+For per-object SQL state that runs on both native and Cloudflare, see the [Durable Object + SQL Guide](docs/durable-sql-guide.md).
 
 ## Services Abstraction
 
