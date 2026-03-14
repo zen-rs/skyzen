@@ -1,4 +1,3 @@
-// On WASM, BoxFuture is LocalBoxFuture (not Send), so wrapper methods are correctly !Send.
 #![cfg_attr(target_arch = "wasm32", allow(clippy::future_not_send))]
 
 //! Portable service abstractions for the Skyzen framework.

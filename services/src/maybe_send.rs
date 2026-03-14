@@ -1,24 +1,13 @@
-//! Conditional `Send` bounds for cross-platform compatibility.
+//! `Send` bounds shared by service wrappers.
 //!
-//! On native targets (multi-threaded), futures must be `Send`.
-//! On WASM (single-threaded), `Send` is not required (and JS types are `!Send`).
+//! Skyzen handlers always require `Send` futures, even on wasm targets.
+//! Service abstractions therefore keep the same contract so backends cannot
+//! silently degrade a `Send` future into a `!Send` wrapper future.
 
-/// A trait that is `Send` on native targets and universally implemented on WASM.
-#[cfg(not(target_arch = "wasm32"))]
+/// Marker trait for futures that satisfy Skyzen's `Send` contract.
 pub trait MaybeSend: Send {}
-#[cfg(not(target_arch = "wasm32"))]
+
 impl<T: Send> MaybeSend for T {}
 
-/// A trait that is universally implemented on WASM (no `Send` requirement).
-#[cfg(target_arch = "wasm32")]
-pub trait MaybeSend {}
-#[cfg(target_arch = "wasm32")]
-impl<T> MaybeSend for T {}
-
-/// Boxed future type that is `Send` on native and `!Send` on WASM.
-#[cfg(not(target_arch = "wasm32"))]
+/// Boxed future type used by service wrapper trait objects.
 pub type BoxFuture<'a, T> = futures_core::future::BoxFuture<'a, T>;
-
-/// Boxed future type that does not require `Send` on WASM.
-#[cfg(target_arch = "wasm32")]
-pub type BoxFuture<'a, T> = futures_core::future::LocalBoxFuture<'a, T>;
