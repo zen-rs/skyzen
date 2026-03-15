@@ -49,6 +49,8 @@ pub mod events;
 #[cfg(target_arch = "wasm32")]
 pub mod ffi;
 #[cfg(target_arch = "wasm32")]
+pub mod fetch;
+#[cfg(target_arch = "wasm32")]
 pub mod kv;
 #[cfg(target_arch = "wasm32")]
 pub mod queues;
@@ -64,8 +66,8 @@ pub use database_error::CfDatabaseError;
 #[cfg(target_arch = "wasm32")]
 pub use durable::{
     invoke_alarm, invoke_websocket_close, invoke_websocket_error, invoke_websocket_message,
-    CfAlarm, CfDurableConnections, CfDurableKv, CfDurableNamespace, CfDurableObjectStub,
-    CfDurableDb, CfDurableState, CfWebSocketConnection, DurableObjectRuntime,
+    CfAlarm, CfDurableConnections, CfDurableDb, CfDurableKv, CfDurableNamespace,
+    CfDurableObjectStub, CfDurableState, CfWebSocketConnection, DurableObjectRuntime,
 };
 #[cfg(target_arch = "wasm32")]
 pub use durable_sqlite::CfDurableSqlite;
@@ -74,6 +76,8 @@ pub use events::{
     CfEventError, CfQueueBatch, CfQueueContext, CfQueueMessage, CfQueueRetryOptions,
     CfScheduleContext, CfScheduledEvent, IntoQueueWorkerResult, IntoWorkerResult,
 };
+#[cfg(target_arch = "wasm32")]
+pub use fetch::{CfFetch, CfFetchError};
 #[cfg(target_arch = "wasm32")]
 pub use kv::CfKv;
 #[cfg(target_arch = "wasm32")]
@@ -96,14 +100,25 @@ const _: () = {
         d1: crate::CfD1,
         namespace: crate::CfDurableNamespace,
         cache: crate::CfCache,
+        fetch: crate::CfFetch,
+        request: worker::Request,
     ) {
         assert_send(d1.exec("SELECT 1"));
-        assert_send(crate::CfD1::new(wasm_bindgen::JsValue::NULL).prepare("SELECT 1").unwrap().all());
-        assert_send(namespace.get_by_name("room").unwrap().fetch_url("https://example.com"));
+        assert_send(
+            crate::CfD1::new(wasm_bindgen::JsValue::NULL)
+                .prepare("SELECT 1")
+                .unwrap()
+                .all(),
+        );
+        assert_send(
+            namespace
+                .get_by_name("room")
+                .unwrap()
+                .fetch_url("https://example.com"),
+        );
         assert_send(cache.get_url("https://example.com", false));
-        assert_send(cache.put_url(
-            "https://example.com",
-            worker::Response::empty().unwrap(),
-        ));
+        assert_send(cache.put_url("https://example.com", worker::Response::empty().unwrap()));
+        assert_send(fetch.request(&request));
+        assert_send(fetch.request_bytes(&request));
     }
 };

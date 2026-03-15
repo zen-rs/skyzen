@@ -1,5 +1,6 @@
 import init, { fetch as wasmFetch } from "./__SKYZEN_BINDINGS_JS__";
 import wasmUrl from "./__SKYZEN_WASM__";
+__SKYZEN_DURABLE_EXPORTS__
 
 let initPromise;
 

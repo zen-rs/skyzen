@@ -9,6 +9,7 @@ use crate::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{
+    collections::BTreeSet,
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
@@ -28,6 +29,13 @@ pub struct CloudflareBuildPlan {
     pub bindings_js_path: PathBuf,
     pub wasm_output_path: PathBuf,
     pub bindgen_out_name: String,
+    pub durable_exports: Vec<DurableObjectExport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DurableObjectExport {
+    pub public_name: String,
+    pub bindings_export_name: String,
 }
 
 pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan> {
@@ -454,6 +462,7 @@ fn resolve_build_plan(
         bindings_js_path,
         wasm_output_path,
         bindgen_out_name: entry_stem.to_owned(),
+        durable_exports: collect_local_durable_exports(config),
     })
 }
 
@@ -555,13 +564,52 @@ fn generate_wasm_bindings(plan: &CloudflareBuildPlan) -> Result<()> {
         .file_name()
         .and_then(OsStr::to_str)
         .expect("wasm file name");
-    let shim = WORKER_SHIM_TEMPLATE
-        .replace("__SKYZEN_BINDINGS_JS__", bindings_name)
-        .replace("__SKYZEN_WASM__", wasm_name);
+    let shim = render_worker_shim(bindings_name, wasm_name, &plan.durable_exports);
     fs::write(&plan.entry_js_path, shim)
         .with_context(|| format!("failed to write {}", plan.entry_js_path.display()))?;
 
     Ok(())
+}
+
+fn collect_local_durable_exports(config: &CloudflareSection) -> Vec<DurableObjectExport> {
+    let mut exports = BTreeSet::new();
+    for binding in &config.durable_objects.bindings {
+        if binding.script_name.is_some() {
+            continue;
+        }
+        exports.insert(DurableObjectExport {
+            public_name: binding.class_name.clone(),
+            bindings_export_name: format!("{}Object", binding.class_name),
+        });
+    }
+    exports.into_iter().collect()
+}
+
+fn render_worker_shim(
+    bindings_name: &str,
+    wasm_name: &str,
+    durable_exports: &[DurableObjectExport],
+) -> String {
+    let durable_exports = durable_exports
+        .iter()
+        .map(|export| {
+            format!(
+                "export {{ {} as {} }} from \"./{}\";",
+                export.bindings_export_name, export.public_name, bindings_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let durable_exports = if durable_exports.is_empty() {
+        String::new()
+    } else {
+        format!("{durable_exports}\n")
+    };
+
+    WORKER_SHIM_TEMPLATE
+        .replace("__SKYZEN_BINDINGS_JS__", bindings_name)
+        .replace("__SKYZEN_WASM__", wasm_name)
+        .replace("__SKYZEN_DURABLE_EXPORTS__", &durable_exports)
 }
 
 #[derive(Debug, Deserialize)]
@@ -791,7 +839,63 @@ crate-type = ["cdylib", "rlib"]
         assert_eq!(build.bindings_js_path, project_dir.join("dist/worker_bg.js"));
         assert_eq!(build.wasm_output_path, project_dir.join("dist/worker_bg.wasm"));
         assert_eq!(build.bindgen_out_name, "worker");
+        assert!(build.durable_exports.is_empty());
         assert!(build.wasm_artifact_path.ends_with("wasm32-unknown-unknown/debug/demo_worker.wasm"));
+    }
+
+    #[test]
+    fn resolve_build_plan_collects_only_local_durable_exports() {
+        let project_dir = temp_project_dir("cloudflare-build-do-exports");
+        fs::write(
+            project_dir.join("Cargo.toml"),
+            r#"[package]
+name = "demo-worker"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+"#,
+        )
+        .expect("write Cargo.toml");
+        fs::create_dir_all(project_dir.join("src")).expect("create src");
+        fs::write(project_dir.join("src/lib.rs"), "pub fn demo() {}").expect("write lib.rs");
+
+        let manifest = LoadedManifest {
+            root_dir: project_dir,
+            data: crate::manifest::SkyzenManifest {
+                cloudflare: Some(CloudflareSection {
+                    compatibility_date: Some("2025-02-01".to_owned()),
+                    durable_objects: CfDurableObjects {
+                        bindings: vec![
+                            CfDurableBinding {
+                                name: "LOCAL_STATE".to_owned(),
+                                class_name: "State".to_owned(),
+                                script_name: None,
+                            },
+                            CfDurableBinding {
+                                name: "REMOTE_STATE".to_owned(),
+                                class_name: "RemoteState".to_owned(),
+                                script_name: Some("shared-worker".to_owned()),
+                            },
+                        ],
+                        migrations: Vec::new(),
+                    },
+                    ..CloudflareSection::default()
+                }),
+                ..crate::manifest::SkyzenManifest::default()
+            },
+        };
+
+        let build = resolve_build_plan(&manifest, manifest.data.cloudflare.as_ref().unwrap())
+            .expect("resolve build plan");
+        assert_eq!(
+            build.durable_exports,
+            vec![DurableObjectExport {
+                public_name: "State".to_owned(),
+                bindings_export_name: "StateObject".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -860,6 +964,36 @@ crate-type = ["cdylib", "rlib"]
         assert_eq!(plan.internal_steps.len(), 1);
         assert!(plan.commands[0].display().contains("wrangler dev --local"));
         assert!(plan.generated_files[0].contents.contains("main = \"../../dist/worker.js\""));
+    }
+
+    #[test]
+    fn render_worker_shim_reexports_local_durable_objects() {
+        let rendered = render_worker_shim(
+            "worker_bg.js",
+            "worker_bg.wasm",
+            &[
+                DurableObjectExport {
+                    public_name: "Scheduler".to_owned(),
+                    bindings_export_name: "SchedulerObject".to_owned(),
+                },
+                DurableObjectExport {
+                    public_name: "Room".to_owned(),
+                    bindings_export_name: "RoomObject".to_owned(),
+                },
+            ],
+        );
+
+        assert!(rendered.contains("import init, { fetch as wasmFetch } from \"./worker_bg.js\";"));
+        assert!(rendered.contains("import wasmUrl from \"./worker_bg.wasm\";"));
+        assert!(rendered.contains("export { SchedulerObject as Scheduler } from \"./worker_bg.js\";"));
+        assert!(rendered.contains("export { RoomObject as Room } from \"./worker_bg.js\";"));
+    }
+
+    #[test]
+    fn render_worker_shim_omits_durable_exports_when_empty() {
+        let rendered = render_worker_shim("worker_bg.js", "worker_bg.wasm", &[]);
+        assert!(!rendered.contains(" as Scheduler }"));
+        assert!(rendered.contains("export default {"));
     }
 
     fn temp_project_dir(prefix: &str) -> PathBuf {
