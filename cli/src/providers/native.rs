@@ -16,6 +16,7 @@ pub fn prepare(action: Action, root_dir: PathBuf) -> Result<ProviderPlan> {
                 cwd: Some(root_dir),
             }],
             generated_files: Vec::new(),
+            internal_steps: Vec::new(),
             run_mode: RunMode::Watch,
         }),
         Action::Deploy => anyhow::bail!("native deploy is not supported"),

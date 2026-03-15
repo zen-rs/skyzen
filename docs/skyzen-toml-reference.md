@@ -154,7 +154,7 @@ API_URL = "https://api.example.com"
 | Key | Type | Description |
 |-----|------|-------------|
 | `name` | string | Worker name |
-| `main` | string | Entry point path |
+| `main` | string | Worker entry path relative to the project root. Default is `dist/worker.js`. Skyzen generates this file automatically for Cloudflare dev/deploy. |
 | `compatibility_date` | string | Workers compatibility date |
 | `compatibility_flags` | string[] | Compatibility flags (e.g. `["nodejs_compat"]`) |
 | `account_id` | string | Cloudflare account ID |
@@ -400,7 +400,7 @@ The `skyzen` CLI generates provider-specific config files from `Skyzen.toml`:
 
 | Provider | Generated Config | `dev` Command | `deploy` Command |
 |----------|-----------------|---------------|-----------------|
-| Cloudflare | `.skyzen/gen/wrangler.toml` | `wrangler dev` | `wrangler deploy` |
+| Cloudflare | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` | `wrangler dev` | `wrangler deploy` |
 | AWS | uses `template` directly | `sam local start-api` | `sam deploy` |
 | Azure | uses `project` directly | `func start` | `func azure functionapp publish` |
 

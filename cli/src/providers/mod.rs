@@ -43,10 +43,27 @@ pub struct GeneratedFile {
 }
 
 #[derive(Debug, Clone)]
+pub enum InternalStep {
+    CloudflareBuild(cloudflare::CloudflareBuildPlan),
+}
+
+impl InternalStep {
+    pub fn display(&self) -> String {
+        match self {
+            Self::CloudflareBuild(plan) => format!(
+                "build Cloudflare worker artifacts into {}",
+                plan.output_dir.display()
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PreparedRun {
     pub action: Action,
     pub commands: Vec<CommandPlan>,
     pub generated_files: Vec<GeneratedFile>,
+    pub internal_steps: Vec<InternalStep>,
     pub run_mode: RunMode,
 }
 
@@ -61,6 +78,7 @@ pub enum RunMode {
 pub struct ProviderPlan {
     commands: Vec<CommandPlan>,
     generated_files: Vec<GeneratedFile>,
+    internal_steps: Vec<InternalStep>,
     run_mode: RunMode,
 }
 
@@ -70,6 +88,7 @@ impl ProviderPlan {
             action,
             commands: self.commands,
             generated_files: self.generated_files,
+            internal_steps: self.internal_steps,
             run_mode: self.run_mode,
         }
     }
@@ -84,6 +103,7 @@ pub fn prepare(options: &CliOptions) -> Result<PreparedRun> {
                 action: Action::Doctor,
                 commands: Vec::new(),
                 generated_files: Vec::new(),
+                internal_steps: Vec::new(),
                 run_mode: RunMode::Once,
             })
         }
@@ -116,6 +136,12 @@ pub fn prepare(options: &CliOptions) -> Result<PreparedRun> {
     }
 }
 
+pub fn run_internal_step(step: &InternalStep) -> Result<()> {
+    match step {
+        InternalStep::CloudflareBuild(plan) => cloudflare::run_build(plan),
+    }
+}
+
 fn run_doctor(provider: Option<Provider>) -> Result<()> {
     let providers = provider.map_or_else(
         || {
@@ -131,17 +157,19 @@ fn run_doctor(provider: Option<Provider>) -> Result<()> {
 
     let mut missing = Vec::new();
     for provider in providers {
-        let (label, binary) = match provider {
-            Provider::Native => ("native", "cargo"),
-            Provider::Cloudflare => ("cloudflare", "wrangler"),
-            Provider::Aws => ("aws", "sam"),
-            Provider::Azure => ("azure", "func"),
+        let (label, binaries): (&str, &[&str]) = match provider {
+            Provider::Native => ("native", &["cargo"]),
+            Provider::Cloudflare => ("cloudflare", &["cargo", "wrangler"]),
+            Provider::Aws => ("aws", &["sam"]),
+            Provider::Azure => ("azure", &["func"]),
         };
-        if binary_exists(binary) {
-            println!("[ok] {label}: found `{binary}`");
-        } else {
-            println!("[missing] {label}: `{binary}` not found");
-            missing.push(binary);
+        for binary in binaries {
+            if binary_exists(binary) {
+                println!("[ok] {label}: found `{binary}`");
+            } else {
+                println!("[missing] {label}: `{binary}` not found");
+                missing.push(*binary);
+            }
         }
     }
 

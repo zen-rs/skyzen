@@ -7,7 +7,7 @@ Project scaffolding, local development, and deployment CLI for Skyzen apps.
 
 ## Overview
 
-The `skyzen` CLI provides a single interface for creating projects, running native local development, and deploying Skyzen applications. For Cloudflare Workers it reads `Skyzen.toml`, generates `.skyzen/gen/wrangler.toml`, and delegates to Wrangler directly. AWS and Azure integration are currently deployment-tooling hooks, not runtime-parity features.
+The `skyzen` CLI provides a single interface for creating projects, running native local development, and deploying Skyzen applications. For Cloudflare Workers it reads `Skyzen.toml`, builds the wasm target, generates Worker artifacts, writes `.skyzen/gen/wrangler.toml`, and then delegates to Wrangler. AWS and Azure integration are currently deployment-tooling hooks, not runtime-parity features.
 
 ## Installation
 
@@ -52,7 +52,7 @@ skyzen dev --provider aws
 skyzen dev --provider azure
 ```
 
-Native mode is supervised by Skyzen and automatically restarts on source changes. Cloudflare mode uses Wrangler directly; Skyzen does not simulate the Cloudflare environment itself.
+Native mode is supervised by Skyzen and automatically restarts on source changes. Cloudflare mode uses Wrangler directly after Skyzen prepares the Worker artifacts.
 
 ### `skyzen deploy`
 
@@ -80,7 +80,7 @@ skyzen deploy --provider azure
 | Provider | `dev` | `deploy` | Generated Config |
 |----------|-------|----------|-----------------|
 | Native | `cargo run` with Skyzen watch/restart | — | none |
-| Cloudflare | `wrangler dev` | `wrangler deploy` | `.skyzen/gen/wrangler.toml` |
+| Cloudflare | `wrangler dev` | `wrangler deploy` | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` |
 | AWS | `sam local start-api` | `sam deploy` | uses `template` from config |
 | Azure | `func start` | `func azure functionapp publish` | uses `project` from config |
 
@@ -88,7 +88,7 @@ The AWS/Azure rows above describe CLI orchestration only. Skyzen's finished runt
 
 ## Skyzen.toml
 
-See the [Skyzen.toml Reference](../docs/skyzen-toml-reference.md) for the full configuration format. Users edit `Skyzen.toml`; generated provider files such as `.skyzen/gen/wrangler.toml` are derived artifacts and are overwritten automatically.
+See the [Skyzen.toml Reference](../docs/skyzen-toml-reference.md) for the full configuration format. Users edit `Skyzen.toml`; generated provider files such as `.skyzen/gen/wrangler.toml` and Cloudflare Worker artifacts under `dist/` are derived artifacts and are overwritten automatically.
 
 Example:
 

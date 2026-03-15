@@ -39,20 +39,12 @@ Run natively (helpful during development because you get logging, CLI overrides,
 cargo run --example worker
 ```
 
-Build for wasm32 targets and upload to Cloudflare Workers:
+For real Cloudflare local simulation or deployment, prefer a normal project with `Skyzen.toml`.
+Skyzen CLI will build the wasm target, generate bindings, write the Worker shim, and then call Wrangler for you:
 
 ```sh
-rustup target add wasm32-unknown-unknown
-cargo build --example worker --target wasm32-unknown-unknown --release
-wasm-bindgen --target web target/wasm32-unknown-unknown/release/examples/worker.wasm --out-dir worker-dist
-```
-
-Deploy the generated artifacts with `wrangler publish worker-dist/worker.js` (create `worker.js` that imports the wasm bundle and forwards `fetch` to it).
-
-If you use `Skyzen.toml`, you can run Cloudflare local simulation via Skyzen CLI:
-
-```sh
-cargo run -p skyzen-cli -- dev --provider cloudflare --manifest ./Skyzen.toml --dry-run
+skyzen dev --provider cloudflare
+skyzen deploy --provider cloudflare
 ```
 
 ## `openapi.rs`

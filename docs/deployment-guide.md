@@ -97,7 +97,18 @@ See the [Skyzen.toml Reference](skyzen-toml-reference.md) for all Cloudflare opt
 skyzen dev --provider cloudflare
 ```
 
-This generates `.skyzen/gen/wrangler.toml` from your `Skyzen.toml` and runs `wrangler dev`.
+This now performs the full Worker preparation flow:
+
+1. `cargo build --target wasm32-unknown-unknown --lib`
+2. Skyzen generates WebAssembly bindings internally
+3. Skyzen writes:
+   - `dist/worker.js`
+   - `dist/worker_bg.js`
+   - `dist/worker_bg.wasm`
+4. Skyzen generates `.skyzen/gen/wrangler.toml`
+5. Skyzen runs `wrangler dev --local`
+
+No manual `wasm-bindgen` step is required in application projects.
 
 ### Deploy
 
@@ -105,14 +116,7 @@ This generates `.skyzen/gen/wrangler.toml` from your `Skyzen.toml` and runs `wra
 skyzen deploy --provider cloudflare
 ```
 
-### Manual Build
-
-If not using the Skyzen CLI:
-
-```sh
-cargo build --target wasm32-unknown-unknown --release
-wasm-bindgen --target web target/wasm32-unknown-unknown/release/my_app.wasm --out-dir dist
-```
+`skyzen deploy --provider cloudflare` uses the same formal Cloudflare build pipeline before invoking `wrangler deploy`.
 
 ### Durable Objects
 
@@ -233,6 +237,8 @@ Use `--dry-run` to preview generated config files without writing them:
 ```sh
 cargo run -p skyzen-cli -- dev --provider cloudflare --manifest ./Skyzen.toml --dry-run
 ```
+
+For Cloudflare, `--dry-run` also prints the internal build step Skyzen will perform before invoking Wrangler.
 
 ## Dual-Target Development
 

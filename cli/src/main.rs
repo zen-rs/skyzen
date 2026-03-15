@@ -9,7 +9,7 @@ mod scaffold;
 
 use anyhow::{Context, Result};
 use args::{Action, CliOptions};
-use providers::{prepare, PreparedRun, RunMode};
+use providers::{prepare, run_internal_step, PreparedRun, RunMode};
 use std::{
     fs,
     process::{Command, Stdio},
@@ -45,6 +45,17 @@ fn execute(prepared: &PreparedRun, dry_run: bool) -> Result<()> {
         fs::write(&file.path, &file.contents)
             .with_context(|| format!("failed to write {}", file.path.display()))?;
         println!("[skyzen] wrote {}", file.path.display());
+    }
+
+    for step in &prepared.internal_steps {
+        let display = step.display();
+        if dry_run {
+            println!("[dry-run] {display}");
+            continue;
+        }
+
+        println!("[skyzen] {display}");
+        run_internal_step(step)?;
     }
 
     for command in &prepared.commands {

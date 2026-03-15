@@ -53,6 +53,7 @@ pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan
     Ok(ProviderPlan {
         commands: vec![command],
         generated_files: Vec::new(),
+        internal_steps: Vec::new(),
         run_mode: RunMode::Once,
     })
 }

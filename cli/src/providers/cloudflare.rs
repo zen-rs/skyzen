@@ -4,10 +4,31 @@ use crate::{
         CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableRenamedClass, CfKvNamespace,
         CfQueueConsumer, CfQueueProducer, CfR2Bucket, CloudflareSection, LoadedManifest,
     },
-    providers::{CommandPlan, GeneratedFile, ProviderPlan, RunMode},
+    providers::{CommandPlan, GeneratedFile, InternalStep, ProviderPlan, RunMode},
 };
 use anyhow::{Context, Result};
-use std::path::Path;
+use serde::Deserialize;
+use std::{
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+use wasm_bindgen_cli_support::Bindgen;
+
+const WORKER_SHIM_TEMPLATE: &str = include_str!("../../assets/cloudflare/worker.mjs");
+
+#[derive(Debug, Clone)]
+pub struct CloudflareBuildPlan {
+    pub root_dir: PathBuf,
+    pub cargo_manifest_path: PathBuf,
+    pub wasm_artifact_path: PathBuf,
+    pub output_dir: PathBuf,
+    pub entry_js_path: PathBuf,
+    pub bindings_js_path: PathBuf,
+    pub wasm_output_path: PathBuf,
+    pub bindgen_out_name: String,
+}
 
 pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan> {
     let config = manifest
@@ -15,8 +36,9 @@ pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan
         .cloudflare
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing [cloudflare] section in Skyzen.toml"))?;
+    let build = resolve_build_plan(manifest, config)?;
     warn_missing_portable_bindings(manifest, config);
-    let wrangler = render_wrangler(config, &manifest.root_dir)?;
+    let wrangler = render_wrangler(config, &manifest.root_dir, &build.entry_js_path)?;
     let wrangler_path = manifest.root_dir.join(".skyzen/gen/wrangler.toml");
 
     let command = match action {
@@ -49,8 +71,15 @@ pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan
             path: wrangler_path,
             contents: wrangler,
         }],
+        internal_steps: vec![InternalStep::CloudflareBuild(build)],
         run_mode: RunMode::Once,
     })
+}
+
+pub fn run_build(plan: &CloudflareBuildPlan) -> Result<()> {
+    run_cargo_build(plan)?;
+    generate_wasm_bindings(plan)?;
+    Ok(())
 }
 
 fn warn_missing_portable_bindings(manifest: &LoadedManifest, config: &CloudflareSection) {
@@ -125,7 +154,11 @@ fn warn_missing_portable_bindings(manifest: &LoadedManifest, config: &Cloudflare
     }
 }
 
-fn render_wrangler(config: &CloudflareSection, root_dir: &Path) -> Result<String> {
+fn render_wrangler(
+    config: &CloudflareSection,
+    root_dir: &Path,
+    entry_js_path: &Path,
+) -> Result<String> {
     let name = config.name.clone().unwrap_or_else(|| {
         root_dir
             .file_name()
@@ -142,11 +175,12 @@ fn render_wrangler(config: &CloudflareSection, root_dir: &Path) -> Result<String
                 "cloudflare.compatibility_date is required (example: compatibility_date = \"2025-02-01\")"
             )
         })?;
-    let main = config.main.as_deref().unwrap_or("worker.js");
+    let wrangler_dir = root_dir.join(".skyzen/gen");
+    let main = relative_posix_path(&wrangler_dir, entry_js_path)?;
 
     let mut out = String::new();
     push_quoted_assignment(&mut out, "name", &name);
-    push_quoted_assignment(&mut out, "main", main);
+    push_quoted_assignment(&mut out, "main", &main);
     push_quoted_assignment(&mut out, "compatibility_date", compatibility_date);
 
     if !config.compatibility_flags.is_empty() {
@@ -332,11 +366,252 @@ fn path_string(path: &Path) -> Result<String> {
         .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
 }
 
+fn relative_posix_path(from_dir: &Path, to_path: &Path) -> Result<String> {
+    let relative = pathdiff::diff_paths(to_path, from_dir).with_context(|| {
+        format!(
+            "failed to derive relative path from {} to {}",
+            from_dir.display(),
+            to_path.display()
+        )
+    })?;
+    let value = relative
+        .to_str()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("path is not valid UTF-8: {}", relative.display()))?;
+    Ok(value.replace('\\', "/"))
+}
+
+fn resolve_build_plan(
+    manifest: &LoadedManifest,
+    config: &CloudflareSection,
+) -> Result<CloudflareBuildPlan> {
+    let cargo_manifest_path = manifest.root_dir.join("Cargo.toml");
+    if !cargo_manifest_path.exists() {
+        anyhow::bail!(
+            "missing Cargo.toml at project root {}; Cloudflare build requires a Rust package root",
+            manifest.root_dir.display()
+        );
+    }
+
+    let metadata = load_cargo_metadata(&manifest.root_dir, &cargo_manifest_path)?;
+    let package = metadata
+        .packages
+        .iter()
+        .find(|package| package.manifest_path == cargo_manifest_path)
+        .with_context(|| {
+            format!(
+                "failed to find package metadata for {}",
+                cargo_manifest_path.display()
+            )
+        })?;
+    let target = package
+        .targets
+        .iter()
+        .find(|target| target.crate_types.iter().any(|kind| kind == "cdylib"))
+        .with_context(|| {
+            format!(
+                "{} must define a [lib] target with crate-type including \"cdylib\" for Cloudflare builds",
+                cargo_manifest_path.display()
+            )
+        })?;
+
+    let entry_rel = parse_entry_path(config)?;
+    let output_dir = manifest
+        .root_dir
+        .join(entry_rel.parent().unwrap_or_else(|| Path::new("")));
+    let entry_stem = entry_rel
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|stem| !stem.is_empty())
+        .with_context(|| {
+            format!(
+                "cloudflare.main must be a JavaScript file path, got {}",
+                entry_rel.display()
+            )
+        })?;
+
+    if entry_stem.ends_with("_bg") {
+        anyhow::bail!(
+            "cloudflare.main file stem must not end with `_bg`; Skyzen reserves that suffix for generated support artifacts"
+        );
+    }
+
+    let target_directory = metadata.target_directory;
+    let wasm_artifact_path = target_directory
+        .join("wasm32-unknown-unknown")
+        .join("debug")
+        .join(format!("{}.wasm", target.name));
+    let entry_js_path = manifest.root_dir.join(&entry_rel);
+    let bindings_js_path = output_dir.join(format!("{entry_stem}_bg.js"));
+    let wasm_output_path = output_dir.join(format!("{entry_stem}_bg.wasm"));
+
+    Ok(CloudflareBuildPlan {
+        root_dir: manifest.root_dir.clone(),
+        cargo_manifest_path,
+        wasm_artifact_path,
+        output_dir,
+        entry_js_path,
+        bindings_js_path,
+        wasm_output_path,
+        bindgen_out_name: entry_stem.to_owned(),
+    })
+}
+
+fn parse_entry_path(config: &CloudflareSection) -> Result<PathBuf> {
+    let entry = config.main.as_deref().unwrap_or("dist/worker.js");
+    let path = PathBuf::from(entry);
+    if path.is_absolute() {
+        anyhow::bail!("cloudflare.main must be relative to the project root, got {entry}");
+    }
+    if path.extension().and_then(OsStr::to_str) != Some("js") {
+        anyhow::bail!("cloudflare.main must point to a .js file, got {entry}");
+    }
+    Ok(path)
+}
+
+fn run_cargo_build(plan: &CloudflareBuildPlan) -> Result<()> {
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--target")
+        .arg("wasm32-unknown-unknown")
+        .arg("--lib")
+        .arg("--manifest-path")
+        .arg(&plan.cargo_manifest_path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .current_dir(&plan.root_dir)
+        .status()
+        .with_context(|| "failed to launch cargo build for Cloudflare worker")?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "cargo build failed while preparing Cloudflare worker artifacts from {}",
+            plan.cargo_manifest_path.display()
+        );
+    }
+
+    if !plan.wasm_artifact_path.exists() {
+        anyhow::bail!(
+            "expected wasm artifact at {} after cargo build, but it was not produced",
+            plan.wasm_artifact_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn generate_wasm_bindings(plan: &CloudflareBuildPlan) -> Result<()> {
+    fs::create_dir_all(&plan.output_dir)
+        .with_context(|| format!("failed to create {}", plan.output_dir.display()))?;
+
+    let generated_entry_path = plan
+        .output_dir
+        .join(format!("{}.js", plan.bindgen_out_name));
+    for path in [
+        &generated_entry_path,
+        &plan.bindings_js_path,
+        &plan.entry_js_path,
+        &plan.wasm_output_path,
+    ] {
+        if path.exists() {
+            fs::remove_file(path)
+                .with_context(|| format!("failed to remove stale artifact {}", path.display()))?;
+        }
+    }
+
+    let mut bindgen = Bindgen::new();
+    bindgen
+        .input_path(&plan.wasm_artifact_path)
+        .out_name(&plan.bindgen_out_name)
+        .web(true)
+        .context("failed to configure wasm-bindgen output mode")?
+        .typescript(false);
+    bindgen
+        .generate(&plan.output_dir)
+        .with_context(|| {
+            format!(
+                "failed to generate wasm bindings from {} into {}",
+                plan.wasm_artifact_path.display(),
+                plan.output_dir.display()
+            )
+        })?;
+
+    fs::rename(&generated_entry_path, &plan.bindings_js_path).with_context(|| {
+        format!(
+            "failed to rename generated bindings {} -> {}",
+            generated_entry_path.display(),
+            plan.bindings_js_path.display()
+        )
+    })?;
+
+    let bindings_name = plan
+        .bindings_js_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("bindings file name");
+    let wasm_name = plan
+        .wasm_output_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("wasm file name");
+    let shim = WORKER_SHIM_TEMPLATE
+        .replace("__SKYZEN_BINDINGS_JS__", bindings_name)
+        .replace("__SKYZEN_WASM__", wasm_name);
+    fs::write(&plan.entry_js_path, shim)
+        .with_context(|| format!("failed to write {}", plan.entry_js_path.display()))?;
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoPackageMetadata>,
+    target_directory: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoPackageMetadata {
+    manifest_path: PathBuf,
+    targets: Vec<CargoTargetMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoTargetMetadata {
+    name: String,
+    crate_types: Vec<String>,
+}
+
+fn load_cargo_metadata(root_dir: &Path, cargo_manifest_path: &Path) -> Result<CargoMetadata> {
+    let output = Command::new("cargo")
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--no-deps")
+        .arg("--manifest-path")
+        .arg(cargo_manifest_path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .current_dir(root_dir)
+        .output()
+        .with_context(|| "failed to launch cargo metadata for Cloudflare worker build")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "cargo metadata failed while preparing Cloudflare worker build for {}",
+            cargo_manifest_path.display()
+        );
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| "failed to parse cargo metadata JSON for Cloudflare worker build")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::{CfDurableObjects, CfQueues, CfTriggers};
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{collections::BTreeMap, fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
     #[test]
     fn renders_wrangler_with_bindings() {
@@ -391,8 +666,14 @@ mod tests {
             },
         };
 
-        let rendered = render_wrangler(&section, &PathBuf::from("/tmp/app")).expect("render");
+        let rendered = render_wrangler(
+            &section,
+            &PathBuf::from("/tmp/app"),
+            &PathBuf::from("/tmp/app/dist/worker.js"),
+        )
+        .expect("render");
         assert!(rendered.contains("name = \"skyzen-worker\""));
+        assert!(rendered.contains("main = \"../../dist/worker.js\""));
         assert!(rendered.contains("[[d1_databases]]"));
         assert!(rendered.contains("binding = \"DB\""));
         assert!(rendered.contains("[[durable_objects.bindings]]"));
@@ -440,7 +721,12 @@ mod tests {
             },
         };
 
-        let rendered = render_wrangler(&section, &PathBuf::from("/tmp/app")).expect("render");
+        let rendered = render_wrangler(
+            &section,
+            &PathBuf::from("/tmp/app"),
+            &PathBuf::from("/tmp/app/dist/worker.js"),
+        )
+        .expect("render");
         assert!(rendered.contains("script_name = \"shared-do-worker\""));
         assert!(rendered.contains("new_sqlite_classes = [\"SqliteState\"]"));
         assert!(rendered.contains("deleted_classes = [\"LegacyState\"]"));
@@ -459,8 +745,130 @@ mod tests {
             ..CloudflareSection::default()
         };
 
-        let rendered = render_wrangler(&section, &PathBuf::from("/tmp/app")).expect("render");
+        let rendered = render_wrangler(
+            &section,
+            &PathBuf::from("/tmp/app"),
+            &PathBuf::from("/tmp/app/dist/worker.js"),
+        )
+        .expect("render");
         assert!(rendered.contains("[triggers]"));
         assert!(rendered.contains("crons = [\"*/10 * * * *\"]"));
+    }
+
+    #[test]
+    fn resolves_cloudflare_build_plan_from_cdylib_project() {
+        let project_dir = temp_project_dir("cloudflare-build-plan");
+        fs::write(
+            project_dir.join("Cargo.toml"),
+            r#"[package]
+name = "demo-worker"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+"#,
+        )
+        .expect("write Cargo.toml");
+        fs::create_dir_all(project_dir.join("src")).expect("create src");
+        fs::write(project_dir.join("src/lib.rs"), "pub fn demo() {}").expect("write lib.rs");
+
+        let manifest = LoadedManifest {
+            root_dir: project_dir.clone(),
+            data: crate::manifest::SkyzenManifest {
+                cloudflare: Some(CloudflareSection {
+                    main: Some("dist/worker.js".to_owned()),
+                    compatibility_date: Some("2025-02-01".to_owned()),
+                    ..CloudflareSection::default()
+                }),
+                ..crate::manifest::SkyzenManifest::default()
+            },
+        };
+
+        let build = resolve_build_plan(&manifest, manifest.data.cloudflare.as_ref().unwrap())
+            .expect("resolve build plan");
+        assert_eq!(build.entry_js_path, project_dir.join("dist/worker.js"));
+        assert_eq!(build.bindings_js_path, project_dir.join("dist/worker_bg.js"));
+        assert_eq!(build.wasm_output_path, project_dir.join("dist/worker_bg.wasm"));
+        assert_eq!(build.bindgen_out_name, "worker");
+        assert!(build.wasm_artifact_path.ends_with("wasm32-unknown-unknown/debug/demo_worker.wasm"));
+    }
+
+    #[test]
+    fn rejects_cloudflare_build_without_cdylib() {
+        let project_dir = temp_project_dir("cloudflare-build-invalid");
+        fs::write(
+            project_dir.join("Cargo.toml"),
+            r#"[package]
+name = "demo-worker"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .expect("write Cargo.toml");
+        fs::create_dir_all(project_dir.join("src")).expect("create src");
+        fs::write(project_dir.join("src/lib.rs"), "pub fn demo() {}").expect("write lib.rs");
+
+        let manifest = LoadedManifest {
+            root_dir: project_dir,
+            data: crate::manifest::SkyzenManifest {
+                cloudflare: Some(CloudflareSection {
+                    compatibility_date: Some("2025-02-01".to_owned()),
+                    ..CloudflareSection::default()
+                }),
+                ..crate::manifest::SkyzenManifest::default()
+            },
+        };
+
+        let error = resolve_build_plan(&manifest, manifest.data.cloudflare.as_ref().unwrap())
+            .expect_err("missing cdylib should fail");
+        assert!(error.to_string().contains("cdylib"));
+    }
+
+    #[test]
+    fn prepare_cloudflare_includes_build_step_and_wrangler_command() {
+        let project_dir = temp_project_dir("cloudflare-prepare");
+        fs::write(
+            project_dir.join("Cargo.toml"),
+            r#"[package]
+name = "demo-worker"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+"#,
+        )
+        .expect("write Cargo.toml");
+        fs::create_dir_all(project_dir.join("src")).expect("create src");
+        fs::write(project_dir.join("src/lib.rs"), "pub fn demo() {}").expect("write lib.rs");
+
+        let manifest = LoadedManifest {
+            root_dir: project_dir,
+            data: crate::manifest::SkyzenManifest {
+                cloudflare: Some(CloudflareSection {
+                    compatibility_date: Some("2025-02-01".to_owned()),
+                    ..CloudflareSection::default()
+                }),
+                ..crate::manifest::SkyzenManifest::default()
+            },
+        };
+
+        let plan = prepare(Action::Dev, &manifest).expect("prepare");
+        assert_eq!(plan.commands.len(), 1);
+        assert_eq!(plan.generated_files.len(), 1);
+        assert_eq!(plan.internal_steps.len(), 1);
+        assert!(plan.commands[0].display().contains("wrangler dev --local"));
+        assert!(plan.generated_files[0].contents.contains("main = \"../../dist/worker.js\""));
+    }
+
+    fn temp_project_dir(prefix: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("skyzen-{prefix}-{suffix}"));
+        fs::create_dir_all(&dir).expect("create temp project dir");
+        dir
     }
 }
