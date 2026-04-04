@@ -38,15 +38,16 @@ impl<T: Send + Sync + Serialize + 'static> Responder for Json<T> {
         Some(vec![crate::openapi::ResponseSchema {
             status: None,
             description: None,
-            schema: None,
+            schema: crate::openapi::maybe_schema_of::<T>(),
             content_type: Some("application/json"),
         }])
     }
 
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(
-        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
+        crate::openapi::maybe_register_schema_for::<T>(defs);
     }
 }
 
@@ -102,14 +103,15 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         Some(crate::openapi::ExtractorSchema {
             content_type: Some("application/json"),
-            schema: None,
+            schema: crate::openapi::maybe_schema_of::<T>(),
         })
     }
 
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(
-        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
+        crate::openapi::maybe_register_schema_for::<T>(defs);
     }
 }
 

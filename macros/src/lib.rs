@@ -94,6 +94,27 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     output.into()
 }
 
+/// Attribute macro that runs an async test with Skyzen's native test runtime and injected mocks.
+#[proc_macro_attribute]
+pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args =
+        parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
+    if !args.is_empty() {
+        return Error::new_spanned(
+            quote! { #args },
+            "#[skyzen::test] does not take arguments; remove them",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let function = parse_macro_input!(item as ItemFn);
+    match expand_test(function) {
+        Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
 /// Import datasource declarations from `Skyzen.toml` and generate strong-typed extractors.
 ///
 /// This macro has no runtime side effects. It only generates types, initialization methods,
@@ -259,24 +280,62 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     };
     let response_ty = raw_response_ty;
 
-    let parameter_types: Vec<_> = parameter_schemas
-        .iter()
-        .map(|meta| meta.ty.clone())
-        .collect();
-
-    let assertions: Vec<_> = parameter_types
-        .iter()
-        .map(|ty| quote! { let _ = ::skyzen::openapi::extractor_schema_of::<#ty>; })
-        .collect();
-
-    let response_assert =
-        quote! { let _ = ::skyzen::openapi::responder_schemas_of::<#response_ty>; };
-
+    let mut assertions = Vec::new();
     let mut parameter_schema_fns = Vec::new();
     let mut parameter_name_lists = Vec::new();
+    let mut schema_collector_idents = Vec::new();
+    let mut schema_collector_defs = Vec::new();
+
     for (included_idx, meta) in parameter_schemas.iter().enumerate() {
         let ty = &meta.ty;
-        parameter_schema_fns.push(quote! { ::skyzen::openapi::extractor_schema_of::<#ty> });
+        let schema_ident = format_ident!(
+            "__SKYZEN_OPENAPI_PARAM_SCHEMA_{}_{}",
+            fn_ident.to_string().to_uppercase(),
+            included_idx
+        );
+        let collector_ident = format_ident!(
+            "__SKYZEN_OPENAPI_SCHEMAS_{}_{}",
+            fn_ident.to_string().to_uppercase(),
+            included_idx
+        );
+
+        if let Some((payload_ty, content_type)) = documented_extractor_payload(ty)? {
+            let content_type_lit = LitStr::new(content_type, fn_ident.span());
+            assertions.push(quote! { let _ = ::skyzen::openapi::schema_of::<#payload_ty>; });
+            parameter_schema_fns.push(quote! { #schema_ident });
+            schema_collector_idents.push(collector_ident.clone());
+            schema_collector_defs.push(quote! {
+                fn #schema_ident() -> Option<::skyzen::openapi::ExtractorSchema> {
+                    let mut schema = ::skyzen::openapi::extractor_schema_of::<#ty>().unwrap_or(
+                        ::skyzen::openapi::ExtractorSchema {
+                            content_type: Some(#content_type_lit),
+                            schema: None,
+                        },
+                    );
+                    schema.schema = ::skyzen::openapi::schema_of::<#payload_ty>();
+                    Some(schema)
+                }
+
+                fn #collector_ident(
+                    schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
+                ) {
+                    ::skyzen::openapi::register_extractor_schemas_for::<#ty>(schemas);
+                    ::skyzen::openapi::register_schema_for::<#payload_ty>(schemas);
+                }
+            });
+        } else {
+            assertions.push(quote! { let _ = ::skyzen::openapi::extractor_schema_of::<#ty>; });
+            parameter_schema_fns.push(quote! { ::skyzen::openapi::extractor_schema_of::<#ty> });
+            schema_collector_idents.push(collector_ident.clone());
+            schema_collector_defs.push(quote! {
+                fn #collector_ident(
+                    schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
+                ) {
+                    ::skyzen::openapi::register_extractor_schemas_for::<#ty>(schemas);
+                }
+            });
+        }
+
         let name = meta.name.as_ref().map_or_else(
             || {
                 let lit = syn::LitStr::new(&format!("param{included_idx}"), fn_ident.span());
@@ -293,37 +352,68 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         quote! { &[#(#parameter_schema_fns),*] }
     };
 
-    let response_schema_fn =
-        quote! { Some(::skyzen::openapi::responder_schemas_of::<#response_ty>) };
-
-    let mut schema_collector_idents = Vec::new();
-    let mut schema_collector_defs = Vec::new();
-    for (idx, ty) in parameter_types.iter().enumerate() {
-        let ident = format_ident!(
-            "__SKYZEN_OPENAPI_SCHEMAS_{}_{}",
-            fn_ident.to_string().to_uppercase(),
-            idx
-        );
-        schema_collector_idents.push(ident.clone());
-        schema_collector_defs.push(quote! {
-            fn #ident(schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>) {
-                ::skyzen::openapi::register_extractor_schemas_for::<#ty>(schemas);
-            }
-        });
-    }
-
+    let response_schema_ident = format_ident!(
+        "__SKYZEN_OPENAPI_RESPONSE_SCHEMA_{}",
+        fn_ident.to_string().to_uppercase()
+    );
     let response_collector_ident = format_ident!(
         "__SKYZEN_OPENAPI_SCHEMAS_{}_RESP",
         fn_ident.to_string().to_uppercase()
     );
     schema_collector_idents.push(response_collector_ident.clone());
-    schema_collector_defs.push(quote! {
-        fn #response_collector_ident(
-            schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
-        ) {
-            ::skyzen::openapi::register_responder_schemas_for::<#response_ty>(schemas);
-        }
-    });
+
+    let response_schema_fn = if let Some((payload_ty, content_type)) =
+        documented_response_payload(&response_ty)?
+    {
+        let content_type_lit = LitStr::new(content_type, fn_ident.span());
+        assertions.push(quote! { let _ = ::skyzen::openapi::schema_of::<#payload_ty>; });
+        schema_collector_defs.push(quote! {
+            fn #response_schema_ident() -> Option<Vec<::skyzen::openapi::ResponseSchema>> {
+                let mut responses = ::skyzen::openapi::responder_schemas_of::<#response_ty>()
+                    .unwrap_or_default();
+                let mut documented = false;
+
+                for response in &mut responses {
+                    if response.status.is_none() {
+                        response.schema = ::skyzen::openapi::schema_of::<#payload_ty>();
+                        response.content_type = response.content_type.or(Some(#content_type_lit));
+                        documented = true;
+                    }
+                }
+
+                if !documented {
+                    responses.push(::skyzen::openapi::ResponseSchema {
+                        status: None,
+                        description: None,
+                        schema: ::skyzen::openapi::schema_of::<#payload_ty>(),
+                        content_type: Some(#content_type_lit),
+                    });
+                }
+
+                Some(responses)
+            }
+
+            fn #response_collector_ident(
+                schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
+            ) {
+                ::skyzen::openapi::register_responder_schemas_for::<#response_ty>(schemas);
+                ::skyzen::openapi::register_schema_for::<#payload_ty>(schemas);
+            }
+        });
+        quote! { Some(#response_schema_ident) }
+    } else {
+        let response_assert =
+            quote! { let _ = ::skyzen::openapi::responder_schemas_of::<#response_ty>; };
+        assertions.push(response_assert);
+        schema_collector_defs.push(quote! {
+            fn #response_collector_ident(
+                schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
+            ) {
+                ::skyzen::openapi::register_responder_schemas_for::<#response_ty>(schemas);
+            }
+        });
+        quote! { Some(::skyzen::openapi::responder_schemas_of::<#response_ty>) }
+    };
 
     let schema_collectors = if schema_collector_idents.is_empty() {
         quote! { &[] }
@@ -347,13 +437,17 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     Ok(quote! {
         #function
 
+        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
         const _: fn() = || {
             #(#assertions)*
-            #response_assert
         };
 
-        #(#schema_collector_defs)*
+        #(
+            #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+            #schema_collector_defs
+        )*
 
+        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
         #[::skyzen::openapi::linkme::distributed_slice(::skyzen::openapi::HANDLER_SPECS)]
         #[linkme(crate = ::skyzen::openapi::linkme)]
         static #spec_ident: ::skyzen::openapi::HandlerSpec = ::skyzen::openapi::HandlerSpec {
@@ -373,6 +467,338 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
 struct ParameterMeta {
     ty: Type,
     name: Option<syn::Ident>,
+}
+
+#[derive(Debug, Clone)]
+enum TestParamKind {
+    TestContext,
+    Kv,
+    Storage,
+    Queue,
+    Db,
+    NamedDatabase {
+        type_ident: proc_macro2::Ident,
+        database_index: usize,
+    },
+}
+
+fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
+    if function.sig.asyncness.is_none() {
+        return Err(Error::new_spanned(
+            &function.sig.fn_token,
+            "#[skyzen::test] requires an async function",
+        ));
+    }
+
+    if !function.sig.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &function.sig.generics,
+            "#[skyzen::test] does not support generic test functions",
+        ));
+    }
+
+    let outer_attrs = function.attrs.clone();
+    function.attrs.clear();
+
+    let original_ident = function.sig.ident.clone();
+    let inner_ident = format_ident!("__skyzen_test_body_{}", original_ident);
+    function.sig.ident = inner_ident.clone();
+
+    let inputs = std::mem::take(&mut function.sig.inputs);
+    let output = function.sig.output.clone();
+    let vis = function.vis.clone();
+
+    let manifest = load_manifest_value()?;
+    let databases = manifest
+        .as_ref()
+        .map(load_databases_from_value)
+        .transpose()?
+        .unwrap_or_default();
+    let database_types = databases
+        .iter()
+        .enumerate()
+        .map(|(index, database)| database_ident_from_name(&database.name).map(|ident| (index, ident)))
+        .collect::<syn::Result<Vec<_>>>()?;
+
+    let mut requires_test_context = false;
+    let mut requires_kv = false;
+    let mut requires_storage = false;
+    let mut requires_queue = false;
+    let mut requires_default_db = false;
+    let mut required_named_db_indices = Vec::new();
+    let mut binding_statements = Vec::new();
+
+    for input in inputs {
+        let FnArg::Typed(pat_type) = input else {
+            return Err(Error::new_spanned(
+                input,
+                "#[skyzen::test] does not support methods; use a free function",
+            ));
+        };
+
+        let pat = pat_type.pat;
+        let ty = pat_type.ty;
+        let kind = classify_test_param(ty.as_ref(), &database_types)?;
+
+        match kind {
+            TestParamKind::TestContext => {
+                requires_test_context = true;
+                binding_statements.push(quote! {
+                    let #pat: #ty = __skyzen_test_context.clone();
+                });
+            }
+            TestParamKind::Kv => {
+                requires_kv = true;
+                binding_statements.push(quote! {
+                    let #pat: #ty = __skyzen_test_kv.clone();
+                });
+            }
+            TestParamKind::Storage => {
+                requires_storage = true;
+                binding_statements.push(quote! {
+                    let #pat: #ty = __skyzen_test_storage.clone();
+                });
+            }
+            TestParamKind::Queue => {
+                requires_queue = true;
+                binding_statements.push(quote! {
+                    let #pat: #ty = __skyzen_test_queue.clone();
+                });
+            }
+            TestParamKind::Db => {
+                requires_default_db = true;
+                binding_statements.push(quote! {
+                    let #pat: #ty = __skyzen_test_default_db.clone();
+                });
+            }
+            TestParamKind::NamedDatabase {
+                type_ident,
+                database_index,
+            } => {
+                if !required_named_db_indices.contains(&database_index) {
+                    required_named_db_indices.push(database_index);
+                }
+                let db_ident = format_ident!("__skyzen_test_named_db_{database_index}");
+                binding_statements.push(quote! {
+                    let #pat: #ty = #type_ident::new(#db_ident.clone());
+                });
+            }
+        }
+    }
+
+    if requires_test_context {
+        requires_kv = true;
+        requires_storage = true;
+        requires_queue = true;
+    }
+
+    let mut setup_statements = Vec::new();
+
+    if requires_kv {
+        setup_statements.push(quote! {
+            let __skyzen_test_kv =
+                ::skyzen_services::Kv::new(::skyzen_test::mock::InMemoryKv::new());
+        });
+    }
+
+    if requires_storage {
+        setup_statements.push(quote! {
+            let __skyzen_test_storage =
+                ::skyzen_services::Storage::new(::skyzen_test::mock::InMemoryStorage::new());
+        });
+    }
+
+    if requires_queue {
+        setup_statements.push(quote! {
+            let __skyzen_test_queue =
+                ::skyzen_services::Queue::new(::skyzen_test::mock::InMemoryQueue::new());
+        });
+    }
+
+    let requires_any_db = requires_default_db || !required_named_db_indices.is_empty();
+    if requires_any_db {
+        let default_database = default_database_index(&databases)?;
+        let mut prepared_indices = required_named_db_indices.clone();
+        if let Some(default_index) = default_database {
+            if requires_default_db && !prepared_indices.contains(&default_index) {
+                prepared_indices.push(default_index);
+            }
+        } else if requires_default_db {
+            prepared_indices.push(usize::MAX);
+        }
+
+        prepared_indices.sort_unstable();
+        let synthesized_default_db = prepared_indices.contains(&usize::MAX);
+
+        for index in prepared_indices {
+            if index == usize::MAX {
+                setup_statements.push(quote! {
+                    let __skyzen_test_default_db = ::skyzen_test::mock::InMemoryDb::new()
+                        .await
+                        .unwrap_or_else(|error| panic!("failed to initialize in-memory test database: {error}"))
+                        .into_db();
+                });
+                continue;
+            }
+
+            let db_ident = format_ident!("__skyzen_test_named_db_{index}");
+            let database_name = &databases[index].name;
+            let init_message = LitStr::new(
+                &format!("failed to initialize in-memory test database `{database_name}`"),
+                proc_macro2::Span::call_site(),
+            );
+            setup_statements.push(quote! {
+                let #db_ident = ::skyzen_test::mock::InMemoryDb::new()
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #init_message))
+                    .into_db();
+            });
+
+            if default_database == Some(index) && requires_default_db {
+                setup_statements.push(quote! {
+                    let __skyzen_test_default_db = #db_ident.clone();
+                });
+            }
+        }
+
+        if requires_default_db && default_database.is_none() && !synthesized_default_db {
+            setup_statements.push(quote! {
+                let __skyzen_test_default_db = ::skyzen_test::mock::InMemoryDb::new()
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to initialize in-memory test database: {error}"))
+                    .into_db();
+            });
+        }
+    }
+
+    if requires_test_context {
+        let mut context_steps = Vec::new();
+        context_steps.push(quote! {
+            let mut __skyzen_test_context = ::skyzen_test::TestContext::new();
+        });
+        if requires_kv {
+            context_steps.push(quote! {
+                __skyzen_test_context = __skyzen_test_context.with_kv(__skyzen_test_kv.clone());
+            });
+        }
+        if requires_storage {
+            context_steps.push(quote! {
+                __skyzen_test_context =
+                    __skyzen_test_context.with_storage(__skyzen_test_storage.clone());
+            });
+        }
+        if requires_queue {
+            context_steps.push(quote! {
+                __skyzen_test_context =
+                    __skyzen_test_context.with_queue(__skyzen_test_queue.clone());
+            });
+        }
+        if requires_default_db {
+            context_steps.push(quote! {
+                __skyzen_test_context = __skyzen_test_context.with_db(__skyzen_test_default_db.clone());
+            });
+        }
+        setup_statements.extend(context_steps);
+    }
+
+    let mut inner_statements = setup_statements;
+    inner_statements.extend(binding_statements);
+    let original_body = function.block.stmts.clone();
+    function.block.stmts = inner_statements
+        .into_iter()
+        .map(syn::parse2)
+        .collect::<syn::Result<Vec<_>>>()?;
+    function.block.stmts.extend(original_body);
+
+    Ok(quote! {
+        #function
+
+        #(#outer_attrs)*
+        #[test]
+        #vis fn #original_ident() #output {
+            ::skyzen::runtime::testing::block_on(async move { #inner_ident().await })
+        }
+    }
+    .into())
+}
+
+fn classify_test_param(
+    ty: &Type,
+    database_types: &[(usize, proc_macro2::Ident)],
+) -> syn::Result<TestParamKind> {
+    let Some(ident) = last_type_ident_token(ty) else {
+        return Err(Error::new_spanned(
+            ty,
+            "unsupported #[skyzen::test] parameter type",
+        ));
+    };
+
+    let ident_name = ident.to_string();
+    match ident_name.as_str() {
+        "TestContext" => Ok(TestParamKind::TestContext),
+        "Kv" => Ok(TestParamKind::Kv),
+        "Storage" => Ok(TestParamKind::Storage),
+        "Queue" => Ok(TestParamKind::Queue),
+        "Db" => Ok(TestParamKind::Db),
+        _ => database_types
+            .iter()
+            .find(|(_, type_ident)| *type_ident == ident)
+            .map_or_else(
+                || {
+                    Err(Error::new_spanned(
+                        ty,
+                        "unsupported #[skyzen::test] parameter type; supported types are `TestContext`, `Kv`, `Storage`, `Queue`, `Db`, and generated database wrappers",
+                    ))
+                },
+                |(database_index, type_ident)| {
+                    Ok(TestParamKind::NamedDatabase {
+                        type_ident: type_ident.clone(),
+                        database_index: *database_index,
+                    })
+                },
+            ),
+    }
+}
+
+fn last_type_ident_token(ty: &Type) -> Option<proc_macro2::Ident> {
+    match ty {
+        Type::Path(type_path) => type_path.path.segments.last().map(|segment| segment.ident.clone()),
+        Type::Group(group) => last_type_ident_token(&group.elem),
+        Type::Paren(paren) => last_type_ident_token(&paren.elem),
+        _ => None,
+    }
+}
+
+fn documented_extractor_payload(ty: &Type) -> syn::Result<Option<(Type, &'static str)>> {
+    let Some(ident) = last_type_ident_token(ty) else {
+        return Ok(None);
+    };
+
+    match ident.to_string().as_str() {
+        "Json" => Ok(Some((single_generic_type(ty)?, "application/json"))),
+        "Form" | "Query" => Ok(Some((
+            single_generic_type(ty)?,
+            "application/x-www-form-urlencoded",
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn documented_response_payload(ty: &Type) -> syn::Result<Option<(Type, &'static str)>> {
+    let Some(ident) = last_type_ident_token(ty) else {
+        return Ok(None);
+    };
+
+    match ident.to_string().as_str() {
+        "Json" | "PrettyJson" => Ok(Some((single_generic_type(ty)?, "application/json"))),
+        "Form" => Ok(Some((
+            single_generic_type(ty)?,
+            "application/x-www-form-urlencoded",
+        ))),
+        "Result" => first_generic_type(ty)
+            .map_or_else(|| Ok(None), |inner| documented_response_payload(&inner)),
+        _ => Ok(None),
+    }
 }
 
 fn parse_parameter_schema(pat_type: &mut PatType) -> syn::Result<ParameterMeta> {
@@ -2170,6 +2596,21 @@ fn single_generic_type(ty: &Type) -> syn::Result<Type> {
             "expected a single generic type argument",
         )),
     }
+}
+
+fn first_generic_type(ty: &Type) -> Option<Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+
+    args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(inner) => Some(inner.clone()),
+        _ => None,
+    })
 }
 
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]

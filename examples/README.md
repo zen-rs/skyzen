@@ -10,7 +10,7 @@ Features:
 - Uses the `Query` extractor and `Params` to parse query strings and path parameters.
 - Returns strongly typed JSON via the `Json<T>` responder.
 
-Run locally (defaults to `127.0.0.1:8787`, override with CLI flags such as `--port 3000`):
+Run locally. Skyzen binds an available localhost port by default and logs it, or you can pin one with CLI flags such as `--port 3000`:
 
 ```sh
 cargo run --example native -- --port 3000
@@ -53,7 +53,7 @@ Features:
 
 - Demonstrates `#[skyzen::openapi]` for handlers along with typed `Json<T>` extractors/responders.
 - Shows how to build a `Router`, call `.openapi()`, and inspect the collected operations.
-- Prints schemas and doc comments when compiled in debug mode (release builds disable OpenAPI instrumentation and log an explicit message).
+- Prints schemas and doc comments from the generated `OpenAPI` description.
 
 Run it locally:
 

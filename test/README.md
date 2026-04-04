@@ -23,7 +23,7 @@ This crate provides platform-agnostic, in-memory implementations of the `skyzen-
 
 ### TestContext & TestClient
 
-The `TestContext` is automatically injected into functions annotated with `#[skyzen::test]`. It allows you to create a `TestClient` for any `Endpoint`.
+The `TestContext` is automatically injected into functions annotated with `#[skyzen::test]`. The macro also provides in-memory `Kv`, `Storage`, `Queue`, and `Db` values when those parameter types appear, and `TestContext` forwards those services into every `TestClient` request it creates.
 
 The `TestClient` executes requests directly against your application's router, bypassing the network stack for maximum performance and easier debugging.
 
@@ -86,9 +86,10 @@ let user: User = from_json_str(include_str!("../fixtures/user.json")).unwrap();
 A complete example demonstrating a handler that uses a KV store, being tested with a mock.
 
 ```rust
-use skyzen_core::extract::Json;
+use skyzen::routing::{CreateRouteNode, Route, Router};
+use skyzen::utils::Json;
 use skyzen_services::Kv;
-use skyzen_test::{TestContext, mock::InMemoryKv};
+use skyzen_test::TestContext;
 use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize)]
@@ -105,14 +106,21 @@ async fn create_user(kv: Kv, Json(user): Json<User>) -> impl Responder {
     StatusCode::CREATED
 }
 
+fn app() -> Router {
+    Route::new((
+        "/users".post(create_user),
+    ))
+    .build()
+}
+
 #[skyzen::test]
 async fn test_create_user(kv: Kv, ctx: TestContext) {
     // 1. Arrange
-    let client = ctx.client(create_user);
+    let client = ctx.client(app());
     let new_user = User { id: "123".into(), name: "Alice".into() };
 
     // 2. Act
-    let resp = client.post("/").json(&new_user).send().await;
+    let resp = client.post("/users").json(&new_user).send().await;
 
     // 3. Assert
     resp.assert_status(201);

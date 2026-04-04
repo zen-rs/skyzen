@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::{
     fmt::{self, Debug},
+    marker::PhantomData,
     sync::Arc,
 };
 
@@ -82,7 +83,7 @@ pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
 
 // Re-exported for macro-generated registrations without requiring downstream crates to depend on
 // `linkme` directly.
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 pub use linkme;
 
 mod builtins;
@@ -180,13 +181,13 @@ where
     }
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
 #[linkme::distributed_slice]
 #[linkme(crate = ::skyzen::openapi::linkme)]
 pub static HANDLER_SPECS: [HandlerSpec] = [..];
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 #[derive(Debug, Clone, Copy)]
 /// Metadata captured for every handler annotated with `#[skyzen::openapi]`.
 pub struct HandlerSpec {
@@ -208,14 +209,14 @@ pub struct HandlerSpec {
     pub schemas: &'static [SchemaCollector],
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 fn find_handler_spec(type_name: &str) -> Option<&'static HandlerSpec> {
     HANDLER_SPECS
         .iter()
         .find(|spec| spec.type_name == type_name)
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(feature = "openapi")]
 fn register_type<T>(defs: &mut BTreeMap<String, SchemaRef>)
 where
     T: crate::PartialSchema + crate::ToSchema,
@@ -230,25 +231,68 @@ where
     }
 }
 
+struct SchemaProbe<T>(PhantomData<T>);
+
+trait MaybeSchemaProbe {
+    fn maybe_schema(self) -> Option<SchemaRef>;
+    fn maybe_register(self, defs: &mut BTreeMap<String, SchemaRef>);
+}
+
+impl<T> MaybeSchemaProbe for &SchemaProbe<T> {
+    fn maybe_schema(self) -> Option<SchemaRef> {
+        None
+    }
+
+    fn maybe_register(self, _defs: &mut BTreeMap<String, SchemaRef>) {}
+}
+
+impl<T> MaybeSchemaProbe for &&SchemaProbe<T>
+where
+    T: crate::PartialSchema + crate::ToSchema,
+{
+    fn maybe_schema(self) -> Option<SchemaRef> {
+        Some(<T as crate::PartialSchema>::schema())
+    }
+
+    fn maybe_register(self, defs: &mut BTreeMap<String, SchemaRef>) {
+        register_type::<T>(defs);
+    }
+}
+
+/// Return the schema for `T` when it implements `ToSchema`; otherwise return `None`.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn maybe_schema_of<T>() -> Option<SchemaRef> {
+    let probe = SchemaProbe::<T>(PhantomData);
+    (&&probe).maybe_schema()
+}
+
+/// Register the schema for `T` when it implements `ToSchema`; otherwise do nothing.
+#[cfg(feature = "openapi")]
+pub fn maybe_register_schema_for<T>(defs: &mut BTreeMap<String, SchemaRef>) {
+    let probe = SchemaProbe::<T>(PhantomData);
+    (&&probe).maybe_register(defs);
+}
+
 /// Register a schema and its dependencies when `OpenAPI` is enabled.
 #[allow(clippy::missing_const_for_fn)]
 pub fn register_schema_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
 where
     T: crate::PartialSchema + crate::ToSchema,
 {
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(feature = "openapi")]
     register_type::<T>(defs);
     let _ = defs;
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(feature = "openapi")]
 /// Registers types and their dependencies into the `OpenAPI` components map.
 pub trait RegisterSchemas {
     /// Insert the type's schema and dependent schemas into the provided map.
     fn register(defs: &mut BTreeMap<String, SchemaRef>);
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(feature = "openapi")]
 impl<T> RegisterSchemas for T
 where
     T: crate::PartialSchema + crate::ToSchema,
@@ -258,7 +302,7 @@ where
     }
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, SchemaRef>) {
     for collector in collectors {
         collector(defs);
@@ -268,44 +312,43 @@ fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, S
 /// Handler metadata attached to each endpoint.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteHandlerDoc {
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     type_name: &'static str,
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     spec: Option<&'static HandlerSpec>,
 }
 
 impl RouteHandlerDoc {
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     const fn new(type_name: &'static str, spec: Option<&'static HandlerSpec>) -> Self {
         Self { type_name, spec }
     }
 
-    #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
+    #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
     const fn new() -> Self {
         Self {}
     }
 }
 
-/// Describe the provided handler type, registering metadata during debug builds and doing nothing
-/// in release builds.
+/// Describe the provided handler type, registering metadata when `OpenAPI` support is enabled.
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
 pub fn describe_handler<H: 'static>() -> RouteHandlerDoc {
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     {
         let type_name = std::any::type_name::<H>();
         let spec = find_handler_spec(type_name);
         RouteHandlerDoc::new(type_name, spec)
     }
 
-    #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
+    #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
     {
         let _ = ::core::marker::PhantomData::<H>;
         RouteHandlerDoc::new()
     }
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 #[derive(Debug, Clone)]
 /// Route metadata stored when `OpenAPI` instrumentation is enabled.
 pub struct RouteOpenApiEntry {
@@ -317,7 +360,7 @@ pub struct RouteOpenApiEntry {
     pub handler: RouteHandlerDoc,
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 impl RouteOpenApiEntry {
     #[must_use]
     /// Construct a new entry describing a route + handler pair.
@@ -333,9 +376,9 @@ impl RouteOpenApiEntry {
 /// Minimal `OpenAPI` representation for Skyzen routers.
 #[derive(Clone, Default)]
 pub struct OpenApi {
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     operations: Vec<OpenApiOperation>,
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     schemas: Vec<(String, SchemaRef)>,
 }
 
@@ -350,7 +393,7 @@ impl Debug for OpenApi {
 
 impl OpenApi {
     /// Build an [`OpenApi`] instance from the collected route metadata.
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     #[must_use]
     pub(crate) fn from_entries(entries: &[RouteOpenApiEntry]) -> Self {
         let mut schema_defs = BTreeMap::new();
@@ -409,23 +452,23 @@ impl OpenApi {
     }
 
     /// Build an empty `OpenAPI` definition when `OpenAPI` support is disabled.
-    #[cfg(not(all(debug_assertions, feature = "openapi")))]
+    #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
     #[must_use]
     #[allow(dead_code)]
     pub(crate) const fn from_entries(_: &[()]) -> Self {
         Self {}
     }
 
-    /// Inspect the registered operations. In release builds this returns an empty slice.
+    /// Inspect the registered operations.
     #[must_use]
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     pub fn operations(&self) -> &[OpenApiOperation] {
         &self.operations
     }
 
-    /// Inspect the registered operations. In release builds this returns an empty slice.
+    /// Inspect the registered operations.
     #[must_use]
-    #[cfg(not(all(debug_assertions, feature = "openapi")))]
+    #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
     pub const fn operations(&self) -> &[OpenApiOperation] {
         &[]
     }
@@ -433,7 +476,7 @@ impl OpenApi {
     /// Indicates whether `OpenAPI` instrumentation is active.
     #[must_use]
     pub const fn is_enabled(&self) -> bool {
-        cfg!(all(debug_assertions, feature = "openapi"))
+        cfg!(all(feature = "openapi", not(target_arch = "wasm32")))
     }
 
     #[must_use]
@@ -485,7 +528,7 @@ impl OpenApi {
             .build()
     }
 
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     fn build_components(&self) -> utoipa::openapi::schema::Components {
         self.schemas
             .iter()
@@ -496,7 +539,7 @@ impl OpenApi {
             .build()
     }
 
-    #[cfg(not(all(debug_assertions, feature = "openapi")))]
+    #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
     #[allow(clippy::unused_self)]
     fn build_components(&self) -> utoipa::openapi::schema::Components {
         ComponentsBuilder::new().build()
@@ -568,7 +611,7 @@ impl OpenApiRedocEndpoint {
 
 http_error!(
     /// Error returned when OpenAPI support is disabled.
-    pub OpenApiRedocDisabledError, StatusCode::NOT_IMPLEMENTED, "OpenAPI instrumentation disabled at compile time");
+    pub OpenApiRedocDisabledError, StatusCode::NOT_IMPLEMENTED, "OpenAPI support is disabled for this build");
 
 impl Endpoint for OpenApiRedocEndpoint {
     type Error = OpenApiRedocDisabledError;

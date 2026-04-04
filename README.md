@@ -41,7 +41,7 @@ fn main() -> Router {
 }
 ```
 
-Run with `cargo run` and visit `http://127.0.0.1:8787`.
+Run with `cargo run` and open the address printed in the startup log, or pin a port explicitly with `cargo run -- --port 8787`.
 
 ## Extractors & Responders
 

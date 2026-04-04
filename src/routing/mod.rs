@@ -108,7 +108,7 @@
 use std::future::Future;
 use std::{fmt, sync::Arc};
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "ws")]
 use crate::websocket::{WebSocket, WebSocketUpgrade};
@@ -242,14 +242,14 @@ impl Route {
     /// Generate an [`OpenApi`] document describing this route tree.
     #[must_use]
     pub fn openapi(&self) -> OpenApi {
-        #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
         {
             let mut entries = Vec::new();
             collect_openapi_entries("", &self.nodes, &mut entries);
             OpenApi::from_entries(&entries)
         }
 
-        #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
+        #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
         {
             OpenApi::default()
         }
@@ -586,7 +586,7 @@ where
     RouteNode::new_endpoint(path.into(), method, endpoint, Some(handler_doc))
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 fn collect_openapi_entries(
     path_prefix: &str,
     nodes: &[RouteNode],

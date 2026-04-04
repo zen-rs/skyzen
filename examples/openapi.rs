@@ -96,7 +96,7 @@ fn schema_to_string<T: Serialize>(schema: &T) -> String {
 
 fn log_openapi(spec: &OpenApi) {
     if !spec.is_enabled() {
-        println!("OpenAPI instrumentation disabled (release build).");
+        println!("OpenAPI support is disabled for this build.");
         return;
     }
 
@@ -142,12 +142,9 @@ fn log_openapi(spec: &OpenApi) {
         }
     }
 
-    #[cfg(debug_assertions)]
-    {
-        let json = serde_json::to_string_pretty(&spec.to_utoipa_spec())
-            .unwrap_or_else(|err| format!("<failed to serialize spec: {err}>"));
-        println!("\nFull OpenAPI document:\n{json}");
-    }
+    let json = serde_json::to_string_pretty(&spec.to_utoipa_spec())
+        .unwrap_or_else(|err| format!("<failed to serialize spec: {err}>"));
+    println!("\nFull OpenAPI document:\n{json}");
 }
 
 #[skyzen::main]

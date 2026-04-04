@@ -78,7 +78,11 @@ async fn get_user(params: Params) -> Result<Json<User>> {
 }
 ```
 
-Extracts request/response schemas from the function signature and registers the operation at compile time via `linkme` distributed slices. Active only in debug builds.
+Extracts request/response schemas from the function signature and registers the operation at compile time via `linkme` distributed slices on native builds with the `openapi` feature enabled.
+
+### `#[skyzen::test]`
+
+Runs an async test on Skyzen's native test runtime and injects test helpers such as `TestContext`, `Kv`, `Storage`, `Queue`, and `Db` using in-memory implementations.
 
 ### `#[skyzen::error]`
 

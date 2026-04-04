@@ -54,14 +54,15 @@ impl<T: Send + Sync + Serialize + 'static> Responder for PrettyJson<T> {
         Some(vec![crate::openapi::ResponseSchema {
             status: None,
             description: None,
-            schema: None,
+            schema: crate::openapi::maybe_schema_of::<T>(),
             content_type: Some("application/json"),
         }])
     }
 
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(
-        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
+        crate::openapi::maybe_register_schema_for::<T>(defs);
     }
 }

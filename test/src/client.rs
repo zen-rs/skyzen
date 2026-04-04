@@ -5,6 +5,7 @@ use http_kit::{
     Body, Endpoint, HttpError, Method, Request, Response,
 };
 use serde::Serialize;
+use skyzen_services::{Db, Kv, Queue, Storage};
 
 use crate::assertions::TestResponse;
 
@@ -14,42 +15,98 @@ use crate::assertions::TestResponse;
 #[derive(Debug)]
 pub struct TestClient<E> {
     endpoint: E,
+    kv: Option<Kv>,
+    storage: Option<Storage>,
+    queue: Option<Queue>,
+    db: Option<Db>,
 }
 
 impl<E: Endpoint + Clone> TestClient<E> {
     /// Create a new test client wrapping the given endpoint.
-    pub(crate) const fn new(endpoint: E) -> Self {
-        Self { endpoint }
+    pub(crate) const fn new(
+        endpoint: E,
+        kv: Option<Kv>,
+        storage: Option<Storage>,
+        queue: Option<Queue>,
+        db: Option<Db>,
+    ) -> Self {
+        Self {
+            endpoint,
+            kv,
+            storage,
+            queue,
+            db,
+        }
     }
 
     /// Start building a GET request.
     #[must_use]
     pub fn get(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(self.endpoint.clone(), Method::GET, path)
+        RequestBuilder::new(
+            self.endpoint.clone(),
+            Method::GET,
+            path,
+            self.kv.clone(),
+            self.storage.clone(),
+            self.queue.clone(),
+            self.db.clone(),
+        )
     }
 
     /// Start building a POST request.
     #[must_use]
     pub fn post(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(self.endpoint.clone(), Method::POST, path)
+        RequestBuilder::new(
+            self.endpoint.clone(),
+            Method::POST,
+            path,
+            self.kv.clone(),
+            self.storage.clone(),
+            self.queue.clone(),
+            self.db.clone(),
+        )
     }
 
     /// Start building a PUT request.
     #[must_use]
     pub fn put(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(self.endpoint.clone(), Method::PUT, path)
+        RequestBuilder::new(
+            self.endpoint.clone(),
+            Method::PUT,
+            path,
+            self.kv.clone(),
+            self.storage.clone(),
+            self.queue.clone(),
+            self.db.clone(),
+        )
     }
 
     /// Start building a PATCH request.
     #[must_use]
     pub fn patch(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(self.endpoint.clone(), Method::PATCH, path)
+        RequestBuilder::new(
+            self.endpoint.clone(),
+            Method::PATCH,
+            path,
+            self.kv.clone(),
+            self.storage.clone(),
+            self.queue.clone(),
+            self.db.clone(),
+        )
     }
 
     /// Start building a DELETE request.
     #[must_use]
     pub fn delete(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(self.endpoint.clone(), Method::DELETE, path)
+        RequestBuilder::new(
+            self.endpoint.clone(),
+            Method::DELETE,
+            path,
+            self.kv.clone(),
+            self.storage.clone(),
+            self.queue.clone(),
+            self.db.clone(),
+        )
     }
 }
 
@@ -61,16 +118,32 @@ pub struct RequestBuilder<E> {
     uri: String,
     headers: Vec<(String, String)>,
     body: Body,
+    kv: Option<Kv>,
+    storage: Option<Storage>,
+    queue: Option<Queue>,
+    db: Option<Db>,
 }
 
 impl<E: Endpoint> RequestBuilder<E> {
-    fn new(endpoint: E, method: Method, path: &str) -> Self {
+    fn new(
+        endpoint: E,
+        method: Method,
+        path: &str,
+        kv: Option<Kv>,
+        storage: Option<Storage>,
+        queue: Option<Queue>,
+        db: Option<Db>,
+    ) -> Self {
         Self {
             endpoint,
             method,
             uri: path.to_owned(),
             headers: Vec::new(),
             body: Body::empty(),
+            kv,
+            storage,
+            queue,
+            db,
         }
     }
 
@@ -124,6 +197,19 @@ impl<E: Endpoint> RequestBuilder<E> {
                     .expect("invalid header name in test request"),
                 HeaderValue::from_str(value).expect("invalid header value in test request"),
             );
+        }
+
+        if let Some(kv) = &self.kv {
+            request.extensions_mut().insert(kv.clone());
+        }
+        if let Some(storage) = &self.storage {
+            request.extensions_mut().insert(storage.clone());
+        }
+        if let Some(queue) = &self.queue {
+            request.extensions_mut().insert(queue.clone());
+        }
+        if let Some(db) = &self.db {
+            request.extensions_mut().insert(db.clone());
         }
 
         let mut endpoint = self.endpoint;

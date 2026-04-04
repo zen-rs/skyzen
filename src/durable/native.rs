@@ -13,7 +13,6 @@ use std::{
 };
 
 use futures_util::lock::Mutex;
-use serde::Serialize;
 use skyzen_services::{
     durable::{
         kv::{DurableKvStore, DurableListOptions},
@@ -169,7 +168,10 @@ where
     }
 
     /// Get a stub for a Durable Object by deterministic name.
-    pub fn get_by_name(&self, name: &str) -> Result<NativeDurableObjectStub<T>, DurableObjectError> {
+    pub fn get_by_name(
+        &self,
+        name: &str,
+    ) -> Result<NativeDurableObjectStub<T>, DurableObjectError> {
         Ok(NativeDurableObjectStub {
             namespace: self.clone(),
             id: self.id_from_name(name)?,
@@ -243,7 +245,8 @@ where
             )
         })?;
 
-        let mut request = alarm_request().map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
+        let mut request =
+            alarm_request().map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
         inject_durable_extensions(&mut request, &slot, id.clone());
 
         alarm_endpoint
@@ -291,9 +294,9 @@ where
     pub async fn fetch_url(&self, url: &str) -> Result<Response, DurableObjectError> {
         let mut request = Request::new(Body::empty());
         *request.method_mut() = Method::GET;
-        *request.uri_mut() = url
-            .parse()
-            .map_err(|error| DurableObjectError::Runtime(format!("invalid durable URL: {error}")))?;
+        *request.uri_mut() = url.parse().map_err(|error| {
+            DurableObjectError::Runtime(format!("invalid durable URL: {error}"))
+        })?;
         self.fetch(request).await
     }
 
@@ -310,10 +313,12 @@ fn inject_durable_extensions(request: &mut Request, slot: &NativeDurableSlot, id
     request
         .extensions_mut()
         .insert(DurableDb::new(slot.db.clone()));
-    request.extensions_mut().insert(Alarm::new(slot.alarm.clone()));
-    request.extensions_mut().insert(DurableConnections::new(Box::new(
-        slot.connections.clone(),
-    )));
+    request
+        .extensions_mut()
+        .insert(Alarm::new(slot.alarm.clone()));
+    request
+        .extensions_mut()
+        .insert(DurableConnections::new(Box::new(slot.connections.clone())));
     request.extensions_mut().insert(id);
 }
 
@@ -425,7 +430,10 @@ impl DurableKvStore for NativeDurableKvStore {
         let data = self.data.read().map_err(kv_lock_err)?;
         Ok(keys
             .iter()
-            .filter_map(|key| data.get(*key).map(|value| ((*key).to_owned(), value.clone())))
+            .filter_map(|key| {
+                data.get(*key)
+                    .map(|value| ((*key).to_owned(), value.clone()))
+            })
             .collect())
     }
 
@@ -446,12 +454,20 @@ impl DurableKvStore for NativeDurableKvStore {
     }
 
     async fn delete(&self, key: &str) -> Result<bool, DurableKvError> {
-        Ok(self.data.write().map_err(kv_lock_err)?.remove(key).is_some())
+        Ok(self
+            .data
+            .write()
+            .map_err(kv_lock_err)?
+            .remove(key)
+            .is_some())
     }
 
     async fn delete_multiple(&self, keys: &[&str]) -> Result<usize, DurableKvError> {
         let mut guard = self.data.write().map_err(kv_lock_err)?;
-        Ok(keys.iter().filter(|key| guard.remove(**key).is_some()).count())
+        Ok(keys
+            .iter()
+            .filter(|key| guard.remove(**key).is_some())
+            .count())
     }
 
     async fn delete_all(&self) -> Result<(), DurableKvError> {
@@ -565,9 +581,9 @@ impl DurableDbBackend for NativeDurableDbStore {
             .map_err(durable_db_error)?
             .page_size;
 
-        let bytes = page_count.checked_mul(page_size).ok_or_else(|| {
-            DurableDbError::Backend("native durable DB size overflow".to_owned())
-        })?;
+        let bytes = page_count
+            .checked_mul(page_size)
+            .ok_or_else(|| DurableDbError::Backend("native durable DB size overflow".to_owned()))?;
         u64::try_from(bytes)
             .map_err(|_| DurableDbError::Backend("native durable DB size was negative".to_owned()))
     }
@@ -584,7 +600,7 @@ mod tests {
         routing::{CreateRouteNode, Route},
         Error, Result,
     };
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use skyzen_services::durable::DurableDb;
 
     #[derive(Default, Serialize, Deserialize)]

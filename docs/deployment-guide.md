@@ -31,6 +31,8 @@ The binary is at `target/release/<your-app>`. It includes:
 ./target/release/my-app --port 8080
 ```
 
+Without `--port` or `SKYZEN_ADDRESS`, Skyzen binds an available localhost port and logs the final address.
+
 ### Docker
 
 ```dockerfile
@@ -40,6 +42,7 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
+ENV SKYZEN_ADDRESS=0.0.0.0:8787
 COPY --from=builder /app/target/release/my-app /usr/local/bin/
 EXPOSE 8787
 CMD ["my-app"]
