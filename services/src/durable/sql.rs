@@ -185,7 +185,9 @@ impl<'a> DurableDbQuery<'a> {
     where
         T: DeserializeOwned,
     {
-        self.fetch_optional().await?.ok_or(DurableDbError::RowNotFound)
+        self.fetch_optional()
+            .await?
+            .ok_or(DurableDbError::RowNotFound)
     }
 }
 

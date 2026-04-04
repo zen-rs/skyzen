@@ -54,6 +54,7 @@ skyzen-services = { workspace = true, features = ["runtime-async-std-native-tls"
 http-kit.workspace = true
 matchit = "0.9.1"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 cookie = { version = "0.18.1", features = ["percent-encode"] }
 tracing.workspace = true
 smallvec = "1.15"
@@ -109,10 +110,6 @@ js-sys = "0.3.87"
 web-sys = { version = "0.3.87", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
 futures-channel = { version = "0.3.32", optional = true }
 
-[dependencies.serde_json]
-version = "1.0"
-optional = true
-
 [dependencies.serde_urlencoded]
 version = "0.7.1"
 optional = true
@@ -135,7 +132,7 @@ default = ["json", "form", "multipart", "sse", "rt", "openapi", "ws", "static-fi
 openapi = ["skyzen-core/openapi"]
 auth = []
 jwt = ["auth", "dep:jsonwebtoken"]
-json = ["dep:serde_json", "http-kit/json"]
+json = ["http-kit/json"]
 form = ["dep:serde_urlencoded", "http-kit/form"]
 multipart = ["dep:multer", "dep:pin-project-lite"]
 sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]

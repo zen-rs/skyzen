@@ -1,7 +1,10 @@
 //! Cloudflare Durable Object `SQLite` adapter for [`DurableDbBackend`].
 
 use serde_json::Value;
-use skyzen_services::{durable::sql::{DurableDbBackend, DurableDbError}, DbExecResult, DbValue};
+use skyzen_services::{
+    durable::sql::{DurableDbBackend, DurableDbError},
+    DbExecResult, DbValue,
+};
 use wasm_bindgen::{JsCast, JsValue};
 use worker_sys::{DurableObjectState, SqlStorage};
 
@@ -72,7 +75,11 @@ impl DurableDbBackend for CfDurableDb {
         })
     }
 
-    async fn execute(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, DurableDbError> {
         self.query(query, params).await
     }
 

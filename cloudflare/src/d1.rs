@@ -45,7 +45,9 @@ impl CfD1 {
     /// Create a `CfD1` from a Workers env by binding name.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, CfDatabaseError> {
         let binding = crate::ffi::get_binding(env, binding_name).map_err(|error| {
-            CfDatabaseError::Backend(format!("failed to get D1 binding '{binding_name}': {error:?}"))
+            CfDatabaseError::Backend(format!(
+                "failed to get D1 binding '{binding_name}': {error:?}"
+            ))
         })?;
         Ok(Self::new(binding))
     }

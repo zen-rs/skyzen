@@ -110,10 +110,12 @@ cache
     )
     .await?;
 
-let cached = cache.get_url("https://example.com/data", false).await?;
+let cached = cache.get_url_json::<serde_json::Value>("https://example.com/data", false).await?;
 ```
 
-`CfCache` methods return `Send` futures, so they can be awaited directly inside Skyzen handlers.
+`CfCache` methods return `Send` futures, and the high-level `get_*_bytes` / `get_*_text` / `get_*_json`
+helpers are designed to be awaited directly inside Skyzen handlers without leaking a non-`Send`
+`worker::Response` into application code.
 
 ### Durable Object SQLite
 

@@ -62,10 +62,7 @@ where
     /// # Errors
     ///
     /// Returns `JsValue` when state I/O, alarm dispatch, or persistence fails.
-    pub async fn alarm(
-        state: worker_sys::DurableObjectState,
-        env: JsValue,
-    ) -> Result<(), JsValue> {
+    pub async fn alarm(state: worker_sys::DurableObjectState, env: JsValue) -> Result<(), JsValue> {
         let mut object = load_state::<T>(&state).await?;
         let durable_state = CfDurableState::new(clone_state(&state), env.clone());
 
@@ -258,8 +255,7 @@ pub async fn invoke_websocket_close<T>(
 where
     T: DurableObject,
 {
-    DurableObjectRuntime::<T>::websocket_close(state, env, websocket, code, reason, was_clean)
-        .await
+    DurableObjectRuntime::<T>::websocket_close(state, env, websocket, code, reason, was_clean).await
 }
 
 /// Invoke a Skyzen Durable Object websocket error handler from an external runtime wrapper.

@@ -2,7 +2,10 @@
 
 use std::sync::{Arc, RwLock};
 
-use skyzen_services::{durable::sql::{DurableDbBackend, DurableDbError}, DbExecResult, DbValue};
+use skyzen_services::{
+    durable::sql::{DurableDbBackend, DurableDbError},
+    DbExecResult, DbValue,
+};
 
 /// In-memory implementation of [`DurableDbBackend`] for testing.
 ///
@@ -32,7 +35,11 @@ impl InMemoryDurableDb {
 }
 
 impl DurableDbBackend for InMemoryDurableDb {
-    async fn query(&self, query: &str, _params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+    async fn query(
+        &self,
+        query: &str,
+        _params: &[DbValue],
+    ) -> Result<DbExecResult, DurableDbError> {
         self.queries
             .write()
             .map_err(|_| DurableDbError::Backend("lock poisoned".to_owned()))?
@@ -40,7 +47,11 @@ impl DurableDbBackend for InMemoryDurableDb {
         Ok(DbExecResult::default())
     }
 
-    async fn execute(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, DurableDbError> {
         self.query(query, params).await
     }
 

@@ -536,15 +536,13 @@ fn generate_wasm_bindings(plan: &CloudflareBuildPlan) -> Result<()> {
         .web(true)
         .context("failed to configure wasm-bindgen output mode")?
         .typescript(false);
-    bindgen
-        .generate(&plan.output_dir)
-        .with_context(|| {
-            format!(
-                "failed to generate wasm bindings from {} into {}",
-                plan.wasm_artifact_path.display(),
-                plan.output_dir.display()
-            )
-        })?;
+    bindgen.generate(&plan.output_dir).with_context(|| {
+        format!(
+            "failed to generate wasm bindings from {} into {}",
+            plan.wasm_artifact_path.display(),
+            plan.output_dir.display()
+        )
+    })?;
 
     fs::rename(&generated_entry_path, &plan.bindings_js_path).with_context(|| {
         format!(
@@ -659,7 +657,12 @@ fn load_cargo_metadata(root_dir: &Path, cargo_manifest_path: &Path) -> Result<Ca
 mod tests {
     use super::*;
     use crate::manifest::{CfDurableObjects, CfQueues, CfTriggers};
-    use std::{collections::BTreeMap, fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn renders_wrangler_with_bindings() {
@@ -836,11 +839,19 @@ crate-type = ["cdylib", "rlib"]
         let build = resolve_build_plan(&manifest, manifest.data.cloudflare.as_ref().unwrap())
             .expect("resolve build plan");
         assert_eq!(build.entry_js_path, project_dir.join("dist/worker.js"));
-        assert_eq!(build.bindings_js_path, project_dir.join("dist/worker_bg.js"));
-        assert_eq!(build.wasm_output_path, project_dir.join("dist/worker_bg.wasm"));
+        assert_eq!(
+            build.bindings_js_path,
+            project_dir.join("dist/worker_bg.js")
+        );
+        assert_eq!(
+            build.wasm_output_path,
+            project_dir.join("dist/worker_bg.wasm")
+        );
         assert_eq!(build.bindgen_out_name, "worker");
         assert!(build.durable_exports.is_empty());
-        assert!(build.wasm_artifact_path.ends_with("wasm32-unknown-unknown/debug/demo_worker.wasm"));
+        assert!(build
+            .wasm_artifact_path
+            .ends_with("wasm32-unknown-unknown/debug/demo_worker.wasm"));
     }
 
     #[test]
@@ -963,7 +974,9 @@ crate-type = ["cdylib", "rlib"]
         assert_eq!(plan.generated_files.len(), 1);
         assert_eq!(plan.internal_steps.len(), 1);
         assert!(plan.commands[0].display().contains("wrangler dev --local"));
-        assert!(plan.generated_files[0].contents.contains("main = \"../../dist/worker.js\""));
+        assert!(plan.generated_files[0]
+            .contents
+            .contains("main = \"../../dist/worker.js\""));
     }
 
     #[test]
@@ -985,7 +998,9 @@ crate-type = ["cdylib", "rlib"]
 
         assert!(rendered.contains("import init, { fetch as wasmFetch } from \"./worker_bg.js\";"));
         assert!(rendered.contains("import wasmUrl from \"./worker_bg.wasm\";"));
-        assert!(rendered.contains("export { SchedulerObject as Scheduler } from \"./worker_bg.js\";"));
+        assert!(
+            rendered.contains("export { SchedulerObject as Scheduler } from \"./worker_bg.js\";")
+        );
         assert!(rendered.contains("export { RoomObject as Room } from \"./worker_bg.js\";"));
     }
 

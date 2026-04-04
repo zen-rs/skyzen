@@ -101,22 +101,12 @@ fn worker_err(error: worker::Error) -> CfFetchError {
 
 async fn read_response_bytes(response: Response) -> Result<Vec<u8>, CfFetchError> {
     let mut response = SendWrapper::new(response);
-    response
-        .0
-        .bytes()
-        .into_send()
-        .await
-        .map_err(worker_err)
+    response.0.bytes().into_send().await.map_err(worker_err)
 }
 
 async fn read_response_text(response: Response) -> Result<String, CfFetchError> {
     let mut response = SendWrapper::new(response);
-    response
-        .0
-        .text()
-        .into_send()
-        .await
-        .map_err(worker_err)
+    response.0.text().into_send().await.map_err(worker_err)
 }
 
 async fn read_response_json<T>(response: Response) -> Result<T, CfFetchError>
@@ -124,10 +114,5 @@ where
     T: DeserializeOwned + Send + 'static,
 {
     let mut response = SendWrapper::new(response);
-    response
-        .0
-        .json::<T>()
-        .into_send()
-        .await
-        .map_err(worker_err)
+    response.0.json::<T>().into_send().await.map_err(worker_err)
 }

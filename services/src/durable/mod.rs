@@ -12,7 +12,7 @@ pub mod alarm;
 pub mod kv;
 pub mod sql;
 
+pub use crate::sql::{DbExecResult, DbValue};
 pub use alarm::{Alarm, AlarmError, AlarmScheduler};
 pub use kv::{DurableKv, DurableKvError, DurableKvStore, DurableListOptions};
-pub use crate::sql::{DbExecResult, DbValue};
 pub use sql::{DurableDb, DurableDbBackend, DurableDbError};

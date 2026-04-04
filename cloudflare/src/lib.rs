@@ -47,9 +47,9 @@ pub mod durable_sqlite;
 #[cfg(target_arch = "wasm32")]
 pub mod events;
 #[cfg(target_arch = "wasm32")]
-pub mod ffi;
-#[cfg(target_arch = "wasm32")]
 pub mod fetch;
+#[cfg(target_arch = "wasm32")]
+pub mod ffi;
 #[cfg(target_arch = "wasm32")]
 pub mod kv;
 #[cfg(target_arch = "wasm32")]

@@ -1,9 +1,10 @@
 //! Cloudflare Cache API wrapper.
 
+use serde::de::DeserializeOwned;
+use wasm_bindgen::JsCast;
 use worker::send::{IntoSendFuture, SendWrapper};
 use worker::{Request, Response};
 use worker_sys::ext::CacheStorageExt;
-use wasm_bindgen::JsCast;
 
 /// Errors from Cloudflare Cache API operations.
 #[derive(Debug, thiserror::Error)]
@@ -62,10 +63,7 @@ impl CfCache {
         let name = name.into();
         async move {
             let global: worker::web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
-            let promise = global
-                .caches()
-                .map_err(js_err)?
-                .open(&name);
+            let promise = global.caches().map_err(js_err)?.open(&name);
             let inner = wasm_bindgen_futures::JsFuture::from(promise)
                 .into_send()
                 .await
@@ -120,7 +118,8 @@ impl CfCache {
         &self,
         url: impl Into<String>,
         ignore_method: bool,
-    ) -> impl core::future::Future<Output = Result<Option<Response>, CfCacheError>> + Send + '_ {
+    ) -> impl core::future::Future<Output = Result<Option<Response>, CfCacheError>> + Send + '_
+    {
         let url = url.into();
         async move {
             let options = worker::web_sys::CacheQueryOptions::new();
@@ -135,8 +134,52 @@ impl CfCache {
             if value.is_undefined() {
                 Ok(None)
             } else {
-                Ok(Some(Response::from(value.unchecked_into::<worker::web_sys::Response>())))
+                Ok(Some(Response::from(
+                    value.unchecked_into::<worker::web_sys::Response>(),
+                )))
             }
+        }
+    }
+
+    /// Lookup a response by URL key and return its body as bytes.
+    pub fn get_url_bytes(
+        &self,
+        url: impl Into<String>,
+        ignore_method: bool,
+    ) -> impl core::future::Future<Output = Result<Option<Vec<u8>>, CfCacheError>> + Send + '_ {
+        let url = url.into();
+        async move {
+            let response = self.get_url(url, ignore_method).await?;
+            read_response_bytes(response).await
+        }
+    }
+
+    /// Lookup a response by URL key and return its body as text.
+    pub fn get_url_text(
+        &self,
+        url: impl Into<String>,
+        ignore_method: bool,
+    ) -> impl core::future::Future<Output = Result<Option<String>, CfCacheError>> + Send + '_ {
+        let url = url.into();
+        async move {
+            let response = self.get_url(url, ignore_method).await?;
+            read_response_text(response).await
+        }
+    }
+
+    /// Lookup a response by URL key and deserialize its body as JSON.
+    pub fn get_url_json<T>(
+        &self,
+        url: impl Into<String>,
+        ignore_method: bool,
+    ) -> impl core::future::Future<Output = Result<Option<T>, CfCacheError>> + Send + '_
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        let url = url.into();
+        async move {
+            let response = self.get_url(url, ignore_method).await?;
+            read_response_json(response).await
         }
     }
 
@@ -145,7 +188,8 @@ impl CfCache {
         &self,
         request: &Request,
         ignore_method: bool,
-    ) -> impl core::future::Future<Output = Result<Option<Response>, CfCacheError>> + Send + '_ {
+    ) -> impl core::future::Future<Output = Result<Option<Response>, CfCacheError>> + Send + '_
+    {
         let request = SendWrapper::new(request.try_into().map_err(worker_err));
         async move {
             let request: worker::web_sys::Request = request.0?;
@@ -161,8 +205,49 @@ impl CfCache {
             if value.is_undefined() {
                 Ok(None)
             } else {
-                Ok(Some(Response::from(value.unchecked_into::<worker::web_sys::Response>())))
+                Ok(Some(Response::from(
+                    value.unchecked_into::<worker::web_sys::Response>(),
+                )))
             }
+        }
+    }
+
+    /// Lookup a response by request key and return its body as bytes.
+    pub fn get_request_bytes<'a>(
+        &'a self,
+        request: &'a Request,
+        ignore_method: bool,
+    ) -> impl core::future::Future<Output = Result<Option<Vec<u8>>, CfCacheError>> + Send + 'a {
+        async move {
+            let response = self.get_request(request, ignore_method).await?;
+            read_response_bytes(response).await
+        }
+    }
+
+    /// Lookup a response by request key and return its body as text.
+    pub fn get_request_text<'a>(
+        &'a self,
+        request: &'a Request,
+        ignore_method: bool,
+    ) -> impl core::future::Future<Output = Result<Option<String>, CfCacheError>> + Send + 'a {
+        async move {
+            let response = self.get_request(request, ignore_method).await?;
+            read_response_text(response).await
+        }
+    }
+
+    /// Lookup a response by request key and deserialize its body as JSON.
+    pub fn get_request_json<'a, T>(
+        &'a self,
+        request: &'a Request,
+        ignore_method: bool,
+    ) -> impl core::future::Future<Output = Result<Option<T>, CfCacheError>> + Send + 'a
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        async move {
+            let response = self.get_request(request, ignore_method).await?;
+            read_response_json(response).await
         }
     }
 
@@ -171,12 +256,15 @@ impl CfCache {
         &self,
         url: impl Into<String>,
         ignore_method: bool,
-    ) -> impl core::future::Future<Output = Result<CfCacheDeletionOutcome, CfCacheError>> + Send + '_ {
+    ) -> impl core::future::Future<Output = Result<CfCacheDeletionOutcome, CfCacheError>> + Send + '_
+    {
         let url = url.into();
         async move {
             let options = worker::web_sys::CacheQueryOptions::new();
             options.set_ignore_method(ignore_method);
-            let promise = self.inner.delete_with_str_and_options(url.as_str(), &options);
+            let promise = self
+                .inner
+                .delete_with_str_and_options(url.as_str(), &options);
             let value: wasm_bindgen::JsValue = wasm_bindgen_futures::JsFuture::from(promise)
                 .into_send()
                 .await
@@ -194,7 +282,8 @@ impl CfCache {
         &self,
         request: &Request,
         ignore_method: bool,
-    ) -> impl core::future::Future<Output = Result<CfCacheDeletionOutcome, CfCacheError>> + Send + '_ {
+    ) -> impl core::future::Future<Output = Result<CfCacheDeletionOutcome, CfCacheError>> + Send + '_
+    {
         let request = SendWrapper::new(request.try_into().map_err(worker_err));
         async move {
             let request: worker::web_sys::Request = request.0?;
@@ -223,4 +312,49 @@ fn js_err(error: wasm_bindgen::JsValue) -> CfCacheError {
 
 fn worker_err(error: worker::Error) -> CfCacheError {
     CfCacheError::Backend(error.to_string())
+}
+
+async fn read_response_bytes(response: Option<Response>) -> Result<Option<Vec<u8>>, CfCacheError> {
+    let response = response.map(SendWrapper::new);
+    match response {
+        Some(mut response) => response
+            .0
+            .bytes()
+            .into_send()
+            .await
+            .map(Some)
+            .map_err(worker_err),
+        None => Ok(None),
+    }
+}
+
+async fn read_response_text(response: Option<Response>) -> Result<Option<String>, CfCacheError> {
+    let response = response.map(SendWrapper::new);
+    match response {
+        Some(mut response) => response
+            .0
+            .text()
+            .into_send()
+            .await
+            .map(Some)
+            .map_err(worker_err),
+        None => Ok(None),
+    }
+}
+
+async fn read_response_json<T>(response: Option<Response>) -> Result<Option<T>, CfCacheError>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    let response = response.map(SendWrapper::new);
+    match response {
+        Some(mut response) => response
+            .0
+            .json::<T>()
+            .into_send()
+            .await
+            .map(Some)
+            .map_err(worker_err),
+        None => Ok(None),
+    }
 }

@@ -415,7 +415,11 @@ impl Middleware for Db {
     }
 }
 
-fn prepare_query_sql(query: &str, actual_params: usize, dialect: DbDialect) -> Result<String, DbError> {
+fn prepare_query_sql(
+    query: &str,
+    actual_params: usize,
+    dialect: DbDialect,
+) -> Result<String, DbError> {
     let tokens = tokenize_sql(query, dialect)?;
     let mut expected_params = 0usize;
     let mut cursor = 0usize;
@@ -462,7 +466,10 @@ fn tokenize_sql(query: &str, dialect: DbDialect) -> Result<Vec<TokenWithSpan>, D
     }
 }
 
-fn tokenize_with_dialect(query: &str, dialect: &dyn Dialect) -> Result<Vec<TokenWithSpan>, DbError> {
+fn tokenize_with_dialect(
+    query: &str,
+    dialect: &dyn Dialect,
+) -> Result<Vec<TokenWithSpan>, DbError> {
     let mut tokenizer = Tokenizer::new(dialect, query);
     tokenizer
         .tokenize_with_location()
@@ -741,14 +748,16 @@ fn postgres_value_to_json(
             row.try_get::<Option<f64>, _>(index).map_err(sqlx_error)?,
         )),
         "BYTEA" => Ok(option_to_json(
-            row.try_get::<Option<Vec<u8>>, _>(index).map_err(sqlx_error)?,
+            row.try_get::<Option<Vec<u8>>, _>(index)
+                .map_err(sqlx_error)?,
         )),
         "JSON" | "JSONB" => Ok(option_to_json(
             row.try_get::<Option<serde_json::Value>, _>(index)
                 .map_err(sqlx_error)?,
         )),
         _ => fallback_value_to_json(
-            row.try_get::<Option<String>, _>(index).map_err(sqlx_error)?,
+            row.try_get::<Option<String>, _>(index)
+                .map_err(sqlx_error)?,
             row.try_get::<Option<Vec<u8>>, _>(index).ok(),
         ),
     }
@@ -761,11 +770,9 @@ fn mysql_value_to_json(
     type_name: &str,
 ) -> Result<serde_json::Value, DbError> {
     match type_name {
-        "BOOLEAN" | "BOOL" => {
-            Ok(option_to_json(
-                row.try_get::<Option<bool>, _>(index).map_err(sqlx_error)?,
-            ))
-        }
+        "BOOLEAN" | "BOOL" => Ok(option_to_json(
+            row.try_get::<Option<bool>, _>(index).map_err(sqlx_error)?,
+        )),
         "SMALLINT" => option_to_json_i64(
             row.try_get::<Option<i16>, _>(index)
                 .map_err(sqlx_error)?
@@ -784,20 +791,22 @@ fn mysql_value_to_json(
                 .map_err(sqlx_error)?
                 .map(f64::from),
         ),
-        "DOUBLE" | "DECIMAL" => {
+        "DOUBLE" | "DECIMAL" => Ok(option_to_json(
+            row.try_get::<Option<f64>, _>(index).map_err(sqlx_error)?,
+        )),
+        "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" | "VARBINARY" => {
             Ok(option_to_json(
-                row.try_get::<Option<f64>, _>(index).map_err(sqlx_error)?,
+                row.try_get::<Option<Vec<u8>>, _>(index)
+                    .map_err(sqlx_error)?,
             ))
         }
-        "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" | "VARBINARY" => Ok(
-            option_to_json(row.try_get::<Option<Vec<u8>>, _>(index).map_err(sqlx_error)?),
-        ),
         "JSON" => Ok(option_to_json(
             row.try_get::<Option<serde_json::Value>, _>(index)
                 .map_err(sqlx_error)?,
         )),
         _ => fallback_value_to_json(
-            row.try_get::<Option<String>, _>(index).map_err(sqlx_error)?,
+            row.try_get::<Option<String>, _>(index)
+                .map_err(sqlx_error)?,
             row.try_get::<Option<Vec<u8>>, _>(index).ok(),
         ),
     }
@@ -813,19 +822,20 @@ fn sqlite_value_to_json(
         "INTEGER" | "INT" => Ok(option_to_json(
             row.try_get::<Option<i64>, _>(index).map_err(sqlx_error)?,
         )),
-        "REAL" | "FLOAT" | "DOUBLE" => {
-            Ok(option_to_json(
-                row.try_get::<Option<f64>, _>(index).map_err(sqlx_error)?,
-            ))
-        }
+        "REAL" | "FLOAT" | "DOUBLE" => Ok(option_to_json(
+            row.try_get::<Option<f64>, _>(index).map_err(sqlx_error)?,
+        )),
         "BLOB" => Ok(option_to_json(
-            row.try_get::<Option<Vec<u8>>, _>(index).map_err(sqlx_error)?,
+            row.try_get::<Option<Vec<u8>>, _>(index)
+                .map_err(sqlx_error)?,
         )),
         "TEXT" => Ok(option_to_json(
-            row.try_get::<Option<String>, _>(index).map_err(sqlx_error)?,
+            row.try_get::<Option<String>, _>(index)
+                .map_err(sqlx_error)?,
         )),
         _ => fallback_value_to_json(
-            row.try_get::<Option<String>, _>(index).map_err(sqlx_error)?,
+            row.try_get::<Option<String>, _>(index)
+                .map_err(sqlx_error)?,
             row.try_get::<Option<Vec<u8>>, _>(index).ok(),
         ),
     }
