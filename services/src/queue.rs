@@ -335,16 +335,63 @@ impl Middleware for Queue {
 #[cfg(test)]
 mod tests {
     use super::{
-        QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition, QueueRetry,
+        MessageQueue, Queue, QueueBatch, QueueBatchDisposition, QueueError, QueueMessage,
+        QueueMessageDisposition, QueueNotConfigured, QueueRetry,
     };
+    use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
+    use serde::{Deserialize, Serialize};
+    use skyzen_core::Extractor;
+    use std::{convert::Infallible, sync::{Arc, RwLock}};
+
+    #[derive(Clone, Default)]
+    struct InMemoryMessageQueue {
+        messages: Arc<RwLock<Vec<Vec<u8>>>>,
+    }
+
+    impl MessageQueue for InMemoryMessageQueue {
+        async fn send(&self, message: &[u8]) -> Result<(), QueueError> {
+            self.messages
+                .write()
+                .map_err(|_| QueueError::Backend("lock poisoned".to_owned()))?
+                .push(message.to_vec());
+            Ok(())
+        }
+
+        async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<(), QueueError> {
+            self.messages
+                .write()
+                .map_err(|_| QueueError::Backend("lock poisoned".to_owned()))?
+                .extend(messages.iter().cloned());
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct QueueSendEndpoint;
+
+    impl Endpoint for QueueSendEndpoint {
+        type Error = Infallible;
+
+        async fn respond(
+            &mut self,
+            request: &mut http_kit::Request,
+        ) -> Result<Response, Self::Error> {
+            let queue = Queue::extract(request).await.expect("queue should be injected");
+            queue
+                .send(b"from-endpoint")
+                .await
+                .expect("queue send should succeed");
+            Ok(Response::new(Body::from("queued")))
+        }
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+    struct Job {
+        kind: String,
+    }
 
     #[test]
     fn decodes_queue_batch_json() {
-        #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
-        struct Job {
-            kind: String,
-        }
-
         let batch = QueueBatch {
             queue: "jobs".to_owned(),
             messages: vec![QueueMessage {
@@ -360,6 +407,55 @@ mod tests {
     }
 
     #[test]
+    fn queue_batch_helpers_preserve_metadata_and_encode_json() {
+        let batch = QueueBatch {
+            queue: "jobs".to_owned(),
+            messages: vec![
+                QueueMessage {
+                    id: "1".to_owned(),
+                    timestamp_ms: 10,
+                    body: Job {
+                        kind: "email".to_owned(),
+                    },
+                },
+                QueueMessage {
+                    id: "2".to_owned(),
+                    timestamp_ms: 20,
+                    body: Job {
+                        kind: "sms".to_owned(),
+                    },
+                },
+            ],
+        };
+
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.is_empty());
+
+        let mapped = batch.clone().map(|job| job.kind);
+        assert_eq!(mapped.messages[0].id, "1");
+        assert_eq!(mapped.messages[1].body, "sms");
+
+        let encoded = batch.encode_json().expect("batch should encode");
+        assert_eq!(encoded.len(), 2);
+        assert!(std::str::from_utf8(&encoded[0]).unwrap().contains("email"));
+    }
+
+    #[test]
+    fn decode_json_surfaces_invalid_message_payloads() {
+        let batch = QueueBatch {
+            queue: "jobs".to_owned(),
+            messages: vec![QueueMessage {
+                id: "1".to_owned(),
+                timestamp_ms: 10,
+                body: b"invalid-json".to_vec(),
+            }],
+        };
+
+        let error = batch.decode_json::<Job>().unwrap_err();
+        assert!(matches!(error, QueueError::Serialization(_)));
+    }
+
+    #[test]
     fn queue_retry_builder_sets_delay() {
         let retry = QueueRetry::new().with_delay_seconds(30);
         assert_eq!(retry.delay_seconds, Some(30));
@@ -371,5 +467,77 @@ mod tests {
             QueueBatchDisposition::ack_all(),
             QueueBatchDisposition::All(QueueMessageDisposition::Ack)
         );
+    }
+
+    #[test]
+    fn queue_batch_retry_all_helper_is_stable() {
+        let retry = QueueRetry::new().with_delay_seconds(15);
+        assert_eq!(
+            QueueBatchDisposition::retry_all(retry),
+            QueueBatchDisposition::All(QueueMessageDisposition::Retry(retry))
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapper_sends_raw_and_json_messages() {
+        let backend = InMemoryMessageQueue::default();
+        let queue = Queue::new(backend.clone());
+
+        queue.send(b"raw").await.unwrap();
+        queue
+            .send_json(&Job {
+                kind: "email".to_owned(),
+            })
+            .await
+            .unwrap();
+        queue
+            .send_json_batch(&[
+                Job {
+                    kind: "sms".to_owned(),
+                },
+                Job {
+                    kind: "push".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        let messages = backend.messages.read().unwrap().clone();
+        assert_eq!(messages[0], b"raw".to_vec());
+        assert!(std::str::from_utf8(&messages[1]).unwrap().contains("email"));
+        assert!(std::str::from_utf8(&messages[2]).unwrap().contains("sms"));
+        assert!(std::str::from_utf8(&messages[3]).unwrap().contains("push"));
+    }
+
+    #[tokio::test]
+    async fn middleware_injects_queue_for_downstream_endpoint_and_extractor() {
+        let backend = InMemoryMessageQueue::default();
+        let mut queue = Queue::new(backend.clone());
+        let mut request = http_kit::Request::new(Body::empty());
+
+        let response = queue.handle(&mut request, QueueSendEndpoint).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "queued");
+
+        let extracted = Queue::extract(&mut request).await.unwrap();
+        extracted.send(b"from-extractor").await.unwrap();
+
+        let messages = backend.messages.read().unwrap().clone();
+        assert_eq!(messages, vec![b"from-endpoint".to_vec(), b"from-extractor".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn extractor_returns_internal_server_error_when_queue_is_missing() {
+        let mut request = http_kit::Request::new(Body::empty());
+
+        let error = Queue::extract(&mut request).await.unwrap_err();
+
+        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn missing_configuration_error_uses_expected_status() {
+        let error = QueueNotConfigured::new();
+        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

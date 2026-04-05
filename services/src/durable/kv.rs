@@ -340,3 +340,241 @@ impl Middleware for DurableKv {
             .map_err(MiddlewareError::Endpoint)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DurableKv, DurableKvError, DurableKvStore, DurableKvNotConfigured, DurableListOptions};
+    use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
+    use serde::{Deserialize, Serialize};
+    use skyzen_core::Extractor;
+    use std::{
+        collections::BTreeMap,
+        convert::Infallible,
+        sync::{Arc, RwLock},
+    };
+
+    #[derive(Clone, Default)]
+    struct InMemoryDurableKvStore {
+        data: Arc<RwLock<BTreeMap<String, Vec<u8>>>>,
+    }
+
+    impl DurableKvStore for InMemoryDurableKvStore {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, DurableKvError> {
+            let data = self
+                .data
+                .read()
+                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+            Ok(data.get(key).cloned())
+        }
+
+        async fn get_multiple(
+            &self,
+            keys: &[&str],
+        ) -> Result<Vec<(String, Vec<u8>)>, DurableKvError> {
+            let data = self
+                .data
+                .read()
+                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+            Ok(keys
+                .iter()
+                .filter_map(|key| data.get(*key).map(|value| ((*key).to_owned(), value.clone())))
+                .collect())
+        }
+
+        async fn put(&self, key: &str, value: &[u8]) -> Result<(), DurableKvError> {
+            self.data
+                .write()
+                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?
+                .insert(key.to_owned(), value.to_vec());
+            Ok(())
+        }
+
+        async fn put_multiple(&self, entries: &[(&str, &[u8])]) -> Result<(), DurableKvError> {
+            let mut data = self
+                .data
+                .write()
+                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+            for (key, value) in entries {
+                data.insert((*key).to_owned(), value.to_vec());
+            }
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<bool, DurableKvError> {
+            Ok(self
+                .data
+                .write()
+                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?
+                .remove(key)
+                .is_some())
+        }
+
+        async fn delete_multiple(&self, keys: &[&str]) -> Result<usize, DurableKvError> {
+            let mut data = self
+                .data
+                .write()
+                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+            Ok(keys.iter().filter(|key| data.remove(**key).is_some()).count())
+        }
+
+        async fn delete_all(&self) -> Result<(), DurableKvError> {
+            self.data
+                .write()
+                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?
+                .clear();
+            Ok(())
+        }
+
+        async fn list(
+            &self,
+            options: DurableListOptions<'_>,
+        ) -> Result<Vec<(String, Vec<u8>)>, DurableKvError> {
+            let data = self
+                .data
+                .read()
+                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+            let iter: Box<dyn Iterator<Item = (&String, &Vec<u8>)>> = if options.reverse {
+                Box::new(data.iter().rev())
+            } else {
+                Box::new(data.iter())
+            };
+
+            Ok(iter
+                .filter(|(key, _)| {
+                    options.prefix.is_none_or(|prefix| key.starts_with(prefix))
+                        && options.start.is_none_or(|start| key.as_str() > start)
+                        && options.end.is_none_or(|end| key.as_str() < end)
+                })
+                .take(options.limit.unwrap_or(usize::MAX))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadDurableKvEndpoint;
+
+    impl Endpoint for ReadDurableKvEndpoint {
+        type Error = Infallible;
+
+        async fn respond(
+            &mut self,
+            request: &mut http_kit::Request,
+        ) -> Result<Response, Self::Error> {
+            let kv = DurableKv::extract(request).await.expect("durable kv should be injected");
+            let body = kv
+                .get("message")
+                .await
+                .expect("durable kv access should succeed")
+                .expect("message should exist");
+            Ok(Response::new(Body::from(body)))
+        }
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    struct Session {
+        user: String,
+    }
+
+    #[tokio::test]
+    async fn wrapper_supports_crud_listing_and_json_helpers() {
+        let kv = DurableKv::new(InMemoryDurableKvStore::default());
+
+        kv.put("alpha", b"1").await.unwrap();
+        kv.put_multiple(&[("beta", b"2"), ("prefix:1", b"3"), ("prefix:2", b"4")])
+            .await
+            .unwrap();
+        kv.put_json(
+            "session",
+            &Session {
+                user: "lexo".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(kv.get("alpha").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(
+            kv.get_multiple(&["alpha", "missing", "beta"]).await.unwrap(),
+            vec![
+                ("alpha".to_owned(), b"1".to_vec()),
+                ("beta".to_owned(), b"2".to_vec()),
+            ]
+        );
+        assert_eq!(
+            kv.get_json::<Session>("session").await.unwrap(),
+            Some(Session {
+                user: "lexo".to_owned(),
+            })
+        );
+
+        let listed = kv
+            .list(DurableListOptions {
+                prefix: Some("prefix:"),
+                start: Some("prefix:1"),
+                end: None,
+                limit: Some(1),
+                reverse: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed, vec![("prefix:2".to_owned(), b"4".to_vec())]);
+
+        let reverse_list = kv
+            .list(DurableListOptions {
+                prefix: Some("prefix:"),
+                start: None,
+                end: None,
+                limit: None,
+                reverse: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reverse_list[0].0, "prefix:2");
+
+        assert!(kv.delete("alpha").await.unwrap());
+        assert_eq!(kv.delete_multiple(&["beta", "missing"]).await.unwrap(), 1);
+        kv.delete_all().await.unwrap();
+        assert!(kv.list(DurableListOptions::default()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_json_surfaces_deserialization_errors() {
+        let kv = DurableKv::new(InMemoryDurableKvStore::default());
+        kv.put("session", b"not-json").await.unwrap();
+
+        let error = kv.get_json::<Session>("session").await.unwrap_err();
+
+        assert!(matches!(error, DurableKvError::Serialization(_)));
+    }
+
+    #[tokio::test]
+    async fn middleware_injects_durable_kv_for_downstream_endpoint_and_extractor() {
+        let store = InMemoryDurableKvStore::default();
+        store.put("message", b"hello").await.unwrap();
+        let mut kv = DurableKv::new(store);
+        let mut request = http_kit::Request::new(Body::empty());
+
+        let response = kv.handle(&mut request, ReadDurableKvEndpoint).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "hello");
+
+        let extracted = DurableKv::extract(&mut request).await.unwrap();
+        assert_eq!(extracted.get("message").await.unwrap(), Some(b"hello".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn extractor_returns_internal_server_error_when_durable_kv_is_missing() {
+        let mut request = http_kit::Request::new(Body::empty());
+
+        let error = DurableKv::extract(&mut request).await.unwrap_err();
+
+        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn missing_configuration_error_uses_expected_status() {
+        let error = DurableKvNotConfigured::new();
+        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

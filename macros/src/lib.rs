@@ -362,12 +362,11 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     );
     schema_collector_idents.push(response_collector_ident.clone());
 
-    let response_schema_fn = if let Some((payload_ty, content_type)) =
-        documented_response_payload(&response_ty)?
-    {
-        let content_type_lit = LitStr::new(content_type, fn_ident.span());
-        assertions.push(quote! { let _ = ::skyzen::openapi::schema_of::<#payload_ty>; });
-        schema_collector_defs.push(quote! {
+    let response_schema_fn =
+        if let Some((payload_ty, content_type)) = documented_response_payload(&response_ty)? {
+            let content_type_lit = LitStr::new(content_type, fn_ident.span());
+            assertions.push(quote! { let _ = ::skyzen::openapi::schema_of::<#payload_ty>; });
+            schema_collector_defs.push(quote! {
             fn #response_schema_ident() -> Option<Vec<::skyzen::openapi::ResponseSchema>> {
                 let mut responses = ::skyzen::openapi::responder_schemas_of::<#response_ty>()
                     .unwrap_or_default();
@@ -400,20 +399,20 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                 ::skyzen::openapi::register_schema_for::<#payload_ty>(schemas);
             }
         });
-        quote! { Some(#response_schema_ident) }
-    } else {
-        let response_assert =
-            quote! { let _ = ::skyzen::openapi::responder_schemas_of::<#response_ty>; };
-        assertions.push(response_assert);
-        schema_collector_defs.push(quote! {
-            fn #response_collector_ident(
-                schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
-            ) {
-                ::skyzen::openapi::register_responder_schemas_for::<#response_ty>(schemas);
-            }
-        });
-        quote! { Some(::skyzen::openapi::responder_schemas_of::<#response_ty>) }
-    };
+            quote! { Some(#response_schema_ident) }
+        } else {
+            let response_assert =
+                quote! { let _ = ::skyzen::openapi::responder_schemas_of::<#response_ty>; };
+            assertions.push(response_assert);
+            schema_collector_defs.push(quote! {
+                fn #response_collector_ident(
+                    schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
+                ) {
+                    ::skyzen::openapi::register_responder_schemas_for::<#response_ty>(schemas);
+                }
+            });
+            quote! { Some(::skyzen::openapi::responder_schemas_of::<#response_ty>) }
+        };
 
     let schema_collectors = if schema_collector_idents.is_empty() {
         quote! { &[] }
@@ -517,7 +516,9 @@ fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
     let database_types = databases
         .iter()
         .enumerate()
-        .map(|(index, database)| database_ident_from_name(&database.name).map(|ident| (index, ident)))
+        .map(|(index, database)| {
+            database_ident_from_name(&database.name).map(|ident| (index, ident))
+        })
         .collect::<syn::Result<Vec<_>>>()?;
 
     let mut requires_test_context = false;
@@ -762,7 +763,11 @@ fn classify_test_param(
 
 fn last_type_ident_token(ty: &Type) -> Option<proc_macro2::Ident> {
     match ty {
-        Type::Path(type_path) => type_path.path.segments.last().map(|segment| segment.ident.clone()),
+        Type::Path(type_path) => type_path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.clone()),
         Type::Group(group) => last_type_ident_token(&group.elem),
         Type::Paren(paren) => last_type_ident_token(&paren.elem),
         _ => None,
@@ -2776,9 +2781,14 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_cloudflare_database_init, generate_native_service_init, load_databases_from_value,
-        load_services_from_value, lookup_table, DatabaseType, ServiceType,
+        database_ident_from_name, default_database_index, documented_extractor_payload,
+        documented_response_payload, first_generic_type, generate_cloudflare_database_init,
+        generate_native_service_init, ident_from_name, load_databases_from_value,
+        load_services_from_value, lookup_table, looks_like_env_name, parse_env_ref,
+        single_generic_type, DatabaseConfig, DatabaseType, ServiceType,
     };
+    use quote::ToTokens;
+    use syn::parse_quote;
 
     #[test]
     fn parses_portable_services_and_databases() {
@@ -2894,5 +2904,114 @@ binding = "DB"
             .to_string();
         assert!(cloudflare_database.contains("skyzen_services :: Db :: new"));
         assert!(cloudflare_database.contains("skyzen_cloudflare :: CfD1 :: from_env"));
+    }
+
+    #[test]
+    fn documented_payload_helpers_detect_supported_extractors_and_responders() {
+        let json_ty = parse_quote!(Json<CreateWidget>);
+        let form_ty = parse_quote!(Form<LoginForm>);
+        let query_ty = parse_quote!(Query<SearchParams>);
+        let result_ty = parse_quote!(Result<Form<LoginForm>>);
+        let plain_ty = parse_quote!(String);
+
+        let (json_inner, json_content_type) =
+            documented_extractor_payload(&json_ty).unwrap().expect("json payload");
+        assert_eq!(json_inner.into_token_stream().to_string(), "CreateWidget");
+        assert_eq!(json_content_type, "application/json");
+
+        let (form_inner, form_content_type) =
+            documented_extractor_payload(&form_ty).unwrap().expect("form payload");
+        assert_eq!(form_inner.into_token_stream().to_string(), "LoginForm");
+        assert_eq!(form_content_type, "application/x-www-form-urlencoded");
+
+        let (query_inner, query_content_type) =
+            documented_extractor_payload(&query_ty).unwrap().expect("query payload");
+        assert_eq!(query_inner.into_token_stream().to_string(), "SearchParams");
+        assert_eq!(query_content_type, "application/x-www-form-urlencoded");
+
+        let (result_inner, result_content_type) =
+            documented_response_payload(&result_ty).unwrap().expect("result payload");
+        assert_eq!(result_inner.into_token_stream().to_string(), "LoginForm");
+        assert_eq!(result_content_type, "application/x-www-form-urlencoded");
+
+        assert!(documented_response_payload(&plain_ty).unwrap().is_none());
+    }
+
+    #[test]
+    fn generic_type_helpers_extract_expected_types_and_fail_fast() {
+        let queue_batch_ty = parse_quote!(QueueBatch<Job>);
+        let result_ty = parse_quote!(Result<Job, Error>);
+        let plain_ty = parse_quote!(String);
+
+        let batch_inner = single_generic_type(&queue_batch_ty).expect("single generic");
+        assert_eq!(batch_inner.into_token_stream().to_string(), "Job");
+
+        let error = match single_generic_type(&result_ty) {
+            Ok(_) => panic!("expected Result<Job, Error> to be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("expected a single generic argument"));
+
+        let first_inner = first_generic_type(&result_ty).expect("first generic");
+        assert_eq!(first_inner.into_token_stream().to_string(), "Job");
+        assert!(first_generic_type(&plain_ty).is_none());
+    }
+
+    #[test]
+    fn default_database_index_enforces_default_selection_rules() {
+        let single = vec![DatabaseConfig {
+            name: "main".to_owned(),
+            database_type: DatabaseType::Sql,
+            default: false,
+        }];
+        assert_eq!(default_database_index(&single).unwrap(), Some(0));
+
+        let multiple_missing_default = vec![
+            DatabaseConfig {
+                name: "main".to_owned(),
+                database_type: DatabaseType::Sql,
+                default: false,
+            },
+            DatabaseConfig {
+                name: "analytics".to_owned(),
+                database_type: DatabaseType::Sql,
+                default: false,
+            },
+        ];
+        assert!(default_database_index(&multiple_missing_default)
+            .unwrap_err()
+            .to_string()
+            .contains("require exactly one `default = true`"));
+
+        let multiple_defaults = vec![
+            DatabaseConfig {
+                name: "main".to_owned(),
+                database_type: DatabaseType::Sql,
+                default: true,
+            },
+            DatabaseConfig {
+                name: "analytics".to_owned(),
+                database_type: DatabaseType::Sql,
+                default: true,
+            },
+        ];
+        assert!(default_database_index(&multiple_defaults)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot mark more than one database as `default = true`"));
+    }
+
+    #[test]
+    fn env_reference_helpers_and_identifier_normalization_are_stable() {
+        assert_eq!(parse_env_ref("${DATABASE_URL}"), Some("DATABASE_URL".to_owned()));
+        assert_eq!(parse_env_ref("DATABASE_URL"), None);
+        assert!(looks_like_env_name("DATABASE_URL_2"));
+        assert!(!looks_like_env_name("database-url"));
+
+        assert_eq!(ident_from_name("cache-service").unwrap().to_string(), "cache_service");
+        assert_eq!(ident_from_name("9cache").unwrap().to_string(), "_9cache");
+        assert_eq!(database_ident_from_name("primary").unwrap().to_string(), "PrimaryDb");
     }
 }

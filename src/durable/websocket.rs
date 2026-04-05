@@ -333,3 +333,213 @@ impl Responder for HibernationWebSocketUpgrade {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{
+        DurableObjectError, HibernationWebSocketUpgrade, WebSocketConnection,
+        WebSocketConnectionInner,
+    };
+
+    #[derive(Debug, Default)]
+    struct MockSocketState {
+        text_messages: Vec<String>,
+        binary_messages: Vec<Vec<u8>>,
+        close_calls: Vec<(u16, String)>,
+        tags: Vec<String>,
+        attachment: Option<Vec<u8>>,
+        fail_text: Option<DurableObjectError>,
+        fail_binary: Option<DurableObjectError>,
+        fail_close: Option<DurableObjectError>,
+        fail_tags: Option<DurableObjectError>,
+        fail_get_attachment: Option<DurableObjectError>,
+        fail_set_attachment: Option<DurableObjectError>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockSocketInner {
+        state: Arc<Mutex<MockSocketState>>,
+    }
+
+    impl MockSocketInner {
+        fn error_clone(error: &DurableObjectError) -> DurableObjectError {
+            match error {
+                DurableObjectError::Runtime(message) => {
+                    DurableObjectError::Runtime(message.clone())
+                }
+                DurableObjectError::Serialization(message) => {
+                    DurableObjectError::Serialization(message.clone())
+                }
+                DurableObjectError::WebSocket(message) => {
+                    DurableObjectError::WebSocket(message.clone())
+                }
+            }
+        }
+    }
+
+    impl WebSocketConnectionInner for MockSocketInner {
+        fn send_text(&self, text: &str) -> Result<(), DurableObjectError> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = &state.fail_text {
+                return Err(Self::error_clone(error));
+            }
+            state.text_messages.push(text.to_owned());
+            Ok(())
+        }
+
+        fn send_binary(&self, data: &[u8]) -> Result<(), DurableObjectError> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = &state.fail_binary {
+                return Err(Self::error_clone(error));
+            }
+            state.binary_messages.push(data.to_vec());
+            Ok(())
+        }
+
+        fn close(&self, code: u16, reason: &str) -> Result<(), DurableObjectError> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = &state.fail_close {
+                return Err(Self::error_clone(error));
+            }
+            state.close_calls.push((code, reason.to_owned()));
+            Ok(())
+        }
+
+        fn tags(&self) -> Result<Vec<String>, DurableObjectError> {
+            let state = self.state.lock().unwrap();
+            if let Some(error) = &state.fail_tags {
+                return Err(Self::error_clone(error));
+            }
+            Ok(state.tags.clone())
+        }
+
+        fn get_attachment_raw(&self) -> Result<Option<Vec<u8>>, DurableObjectError> {
+            let state = self.state.lock().unwrap();
+            if let Some(error) = &state.fail_get_attachment {
+                return Err(Self::error_clone(error));
+            }
+            Ok(state.attachment.clone())
+        }
+
+        fn set_attachment_raw(&self, data: &[u8]) -> Result<(), DurableObjectError> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = &state.fail_set_attachment {
+                return Err(Self::error_clone(error));
+            }
+            state.attachment = Some(data.to_vec());
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Attachment {
+        room: String,
+        revision: u32,
+    }
+
+    #[derive(Debug)]
+    struct AlwaysFails;
+
+    impl Serialize for AlwaysFails {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("expected serialization failure"))
+        }
+    }
+
+    fn connection_with_state(state: Arc<Mutex<MockSocketState>>) -> WebSocketConnection {
+        WebSocketConnection::new(Box::new(MockSocketInner { state }))
+    }
+
+    #[test]
+    fn send_json_serializes_payload_as_text_message() {
+        let state = Arc::new(Mutex::new(MockSocketState::default()));
+        let connection = connection_with_state(Arc::clone(&state));
+
+        connection
+            .send_json(&Attachment {
+                room: "room-1".to_owned(),
+                revision: 7,
+            })
+            .unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().text_messages,
+            vec![r#"{"room":"room-1","revision":7}"#.to_owned()]
+        );
+    }
+
+    #[test]
+    fn send_json_rejects_non_finite_numbers() {
+        let connection = connection_with_state(Arc::new(Mutex::new(MockSocketState::default())));
+
+        let error = connection.send_json(&AlwaysFails).unwrap_err();
+
+        assert!(matches!(error, DurableObjectError::Serialization(_)));
+    }
+
+    #[test]
+    fn attachment_round_trips_through_raw_storage() {
+        let state = Arc::new(Mutex::new(MockSocketState::default()));
+        let connection = connection_with_state(Arc::clone(&state));
+        let attachment = Attachment {
+            room: "general".to_owned(),
+            revision: 3,
+        };
+
+        connection.set_attachment(&attachment).unwrap();
+        let restored = connection.attachment::<Attachment>().unwrap().unwrap();
+
+        assert_eq!(restored, attachment);
+        assert!(state.lock().unwrap().attachment.is_some());
+    }
+
+    #[test]
+    fn attachment_reports_deserialization_errors_for_invalid_bytes() {
+        let state = Arc::new(Mutex::new(MockSocketState {
+            attachment: Some(b"{".to_vec()),
+            ..MockSocketState::default()
+        }));
+        let connection = connection_with_state(state);
+
+        let error = connection.attachment::<Attachment>().unwrap_err();
+
+        assert!(matches!(error, DurableObjectError::Serialization(_)));
+    }
+
+    #[test]
+    fn close_and_tags_delegate_to_inner_handle() {
+        let state = Arc::new(Mutex::new(MockSocketState {
+            tags: vec!["room-1".to_owned(), "admin".to_owned()],
+            ..MockSocketState::default()
+        }));
+        let connection = connection_with_state(Arc::clone(&state));
+
+        assert_eq!(
+            connection.tags().unwrap(),
+            vec!["room-1".to_owned(), "admin".to_owned()]
+        );
+        connection.close(1000, "done").unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().close_calls,
+            vec![(1000, "done".to_owned())]
+        );
+    }
+
+    #[test]
+    fn hibernation_upgrade_preserves_tag_order() {
+        let tags = HibernationWebSocketUpgrade::new()
+            .tag("room-1")
+            .tag("presence")
+            .into_tags();
+
+        assert_eq!(tags, vec!["room-1".to_owned(), "presence".to_owned()]);
+    }
+}

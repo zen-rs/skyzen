@@ -153,3 +153,103 @@ impl Middleware for Alarm {
             .map_err(MiddlewareError::Endpoint)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Alarm, AlarmError, AlarmNotConfigured, AlarmScheduler};
+    use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
+    use skyzen_core::Extractor;
+    use std::{convert::Infallible, sync::{Arc, RwLock}};
+
+    #[derive(Clone, Default)]
+    struct InMemoryAlarmScheduler {
+        scheduled: Arc<RwLock<Option<i64>>>,
+    }
+
+    impl AlarmScheduler for InMemoryAlarmScheduler {
+        async fn get_alarm(&self) -> Result<Option<i64>, AlarmError> {
+            let scheduled = self
+                .scheduled
+                .read()
+                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))?;
+            Ok(*scheduled)
+        }
+
+        async fn set_alarm(&self, scheduled_time_ms: i64) -> Result<(), AlarmError> {
+            *self
+                .scheduled
+                .write()
+                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? = Some(scheduled_time_ms);
+            Ok(())
+        }
+
+        async fn delete_alarm(&self) -> Result<(), AlarmError> {
+            *self
+                .scheduled
+                .write()
+                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? = None;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadAlarmEndpoint;
+
+    impl Endpoint for ReadAlarmEndpoint {
+        type Error = Infallible;
+
+        async fn respond(
+            &mut self,
+            request: &mut http_kit::Request,
+        ) -> Result<Response, Self::Error> {
+            let alarm = Alarm::extract(request).await.expect("alarm should be injected");
+            let scheduled = alarm
+                .get_alarm()
+                .await
+                .expect("alarm access should succeed")
+                .expect("alarm should exist");
+            Ok(Response::new(Body::from(scheduled.to_string())))
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapper_supports_set_get_and_delete_alarm() {
+        let alarm = Alarm::new(InMemoryAlarmScheduler::default());
+
+        assert_eq!(alarm.get_alarm().await.unwrap(), None);
+        alarm.set_alarm(42).await.unwrap();
+        assert_eq!(alarm.get_alarm().await.unwrap(), Some(42));
+        alarm.delete_alarm().await.unwrap();
+        assert_eq!(alarm.get_alarm().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn middleware_injects_alarm_for_downstream_endpoint_and_extractor() {
+        let scheduler = InMemoryAlarmScheduler::default();
+        scheduler.set_alarm(1337).await.unwrap();
+        let mut alarm = Alarm::new(scheduler);
+        let mut request = http_kit::Request::new(Body::empty());
+
+        let response = alarm.handle(&mut request, ReadAlarmEndpoint).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "1337");
+
+        let extracted = Alarm::extract(&mut request).await.unwrap();
+        assert_eq!(extracted.get_alarm().await.unwrap(), Some(1337));
+    }
+
+    #[tokio::test]
+    async fn extractor_returns_internal_server_error_when_alarm_is_missing() {
+        let mut request = http_kit::Request::new(Body::empty());
+
+        let error = Alarm::extract(&mut request).await.unwrap_err();
+
+        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn missing_configuration_error_uses_expected_status() {
+        let error = AlarmNotConfigured::new();
+        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

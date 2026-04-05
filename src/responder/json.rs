@@ -66,3 +66,79 @@ impl<T: Send + Sync + Serialize + 'static> Responder for PrettyJson<T> {
         crate::openapi::maybe_register_schema_for::<T>(defs);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::{header::CONTENT_TYPE, Body, Request, Response, ToSchema};
+    use http_kit::HttpError;
+    use serde::Serialize;
+    use skyzen_core::Responder;
+
+    use super::PrettyJson;
+
+    #[derive(Debug, Serialize, ToSchema)]
+    struct User {
+        name: String,
+        age: u8,
+    }
+
+    #[derive(Debug)]
+    struct AlwaysFails;
+
+    impl Serialize for AlwaysFails {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("expected serialization failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_pretty_json_body_and_content_type() {
+        let payload = User {
+            name: "Lexo".to_owned(),
+            age: 17,
+        };
+        let request = Request::new(Body::empty());
+        let mut response = Response::new(Body::empty());
+
+        PrettyJson(payload)
+            .respond_to(&request, &mut response)
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "{\n  \"name\": \"Lexo\",\n  \"age\": 17\n}");
+    }
+
+    #[test]
+    fn surfaces_serialization_errors() {
+        let request = Request::new(Body::empty());
+        let mut response = Response::new(Body::empty());
+
+        let error = PrettyJson(AlwaysFails)
+            .respond_to(&request, &mut response)
+            .unwrap_err();
+
+        assert_eq!(error.status(), crate::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn openapi_includes_wrapped_schema_and_dependencies() {
+        let schemas = <PrettyJson<User> as Responder>::openapi().unwrap();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].content_type, Some("application/json"));
+        assert!(crate::openapi::schema_of::<User>().is_some());
+
+        let mut defs = BTreeMap::new();
+        <PrettyJson<User> as Responder>::register_openapi_schemas(&mut defs);
+        let _ = defs;
+    }
+}

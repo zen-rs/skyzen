@@ -549,3 +549,237 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
         Box::pin(fut)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_cli_overrides, server_addr, sniff_protocol, Prefixed};
+    use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use serial_test::serial;
+    use std::{
+        io::{Cursor, Read},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    struct EnvGuard {
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                original: std::env::var("SKYZEN_ADDRESS").ok(),
+            }
+        }
+
+        fn clear() -> Self {
+            let guard = Self::capture();
+            unsafe {
+                std::env::remove_var("SKYZEN_ADDRESS");
+            }
+            guard
+        }
+
+        fn set(value: &str) -> Self {
+            let guard = Self::capture();
+            unsafe {
+                std::env::set_var("SKYZEN_ADDRESS", value);
+            }
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe {
+                    std::env::set_var("SKYZEN_ADDRESS", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("SKYZEN_ADDRESS");
+                },
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestStream {
+        read: Cursor<Vec<u8>>,
+        written: Vec<u8>,
+        closed: bool,
+    }
+
+    impl TestStream {
+        fn new(bytes: impl Into<Vec<u8>>) -> Self {
+            Self {
+                read: Cursor::new(bytes.into()),
+                written: Vec::new(),
+                closed: false,
+            }
+        }
+    }
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Poll::Ready(Read::read(&mut self.read, buf))
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            self.closed = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn server_addr_defaults_to_random_localhost_port() {
+        let _guard = EnvGuard::clear();
+
+        assert_eq!(
+            server_addr(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn server_addr_uses_environment_override() {
+        let _guard = EnvGuard::set("127.0.0.1:4012");
+
+        assert_eq!(
+            server_addr(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4012)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn server_addr_fast_fails_for_invalid_environment_value() {
+        let _guard = EnvGuard::set("not-an-address");
+
+        let panic = std::panic::catch_unwind(server_addr);
+
+        assert!(panic.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn apply_cli_overrides_accepts_listen_aliases_and_split_flags() {
+        let _guard = EnvGuard::clear();
+
+        apply_cli_overrides([
+            "skyzen".to_owned(),
+            "--addr".to_owned(),
+            "127.0.0.1:5050".to_owned(),
+        ]);
+        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:5050");
+
+        apply_cli_overrides([
+            "skyzen".to_owned(),
+            "--host".to_owned(),
+            "127.0.0.1".to_owned(),
+            "-p".to_owned(),
+            "6060".to_owned(),
+        ]);
+        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:6060");
+    }
+
+    #[test]
+    #[serial]
+    fn apply_cli_overrides_ignores_invalid_values_without_overwriting_existing_address() {
+        let _guard = EnvGuard::set("127.0.0.1:7000");
+
+        apply_cli_overrides([
+            "skyzen".to_owned(),
+            "--listen".to_owned(),
+            "bad-address".to_owned(),
+        ]);
+        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:7000");
+
+        apply_cli_overrides([
+            "skyzen".to_owned(),
+            "--host=invalid-host".to_owned(),
+            "--port=7001".to_owned(),
+        ]);
+        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:7000");
+
+        apply_cli_overrides([
+            "skyzen".to_owned(),
+            "--host=127.0.0.1".to_owned(),
+            "--port=bad-port".to_owned(),
+        ]);
+        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:7000");
+    }
+
+    #[tokio::test]
+    async fn sniff_protocol_detects_http2_preface_and_replays_buffered_bytes() {
+        let payload = [HTTP2_PREFACE, b"rest"].concat();
+        let (mut stream, is_h2) = sniff_protocol(TestStream::new(payload.clone()), HTTP2_PREFACE)
+            .await
+            .unwrap();
+
+        assert!(is_h2);
+
+        let mut read = Vec::new();
+        stream.read_to_end(&mut read).await.unwrap();
+        assert_eq!(read, payload);
+    }
+
+    #[tokio::test]
+    async fn sniff_protocol_distinguishes_http1_and_preserves_writes() {
+        let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let (mut stream, is_h2) = sniff_protocol(TestStream::new(payload.clone()), HTTP2_PREFACE)
+            .await
+            .unwrap();
+
+        assert!(!is_h2);
+
+        let mut read = Vec::new();
+        stream.read_to_end(&mut read).await.unwrap();
+        assert_eq!(read, payload);
+
+        stream.write_all(b"pong").await.unwrap();
+        stream.flush().await.unwrap();
+        stream.close().await.unwrap();
+        assert_eq!(stream.inner.written, b"pong".to_vec());
+        assert!(stream.inner.closed);
+    }
+
+    #[tokio::test]
+    async fn prefixed_reads_buffer_before_inner_stream() {
+        let mut stream = Prefixed::new(TestStream::new(b"tail".to_vec()), b"head".to_vec());
+
+        let mut read = Vec::new();
+        stream.read_to_end(&mut read).await.unwrap();
+
+        assert_eq!(read, b"headtail".to_vec());
+    }
+}

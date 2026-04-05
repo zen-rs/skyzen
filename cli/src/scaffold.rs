@@ -288,6 +288,7 @@ mod tests {
     use super::*;
     use crate::args::{Action, CliOptions, Template};
     use std::{
+        process,
         process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -298,7 +299,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
-        path.push(format!("skyzen-scaffold-{unique}"));
+        path.push(format!(
+            "skyzen-scaffold-{}-{:?}-{unique}",
+            process::id(),
+            std::thread::current().id()
+        ));
         path
     }
 
@@ -447,6 +452,13 @@ skyzen-services = {{ path = "{}" }}
     }
 
     fn run_cargo_check(path: &Path, shared_target_dir: &Path, wasm: bool) {
+        // Nested wasm checks are already covered by the normal test run. Under cargo-llvm-cov,
+        // rustc injects coverage instrumentation that the wasm target in this environment cannot
+        // link because `profiler_builtins` is unavailable.
+        if wasm && cfg!(coverage) {
+            return;
+        }
+
         let mut command = Command::new("cargo");
         command.arg("check").arg("--quiet").arg("--offline");
         if wasm {
@@ -455,6 +467,11 @@ skyzen-services = {{ path = "{}" }}
         let output = command
             .current_dir(path)
             .env("CARGO_TARGET_DIR", shared_target_dir)
+            .env("RUSTFLAGS", "")
+            .env("CARGO_ENCODED_RUSTFLAGS", "")
+            .env("RUSTDOCFLAGS", "")
+            .env("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS", "")
+            .env_remove("LLVM_PROFILE_FILE")
             .output()
             .expect("cargo check should launch");
 

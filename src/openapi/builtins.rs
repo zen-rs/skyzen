@@ -170,3 +170,64 @@ impl<T: Send + Sync + 'static> utoipa::PartialSchema for IgnoreOpenApi<T> {
 }
 
 impl<T: Send + Sync + 'static> utoipa::ToSchema for IgnoreOpenApi<T> {}
+
+#[cfg(test)]
+mod tests {
+    use serde::Serialize;
+    use serde_json::Value;
+
+    use super::*;
+
+    #[derive(Debug, Serialize, utoipa::ToSchema)]
+    struct Payload {
+        name: String,
+    }
+
+    fn schema_json<T>() -> Value
+    where
+        T: utoipa::PartialSchema,
+    {
+        serde_json::to_value(T::schema()).unwrap()
+    }
+
+    #[test]
+    fn built_in_route_and_address_schemas_expose_stable_metadata() {
+        assert_eq!(<Params as utoipa::ToSchema>::name().as_ref(), "Params");
+        assert_eq!(schema_json::<Params>()["title"], "Params");
+        assert_eq!(
+            schema_json::<Params>()["description"],
+            "Route parameters extracted from the current path"
+        );
+
+        assert_eq!(schema_json::<ClientIp>()["type"], "string");
+        assert_eq!(
+            schema_json::<ClientIp>()["description"],
+            "Client IP address (may be forwarded)"
+        );
+        assert_eq!(schema_json::<PeerAddr>()["type"], "string");
+    }
+
+    #[cfg(feature = "form")]
+    #[test]
+    fn form_and_query_wrappers_forward_inner_schema() {
+        let inner = schema_json::<Payload>();
+        assert_eq!(schema_json::<Form<Payload>>(), inner);
+        assert_eq!(schema_json::<Query<Payload>>(), inner);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_wrappers_forward_inner_schema() {
+        let inner = schema_json::<Payload>();
+        assert_eq!(schema_json::<Json<Payload>>(), inner);
+        assert_eq!(schema_json::<PrettyJson<Payload>>(), inner);
+    }
+
+    #[test]
+    fn state_and_ignore_openapi_use_empty_schema() {
+        let empty_schema: SchemaRef = utoipa::openapi::schema::empty().into();
+        let empty_schema = serde_json::to_value(empty_schema).unwrap();
+        assert_eq!(schema_json::<State<String>>(), empty_schema);
+        assert_eq!(schema_json::<IgnoreOpenApi<String>>(), empty_schema);
+    }
+}

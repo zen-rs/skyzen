@@ -81,3 +81,63 @@ impl Responder for CookieJar {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use http_kit::{
+        header::{HeaderValue, COOKIE, SET_COOKIE},
+        HttpError,
+    };
+    use skyzen_core::{Extractor, Responder};
+
+    use super::{Cookie, CookieJar};
+    use crate::{Body, Request, Response, StatusCode};
+
+    #[tokio::test]
+    async fn extracts_multiple_percent_encoded_cookies() {
+        let mut request = Request::new(Body::empty());
+        request.headers_mut().insert(
+            COOKIE,
+            HeaderValue::from_static("session=abc%20123; theme=dark"),
+        );
+
+        let jar = CookieJar::extract(&mut request).await.unwrap();
+
+        assert_eq!(jar.get("session").unwrap().value(), "abc 123");
+        assert_eq!(jar.get("theme").unwrap().value(), "dark");
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_utf8_cookie_headers() {
+        let mut request = Request::new(Body::empty());
+        request
+            .headers_mut()
+            .insert(COOKIE, HeaderValue::from_bytes(b"\xFF").unwrap());
+
+        let error = CookieJar::extract(&mut request).await.unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn responder_emits_only_cookie_delta_headers() {
+        let request = Request::new(Body::empty());
+        let mut response = Response::new(Body::empty());
+        let mut jar: CookieJar = "session=old".parse().unwrap();
+        jar.add(Cookie::new("theme", "dark"));
+
+        jar.respond_to(&request, &mut response).unwrap();
+
+        let set_cookies: Vec<_> = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(set_cookies.len(), 1);
+        assert!(set_cookies[0].starts_with("theme=dark"));
+        assert!(set_cookies
+            .iter()
+            .all(|value| !value.starts_with("session=old")));
+    }
+}

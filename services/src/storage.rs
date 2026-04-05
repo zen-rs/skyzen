@@ -267,3 +267,180 @@ impl Middleware for Storage {
             .map_err(MiddlewareError::Endpoint)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError,
+        StorageNotConfigured, StorageObject,
+    };
+    use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
+    use skyzen_core::Extractor;
+    use std::{
+        collections::HashMap,
+        convert::Infallible,
+        sync::{Arc, RwLock},
+    };
+
+    #[derive(Clone, Default)]
+    struct InMemoryObjectStorage {
+        data: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    }
+
+    impl InMemoryObjectStorage {
+        fn metadata_for(key: &str, body: &[u8]) -> ObjectMetadata {
+            ObjectMetadata {
+                key: key.to_owned(),
+                size: body.len() as u64,
+                content_type: None,
+                last_modified: None,
+                metadata: HashMap::new(),
+            }
+        }
+    }
+
+    impl ObjectStorage for InMemoryObjectStorage {
+        async fn get(&self, key: &str) -> Result<Option<StorageObject>, StorageError> {
+            let data = self
+                .data
+                .read()
+                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?;
+            Ok(data.get(key).map(|body| StorageObject {
+                body: body.clone(),
+                metadata: Self::metadata_for(key, body),
+            }))
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StorageError> {
+            self.data
+                .write()
+                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?
+                .insert(key.to_owned(), body);
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.data
+                .write()
+                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?
+                .remove(key);
+            Ok(())
+        }
+
+        async fn list(&self, options: ListOptions) -> Result<ListResult, StorageError> {
+            let data = self
+                .data
+                .read()
+                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?;
+            let mut objects: Vec<ObjectMetadata> = data
+                .iter()
+                .filter(|(key, _)| {
+                    options
+                        .prefix
+                        .as_ref()
+                        .is_none_or(|prefix| key.starts_with(prefix))
+                })
+                .map(|(key, body)| Self::metadata_for(key, body))
+                .collect();
+            objects.sort_by(|left, right| left.key.cmp(&right.key));
+            if let Some(limit) = options.limit {
+                objects.truncate(limit);
+            }
+
+            Ok(ListResult {
+                objects,
+                cursor: None,
+            })
+        }
+
+        async fn head(&self, key: &str) -> Result<Option<ObjectMetadata>, StorageError> {
+            let data = self
+                .data
+                .read()
+                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?;
+            Ok(data.get(key).map(|body| Self::metadata_for(key, body)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadStorageEndpoint;
+
+    impl Endpoint for ReadStorageEndpoint {
+        type Error = Infallible;
+
+        async fn respond(
+            &mut self,
+            request: &mut http_kit::Request,
+        ) -> Result<Response, Self::Error> {
+            let storage = Storage::extract(request).await.expect("storage should be injected");
+            let object = storage
+                .get("file.txt")
+                .await
+                .expect("storage access should succeed")
+                .expect("object should exist");
+            Ok(Response::new(Body::from(object.body)))
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapper_supports_crud_list_and_head_operations() {
+        let storage = Storage::new(InMemoryObjectStorage::default());
+
+        storage.put("prefix:a.txt", b"a".to_vec()).await.unwrap();
+        storage.put("prefix:b.txt", b"bb".to_vec()).await.unwrap();
+        storage.put("other.txt", b"ccc".to_vec()).await.unwrap();
+
+        let object = storage.get("prefix:b.txt").await.unwrap().unwrap();
+        assert_eq!(object.body, b"bb".to_vec());
+        assert_eq!(object.metadata.size, 2);
+
+        let head = storage.head("prefix:b.txt").await.unwrap().unwrap();
+        assert_eq!(head.key, "prefix:b.txt");
+        assert_eq!(head.size, 2);
+
+        let listed = storage
+            .list(ListOptions {
+                prefix: Some("prefix:".to_owned()),
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.objects.len(), 1);
+        assert!(listed.objects[0].key.starts_with("prefix:"));
+
+        storage.delete("prefix:a.txt").await.unwrap();
+        assert!(storage.get("prefix:a.txt").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn middleware_injects_storage_for_downstream_endpoint_and_extractor() {
+        let backend = InMemoryObjectStorage::default();
+        backend.put("file.txt", b"hello".to_vec()).await.unwrap();
+        let mut storage = Storage::new(backend);
+        let mut request = http_kit::Request::new(Body::empty());
+
+        let response = storage.handle(&mut request, ReadStorageEndpoint).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "hello");
+
+        let extracted = Storage::extract(&mut request).await.unwrap();
+        let object = extracted.get("file.txt").await.unwrap().unwrap();
+        assert_eq!(object.body, b"hello".to_vec());
+    }
+
+    #[tokio::test]
+    async fn extractor_returns_internal_server_error_when_storage_is_missing() {
+        let mut request = http_kit::Request::new(Body::empty());
+
+        let error = Storage::extract(&mut request).await.unwrap_err();
+
+        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn missing_configuration_error_uses_expected_status() {
+        let error = StorageNotConfigured::new();
+        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

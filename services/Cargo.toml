@@ -31,5 +31,8 @@ postgres = []
 mysql = []
 sqlite = []
 
+[dev-dependencies]
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true

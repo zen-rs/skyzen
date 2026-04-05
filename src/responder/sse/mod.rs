@@ -86,6 +86,7 @@ impl Event {
         let mut event = Self::empty();
         event.buffer.extend_from_slice(b"data:");
         serde_json::to_writer(&mut event.buffer, &v)?;
+        event.buffer.push(b'\n');
         Ok(event)
     }
 
@@ -239,5 +240,105 @@ impl Responder for Sse {
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
         *response.body_mut() = self.stream;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{convert::Infallible, time::Duration};
+
+    use futures_util::stream::once;
+    use http_kit::HttpError;
+    use serde::Serialize;
+    use skyzen_core::Responder;
+
+    use super::{Event, Sse};
+    use crate::{header, Body, Request, Response};
+
+    #[derive(Debug, Serialize)]
+    struct Payload {
+        name: &'static str,
+    }
+
+    #[test]
+    fn formats_data_event_with_id_and_event_name() {
+        let bytes = Event::data("hello").id("evt-1").event("message").finalize();
+
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "data:hello\nid:evt-1\nevent:message\n\n"
+        );
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_event_serializes_payload() {
+        let bytes = Event::json(Payload { name: "skyzen" }).unwrap().finalize();
+
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "data:{\"name\":\"skyzen\"}\n\n"
+        );
+    }
+
+    #[test]
+    fn comment_and_retry_events_have_expected_wire_format() {
+        assert_eq!(
+            String::from_utf8(Event::comment("keepalive").finalize()).unwrap(),
+            ":keepalive\n\n"
+        );
+        assert_eq!(
+            String::from_utf8(Event::retry(Duration::from_millis(1500)).finalize()).unwrap(),
+            "retry:1500\n\n"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "SSE field value cannot include newline")]
+    fn event_fields_reject_newlines() {
+        let _ = Event::data("hello\nworld");
+    }
+
+    #[tokio::test]
+    async fn from_stream_sets_headers_and_serializes_event_stream() {
+        let request = Request::new(Body::empty());
+        let mut response = Response::new(Body::empty());
+        let sse = Sse::from_stream(once(async { Ok::<_, Infallible>(Event::data("hello")) }));
+
+        sse.respond_to(&request, &mut response).unwrap();
+
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "data:hello\n\n");
+    }
+
+    #[tokio::test]
+    async fn channel_sender_delivers_events_and_closes_cleanly() {
+        let (sender, sse) = Sse::channel();
+        let request = Request::new(Body::empty());
+        let mut response = Response::new(Body::empty());
+
+        sse.respond_to(&request, &mut response).unwrap();
+        sender.send_data("hello").await.unwrap();
+        drop(sender);
+
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "data:hello\n\n");
+    }
+
+    #[tokio::test]
+    async fn sender_reports_error_after_stream_is_dropped() {
+        let (sender, sse) = Sse::channel();
+        drop(sse);
+
+        let error = sender.send_data("hello").await.unwrap_err();
+        assert_eq!(error.status(), crate::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

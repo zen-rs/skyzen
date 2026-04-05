@@ -121,7 +121,9 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
 }
 
 fn extract<T: Send + Sync + DeserializeOwned>(data: &str) -> Result<Form<T>, FormContentTypeError> {
-    from_str(data).map(Form).map_err(|_| FormContentTypeError::InvalidPayload)
+    from_str(data)
+        .map(Form)
+        .map_err(|_| FormContentTypeError::InvalidPayload)
 }
 
 impl_deref!(Form);
@@ -174,7 +176,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_payload() {
-        let mut request = request("remember=not-a-bool", Some("application/x-www-form-urlencoded"));
+        let mut request = request(
+            "remember=not-a-bool",
+            Some("application/x-www-form-urlencoded"),
+        );
         let error = Form::<LoginForm>::extract(&mut request).await.unwrap_err();
         assert!(matches!(error, FormContentTypeError::InvalidPayload));
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
