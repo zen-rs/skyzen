@@ -26,6 +26,7 @@ sqlx = { version = "0.8", default-features = false, features = ["json", "postgre
 runtime-tokio-native-tls = ["sqlx/runtime-tokio-native-tls"]
 runtime-tokio-rustls = ["sqlx/runtime-tokio-rustls"]
 runtime-async-std-native-tls = ["sqlx/runtime-async-std-native-tls"]
+runtime-async-std-rustls = ["sqlx/runtime-async-std-rustls"]
 # Database backends
 postgres = []
 mysql = []

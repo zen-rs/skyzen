@@ -341,7 +341,10 @@ mod tests {
     use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
     use serde::{Deserialize, Serialize};
     use skyzen_core::Extractor;
-    use std::{convert::Infallible, sync::{Arc, RwLock}};
+    use std::{
+        convert::Infallible,
+        sync::{Arc, RwLock},
+    };
 
     #[derive(Clone, Default)]
     struct InMemoryMessageQueue {
@@ -376,7 +379,9 @@ mod tests {
             &mut self,
             request: &mut http_kit::Request,
         ) -> Result<Response, Self::Error> {
-            let queue = Queue::extract(request).await.expect("queue should be injected");
+            let queue = Queue::extract(request)
+                .await
+                .expect("queue should be injected");
             queue
                 .send(b"from-endpoint")
                 .await
@@ -523,7 +528,10 @@ mod tests {
         extracted.send(b"from-extractor").await.unwrap();
 
         let messages = backend.messages.read().unwrap().clone();
-        assert_eq!(messages, vec![b"from-endpoint".to_vec(), b"from-extractor".to_vec()]);
+        assert_eq!(
+            messages,
+            vec![b"from-endpoint".to_vec(), b"from-extractor".to_vec()]
+        );
     }
 
     #[tokio::test]
@@ -532,12 +540,18 @@ mod tests {
 
         let error = Queue::extract(&mut request).await.unwrap_err();
 
-        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.status(),
+            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
     fn missing_configuration_error_uses_expected_status() {
         let error = QueueNotConfigured::new();
-        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.status(),
+            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

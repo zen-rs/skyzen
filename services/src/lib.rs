@@ -45,7 +45,7 @@ pub use queue::{
     MessageQueue, Queue, QueueBatch, QueueBatchDisposition, QueueError, QueueMessage,
     QueueMessageDisposition, QueueRetry,
 };
-pub use sql::{Db, DbBackend, DbError, DbExecResult, DbValue};
+pub use sql::{Db, DbBackend, DbError, DbExecResult, DbTransaction, DbTransactionBackend, DbValue};
 pub use storage::{
     ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError, StorageObject,
 };

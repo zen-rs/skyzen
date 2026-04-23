@@ -46,6 +46,10 @@ pub enum DbError {
     /// A query expected one row but none were returned.
     #[error("database row not found")]
     RowNotFound,
+
+    /// The database backend does not support transactions.
+    #[error("database transactions are not supported by this backend")]
+    TransactionsUnsupported,
 }
 
 /// A SQL parameter value.
@@ -198,6 +202,41 @@ pub trait DbBackend: Send + Sync + Clone + 'static {
         query: &str,
         params: &[DbValue],
     ) -> impl Future<Output = Result<DbExecResult, DbError>> + MaybeSend;
+
+    /// Begin a database transaction.
+    fn begin(&self) -> impl Future<Output = Result<DbTransaction, DbError>> + MaybeSend {
+        async { Err(DbError::TransactionsUnsupported) }
+    }
+}
+
+/// A mutable database transaction backend.
+pub trait DbTransactionBackend: Send + 'static {
+    /// Which SQL dialect this transaction expects.
+    fn dialect(&self) -> DbDialect;
+
+    /// Execute a statement that returns rows inside this transaction.
+    fn query(
+        &mut self,
+        query: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + MaybeSend;
+
+    /// Execute a statement that does not return rows inside this transaction.
+    fn execute(
+        &mut self,
+        query: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + MaybeSend;
+
+    /// Commit this transaction.
+    fn commit(self) -> impl Future<Output = Result<(), DbError>> + MaybeSend
+    where
+        Self: Sized;
+
+    /// Roll back this transaction.
+    fn rollback(self) -> impl Future<Output = Result<(), DbError>> + MaybeSend
+    where
+        Self: Sized;
 }
 
 trait DbBackendObj: Send + Sync {
@@ -212,7 +251,24 @@ trait DbBackendObj: Send + Sync {
         query: &'a str,
         params: &'a [DbValue],
     ) -> BoxFuture<'a, Result<DbExecResult, DbError>>;
+    fn begin<'a>(&'a self) -> BoxFuture<'a, Result<DbTransaction, DbError>>;
     fn clone_box(&self) -> Box<dyn DbBackendObj>;
+}
+
+trait DbTransactionBackendObj: Send {
+    fn dialect(&self) -> DbDialect;
+    fn query<'a>(
+        &'a mut self,
+        query: &'a str,
+        params: &'a [DbValue],
+    ) -> BoxFuture<'a, Result<DbExecResult, DbError>>;
+    fn execute<'a>(
+        &'a mut self,
+        query: &'a str,
+        params: &'a [DbValue],
+    ) -> BoxFuture<'a, Result<DbExecResult, DbError>>;
+    fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), DbError>>;
+    fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), DbError>>;
 }
 
 impl<T: DbBackend> DbBackendObj for T {
@@ -236,8 +292,42 @@ impl<T: DbBackend> DbBackendObj for T {
         Box::pin(DbBackend::execute(self, query, params))
     }
 
+    fn begin<'a>(&'a self) -> BoxFuture<'a, Result<DbTransaction, DbError>> {
+        Box::pin(DbBackend::begin(self))
+    }
+
     fn clone_box(&self) -> Box<dyn DbBackendObj> {
         Box::new(self.clone())
+    }
+}
+
+impl<T: DbTransactionBackend> DbTransactionBackendObj for T {
+    fn dialect(&self) -> DbDialect {
+        DbTransactionBackend::dialect(self)
+    }
+
+    fn query<'a>(
+        &'a mut self,
+        query: &'a str,
+        params: &'a [DbValue],
+    ) -> BoxFuture<'a, Result<DbExecResult, DbError>> {
+        Box::pin(DbTransactionBackend::query(self, query, params))
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+        query: &'a str,
+        params: &'a [DbValue],
+    ) -> BoxFuture<'a, Result<DbExecResult, DbError>> {
+        Box::pin(DbTransactionBackend::execute(self, query, params))
+    }
+
+    fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), DbError>> {
+        Box::pin(async move { DbTransactionBackend::commit(*self).await })
+    }
+
+    fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), DbError>> {
+        Box::pin(async move { DbTransactionBackend::rollback(*self).await })
     }
 }
 
@@ -270,6 +360,11 @@ impl Db {
             sql: Cow::Borrowed(sql),
             params: Vec::new(),
         }
+    }
+
+    /// Begin a database transaction.
+    pub async fn begin(&self) -> Result<DbTransaction, DbError> {
+        self.0.begin().await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -315,6 +410,41 @@ impl Db {
                 .await
                 .map_err(sqlx_error)?,
         )))
+    }
+}
+
+/// A type-erased database transaction.
+pub struct DbTransaction(Box<dyn DbTransactionBackendObj>);
+
+impl std::fmt::Debug for DbTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbTransaction").finish_non_exhaustive()
+    }
+}
+
+impl DbTransaction {
+    /// Wrap a concrete transaction backend.
+    pub fn new(tx: impl DbTransactionBackend) -> Self {
+        Self(Box::new(tx))
+    }
+
+    /// Start building a SQL query within this transaction.
+    pub fn query<'a>(&'a mut self, sql: &'a str) -> DbTransactionQuery<'a> {
+        DbTransactionQuery {
+            tx: self,
+            sql: Cow::Borrowed(sql),
+            params: Vec::new(),
+        }
+    }
+
+    /// Commit this transaction.
+    pub async fn commit(self) -> Result<(), DbError> {
+        self.0.commit().await
+    }
+
+    /// Roll this transaction back.
+    pub async fn rollback(self) -> Result<(), DbError> {
+        self.0.rollback().await
     }
 }
 
@@ -364,6 +494,69 @@ impl<'a> DbQuery<'a> {
     {
         let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.db.0.dialect())?;
         let result = self.db.0.query(&sql, &self.params).await?;
+        result
+            .rows
+            .into_iter()
+            .next()
+            .map(|row| serde_json::from_value(row).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Execute a query and deserialize exactly one row into `T`.
+    pub async fn fetch_one<T>(self) -> Result<T, DbError>
+    where
+        T: DeserializeOwned,
+    {
+        self.fetch_optional().await?.ok_or(DbError::RowNotFound)
+    }
+}
+
+/// A query builder scoped to a mutable transaction.
+#[derive(Debug)]
+pub struct DbTransactionQuery<'a> {
+    tx: &'a mut DbTransaction,
+    sql: Cow<'a, str>,
+    params: Vec<DbValue>,
+}
+
+impl<'a> DbTransactionQuery<'a> {
+    /// Bind a parameter value to the query.
+    #[must_use]
+    pub fn bind<T>(mut self, value: T) -> Self
+    where
+        T: Into<DbValue>,
+    {
+        self.params.push(value.into());
+        self
+    }
+
+    /// Execute a statement that does not return rows.
+    pub async fn execute(self) -> Result<DbExecResult, DbError> {
+        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.tx.0.dialect())?;
+        self.tx.0.execute(&sql, &self.params).await
+    }
+
+    /// Execute a query and deserialize all rows into `T`.
+    pub async fn fetch_all<T>(self) -> Result<Vec<T>, DbError>
+    where
+        T: DeserializeOwned,
+    {
+        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.tx.0.dialect())?;
+        let result = self.tx.0.query(&sql, &self.params).await?;
+        result
+            .rows
+            .into_iter()
+            .map(|row| serde_json::from_value(row).map_err(Into::into))
+            .collect()
+    }
+
+    /// Execute a query and deserialize the first row into `T`, if present.
+    pub async fn fetch_optional<T>(self) -> Result<Option<T>, DbError>
+    where
+        T: DeserializeOwned,
+    {
+        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.tx.0.dialect())?;
+        let result = self.tx.0.query(&sql, &self.params).await?;
         result
             .rows
             .into_iter()
@@ -523,6 +716,13 @@ enum NativeDbBackend {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+enum NativeDbTransaction {
+    Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
+    MySql(sqlx::Transaction<'static, sqlx::MySql>),
+    Sqlite(sqlx::Transaction<'static, sqlx::Sqlite>),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl DbBackend for NativeDbBackend {
     fn dialect(&self) -> DbDialect {
         match self {
@@ -545,6 +745,64 @@ impl DbBackend for NativeDbBackend {
             Self::Postgres(pool) => execute_postgres(pool, query, params).await,
             Self::MySql(pool) => execute_mysql(pool, query, params).await,
             Self::Sqlite(pool) => execute_sqlite(pool, query, params).await,
+        }
+    }
+
+    async fn begin(&self) -> Result<DbTransaction, DbError> {
+        let tx = match self {
+            Self::Postgres(pool) => {
+                NativeDbTransaction::Postgres(pool.begin().await.map_err(sqlx_error)?)
+            }
+            Self::MySql(pool) => {
+                NativeDbTransaction::MySql(pool.begin().await.map_err(sqlx_error)?)
+            }
+            Self::Sqlite(pool) => {
+                NativeDbTransaction::Sqlite(pool.begin().await.map_err(sqlx_error)?)
+            }
+        };
+        Ok(DbTransaction::new(tx))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DbTransactionBackend for NativeDbTransaction {
+    fn dialect(&self) -> DbDialect {
+        match self {
+            Self::Postgres(_) => DbDialect::Postgres,
+            Self::MySql(_) => DbDialect::MySql,
+            Self::Sqlite(_) => DbDialect::Sqlite,
+        }
+    }
+
+    async fn query(&mut self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DbError> {
+        match self {
+            Self::Postgres(tx) => query_postgres_with(&mut **tx, query, params).await,
+            Self::MySql(tx) => query_mysql_with(&mut **tx, query, params).await,
+            Self::Sqlite(tx) => query_sqlite_with(&mut **tx, query, params).await,
+        }
+    }
+
+    async fn execute(&mut self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DbError> {
+        match self {
+            Self::Postgres(tx) => execute_postgres_with(&mut **tx, query, params).await,
+            Self::MySql(tx) => execute_mysql_with(&mut **tx, query, params).await,
+            Self::Sqlite(tx) => execute_sqlite_with(&mut **tx, query, params).await,
+        }
+    }
+
+    async fn commit(self) -> Result<(), DbError> {
+        match self {
+            Self::Postgres(tx) => tx.commit().await.map_err(sqlx_error),
+            Self::MySql(tx) => tx.commit().await.map_err(sqlx_error),
+            Self::Sqlite(tx) => tx.commit().await.map_err(sqlx_error),
+        }
+    }
+
+    async fn rollback(self) -> Result<(), DbError> {
+        match self {
+            Self::Postgres(tx) => tx.rollback().await.map_err(sqlx_error),
+            Self::MySql(tx) => tx.rollback().await.map_err(sqlx_error),
+            Self::Sqlite(tx) => tx.rollback().await.map_err(sqlx_error),
         }
     }
 }
@@ -578,8 +836,20 @@ async fn execute_postgres(
     query: &str,
     params: &[DbValue],
 ) -> Result<DbExecResult, DbError> {
+    execute_postgres_with(pool, query, params).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn execute_postgres_with<'e, E>(
+    executor: E,
+    query: &str,
+    params: &[DbValue],
+) -> Result<DbExecResult, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let query = bind_query_values!(sqlx::query(query), params);
-    let result = query.execute(pool).await.map_err(sqlx_error)?;
+    let result = query.execute(executor).await.map_err(sqlx_error)?;
     Ok(DbExecResult {
         rows: Vec::new(),
         rows_read: 0,
@@ -593,8 +863,20 @@ async fn execute_mysql(
     query: &str,
     params: &[DbValue],
 ) -> Result<DbExecResult, DbError> {
+    execute_mysql_with(pool, query, params).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn execute_mysql_with<'e, E>(
+    executor: E,
+    query: &str,
+    params: &[DbValue],
+) -> Result<DbExecResult, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
     let query = bind_query_values!(sqlx::query(query), params);
-    let result = query.execute(pool).await.map_err(sqlx_error)?;
+    let result = query.execute(executor).await.map_err(sqlx_error)?;
     Ok(DbExecResult {
         rows: Vec::new(),
         rows_read: 0,
@@ -608,8 +890,20 @@ async fn execute_sqlite(
     query: &str,
     params: &[DbValue],
 ) -> Result<DbExecResult, DbError> {
+    execute_sqlite_with(pool, query, params).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn execute_sqlite_with<'e, E>(
+    executor: E,
+    query: &str,
+    params: &[DbValue],
+) -> Result<DbExecResult, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let query = bind_query_values!(sqlx::query(query), params);
-    let result = query.execute(pool).await.map_err(sqlx_error)?;
+    let result = query.execute(executor).await.map_err(sqlx_error)?;
     Ok(DbExecResult {
         rows: Vec::new(),
         rows_read: 0,
@@ -623,8 +917,20 @@ async fn query_postgres(
     query: &str,
     params: &[DbValue],
 ) -> Result<DbExecResult, DbError> {
+    query_postgres_with(pool, query, params).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn query_postgres_with<'e, E>(
+    executor: E,
+    query: &str,
+    params: &[DbValue],
+) -> Result<DbExecResult, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let query = bind_query_values!(sqlx::query(query), params);
-    let rows = query.fetch_all(pool).await.map_err(sqlx_error)?;
+    let rows = query.fetch_all(executor).await.map_err(sqlx_error)?;
     let rows_json = rows
         .iter()
         .map(postgres_row_to_json)
@@ -642,8 +948,20 @@ async fn query_mysql(
     query: &str,
     params: &[DbValue],
 ) -> Result<DbExecResult, DbError> {
+    query_mysql_with(pool, query, params).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn query_mysql_with<'e, E>(
+    executor: E,
+    query: &str,
+    params: &[DbValue],
+) -> Result<DbExecResult, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
     let query = bind_query_values!(sqlx::query(query), params);
-    let rows = query.fetch_all(pool).await.map_err(sqlx_error)?;
+    let rows = query.fetch_all(executor).await.map_err(sqlx_error)?;
     let rows_json = rows
         .iter()
         .map(mysql_row_to_json)
@@ -661,8 +979,20 @@ async fn query_sqlite(
     query: &str,
     params: &[DbValue],
 ) -> Result<DbExecResult, DbError> {
+    query_sqlite_with(pool, query, params).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn query_sqlite_with<'e, E>(
+    executor: E,
+    query: &str,
+    params: &[DbValue],
+) -> Result<DbExecResult, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let query = bind_query_values!(sqlx::query(query), params);
-    let rows = query.fetch_all(pool).await.map_err(sqlx_error)?;
+    let rows = query.fetch_all(executor).await.map_err(sqlx_error)?;
     let rows_json = rows
         .iter()
         .map(sqlite_row_to_json)
@@ -819,6 +1149,9 @@ fn sqlite_value_to_json(
     type_name: &str,
 ) -> Result<serde_json::Value, DbError> {
     match type_name {
+        "BOOLEAN" | "BOOL" => Ok(option_to_json(
+            row.try_get::<Option<bool>, _>(index).map_err(sqlx_error)?,
+        )),
         "INTEGER" | "INT" => Ok(option_to_json(
             row.try_get::<Option<i64>, _>(index).map_err(sqlx_error)?,
         )),
@@ -833,12 +1166,28 @@ fn sqlite_value_to_json(
             row.try_get::<Option<String>, _>(index)
                 .map_err(sqlx_error)?,
         )),
-        _ => fallback_value_to_json(
-            row.try_get::<Option<String>, _>(index)
-                .map_err(sqlx_error)?,
-            row.try_get::<Option<Vec<u8>>, _>(index).ok(),
-        ),
+        _ => sqlite_dynamic_value_to_json(row, index),
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sqlite_dynamic_value_to_json(
+    row: &sqlx::sqlite::SqliteRow,
+    index: usize,
+) -> Result<serde_json::Value, DbError> {
+    if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
+        return Ok(option_to_json(value));
+    }
+    if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
+        return Ok(option_to_json(value));
+    }
+    if let Ok(value) = row.try_get::<Option<String>, _>(index) {
+        return Ok(option_to_json(value));
+    }
+    if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index) {
+        return Ok(option_to_json(value));
+    }
+    Ok(serde_json::Value::Null)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -873,4 +1222,75 @@ fn option_to_json_i64(value: Option<i64>) -> Result<serde_json::Value, DbError> 
 #[cfg(not(target_arch = "wasm32"))]
 fn option_to_json_f64(value: Option<f64>) -> Result<serde_json::Value, DbError> {
     Ok(value.map_or(serde_json::Value::Null, |value| serde_json::json!(value)))
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    any(
+        feature = "runtime-tokio-native-tls",
+        feature = "runtime-tokio-rustls",
+        feature = "runtime-async-std-native-tls",
+        feature = "runtime-async-std-rustls"
+    )
+))]
+mod tests {
+    use super::Db;
+
+    #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+    struct CountRow {
+        count: i64,
+    }
+
+    #[tokio::test]
+    async fn sqlite_transaction_commit_persists_changes() {
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory sqlite should connect");
+        db.query("CREATE TABLE entries (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .expect("schema should be created");
+
+        let mut tx = db.begin().await.expect("transaction should begin");
+        tx.query("INSERT INTO entries (value) VALUES (?)")
+            .bind(1_i64)
+            .execute()
+            .await
+            .expect("insert should succeed");
+        tx.commit().await.expect("commit should succeed");
+
+        let row = db
+            .query("SELECT COUNT(*) AS count FROM entries")
+            .fetch_one::<CountRow>()
+            .await
+            .expect("count query should succeed");
+        assert_eq!(row, CountRow { count: 1 });
+    }
+
+    #[tokio::test]
+    async fn sqlite_transaction_rollback_discards_changes() {
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory sqlite should connect");
+        db.query("CREATE TABLE entries (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .expect("schema should be created");
+
+        let mut tx = db.begin().await.expect("transaction should begin");
+        tx.query("INSERT INTO entries (value) VALUES (?)")
+            .bind(1_i64)
+            .execute()
+            .await
+            .expect("insert should succeed");
+        tx.rollback().await.expect("rollback should succeed");
+
+        let row = db
+            .query("SELECT COUNT(*) AS count FROM entries")
+            .fetch_one::<CountRow>()
+            .await
+            .expect("count query should succeed");
+        assert_eq!(row, CountRow { count: 0 });
+    }
 }

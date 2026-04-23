@@ -159,7 +159,10 @@ mod tests {
     use super::{Alarm, AlarmError, AlarmNotConfigured, AlarmScheduler};
     use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
     use skyzen_core::Extractor;
-    use std::{convert::Infallible, sync::{Arc, RwLock}};
+    use std::{
+        convert::Infallible,
+        sync::{Arc, RwLock},
+    };
 
     #[derive(Clone, Default)]
     struct InMemoryAlarmScheduler {
@@ -179,7 +182,8 @@ mod tests {
             *self
                 .scheduled
                 .write()
-                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? = Some(scheduled_time_ms);
+                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? =
+                Some(scheduled_time_ms);
             Ok(())
         }
 
@@ -202,7 +206,9 @@ mod tests {
             &mut self,
             request: &mut http_kit::Request,
         ) -> Result<Response, Self::Error> {
-            let alarm = Alarm::extract(request).await.expect("alarm should be injected");
+            let alarm = Alarm::extract(request)
+                .await
+                .expect("alarm should be injected");
             let scheduled = alarm
                 .get_alarm()
                 .await
@@ -244,12 +250,18 @@ mod tests {
 
         let error = Alarm::extract(&mut request).await.unwrap_err();
 
-        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.status(),
+            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
     fn missing_configuration_error_uses_expected_status() {
         let error = AlarmNotConfigured::new();
-        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.status(),
+            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

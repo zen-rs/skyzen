@@ -343,7 +343,9 @@ impl Middleware for DurableKv {
 
 #[cfg(test)]
 mod tests {
-    use super::{DurableKv, DurableKvError, DurableKvStore, DurableKvNotConfigured, DurableListOptions};
+    use super::{
+        DurableKv, DurableKvError, DurableKvNotConfigured, DurableKvStore, DurableListOptions,
+    };
     use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
     use serde::{Deserialize, Serialize};
     use skyzen_core::Extractor;
@@ -377,7 +379,10 @@ mod tests {
                 .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
             Ok(keys
                 .iter()
-                .filter_map(|key| data.get(*key).map(|value| ((*key).to_owned(), value.clone())))
+                .filter_map(|key| {
+                    data.get(*key)
+                        .map(|value| ((*key).to_owned(), value.clone()))
+                })
                 .collect())
         }
 
@@ -414,7 +419,10 @@ mod tests {
                 .data
                 .write()
                 .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
-            Ok(keys.iter().filter(|key| data.remove(**key).is_some()).count())
+            Ok(keys
+                .iter()
+                .filter(|key| data.remove(**key).is_some())
+                .count())
         }
 
         async fn delete_all(&self) -> Result<(), DurableKvError> {
@@ -461,7 +469,9 @@ mod tests {
             &mut self,
             request: &mut http_kit::Request,
         ) -> Result<Response, Self::Error> {
-            let kv = DurableKv::extract(request).await.expect("durable kv should be injected");
+            let kv = DurableKv::extract(request)
+                .await
+                .expect("durable kv should be injected");
             let body = kv
                 .get("message")
                 .await
@@ -495,7 +505,9 @@ mod tests {
 
         assert_eq!(kv.get("alpha").await.unwrap(), Some(b"1".to_vec()));
         assert_eq!(
-            kv.get_multiple(&["alpha", "missing", "beta"]).await.unwrap(),
+            kv.get_multiple(&["alpha", "missing", "beta"])
+                .await
+                .unwrap(),
             vec![
                 ("alpha".to_owned(), b"1".to_vec()),
                 ("beta".to_owned(), b"2".to_vec()),
@@ -535,7 +547,11 @@ mod tests {
         assert!(kv.delete("alpha").await.unwrap());
         assert_eq!(kv.delete_multiple(&["beta", "missing"]).await.unwrap(), 1);
         kv.delete_all().await.unwrap();
-        assert!(kv.list(DurableListOptions::default()).await.unwrap().is_empty());
+        assert!(kv
+            .list(DurableListOptions::default())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -555,12 +571,18 @@ mod tests {
         let mut kv = DurableKv::new(store);
         let mut request = http_kit::Request::new(Body::empty());
 
-        let response = kv.handle(&mut request, ReadDurableKvEndpoint).await.unwrap();
+        let response = kv
+            .handle(&mut request, ReadDurableKvEndpoint)
+            .await
+            .unwrap();
         let body = response.into_body().into_string().await.unwrap();
         assert_eq!(body, "hello");
 
         let extracted = DurableKv::extract(&mut request).await.unwrap();
-        assert_eq!(extracted.get("message").await.unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(
+            extracted.get("message").await.unwrap(),
+            Some(b"hello".to_vec())
+        );
     }
 
     #[tokio::test]
@@ -569,12 +591,18 @@ mod tests {
 
         let error = DurableKv::extract(&mut request).await.unwrap_err();
 
-        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.status(),
+            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
     fn missing_configuration_error_uses_expected_status() {
         let error = DurableKvNotConfigured::new();
-        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.status(),
+            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

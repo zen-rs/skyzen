@@ -231,6 +231,13 @@ where
     }
 }
 
+#[cfg(not(feature = "openapi"))]
+fn register_type<T>(_defs: &mut BTreeMap<String, SchemaRef>)
+where
+    T: crate::PartialSchema + crate::ToSchema,
+{
+}
+
 struct SchemaProbe<T>(PhantomData<T>);
 
 trait MaybeSchemaProbe {

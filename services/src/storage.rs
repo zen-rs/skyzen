@@ -372,7 +372,9 @@ mod tests {
             &mut self,
             request: &mut http_kit::Request,
         ) -> Result<Response, Self::Error> {
-            let storage = Storage::extract(request).await.expect("storage should be injected");
+            let storage = Storage::extract(request)
+                .await
+                .expect("storage should be injected");
             let object = storage
                 .get("file.txt")
                 .await
@@ -420,7 +422,10 @@ mod tests {
         let mut storage = Storage::new(backend);
         let mut request = http_kit::Request::new(Body::empty());
 
-        let response = storage.handle(&mut request, ReadStorageEndpoint).await.unwrap();
+        let response = storage
+            .handle(&mut request, ReadStorageEndpoint)
+            .await
+            .unwrap();
         let body = response.into_body().into_string().await.unwrap();
         assert_eq!(body, "hello");
 
@@ -435,12 +440,18 @@ mod tests {
 
         let error = Storage::extract(&mut request).await.unwrap_err();
 
-        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.status(),
+            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
     fn missing_configuration_error_uses_expected_status() {
         let error = StorageNotConfigured::new();
-        assert_eq!(error.status(), skyzen_core::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.status(),
+            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

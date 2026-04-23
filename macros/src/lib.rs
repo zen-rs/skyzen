@@ -2784,7 +2784,7 @@ mod tests {
         database_ident_from_name, default_database_index, documented_extractor_payload,
         documented_response_payload, first_generic_type, generate_cloudflare_database_init,
         generate_native_service_init, ident_from_name, load_databases_from_value,
-        load_services_from_value, lookup_table, looks_like_env_name, parse_env_ref,
+        load_services_from_value, looks_like_env_name, lookup_table, parse_env_ref,
         single_generic_type, DatabaseConfig, DatabaseType, ServiceType,
     };
     use quote::ToTokens;
@@ -2914,23 +2914,27 @@ binding = "DB"
         let result_ty = parse_quote!(Result<Form<LoginForm>>);
         let plain_ty = parse_quote!(String);
 
-        let (json_inner, json_content_type) =
-            documented_extractor_payload(&json_ty).unwrap().expect("json payload");
+        let (json_inner, json_content_type) = documented_extractor_payload(&json_ty)
+            .unwrap()
+            .expect("json payload");
         assert_eq!(json_inner.into_token_stream().to_string(), "CreateWidget");
         assert_eq!(json_content_type, "application/json");
 
-        let (form_inner, form_content_type) =
-            documented_extractor_payload(&form_ty).unwrap().expect("form payload");
+        let (form_inner, form_content_type) = documented_extractor_payload(&form_ty)
+            .unwrap()
+            .expect("form payload");
         assert_eq!(form_inner.into_token_stream().to_string(), "LoginForm");
         assert_eq!(form_content_type, "application/x-www-form-urlencoded");
 
-        let (query_inner, query_content_type) =
-            documented_extractor_payload(&query_ty).unwrap().expect("query payload");
+        let (query_inner, query_content_type) = documented_extractor_payload(&query_ty)
+            .unwrap()
+            .expect("query payload");
         assert_eq!(query_inner.into_token_stream().to_string(), "SearchParams");
         assert_eq!(query_content_type, "application/x-www-form-urlencoded");
 
-        let (result_inner, result_content_type) =
-            documented_response_payload(&result_ty).unwrap().expect("result payload");
+        let (result_inner, result_content_type) = documented_response_payload(&result_ty)
+            .unwrap()
+            .expect("result payload");
         assert_eq!(result_inner.into_token_stream().to_string(), "LoginForm");
         assert_eq!(result_content_type, "application/x-www-form-urlencoded");
 
@@ -3005,13 +3009,22 @@ binding = "DB"
 
     #[test]
     fn env_reference_helpers_and_identifier_normalization_are_stable() {
-        assert_eq!(parse_env_ref("${DATABASE_URL}"), Some("DATABASE_URL".to_owned()));
+        assert_eq!(
+            parse_env_ref("${DATABASE_URL}"),
+            Some("DATABASE_URL".to_owned())
+        );
         assert_eq!(parse_env_ref("DATABASE_URL"), None);
         assert!(looks_like_env_name("DATABASE_URL_2"));
         assert!(!looks_like_env_name("database-url"));
 
-        assert_eq!(ident_from_name("cache-service").unwrap().to_string(), "cache_service");
+        assert_eq!(
+            ident_from_name("cache-service").unwrap().to_string(),
+            "cache_service"
+        );
         assert_eq!(ident_from_name("9cache").unwrap().to_string(), "_9cache");
-        assert_eq!(database_ident_from_name("primary").unwrap().to_string(), "PrimaryDb");
+        assert_eq!(
+            database_ident_from_name("primary").unwrap().to_string(),
+            "PrimaryDb"
+        );
     }
 }

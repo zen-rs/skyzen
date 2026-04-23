@@ -1,8 +1,8 @@
 [workspace]
-members = ["core", "hyper", "macros", "services", "test", "redis", "s3", "cloudflare", "aws", "azure", "cli"]
+members = ["core", "hyper", "macros", "services", "test", "redis", "s3", "cloudflare", "cloudflare-admin", "aws", "azure", "cli"]
 # cloudflare is wasm32-only — exclude from default builds, build with:
 #   cargo check -p skyzen-cloudflare --target wasm32-unknown-unknown
-default-members = ["core", "hyper", "macros", "services", "test", "redis", "s3", "aws", "azure", "cli", "."]
+default-members = ["core", "hyper", "macros", "services", "test", "redis", "s3", "cloudflare-admin", "aws", "azure", "cli", "."]
 resolver = "2"
 
 [workspace.dependencies]
@@ -50,7 +50,7 @@ categories = ["web-programming::http-server"]
 
 [dependencies]
 skyzen-core.workspace = true
-skyzen-services = { workspace = true, features = ["runtime-async-std-native-tls"] }
+skyzen-services.workspace = true
 http-kit.workspace = true
 matchit = "0.9.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -129,7 +129,7 @@ optional = true
 
 
 [features]
-default = ["json", "form", "multipart", "sse", "rt", "openapi", "ws", "static-files"]
+default = ["json", "form", "multipart", "sse", "rt", "openapi", "ws", "static-files", "runtime-async-std-native-tls"]
 openapi = ["skyzen-core/openapi"]
 auth = []
 jwt = ["auth", "dep:jsonwebtoken"]
@@ -138,6 +138,8 @@ form = ["dep:serde_urlencoded", "http-kit/form"]
 multipart = ["dep:multer", "dep:pin-project-lite"]
 sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
 static-files = []
+runtime-async-std-native-tls = ["skyzen-services/runtime-async-std-native-tls"]
+runtime-async-std-rustls = ["skyzen-services/runtime-async-std-rustls"]
 ws = [
     "json",
     "dep:futures-channel",

@@ -1,0 +1,14 @@
+[package]
+name = "skyzen-cloudflare-admin"
+version = "0.1.0"
+edition = "2024"
+description = "Reusable Cloudflare control-plane API client — DNS, Pages, Access, Workers metadata. Extracted from fkgfw-deploy so any project that manages Cloudflare resources from a Rust CLI can depend on the admin surface without the rest of fkgfw."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zenwave = { path = "../../zenwave" }
+
+[lints]
+workspace = true
