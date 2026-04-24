@@ -155,7 +155,7 @@ impl From<&[u8]> for DbValue {
 
 impl<T> From<Option<T>> for DbValue
 where
-    T: Into<DbValue>,
+    T: Into<Self>,
 {
     fn from(value: Option<T>) -> Self {
         value.map_or(Self::Null, Into::into)
@@ -176,11 +176,11 @@ pub struct DbExecResult {
 /// SQL dialect expected by a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbDialect {
-    /// PostgreSQL syntax and placeholder rules.
+    /// `PostgreSQL` syntax and placeholder rules.
     Postgres,
-    /// MySQL syntax and placeholder rules.
+    /// `MySQL` syntax and placeholder rules.
     MySql,
-    /// SQLite syntax and placeholder rules.
+    /// `SQLite` syntax and placeholder rules.
     Sqlite,
 }
 
@@ -251,7 +251,7 @@ trait DbBackendObj: Send + Sync {
         query: &'a str,
         params: &'a [DbValue],
     ) -> BoxFuture<'a, Result<DbExecResult, DbError>>;
-    fn begin<'a>(&'a self) -> BoxFuture<'a, Result<DbTransaction, DbError>>;
+    fn begin(&self) -> BoxFuture<'_, Result<DbTransaction, DbError>>;
     fn clone_box(&self) -> Box<dyn DbBackendObj>;
 }
 
@@ -292,7 +292,7 @@ impl<T: DbBackend> DbBackendObj for T {
         Box::pin(DbBackend::execute(self, query, params))
     }
 
-    fn begin<'a>(&'a self) -> BoxFuture<'a, Result<DbTransaction, DbError>> {
+    fn begin(&self) -> BoxFuture<'_, Result<DbTransaction, DbError>> {
         Box::pin(DbBackend::begin(self))
     }
 
@@ -354,7 +354,7 @@ impl Db {
 
     /// Start building a SQL query.
     #[must_use]
-    pub fn query<'a>(&'a self, sql: &'a str) -> DbQuery<'a> {
+    pub const fn query<'a>(&'a self, sql: &'a str) -> DbQuery<'a> {
         DbQuery {
             db: self,
             sql: Cow::Borrowed(sql),
@@ -368,7 +368,7 @@ impl Db {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    /// Connect to a PostgreSQL database using `sqlx`.
+    /// Connect to a `PostgreSQL` database using `sqlx`.
     pub async fn connect_postgres(url: &str) -> Result<Self, DbError> {
         Ok(Self::new(NativeDbBackend::Postgres(
             sqlx::postgres::PgPoolOptions::new()
@@ -379,7 +379,7 @@ impl Db {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    /// Connect to a MySQL database using `sqlx`.
+    /// Connect to a `MySQL` database using `sqlx`.
     pub async fn connect_mysql(url: &str) -> Result<Self, DbError> {
         Ok(Self::new(NativeDbBackend::MySql(
             sqlx::mysql::MySqlPoolOptions::new()
@@ -390,7 +390,7 @@ impl Db {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    /// Connect to a SQLite database using `sqlx`.
+    /// Connect to a `SQLite` database using `sqlx`.
     pub async fn connect_sqlite(url: &str) -> Result<Self, DbError> {
         Ok(Self::new(NativeDbBackend::Sqlite(
             sqlx::sqlite::SqlitePoolOptions::new()
@@ -401,7 +401,7 @@ impl Db {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    /// Connect to an in-memory SQLite database using a single connection.
+    /// Connect to an in-memory `SQLite` database using a single connection.
     pub async fn connect_sqlite_memory() -> Result<Self, DbError> {
         Ok(Self::new(NativeDbBackend::Sqlite(
             sqlx::sqlite::SqlitePoolOptions::new()
@@ -429,7 +429,7 @@ impl DbTransaction {
     }
 
     /// Start building a SQL query within this transaction.
-    pub fn query<'a>(&'a mut self, sql: &'a str) -> DbTransactionQuery<'a> {
+    pub const fn query<'a>(&'a mut self, sql: &'a str) -> DbTransactionQuery<'a> {
         DbTransactionQuery {
             tx: self,
             sql: Cow::Borrowed(sql),
@@ -456,7 +456,7 @@ pub struct DbQuery<'a> {
     params: Vec<DbValue>,
 }
 
-impl<'a> DbQuery<'a> {
+impl DbQuery<'_> {
     /// Bind a parameter value to the query.
     #[must_use]
     pub fn bind<T>(mut self, value: T) -> Self
@@ -519,7 +519,7 @@ pub struct DbTransactionQuery<'a> {
     params: Vec<DbValue>,
 }
 
-impl<'a> DbTransactionQuery<'a> {
+impl DbTransactionQuery<'_> {
     /// Bind a parameter value to the query.
     #[must_use]
     pub fn bind<T>(mut self, value: T) -> Self

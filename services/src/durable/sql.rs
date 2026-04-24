@@ -115,7 +115,7 @@ impl DurableDb {
 
     /// Start building a query against the Durable Object database.
     #[must_use]
-    pub fn query<'a>(&'a self, sql: &'a str) -> DurableDbQuery<'a> {
+    pub const fn query<'a>(&'a self, sql: &'a str) -> DurableDbQuery<'a> {
         DurableDbQuery {
             db: self,
             sql,
@@ -137,7 +137,7 @@ pub struct DurableDbQuery<'a> {
     params: Vec<DbValue>,
 }
 
-impl<'a> DurableDbQuery<'a> {
+impl DurableDbQuery<'_> {
     /// Bind a parameter value to the query.
     #[must_use]
     pub fn bind<T>(mut self, value: T) -> Self

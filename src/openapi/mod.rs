@@ -271,14 +271,14 @@ where
 #[must_use]
 pub fn maybe_schema_of<T>() -> Option<SchemaRef> {
     let probe = SchemaProbe::<T>(PhantomData);
-    (&&probe).maybe_schema()
+    (&probe).maybe_schema()
 }
 
 /// Register the schema for `T` when it implements `ToSchema`; otherwise do nothing.
 #[cfg(feature = "openapi")]
 pub fn maybe_register_schema_for<T>(defs: &mut BTreeMap<String, SchemaRef>) {
     let probe = SchemaProbe::<T>(PhantomData);
-    (&&probe).maybe_register(defs);
+    (&probe).maybe_register(defs);
 }
 
 /// Register a schema and its dependencies when `OpenAPI` is enabled.

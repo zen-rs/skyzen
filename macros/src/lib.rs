@@ -484,7 +484,7 @@ enum TestParamKind {
 fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
     if function.sig.asyncness.is_none() {
         return Err(Error::new_spanned(
-            &function.sig.fn_token,
+            function.sig.fn_token,
             "#[skyzen::test] requires an async function",
         ));
     }
