@@ -219,10 +219,6 @@ skyzen doctor                          # Check toolchain
 skyzen dev                             # Native watch + restart
 skyzen dev --provider cloudflare       # Wrangler-driven Cloudflare dev
 skyzen deploy --provider cloudflare    # Deploy to Workers
-skyzen dev --provider aws              # SAM local API
-skyzen deploy --provider aws           # SAM deploy
-skyzen dev --provider azure            # Azure Functions local
-skyzen deploy --provider azure         # Publish to Azure
 ```
 
 Configure platforms via [`Skyzen.toml`](docs/skyzen-toml-reference.md). For Cloudflare, Skyzen generates `.skyzen/gen/wrangler.toml` automatically; users do not hand-maintain `wrangler.toml`.

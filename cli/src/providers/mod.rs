@@ -1,5 +1,3 @@
-mod aws;
-mod azure;
 mod cloudflare;
 mod native;
 
@@ -128,8 +126,6 @@ pub fn prepare(options: &CliOptions) -> Result<PreparedRun> {
             let plan = match provider {
                 Provider::Native => unreachable!("native dev is handled above"),
                 Provider::Cloudflare => cloudflare::prepare(options.action, &manifest)?,
-                Provider::Aws => aws::prepare(options.action, &manifest)?,
-                Provider::Azure => azure::prepare(options.action, &manifest)?,
             };
             Ok(plan.into_prepared(options.action))
         }
@@ -143,25 +139,14 @@ pub fn run_internal_step(step: &InternalStep) -> Result<()> {
 }
 
 fn run_doctor(provider: Option<Provider>) -> Result<()> {
-    let providers = provider.map_or_else(
-        || {
-            vec![
-                Provider::Native,
-                Provider::Cloudflare,
-                Provider::Aws,
-                Provider::Azure,
-            ]
-        },
-        |p| vec![p],
-    );
+    let providers =
+        provider.map_or_else(|| vec![Provider::Native, Provider::Cloudflare], |p| vec![p]);
 
     let mut missing = Vec::new();
     for provider in providers {
         let (label, binaries): (&str, &[&str]) = match provider {
             Provider::Native => ("native", &["cargo"]),
             Provider::Cloudflare => ("cloudflare", &["cargo", "wrangler"]),
-            Provider::Aws => ("aws", &["sam"]),
-            Provider::Azure => ("azure", &["func"]),
         };
         for binary in binaries {
             if binary_exists(binary) {

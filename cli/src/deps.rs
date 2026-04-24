@@ -331,7 +331,6 @@ mod tests {
                     )]),
                     ..CloudflareSection::default()
                 }),
-                ..SkyzenManifest::default()
             },
         };
 

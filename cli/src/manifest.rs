@@ -7,6 +7,7 @@ use std::{
 };
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SkyzenManifest {
     #[serde(default)]
     pub service: Vec<ServiceEntry>,
@@ -16,10 +17,6 @@ pub struct SkyzenManifest {
     pub native: Option<NativeSection>,
     #[serde(default)]
     pub cloudflare: Option<CloudflareSection>,
-    #[serde(default)]
-    pub aws: Option<AwsSection>,
-    #[serde(default)]
-    pub azure: Option<AzureSection>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,23 +176,6 @@ pub struct CfDurableMigration {
 pub struct CfDurableRenamedClass {
     pub from: String,
     pub to: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct AwsSection {
-    pub template: Option<String>,
-    pub stack_name: Option<String>,
-    pub region: Option<String>,
-    pub profile: Option<String>,
-    pub local_port: Option<u16>,
-    pub env_vars: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct AzureSection {
-    pub project: Option<String>,
-    pub app_name: Option<String>,
-    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]

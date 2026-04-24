@@ -48,8 +48,6 @@ Start local development:
 ```sh
 skyzen dev                         # native watch + restart
 skyzen dev --provider cloudflare
-skyzen dev --provider aws
-skyzen dev --provider azure
 ```
 
 Native mode is supervised by Skyzen and automatically restarts on source changes. Cloudflare mode uses Wrangler directly after Skyzen prepares the Worker artifacts.
@@ -60,15 +58,13 @@ Deploy the application to the target platform:
 
 ```sh
 skyzen deploy --provider cloudflare
-skyzen deploy --provider aws
-skyzen deploy --provider azure
 ```
 
 ## Options
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--provider <name>` | `-p` | Target platform: `native`, `cloudflare`, `aws`, `azure` |
+| `--provider <name>` | `-p` | Target platform: `native`, `cloudflare` |
 | `--template <name>` | `-t` | Project template for `skyzen new`: `api`, `serverless-events`, `durable-realtime` |
 | `--manifest <path>` | `-m` | Path to `Skyzen.toml` (default: `Skyzen.toml` in current directory) |
 | `--force` | `-f` | Reuse an existing target directory when scaffolding |
@@ -81,10 +77,6 @@ skyzen deploy --provider azure
 |----------|-------|----------|-----------------|
 | Native | `cargo run` with Skyzen watch/restart | — | none |
 | Cloudflare | `wrangler dev` | `wrangler deploy` | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` |
-| AWS | `sam local start-api` | `sam deploy` | uses `template` from config |
-| Azure | `func start` | `func azure functionapp publish` | uses `project` from config |
-
-The AWS/Azure rows above describe CLI orchestration only. Skyzen's finished runtime surface is native + Cloudflare.
 
 ## Skyzen.toml
 
@@ -98,16 +90,6 @@ name = "my-worker"
 main = "dist/worker.js"
 compatibility_date = "2025-02-01"
 workers_dev = true
-
-[aws]
-template = "template.yaml"
-stack_name = "my-stack"
-region = "us-east-1"
-
-[azure]
-project = "."
-app_name = "my-function-app"
-port = 7071
 ```
 
 ## License

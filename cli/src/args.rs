@@ -13,8 +13,6 @@ pub enum Action {
 pub enum Provider {
     Native,
     Cloudflare,
-    Aws,
-    Azure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,9 +64,9 @@ impl CliOptions {
 
             match arg.as_str() {
                 "--provider" | "-p" => {
-                    let value = args.next().context(
-                        "missing value for --provider (expected native|cloudflare|aws|azure)",
-                    )?;
+                    let value = args
+                        .next()
+                        .context("missing value for --provider (expected native|cloudflare)")?;
                     provider = Some(parse_provider(&value)?);
                 }
                 "--manifest" | "-m" => {
@@ -151,9 +149,7 @@ fn parse_provider(value: &str) -> Result<Provider> {
     match value {
         "native" => Ok(Provider::Native),
         "cloudflare" => Ok(Provider::Cloudflare),
-        "aws" => Ok(Provider::Aws),
-        "azure" => Ok(Provider::Azure),
-        _ => anyhow::bail!("unsupported provider: {value} (expected native|cloudflare|aws|azure)"),
+        _ => anyhow::bail!("unsupported provider: {value} (expected native|cloudflare)"),
     }
 }
 
@@ -172,9 +168,9 @@ fn print_usage_and_exit() -> ! {
     eprintln!(
         "Usage:
   skyzen new <path> [--template api|serverless-events|durable-realtime] [--force]
-  skyzen dev [--provider <native|cloudflare|aws|azure>] [--manifest Skyzen.toml] [--dry-run]
-  skyzen deploy --provider <cloudflare|aws|azure> [--manifest Skyzen.toml] [--dry-run]
-  skyzen doctor [--provider <native|cloudflare|aws|azure>]"
+  skyzen dev [--provider <native|cloudflare>] [--manifest Skyzen.toml] [--dry-run]
+  skyzen deploy --provider <cloudflare> [--manifest Skyzen.toml] [--dry-run]
+  skyzen doctor [--provider <native|cloudflare>]"
     );
     std::process::exit(2);
 }
@@ -219,14 +215,25 @@ mod tests {
     fn parses_equals_style_flags() {
         let args = vec![
             "skyzen".to_string(),
-            "--provider=aws".to_string(),
+            "--provider=cloudflare".to_string(),
             "--manifest=custom.toml".to_string(),
             "deploy".to_string(),
         ];
         let parsed = CliOptions::parse(args).expect("parse should succeed");
         assert_eq!(parsed.action, Action::Deploy);
-        assert_eq!(parsed.provider, Some(Provider::Aws));
+        assert_eq!(parsed.provider, Some(Provider::Cloudflare));
         assert_eq!(parsed.manifest, PathBuf::from("custom.toml"));
+    }
+
+    #[test]
+    fn rejects_unsupported_provider() {
+        let args = vec![
+            "skyzen".to_string(),
+            "--provider=aws".to_string(),
+            "deploy".to_string(),
+        ];
+        let error = CliOptions::parse(args).expect_err("parse should fail");
+        assert!(error.to_string().contains("native|cloudflare"));
     }
 
     #[test]

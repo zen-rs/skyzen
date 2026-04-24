@@ -58,6 +58,23 @@ fn execute(prepared: &PreparedRun, dry_run: bool) -> Result<()> {
         run_internal_step(step)?;
     }
 
+    if prepared.commands.is_empty() {
+        match prepared.action {
+            Action::Doctor => {}
+            Action::New => unreachable!("new is handled before prepare"),
+            Action::Dev | Action::Deploy => {
+                anyhow::bail!("no command prepared");
+            }
+        }
+    }
+
+    if prepared.run_mode == RunMode::Watch {
+        let Some(command) = prepared.commands.first() else {
+            anyhow::bail!("watch mode requires at least one command");
+        };
+        return dev::run_native_watch(command, dry_run);
+    }
+
     for command in &prepared.commands {
         let display = command.display();
         if dry_run {
@@ -86,23 +103,6 @@ fn execute(prepared: &PreparedRun, dry_run: bool) -> Result<()> {
                 command.display()
             );
         }
-    }
-
-    if prepared.commands.is_empty() {
-        match prepared.action {
-            Action::Doctor => {}
-            Action::New => unreachable!("new is handled before prepare"),
-            Action::Dev | Action::Deploy => {
-                anyhow::bail!("no command prepared");
-            }
-        }
-    }
-
-    if prepared.run_mode == RunMode::Watch {
-        let Some(command) = prepared.commands.first() else {
-            anyhow::bail!("watch mode requires at least one command");
-        };
-        return dev::run_native_watch(command, dry_run);
     }
 
     Ok(())

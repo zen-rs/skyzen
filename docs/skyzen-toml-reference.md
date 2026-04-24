@@ -277,54 +277,6 @@ renamed_classes = [{ from = "Old", to = "New" }]
 | `deleted_classes` | string[] | Classes to remove |
 | `renamed_classes` | object[] | Classes to rename (`{ from = "Old", to = "New" }`) |
 
-## AWS Section
-
-The AWS section currently configures CLI orchestration only. It does not imply AWS runtime parity with the Cloudflare/native path.
-
-```toml
-[aws]
-template = "template.yaml"
-stack_name = "my-stack"
-region = "us-east-1"
-profile = "my-profile"
-local_port = 3001
-env_vars = ".env"
-```
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `template` | string | SAM/CloudFormation template path |
-| `stack_name` | string | CloudFormation stack name |
-| `region` | string | AWS region |
-| `profile` | string | AWS CLI profile name |
-| `local_port` | u16 | Port for `sam local start-api` |
-| `env_vars` | string | Path to env vars file for local development |
-
-The `skyzen` CLI runs:
-- `skyzen dev --provider aws` → `sam local start-api`
-- `skyzen deploy --provider aws` → `sam deploy`
-
-## Azure Section
-
-The Azure section currently configures CLI orchestration only. It does not imply Azure runtime parity with the Cloudflare/native path.
-
-```toml
-[azure]
-project = "."
-app_name = "my-function-app"
-port = 7071
-```
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `project` | string | Azure Functions project directory |
-| `app_name` | string | Function app name for deployment |
-| `port` | u16 | Port for `func start` |
-
-The `skyzen` CLI runs:
-- `skyzen dev --provider azure` → `func start`
-- `skyzen deploy --provider azure` → `func azure functionapp publish`
-
 ## Full Example
 
 ```toml
@@ -387,11 +339,6 @@ class_name = "AppState"
 [[cloudflare.durable_objects.migrations]]
 tag = "v1"
 new_sqlite_classes = ["AppState"]
-
-[aws]
-template = "template.yaml"
-stack_name = "my-app-stack"
-region = "us-east-1"
 ```
 
 ## Provider Mapping
@@ -401,7 +348,5 @@ The `skyzen` CLI generates provider-specific config files from `Skyzen.toml`:
 | Provider | Generated Config | `dev` Command | `deploy` Command |
 |----------|-----------------|---------------|-----------------|
 | Cloudflare | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` | `wrangler dev` | `wrangler deploy` |
-| AWS | uses `template` directly | `sam local start-api` | `sam deploy` |
-| Azure | uses `project` directly | `func start` | `func azure functionapp publish` |
 
 Run `skyzen doctor` to verify that required provider tools are installed.

@@ -58,6 +58,8 @@ serde_json = "1.0"
 cookie = { version = "0.18.1", features = ["percent-encode"] }
 tracing.workspace = true
 smallvec = "1.15"
+flate2 = "1.1"
+bytes = "1.11"
 mime_guess = "2.0"
 include_dir = "0.7"
 skyzen-macros.workspace = true
@@ -108,6 +110,7 @@ serial_test = "3.2"
 wasm-bindgen = { version = "0.2.110", features = ["spans"] }
 wasm-bindgen-futures = "0.4.60"
 js-sys = "0.3.87"
+wasm-streams = "0.4.2"
 web-sys = { version = "0.3.87", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
 futures-channel = { version = "0.3.32", optional = true }
 

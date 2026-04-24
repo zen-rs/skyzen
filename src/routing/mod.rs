@@ -2,7 +2,8 @@
 //!
 //! Routes are defined by combining nodes produced by the [`CreateRouteNode`] extension. Path
 //! literals gain builder methods such as `.at(handler)` (GET), `.post(handler)`, `.put(handler)`,
-//! `.delete(handler)`, `.ws(handler)`, and `.route(children)`
+//! `.patch(handler)`, `.delete(handler)`, `.head(handler)`, `.options(handler)`,
+//! `.trace(handler)`, `.ws(handler)`, and `.route(children)`
 //! so you can describe the full tree declaratively. Once a tree is assembled, call [`Route::build`]
 //! to obtain a [`Router`] that can be mounted on a server or invoked directly from tests.
 //!
@@ -419,6 +420,17 @@ impl RouteNode {
         self.with_handler(Method::POST, handler)
     }
 
+    /// Attach a PATCH handler to the current route node.
+    #[must_use]
+    pub fn patch<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::PATCH, handler)
+    }
+
     /// Attach a PUT handler to the current route node.
     #[must_use]
     pub fn put<H, T, R>(self, handler: H) -> Self
@@ -439,6 +451,39 @@ impl RouteNode {
         R: Responder,
     {
         self.with_handler(Method::DELETE, handler)
+    }
+
+    /// Attach a HEAD handler to the current route node.
+    #[must_use]
+    pub fn head<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::HEAD, handler)
+    }
+
+    /// Attach an OPTIONS handler to the current route node.
+    #[must_use]
+    pub fn options<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::OPTIONS, handler)
+    }
+
+    /// Attach a TRACE handler to the current route node.
+    #[must_use]
+    pub fn trace<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::TRACE, handler)
     }
 
     /// Attach an endpoint under the current path with an arbitrary HTTP method.
@@ -635,6 +680,13 @@ pub trait CreateRouteNode: Sized {
         T: Extractor,
         R: Responder;
 
+    /// Attach a PATCH handler to the path.
+    fn patch<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
+
     /// Attach a PUT handler to the path.
     fn put<H, T, R>(self, handler: H) -> RouteNode
     where
@@ -644,6 +696,27 @@ pub trait CreateRouteNode: Sized {
 
     /// Attach a DELETE handler to the path.
     fn delete<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
+
+    /// Attach a HEAD handler to the path.
+    fn head<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
+
+    /// Attach an OPTIONS handler to the path.
+    fn options<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
+
+    /// Attach a TRACE handler to the path.
+    fn trace<H, T, R>(self, handler: H) -> RouteNode
     where
         H: Handler<T, R>,
         T: Extractor,
@@ -697,6 +770,15 @@ where
         endpoint_node_from_handler(self, Method::POST, handler)
     }
 
+    fn patch<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::PATCH, handler)
+    }
+
     fn put<H, T, R>(self, handler: H) -> RouteNode
     where
         H: Handler<T, R>,
@@ -713,6 +795,33 @@ where
         R: Responder,
     {
         endpoint_node_from_handler(self, Method::DELETE, handler)
+    }
+
+    fn head<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::HEAD, handler)
+    }
+
+    fn options<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::OPTIONS, handler)
+    }
+
+    fn trace<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::TRACE, handler)
     }
 
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode

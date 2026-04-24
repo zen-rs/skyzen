@@ -1,12 +1,19 @@
-use std::cell::RefCell;
-use std::future::Future;
+use std::{
+    cell::RefCell,
+    error::Error as StdError,
+    fmt,
+    future::Future,
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+};
 
+use futures_core::Stream;
 use http_kit::http_error;
 use skyzen_core::Extractor;
 
-use crate::{Body, Endpoint, HttpError, StatusCode};
+use crate::{Body, BodyError, Endpoint, HttpError, StatusCode};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen::JsCast;
 
 /// Alias matching the WinterCG request object.
 pub type Request = web_sys::Request;
@@ -199,9 +206,8 @@ async fn convert_request(request: Request) -> Result<crate::Request, JsValue> {
         builder = builder.header(key, value);
     }
 
-    let bytes = read_body_bytes(&request).await?;
     let http_request = builder
-        .body(Body::from(bytes))
+        .body(request_body(request)?)
         .map_err(|error| JsValue::from_str(&format!("Failed to build request: {error}")))?;
     Ok(crate::Request::from(http_request))
 }
@@ -239,23 +245,97 @@ async fn convert_response(mut response: crate::Response) -> Result<Response, JsV
     }
     init.set_headers(&headers);
 
-    let bytes = response
-        .into_body()
-        .into_bytes()
-        .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
-
-    // Use Uint8Array to safely pass bytes to JavaScript
-    // This avoids memory safety issues with direct slice passing
-    let uint8_array = js_sys::Uint8Array::from(bytes.as_ref());
-    Response::new_with_opt_buffer_source_and_init(Some(&uint8_array), &init)
+    let body = response_body_stream(response.into_body());
+    Response::new_with_opt_readable_stream_and_init(Some(&body), &init)
 }
 
-async fn read_body_bytes(request: &Request) -> Result<Vec<u8>, JsValue> {
-    let promise = request
-        .array_buffer()
-        .map_err(|error| JsValue::from(error))?;
-    let buffer = JsFuture::from(promise).await?;
-    let array = js_sys::Uint8Array::new(&buffer);
-    Ok(array.to_vec())
+fn request_body(request: Request) -> Result<Body, JsValue> {
+    let Some(raw_stream) = request.body() else {
+        return Ok(Body::empty());
+    };
+
+    let stream = wasm_streams::ReadableStream::from_raw(raw_stream).into_stream();
+    Ok(Body::from_stream(JsReadableBody { inner: stream }))
 }
+
+fn response_body_stream(body: Body) -> web_sys::ReadableStream {
+    wasm_streams::ReadableStream::from_stream(BodyReadableStream { body }).into_raw()
+}
+
+#[derive(Debug)]
+struct JsReadableBody {
+    inner: wasm_streams::readable::IntoStream<'static>,
+}
+
+// SAFETY: WinterCG WASM request streams are confined to the single-threaded JS event loop.
+unsafe impl Send for JsReadableBody {}
+// SAFETY: `JsReadableBody` is only polled by the single-threaded WASM runtime.
+unsafe impl Sync for JsReadableBody {}
+
+impl Stream for JsReadableBody {
+    type Item = Result<Vec<u8>, BodyError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx).map(|item| {
+            item.map(|result| match result {
+                Ok(value) => js_value_to_body_bytes(value),
+                Err(error) => Err(body_stream_error(js_value_to_error_message(error))),
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BodyReadableStream {
+    body: Body,
+}
+
+impl Stream for BodyReadableStream {
+    type Item = Result<JsValue, JsValue>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.body)
+            .poll_next(cx)
+            .map(|item| item.map(|result| result.map(bytes_to_js_value).map_err(body_error_to_js)))
+    }
+}
+
+fn js_value_to_body_bytes(value: JsValue) -> Result<Vec<u8>, BodyError> {
+    if value.is_instance_of::<js_sys::Uint8Array>() || value.is_instance_of::<js_sys::ArrayBuffer>()
+    {
+        Ok(js_sys::Uint8Array::new(&value).to_vec())
+    } else {
+        Err(body_stream_error(
+            "request body stream yielded a non-byte chunk",
+        ))
+    }
+}
+
+fn bytes_to_js_value(bytes: bytes::Bytes) -> JsValue {
+    js_sys::Uint8Array::from(bytes.as_ref()).into()
+}
+
+fn body_error_to_js(error: BodyError) -> JsValue {
+    JsValue::from_str(&error.to_string())
+}
+
+fn js_value_to_error_message(value: JsValue) -> String {
+    value
+        .as_string()
+        .unwrap_or_else(|| format!("request body stream read failed: {value:?}"))
+}
+
+fn body_stream_error(message: impl Into<String>) -> BodyError {
+    BodyError::Other(Box::new(WasmBodyStreamError(message.into())))
+}
+
+#[derive(Debug)]
+struct WasmBodyStreamError(String);
+
+impl fmt::Display for WasmBodyStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl StdError for WasmBodyStreamError {}

@@ -137,101 +137,13 @@ new_sqlite_classes = ["AppState"]
 
 Bump the migration `tag` (`v2`, `v3`, ...) whenever class definitions change.
 
-## AWS CLI Integration
-
-Skyzen currently provides CLI orchestration for AWS tooling. It does not yet provide first-class AWS runtime parity.
-
-### Project Setup
-
-Use the same `cdylib` setup as Cloudflare Workers. The SAM template defines the Lambda function:
-
-**`template.yaml`:**
-
-```yaml
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-
-Globals:
-  Function:
-    Timeout: 30
-
-Resources:
-  MyFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      Runtime: provided.al2023
-      Handler: bootstrap
-      CodeUri: target/release/
-      Events:
-        Api:
-          Type: Api
-          Properties:
-            Path: /{proxy+}
-            Method: ANY
-```
-
-### Skyzen.toml
-
-```toml
-[aws]
-template = "template.yaml"
-stack_name = "my-app-stack"
-region = "us-east-1"
-local_port = 3001
-```
-
-### Local Development
-
-```sh
-skyzen dev --provider aws
-```
-
-Runs `sam local start-api` with the configured template and port.
-
-### Deploy
-
-```sh
-skyzen deploy --provider aws
-```
-
-Runs `sam deploy` with the configured stack name and region.
-
-## Azure CLI Integration
-
-Skyzen currently provides CLI orchestration for Azure Functions tooling. It does not yet provide first-class Azure runtime parity.
-
-### Skyzen.toml
-
-```toml
-[azure]
-project = "."
-app_name = "my-function-app"
-port = 7071
-```
-
-### Local Development
-
-```sh
-skyzen dev --provider azure
-```
-
-Runs `func start` in the project directory.
-
-### Deploy
-
-```sh
-skyzen deploy --provider azure
-```
-
-Runs `func azure functionapp publish <app_name>`.
-
 ## Running from Source
 
 You can also run the CLI from the Skyzen repository:
 
 ```sh
 cargo run -p skyzen-cli -- dev --provider cloudflare --manifest ./Skyzen.toml
-cargo run -p skyzen-cli -- deploy --provider aws --manifest ./Skyzen.toml
+cargo run -p skyzen-cli -- deploy --provider cloudflare --manifest ./Skyzen.toml
 cargo run -p skyzen-cli -- doctor
 ```
 

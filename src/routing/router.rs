@@ -545,6 +545,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routes_extended_http_method_builders() {
+        let router = build(Route::new((
+            "/items".patch(|| async { Result::Ok("patched") }),
+            "/items".head(|| async { Result::Ok("") }),
+            "/items".options(|| async { Result::Ok("options") }),
+            "/items".trace(|| async { Result::Ok("trace") }),
+        )))
+        .unwrap();
+
+        for (method, expected) in [
+            (Method::PATCH, "patched"),
+            (Method::HEAD, ""),
+            (Method::OPTIONS, "options"),
+            (Method::TRACE, "trace"),
+        ] {
+            let request = request_with_method("/items", method);
+            let response = router.clone().go(request).await.unwrap();
+            let body = response.into_body().into_string().await.unwrap();
+            assert_eq!(body, expected);
+        }
+    }
+
+    #[tokio::test]
     async fn exposes_api_docs_at_root() {
         async fn ping() -> Result<&'static str> {
             Ok("pong")
