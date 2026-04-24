@@ -26,6 +26,7 @@ ctrlc = "3.5"
 [workspace.lints]
 rust.missing_docs = "warn"
 rust.missing_debug_implementations = "warn"
+rust.unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 clippy.all = "warn"
 clippy.style = "warn"
 clippy.correctness = "warn"

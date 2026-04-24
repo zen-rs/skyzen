@@ -481,6 +481,31 @@ enum TestParamKind {
     },
 }
 
+#[derive(Default)]
+struct TestRequirements {
+    test_context: bool,
+    services: TestServiceRequirements,
+    databases: TestDatabaseRequirements,
+}
+
+#[derive(Default)]
+struct TestServiceRequirements {
+    kv: bool,
+    storage: bool,
+    queue: bool,
+}
+
+#[derive(Default)]
+struct TestDatabaseRequirements {
+    default_db: bool,
+    named_db_indices: Vec<usize>,
+}
+
+struct TestParamBindings {
+    requirements: TestRequirements,
+    statements: Vec<proc_macro2::TokenStream>,
+}
+
 fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
     if function.sig.asyncness.is_none() {
         return Err(Error::new_spanned(
@@ -513,197 +538,12 @@ fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
         .map(load_databases_from_value)
         .transpose()?
         .unwrap_or_default();
-    let database_types = databases
-        .iter()
-        .enumerate()
-        .map(|(index, database)| {
-            database_ident_from_name(&database.name).map(|ident| (index, ident))
-        })
-        .collect::<syn::Result<Vec<_>>>()?;
-
-    let mut requires_test_context = false;
-    let mut requires_kv = false;
-    let mut requires_storage = false;
-    let mut requires_queue = false;
-    let mut requires_default_db = false;
-    let mut required_named_db_indices = Vec::new();
-    let mut binding_statements = Vec::new();
-
-    for input in inputs {
-        let FnArg::Typed(pat_type) = input else {
-            return Err(Error::new_spanned(
-                input,
-                "#[skyzen::test] does not support methods; use a free function",
-            ));
-        };
-
-        let pat = pat_type.pat;
-        let ty = pat_type.ty;
-        let kind = classify_test_param(ty.as_ref(), &database_types)?;
-
-        match kind {
-            TestParamKind::TestContext => {
-                requires_test_context = true;
-                binding_statements.push(quote! {
-                    let #pat: #ty = __skyzen_test_context.clone();
-                });
-            }
-            TestParamKind::Kv => {
-                requires_kv = true;
-                binding_statements.push(quote! {
-                    let #pat: #ty = __skyzen_test_kv.clone();
-                });
-            }
-            TestParamKind::Storage => {
-                requires_storage = true;
-                binding_statements.push(quote! {
-                    let #pat: #ty = __skyzen_test_storage.clone();
-                });
-            }
-            TestParamKind::Queue => {
-                requires_queue = true;
-                binding_statements.push(quote! {
-                    let #pat: #ty = __skyzen_test_queue.clone();
-                });
-            }
-            TestParamKind::Db => {
-                requires_default_db = true;
-                binding_statements.push(quote! {
-                    let #pat: #ty = __skyzen_test_default_db.clone();
-                });
-            }
-            TestParamKind::NamedDatabase {
-                type_ident,
-                database_index,
-            } => {
-                if !required_named_db_indices.contains(&database_index) {
-                    required_named_db_indices.push(database_index);
-                }
-                let db_ident = format_ident!("__skyzen_test_named_db_{database_index}");
-                binding_statements.push(quote! {
-                    let #pat: #ty = #type_ident::new(#db_ident.clone());
-                });
-            }
-        }
-    }
-
-    if requires_test_context {
-        requires_kv = true;
-        requires_storage = true;
-        requires_queue = true;
-    }
-
-    let mut setup_statements = Vec::new();
-
-    if requires_kv {
-        setup_statements.push(quote! {
-            let __skyzen_test_kv =
-                ::skyzen_services::Kv::new(::skyzen_test::mock::InMemoryKv::new());
-        });
-    }
-
-    if requires_storage {
-        setup_statements.push(quote! {
-            let __skyzen_test_storage =
-                ::skyzen_services::Storage::new(::skyzen_test::mock::InMemoryStorage::new());
-        });
-    }
-
-    if requires_queue {
-        setup_statements.push(quote! {
-            let __skyzen_test_queue =
-                ::skyzen_services::Queue::new(::skyzen_test::mock::InMemoryQueue::new());
-        });
-    }
-
-    let requires_any_db = requires_default_db || !required_named_db_indices.is_empty();
-    if requires_any_db {
-        let default_database = default_database_index(&databases)?;
-        let mut prepared_indices = required_named_db_indices.clone();
-        if let Some(default_index) = default_database {
-            if requires_default_db && !prepared_indices.contains(&default_index) {
-                prepared_indices.push(default_index);
-            }
-        } else if requires_default_db {
-            prepared_indices.push(usize::MAX);
-        }
-
-        prepared_indices.sort_unstable();
-        let synthesized_default_db = prepared_indices.contains(&usize::MAX);
-
-        for index in prepared_indices {
-            if index == usize::MAX {
-                setup_statements.push(quote! {
-                    let __skyzen_test_default_db = ::skyzen_test::mock::InMemoryDb::new()
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to initialize in-memory test database: {error}"))
-                        .into_db();
-                });
-                continue;
-            }
-
-            let db_ident = format_ident!("__skyzen_test_named_db_{index}");
-            let database_name = &databases[index].name;
-            let init_message = LitStr::new(
-                &format!("failed to initialize in-memory test database `{database_name}`"),
-                proc_macro2::Span::call_site(),
-            );
-            setup_statements.push(quote! {
-                let #db_ident = ::skyzen_test::mock::InMemoryDb::new()
-                    .await
-                    .unwrap_or_else(|error| panic!("{}: {error}", #init_message))
-                    .into_db();
-            });
-
-            if default_database == Some(index) && requires_default_db {
-                setup_statements.push(quote! {
-                    let __skyzen_test_default_db = #db_ident.clone();
-                });
-            }
-        }
-
-        if requires_default_db && default_database.is_none() && !synthesized_default_db {
-            setup_statements.push(quote! {
-                let __skyzen_test_default_db = ::skyzen_test::mock::InMemoryDb::new()
-                    .await
-                    .unwrap_or_else(|error| panic!("failed to initialize in-memory test database: {error}"))
-                    .into_db();
-            });
-        }
-    }
-
-    if requires_test_context {
-        let mut context_steps = Vec::new();
-        context_steps.push(quote! {
-            let mut __skyzen_test_context = ::skyzen_test::TestContext::new();
-        });
-        if requires_kv {
-            context_steps.push(quote! {
-                __skyzen_test_context = __skyzen_test_context.with_kv(__skyzen_test_kv.clone());
-            });
-        }
-        if requires_storage {
-            context_steps.push(quote! {
-                __skyzen_test_context =
-                    __skyzen_test_context.with_storage(__skyzen_test_storage.clone());
-            });
-        }
-        if requires_queue {
-            context_steps.push(quote! {
-                __skyzen_test_context =
-                    __skyzen_test_context.with_queue(__skyzen_test_queue.clone());
-            });
-        }
-        if requires_default_db {
-            context_steps.push(quote! {
-                __skyzen_test_context = __skyzen_test_context.with_db(__skyzen_test_default_db.clone());
-            });
-        }
-        setup_statements.extend(context_steps);
-    }
+    let database_types = test_database_types(&databases)?;
+    let bindings = collect_test_param_bindings(inputs, &database_types)?;
+    let setup_statements = test_setup_statements(&bindings.requirements, &databases)?;
 
     let mut inner_statements = setup_statements;
-    inner_statements.extend(binding_statements);
+    inner_statements.extend(bindings.statements);
     let original_body = function.block.stmts.clone();
     function.block.stmts = inner_statements
         .into_iter()
@@ -721,6 +561,260 @@ fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
         }
     }
     .into())
+}
+
+fn test_database_types(
+    databases: &[DatabaseConfig],
+) -> syn::Result<Vec<(usize, proc_macro2::Ident)>> {
+    databases
+        .iter()
+        .enumerate()
+        .map(|(index, database)| {
+            database_ident_from_name(&database.name).map(|ident| (index, ident))
+        })
+        .collect()
+}
+
+fn collect_test_param_bindings(
+    inputs: Punctuated<FnArg, Token![,]>,
+    database_types: &[(usize, proc_macro2::Ident)],
+) -> syn::Result<TestParamBindings> {
+    let mut requirements = TestRequirements::default();
+    let mut statements = Vec::new();
+
+    for input in inputs {
+        let FnArg::Typed(pat_type) = input else {
+            return Err(Error::new_spanned(
+                input,
+                "#[skyzen::test] does not support methods; use a free function",
+            ));
+        };
+
+        let pat = pat_type.pat;
+        let ty = pat_type.ty;
+        let kind = classify_test_param(ty.as_ref(), database_types)?;
+        push_test_param_binding(
+            &mut requirements,
+            &mut statements,
+            kind,
+            pat.as_ref(),
+            ty.as_ref(),
+        );
+    }
+
+    if requirements.test_context {
+        requirements.services.kv = true;
+        requirements.services.storage = true;
+        requirements.services.queue = true;
+    }
+
+    Ok(TestParamBindings {
+        requirements,
+        statements,
+    })
+}
+
+fn push_test_param_binding(
+    requirements: &mut TestRequirements,
+    statements: &mut Vec<proc_macro2::TokenStream>,
+    kind: TestParamKind,
+    pat: &syn::Pat,
+    ty: &Type,
+) {
+    match kind {
+        TestParamKind::TestContext => {
+            requirements.test_context = true;
+            statements.push(quote! {
+                let #pat: #ty = __skyzen_test_context.clone();
+            });
+        }
+        TestParamKind::Kv => {
+            requirements.services.kv = true;
+            statements.push(quote! {
+                let #pat: #ty = __skyzen_test_kv.clone();
+            });
+        }
+        TestParamKind::Storage => {
+            requirements.services.storage = true;
+            statements.push(quote! {
+                let #pat: #ty = __skyzen_test_storage.clone();
+            });
+        }
+        TestParamKind::Queue => {
+            requirements.services.queue = true;
+            statements.push(quote! {
+                let #pat: #ty = __skyzen_test_queue.clone();
+            });
+        }
+        TestParamKind::Db => {
+            requirements.databases.default_db = true;
+            statements.push(quote! {
+                let #pat: #ty = __skyzen_test_default_db.clone();
+            });
+        }
+        TestParamKind::NamedDatabase {
+            type_ident,
+            database_index,
+        } => {
+            if !requirements
+                .databases
+                .named_db_indices
+                .contains(&database_index)
+            {
+                requirements.databases.named_db_indices.push(database_index);
+            }
+            let db_ident = format_ident!("__skyzen_test_named_db_{database_index}");
+            statements.push(quote! {
+                let #pat: #ty = #type_ident::new(#db_ident.clone());
+            });
+        }
+    }
+}
+
+fn test_setup_statements(
+    requirements: &TestRequirements,
+    databases: &[DatabaseConfig],
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let mut statements = Vec::new();
+    push_test_service_setup(requirements, &mut statements);
+    push_test_database_setup(requirements, databases, &mut statements)?;
+    push_test_context_setup(requirements, &mut statements);
+    Ok(statements)
+}
+
+fn push_test_service_setup(
+    requirements: &TestRequirements,
+    statements: &mut Vec<proc_macro2::TokenStream>,
+) {
+    if requirements.services.kv {
+        statements.push(quote! {
+            let __skyzen_test_kv =
+                ::skyzen_services::Kv::new(::skyzen_test::mock::InMemoryKv::new());
+        });
+    }
+
+    if requirements.services.storage {
+        statements.push(quote! {
+            let __skyzen_test_storage =
+                ::skyzen_services::Storage::new(::skyzen_test::mock::InMemoryStorage::new());
+        });
+    }
+
+    if requirements.services.queue {
+        statements.push(quote! {
+            let __skyzen_test_queue =
+                ::skyzen_services::Queue::new(::skyzen_test::mock::InMemoryQueue::new());
+        });
+    }
+}
+
+fn push_test_database_setup(
+    requirements: &TestRequirements,
+    databases: &[DatabaseConfig],
+    statements: &mut Vec<proc_macro2::TokenStream>,
+) -> syn::Result<()> {
+    if !requirements.databases.default_db && requirements.databases.named_db_indices.is_empty() {
+        return Ok(());
+    }
+
+    let default_database = default_database_index(databases)?;
+    let mut prepared_indices = requirements.databases.named_db_indices.clone();
+    if let Some(default_index) = default_database {
+        if requirements.databases.default_db && !prepared_indices.contains(&default_index) {
+            prepared_indices.push(default_index);
+        }
+    } else if requirements.databases.default_db {
+        prepared_indices.push(usize::MAX);
+    }
+
+    prepared_indices.sort_unstable();
+    let synthesized_default_db = prepared_indices.contains(&usize::MAX);
+
+    for index in prepared_indices {
+        push_test_database_init(index, default_database, requirements, databases, statements);
+    }
+
+    if requirements.databases.default_db && default_database.is_none() && !synthesized_default_db {
+        statements.push(in_memory_default_db_init());
+    }
+
+    Ok(())
+}
+
+fn push_test_database_init(
+    index: usize,
+    default_database: Option<usize>,
+    requirements: &TestRequirements,
+    databases: &[DatabaseConfig],
+    statements: &mut Vec<proc_macro2::TokenStream>,
+) {
+    if index == usize::MAX {
+        statements.push(in_memory_default_db_init());
+        return;
+    }
+
+    let db_ident = format_ident!("__skyzen_test_named_db_{index}");
+    let database_name = &databases[index].name;
+    let init_message = LitStr::new(
+        &format!("failed to initialize in-memory test database `{database_name}`"),
+        proc_macro2::Span::call_site(),
+    );
+    statements.push(quote! {
+        let #db_ident = ::skyzen_test::mock::InMemoryDb::new()
+            .await
+            .unwrap_or_else(|error| panic!("{}: {error}", #init_message))
+            .into_db();
+    });
+
+    if default_database == Some(index) && requirements.databases.default_db {
+        statements.push(quote! {
+            let __skyzen_test_default_db = #db_ident.clone();
+        });
+    }
+}
+
+fn in_memory_default_db_init() -> proc_macro2::TokenStream {
+    quote! {
+        let __skyzen_test_default_db = ::skyzen_test::mock::InMemoryDb::new()
+            .await
+            .unwrap_or_else(|error| panic!("failed to initialize in-memory test database: {error}"))
+            .into_db();
+    }
+}
+
+fn push_test_context_setup(
+    requirements: &TestRequirements,
+    statements: &mut Vec<proc_macro2::TokenStream>,
+) {
+    if !requirements.test_context {
+        return;
+    }
+
+    statements.push(quote! {
+        let mut __skyzen_test_context = ::skyzen_test::TestContext::new();
+    });
+    if requirements.services.kv {
+        statements.push(quote! {
+            __skyzen_test_context = __skyzen_test_context.with_kv(__skyzen_test_kv.clone());
+        });
+    }
+    if requirements.services.storage {
+        statements.push(quote! {
+            __skyzen_test_context =
+                __skyzen_test_context.with_storage(__skyzen_test_storage.clone());
+        });
+    }
+    if requirements.services.queue {
+        statements.push(quote! {
+            __skyzen_test_context =
+                __skyzen_test_context.with_queue(__skyzen_test_queue.clone());
+        });
+    }
+    if requirements.databases.default_db {
+        statements.push(quote! {
+            __skyzen_test_context = __skyzen_test_context.with_db(__skyzen_test_default_db.clone());
+        });
+    }
 }
 
 fn classify_test_param(
@@ -2950,9 +3044,8 @@ binding = "DB"
         let batch_inner = single_generic_type(&queue_batch_ty).expect("single generic");
         assert_eq!(batch_inner.into_token_stream().to_string(), "Job");
 
-        let error = match single_generic_type(&result_ty) {
-            Ok(_) => panic!("expected Result<Job, Error> to be rejected"),
-            Err(error) => error,
+        let Err(error) = single_generic_type(&result_ty) else {
+            panic!("expected Result<Job, Error> to be rejected");
         };
         assert!(error
             .to_string()

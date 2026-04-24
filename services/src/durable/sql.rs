@@ -12,7 +12,7 @@ use skyzen_core::{Extractor, StatusCode};
 
 use crate::{
     maybe_send::{BoxFuture, MaybeSend},
-    sql::{DbExecResult, DbValue},
+    sql::{DbError, DbExecResult, DbValue},
 };
 
 /// Errors from Durable Object database operations.
@@ -29,6 +29,12 @@ pub enum DurableDbError {
     /// A query expected one row but none were returned.
     #[error("durable database row not found")]
     RowNotFound,
+}
+
+impl From<DbError> for DurableDbError {
+    fn from(error: DbError) -> Self {
+        Self::Backend(error.to_string())
+    }
 }
 
 /// Durable Object SQL storage.
@@ -124,6 +130,10 @@ impl DurableDb {
     }
 
     /// Get the on-disk database size in bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot report its database size.
     pub async fn database_size(&self) -> Result<u64, DurableDbError> {
         self.0.database_size().await
     }
@@ -149,11 +159,19 @@ impl DurableDbQuery<'_> {
     }
 
     /// Execute a statement that does not return rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if backend execution or result conversion fails.
     pub async fn execute(self) -> Result<DbExecResult, DurableDbError> {
         self.db.0.execute(self.sql, &self.params).await
     }
 
     /// Execute a query and deserialize all rows into `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if backend execution or row deserialization fails.
     pub async fn fetch_all<T>(self) -> Result<Vec<T>, DurableDbError>
     where
         T: DeserializeOwned,
@@ -167,6 +185,10 @@ impl DurableDbQuery<'_> {
     }
 
     /// Execute a query and deserialize the first row into `T`, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if backend execution or row deserialization fails.
     pub async fn fetch_optional<T>(self) -> Result<Option<T>, DurableDbError>
     where
         T: DeserializeOwned,
@@ -181,6 +203,10 @@ impl DurableDbQuery<'_> {
     }
 
     /// Execute a query and deserialize exactly one row into `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails or the query returns no rows.
     pub async fn fetch_one<T>(self) -> Result<T, DurableDbError>
     where
         T: DeserializeOwned,

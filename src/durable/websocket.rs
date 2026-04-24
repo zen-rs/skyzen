@@ -383,29 +383,35 @@ mod tests {
 
     impl WebSocketConnectionInner for MockSocketInner {
         fn send_text(&self, text: &str) -> Result<(), DurableObjectError> {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = &state.fail_text {
-                return Err(Self::error_clone(error));
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(error) = &state.fail_text {
+                    return Err(Self::error_clone(error));
+                }
+                state.text_messages.push(text.to_owned());
             }
-            state.text_messages.push(text.to_owned());
             Ok(())
         }
 
         fn send_binary(&self, data: &[u8]) -> Result<(), DurableObjectError> {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = &state.fail_binary {
-                return Err(Self::error_clone(error));
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(error) = &state.fail_binary {
+                    return Err(Self::error_clone(error));
+                }
+                state.binary_messages.push(data.to_vec());
             }
-            state.binary_messages.push(data.to_vec());
             Ok(())
         }
 
         fn close(&self, code: u16, reason: &str) -> Result<(), DurableObjectError> {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = &state.fail_close {
-                return Err(Self::error_clone(error));
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(error) = &state.fail_close {
+                    return Err(Self::error_clone(error));
+                }
+                state.close_calls.push((code, reason.to_owned()));
             }
-            state.close_calls.push((code, reason.to_owned()));
             Ok(())
         }
 
@@ -426,11 +432,13 @@ mod tests {
         }
 
         fn set_attachment_raw(&self, data: &[u8]) -> Result<(), DurableObjectError> {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = &state.fail_set_attachment {
-                return Err(Self::error_clone(error));
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(error) = &state.fail_set_attachment {
+                    return Err(Self::error_clone(error));
+                }
+                state.attachment = Some(data.to_vec());
             }
-            state.attachment = Some(data.to_vec());
             Ok(())
         }
     }

@@ -395,12 +395,14 @@ mod tests {
         }
 
         async fn put_multiple(&self, entries: &[(&str, &[u8])]) -> Result<(), DurableKvError> {
-            let mut data = self
-                .data
-                .write()
-                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
-            for (key, value) in entries {
-                data.insert((*key).to_owned(), value.to_vec());
+            {
+                let mut data = self
+                    .data
+                    .write()
+                    .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+                for (key, value) in entries {
+                    data.insert((*key).to_owned(), value.to_vec());
+                }
             }
             Ok(())
         }

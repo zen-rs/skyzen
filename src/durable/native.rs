@@ -19,7 +19,7 @@ use skyzen_services::{
         Alarm, AlarmError, AlarmScheduler, DurableDb, DurableDbBackend, DurableDbError, DurableKv,
         DurableKvError,
     },
-    Db, DbError, DbExecResult, DbValue,
+    Db, DbExecResult, DbValue,
 };
 
 use super::{
@@ -70,7 +70,7 @@ impl NativeDurableSlot {
             db: NativeDurableDbStore::new(
                 Db::connect_sqlite_memory()
                     .await
-                    .map_err(runtime_db_error)?,
+                    .map_err(DurableObjectError::from)?,
             ),
             alarm: NativeAlarmScheduler::default(),
             connections: NativeDurableConnections,
@@ -130,6 +130,11 @@ where
     }
 
     /// Resolve a deterministic Durable Object ID from a name.
+    ///
+    /// # Errors
+    ///
+    /// This native implementation is deterministic and currently infallible,
+    /// preserving the shared runtime API shape.
     pub fn id_from_name(&self, name: &str) -> Result<DurableObjectId, DurableObjectError> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.inner.type_name.hash(&mut hasher);
@@ -141,6 +146,10 @@ where
     }
 
     /// Reconstruct a Durable Object ID from its string form.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `id` is empty or only whitespace.
     pub fn id_from_string(&self, id: &str) -> Result<DurableObjectId, DurableObjectError> {
         if id.trim().is_empty() {
             return Err(DurableObjectError::Runtime(
@@ -151,6 +160,11 @@ where
     }
 
     /// Allocate a new unique Durable Object ID.
+    ///
+    /// # Errors
+    ///
+    /// This native implementation is currently infallible, preserving the
+    /// shared runtime API shape.
     pub fn new_unique_id(&self) -> Result<DurableObjectId, DurableObjectError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         Ok(DurableObjectId::new(
@@ -160,6 +174,10 @@ where
     }
 
     /// Get a stub for the provided Durable Object ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `id` is empty or only whitespace.
     pub fn get(&self, id: &str) -> Result<NativeDurableObjectStub<T>, DurableObjectError> {
         Ok(NativeDurableObjectStub {
             namespace: self.clone(),
@@ -168,6 +186,11 @@ where
     }
 
     /// Get a stub for a Durable Object by deterministic name.
+    ///
+    /// # Errors
+    ///
+    /// This native implementation is currently infallible, preserving the
+    /// shared runtime API shape.
     pub fn get_by_name(
         &self,
         name: &str,
@@ -182,23 +205,27 @@ where
         &self,
         id: &DurableObjectId,
     ) -> Result<Arc<Mutex<NativeDurableSlot>>, DurableObjectError> {
-        if let Some(slot) = self
-            .inner
-            .instances
-            .read()
-            .map_err(lock_poisoned)?
-            .get(id.as_str())
-            .cloned()
-        {
+        let existing_slot = {
+            self.inner
+                .instances
+                .read()
+                .map_err(lock_poisoned)?
+                .get(id.as_str())
+                .cloned()
+        };
+        if let Some(slot) = existing_slot {
             return Ok(slot);
         }
 
         let slot = Arc::new(Mutex::new(NativeDurableSlot::new().await?));
-        let mut instances = self.inner.instances.write().map_err(lock_poisoned)?;
-        Ok(instances
-            .entry(id.as_str().to_owned())
-            .or_insert_with(|| Arc::clone(&slot))
-            .clone())
+        let slot = {
+            let mut instances = self.inner.instances.write().map_err(lock_poisoned)?;
+            instances
+                .entry(id.as_str().to_owned())
+                .or_insert_with(|| Arc::clone(&slot))
+                .clone()
+        };
+        Ok(slot)
     }
 
     async fn fetch(
@@ -207,54 +234,59 @@ where
         mut request: Request,
     ) -> Result<Response, DurableObjectError> {
         let slot = self.slot_for(id).await?;
-        let mut slot = slot.lock().await;
-        let mut object = slot.load_object::<T>()?;
-
-        inject_durable_extensions(&mut request, &slot, id.clone());
-
         let response = {
-            let mut endpoint = object.fetch();
-            match endpoint.respond(&mut request).await {
-                Ok(response) => response,
-                Err(error) => error_to_response(&error),
-            }
-        };
+            let mut slot = slot.lock().await;
+            let mut object = slot.load_object::<T>()?;
 
-        slot.save_object(&object)?;
+            inject_durable_extensions(&mut request, &slot, id.clone());
+
+            let response = {
+                let mut endpoint = object.fetch();
+                match endpoint.respond(&mut request).await {
+                    Ok(response) => response,
+                    Err(error) => error_to_response(&error),
+                }
+            };
+
+            slot.save_object(&object)?;
+            response
+        };
         Ok(response)
     }
 
     async fn alarm(&self, id: &DurableObjectId) -> Result<(), DurableObjectError> {
         let slot = self.slot_for(id).await?;
-        let mut slot = slot.lock().await;
-        let mut object = slot.load_object::<T>()?;
+        {
+            let mut slot = slot.lock().await;
+            let mut object = slot.load_object::<T>()?;
 
-        let mut endpoint = object.fetch();
-        let router = (&mut endpoint as &mut dyn std::any::Any)
-            .downcast_mut::<crate::routing::Router>()
-            .ok_or_else(|| {
+            let mut endpoint = object.fetch();
+            let router = (&mut endpoint as &mut dyn std::any::Any)
+                .downcast_mut::<crate::routing::Router>()
+                .ok_or_else(|| {
+                    DurableObjectError::Runtime(
+                        "DurableObject::fetch() must return skyzen::routing::Router for alarm handling"
+                            .to_owned(),
+                    )
+                })?;
+
+            let mut alarm_endpoint = router.alarm_endpoint().ok_or_else(|| {
                 DurableObjectError::Runtime(
-                    "DurableObject::fetch() must return skyzen::routing::Router for alarm handling"
-                        .to_owned(),
+                    "No alarm handler registered. Use Route::on_alarm(handler).".to_owned(),
                 )
             })?;
 
-        let mut alarm_endpoint = router.alarm_endpoint().ok_or_else(|| {
-            DurableObjectError::Runtime(
-                "No alarm handler registered. Use Route::on_alarm(handler).".to_owned(),
-            )
-        })?;
+            let mut request =
+                alarm_request().map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
+            inject_durable_extensions(&mut request, &slot, id.clone());
 
-        let mut request =
-            alarm_request().map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
-        inject_durable_extensions(&mut request, &slot, id.clone());
+            alarm_endpoint
+                .respond(&mut request)
+                .await
+                .map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
 
-        alarm_endpoint
-            .respond(&mut request)
-            .await
-            .map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
-
-        slot.save_object(&object)?;
+            slot.save_object(&object)?;
+        }
         Ok(())
     }
 }
@@ -286,11 +318,20 @@ where
     }
 
     /// Dispatch a request to the target Durable Object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if object loading, request dispatch, or state
+    /// persistence fails.
     pub async fn fetch(&self, request: Request) -> Result<Response, DurableObjectError> {
         self.namespace.fetch(&self.id, request).await
     }
 
     /// Dispatch a `GET` request to the target Durable Object using a URL string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `url` is invalid or the object fetch fails.
     pub async fn fetch_url(&self, url: &str) -> Result<Response, DurableObjectError> {
         let mut request = Request::new(Body::empty());
         *request.method_mut() = Method::GET;
@@ -301,6 +342,11 @@ where
     }
 
     /// Trigger the target Durable Object's alarm handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if object loading, alarm dispatch, or state
+    /// persistence fails.
     pub async fn alarm(&self) -> Result<(), DurableObjectError> {
         self.namespace.alarm(&self.id).await
     }
@@ -350,10 +396,6 @@ fn error_to_response(error: &dyn HttpError) -> Response {
     response
 }
 
-fn runtime_db_error(error: DbError) -> DurableObjectError {
-    DurableObjectError::Runtime(error.to_string())
-}
-
 fn lock_poisoned<T>(_: T) -> DurableObjectError {
     DurableObjectError::Runtime("native durable simulator lock poisoned".to_owned())
 }
@@ -390,27 +432,30 @@ struct NativeAlarmScheduler {
 
 impl AlarmScheduler for NativeAlarmScheduler {
     async fn get_alarm(&self) -> Result<Option<i64>, AlarmError> {
-        self.alarm
+        let alarm = self
+            .alarm
             .read()
-            .map_err(|_| AlarmError::Backend("native durable alarm lock poisoned".to_owned()))
-            .map(|value| *value)
+            .map_err(|_| AlarmError::Backend("native durable alarm lock poisoned".to_owned()))?;
+        Ok(*alarm)
     }
 
     async fn set_alarm(&self, scheduled_time_ms: i64) -> Result<(), AlarmError> {
-        let mut alarm = self
-            .alarm
-            .write()
-            .map_err(|_| AlarmError::Backend("native durable alarm lock poisoned".to_owned()))?;
-        *alarm = Some(scheduled_time_ms);
+        {
+            let mut alarm = self.alarm.write().map_err(|_| {
+                AlarmError::Backend("native durable alarm lock poisoned".to_owned())
+            })?;
+            *alarm = Some(scheduled_time_ms);
+        }
         Ok(())
     }
 
     async fn delete_alarm(&self) -> Result<(), AlarmError> {
-        let mut alarm = self
-            .alarm
-            .write()
-            .map_err(|_| AlarmError::Backend("native durable alarm lock poisoned".to_owned()))?;
-        *alarm = None;
+        {
+            let mut alarm = self.alarm.write().map_err(|_| {
+                AlarmError::Backend("native durable alarm lock poisoned".to_owned())
+            })?;
+            *alarm = None;
+        }
         Ok(())
     }
 }
@@ -446,9 +491,11 @@ impl DurableKvStore for NativeDurableKvStore {
     }
 
     async fn put_multiple(&self, entries: &[(&str, &[u8])]) -> Result<(), DurableKvError> {
-        let mut guard = self.data.write().map_err(kv_lock_err)?;
-        for (key, value) in entries {
-            guard.insert((*key).to_owned(), value.to_vec());
+        {
+            let mut guard = self.data.write().map_err(kv_lock_err)?;
+            for (key, value) in entries {
+                guard.insert((*key).to_owned(), value.to_vec());
+            }
         }
         Ok(())
     }
@@ -535,7 +582,7 @@ impl DurableDbBackend for NativeDurableDbStore {
         let rows = statement
             .fetch_all::<serde_json::Value>()
             .await
-            .map_err(durable_db_error)?;
+            .map_err(DurableDbError::from)?;
         Ok(DbExecResult {
             rows_read: rows.len() as u64,
             rows,
@@ -552,7 +599,7 @@ impl DurableDbBackend for NativeDurableDbStore {
         for value in params {
             statement = statement.bind(value.clone());
         }
-        statement.execute().await.map_err(durable_db_error)
+        statement.execute().await.map_err(DurableDbError::from)
     }
 
     async fn database_size(&self) -> Result<u64, DurableDbError> {
@@ -571,14 +618,14 @@ impl DurableDbBackend for NativeDurableDbStore {
             .query("PRAGMA page_count")
             .fetch_one::<PageCount>()
             .await
-            .map_err(durable_db_error)?
+            .map_err(DurableDbError::from)?
             .page_count;
         let page_size = self
             .db
             .query("PRAGMA page_size")
             .fetch_one::<PageSize>()
             .await
-            .map_err(durable_db_error)?
+            .map_err(DurableDbError::from)?
             .page_size;
 
         let bytes = page_count
@@ -587,10 +634,6 @@ impl DurableDbBackend for NativeDurableDbStore {
         u64::try_from(bytes)
             .map_err(|_| DurableDbError::Backend("native durable DB size was negative".to_owned()))
     }
-}
-
-fn durable_db_error(error: DbError) -> DurableDbError {
-    DurableDbError::Backend(error.to_string())
 }
 
 #[cfg(test)]
@@ -606,6 +649,11 @@ mod tests {
     #[derive(Default, Serialize, Deserialize)]
     #[skyzen::durable_object]
     struct CounterObject;
+
+    #[derive(serde::Deserialize)]
+    struct CounterRow {
+        value: i64,
+    }
 
     impl DurableObject for CounterObject {
         fn fetch(&mut self) -> impl Endpoint + 'static {
@@ -625,14 +673,9 @@ mod tests {
             .await
             .map_err(to_error)?;
 
-        #[derive(serde::Deserialize)]
-        struct Row {
-            value: i64,
-        }
-
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
-            .fetch_optional::<Row>()
+            .fetch_optional::<CounterRow>()
             .await
             .map_err(to_error)?
             .map_or(0, |row| row.value);
@@ -661,14 +704,9 @@ mod tests {
             .await
             .map_err(to_error)?;
 
-        #[derive(serde::Deserialize)]
-        struct Row {
-            value: i64,
-        }
-
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
-            .fetch_optional::<Row>()
+            .fetch_optional::<CounterRow>()
             .await
             .map_err(to_error)?
             .map_or(0, |row| row.value);
@@ -681,14 +719,9 @@ mod tests {
             .await
             .map_err(to_error)?;
 
-        #[derive(serde::Deserialize)]
-        struct Row {
-            value: i64,
-        }
-
         let current = db
             .query("SELECT value FROM alarm_runs LIMIT 1")
-            .fetch_optional::<Row>()
+            .fetch_optional::<CounterRow>()
             .await
             .map_err(to_error)?
             .map_or(0, |row| row.value);
@@ -717,14 +750,9 @@ mod tests {
             .await
             .map_err(to_error)?;
 
-        #[derive(serde::Deserialize)]
-        struct Row {
-            value: i64,
-        }
-
         let current = db
             .query("SELECT value FROM alarm_runs LIMIT 1")
-            .fetch_optional::<Row>()
+            .fetch_optional::<CounterRow>()
             .await
             .map_err(to_error)?
             .map_or(0, |row| row.value);

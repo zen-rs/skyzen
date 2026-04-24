@@ -1,6 +1,6 @@
 //! In-memory `SQLite` database helper for testing.
 //!
-//! This utility creates a [`skyzen_services::Db`] backed by in-memory SQLite.
+//! This utility creates a [`skyzen_services::Db`] backed by in-memory `SQLite`.
 
 use skyzen_services::{Db, DbError};
 

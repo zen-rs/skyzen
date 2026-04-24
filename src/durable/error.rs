@@ -26,3 +26,9 @@ impl fmt::Display for DurableObjectError {
 }
 
 impl std::error::Error for DurableObjectError {}
+
+impl From<skyzen_services::DbError> for DurableObjectError {
+    fn from(error: skyzen_services::DbError) -> Self {
+        Self::Runtime(error.to_string())
+    }
+}

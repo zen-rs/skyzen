@@ -52,6 +52,13 @@ pub enum DbError {
     TransactionsUnsupported,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl From<sqlx::Error> for DbError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Backend(error.to_string())
+    }
+}
+
 /// A SQL parameter value.
 #[derive(Debug, Clone)]
 pub enum DbValue {
@@ -204,6 +211,10 @@ pub trait DbBackend: Send + Sync + Clone + 'static {
     ) -> impl Future<Output = Result<DbExecResult, DbError>> + MaybeSend;
 
     /// Begin a database transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot create a transaction.
     fn begin(&self) -> impl Future<Output = Result<DbTransaction, DbError>> + MaybeSend {
         async { Err(DbError::TransactionsUnsupported) }
     }
@@ -229,6 +240,10 @@ pub trait DbTransactionBackend: Send + 'static {
     ) -> impl Future<Output = Result<DbExecResult, DbError>> + MaybeSend;
 
     /// Commit this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot commit the transaction.
     fn commit(self) -> impl Future<Output = Result<(), DbError>> + MaybeSend
     where
         Self: Sized;
@@ -363,52 +378,62 @@ impl Db {
     }
 
     /// Begin a database transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot create a transaction.
     pub async fn begin(&self) -> Result<DbTransaction, DbError> {
         self.0.begin().await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     /// Connect to a `PostgreSQL` database using `sqlx`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sqlx` cannot establish the connection.
     pub async fn connect_postgres(url: &str) -> Result<Self, DbError> {
         Ok(Self::new(NativeDbBackend::Postgres(
-            sqlx::postgres::PgPoolOptions::new()
-                .connect(url)
-                .await
-                .map_err(sqlx_error)?,
+            sqlx::postgres::PgPoolOptions::new().connect(url).await?,
         )))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     /// Connect to a `MySQL` database using `sqlx`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sqlx` cannot establish the connection.
     pub async fn connect_mysql(url: &str) -> Result<Self, DbError> {
         Ok(Self::new(NativeDbBackend::MySql(
-            sqlx::mysql::MySqlPoolOptions::new()
-                .connect(url)
-                .await
-                .map_err(sqlx_error)?,
+            sqlx::mysql::MySqlPoolOptions::new().connect(url).await?,
         )))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     /// Connect to a `SQLite` database using `sqlx`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sqlx` cannot establish the connection.
     pub async fn connect_sqlite(url: &str) -> Result<Self, DbError> {
         Ok(Self::new(NativeDbBackend::Sqlite(
-            sqlx::sqlite::SqlitePoolOptions::new()
-                .connect(url)
-                .await
-                .map_err(sqlx_error)?,
+            sqlx::sqlite::SqlitePoolOptions::new().connect(url).await?,
         )))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     /// Connect to an in-memory `SQLite` database using a single connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sqlx` cannot initialize the in-memory database.
     pub async fn connect_sqlite_memory() -> Result<Self, DbError> {
         Ok(Self::new(NativeDbBackend::Sqlite(
             sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
-                .await
-                .map_err(sqlx_error)?,
+                .await?,
         )))
     }
 }
@@ -438,11 +463,19 @@ impl DbTransaction {
     }
 
     /// Commit this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot commit the transaction.
     pub async fn commit(self) -> Result<(), DbError> {
         self.0.commit().await
     }
 
     /// Roll this transaction back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot roll back the transaction.
     pub async fn rollback(self) -> Result<(), DbError> {
         self.0.rollback().await
     }
@@ -468,12 +501,22 @@ impl DbQuery<'_> {
     }
 
     /// Execute a statement that does not return rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if placeholder rewriting, backend execution, or result
+    /// conversion fails.
     pub async fn execute(self) -> Result<DbExecResult, DbError> {
         let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.db.0.dialect())?;
         self.db.0.execute(&sql, &self.params).await
     }
 
     /// Execute a query and deserialize all rows into `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if placeholder rewriting, backend execution, or row
+    /// deserialization fails.
     pub async fn fetch_all<T>(self) -> Result<Vec<T>, DbError>
     where
         T: DeserializeOwned,
@@ -488,6 +531,11 @@ impl DbQuery<'_> {
     }
 
     /// Execute a query and deserialize the first row into `T`, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if placeholder rewriting, backend execution, or row
+    /// deserialization fails.
     pub async fn fetch_optional<T>(self) -> Result<Option<T>, DbError>
     where
         T: DeserializeOwned,
@@ -503,6 +551,10 @@ impl DbQuery<'_> {
     }
 
     /// Execute a query and deserialize exactly one row into `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails or the query returns no rows.
     pub async fn fetch_one<T>(self) -> Result<T, DbError>
     where
         T: DeserializeOwned,
@@ -531,12 +583,22 @@ impl DbTransactionQuery<'_> {
     }
 
     /// Execute a statement that does not return rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if placeholder rewriting, backend execution, or result
+    /// conversion fails.
     pub async fn execute(self) -> Result<DbExecResult, DbError> {
         let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.tx.0.dialect())?;
         self.tx.0.execute(&sql, &self.params).await
     }
 
     /// Execute a query and deserialize all rows into `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if placeholder rewriting, backend execution, or row
+    /// deserialization fails.
     pub async fn fetch_all<T>(self) -> Result<Vec<T>, DbError>
     where
         T: DeserializeOwned,
@@ -551,6 +613,11 @@ impl DbTransactionQuery<'_> {
     }
 
     /// Execute a query and deserialize the first row into `T`, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if placeholder rewriting, backend execution, or row
+    /// deserialization fails.
     pub async fn fetch_optional<T>(self) -> Result<Option<T>, DbError>
     where
         T: DeserializeOwned,
@@ -566,6 +633,10 @@ impl DbTransactionQuery<'_> {
     }
 
     /// Execute a query and deserialize exactly one row into `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails or the query returns no rows.
     pub async fn fetch_one<T>(self) -> Result<T, DbError>
     where
         T: DeserializeOwned,
@@ -750,15 +821,9 @@ impl DbBackend for NativeDbBackend {
 
     async fn begin(&self) -> Result<DbTransaction, DbError> {
         let tx = match self {
-            Self::Postgres(pool) => {
-                NativeDbTransaction::Postgres(pool.begin().await.map_err(sqlx_error)?)
-            }
-            Self::MySql(pool) => {
-                NativeDbTransaction::MySql(pool.begin().await.map_err(sqlx_error)?)
-            }
-            Self::Sqlite(pool) => {
-                NativeDbTransaction::Sqlite(pool.begin().await.map_err(sqlx_error)?)
-            }
+            Self::Postgres(pool) => NativeDbTransaction::Postgres(pool.begin().await?),
+            Self::MySql(pool) => NativeDbTransaction::MySql(pool.begin().await?),
+            Self::Sqlite(pool) => NativeDbTransaction::Sqlite(pool.begin().await?),
         };
         Ok(DbTransaction::new(tx))
     }
@@ -792,24 +857,19 @@ impl DbTransactionBackend for NativeDbTransaction {
 
     async fn commit(self) -> Result<(), DbError> {
         match self {
-            Self::Postgres(tx) => tx.commit().await.map_err(sqlx_error),
-            Self::MySql(tx) => tx.commit().await.map_err(sqlx_error),
-            Self::Sqlite(tx) => tx.commit().await.map_err(sqlx_error),
+            Self::Postgres(tx) => tx.commit().await.map_err(Into::into),
+            Self::MySql(tx) => tx.commit().await.map_err(Into::into),
+            Self::Sqlite(tx) => tx.commit().await.map_err(Into::into),
         }
     }
 
     async fn rollback(self) -> Result<(), DbError> {
         match self {
-            Self::Postgres(tx) => tx.rollback().await.map_err(sqlx_error),
-            Self::MySql(tx) => tx.rollback().await.map_err(sqlx_error),
-            Self::Sqlite(tx) => tx.rollback().await.map_err(sqlx_error),
+            Self::Postgres(tx) => tx.rollback().await.map_err(Into::into),
+            Self::MySql(tx) => tx.rollback().await.map_err(Into::into),
+            Self::Sqlite(tx) => tx.rollback().await.map_err(Into::into),
         }
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn sqlx_error(error: sqlx::Error) -> DbError {
-    DbError::Backend(error.to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -849,7 +909,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     let query = bind_query_values!(sqlx::query(query), params);
-    let result = query.execute(executor).await.map_err(sqlx_error)?;
+    let result = query.execute(executor).await?;
     Ok(DbExecResult {
         rows: Vec::new(),
         rows_read: 0,
@@ -876,7 +936,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
 {
     let query = bind_query_values!(sqlx::query(query), params);
-    let result = query.execute(executor).await.map_err(sqlx_error)?;
+    let result = query.execute(executor).await?;
     Ok(DbExecResult {
         rows: Vec::new(),
         rows_read: 0,
@@ -903,7 +963,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     let query = bind_query_values!(sqlx::query(query), params);
-    let result = query.execute(executor).await.map_err(sqlx_error)?;
+    let result = query.execute(executor).await?;
     Ok(DbExecResult {
         rows: Vec::new(),
         rows_read: 0,
@@ -930,7 +990,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     let query = bind_query_values!(sqlx::query(query), params);
-    let rows = query.fetch_all(executor).await.map_err(sqlx_error)?;
+    let rows = query.fetch_all(executor).await?;
     let rows_json = rows
         .iter()
         .map(postgres_row_to_json)
@@ -961,7 +1021,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
 {
     let query = bind_query_values!(sqlx::query(query), params);
-    let rows = query.fetch_all(executor).await.map_err(sqlx_error)?;
+    let rows = query.fetch_all(executor).await?;
     let rows_json = rows
         .iter()
         .map(mysql_row_to_json)
@@ -992,7 +1052,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     let query = bind_query_values!(sqlx::query(query), params);
-    let rows = query.fetch_all(executor).await.map_err(sqlx_error)?;
+    let rows = query.fetch_all(executor).await?;
     let rows_json = rows
         .iter()
         .map(sqlite_row_to_json)
@@ -1053,43 +1113,26 @@ fn postgres_value_to_json(
     type_name: &str,
 ) -> Result<serde_json::Value, DbError> {
     match type_name {
-        "BOOL" => Ok(option_to_json(
-            row.try_get::<Option<bool>, _>(index).map_err(sqlx_error)?,
+        "BOOL" => Ok(option_to_json(row.try_get::<Option<bool>, _>(index)?)),
+        "INT2" => Ok(option_to_json(
+            row.try_get::<Option<i16>, _>(index)?.map(i64::from),
         )),
-        "INT2" => option_to_json_i64(
-            row.try_get::<Option<i16>, _>(index)
-                .map_err(sqlx_error)?
-                .map(i64::from),
-        ),
-        "INT4" => option_to_json_i64(
-            row.try_get::<Option<i32>, _>(index)
-                .map_err(sqlx_error)?
-                .map(i64::from),
-        ),
-        "INT8" | "OID" => Ok(option_to_json(
-            row.try_get::<Option<i64>, _>(index).map_err(sqlx_error)?,
+        "INT4" => Ok(option_to_json(
+            row.try_get::<Option<i32>, _>(index)?.map(i64::from),
         )),
-        "FLOAT4" => option_to_json_f64(
-            row.try_get::<Option<f32>, _>(index)
-                .map_err(sqlx_error)?
-                .map(f64::from),
-        ),
-        "FLOAT8" => Ok(option_to_json(
-            row.try_get::<Option<f64>, _>(index).map_err(sqlx_error)?,
+        "INT8" | "OID" => Ok(option_to_json(row.try_get::<Option<i64>, _>(index)?)),
+        "FLOAT4" => Ok(option_to_json(
+            row.try_get::<Option<f32>, _>(index)?.map(f64::from),
         )),
-        "BYTEA" => Ok(option_to_json(
-            row.try_get::<Option<Vec<u8>>, _>(index)
-                .map_err(sqlx_error)?,
-        )),
+        "FLOAT8" => Ok(option_to_json(row.try_get::<Option<f64>, _>(index)?)),
+        "BYTEA" => Ok(option_to_json(row.try_get::<Option<Vec<u8>>, _>(index)?)),
         "JSON" | "JSONB" => Ok(option_to_json(
-            row.try_get::<Option<serde_json::Value>, _>(index)
-                .map_err(sqlx_error)?,
+            row.try_get::<Option<serde_json::Value>, _>(index)?,
         )),
-        _ => fallback_value_to_json(
-            row.try_get::<Option<String>, _>(index)
-                .map_err(sqlx_error)?,
-            row.try_get::<Option<Vec<u8>>, _>(index).ok(),
-        ),
+        _ => Ok(fallback_value_to_json(
+            row.try_get::<Option<String>, _>(index)?,
+            row.try_get::<Option<Vec<u8>>, _>(index),
+        )),
     }
 }
 
@@ -1100,45 +1143,28 @@ fn mysql_value_to_json(
     type_name: &str,
 ) -> Result<serde_json::Value, DbError> {
     match type_name {
-        "BOOLEAN" | "BOOL" => Ok(option_to_json(
-            row.try_get::<Option<bool>, _>(index).map_err(sqlx_error)?,
+        "BOOLEAN" | "BOOL" => Ok(option_to_json(row.try_get::<Option<bool>, _>(index)?)),
+        "SMALLINT" => Ok(option_to_json(
+            row.try_get::<Option<i16>, _>(index)?.map(i64::from),
         )),
-        "SMALLINT" => option_to_json_i64(
-            row.try_get::<Option<i16>, _>(index)
-                .map_err(sqlx_error)?
-                .map(i64::from),
-        ),
-        "INT" | "INTEGER" | "MEDIUMINT" | "TINYINT" => option_to_json_i64(
-            row.try_get::<Option<i32>, _>(index)
-                .map_err(sqlx_error)?
-                .map(i64::from),
-        ),
-        "BIGINT" => Ok(option_to_json(
-            row.try_get::<Option<i64>, _>(index).map_err(sqlx_error)?,
+        "INT" | "INTEGER" | "MEDIUMINT" | "TINYINT" => Ok(option_to_json(
+            row.try_get::<Option<i32>, _>(index)?.map(i64::from),
         )),
-        "FLOAT" => option_to_json_f64(
-            row.try_get::<Option<f32>, _>(index)
-                .map_err(sqlx_error)?
-                .map(f64::from),
-        ),
-        "DOUBLE" | "DECIMAL" => Ok(option_to_json(
-            row.try_get::<Option<f64>, _>(index).map_err(sqlx_error)?,
+        "BIGINT" => Ok(option_to_json(row.try_get::<Option<i64>, _>(index)?)),
+        "FLOAT" => Ok(option_to_json(
+            row.try_get::<Option<f32>, _>(index)?.map(f64::from),
         )),
+        "DOUBLE" | "DECIMAL" => Ok(option_to_json(row.try_get::<Option<f64>, _>(index)?)),
         "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" | "VARBINARY" => {
-            Ok(option_to_json(
-                row.try_get::<Option<Vec<u8>>, _>(index)
-                    .map_err(sqlx_error)?,
-            ))
+            Ok(option_to_json(row.try_get::<Option<Vec<u8>>, _>(index)?))
         }
         "JSON" => Ok(option_to_json(
-            row.try_get::<Option<serde_json::Value>, _>(index)
-                .map_err(sqlx_error)?,
+            row.try_get::<Option<serde_json::Value>, _>(index)?,
         )),
-        _ => fallback_value_to_json(
-            row.try_get::<Option<String>, _>(index)
-                .map_err(sqlx_error)?,
-            row.try_get::<Option<Vec<u8>>, _>(index).ok(),
-        ),
+        _ => Ok(fallback_value_to_json(
+            row.try_get::<Option<String>, _>(index)?,
+            row.try_get::<Option<Vec<u8>>, _>(index),
+        )),
     }
 }
 
@@ -1149,61 +1175,46 @@ fn sqlite_value_to_json(
     type_name: &str,
 ) -> Result<serde_json::Value, DbError> {
     match type_name {
-        "BOOLEAN" | "BOOL" => Ok(option_to_json(
-            row.try_get::<Option<bool>, _>(index).map_err(sqlx_error)?,
-        )),
-        "INTEGER" | "INT" => Ok(option_to_json(
-            row.try_get::<Option<i64>, _>(index).map_err(sqlx_error)?,
-        )),
-        "REAL" | "FLOAT" | "DOUBLE" => Ok(option_to_json(
-            row.try_get::<Option<f64>, _>(index).map_err(sqlx_error)?,
-        )),
-        "BLOB" => Ok(option_to_json(
-            row.try_get::<Option<Vec<u8>>, _>(index)
-                .map_err(sqlx_error)?,
-        )),
-        "TEXT" => Ok(option_to_json(
-            row.try_get::<Option<String>, _>(index)
-                .map_err(sqlx_error)?,
-        )),
-        _ => sqlite_dynamic_value_to_json(row, index),
+        "BOOLEAN" | "BOOL" => Ok(option_to_json(row.try_get::<Option<bool>, _>(index)?)),
+        "INTEGER" | "INT" => Ok(option_to_json(row.try_get::<Option<i64>, _>(index)?)),
+        "REAL" | "FLOAT" | "DOUBLE" => Ok(option_to_json(row.try_get::<Option<f64>, _>(index)?)),
+        "BLOB" => Ok(option_to_json(row.try_get::<Option<Vec<u8>>, _>(index)?)),
+        "TEXT" => Ok(option_to_json(row.try_get::<Option<String>, _>(index)?)),
+        _ => Ok(sqlite_dynamic_value_to_json(row, index)),
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn sqlite_dynamic_value_to_json(
-    row: &sqlx::sqlite::SqliteRow,
-    index: usize,
-) -> Result<serde_json::Value, DbError> {
+fn sqlite_dynamic_value_to_json(row: &sqlx::sqlite::SqliteRow, index: usize) -> serde_json::Value {
     if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
-        return Ok(option_to_json(value));
+        return option_to_json(value);
     }
     if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
-        return Ok(option_to_json(value));
+        return option_to_json(value);
     }
     if let Ok(value) = row.try_get::<Option<String>, _>(index) {
-        return Ok(option_to_json(value));
+        return option_to_json(value);
     }
     if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index) {
-        return Ok(option_to_json(value));
+        return option_to_json(value);
     }
-    Ok(serde_json::Value::Null)
+    serde_json::Value::Null
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn fallback_value_to_json(
     string_value: Option<String>,
-    bytes_value: Option<Option<Vec<u8>>>,
-) -> Result<serde_json::Value, DbError> {
+    bytes_value: Result<Option<Vec<u8>>, sqlx::Error>,
+) -> serde_json::Value {
     if let Some(value) = string_value {
-        return Ok(serde_json::Value::String(value));
+        return serde_json::Value::String(value);
     }
 
-    if let Some(value) = bytes_value {
-        return Ok(option_to_json(value));
+    if let Ok(value) = bytes_value {
+        return option_to_json(value);
     }
 
-    Ok(serde_json::Value::Null)
+    serde_json::Value::Null
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1212,16 +1223,6 @@ where
     T: serde::Serialize,
 {
     value.map_or(serde_json::Value::Null, |value| serde_json::json!(value))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn option_to_json_i64(value: Option<i64>) -> Result<serde_json::Value, DbError> {
-    Ok(value.map_or(serde_json::Value::Null, |value| serde_json::json!(value)))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn option_to_json_f64(value: Option<f64>) -> Result<serde_json::Value, DbError> {
-    Ok(value.map_or(serde_json::Value::Null, |value| serde_json::json!(value)))
 }
 
 #[cfg(all(

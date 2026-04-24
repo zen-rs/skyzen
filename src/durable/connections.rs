@@ -210,20 +210,24 @@ mod tests {
 
     impl WebSocketConnectionInner for MockSocketInner {
         fn send_text(&self, text: &str) -> Result<(), DurableObjectError> {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = &state.fail_text {
-                return Err(Self::error_clone(error));
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(error) = &state.fail_text {
+                    return Err(Self::error_clone(error));
+                }
+                state.text_messages.push(text.to_owned());
             }
-            state.text_messages.push(text.to_owned());
             Ok(())
         }
 
         fn send_binary(&self, data: &[u8]) -> Result<(), DurableObjectError> {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = &state.fail_binary {
-                return Err(Self::error_clone(error));
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(error) = &state.fail_binary {
+                    return Err(Self::error_clone(error));
+                }
+                state.binary_messages.push(data.to_vec());
             }
-            state.binary_messages.push(data.to_vec());
             Ok(())
         }
 
@@ -317,21 +321,25 @@ mod tests {
             request: &str,
             response: &str,
         ) -> Result<(), DurableObjectError> {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = &state.fail_set_auto_response {
-                return Err(Self::error_clone(error));
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(error) = &state.fail_set_auto_response {
+                    return Err(Self::error_clone(error));
+                }
+                state.auto_response = Some((request.to_owned(), response.to_owned()));
             }
-            state.auto_response = Some((request.to_owned(), response.to_owned()));
             Ok(())
         }
 
         fn clear_auto_response(&self) -> Result<(), DurableObjectError> {
-            let mut state = self.state.lock().unwrap();
-            if let Some(error) = &state.fail_clear_auto_response {
-                return Err(Self::error_clone(error));
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(error) = &state.fail_clear_auto_response {
+                    return Err(Self::error_clone(error));
+                }
+                state.auto_response = None;
+                state.clear_calls += 1;
             }
-            state.auto_response = None;
-            state.clear_calls += 1;
             Ok(())
         }
 
@@ -420,9 +428,12 @@ mod tests {
         connections.set_auto_response("ping", "pong").unwrap();
         connections.clear_auto_response().unwrap();
 
-        let state = state.lock().unwrap();
-        assert_eq!(state.auto_response, None);
-        assert_eq!(state.clear_calls, 1);
+        let (auto_response, clear_calls) = {
+            let state = state.lock().unwrap();
+            (state.auto_response.clone(), state.clear_calls)
+        };
+        assert_eq!(auto_response, None);
+        assert_eq!(clear_calls, 1);
     }
 
     #[tokio::test]

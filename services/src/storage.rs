@@ -328,20 +328,21 @@ mod tests {
         }
 
         async fn list(&self, options: ListOptions) -> Result<ListResult, StorageError> {
-            let data = self
-                .data
-                .read()
-                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?;
-            let mut objects: Vec<ObjectMetadata> = data
-                .iter()
-                .filter(|(key, _)| {
-                    options
-                        .prefix
-                        .as_ref()
-                        .is_none_or(|prefix| key.starts_with(prefix))
-                })
-                .map(|(key, body)| Self::metadata_for(key, body))
-                .collect();
+            let mut objects: Vec<ObjectMetadata> = {
+                let data = self
+                    .data
+                    .read()
+                    .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?;
+                data.iter()
+                    .filter(|(key, _)| {
+                        options
+                            .prefix
+                            .as_ref()
+                            .is_none_or(|prefix| key.starts_with(prefix))
+                    })
+                    .map(|(key, body)| Self::metadata_for(key, body))
+                    .collect()
+            };
             objects.sort_by(|left, right| left.key.cmp(&right.key));
             if let Some(limit) = options.limit {
                 objects.truncate(limit);
