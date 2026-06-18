@@ -80,6 +80,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         use ::skyzen::wasm_bindgen as wasm_bindgen;
         #[cfg(target_arch = "wasm32")]
         use ::skyzen::wasm_bindgen_futures as wasm_bindgen_futures;
+        /// Skyzen WebAssembly request entrypoint.
         #[cfg(target_arch = "wasm32")]
         #[::skyzen::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::skyzen::wasm_bindgen)]
         pub async fn fetch(

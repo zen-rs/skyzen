@@ -1,9 +1,10 @@
 //! OpenAPI helpers powered by `utoipa` schemas.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "openapi")]
+use std::marker::PhantomData;
 use std::{
     fmt::{self, Debug},
-    marker::PhantomData,
     sync::Arc,
 };
 
@@ -231,20 +232,16 @@ where
     }
 }
 
-#[cfg(not(feature = "openapi"))]
-fn register_type<T>(_defs: &mut BTreeMap<String, SchemaRef>)
-where
-    T: crate::PartialSchema + crate::ToSchema,
-{
-}
-
+#[cfg(feature = "openapi")]
 struct SchemaProbe<T>(PhantomData<T>);
 
+#[cfg(feature = "openapi")]
 trait MaybeSchemaProbe {
     fn maybe_schema(self) -> Option<SchemaRef>;
     fn maybe_register(self, defs: &mut BTreeMap<String, SchemaRef>);
 }
 
+#[cfg(feature = "openapi")]
 impl<T> MaybeSchemaProbe for &SchemaProbe<T> {
     fn maybe_schema(self) -> Option<SchemaRef> {
         None
@@ -253,6 +250,7 @@ impl<T> MaybeSchemaProbe for &SchemaProbe<T> {
     fn maybe_register(self, _defs: &mut BTreeMap<String, SchemaRef>) {}
 }
 
+#[cfg(feature = "openapi")]
 impl<T> MaybeSchemaProbe for &&SchemaProbe<T>
 where
     T: crate::PartialSchema + crate::ToSchema,

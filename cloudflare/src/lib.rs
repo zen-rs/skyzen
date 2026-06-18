@@ -51,11 +51,15 @@ pub mod fetch;
 #[cfg(target_arch = "wasm32")]
 pub mod ffi;
 #[cfg(target_arch = "wasm32")]
+pub mod http_request;
+#[cfg(target_arch = "wasm32")]
 pub mod kv;
 #[cfg(target_arch = "wasm32")]
 pub mod queues;
 #[cfg(target_arch = "wasm32")]
 pub mod r2;
+#[cfg(target_arch = "wasm32")]
+pub mod secret;
 
 #[cfg(target_arch = "wasm32")]
 pub use cache::{CfCache, CfCacheDeletionOutcome, CfCacheError};
@@ -79,11 +83,17 @@ pub use events::{
 #[cfg(target_arch = "wasm32")]
 pub use fetch::{CfFetch, CfFetchError};
 #[cfg(target_arch = "wasm32")]
+pub use http_request::{bare_request, json_request, CfHttpRequestError};
+#[cfg(target_arch = "wasm32")]
 pub use kv::CfKv;
 #[cfg(target_arch = "wasm32")]
 pub use queues::CfQueue;
 #[cfg(target_arch = "wasm32")]
 pub use r2::CfR2;
+#[cfg(target_arch = "wasm32")]
+pub use secret::{
+    optional_string as optional_secret, required_string as required_secret, CfSecretError,
+};
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use worker;
