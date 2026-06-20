@@ -449,7 +449,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
             #schema_collector_defs
         )*
 
-        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         #[::skyzen::openapi::linkme::distributed_slice(::skyzen::openapi::HANDLER_SPECS)]
         #[linkme(crate = ::skyzen::openapi::linkme)]
         static #spec_ident: ::skyzen::openapi::HandlerSpec = ::skyzen::openapi::HandlerSpec {

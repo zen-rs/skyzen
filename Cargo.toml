@@ -6,19 +6,20 @@ default-members = ["core", "hyper", "macros", "services", "test", "redis", "s3",
 resolver = "2"
 
 [workspace.dependencies]
-skyzen-core = { path = "core" }
-skyzen-macros = { path = "macros" }
-skyzen-services = { path = "services" }
-skyzen-test = { path = "test" }
-skyzen-redis = { path = "redis" }
-skyzen-s3 = { path = "s3" }
+skyzen-core = { path = "core", version = "0.1.0" }
+skyzen-macros = { path = "macros", version = "0.1.0" }
+skyzen-services = { path = "services", version = "0.1.0" }
+skyzen-test = { path = "test", version = "0.1.0" }
+skyzen-redis = { path = "redis", version = "0.1.0" }
+skyzen-s3 = { path = "s3", version = "0.1.0" }
 
 http-kit = "0.4.2"
-executor-core = { version = "0.7.1", default-features = false, features = ["std"] }
-skyzen-hyper = { path = "hyper" }
+executor-core = { version = "0.7.1", default-features = false, features = ["std", "async-executor"] }
+skyzen-hyper = { path = "hyper", version = "0.1.1" }
 tracing = "0.1.44"
-skyzen = { path = "."}
+skyzen = { path = ".", version = "0.1.1" }
 smol = "2.0"
+async-executor = "1.13"
 async-io = "2.6"
 async-net = "2.0"
 ctrlc = "3.5"
@@ -40,10 +41,10 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1 }
 
 [package]
 name = "skyzen"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-description = "Skyzen - a pragmatic HTTP framework built on http-kit"
-license = "MIT OR Apache-2.0"
+description = "A fast, ergonomic HTTP framework that works everywhere"
+license = "MIT"
 repository = "https://github.com/zen-rs/skyzen"
 readme = "README.md"
 keywords = ["http", "web", "framework"]

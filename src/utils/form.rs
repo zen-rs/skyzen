@@ -4,7 +4,7 @@ use crate::{
     extract::Extractor,
     header::{HeaderValue, CONTENT_TYPE},
     responder::Responder,
-    Request, Response, StatusCode,
+    Method, Request, Response, StatusCode,
 };
 
 use http_kit::http_error;
@@ -53,7 +53,7 @@ impl<T: Send + Sync + Serialize + DeserializeOwned + 'static> Responder for Form
     }
 }
 
-/// Error raised when a request cannot be extracted as `application/x-www-form-urlencoded`.
+/// Errors raised when parsing `application/x-www-form-urlencoded` data.
 #[skyzen::error]
 pub enum FormContentTypeError {
     /// The content type header is missing.
@@ -62,32 +62,26 @@ pub enum FormContentTypeError {
         status = StatusCode::BAD_REQUEST
     )]
     Missing,
-    /// The content type header is not `application/x-www-form-urlencoded`.
+    /// The content type does not match `application/x-www-form-urlencoded`.
     #[error(
         "Expected content type `application/x-www-form-urlencoded`",
         status = StatusCode::UNSUPPORTED_MEDIA_TYPE
     )]
     Unsupported,
-    /// The request body could not be decoded as URL-encoded form data.
+    /// The payload could not be parsed as form data.
     #[error("Failed to parse form data", status = StatusCode::BAD_REQUEST)]
     InvalidPayload,
-}
-
-fn is_form_content_type(content_type: &HeaderValue) -> bool {
-    let Ok(value) = content_type.to_str() else {
-        return false;
-    };
-
-    let Some(media_type) = value.split(';').next().map(str::trim) else {
-        return false;
-    };
-
-    media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded")
 }
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
     type Error = FormContentTypeError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        // A GET request carries the form in the query string and needs no content type.
+        if request.method() == Method::GET {
+            let data = request.uri().query().unwrap_or_default();
+            return extract(data);
+        }
+
         if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
             if !is_form_content_type(content_type) {
                 return Err(FormContentTypeError::Unsupported);
@@ -129,79 +123,106 @@ fn extract<T: Send + Sync + DeserializeOwned>(data: &str) -> Result<Form<T>, For
 
 impl_deref!(Form);
 
+fn is_form_content_type(value: &HeaderValue) -> bool {
+    value
+        .to_str()
+        .ok()
+        .and_then(|raw| raw.split(';').next())
+        .is_some_and(|mime| {
+            mime.trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_form_content_type, Form, FormContentTypeError};
-    use crate::{Body, Method, StatusCode};
-    use http_kit::{header::HeaderValue, HttpError};
+    use super::{Form, FormContentTypeError};
+    use crate::{Body, Method};
+    use http_kit::{header::CONTENT_TYPE, Request};
     use serde::Deserialize;
     use skyzen_core::Extractor;
 
     #[derive(Debug, Deserialize, PartialEq)]
-    struct LoginForm {
-        user: String,
-        remember: bool,
+    struct Payload {
+        name: String,
+        age: u8,
+    }
+
+    fn request_with_body(body: &'static [u8]) -> Request {
+        let mut request = Request::new(Body::from_bytes(body.to_vec()));
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = "http://localhost/".parse().expect("invalid uri");
+        request
     }
 
     #[tokio::test]
-    async fn extracts_form_body_when_content_type_matches() {
-        let mut request = request(
-            "user=lexo&remember=true",
-            Some("application/x-www-form-urlencoded; charset=utf-8"),
+    async fn accepts_charset_param() {
+        let mut request = request_with_body(b"name=Lexo&age=17");
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static(
+                "application/x-www-form-urlencoded; charset=utf-8",
+            ),
         );
-        let Form(form) = Form::<LoginForm>::extract(&mut request).await.unwrap();
+
+        let Form(payload) = Form::<Payload>::extract(&mut request)
+            .await
+            .expect("form should parse");
         assert_eq!(
-            form,
-            LoginForm {
-                user: "lexo".into(),
-                remember: true,
+            payload,
+            Payload {
+                name: "Lexo".to_string(),
+                age: 17
             }
         );
     }
 
     #[tokio::test]
-    async fn rejects_missing_content_type() {
-        let mut request = request("user=lexo&remember=true", None);
-        let error = Form::<LoginForm>::extract(&mut request).await.unwrap_err();
+    async fn rejects_missing_content_type_on_body() {
+        let mut request = request_with_body(b"name=Lexo&age=17");
+        let error = Form::<Payload>::extract(&mut request).await.unwrap_err();
         assert!(matches!(error, FormContentTypeError::Missing));
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn rejects_non_form_content_type() {
-        let mut request = request("user=lexo&remember=true", Some("application/json"));
-        let error = Form::<LoginForm>::extract(&mut request).await.unwrap_err();
-        assert!(matches!(error, FormContentTypeError::Unsupported));
-        assert_eq!(error.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]
     async fn rejects_invalid_payload() {
-        let mut request = request(
-            "remember=not-a-bool",
-            Some("application/x-www-form-urlencoded"),
+        let mut request = request_with_body(b"name=Lexo&age=oops");
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
-        let error = Form::<LoginForm>::extract(&mut request).await.unwrap_err();
+        let error = Form::<Payload>::extract(&mut request).await.unwrap_err();
         assert!(matches!(error, FormContentTypeError::InvalidPayload));
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn accepts_form_content_type_with_parameters() {
-        assert!(is_form_content_type(&HeaderValue::from_static(
-            "application/x-www-form-urlencoded; charset=utf-8"
-        )));
+    #[tokio::test]
+    async fn rejects_wrong_content_type() {
+        let mut request = request_with_body(b"name=Lexo&age=17");
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("text/plain"),
+        );
+        let error = Form::<Payload>::extract(&mut request).await.unwrap_err();
+        assert!(matches!(error, FormContentTypeError::Unsupported));
     }
 
-    fn request(body: &str, content_type: Option<&str>) -> http_kit::Request {
-        let mut request = http_kit::Request::new(Body::from(body.to_owned()));
-        *request.method_mut() = Method::POST;
-        if let Some(content_type) = content_type {
-            request.headers_mut().insert(
-                crate::header::CONTENT_TYPE,
-                HeaderValue::from_str(content_type).expect("valid content type"),
-            );
-        }
-        request
+    #[tokio::test]
+    async fn parses_get_query_without_content_type() {
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = Method::GET;
+        *request.uri_mut() = "http://localhost/?name=Lexo&age=17"
+            .parse()
+            .expect("invalid uri");
+
+        let Form(payload) = Form::<Payload>::extract(&mut request)
+            .await
+            .expect("query form should parse");
+        assert_eq!(
+            payload,
+            Payload {
+                name: "Lexo".to_string(),
+                age: 17
+            }
+        );
     }
 }

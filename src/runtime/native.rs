@@ -800,4 +800,108 @@ mod tests {
 
         assert_eq!(read, b"headtail".to_vec());
     }
+
+    // A stream that yields its bytes in caller-chosen chunks, to exercise `sniff_protocol`'s
+    // short-read handling (the HTTP/2 preface arriving across multiple reads).
+    struct ChunkedStream {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl ChunkedStream {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: std::collections::VecDeque::from(chunks),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for ChunkedStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            match this.chunks.pop_front() {
+                Some(mut chunk) => {
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        chunk.drain(..n);
+                        this.chunks.push_front(chunk);
+                    }
+                    Poll::Ready(Ok(n))
+                }
+                None => Poll::Ready(Ok(0)),
+            }
+        }
+    }
+
+    impl AsyncWrite for ChunkedStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            this.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn read_all<R: AsyncRead + Unpin>(mut reader: R) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 16];
+        loop {
+            let n = reader.read(&mut buf).await.expect("read failed");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn sniff_detects_split_http2_preface() {
+        let chunks = vec![
+            HTTP2_PREFACE[..5].to_vec(),
+            HTTP2_PREFACE[5..12].to_vec(),
+            HTTP2_PREFACE[12..].to_vec(),
+        ];
+        let stream = ChunkedStream::new(chunks);
+
+        let (_prefixed, is_h2) = sniff_protocol(stream, HTTP2_PREFACE).await.unwrap();
+        assert!(is_h2);
+    }
+
+    #[tokio::test]
+    async fn sniff_preserves_bytes_on_split_mismatch() {
+        let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let chunks = vec![
+            payload[..3].to_vec(),
+            payload[3..10].to_vec(),
+            payload[10..].to_vec(),
+        ];
+        let stream = ChunkedStream::new(chunks);
+
+        let (prefixed, is_h2) = sniff_protocol(stream, HTTP2_PREFACE).await.unwrap();
+        assert!(!is_h2);
+
+        let restored = read_all(prefixed).await;
+        assert_eq!(restored, payload);
+    }
 }
