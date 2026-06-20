@@ -13,7 +13,6 @@ categories = ["api-bindings", "web-programming"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-zenwave = { path = "../../zenwave" }
 
 [lints]
 workspace = true

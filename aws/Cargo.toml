@@ -13,8 +13,17 @@ categories = ["web-programming::http-server", "database"]
 skyzen-services = { path = "../services" }
 skyzen-s3 = { path = "../s3", optional = true }
 aws-config = "1"
-aws-sdk-dynamodb = { version = "1", optional = true }
-aws-sdk-sqs = { version = "1", optional = true }
+# Disable the SDK default `rustls` feature: it pulls the legacy `tls-rustls` connector
+# (rustls 0.21 / hyper-rustls 0.24), which is redundant with the modern `default-https-client`
+# (rustls-aws-lc) and carries unpatched RustSec advisories. The default HTTPS client is unaffected.
+aws-sdk-dynamodb = { version = "1", optional = true, default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-sqs = { version = "1", optional = true, default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 base64 = { version = "0.22", optional = true }
 
 [features]

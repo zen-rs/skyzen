@@ -11,7 +11,14 @@ categories = ["web-programming::http-server", "database"]
 
 [dependencies]
 skyzen-services = { path = "../services" }
-aws-sdk-s3 = { version = "1" }
+# Disable the SDK default `rustls` feature: it pulls the legacy `tls-rustls` connector
+# (rustls 0.21 / hyper-rustls 0.24), which is redundant with the modern `default-https-client`
+# (rustls-aws-lc) and carries unpatched RustSec advisories. The default HTTPS client is unaffected.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "sigv4a",
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-config = { version = "1" }
 aws-smithy-types = { version = "1" }
 
