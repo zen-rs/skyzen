@@ -35,6 +35,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          # The CLI scaffold test cross-checks generated Cloudflare templates for wasm.
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
         with:
