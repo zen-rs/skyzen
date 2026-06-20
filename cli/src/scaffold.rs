@@ -460,7 +460,10 @@ skyzen-services = {{ path = "{}" }}
         }
 
         let mut command = Command::new("cargo");
-        command.arg("check").arg("--quiet").arg("--offline");
+        // Don't pass `--offline`: the generated projects (especially the wasm Cloudflare templates)
+        // pull deps such as `gloo-timers` that the workspace's native build never caches, so an
+        // offline check fails on CI even though the template is correct. Let cargo fetch as needed.
+        command.arg("check").arg("--quiet");
         if wasm {
             command.arg("--target").arg("wasm32-unknown-unknown");
         }

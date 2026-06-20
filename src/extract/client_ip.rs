@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unparseable_forwarded_address() {
+    async fn rejects_unparsable_forwarded_address() {
         let mut request = Request::new(Body::empty());
         *request.method_mut() = Method::GET;
         request.headers_mut().insert(
