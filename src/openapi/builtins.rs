@@ -3,12 +3,7 @@ use serde::Serialize;
 use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType, Type};
 use utoipa::openapi::RefOr;
 
-use crate::{
-    extract::client_ip::{ClientIp, PeerAddr},
-    openapi::SchemaRef,
-    routing::Params,
-    utils::State,
-};
+use crate::{extract::client_ip::ClientIp, openapi::SchemaRef, routing::Params, utils::State};
 
 #[cfg(feature = "form")]
 use crate::extract::Query;
@@ -61,10 +56,6 @@ simple_schema!(
 simple_schema!(
     ClientIp,
     string_schema("Client IP address (may be forwarded)")
-);
-simple_schema!(
-    PeerAddr,
-    string_schema("Peer socket address reported by the transport")
 );
 
 #[cfg(feature = "form")]
@@ -204,7 +195,6 @@ mod tests {
             schema_json::<ClientIp>()["description"],
             "Client IP address (may be forwarded)"
         );
-        assert_eq!(schema_json::<PeerAddr>()["type"], "string");
     }
 
     #[cfg(feature = "form")]

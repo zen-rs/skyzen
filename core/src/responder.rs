@@ -167,9 +167,12 @@ impl<T: Responder, E: HttpError> Responder for core::result::Result<T, E> {
         if let Some(mut inner) = T::openapi() {
             schemas.append(&mut inner);
         }
+        // The concrete error status is determined at runtime by `E::status()`; the framework's
+        // documented default for an uncaught handler error is 500, so advertise that rather than a
+        // misleading 503.
         schemas.push(ResponseSchema {
-            status: Some(http_kit::StatusCode::SERVICE_UNAVAILABLE),
-            description: None,
+            status: Some(http_kit::StatusCode::INTERNAL_SERVER_ERROR),
+            description: Some("Handler error"),
             schema: None,
             content_type: None,
         });

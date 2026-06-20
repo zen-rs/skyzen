@@ -65,18 +65,6 @@ impl Extractor for Params {
             .unwrap_or(Self::empty()))
     }
 
-    #[cfg(feature = "openapi")]
-    fn openapi() -> Option<crate::openapi::ExtractorSchema> {
-        crate::openapi::schema_of::<Self>().map(|schema| crate::openapi::ExtractorSchema {
-            content_type: None,
-            schema: Some(schema),
-        })
-    }
-
-    #[cfg(feature = "openapi")]
-    fn register_openapi_schemas(
-        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
-    ) {
-        crate::openapi::register_schema_for::<Self>(defs);
-    }
+    // Individual path parameters are derived from the route's `{name}` segments when the OpenAPI
+    // document is built, so the whole-map `Params` extractor contributes no schema of its own.
 }

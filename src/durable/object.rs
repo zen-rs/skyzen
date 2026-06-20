@@ -2,12 +2,12 @@
 
 use std::future::Future;
 
-use http_kit::Endpoint;
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::context::DurableContext;
 use super::error::DurableObjectError;
 use super::websocket::{WebSocketConnection, WebSocketEvent};
+use crate::routing::Router;
 
 /// A Durable Object with hibernation-first WebSocket support.
 ///
@@ -21,7 +21,7 @@ use super::websocket::{WebSocketConnection, WebSocketEvent};
 /// - **`&mut self` everywhere**: Durable Objects have single-threaded serial execution.
 ///   No locks needed.
 ///
-/// - **Two methods**: `fetch` for HTTP (returns `impl Endpoint`),
+/// - **Two methods**: `fetch` for HTTP (returns a [`Router`]),
 ///   `websocket` for all hibernation WS events.
 ///
 /// # Example
@@ -29,7 +29,7 @@ use super::websocket::{WebSocketConnection, WebSocketEvent};
 /// ```ignore
 /// use serde::{Serialize, Deserialize};
 /// use skyzen::durable::*;
-/// use skyzen::routing::{CreateRouteNode, Route};
+/// use skyzen::routing::{CreateRouteNode, Route, Router};
 ///
 /// #[derive(Serialize, Deserialize, Default)]
 /// struct Counter {
@@ -37,7 +37,7 @@ use super::websocket::{WebSocketConnection, WebSocketEvent};
 /// }
 ///
 /// impl DurableObject for Counter {
-///     fn fetch(&mut self) -> impl Endpoint {
+///     fn fetch(&mut self) -> Router {
 ///         Route::new((
 ///             "/increment".at(increment),
 ///         ))
@@ -50,11 +50,12 @@ use super::websocket::{WebSocketConnection, WebSocketEvent};
 /// }
 /// ```
 pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'static {
-    /// Build the endpoint for HTTP requests.
+    /// Build the [`Router`] handling HTTP requests (and, via [`Route::on_alarm`](crate::routing::Route::on_alarm),
+    /// alarm events).
     ///
     /// Services (`DurableKv`, `DurableDb`, `Alarm`, `DurableConnections`)
     /// are available as extractors in the handlers.
-    fn fetch(&mut self) -> impl Endpoint + 'static;
+    fn fetch(&mut self) -> Router;
 
     /// Handle all WebSocket Hibernation events.
     ///
@@ -77,17 +78,14 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::DurableObject;
-    use crate::{
-        routing::{CreateRouteNode, Route},
-        Endpoint,
-    };
+    use crate::routing::{CreateRouteNode, Route, Router};
 
     #[derive(Default, Serialize, Deserialize)]
     #[skyzen::durable_object]
     struct Counter;
 
     impl DurableObject for Counter {
-        fn fetch(&mut self) -> impl Endpoint + 'static {
+        fn fetch(&mut self) -> Router {
             Route::new(("/".at(|| async { "ok" }),)).build()
         }
     }

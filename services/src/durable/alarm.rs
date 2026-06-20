@@ -1,13 +1,6 @@
 //! Durable Object alarm scheduling abstraction.
 
-use core::{convert::Infallible, future::Future};
-
-use http_kit::{
-    http_error,
-    middleware::{Middleware, MiddlewareError},
-    Endpoint, Response,
-};
-use skyzen_core::{Extractor, StatusCode};
+use core::future::Future;
 
 use crate::maybe_send::{BoxFuture, MaybeSend};
 
@@ -74,17 +67,11 @@ impl<T: AlarmScheduler> AlarmSchedulerObj for T {
 /// Wraps any [`AlarmScheduler`] behind dynamic dispatch.
 pub struct Alarm(Box<dyn AlarmSchedulerObj>);
 
-impl Clone for Alarm {
-    fn clone(&self) -> Self {
-        Self(self.0.clone_box())
-    }
-}
-
-impl std::fmt::Debug for Alarm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Alarm").finish_non_exhaustive()
-    }
-}
+service_extractor!(
+    Alarm,
+    AlarmNotConfigured,
+    "Alarm scheduler not configured. Ensure an AlarmScheduler implementation is injected."
+);
 
 impl Alarm {
     /// Create a new `Alarm` from any [`AlarmScheduler`] implementation.
@@ -117,40 +104,6 @@ impl Alarm {
     /// Returns [`AlarmError`] if the backend operation fails.
     pub async fn delete_alarm(&self) -> Result<(), AlarmError> {
         self.0.delete_alarm().await
-    }
-}
-
-http_error!(
-    /// The Alarm service was not found in request extensions.
-    pub AlarmNotConfigured,
-    StatusCode::INTERNAL_SERVER_ERROR,
-    "Alarm scheduler not configured. Ensure an AlarmScheduler implementation is injected."
-);
-
-impl Extractor for Alarm {
-    type Error = AlarmNotConfigured;
-
-    async fn extract(request: &mut http_kit::Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or(AlarmNotConfigured::new())
-    }
-}
-
-impl Middleware for Alarm {
-    type Error = Infallible;
-
-    async fn handle<N: Endpoint>(
-        &mut self,
-        request: &mut http_kit::Request,
-        mut next: N,
-    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
-        request.extensions_mut().insert(self.clone());
-        next.respond(request)
-            .await
-            .map_err(MiddlewareError::Endpoint)
     }
 }
 

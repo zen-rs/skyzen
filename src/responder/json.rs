@@ -41,7 +41,10 @@ http_error!(
 impl<T: Send + Sync + Serialize + 'static> Responder for PrettyJson<T> {
     type Error = PrettyJsonError;
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
-        let payload = to_vec_pretty(&self.0).map_err(|_| PrettyJsonError::new())?;
+        let payload = to_vec_pretty(&self.0).map_err(|error| {
+            tracing::error!(%error, "failed to serialize JSON payload");
+            PrettyJsonError::new()
+        })?;
         *response.body_mut() = http_kit::Body::from_bytes(payload);
         response
             .headers_mut()

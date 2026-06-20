@@ -1,14 +1,8 @@
 //! Durable Object key-value store abstraction.
 
-use core::{convert::Infallible, future::Future};
+use core::future::Future;
 
-use http_kit::{
-    http_error,
-    middleware::{Middleware, MiddlewareError},
-    Endpoint, Response,
-};
 use serde::{de::DeserializeOwned, Serialize};
-use skyzen_core::{Extractor, StatusCode};
 
 use crate::maybe_send::{BoxFuture, MaybeSend};
 
@@ -180,17 +174,11 @@ impl<T: DurableKvStore> DurableKvStoreObj for T {
 /// convenience methods for JSON operations.
 pub struct DurableKv(Box<dyn DurableKvStoreObj>);
 
-impl Clone for DurableKv {
-    fn clone(&self) -> Self {
-        Self(self.0.clone_box())
-    }
-}
-
-impl std::fmt::Debug for DurableKv {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DurableKv").finish_non_exhaustive()
-    }
-}
+service_extractor!(
+    DurableKv,
+    DurableKvNotConfigured,
+    "Durable KV store not configured. Ensure a DurableKvStore implementation is injected."
+);
 
 impl DurableKv {
     /// Create a new `DurableKv` from any [`DurableKvStore`] implementation.
@@ -304,40 +292,6 @@ impl DurableKv {
     ) -> Result<(), DurableKvError> {
         let bytes = serde_json::to_vec(value)?;
         self.put(key, &bytes).await
-    }
-}
-
-http_error!(
-    /// The Durable KV service was not found in request extensions.
-    pub DurableKvNotConfigured,
-    StatusCode::INTERNAL_SERVER_ERROR,
-    "Durable KV store not configured. Ensure a DurableKvStore implementation is injected."
-);
-
-impl Extractor for DurableKv {
-    type Error = DurableKvNotConfigured;
-
-    async fn extract(request: &mut http_kit::Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or(DurableKvNotConfigured::new())
-    }
-}
-
-impl Middleware for DurableKv {
-    type Error = Infallible;
-
-    async fn handle<N: Endpoint>(
-        &mut self,
-        request: &mut http_kit::Request,
-        mut next: N,
-    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
-        request.extensions_mut().insert(self.clone());
-        next.respond(request)
-            .await
-            .map_err(MiddlewareError::Endpoint)
     }
 }
 

@@ -14,11 +14,13 @@ http-kit.workspace = true
 executor-core = { workspace = true, default-features = false }
 eyre = "0.6.12"
 utoipa = { version = "5.4", optional = true, default-features = false, features = ["macros"] }
+serde = { version = "1.0", optional = true, default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", optional = true }
 
 [lints]
 workspace = true
 
 [features]
 default = ["std"]
-std = []
+std = ["dep:serde", "dep:serde_json"]
 openapi = ["std", "dep:utoipa"]

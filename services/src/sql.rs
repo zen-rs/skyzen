@@ -1,14 +1,8 @@
 //! Unified SQL database abstraction.
 
-use std::{borrow::Cow, convert::Infallible, future::Future};
+use std::{borrow::Cow, future::Future};
 
-use http_kit::{
-    http_error,
-    middleware::{Middleware, MiddlewareError},
-    Endpoint, Response,
-};
 use serde::de::DeserializeOwned;
-use skyzen_core::{Extractor, StatusCode};
 use sqlparser::{
     dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     tokenizer::{Location, Token, TokenWithSpan, Tokenizer},
@@ -349,17 +343,11 @@ impl<T: DbTransactionBackend> DbTransactionBackendObj for T {
 /// A type-erased SQL database extractor.
 pub struct Db(Box<dyn DbBackendObj>);
 
-impl Clone for Db {
-    fn clone(&self) -> Self {
-        Self(self.0.clone_box())
-    }
-}
-
-impl std::fmt::Debug for Db {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Db").finish_non_exhaustive()
-    }
-}
+service_extractor!(
+    Db,
+    DbNotConfigured,
+    "Database not configured. Ensure a DbBackend implementation is injected."
+);
 
 impl Db {
     /// Create a new `Db` from any [`DbBackend`] implementation.
@@ -642,40 +630,6 @@ impl DbTransactionQuery<'_> {
         T: DeserializeOwned,
     {
         self.fetch_optional().await?.ok_or(DbError::RowNotFound)
-    }
-}
-
-http_error!(
-    /// The database was not found in request extensions.
-    pub DbNotConfigured,
-    StatusCode::INTERNAL_SERVER_ERROR,
-    "Database not configured. Ensure a DbBackend implementation is injected."
-);
-
-impl Extractor for Db {
-    type Error = DbNotConfigured;
-
-    async fn extract(request: &mut http_kit::Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or(DbNotConfigured::new())
-    }
-}
-
-impl Middleware for Db {
-    type Error = Infallible;
-
-    async fn handle<N: Endpoint>(
-        &mut self,
-        request: &mut http_kit::Request,
-        mut next: N,
-    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
-        request.extensions_mut().insert(self.clone());
-        next.respond(request)
-            .await
-            .map_err(MiddlewareError::Endpoint)
     }
 }
 

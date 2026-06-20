@@ -1,6 +1,5 @@
 //! Runtime glue for driving Skyzen Durable Objects on Cloudflare Workers.
 
-use std::any::Any;
 use std::marker::PhantomData;
 
 use skyzen::durable::{DurableObject, DurableObjectError, WebSocketConnection, WebSocketEvent};
@@ -67,15 +66,9 @@ where
         let durable_state = CfDurableState::new(clone_state(&state), env.clone());
 
         {
-            let mut endpoint = skyzen::runtime::wasm::with_current_env(env, || object.fetch());
-
-            let router = (&mut endpoint as &mut dyn Any)
-                .downcast_mut::<skyzen::routing::Router>()
-                .ok_or_else(|| {
-                    JsValue::from_str(
-                        "DurableObject::fetch() must return skyzen::routing::Router for alarm handling",
-                    )
-                })?;
+            // `fetch()` returns a `Router`, which exposes the alarm handler registered via
+            // `Route::on_alarm` directly — no runtime downcast required.
+            let mut router = skyzen::runtime::wasm::with_current_env(env, || object.fetch());
 
             let mut alarm_endpoint = router.alarm_endpoint().ok_or_else(|| {
                 JsValue::from_str("No alarm handler registered. Use Route::on_alarm(handler).")

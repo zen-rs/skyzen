@@ -34,29 +34,54 @@ pub enum BearerTokenError {
     NotBearer,
 }
 
+/// Parse a Bearer token from the request's `Authorization` header.
+///
+/// The auth scheme is matched case-insensitively (`Bearer`/`bearer`/`BEARER`) per RFC 7235, and
+/// any amount of whitespace between the scheme and the token is tolerated. The returned token
+/// borrows from the request, so callers that need ownership should clone it.
+///
+/// # Errors
+///
+/// Returns [`BearerTokenError`] if the header is missing, not valid UTF-8, or does not carry a
+/// non-empty Bearer credential.
+// Re-exported crate-wide via `extract::auth::parse_bearer`, so `pub(crate)` is required despite the
+// enclosing module being private.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn parse_bearer(request: &Request) -> Result<&str, BearerTokenError> {
+    let value = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .ok_or(BearerTokenError::MissingHeader)?
+        .to_str()
+        .map_err(|_| BearerTokenError::InvalidEncoding)?;
+
+    let (scheme, token) = value
+        .split_once(char::is_whitespace)
+        .ok_or(BearerTokenError::NotBearer)?;
+
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(BearerTokenError::NotBearer);
+    }
+
+    let token = token.trim_start();
+    if token.is_empty() {
+        return Err(BearerTokenError::NotBearer);
+    }
+
+    Ok(token)
+}
+
 impl Extractor for BearerToken {
     type Error = BearerTokenError;
 
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let header_value = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .ok_or(BearerTokenError::MissingHeader)?;
-
-        let value = header_value
-            .to_str()
-            .map_err(|_| BearerTokenError::InvalidEncoding)?;
-
-        let token = value
-            .strip_prefix("Bearer ")
-            .ok_or(BearerTokenError::NotBearer)?;
-
-        Ok(Self(token.to_owned()))
+        parse_bearer(request).map(|token| Self(token.to_owned()))
     }
 
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         Some(crate::openapi::ExtractorSchema {
+            location: crate::openapi::ParameterLocation::Header,
             content_type: None,
             schema: None,
         })

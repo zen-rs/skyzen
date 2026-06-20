@@ -1,14 +1,8 @@
 //! Durable Object database abstraction.
 
-use core::{convert::Infallible, future::Future};
+use core::future::Future;
 
-use http_kit::{
-    http_error,
-    middleware::{Middleware, MiddlewareError},
-    Endpoint, Response,
-};
 use serde::de::DeserializeOwned;
-use skyzen_core::{Extractor, StatusCode};
 
 use crate::{
     maybe_send::{BoxFuture, MaybeSend},
@@ -101,17 +95,11 @@ impl<T: DurableDbBackend> DurableDbBackendObj for T {
 /// Type-erased Durable Object database extractor.
 pub struct DurableDb(Box<dyn DurableDbBackendObj>);
 
-impl Clone for DurableDb {
-    fn clone(&self) -> Self {
-        Self(self.0.clone_box())
-    }
-}
-
-impl std::fmt::Debug for DurableDb {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DurableDb").finish_non_exhaustive()
-    }
-}
+service_extractor!(
+    DurableDb,
+    DurableDbNotConfigured,
+    "Durable database not configured. Ensure a DurableDbBackend implementation is injected."
+);
 
 impl DurableDb {
     /// Create a new `DurableDb` from any [`DurableDbBackend`] implementation.
@@ -214,39 +202,5 @@ impl DurableDbQuery<'_> {
         self.fetch_optional()
             .await?
             .ok_or(DurableDbError::RowNotFound)
-    }
-}
-
-http_error!(
-    /// The Durable Object database was not found in request extensions.
-    pub DurableDbNotConfigured,
-    StatusCode::INTERNAL_SERVER_ERROR,
-    "Durable database not configured. Ensure a DurableDbBackend implementation is injected."
-);
-
-impl Extractor for DurableDb {
-    type Error = DurableDbNotConfigured;
-
-    async fn extract(request: &mut http_kit::Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or(DurableDbNotConfigured::new())
-    }
-}
-
-impl Middleware for DurableDb {
-    type Error = Infallible;
-
-    async fn handle<N: Endpoint>(
-        &mut self,
-        request: &mut http_kit::Request,
-        mut next: N,
-    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
-        request.extensions_mut().insert(self.clone());
-        next.respond(request)
-            .await
-            .map_err(MiddlewareError::Endpoint)
     }
 }

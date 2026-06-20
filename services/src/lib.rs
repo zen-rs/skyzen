@@ -30,6 +30,9 @@ compile_error!(
 Use cloud vendor database services instead (for Cloudflare, use skyzen-cloudflare::CfD1 or CfDurableSqlite / skyzen_services::durable::DurableDb)."
 );
 
+#[macro_use]
+mod macros;
+
 pub mod durable;
 pub mod events;
 pub mod kv;

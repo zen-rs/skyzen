@@ -18,7 +18,6 @@ use tracing::info;
 // The entrance of request,composing of endpoint
 pub struct App {
     endpoint_factory: EndpointFactory,
-    // middlewares: SmallVec<[SharedMiddleware; 5]>, // Simplified for now
 }
 
 impl Debug for App {
@@ -232,7 +231,6 @@ fn flatten(
                 endpoint_factory,
                 method,
                 openapi,
-                // middlewares, // Disabled for now
             } => {
                 let entry = buf.entry(path.clone()).or_default();
 
@@ -258,7 +256,6 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
                 endpoint_factory,
                 method,
                 openapi: _,
-                // middlewares, // Disabled for now
             } => {
                 let entry = buf.entry(path).or_default();
                 entry.push((method, App::new(endpoint_factory)));
@@ -702,6 +699,51 @@ mod tests {
                     && response.schema.is_some()
             }),
             "expected documented form response schema"
+        );
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    struct ListParams {
+        page: u32,
+        tag: Option<String>,
+    }
+
+    #[skyzen::openapi]
+    async fn list_items(
+        _query: crate::extract::Query<ListParams>,
+        _params: Params,
+    ) -> Result<&'static str> {
+        Ok("ok")
+    }
+
+    #[test]
+    fn openapi_emits_query_and_path_parameters_not_request_body() {
+        let spec = Route::new(("/items/{id}".at(list_items),))
+            .openapi()
+            .to_utoipa_spec();
+        let json = serde_json::to_value(&spec).expect("serialize spec");
+        let operation = &json["paths"]["/items/{id}"]["get"];
+
+        let parameters = operation["parameters"]
+            .as_array()
+            .expect("operation should declare parameters");
+        let find = |name: &str| parameters.iter().find(|param| param["name"] == name);
+
+        let id = find("id").expect("path parameter `id`");
+        assert_eq!(id["in"], "path");
+        assert_eq!(id["required"], true);
+
+        let page = find("page").expect("query parameter `page`");
+        assert_eq!(page["in"], "query");
+        assert_eq!(page["required"], true);
+
+        let tag = find("tag").expect("query parameter `tag`");
+        assert_eq!(tag["in"], "query");
+        assert_eq!(tag["required"], false);
+
+        assert!(
+            operation["requestBody"].is_null(),
+            "a GET with query/path params must not declare a request body"
         );
     }
 }

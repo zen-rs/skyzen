@@ -4,15 +4,9 @@
 //! Implementations include SQS, Cloudflare Queues, Azure Service Bus,
 //! and in-memory (for testing).
 
-use core::{convert::Infallible, future::Future};
+use core::future::Future;
 
-use http_kit::{
-    http_error,
-    middleware::{Middleware, MiddlewareError},
-    Endpoint, Response,
-};
 use serde::{de::DeserializeOwned, Serialize};
-use skyzen_core::{Extractor, StatusCode};
 
 use crate::maybe_send::{BoxFuture, MaybeSend};
 
@@ -238,17 +232,11 @@ impl<T: MessageQueue> MessageQueueObj for T {
 /// It is injected into handlers via request extensions.
 pub struct Queue(Box<dyn MessageQueueObj>);
 
-impl Clone for Queue {
-    fn clone(&self) -> Self {
-        Self(self.0.clone_box())
-    }
-}
-
-impl std::fmt::Debug for Queue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Queue").finish_non_exhaustive()
-    }
-}
+service_extractor!(
+    Queue,
+    QueueNotConfigured,
+    "Message queue not configured. Ensure a MessageQueue implementation is injected."
+);
 
 impl Queue {
     /// Create a new `Queue` from any [`MessageQueue`] implementation.
@@ -295,40 +283,6 @@ impl Queue {
     ) -> Result<(), QueueError> {
         let batch: Result<Vec<Vec<u8>>, _> = messages.iter().map(serde_json::to_vec).collect();
         self.send_batch(&batch?).await
-    }
-}
-
-http_error!(
-    /// The queue service was not found in request extensions.
-    pub QueueNotConfigured,
-    StatusCode::INTERNAL_SERVER_ERROR,
-    "Message queue not configured. Ensure a MessageQueue implementation is injected."
-);
-
-impl Extractor for Queue {
-    type Error = QueueNotConfigured;
-
-    async fn extract(request: &mut http_kit::Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or(QueueNotConfigured::new())
-    }
-}
-
-impl Middleware for Queue {
-    type Error = Infallible;
-
-    async fn handle<N: Endpoint>(
-        &mut self,
-        request: &mut http_kit::Request,
-        mut next: N,
-    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
-        request.extensions_mut().insert(self.clone());
-        next.respond(request)
-            .await
-            .map_err(MiddlewareError::Endpoint)
     }
 }
 

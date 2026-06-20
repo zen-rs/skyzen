@@ -3,15 +3,8 @@
 //! Provides a platform-agnostic interface for object/blob storage.
 //! Implementations include S3, Cloudflare R2, Azure Blob, and in-memory (for testing).
 
-use core::{convert::Infallible, future::Future};
+use core::future::Future;
 use std::collections::HashMap;
-
-use http_kit::{
-    http_error,
-    middleware::{Middleware, MiddlewareError},
-    Endpoint, Response,
-};
-use skyzen_core::{Extractor, StatusCode};
 
 use crate::maybe_send::{BoxFuture, MaybeSend};
 
@@ -170,17 +163,11 @@ impl<T: ObjectStorage> ObjectStorageObj for T {
 /// It is injected into handlers via request extensions.
 pub struct Storage(Box<dyn ObjectStorageObj>);
 
-impl Clone for Storage {
-    fn clone(&self) -> Self {
-        Self(self.0.clone_box())
-    }
-}
-
-impl std::fmt::Debug for Storage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Storage").finish_non_exhaustive()
-    }
-}
+service_extractor!(
+    Storage,
+    StorageNotConfigured,
+    "Object storage not configured. Ensure an ObjectStorage implementation is injected."
+);
 
 impl Storage {
     /// Create a new `Storage` from any [`ObjectStorage`] implementation.
@@ -231,40 +218,6 @@ impl Storage {
     /// Returns [`StorageError`] if the backend operation fails.
     pub async fn head(&self, key: &str) -> Result<Option<ObjectMetadata>, StorageError> {
         self.0.head(key).await
-    }
-}
-
-http_error!(
-    /// The storage service was not found in request extensions.
-    pub StorageNotConfigured,
-    StatusCode::INTERNAL_SERVER_ERROR,
-    "Object storage not configured. Ensure an ObjectStorage implementation is injected."
-);
-
-impl Extractor for Storage {
-    type Error = StorageNotConfigured;
-
-    async fn extract(request: &mut http_kit::Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or(StorageNotConfigured::new())
-    }
-}
-
-impl Middleware for Storage {
-    type Error = Infallible;
-
-    async fn handle<N: Endpoint>(
-        &mut self,
-        request: &mut http_kit::Request,
-        mut next: N,
-    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
-        request.extensions_mut().insert(self.clone());
-        next.respond(request)
-            .await
-            .map_err(MiddlewareError::Endpoint)
     }
 }
 

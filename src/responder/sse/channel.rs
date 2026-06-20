@@ -4,15 +4,21 @@ use std::{
     task::{ready, Context, Poll},
 };
 
-use async_channel::unbounded;
+use async_channel::bounded;
 use http_kit::{http_error, utils::Stream};
 use pin_project_lite::pin_project;
 
 use super::{Event, Sse};
 
-/// Sender of SSE channel.
-/// # Warning
-/// If you don't return SSE responder in your handler.`send` method will keep await.And event stream cannot start.
+/// Default number of events buffered by an SSE channel created via [`Sse::channel`](super::Sse::channel).
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 16;
+
+/// Sender half of an SSE channel.
+///
+/// The channel is **bounded**, so [`Sender::send`] applies real backpressure: once the buffer is
+/// full it awaits until the client consumes events, preventing unbounded memory growth on slow
+/// consumers. Return the paired [`Sse`] responder from your handler for the stream to be driven;
+/// otherwise `send` blocks once the buffer fills.
 #[derive(Debug, Clone)]
 pub struct Sender {
     sender: async_channel::Sender<Event>,
@@ -44,7 +50,16 @@ impl Stream for Receiver {
 
 impl Sender {
     pub(crate) fn new() -> (Self, Sse) {
-        let (sender, receiver) = unbounded();
+        Self::with_capacity(DEFAULT_CHANNEL_CAPACITY)
+    }
+
+    /// Create a sender/responder pair whose channel buffers up to `capacity` events.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero (a programmer error caught at construction time).
+    pub(crate) fn with_capacity(capacity: usize) -> (Self, Sse) {
+        let (sender, receiver) = bounded(capacity);
         (Self { sender }, Sse::from_stream(Receiver::new(receiver)))
     }
 

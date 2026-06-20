@@ -89,6 +89,10 @@ pub enum WebSocketUpgradeError {
     /// The `OnUpgrade` extension is missing.
     #[error("Missing OnUpgrade extension", status = StatusCode::UPGRADE_REQUIRED)]
     MissingOnUpgrade,
+
+    /// The async executor was not injected by the HTTP backend, so the upgrade cannot be driven.
+    #[error("WebSocket runtime executor is unavailable", status = StatusCode::INTERNAL_SERVER_ERROR)]
+    MissingExecutor,
 }
 
 fn header_has_token(value: &header::HeaderValue, token: &str) -> bool {
@@ -267,7 +271,7 @@ impl WebSocket {
     /// # struct MyData { value: i32 }
     /// # async fn example(mut socket: WebSocket) {
     /// while let Some(Ok(data)) = socket.recv_json::<MyData>().await {
-    ///     println!("Received: {}", data.value);
+    ///     tracing::info!(value = data.value, "received");
     /// }
     /// # }
     /// ```
@@ -777,11 +781,13 @@ impl Responder for WebSocketUpgradeResponder {
         if let Some(callback) = self.callback.take() {
             let on_upgrade = self.upgrade.on_upgrade.clone();
             let config = self.upgrade.config.clone();
+            // Fail closed if the backend never injected an executor, rather than panicking on the
+            // request path.
             let executor = self
                 .upgrade
                 .executor
                 .take()
-                .expect("Executor must be set by the HTTP backend");
+                .ok_or(WebSocketUpgradeError::MissingExecutor)?;
 
             executor
                 .spawn(async move {
@@ -870,6 +876,7 @@ impl From<TungsteniteCloseFrame> for WebSocketCloseFrame {
 fn to_tungstenite_config(config: &WebSocketConfig) -> TungsteniteConfig {
     let mut cfg = TungsteniteConfig::default();
     cfg.max_message_size = config.max_message_size;
+    cfg.max_frame_size = config.max_frame_size;
     cfg
 }
 

@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use skyzen::durable::{DurableObject, WebSocketEvent};
-use skyzen::routing::{CreateRouteNode, Route};
-use skyzen::Endpoint;
+use skyzen::routing::{CreateRouteNode, Route, Router};
 
 #[derive(Default, Serialize, Deserialize)]
 #[skyzen::durable_object]
@@ -10,7 +9,7 @@ pub struct Room {
 }
 
 impl DurableObject for Room {
-    fn fetch(&mut self) -> impl Endpoint + 'static {
+    fn fetch(&mut self) -> Router {
         Route::new((
             "/".at(|| async { "room ready" }),
         ))

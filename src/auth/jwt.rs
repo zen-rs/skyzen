@@ -24,18 +24,64 @@
 use std::marker::PhantomData;
 
 use http::StatusCode;
-use jsonwebtoken::{decode, DecodingKey, TokenData, Validation};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, TokenData, Validation};
 use serde::de::DeserializeOwned;
 
-use crate::{header, middleware::auth::Authenticator, Request};
+use crate::{
+    extract::auth::parse_bearer, extract::auth::BearerTokenError, middleware::auth::Authenticator,
+    Request,
+};
+
+/// Cryptographic family of the configured decoding key.
+///
+/// Tracking this lets [`JwtConfig::with_algorithms`] reject algorithm/key combinations that would
+/// otherwise enable algorithm-confusion attacks (e.g. accepting an `HS256` token verified against
+/// an RSA public key used as an HMAC secret).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyFamily {
+    Hmac,
+    Rsa,
+    Ec,
+}
+
+impl KeyFamily {
+    /// Returns whether `algorithm` belongs to this key's family.
+    const fn permits(self, algorithm: Algorithm) -> bool {
+        match self {
+            Self::Hmac => matches!(
+                algorithm,
+                Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+            ),
+            Self::Rsa => matches!(
+                algorithm,
+                Algorithm::RS256
+                    | Algorithm::RS384
+                    | Algorithm::RS512
+                    | Algorithm::PS256
+                    | Algorithm::PS384
+                    | Algorithm::PS512
+            ),
+            Self::Ec => matches!(algorithm, Algorithm::ES256 | Algorithm::ES384),
+        }
+    }
+}
 
 /// Configuration for JWT verification.
 ///
 /// Holds the decoding key and validation settings used to verify JWT tokens.
+///
+/// # Security
+///
+/// By default neither the issuer nor the audience claim is required (matching `jsonwebtoken`'s
+/// defaults). For production deployments you should pin the expected issuer/audience via
+/// [`with_issuer`](Self::with_issuer) / [`with_audience`](Self::with_audience). The permitted
+/// signing algorithms are fixed to the key's cryptographic family at construction time and cannot
+/// be widened across families.
 #[derive(Clone)]
 pub struct JwtConfig {
     decoding_key: DecodingKey,
     validation: Validation,
+    key_family: KeyFamily,
 }
 
 impl std::fmt::Debug for JwtConfig {
@@ -55,6 +101,7 @@ impl JwtConfig {
         Self {
             decoding_key: DecodingKey::from_secret(secret),
             validation: Validation::default(),
+            key_family: KeyFamily::Hmac,
         }
     }
 
@@ -68,9 +115,10 @@ impl JwtConfig {
             decoding_key: DecodingKey::from_rsa_pem(pem)?,
             validation: {
                 let mut v = Validation::default();
-                v.algorithms = vec![jsonwebtoken::Algorithm::RS256];
+                v.algorithms = vec![Algorithm::RS256];
                 v
             },
+            key_family: KeyFamily::Rsa,
         })
     }
 
@@ -84,9 +132,10 @@ impl JwtConfig {
             decoding_key: DecodingKey::from_ec_pem(pem)?,
             validation: {
                 let mut v = Validation::default();
-                v.algorithms = vec![jsonwebtoken::Algorithm::ES256];
+                v.algorithms = vec![Algorithm::ES256];
                 v
             },
+            key_family: KeyFamily::Ec,
         })
     }
 
@@ -104,9 +153,25 @@ impl JwtConfig {
         self
     }
 
-    /// Set multiple allowed algorithms.
+    /// Restrict verification to the given set of allowed algorithms.
+    ///
+    /// All algorithms must belong to the same cryptographic family as the configured key. This
+    /// prevents algorithm-confusion attacks where, for example, an `HS256` token is forged using an
+    /// RSA public key as the HMAC secret.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any algorithm is incompatible with the key's family — a configuration error caught
+    /// at startup rather than at request time.
     #[must_use]
-    pub fn with_algorithms(mut self, algorithms: Vec<jsonwebtoken::Algorithm>) -> Self {
+    pub fn with_algorithms(mut self, algorithms: Vec<Algorithm>) -> Self {
+        for algorithm in &algorithms {
+            assert!(
+                self.key_family.permits(*algorithm),
+                "JWT algorithm {algorithm:?} is incompatible with the configured {:?} key",
+                self.key_family
+            );
+        }
         self.validation.algorithms = algorithms;
         self
     }
@@ -141,22 +206,22 @@ impl JwtConfig {
 /// Error returned when JWT authentication fails.
 #[skyzen::error(status = StatusCode::UNAUTHORIZED)]
 pub enum JwtError {
-    /// The Authorization header is missing.
-    #[error("Missing Authorization header")]
-    MissingHeader,
-    /// The Authorization header is not valid UTF-8.
-    #[error("Invalid Authorization header encoding")]
-    InvalidEncoding,
-    /// The Authorization header does not use the Bearer scheme.
-    #[error("Authorization header must use Bearer scheme")]
-    NotBearer,
+    /// The Authorization header is missing, malformed, or not a Bearer credential.
+    #[error("Invalid Authorization header")]
+    Header(#[from] BearerTokenError),
     /// The JWT signature is invalid.
     #[error("Invalid token signature")]
     InvalidSignature,
+    /// The token's signing algorithm is not accepted (possible algorithm-confusion attempt).
+    #[error("Unsupported or disallowed token algorithm")]
+    InvalidAlgorithm,
     /// The JWT has expired.
     #[error("Token has expired")]
     Expired,
-    /// The JWT claims are invalid (issuer, audience, etc.).
+    /// The JWT is not yet valid (`nbf` in the future).
+    #[error("Token is not yet valid")]
+    NotYetValid,
+    /// The JWT claims are invalid (issuer, audience, missing required claim, etc.).
     #[error("Invalid token claims")]
     InvalidClaims,
     /// The JWT is malformed and cannot be parsed.
@@ -170,9 +235,14 @@ impl From<jsonwebtoken::errors::Error> for JwtError {
         match err.kind() {
             ErrorKind::InvalidSignature => Self::InvalidSignature,
             ErrorKind::ExpiredSignature => Self::Expired,
+            ErrorKind::ImmatureSignature => Self::NotYetValid,
             ErrorKind::InvalidIssuer
             | ErrorKind::InvalidAudience
-            | ErrorKind::ImmatureSignature => Self::InvalidClaims,
+            | ErrorKind::InvalidSubject
+            | ErrorKind::MissingRequiredClaim(_) => Self::InvalidClaims,
+            ErrorKind::InvalidAlgorithm
+            | ErrorKind::InvalidAlgorithmName
+            | ErrorKind::MissingAlgorithm => Self::InvalidAlgorithm,
             _ => Self::Malformed,
         }
     }
@@ -220,17 +290,7 @@ where
     type Error = JwtError;
 
     async fn authenticate(&self, req: &Request) -> Result<Self::User, Self::Error> {
-        let header_value = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .ok_or(JwtError::MissingHeader)?;
-
-        let value = header_value
-            .to_str()
-            .map_err(|_| JwtError::InvalidEncoding)?;
-
-        let token = value.strip_prefix("Bearer ").ok_or(JwtError::NotBearer)?;
-
+        let token = parse_bearer(req)?;
         let token_data = self.config.decode::<C>(token)?;
         Ok(token_data.claims)
     }
@@ -243,6 +303,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::{JwtAuthenticator, JwtConfig, JwtError};
+    use crate::extract::auth::BearerTokenError;
     use crate::middleware::auth::Authenticator;
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -294,7 +355,10 @@ mod tests {
             .unwrap();
 
         let result = authenticator.authenticate(&request).await;
-        assert!(matches!(result, Err(JwtError::MissingHeader)));
+        assert!(matches!(
+            result,
+            Err(JwtError::Header(BearerTokenError::MissingHeader))
+        ));
     }
 
     #[tokio::test]
@@ -352,6 +416,37 @@ mod tests {
             .unwrap();
 
         let result = authenticator.authenticate(&request).await;
-        assert!(matches!(result, Err(JwtError::NotBearer)));
+        assert!(matches!(
+            result,
+            Err(JwtError::Header(BearerTokenError::NotBearer))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_jwt_accepts_case_insensitive_scheme() {
+        let secret = b"test-secret-key";
+        let claims = TestClaims {
+            sub: "user123".to_owned(),
+            exp: u64::MAX,
+            roles: vec![],
+        };
+        let token = create_token(&claims, secret);
+        let authenticator = JwtAuthenticator::<TestClaims>::new(JwtConfig::with_secret(secret));
+
+        // Lowercase scheme and extra whitespace must still be accepted (RFC 7235).
+        let request = http::Request::builder()
+            .header(AUTHORIZATION, format!("bearer   {token}"))
+            .body(http_kit::Body::empty())
+            .unwrap();
+
+        assert_eq!(authenticator.authenticate(&request).await.unwrap(), claims);
+    }
+
+    #[test]
+    #[should_panic(expected = "incompatible with the configured Hmac key")]
+    fn test_with_algorithms_rejects_cross_family() {
+        // Adding an RSA algorithm to an HMAC key must fail loudly at configuration time.
+        let _ =
+            JwtConfig::with_secret(b"secret").with_algorithms(vec![jsonwebtoken::Algorithm::RS256]);
     }
 }

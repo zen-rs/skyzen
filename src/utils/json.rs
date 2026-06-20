@@ -91,17 +91,17 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
             return Err(JsonContentTypeError::Missing);
         }
 
-        let value = request
-            .body_mut()
-            .into_json()
-            .await
-            .map_err(|_| JsonContentTypeError::InvalidPayload)?;
+        let value = request.body_mut().into_json().await.map_err(|error| {
+            tracing::debug!(%error, "failed to deserialize JSON request body");
+            JsonContentTypeError::InvalidPayload
+        })?;
         Ok(Self(value))
     }
 
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         Some(crate::openapi::ExtractorSchema {
+            location: crate::openapi::ParameterLocation::Body,
             content_type: Some("application/json"),
             schema: crate::openapi::maybe_schema_of::<T>(),
         })

@@ -18,13 +18,17 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
     type Error = QueryError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         let data = request.uri().query().unwrap_or_default();
-        Ok(Self(from_str(data).map_err(|_| QueryError::new())?))
+        Ok(Self(from_str(data).map_err(|error| {
+            tracing::debug!(%error, "failed to parse query string");
+            QueryError::new()
+        })?))
     }
 
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         Some(crate::openapi::ExtractorSchema {
-            content_type: Some("application/x-www-form-urlencoded"),
+            location: crate::openapi::ParameterLocation::Query,
+            content_type: None,
             schema: crate::openapi::maybe_schema_of::<T>(),
         })
     }

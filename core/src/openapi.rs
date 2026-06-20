@@ -12,9 +12,22 @@ use utoipa::openapi::{
 /// `OpenAPI` schema reference type alias.
 pub type SchemaRef = RefOr<Schema>;
 
+/// Where an extractor reads its data from, which determines how it is rendered in `OpenAPI`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParameterLocation {
+    /// Read from the request body (e.g. JSON, form, raw bytes, multipart).
+    Body,
+    /// Read from the URL query string.
+    Query,
+    /// Read from a request header.
+    Header,
+}
+
 /// Schema information captured for an extractor argument.
 #[derive(Clone)]
 pub struct ExtractorSchema {
+    /// Where the extractor sources its data (body, query, or header).
+    pub location: ParameterLocation,
     /// Content type associated with the extractor, if any.
     pub content_type: Option<&'static str>,
     /// JSON schema describing the extractor payload.
@@ -37,6 +50,7 @@ pub struct ResponseSchema {
 impl fmt::Debug for ExtractorSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExtractorSchema")
+            .field("location", &self.location)
             .field("content_type", &self.content_type)
             .field("has_schema", &self.schema.is_some())
             .finish()

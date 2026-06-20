@@ -14,13 +14,16 @@
 //! ```
 //!
 //! # Channel style
-//! Create a SSE stream and a sender, send message to stream with the sender.
-//! *Warning:* You must return SSE stream first before you send message by sender.
+//! Create a SSE stream and a sender, then push messages from another task while the handler
+//! returns the [`Sse`](crate::responder::Sse) responder so the stream starts flowing. The channel
+//! is bounded, so `send` awaits when the buffer is full.
 //! ```
 //! use skyzen::responder::{Sse,sse::Event};
 //! async fn handler() -> Sse{
 //!     let(sender,sse) = Sse::channel();
-//!     sender.send_data("Hello!");
+//!     // Drive `sender` from a spawned task using your runtime, e.g.
+//!     // tokio::spawn(async move { sender.send_data("Hello!").await.ok(); });
+//!     let _ = sender;
 //!     sse
 //! }
 //! ```
@@ -55,10 +58,6 @@ pub struct Event {
     has_event_field: bool,
 }
 
-fn has_newline(v: &[u8]) -> bool {
-    v.iter().any(|x| *x == b'\n' || *x == b'\r')
-}
-
 impl Event {
     const fn empty() -> Self {
         Self {
@@ -69,10 +68,13 @@ impl Event {
     }
 
     /// Create an SSE event with a data payload.
+    ///
+    /// Per the SSE specification a multi-line payload is encoded as one `data:` line per source
+    /// line (split on `LF`, `CR`, or `CRLF`), so newlines in user data are preserved correctly
+    /// rather than corrupting the stream framing.
     pub fn data(data: impl AsRef<str>) -> Self {
         let mut event = Self::empty();
-        let data = data.as_ref();
-        event.field("data", data);
+        event.push_multiline_field("data", data.as_ref());
         event
     }
 
@@ -90,12 +92,12 @@ impl Event {
         Ok(event)
     }
 
-    /// A comment for the stream,being ignored by most of client.
+    /// A comment for the stream, ignored by most clients. Multi-line comments are encoded as one
+    /// `:` line per source line.
     pub fn comment(message: impl AsRef<str>) -> Self {
         let mut event = Self::empty();
-        let message = message.as_ref();
-        event.field("", message);
-        // Prevent including event and id in comment
+        event.push_multiline_field("", message.as_ref());
+        // A comment cannot carry an id or event name.
         event.has_event_field = true;
         event.has_id = true;
         event
@@ -105,8 +107,8 @@ impl Event {
     #[must_use]
     pub fn retry(duration: Duration) -> Self {
         let mut event = Self::empty();
-        event.field("retry", Buffer::new().format(duration.as_millis()));
-        // Prevent including event and id in comment.
+        event.push_field_line("retry", Buffer::new().format(duration.as_millis()));
+        // A retry directive cannot carry an id or event name.
         event.has_event_field = true;
         event.has_id = true;
         event
@@ -117,49 +119,64 @@ impl Event {
     ///
     /// # Panics
     ///
-    /// Panics if the id has already been set.
+    /// Panics if the id has already been set — a programmer error in handler code, not reachable
+    /// from request data.
     #[must_use]
     pub fn id(mut self, id: impl AsRef<str>) -> Self {
         assert!(!self.has_id, "Id has already been set");
-        let id = id.as_ref();
-        self.field("id", id);
+        self.push_field_line("id", id.as_ref());
+        self.has_id = true;
         self
     }
 
-    /// Set the event of this event.
+    /// Set the event name of this event.
     ///
     /// # Panics
     ///
-    /// Panics if the event has already been set.
+    /// Panics if the event name has already been set — a programmer error in handler code, not
+    /// reachable from request data.
     #[must_use]
     pub fn event(mut self, event: impl AsRef<str>) -> Self {
         assert!(!self.has_event_field, "Event has already been set");
-        let event = event.as_ref();
-        self.field("event", event);
+        self.push_field_line("event", event.as_ref());
         self.has_event_field = true;
         self
     }
 
-    // Warning: the value cannot include `\r` or `\n`
-    fn field(&mut self, name: &str, value: &str) {
-        assert!(
-            !has_newline(value.as_bytes()),
-            "SSE field value cannot include newline"
-        );
-
+    /// Append a single SSE field line (`name:value`).
+    ///
+    /// `CR`/`LF` are stripped because a single field value cannot span lines; multi-line content
+    /// must go through [`Self::push_multiline_field`].
+    fn push_field_line(&mut self, name: &str, value: &str) {
         self.buffer.extend_from_slice(name.as_bytes());
+        self.buffer.push(b':');
 
-        self.buffer.extend_from_slice(b":");
-
-        let value = value.as_bytes();
-
-        if value.starts_with(b" ") {
+        // The SSE parser strips exactly one space after the colon, so preserve a leading space.
+        if value.as_bytes().first() == Some(&b' ') {
             self.buffer.push(b' ');
         }
 
-        self.buffer.extend_from_slice(value);
+        self.buffer.extend(
+            value
+                .bytes()
+                .filter(|byte| *byte != b'\r' && *byte != b'\n'),
+        );
+        self.buffer.push(b'\n');
+    }
 
-        self.buffer.extend_from_slice(b"\n");
+    /// Append a possibly multi-line value as one `name:` line per source line, splitting on `LF`,
+    /// `CR`, or `CRLF`.
+    fn push_multiline_field(&mut self, name: &str, value: &str) {
+        let mut rest = value;
+        loop {
+            let Some(idx) = rest.find(['\r', '\n']) else {
+                self.push_field_line(name, rest);
+                break;
+            };
+            self.push_field_line(name, &rest[..idx]);
+            let after = &rest[idx..];
+            rest = after.strip_prefix("\r\n").unwrap_or_else(|| &after[1..]);
+        }
     }
 
     fn finalize(mut self) -> Vec<u8> {
@@ -208,10 +225,22 @@ where
 }
 
 impl Sse {
-    /// Create a paif of sender and SSE responder
+    /// Create a pair of sender and SSE responder backed by a bounded channel with the
+    /// [default capacity](channel::DEFAULT_CHANNEL_CAPACITY).
     #[must_use]
     pub fn channel() -> (Sender, Self) {
         Sender::new()
+    }
+
+    /// Create a sender/responder pair whose bounded channel buffers up to `capacity` events before
+    /// [`Sender::send`] applies backpressure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero.
+    #[must_use]
+    pub fn channel_with_capacity(capacity: usize) -> (Sender, Self) {
+        Sender::with_capacity(capacity)
     }
 
     /// Create a SSE responder with a stream.
@@ -221,9 +250,10 @@ impl Sse {
         E: Send + Sync + core::error::Error + 'static,
     {
         Self {
-            stream: Body::from_stream(IntoStream::new(stream).map_err(|error| {
-                BodyError::Other(Box::new(error)) // TODO: improve error handling, currently we just box the error
-            })),
+            // Erase the stream's concrete error into the body error channel.
+            stream: Body::from_stream(
+                IntoStream::new(stream).map_err(|error| BodyError::Other(Box::new(error))),
+            ),
         }
     }
 }
@@ -294,9 +324,27 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "SSE field value cannot include newline")]
-    fn event_fields_reject_newlines() {
-        let _ = Event::data("hello\nworld");
+    fn data_event_splits_multiple_lines() {
+        let bytes = Event::data("hello\nworld").finalize();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "data:hello\ndata:world\n\n"
+        );
+    }
+
+    #[test]
+    fn data_event_handles_crlf_and_cr_terminators() {
+        let bytes = Event::data("a\r\nb\rc").finalize();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "data:a\ndata:b\ndata:c\n\n"
+        );
+    }
+
+    #[test]
+    fn id_strips_stray_newlines_to_protect_framing() {
+        let bytes = Event::data("x").id("a\nb").finalize();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "data:x\nid:ab\n\n");
     }
 
     #[tokio::test]

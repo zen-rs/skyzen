@@ -1,52 +1,20 @@
 //! Look up the IP address of client.
 
 use std::{
-    net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr},
+    net::{AddrParseError, IpAddr, Ipv6Addr},
     str::{FromStr, Utf8Error},
 };
 
 use http::StatusCode;
-use http_kit::http_error;
 
 use crate::{extract::Extractor, header, header::HeaderName, Request};
 
-http_error!(/// Raised when the connection metadata does not expose the remote address.
-pub MissingRemoteAddr,
-StatusCode::INTERNAL_SERVER_ERROR, 
-"Missing remote addr, maybe it's not a tcp/udp connection");
-
-/// Extract the apparent address of the client.
-/// If the server is behind a proxy, you may obtain the proxy's address instead of the actual user's.
-#[derive(Debug, Clone)]
-pub struct PeerAddr(pub SocketAddr);
-
-impl Extractor for PeerAddr {
-    type Error = MissingRemoteAddr;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(Self(
-            request
-                .extensions()
-                .get::<Self>()
-                .ok_or(MissingRemoteAddr::new())?
-                .0,
-        ))
-    }
-
-    #[cfg(feature = "openapi")]
-    fn openapi() -> Option<crate::openapi::ExtractorSchema> {
-        crate::openapi::schema_of::<Self>().map(|schema| crate::openapi::ExtractorSchema {
-            content_type: None,
-            schema: Some(schema),
-        })
-    }
-
-    #[cfg(feature = "openapi")]
-    fn register_openapi_schemas(
-        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
-    ) {
-        crate::openapi::register_schema_for::<Self>(defs);
-    }
-}
+/// The remote peer address of the connection.
+///
+/// Re-exported from [`skyzen_core`] so that server backends can populate it without depending on
+/// the top-level `skyzen` crate. If the server is behind a proxy this is the proxy's address; use
+/// [`ClientIp`] to honour `Forwarded`/`X-Forwarded-For`.
+pub use skyzen_core::{MissingRemoteAddr, PeerAddr};
 
 /// Extract the IP address of the client.
 ///
@@ -57,8 +25,6 @@ impl Extractor for PeerAddr {
 /// If you're working on something like rate limiting, consider using the `PeerAddr` extractor.
 #[derive(Debug, Clone)]
 pub struct ClientIp(pub IpAddr);
-
-impl_deref!(PeerAddr, SocketAddr);
 
 impl_deref!(ClientIp, IpAddr);
 
@@ -92,20 +58,8 @@ impl Extractor for ClientIp {
         // It's unnecessary to consume the extension.
     }
 
-    #[cfg(feature = "openapi")]
-    fn openapi() -> Option<crate::openapi::ExtractorSchema> {
-        crate::openapi::schema_of::<Self>().map(|schema| crate::openapi::ExtractorSchema {
-            content_type: None,
-            schema: Some(schema),
-        })
-    }
-
-    #[cfg(feature = "openapi")]
-    fn register_openapi_schemas(
-        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
-    ) {
-        crate::openapi::register_schema_for::<Self>(defs);
-    }
+    // The client IP is derived server-side from connection metadata and proxy headers, so it is
+    // not a client-supplied request parameter and contributes no OpenAPI schema.
 }
 
 /// An error occurred while extracting the client's IP.

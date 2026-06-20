@@ -35,6 +35,10 @@ mod responder;
 pub use responder::Responder;
 mod server;
 pub use server::Server;
+#[cfg(feature = "std")]
+mod net;
+#[cfg(feature = "std")]
+pub use net::{error_response, MissingRemoteAddr, PeerAddr};
 #[cfg(feature = "openapi")]
 pub mod openapi;
 

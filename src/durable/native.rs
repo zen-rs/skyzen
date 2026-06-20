@@ -234,59 +234,57 @@ where
         mut request: Request,
     ) -> Result<Response, DurableObjectError> {
         let slot = self.slot_for(id).await?;
-        let response = {
-            let mut slot = slot.lock().await;
-            let mut object = slot.load_object::<T>()?;
 
+        // Load the struct state and clone the (independently synchronized) service handles while
+        // holding the slot lock, then release it before dispatching. Holding the lock across
+        // `respond().await` would deadlock if a handler re-enters the same Durable Object id. The
+        // shared `DurableKv`/`DurableDb` keep their own locks, so cross-request state stays
+        // consistent; struct-field state under concurrent same-id access is last-writer-wins.
+        let mut object = {
+            let slot = slot.lock().await;
             inject_durable_extensions(&mut request, &slot, id.clone());
-
-            let response = {
-                let mut endpoint = object.fetch();
-                match endpoint.respond(&mut request).await {
-                    Ok(response) => response,
-                    Err(error) => error_to_response(&error),
-                }
-            };
-
-            slot.save_object(&object)?;
-            response
+            slot.load_object::<T>()?
         };
+
+        let response = {
+            let mut endpoint = object.fetch();
+            match endpoint.respond(&mut request).await {
+                Ok(response) => response,
+                Err(error) => error_to_response(&error),
+            }
+        };
+
+        slot.lock().await.save_object(&object)?;
         Ok(response)
     }
 
     async fn alarm(&self, id: &DurableObjectId) -> Result<(), DurableObjectError> {
         let slot = self.slot_for(id).await?;
-        {
-            let mut slot = slot.lock().await;
-            let mut object = slot.load_object::<T>()?;
 
-            let mut endpoint = object.fetch();
-            let router = (&mut endpoint as &mut dyn std::any::Any)
-                .downcast_mut::<crate::routing::Router>()
-                .ok_or_else(|| {
-                    DurableObjectError::Runtime(
-                        "DurableObject::fetch() must return skyzen::routing::Router for alarm handling"
-                            .to_owned(),
-                    )
-                })?;
+        // See `fetch` for why the lock is released before dispatching the alarm handler.
+        let guard = slot.lock().await;
+        let mut object = guard.load_object::<T>()?;
 
-            let mut alarm_endpoint = router.alarm_endpoint().ok_or_else(|| {
-                DurableObjectError::Runtime(
-                    "No alarm handler registered. Use Route::on_alarm(handler).".to_owned(),
-                )
-            })?;
+        // `fetch()` returns a `Router`, which exposes the alarm handler registered via
+        // `Route::on_alarm` directly — no runtime downcast required.
+        let mut alarm_endpoint = object.fetch().alarm_endpoint().ok_or_else(|| {
+            DurableObjectError::Runtime(
+                "No alarm handler registered. Use Route::on_alarm(handler).".to_owned(),
+            )
+        })?;
 
-            let mut request =
-                alarm_request().map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
-            inject_durable_extensions(&mut request, &slot, id.clone());
+        let mut request =
+            alarm_request().map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
+        inject_durable_extensions(&mut request, &guard, id.clone());
+        drop(guard);
 
-            alarm_endpoint
-                .respond(&mut request)
-                .await
-                .map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
+        alarm_endpoint
+            .respond(&mut request)
+            .await
+            .map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
 
-            slot.save_object(&object)?;
-        }
+        // Persist any state the alarm handler wrote through the injected services.
+        slot.lock().await.save_object(&object)?;
         Ok(())
     }
 }
@@ -656,7 +654,7 @@ mod tests {
     }
 
     impl DurableObject for CounterObject {
-        fn fetch(&mut self) -> impl Endpoint + 'static {
+        fn fetch(&mut self) -> crate::routing::Router {
             Route::new((
                 "/increment".post(increment),
                 "/value".at(value),

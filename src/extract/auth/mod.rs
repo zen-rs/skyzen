@@ -4,4 +4,5 @@
 
 mod bearer;
 
+pub(crate) use bearer::parse_bearer;
 pub use bearer::{BearerToken, BearerTokenError};

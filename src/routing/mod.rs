@@ -121,7 +121,6 @@ use skyzen_core::{Extractor, Responder};
 /// Type alias for dynamically dispatched endpoints stored in the routing tree.
 pub type BoxEndpoint = AnyEndpoint;
 pub(crate) type EndpointFactory = Arc<dyn Fn() -> BoxEndpoint + Send + Sync>;
-// type SharedMiddleware = Box<dyn Middleware>; // Disabled for now
 
 // Export param types
 mod param;
@@ -260,7 +259,8 @@ impl Route {
     #[must_use]
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.openapi();
-        self.nodes.push(openapi.redoc_route("/api-docs"));
+        self.nodes
+            .push(openapi.redoc_route(openapi::DEFAULT_API_DOCS_MOUNT));
         self
     }
 }
@@ -321,7 +321,9 @@ impl RouteWithAlarm {
     #[must_use]
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.route.openapi();
-        self.route.nodes.push(openapi.redoc_route("/api-docs"));
+        self.route
+            .nodes
+            .push(openapi.redoc_route(openapi::DEFAULT_API_DOCS_MOUNT));
         self
     }
 }
@@ -835,15 +837,3 @@ where
         RouteNode::new_route(self.into(), Route::new(routes))
     }
 }
-
-// Disabled the Node trait for now since middleware system needs redesign
-// pub trait Node {
-//     fn apply_middleware(
-//         self,
-//         middleware: impl Middleware + 'static,
-//     ) -> impl Node;
-
-//     fn into_endpoints(self) -> Vec<EndpointNode<AnyEndpoint>>;
-// }
-
-// Remove the generic Node implementation for now since we have concrete types

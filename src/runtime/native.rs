@@ -214,8 +214,13 @@ pub fn init_logging() {
     });
 }
 
-/// Apply CLI overrides such as `--addr` or `--port` to configure the listener.
-pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
+/// Parse CLI overrides such as `--addr`/`--port` and return the resulting listen address.
+///
+/// Returns `None` when no valid override was supplied; the caller then falls back to the
+/// `SKYZEN_ADDRESS` environment variable or the built-in default (see [`server_addr`]). Invalid
+/// values are logged and ignored rather than mutating any global state.
+#[must_use]
+pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<SocketAddr> {
     let mut args = args.into_iter();
     let _ = args.next(); // binary name
     let mut listen = None;
@@ -254,20 +259,20 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
     }
 
     if let Some(addr) = listen {
-        match addr.parse::<SocketAddr>() {
+        return match addr.parse::<SocketAddr>() {
             Ok(socket) => {
-                unsafe {
-                    std::env::set_var("SKYZEN_ADDRESS", socket.to_string());
-                }
                 info!("Configured listener address via CLI: {socket}");
+                Some(socket)
             }
-            Err(error) => warn!("Ignoring invalid --listen address `{addr}`: {error}"),
-        }
-        return;
+            Err(error) => {
+                warn!("Ignoring invalid --listen address `{addr}`: {error}");
+                None
+            }
+        };
     }
 
     if host.is_none() && port.is_none() {
-        return;
+        return None;
     }
 
     let mut candidate = server_addr();
@@ -276,7 +281,7 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
             Ok(ip) => candidate.set_ip(ip),
             Err(error) => {
                 warn!("Ignoring invalid --host `{host}`: {error}");
-                return;
+                return None;
             }
         }
     }
@@ -285,15 +290,13 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
             Ok(value) => candidate.set_port(value),
             Err(error) => {
                 warn!("Ignoring invalid --port `{port}`: {error}");
-                return;
+                return None;
             }
         }
     }
 
-    unsafe {
-        std::env::set_var("SKYZEN_ADDRESS", candidate.to_string());
-    }
     info!("Configured listener address via CLI: {candidate}");
+    Some(candidate)
 }
 
 fn shutdown_signal() -> Receiver<()> {
@@ -311,7 +314,7 @@ fn shutdown_signal() -> Receiver<()> {
 /// # Panics
 ///
 /// Panics if the global executor fails to initialize.
-pub fn launch<Fut, E>(factory: impl FnOnce() -> Fut)
+pub fn launch<Fut, E>(addr: Option<SocketAddr>, factory: impl FnOnce() -> Fut)
 where
     Fut: Future<Output = E> + Send + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
@@ -325,21 +328,22 @@ where
         tracing::info!("Skyzen application starting up");
 
         let endpoint = factory().await;
-        match run_server(executor, endpoint).await {
+        let addr = addr.unwrap_or_else(server_addr);
+        match run_server(executor, endpoint, addr).await {
             Ok(()) => info!("Skyzen server shut down gracefully"),
             Err(error) => error!("Skyzen server terminated: {error}"),
         }
     });
 }
 
-async fn run_server<Exec, E>(executor: Exec, endpoint: E) -> std::io::Result<()>
+async fn run_server<Exec, E>(executor: Exec, endpoint: E, addr: SocketAddr) -> std::io::Result<()>
 where
     Exec: CoreExecutor + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
 {
     const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-    let listener = TcpListener::bind(server_addr()).await?;
+    let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     info!("Skyzen listening on http://{}", local_addr);
 
@@ -431,9 +435,23 @@ async fn sniff_protocol<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Pr
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
+    // A single `read` may return fewer bytes than the full HTTP/2 preface (it can arrive across
+    // several TCP segments). Keep reading until we have enough bytes to decide, the bytes so far
+    // already diverge from the preface (so it is HTTP/1), or we hit EOF. Whatever we consumed is
+    // replayed by `Prefixed`, so no data is lost regardless of the outcome.
     let mut buf = vec![0u8; preface.len()];
-    let n = stream.read(&mut buf).await?;
-    buf.truncate(n);
+    let mut filled = 0;
+    while filled < preface.len() {
+        if buf[..filled] != preface[..filled] {
+            break;
+        }
+        let n = stream.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
     let is_h2 = buf.starts_with(preface);
     Ok((Prefixed::new(stream, buf), is_h2))
 }
@@ -497,43 +515,27 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 }
                 Err(err) => {
                     let status = err.status();
-                    let error_message = err.to_string();
-
-                    // For 5xx server errors, hide internal details
-                    // For 4xx client errors and others, show the error message
-                    let body_message = if status.is_server_error() {
+                    if status.is_server_error() {
                         error!(
                             method = method.as_str(),
                             path = path.as_str(),
                             status = status.as_u16(),
-                            error = %error_message,
+                            error = %err,
                             "internal server error"
                         );
-                        "Internal server error".to_string()
                     } else {
                         warn!(
                             method = method.as_str(),
                             path = path.as_str(),
                             status = status.as_u16(),
-                            error = %error_message,
+                            error = %err,
                             "client error"
                         );
-                        error_message
-                    };
+                    }
 
-                    // Create JSON error response
-                    let body = format!(
-                        r#"{{"error":"{}"}}"#,
-                        body_message.replace('\\', r"\\").replace('"', r#"\""#)
-                    );
-
-                    let mut response = crate::Response::new(crate::Body::from(body));
-                    *response.status_mut() = status;
-                    response.headers_mut().insert(
-                        http::header::CONTENT_TYPE,
-                        http::header::HeaderValue::from_static("application/json"),
-                    );
-                    response
+                    // Build the JSON error body via the shared serde-backed helper (5xx details are
+                    // hidden there) instead of ad-hoc string formatting.
+                    skyzen_core::error_response(&err)
                 }
             };
 
@@ -695,48 +697,64 @@ mod tests {
     fn apply_cli_overrides_accepts_listen_aliases_and_split_flags() {
         let _guard = EnvGuard::clear();
 
-        apply_cli_overrides([
-            "skyzen".to_owned(),
-            "--addr".to_owned(),
-            "127.0.0.1:5050".to_owned(),
-        ]);
-        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:5050");
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--addr".to_owned(),
+                "127.0.0.1:5050".to_owned(),
+            ]),
+            Some("127.0.0.1:5050".parse().unwrap())
+        );
 
-        apply_cli_overrides([
-            "skyzen".to_owned(),
-            "--host".to_owned(),
-            "127.0.0.1".to_owned(),
-            "-p".to_owned(),
-            "6060".to_owned(),
-        ]);
-        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:6060");
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--host".to_owned(),
+                "127.0.0.1".to_owned(),
+                "-p".to_owned(),
+                "6060".to_owned(),
+            ]),
+            Some("127.0.0.1:6060".parse().unwrap())
+        );
     }
 
     #[test]
     #[serial]
-    fn apply_cli_overrides_ignores_invalid_values_without_overwriting_existing_address() {
+    fn apply_cli_overrides_returns_none_for_invalid_values() {
         let _guard = EnvGuard::set("127.0.0.1:7000");
 
-        apply_cli_overrides([
-            "skyzen".to_owned(),
-            "--listen".to_owned(),
-            "bad-address".to_owned(),
-        ]);
-        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:7000");
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--listen".to_owned(),
+                "bad-address".to_owned(),
+            ]),
+            None
+        );
 
-        apply_cli_overrides([
-            "skyzen".to_owned(),
-            "--host=invalid-host".to_owned(),
-            "--port=7001".to_owned(),
-        ]);
-        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:7000");
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--host=invalid-host".to_owned(),
+                "--port=7001".to_owned(),
+            ]),
+            None
+        );
 
-        apply_cli_overrides([
-            "skyzen".to_owned(),
-            "--host=127.0.0.1".to_owned(),
-            "--port=bad-port".to_owned(),
-        ]);
-        assert_eq!(std::env::var("SKYZEN_ADDRESS").unwrap(), "127.0.0.1:7000");
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--host=127.0.0.1".to_owned(),
+                "--port=bad-port".to_owned(),
+            ]),
+            None
+        );
+
+        // A valid override is combined with the env-configured base address.
+        assert_eq!(
+            apply_cli_overrides(["skyzen".to_owned(), "--port=8080".to_owned()]),
+            Some("127.0.0.1:8080".parse().unwrap())
+        );
     }
 
     #[tokio::test]

@@ -97,16 +97,17 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
         }
 
         let body = core::mem::replace(request.body_mut(), http_kit::Body::empty());
-        let data = body
-            .into_string()
-            .await
-            .map_err(|_| FormContentTypeError::InvalidPayload)?;
+        let data = body.into_string().await.map_err(|error| {
+            tracing::debug!(%error, "failed to read form request body");
+            FormContentTypeError::InvalidPayload
+        })?;
         extract(&data)
     }
 
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         Some(crate::openapi::ExtractorSchema {
+            location: crate::openapi::ParameterLocation::Body,
             content_type: Some("application/x-www-form-urlencoded"),
             schema: crate::openapi::maybe_schema_of::<T>(),
         })

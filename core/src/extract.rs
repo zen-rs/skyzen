@@ -2,7 +2,7 @@ use core::mem;
 use core::{convert::Infallible, future::Future};
 
 #[cfg(feature = "openapi")]
-use crate::openapi::{ExtractorSchema, SchemaRef};
+use crate::openapi::{ExtractorSchema, ParameterLocation, SchemaRef};
 use alloc::boxed::Box;
 #[cfg(feature = "openapi")]
 use alloc::collections::BTreeMap;
@@ -79,26 +79,28 @@ macro_rules! impl_tuple_extractor {
             #[allow(non_snake_case)]
             #[allow(unused_variables)]
             #[allow(clippy::unused_unit)]
-            impl<$($ty:Extractor+Send,)*> Extractor for ($($ty,)*) {
+            impl<$($ty:Extractor,)*> Extractor for ($($ty,)*) {
                 type Error = TupleExtractorError<$($ty),*>;
-            async fn extract(request:&mut Request) -> Result<Self,Self::Error>{
+                async fn extract(request:&mut Request) -> Result<Self,Self::Error>{
                     Ok(($($ty::extract(request).await.map_err(|error|{
                         TupleExtractorError::$ty(error)
                     })?,)*))
                 }
-            }
 
-            #[cfg(feature = "openapi")]
-            #[allow(dead_code)]
-            const fn openapi() -> Option<crate::openapi::ExtractorSchema> {
-                None
-            }
+                // A tuple combines several extractors, but `openapi()` can only describe one, so it
+                // reports none — document tuple-sourced parameters via individual handler arguments
+                // instead. Component schemas are still registered via `register_openapi_schemas`.
+                #[cfg(feature = "openapi")]
+                fn openapi() -> Option<crate::openapi::ExtractorSchema> {
+                    None
+                }
 
-            #[cfg(feature = "openapi")]
-            #[allow(dead_code)]
-            const fn register_openapi_schemas(
-                _defs: &mut alloc::collections::BTreeMap<String, crate::openapi::SchemaRef>,
-            ) {
+                #[cfg(feature = "openapi")]
+                fn register_openapi_schemas(
+                    defs: &mut alloc::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+                ) {
+                    $(<$ty as Extractor>::register_openapi_schemas(defs);)*
+                }
             }
         };
     };
@@ -118,6 +120,7 @@ impl Extractor for Bytes {
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<ExtractorSchema> {
         Some(ExtractorSchema {
+            location: ParameterLocation::Body,
             content_type: Some("application/octet-stream"),
             schema: None,
         })
@@ -134,6 +137,7 @@ impl Extractor for ByteStr {
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<ExtractorSchema> {
         Some(ExtractorSchema {
+            location: ParameterLocation::Body,
             content_type: Some("text/plain; charset=utf-8"),
             schema: None,
         })
@@ -149,6 +153,7 @@ impl Extractor for Body {
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<ExtractorSchema> {
         Some(ExtractorSchema {
+            location: ParameterLocation::Body,
             content_type: Some("application/octet-stream"),
             schema: None,
         })

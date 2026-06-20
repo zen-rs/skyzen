@@ -18,7 +18,10 @@ use http_kit::{header, http_error, Method, StatusCode};
 use utoipa::openapi::{
     content::Content,
     info::Info,
-    path::{HttpMethod, Operation, OperationBuilder, PathItemBuilder, Paths, PathsBuilder},
+    path::{
+        HttpMethod, Operation, OperationBuilder, Parameter, ParameterBuilder, ParameterIn,
+        PathItemBuilder, Paths, PathsBuilder,
+    },
     request_body::RequestBodyBuilder,
     response::{ResponseBuilder, ResponsesBuilder},
     schema::{ComponentsBuilder, ObjectBuilder, Schema, SchemaType, Type},
@@ -30,12 +33,28 @@ use utoipa_redoc::Redoc;
 pub type SchemaRef = RefOr<Schema>;
 
 #[cfg(feature = "openapi")]
-pub use skyzen_core::openapi::{ExtractorSchema, ResponseSchema, SchemaCollector};
+pub use skyzen_core::openapi::{
+    ExtractorSchema, ParameterLocation, ResponseSchema, SchemaCollector,
+};
+
+#[cfg(not(feature = "openapi"))]
+/// Where an extractor reads its data from (stubbed when `openapi` is disabled).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParameterLocation {
+    /// Read from the request body.
+    Body,
+    /// Read from the URL query string.
+    Query,
+    /// Read from a request header.
+    Header,
+}
 
 #[cfg(not(feature = "openapi"))]
 /// Schema information captured for an extractor argument (stubbed when `openapi` is disabled).
 #[derive(Clone)]
 pub struct ExtractorSchema {
+    /// Where the extractor sources its data.
+    pub location: ParameterLocation,
     /// Content type associated with the extractor, if any.
     pub content_type: Option<&'static str>,
     /// JSON schema describing the extractor payload.
@@ -60,6 +79,7 @@ pub struct ResponseSchema {
 impl fmt::Debug for ExtractorSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExtractorSchema")
+            .field("location", &self.location)
             .field("content_type", &self.content_type)
             .field("has_schema", &self.schema.is_some())
             .finish()
@@ -645,9 +665,12 @@ fn redoc_route(endpoint: OpenApiRedocEndpoint, mount_path: String) -> RouteNode 
     RouteNode::new_route(mount_path, route)
 }
 
+/// Default mount path for the generated Redoc API documentation page.
+pub const DEFAULT_API_DOCS_MOUNT: &str = "/api-docs";
+
 impl IntoRouteNode for OpenApiRedocEndpoint {
     fn into_route_node(self) -> RouteNode {
-        redoc_route(self, "/api-doc".to_string())
+        redoc_route(self, DEFAULT_API_DOCS_MOUNT.to_string())
     }
 }
 
@@ -679,6 +702,11 @@ fn build_operation(op: &OpenApiOperation) -> Operation {
         builder = builder.deprecated(Some(Deprecated::True));
     }
 
+    let parameters = build_parameters(op);
+    if !parameters.is_empty() {
+        builder = builder.parameters(Some(parameters));
+    }
+
     if let Some(body) = build_request_body(op) {
         builder = builder.request_body(Some(body));
     }
@@ -688,6 +716,112 @@ fn build_operation(op: &OpenApiOperation) -> Operation {
     }
 
     builder.build()
+}
+
+/// A minimal `string` schema used as a default for path/query/header parameters that don't carry
+/// their own typed schema.
+fn string_param_schema() -> RefOr<Schema> {
+    RefOr::T(Schema::Object(
+        ObjectBuilder::new()
+            .schema_type(SchemaType::from(Type::String))
+            .build(),
+    ))
+}
+
+/// Extract the names of `{name}` / `{*wildcard}` segments from a route path.
+fn path_parameter_names(path: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = path;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else { break };
+        let raw = &after[..end];
+        let name = raw.strip_prefix('*').unwrap_or(raw);
+        if !name.is_empty() {
+            names.push(name.to_owned());
+        }
+        rest = &after[end + 1..];
+    }
+    names
+}
+
+/// Build the `OpenAPI` `parameters` list: path parameters (from the route pattern) plus query and
+/// header parameters (from the handler's extractor schemas). Body extractors are handled separately
+/// by [`build_request_body`].
+fn build_parameters(op: &OpenApiOperation) -> Vec<Parameter> {
+    let mut parameters = Vec::new();
+
+    for name in path_parameter_names(&op.path) {
+        parameters.push(
+            ParameterBuilder::new()
+                .name(name)
+                .parameter_in(ParameterIn::Path)
+                .required(Required::True)
+                .schema(Some(string_param_schema()))
+                .build(),
+        );
+    }
+
+    for named in &op.parameters {
+        match named.schema.location {
+            ParameterLocation::Query => append_query_parameters(&mut parameters, named),
+            ParameterLocation::Header => parameters.push(
+                ParameterBuilder::new()
+                    .name(named.name.clone())
+                    .parameter_in(ParameterIn::Header)
+                    .required(Required::False)
+                    .schema(Some(
+                        named
+                            .schema
+                            .schema
+                            .clone()
+                            .unwrap_or_else(string_param_schema),
+                    ))
+                    .build(),
+            ),
+            ParameterLocation::Body => {}
+        }
+    }
+
+    parameters
+}
+
+/// Append query parameters for a `Query<T>` extractor. When the schema is an inline object its
+/// fields become individual query parameters (the conventional `OpenAPI` representation); otherwise
+/// the whole schema is exposed under the argument name.
+fn append_query_parameters(out: &mut Vec<Parameter>, named: &NamedExtractorSchema) {
+    if let Some(RefOr::T(Schema::Object(object))) = &named.schema.schema {
+        for (name, schema) in &object.properties {
+            let required = object.required.iter().any(|field| field == name);
+            out.push(
+                ParameterBuilder::new()
+                    .name(name.clone())
+                    .parameter_in(ParameterIn::Query)
+                    .required(if required {
+                        Required::True
+                    } else {
+                        Required::False
+                    })
+                    .schema(Some(schema.clone()))
+                    .build(),
+            );
+        }
+    } else {
+        out.push(
+            ParameterBuilder::new()
+                .name(named.name.clone())
+                .parameter_in(ParameterIn::Query)
+                .required(Required::False)
+                .schema(Some(
+                    named
+                        .schema
+                        .schema
+                        .clone()
+                        .unwrap_or_else(string_param_schema),
+                ))
+                .build(),
+        );
+    }
 }
 
 fn build_responses(op: &OpenApiOperation) -> utoipa::openapi::response::Responses {
@@ -722,17 +856,21 @@ fn build_request_body(op: &OpenApiOperation) -> Option<utoipa::openapi::request_
     let mut by_content_type: BTreeMap<&str, Vec<(String, RefOr<Schema>)>> = BTreeMap::new();
 
     for param in &op.parameters {
-        let content_type = param.schema.content_type;
-        if content_type.is_none() && param.schema.schema.is_none() {
+        // Only body-sourced extractors contribute to the request body; query/header/path
+        // parameters are emitted as `parameters` by `build_parameters`.
+        if param.schema.location != ParameterLocation::Body {
             continue;
         }
+
+        let Some(content_type) = param.schema.content_type else {
+            continue;
+        };
 
         let schema = param
             .schema
             .schema
             .clone()
             .unwrap_or_else(|| utoipa::openapi::schema::empty().into());
-        let content_type = content_type.unwrap_or("application/json");
         by_content_type
             .entry(content_type)
             .or_default()

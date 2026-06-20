@@ -72,8 +72,9 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[cfg(not(target_arch = "wasm32"))]
         fn main() {
             #init_logging
-            ::skyzen::runtime::native::apply_cli_overrides(::std::env::args());
-            ::skyzen::runtime::native::launch(|| #native_factory);
+            let __skyzen_listen_addr =
+                ::skyzen::runtime::native::apply_cli_overrides(::std::env::args());
+            ::skyzen::runtime::native::launch(__skyzen_listen_addr, || #native_factory);
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -309,6 +310,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                 fn #schema_ident() -> Option<::skyzen::openapi::ExtractorSchema> {
                     let mut schema = ::skyzen::openapi::extractor_schema_of::<#ty>().unwrap_or(
                         ::skyzen::openapi::ExtractorSchema {
+                            location: ::skyzen::openapi::ParameterLocation::Body,
                             content_type: Some(#content_type_lit),
                             schema: None,
                         },
@@ -2228,7 +2230,7 @@ fn generate_native_database_init(
                     .unwrap_or_else(|_| panic!("{}", #missing_message));
                 ::skyzen_services::Db::connect_postgres(&url)
                     .await
-                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message));
+                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
             }})
         }
         (DatabaseType::Sql, "mysql") => {
