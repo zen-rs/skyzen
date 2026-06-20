@@ -710,10 +710,10 @@ mod tests {
 
     #[skyzen::openapi]
     async fn list_items(
-        _query: crate::extract::Query<ListParams>,
+        query: crate::extract::Query<ListParams>,
         _params: Params,
-    ) -> Result<&'static str> {
-        Ok("ok")
+    ) -> Result<String> {
+        Ok(format!("page {} tag {:?}", query.0.page, query.0.tag))
     }
 
     #[test]
@@ -729,9 +729,9 @@ mod tests {
             .expect("operation should declare parameters");
         let find = |name: &str| parameters.iter().find(|param| param["name"] == name);
 
-        let id = find("id").expect("path parameter `id`");
-        assert_eq!(id["in"], "path");
-        assert_eq!(id["required"], true);
+        let id_param = find("id").expect("path parameter `id`");
+        assert_eq!(id_param["in"], "path");
+        assert_eq!(id_param["required"], true);
 
         let page = find("page").expect("query parameter `page`");
         assert_eq!(page["in"], "query");
