@@ -428,27 +428,38 @@ mod tests {
     }
 
     fn patch_local_crates(path: &Path) {
+        use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
+
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("cli crate should have a workspace parent")
             .to_path_buf();
-        let patch_section = format!(
-            r#"
-
-[patch.crates-io]
-skyzen = {{ path = "{}" }}
-skyzen-cloudflare = {{ path = "{}" }}
-skyzen-services = {{ path = "{}" }}
-"#,
-            workspace_root.display(),
-            workspace_root.join("cloudflare").display(),
-            workspace_root.join("services").display(),
-        );
 
         let cargo_toml_path = path.join("Cargo.toml");
         let existing = fs::read_to_string(&cargo_toml_path).expect("template Cargo.toml");
-        fs::write(&cargo_toml_path, format!("{existing}{patch_section}"))
-            .expect("patched Cargo.toml");
+        let mut doc = existing
+            .parse::<DocumentMut>()
+            .expect("template Cargo.toml is valid TOML");
+
+        // Build `[patch.crates-io]` via toml_edit so paths are escaped correctly — a hand-formatted
+        // string would emit invalid TOML for Windows paths (e.g. `D:\a\skyzen` has `\a`/`\s`).
+        let mut crates_io = Table::new();
+        for (name, dir) in [
+            ("skyzen", workspace_root.clone()),
+            ("skyzen-cloudflare", workspace_root.join("cloudflare")),
+            ("skyzen-services", workspace_root.join("services")),
+        ] {
+            let mut dep = InlineTable::new();
+            dep.insert("path", Value::from(dir.display().to_string()));
+            crates_io.insert(name, Item::Value(Value::InlineTable(dep)));
+        }
+
+        let mut patch_table = Table::new();
+        patch_table.set_implicit(true);
+        patch_table.insert("crates-io", Item::Table(crates_io));
+        doc.insert("patch", Item::Table(patch_table));
+
+        fs::write(&cargo_toml_path, doc.to_string()).expect("patched Cargo.toml");
     }
 
     fn run_cargo_check(path: &Path, shared_target_dir: &Path, wasm: bool) {
