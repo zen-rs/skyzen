@@ -2,8 +2,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, RecvTimeoutError},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -104,6 +103,7 @@ fn terminate_child(child: &mut Child) -> Result<()> {
             sys::signal::{kill, Signal},
             unistd::Pid,
         };
+        use std::{thread, time::Instant};
 
         let pid = Pid::from_raw(
             i32::try_from(child.id()).expect("child process id exceeded i32 range on unix"),
