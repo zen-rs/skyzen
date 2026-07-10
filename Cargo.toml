@@ -6,8 +6,8 @@ default-members = ["core", "hyper", "macros", "services", "test", "redis", "s3",
 resolver = "2"
 
 [workspace.dependencies]
-skyzen-core = { path = "core", version = "0.1.0" }
-skyzen-macros = { path = "macros", version = "0.1.0" }
+skyzen-core = { path = "core", version = "0.1.1" }
+skyzen-macros = { path = "macros", version = "0.1.1" }
 skyzen-services = { path = "services", version = "0.1.0" }
 skyzen-test = { path = "test", version = "0.1.0" }
 skyzen-redis = { path = "redis", version = "0.1.0" }
@@ -98,6 +98,7 @@ skyzen-hyper = { workspace = true, optional = true }
 jsonwebtoken = { version = "10", optional = true, features = ["aws_lc_rs"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+async-tungstenite = { version = "0.33.0", features = ["tokio-runtime"] }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "net"] }
 executor-core = { version = "0.7.1", features = ["tokio"] }
 femme = "2.2.1"
