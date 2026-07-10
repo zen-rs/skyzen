@@ -13,7 +13,6 @@ categories = ["web-programming::http-server", "database"]
 skyzen-services = { path = "../services" }
 azure_data_cosmos = { version = "0.36", optional = true }
 azure_messaging_servicebus = { version = "0.21", optional = true }
-azure_core = { version = "1", optional = true }
 opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "http-transport-reqwest-rustls", "services-azblob"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,7 +21,7 @@ base64 = "0.22"
 
 [features]
 default = ["cosmos", "blob", "servicebus"]
-cosmos = ["dep:azure_data_cosmos", "dep:azure_core"]
+cosmos = ["dep:azure_data_cosmos"]
 blob = ["dep:opendal"]
 servicebus = ["dep:azure_messaging_servicebus"]
 
