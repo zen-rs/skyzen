@@ -4,7 +4,7 @@
 //! Values are stored as JSON documents with an `id` field (the key)
 //! and a `value` field (base64-encoded bytes).
 
-use azure_data_cosmos::clients::ContainerClient;
+use azure_data_cosmos::{clients::ContainerClient, CosmosError, FeedScope};
 use base64::Engine;
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
@@ -63,16 +63,14 @@ fn decode_value(encoded: &str) -> Result<Vec<u8>, KvError> {
 impl KeyValueStore for CosmosKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         // Partition key requires 'static, so we must use an owned String
-        match self
-            .container
-            .read_item::<KvDocument>(key.to_string(), key, None)
-            .await
-        {
+        match self.container.read_item(key.to_owned(), key, None).await {
             Ok(response) => {
-                let doc = response.into_model().map_err(kv_backend_err)?;
+                let doc = response
+                    .into_model::<KvDocument>()
+                    .map_err(kv_backend_err)?;
                 decode_value(&doc.value).map(Some)
             }
-            Err(e) if is_not_found_status(e.http_status()) => Ok(None),
+            Err(error) if is_not_found(&error) => Ok(None),
             Err(e) => Err(kv_backend_err(e)),
         }
     }
@@ -85,16 +83,16 @@ impl KeyValueStore for CosmosKv {
         };
 
         self.container
-            .upsert_item(key.to_string(), doc, None)
+            .upsert_item(key.to_owned(), key, doc, None)
             .await
             .map_err(kv_backend_err)?;
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
-        match self.container.delete_item(key.to_string(), key, None).await {
+        match self.container.delete_item(key.to_owned(), key, None).await {
             Ok(_) => Ok(()),
-            Err(e) if is_not_found_status(e.http_status()) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
             Err(e) => Err(kv_backend_err(e)),
         }
     }
@@ -110,10 +108,11 @@ impl KeyValueStore for CosmosKv {
             },
         );
 
-        // Use empty partition key `()` for cross-partition queries
+        // Query the full container because key prefixes can span logical partitions.
         let mut pager = self
             .container
-            .query_items::<serde_json::Value>(query, (), None)
+            .query_items::<serde_json::Value>(query, FeedScope::full_container(), None)
+            .await
             .map_err(kv_backend_err)?;
 
         let mut keys = Vec::new();
@@ -131,9 +130,6 @@ fn kv_backend_err<E: std::fmt::Display>(e: E) -> KvError {
     KvError::Backend(e.to_string())
 }
 
-fn is_not_found_status<S>(status: Option<S>) -> bool
-where
-    u16: From<S>,
-{
-    status.map(u16::from) == Some(404)
+fn is_not_found(error: &CosmosError) -> bool {
+    u16::from(error.status().status_code()) == 404
 }

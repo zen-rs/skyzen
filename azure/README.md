@@ -28,7 +28,7 @@ skyzen-azure = "0.1"
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `cosmos` | Yes | Cosmos DB `KeyValueStore` via `azure_data_cosmos` |
-| `blob` | Yes | Blob Storage `ObjectStorage` via `azure_storage_blob` |
+| `blob` | Yes | Blob Storage `ObjectStorage` via Apache OpenDAL |
 | `servicebus` | Yes | Service Bus `MessageQueue` via `azure_messaging_servicebus` |
 
 Disable unused features to reduce compile times:
@@ -57,10 +57,13 @@ let user: Option<User> = kv.get_json("user:1").await?;
 ### AzureBlob
 
 ```rust
-use skyzen_azure::AzureBlob;
+use skyzen_azure::{AzureBlob, blob::Azblob};
 use skyzen_services::Storage;
 
-let blob = AzureBlob::new(container_client);
+let builder = Azblob::default()
+    .container(&std::env::var("AZURE_STORAGE_CONTAINER")?)
+    .endpoint(&std::env::var("AZURE_STORAGE_ENDPOINT")?);
+let blob = AzureBlob::new(builder)?;
 let storage = Storage::new(blob);
 
 storage.put("images/photo.png", image_bytes).await?;

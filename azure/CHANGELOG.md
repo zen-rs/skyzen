@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0](https://github.com/zen-rs/skyzen/releases/tag/skyzen-azure-v0.1.0) - 2026-07-10
 
+### Fixed
+
+- Replace the vulnerable Azure Blob XML dependency chain and update Cosmos to the current SDK API
+
 ### Other
 
 - Implement portable serverless services and CLI workflow
