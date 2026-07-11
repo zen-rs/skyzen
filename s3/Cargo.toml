@@ -10,7 +10,7 @@ keywords = ["s3", "object-storage", "skyzen", "services"]
 categories = ["web-programming::http-server", "database"]
 
 [dependencies]
-skyzen-services = { path = "../services" }
+skyzen-services = { path = "../services", version = "0.1.0" }
 # Disable the SDK default `rustls` feature: it pulls the legacy `tls-rustls` connector
 # (rustls 0.21 / hyper-rustls 0.24), which is redundant with the modern `default-https-client`
 # (rustls-aws-lc) and carries unpatched RustSec advisories. The default HTTPS client is unaffected.
