@@ -10,7 +10,7 @@ keywords = ["azure", "cosmos", "blob", "skyzen", "services"]
 categories = ["web-programming::http-server", "database"]
 
 [dependencies]
-skyzen-services = { path = "../services" }
+skyzen-services = { path = "../services", version = "0.1.0" }
 azure_data_cosmos = { version = "0.36", optional = true }
 azure_messaging_servicebus = { version = "0.21", optional = true }
 opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "http-transport-reqwest-rustls", "services-azblob"], optional = true }
