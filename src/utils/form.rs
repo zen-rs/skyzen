@@ -21,7 +21,7 @@ const APPLICATION_WWW_FORM_URLENCODED: HeaderValue =
 
 http_error!(
     /// Raised when the request content-type is not `application/x-www-form-urlencoded`.
-    pub FormEncodeError, StatusCode::SERVICE_UNAVAILABLE, "Failed to parse form data"
+    pub FormEncodeError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to encode form data"
 );
 
 impl<T: Send + Sync + Serialize + DeserializeOwned + 'static> Responder for Form<T> {
@@ -40,15 +40,16 @@ impl<T: Send + Sync + Serialize + DeserializeOwned + 'static> Responder for Form
         Some(vec![crate::openapi::ResponseSchema {
             status: None,
             description: None,
-            schema: None,
+            schema: crate::openapi::maybe_schema_of::<T>(),
             content_type: Some("application/x-www-form-urlencoded"),
         }])
     }
 
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(
-        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
+        crate::openapi::maybe_register_schema_for::<T>(defs);
     }
 }
 
@@ -75,39 +76,42 @@ pub enum FormContentTypeError {
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
     type Error = FormContentTypeError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        // A GET request carries the form in the query string and needs no content type.
         if request.method() == Method::GET {
             let data = request.uri().query().unwrap_or_default();
-            extract(data)
-        } else {
-            if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
-                if !is_form_content_type(content_type) {
-                    return Err(FormContentTypeError::Unsupported);
-                }
-            } else {
-                return Err(FormContentTypeError::Missing);
-            }
-
-            let body = core::mem::replace(request.body_mut(), http_kit::Body::empty());
-            let data = body
-                .into_string()
-                .await
-                .map_err(|_| FormContentTypeError::InvalidPayload)?;
-            extract(&data)
+            return extract(data);
         }
+
+        if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
+            if !is_form_content_type(content_type) {
+                return Err(FormContentTypeError::Unsupported);
+            }
+        } else {
+            return Err(FormContentTypeError::Missing);
+        }
+
+        let body = core::mem::replace(request.body_mut(), http_kit::Body::empty());
+        let data = body.into_string().await.map_err(|error| {
+            tracing::debug!(%error, "failed to read form request body");
+            FormContentTypeError::InvalidPayload
+        })?;
+        extract(&data)
     }
 
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         Some(crate::openapi::ExtractorSchema {
+            location: crate::openapi::ParameterLocation::Body,
             content_type: Some("application/x-www-form-urlencoded"),
-            schema: None,
+            schema: crate::openapi::maybe_schema_of::<T>(),
         })
     }
 
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(
-        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
+        crate::openapi::maybe_register_schema_for::<T>(defs);
     }
 }
 
@@ -124,11 +128,10 @@ fn is_form_content_type(value: &HeaderValue) -> bool {
         .to_str()
         .ok()
         .and_then(|raw| raw.split(';').next())
-        .map(|mime| {
+        .is_some_and(|mime| {
             mime.trim()
                 .eq_ignore_ascii_case("application/x-www-form-urlencoded")
         })
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

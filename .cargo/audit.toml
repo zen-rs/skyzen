@@ -1,0 +1,6 @@
+[advisories]
+ignore = [
+    # Pulled via optional sqlx-mysql in SeaORM graph; upstream has no fixed
+    # version yet for this advisory.
+    "RUSTSEC-2023-0071",
+]

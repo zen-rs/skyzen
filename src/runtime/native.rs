@@ -7,11 +7,12 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::Endpoint;
+use crate::{extract::PeerAddr, Endpoint, HttpError};
 use async_channel::{bounded, Receiver};
-use async_executor::Executor as AsyncExecutor;
 use async_net::TcpListener;
-use executor_core::{try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task};
+use executor_core::{
+    smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
+};
 use futures_util::{future::FutureExt, stream::MapOk, StreamExt, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
 use http_kit::{
@@ -213,8 +214,13 @@ pub fn init_logging() {
     });
 }
 
-/// Apply CLI overrides such as `--addr` or `--port` to configure the listener.
-pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
+/// Parse CLI overrides such as `--addr`/`--port` and return the resulting listen address.
+///
+/// Returns `None` when no valid override was supplied; the caller then falls back to the
+/// `SKYZEN_ADDRESS` environment variable or the built-in default (see [`server_addr`]). Invalid
+/// values are logged and ignored rather than mutating any global state.
+#[must_use]
+pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<SocketAddr> {
     let mut args = args.into_iter();
     let _ = args.next(); // binary name
     let mut listen = None;
@@ -253,20 +259,20 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
     }
 
     if let Some(addr) = listen {
-        match addr.parse::<SocketAddr>() {
+        return match addr.parse::<SocketAddr>() {
             Ok(socket) => {
-                unsafe {
-                    std::env::set_var("SKYZEN_ADDRESS", socket.to_string());
-                }
                 info!("Configured listener address via CLI: {socket}");
+                Some(socket)
             }
-            Err(error) => warn!("Ignoring invalid --listen address `{addr}`: {error}"),
-        }
-        return;
+            Err(error) => {
+                warn!("Ignoring invalid --listen address `{addr}`: {error}");
+                None
+            }
+        };
     }
 
     if host.is_none() && port.is_none() {
-        return;
+        return None;
     }
 
     let mut candidate = server_addr();
@@ -275,7 +281,7 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
             Ok(ip) => candidate.set_ip(ip),
             Err(error) => {
                 warn!("Ignoring invalid --host `{host}`: {error}");
-                return;
+                return None;
             }
         }
     }
@@ -284,15 +290,13 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) {
             Ok(value) => candidate.set_port(value),
             Err(error) => {
                 warn!("Ignoring invalid --port `{port}`: {error}");
-                return;
+                return None;
             }
         }
     }
 
-    unsafe {
-        std::env::set_var("SKYZEN_ADDRESS", candidate.to_string());
-    }
     info!("Configured listener address via CLI: {candidate}");
+    Some(candidate)
 }
 
 fn shutdown_signal() -> Receiver<()> {
@@ -310,41 +314,40 @@ fn shutdown_signal() -> Receiver<()> {
 /// # Panics
 ///
 /// Panics if the global executor fails to initialize.
-pub fn launch<Fut, E>(factory: impl FnOnce() -> Fut)
+pub fn launch<Fut, E>(addr: Option<SocketAddr>, factory: impl FnOnce() -> Fut)
 where
     Fut: Future<Output = E> + Send + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
 {
-    let executor = Arc::new(AsyncExecutor::new());
-    if try_init_global_executor(executor.clone()).is_err() {
+    let executor = SmolGlobal;
+    if try_init_global_executor(executor).is_err() {
         debug!("Global executor already initialized; reusing existing instance");
     }
 
-    let executor_clone = Arc::clone(&executor);
-    async_io::block_on(executor.run(async move {
+    smol::block_on(async move {
         tracing::info!("Skyzen application starting up");
 
         let endpoint = factory().await;
-        match run_server(executor_clone, endpoint).await {
+        let addr = addr.unwrap_or_else(server_addr);
+        match run_server(executor, endpoint, addr).await {
             Ok(()) => info!("Skyzen server shut down gracefully"),
             Err(error) => error!("Skyzen server terminated: {error}"),
         }
-    }));
+    });
 }
 
-async fn run_server<Exec, E>(executor: Arc<Exec>, endpoint: E) -> std::io::Result<()>
+async fn run_server<Exec, E>(executor: Exec, endpoint: E, addr: SocketAddr) -> std::io::Result<()>
 where
     Exec: CoreExecutor + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
 {
     const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-    let listener = TcpListener::bind(server_addr()).await?;
-    info!(
-        "Skyzen listening on http://{}",
-        listener.local_addr().unwrap()
-    );
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    info!("Skyzen listening on http://{}", local_addr);
 
+    let executor = Arc::new(executor);
     let hyper_executor = HyperExecutor(Arc::clone(&executor));
     let shared_executor: Arc<AnyExecutor> = Arc::new(AnyExecutor::new(Arc::clone(&executor)));
 
@@ -362,9 +365,10 @@ where
             connection = incoming.next().fuse() => {
                 match connection {
                     Some(Ok(stream)) => {
-                        if let Ok(peer) = stream.peer_addr() {
+                        let peer_addr = stream.peer_addr().map_or(None, |peer| {
                             debug!("Accepted connection from {peer}");
-                        }
+                            Some(peer)
+                        });
                         let endpoint = endpoint.clone();
                         let (stream, is_h2) = match sniff_protocol(stream, HTTP2_PREFACE).await {
                             Ok(result) => result,
@@ -375,7 +379,8 @@ where
                         };
 
                         if is_h2 {
-                            let service = IntoService::new(endpoint, shared_executor.clone());
+                            let service =
+                                IntoService::new(endpoint, shared_executor.clone(), peer_addr);
                             let hyper_executor = hyper_executor.clone();
                             executor
                                 .spawn(async move {
@@ -389,7 +394,8 @@ where
                                 })
                                 .detach();
                         } else {
-                            let service = IntoService::new(endpoint, shared_executor.clone());
+                            let service =
+                                IntoService::new(endpoint, shared_executor.clone(), peer_addr);
                             executor
                                 .spawn(async move {
                                     let builder = http1::Builder::new();
@@ -429,44 +435,383 @@ async fn sniff_protocol<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Pr
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buf = Vec::with_capacity(preface.len());
-    while buf.len() < preface.len() {
-        let remaining = preface.len() - buf.len();
-        let mut chunk = vec![0u8; remaining];
-        let n = stream.read(&mut chunk).await?;
+    // A single `read` may return fewer bytes than the full HTTP/2 preface (it can arrive across
+    // several TCP segments). Keep reading until we have enough bytes to decide, the bytes so far
+    // already diverge from the preface (so it is HTTP/1), or we hit EOF. Whatever we consumed is
+    // replayed by `Prefixed`, so no data is lost regardless of the outcome.
+    let mut buf = vec![0u8; preface.len()];
+    let mut filled = 0;
+    while filled < preface.len() {
+        if buf[..filled] != preface[..filled] {
+            break;
+        }
+        let n = stream.read(&mut buf[filled..]).await?;
         if n == 0 {
             break;
         }
-        chunk.truncate(n);
-        buf.extend_from_slice(&chunk);
-        if !preface.starts_with(&buf) {
-            return Ok((Prefixed::new(stream, buf), false));
+        filled += n;
+    }
+    buf.truncate(filled);
+    let is_h2 = buf.starts_with(preface);
+    Ok((Prefixed::new(stream, buf), is_h2))
+}
+
+#[derive(Debug)]
+struct IntoService<E> {
+    endpoint: E,
+    executor: Arc<AnyExecutor>,
+    peer_addr: Option<SocketAddr>,
+}
+
+impl<E: Endpoint + Clone> IntoService<E> {
+    const fn new(endpoint: E, executor: Arc<AnyExecutor>, peer_addr: Option<SocketAddr>) -> Self {
+        Self {
+            endpoint,
+            executor,
+            peer_addr,
         }
     }
-    let is_h2 = buf.len() == preface.len() && buf.as_slice() == preface;
-    Ok((Prefixed::new(stream, buf), is_h2))
+}
+
+impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
+    for IntoService<E>
+{
+    type Response = hyper::Response<
+        StreamBody<MapOk<crate::Body, fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>>>,
+    >;
+    type Error = BoxHttpError;
+    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
+
+    fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
+        let mut endpoint = self.endpoint.clone();
+        let executor = self.executor.clone();
+        let peer_addr = self.peer_addr;
+        let fut = async move {
+            let on_upgrade = hyper::upgrade::on(&mut req);
+            let method = req.method().clone();
+            let path = req.uri().path().to_owned();
+            let mut request: crate::Request =
+                crate::Request::from(req.map(BodyDataStream::new).map(|body| {
+                    crate::Body::from_stream(
+                        body.map_err(|error| BodyError::Other(Box::new(error))),
+                    )
+                }));
+            request.extensions_mut().insert(on_upgrade);
+            request.extensions_mut().insert(executor);
+            if let Some(peer_addr) = peer_addr {
+                request.extensions_mut().insert(PeerAddr(peer_addr));
+            }
+
+            // Convert errors to HTTP responses at the runtime level
+            let response: crate::Response = match endpoint.respond(&mut request).await {
+                Ok(response) => {
+                    info!(
+                        method = method.as_str(),
+                        path = path.as_str(),
+                        status = response.status().as_u16(),
+                        "request completed"
+                    );
+                    response
+                }
+                Err(err) => {
+                    let status = err.status();
+                    if status.is_server_error() {
+                        error!(
+                            method = method.as_str(),
+                            path = path.as_str(),
+                            status = status.as_u16(),
+                            error = %err,
+                            "internal server error"
+                        );
+                    } else {
+                        warn!(
+                            method = method.as_str(),
+                            path = path.as_str(),
+                            status = status.as_u16(),
+                            error = %err,
+                            "client error"
+                        );
+                    }
+
+                    // Build the JSON error body via the shared serde-backed helper (5xx details are
+                    // hidden there) instead of ad-hoc string formatting.
+                    skyzen_core::error_response(&err)
+                }
+            };
+
+            Ok(response.map(|body| {
+                let body: MapOk<
+                    crate::Body,
+                    fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>,
+                > = body.map_ok(Frame::data);
+                StreamBody::new(body)
+            }))
+        };
+
+        Box::pin(fut)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sniff_protocol;
-    use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite};
-    use std::collections::VecDeque;
-    use std::io;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
+    use super::{apply_cli_overrides, server_addr, sniff_protocol, Prefixed};
+    use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use serial_test::serial;
+    use std::{
+        io::{Cursor, Read},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
-    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+    struct EnvGuard {
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                original: std::env::var("SKYZEN_ADDRESS").ok(),
+            }
+        }
+
+        fn clear() -> Self {
+            let guard = Self::capture();
+            unsafe {
+                std::env::remove_var("SKYZEN_ADDRESS");
+            }
+            guard
+        }
+
+        fn set(value: &str) -> Self {
+            let guard = Self::capture();
+            unsafe {
+                std::env::set_var("SKYZEN_ADDRESS", value);
+            }
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe {
+                    std::env::set_var("SKYZEN_ADDRESS", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("SKYZEN_ADDRESS");
+                },
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestStream {
+        read: Cursor<Vec<u8>>,
+        written: Vec<u8>,
+        closed: bool,
+    }
+
+    impl TestStream {
+        fn new(bytes: impl Into<Vec<u8>>) -> Self {
+            Self {
+                read: Cursor::new(bytes.into()),
+                written: Vec::new(),
+                closed: false,
+            }
+        }
+    }
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Poll::Ready(Read::read(&mut self.read, buf))
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            self.closed = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn server_addr_defaults_to_random_localhost_port() {
+        let _guard = EnvGuard::clear();
+
+        assert_eq!(
+            server_addr(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn server_addr_uses_environment_override() {
+        let _guard = EnvGuard::set("127.0.0.1:4012");
+
+        assert_eq!(
+            server_addr(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4012)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn server_addr_fast_fails_for_invalid_environment_value() {
+        let _guard = EnvGuard::set("not-an-address");
+
+        let panic = std::panic::catch_unwind(server_addr);
+
+        assert!(panic.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn apply_cli_overrides_accepts_listen_aliases_and_split_flags() {
+        let _guard = EnvGuard::clear();
+
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--addr".to_owned(),
+                "127.0.0.1:5050".to_owned(),
+            ]),
+            Some("127.0.0.1:5050".parse().unwrap())
+        );
+
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--host".to_owned(),
+                "127.0.0.1".to_owned(),
+                "-p".to_owned(),
+                "6060".to_owned(),
+            ]),
+            Some("127.0.0.1:6060".parse().unwrap())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_cli_overrides_returns_none_for_invalid_values() {
+        let _guard = EnvGuard::set("127.0.0.1:7000");
+
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--listen".to_owned(),
+                "bad-address".to_owned(),
+            ]),
+            None
+        );
+
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--host=invalid-host".to_owned(),
+                "--port=7001".to_owned(),
+            ]),
+            None
+        );
+
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--host=127.0.0.1".to_owned(),
+                "--port=bad-port".to_owned(),
+            ]),
+            None
+        );
+
+        // A valid override is combined with the env-configured base address.
+        assert_eq!(
+            apply_cli_overrides(["skyzen".to_owned(), "--port=8080".to_owned()]),
+            Some("127.0.0.1:8080".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn sniff_protocol_detects_http2_preface_and_replays_buffered_bytes() {
+        let payload = [HTTP2_PREFACE, b"rest"].concat();
+        let (mut stream, is_h2) = sniff_protocol(TestStream::new(payload.clone()), HTTP2_PREFACE)
+            .await
+            .unwrap();
+
+        assert!(is_h2);
+
+        let mut read = Vec::new();
+        stream.read_to_end(&mut read).await.unwrap();
+        assert_eq!(read, payload);
+    }
+
+    #[tokio::test]
+    async fn sniff_protocol_distinguishes_http1_and_preserves_writes() {
+        let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let (mut stream, is_h2) = sniff_protocol(TestStream::new(payload.clone()), HTTP2_PREFACE)
+            .await
+            .unwrap();
+
+        assert!(!is_h2);
+
+        let mut read = Vec::new();
+        stream.read_to_end(&mut read).await.unwrap();
+        assert_eq!(read, payload);
+
+        stream.write_all(b"pong").await.unwrap();
+        stream.flush().await.unwrap();
+        stream.close().await.unwrap();
+        assert_eq!(stream.inner.written, b"pong".to_vec());
+        assert!(stream.inner.closed);
+    }
+
+    #[tokio::test]
+    async fn prefixed_reads_buffer_before_inner_stream() {
+        let mut stream = Prefixed::new(TestStream::new(b"tail".to_vec()), b"head".to_vec());
+
+        let mut read = Vec::new();
+        stream.read_to_end(&mut read).await.unwrap();
+
+        assert_eq!(read, b"headtail".to_vec());
+    }
+
+    // A stream that yields its bytes in caller-chosen chunks, to exercise `sniff_protocol`'s
+    // short-read handling (the HTTP/2 preface arriving across multiple reads).
     struct ChunkedStream {
-        chunks: VecDeque<Vec<u8>>,
+        chunks: std::collections::VecDeque<Vec<u8>>,
         written: Vec<u8>,
     }
 
     impl ChunkedStream {
         fn new(chunks: Vec<Vec<u8>>) -> Self {
             Self {
-                chunks: VecDeque::from(chunks),
+                chunks: std::collections::VecDeque::from(chunks),
                 written: Vec::new(),
             }
         }
@@ -477,7 +822,7 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             buf: &mut [u8],
-        ) -> Poll<io::Result<usize>> {
+        ) -> Poll<std::io::Result<usize>> {
             let this = self.get_mut();
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
@@ -502,17 +847,17 @@ mod tests {
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
+        ) -> Poll<std::io::Result<usize>> {
             let this = self.get_mut();
             this.written.extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -531,99 +876,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detects_split_h2_preface() {
-        let chunks = vec![PREFACE[..5].to_vec(), PREFACE[5..12].to_vec(), PREFACE[12..].to_vec()];
+    async fn sniff_detects_split_http2_preface() {
+        let chunks = vec![
+            HTTP2_PREFACE[..5].to_vec(),
+            HTTP2_PREFACE[5..12].to_vec(),
+            HTTP2_PREFACE[12..].to_vec(),
+        ];
         let stream = ChunkedStream::new(chunks);
 
-        let (_prefixed, is_h2) = sniff_protocol(stream, PREFACE).await.unwrap();
+        let (_prefixed, is_h2) = sniff_protocol(stream, HTTP2_PREFACE).await.unwrap();
         assert!(is_h2);
     }
 
     #[tokio::test]
-    async fn preserves_bytes_on_mismatch() {
+    async fn sniff_preserves_bytes_on_split_mismatch() {
         let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
-        let chunks = vec![payload[..3].to_vec(), payload[3..10].to_vec(), payload[10..].to_vec()];
+        let chunks = vec![
+            payload[..3].to_vec(),
+            payload[3..10].to_vec(),
+            payload[10..].to_vec(),
+        ];
         let stream = ChunkedStream::new(chunks);
 
-        let (prefixed, is_h2) = sniff_protocol(stream, PREFACE).await.unwrap();
+        let (prefixed, is_h2) = sniff_protocol(stream, HTTP2_PREFACE).await.unwrap();
         assert!(!is_h2);
 
         let restored = read_all(prefixed).await;
         assert_eq!(restored, payload);
-    }
-}
-
-#[derive(Debug)]
-struct IntoService<E> {
-    endpoint: E,
-    executor: Arc<AnyExecutor>,
-}
-
-impl<E: Endpoint + Clone> IntoService<E> {
-    const fn new(endpoint: E, executor: Arc<AnyExecutor>) -> Self {
-        Self { endpoint, executor }
-    }
-}
-
-impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
-    for IntoService<E>
-{
-    type Response = hyper::Response<
-        StreamBody<MapOk<crate::Body, fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>>>,
-    >;
-    type Error = BoxHttpError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
-        let mut endpoint = self.endpoint.clone();
-        let executor = self.executor.clone();
-        let fut = async move {
-            let on_upgrade = hyper::upgrade::on(&mut req);
-            let method = req.method().clone();
-            let path = req.uri().path().to_owned();
-            let mut request: crate::Request =
-                crate::Request::from(req.map(BodyDataStream::new).map(|body| {
-                    crate::Body::from_stream(
-                        body.map_err(|error| BodyError::Other(Box::new(error))),
-                    )
-                }));
-            request.extensions_mut().insert(on_upgrade);
-            request.extensions_mut().insert(executor);
-            let response = endpoint.respond(&mut request).await;
-            let response: Result<hyper::Response<crate::Body>, Self::Error> =
-                response.map_err(|error| Box::new(error) as BoxHttpError);
-
-            match &response {
-                Ok(ok) => {
-                    info!(
-                        method = method.as_str(),
-                        path = path.as_str(),
-                        status = ok.status().as_u16(),
-                        "request completed"
-                    );
-                }
-                Err(err) => {
-                    let status = err.status().as_u16();
-                    error!(
-                        method = method.as_str(),
-                        path = path.as_str(),
-                        status = status,
-                        "request failed: {err}"
-                    );
-                }
-            }
-
-            response.map(|response| {
-                response.map(|body| {
-                    let body: MapOk<
-                        crate::Body,
-                        fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>,
-                    > = body.map_ok(Frame::data);
-                    StreamBody::new(body)
-                })
-            })
-        };
-
-        Box::pin(fut)
     }
 }

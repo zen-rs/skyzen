@@ -15,11 +15,7 @@ use http::{
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY},
     HeaderMap, HeaderValue, Method, StatusCode,
 };
-use http_kit::{
-    http_error,
-    middleware::MiddlewareError,
-    Body, Middleware, Request, Response,
-};
+use http_kit::{http_error, middleware::MiddlewareError, Body, Middleware, Request, Response};
 use smallvec::{smallvec, SmallVec};
 
 type EncodingList = SmallVec<[CompressionEncoding; 3]>;
@@ -32,7 +28,7 @@ http_error!(
 );
 
 /// Middleware that conditionally compresses outgoing responses.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompressionMiddleware {
     config: CompressionConfig,
 }
@@ -47,7 +43,7 @@ impl CompressionMiddleware {
 
     /// Updates the minimum response size that qualifies for compression.
     #[must_use]
-    pub fn minimum_size(mut self, minimum_size: usize) -> Self {
+    pub const fn minimum_size(mut self, minimum_size: usize) -> Self {
         self.config.minimum_size = minimum_size;
         self
     }
@@ -65,7 +61,7 @@ impl CompressionMiddleware {
 
     /// Sets the compression level that will be used by the selected encoder.
     #[must_use]
-    pub fn level(mut self, level: CompressionLevel) -> Self {
+    pub const fn level(mut self, level: CompressionLevel) -> Self {
         self.config.level = level;
         self
     }
@@ -73,7 +69,7 @@ impl CompressionMiddleware {
     fn negotiate_encoding(&self, request: &Request) -> Option<CompressionEncoding> {
         let mut best: Option<Candidate> = None;
         let mut position = 0usize;
-        for value in request.headers().get_all(ACCEPT_ENCODING).iter() {
+        for value in &request.headers().get_all(ACCEPT_ENCODING) {
             if let Ok(raw) = value.to_str() {
                 parse_header_value(raw, &self.config.encodings, &mut position, &mut best);
             }
@@ -81,7 +77,7 @@ impl CompressionMiddleware {
         best.map(|candidate| candidate.encoding)
     }
 
-    fn is_response_eligible(&self, request: &Request, response: &Response) -> bool {
+    fn is_response_eligible(request: &Request, response: &Response) -> bool {
         if matches!(request.method(), &Method::HEAD) {
             return false;
         }
@@ -104,8 +100,11 @@ impl CompressionMiddleware {
         response: &mut Response,
         encoding: CompressionEncoding,
     ) -> Result<(), CompressionError> {
-        let mut body = mem::take(response.body_mut());
-        let original = body.into_bytes().await.map_err(|_| CompressionError::new())?;
+        let body = mem::take(response.body_mut());
+        let original = body
+            .into_bytes()
+            .await
+            .map_err(|_| CompressionError::new())?;
 
         if original.len() < self.config.minimum_size {
             set_content_length(response, original.len())?;
@@ -133,27 +132,19 @@ impl CompressionMiddleware {
     }
 }
 
-impl Default for CompressionMiddleware {
-    fn default() -> Self {
-        Self {
-            config: CompressionConfig::default(),
-        }
-    }
-}
-
 impl Middleware for CompressionMiddleware {
     type Error = CompressionError;
     async fn handle<N: http_kit::Endpoint>(
         &mut self,
         request: &mut Request,
-        next: N,
+        mut next: N,
     ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
         let mut response = next
             .respond(request)
             .await
             .map_err(MiddlewareError::Endpoint)?;
 
-        if self.is_response_eligible(request, &response) {
+        if Self::is_response_eligible(request, &response) {
             if let Some(encoding) = self.negotiate_encoding(request) {
                 self.compress_response(&mut response, encoding)
                     .await
@@ -254,15 +245,14 @@ fn consider_candidate(best: &mut Option<Candidate>, candidate: Candidate) {
         None => true,
         Some(existing) => match candidate.quality.partial_cmp(&existing.quality) {
             Some(Ordering::Greater) => true,
-            Some(Ordering::Less) => false,
             Some(Ordering::Equal) => {
-                if candidate.position != existing.position {
-                    candidate.position < existing.position
-                } else {
+                if candidate.position == existing.position {
                     candidate.supported_order < existing.supported_order
+                } else {
+                    candidate.position < existing.position
                 }
             }
-            None => false,
+            Some(Ordering::Less) | None => false,
         },
     };
 
@@ -333,8 +323,8 @@ impl ParsedEncoding {
 }
 
 fn set_content_length(response: &mut Response, len: usize) -> Result<(), CompressionError> {
-    let len_header = HeaderValue::from_str(&len.to_string())
-        .map_err(|_| CompressionError::new())?;
+    let len_header =
+        HeaderValue::from_str(&len.to_string()).map_err(|_| CompressionError::new())?;
     response.headers_mut().insert(CONTENT_LENGTH, len_header);
     response.headers_mut().remove(TRANSFER_ENCODING);
     Ok(())
@@ -380,7 +370,7 @@ pub enum CompressionEncoding {
 }
 
 impl CompressionEncoding {
-    fn header_value(self) -> HeaderValue {
+    const fn header_value(self) -> HeaderValue {
         match self {
             Self::Gzip => HeaderValue::from_static("gzip"),
             Self::Deflate => HeaderValue::from_static("deflate"),
@@ -405,7 +395,7 @@ impl CompressionEncoding {
 }
 
 /// Compression strength used by [`CompressionMiddleware`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompressionLevel {
     /// Fast compression optimized for latency.
     Fast,
@@ -414,6 +404,7 @@ pub enum CompressionLevel {
     /// Custom compression level (0-9).
     Precise(u32),
     /// Uses the zlib default.
+    #[default]
     Default,
 }
 
@@ -425,12 +416,6 @@ impl CompressionLevel {
             Self::Default => FlateCompression::default(),
             Self::Precise(level) => FlateCompression::new(level.min(9)),
         }
-    }
-}
-
-impl Default for CompressionLevel {
-    fn default() -> Self {
-        Self::Default
     }
 }
 

@@ -18,6 +18,9 @@ cargo run --example native -- --port 3000
 cargo run --example worker
 cargo run --example openapi
 
+# Build cloudflare crate (wasm32-only, excluded from default workspace members)
+cargo clippy -p skyzen-cloudflare --target wasm32-unknown-unknown
+
 # Build for wasm32 targets
 rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown --release
@@ -25,14 +28,38 @@ cargo build --target wasm32-unknown-unknown --release
 
 ## Architecture Overview
 
-Skyzen is a router-first HTTP framework targeting both native servers (Tokio + Hyper) and WebAssembly edge platforms. The codebase is a Cargo workspace with four crates:
+Skyzen is a router-first HTTP framework targeting both native servers (Tokio + Hyper) and WebAssembly edge platforms. The codebase is a Cargo workspace:
 
 ### Crate Structure
 
+**Framework core:**
 - **`skyzen`** (root) - Main framework crate with routing, middleware, extractors, responders, and runtime helpers
 - **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`) reusable by alternative runtimes. Supports `no_std` when the `std` feature is disabled
-- **`skyzen-macros`** (`skyzen-macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::openapi]`, `#[skyzen::error]`, `#[derive(HttpError)]`
+- **`skyzen-macros`** (`macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::openapi]`, `#[skyzen::error]`, `#[derive(HttpError)]`
 - **`skyzen-hyper`** (`hyper/`) - Hyper backend that implements the `Server` trait from `skyzen-core`
+
+**Services abstraction:**
+- **`skyzen-services`** (`services/`) - Platform-agnostic service traits (`KeyValueStore`, `ObjectStorage`, `MessageQueue`) and type-erased extractors (`Kv`, `Storage`, `Queue`, `Db`). Re-exports `sea_orm` for database access
+- **`skyzen-test`** (`test/`) - In-memory mock implementations (`InMemoryKv`, `InMemoryStorage`, `InMemoryQueue`) for testing
+
+**Platform implementations:**
+- **`skyzen-redis`** (`redis/`) - Redis `KeyValueStore` implementation
+- **`skyzen-s3`** (`s3/`) - S3-compatible `ObjectStorage` implementation
+- **`skyzen-cloudflare`** (`cloudflare/`) - Cloudflare Workers implementations (KV, R2, Queues, D1, Durable Object SQLite). **wasm32-only**
+- **`skyzen-aws`** (`aws/`) - AWS implementations (DynamoDB, SQS)
+- **`skyzen-azure`** (`azure/`) - Azure implementations (Cosmos DB, Blob Storage, Service Bus)
+
+### Services Abstraction (Two-Trait Pattern)
+
+Services use a two-layer design for type erasure:
+- **Public trait** (e.g. `KeyValueStore`) with `impl Future` returns — ergonomic for implementors, NOT object-safe
+- **Private `*Obj` trait** with `BoxFuture` — object-safe for dynamic dispatch via `Box<dyn *Obj>`
+- **Bridge**: blanket impl of `*Obj` for any `T: PublicTrait`
+- **Wrapper** (e.g. `Kv`): holds `Box<dyn *Obj>`, implements `Extractor`, exposes async methods
+
+The `MaybeSend` pattern (`services/src/maybe_send.rs`) conditionally applies `Send` bounds — `Send` on native, no-op on WASM. This allows the same traits to work on both targets.
+
+Platform crates depend only on `skyzen-services` (traits), NOT on the `skyzen` main crate.
 
 ### Key Abstractions
 

@@ -27,10 +27,21 @@ use std::{
 };
 use wasm_bindgen::{prelude::*, JsCast};
 
+/// Reject an outbound message whose size exceeds the configured maximum, before handing it to the
+/// host runtime (which would otherwise fail opaquely or truncate).
+fn ensure_within_limit(config: &WebSocketConfig, len: usize) -> WebSocketResult<()> {
+    if let Some(limit) = config.max_message_size {
+        if len > limit {
+            return Err(WebSocketError::MessageTooLarge { len, limit });
+        }
+    }
+    Ok(())
+}
+
 /// WebSocket connection for WASM targets.
 ///
 /// # Platform Notes
-/// - Maximum message size: 1 MiB (platform imposed)
+/// - Maximum message size: enforced from [`WebSocketConfig::max_message_size`]
 /// - No ping/pong frame control (use `send_ping`/`send_pong` returns error)
 /// - Event-driven model converted to Stream
 pub struct WebSocket {
@@ -119,18 +130,20 @@ impl WebSocket {
     /// Send a raw text frame without JSON serialization.
     pub async fn send_text(&mut self, text: impl Into<ByteStr>) -> WebSocketResult<()> {
         let text = text.into();
+        ensure_within_limit(&self.config, text.len())?;
         self.inner
             .send(&JsValue::from_str(&text))
-            .map_err(|e| WebSocketError::Protocol(format!("{:?}", e)))
+            .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
     }
 
     /// Send raw binary data without JSON serialization.
     pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
         let bytes = data.into();
+        ensure_within_limit(&self.config, bytes.len())?;
         let array = js_sys::Uint8Array::from(&bytes[..]);
         self.inner
             .send(&array.into())
-            .map_err(|e| WebSocketError::Protocol(format!("{:?}", e)))
+            .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
     }
 
     /// Send a ping frame with optional payload.
@@ -264,18 +277,20 @@ impl WebSocketSender {
     /// Send a raw text frame without JSON serialization.
     pub async fn send_text(&mut self, text: impl Into<ByteStr>) -> WebSocketResult<()> {
         let text = text.into();
+        ensure_within_limit(&self.config, text.len())?;
         self.inner
             .send(&JsValue::from_str(&text))
-            .map_err(|e| WebSocketError::Protocol(format!("{:?}", e)))
+            .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
     }
 
     /// Send raw binary data without JSON serialization.
     pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
         let bytes = data.into();
+        ensure_within_limit(&self.config, bytes.len())?;
         let array = js_sys::Uint8Array::from(&bytes[..]);
         self.inner
             .send(&array.into())
-            .map_err(|e| WebSocketError::Protocol(format!("{:?}", e)))
+            .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
     }
 
     /// Send a ping frame with optional payload.
@@ -464,11 +479,12 @@ impl WebSocketUpgrade {
         self
     }
 
-    /// Set the maximum incoming message size accepted by the websocket.
+    /// Set the maximum message size accepted/sent by the websocket.
     ///
     /// # Platform Notes
-    /// - **Native**: Enforced by async-tungstenite
-    /// - **WASM**: 1 MiB limit enforced by runtime (this setting is advisory only)
+    /// - **Native**: Enforced by async-tungstenite on both directions.
+    /// - **WASM**: Enforced by Skyzen on outbound sends. Note the host runtime may impose its own
+    ///   lower cap (e.g. Cloudflare Workers limits messages to 1 MiB), so set this accordingly.
     #[must_use]
     pub fn max_message_size(mut self, max_size: Option<usize>) -> Self {
         self.config.max_message_size = max_size;

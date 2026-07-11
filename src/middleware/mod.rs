@@ -24,5 +24,7 @@
 mod error_handling;
 
 pub mod auth;
+pub mod compression;
+pub use compression::{CompressionEncoding, CompressionLevel, CompressionMiddleware};
 pub use error_handling::ErrorHandlingMiddleware;
 pub use http_kit::middleware::Middleware;

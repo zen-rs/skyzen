@@ -1,0 +1,10 @@
+mod app;
+mod durable_object;
+
+use skyzen::routing::Router;
+
+#[skyzen::main]
+fn worker() -> Router {
+    app::router()
+}
+

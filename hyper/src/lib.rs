@@ -1,6 +1,17 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
-//! The hyper backend of skyzen
+//! Hyper server backend for the Skyzen framework.
+//!
+//! This crate provides [`Hyper`], which implements the [`Server`] trait from
+//! `skyzen-core`, bridging Skyzen's [`Endpoint`] abstraction with Hyper's
+//! HTTP/1 and HTTP/2 server implementation.
+//!
+//! Most users don't need this crate directly — `#[skyzen::main]` sets up Hyper
+//! automatically. Use this crate when embedding Skyzen into an existing application
+//! with a custom async runtime.
+//!
+//! See the [`embed_hyper.rs`](https://github.com/zen-rs/skyzen/blob/main/examples/embed_hyper.rs)
+//! example for a complete setup using `smol` as the async runtime.
 
 use core::future::Future;
 use executor_core::{AnyExecutor, Executor, Task};
@@ -326,7 +337,11 @@ mod tests {
 
     #[tokio::test]
     async fn detects_split_h2_preface() {
-        let chunks = vec![PREFACE[..4].to_vec(), PREFACE[4..9].to_vec(), PREFACE[9..].to_vec()];
+        let chunks = vec![
+            PREFACE[..4].to_vec(),
+            PREFACE[4..9].to_vec(),
+            PREFACE[9..].to_vec(),
+        ];
         let stream = ChunkedStream::new(chunks);
 
         let (_prefixed, is_h2) = sniff_protocol(stream, PREFACE).await.unwrap();
@@ -336,7 +351,11 @@ mod tests {
     #[tokio::test]
     async fn preserves_bytes_on_mismatch() {
         let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
-        let chunks = vec![payload[..2].to_vec(), payload[2..8].to_vec(), payload[8..].to_vec()];
+        let chunks = vec![
+            payload[..2].to_vec(),
+            payload[2..8].to_vec(),
+            payload[8..].to_vec(),
+        ];
         let stream = ChunkedStream::new(chunks);
 
         let (prefixed, is_h2) = sniff_protocol(stream, PREFACE).await.unwrap();

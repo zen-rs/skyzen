@@ -32,6 +32,7 @@ fn worker() -> Router {
     build_router()
 }
 
-// Cargo expects a main when building the example as a bin; wasm uses the exported fetch instead.
+// Example-only shim: Cargo examples are binaries.
+// Real serverless apps should use a normal lib crate (`cdylib`) and don't need this.
 #[cfg(target_arch = "wasm32")]
 fn main() {}

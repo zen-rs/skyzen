@@ -1,6 +1,26 @@
 #![deny(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
-//! Base type and trait for HTTP server.
+//! Foundational traits and types for the Skyzen HTTP framework.
+//!
+//! This crate defines the core abstractions that all Skyzen components build upon:
+//!
+//! - [`Extractor`] — Pull typed data from HTTP requests
+//! - [`Responder`] — Convert types into HTTP responses
+//! - [`Server`] — HTTP server backend trait (implemented by `skyzen-hyper`)
+//!
+//! Also re-exports HTTP primitives from `http-kit`: [`Request`], [`Response`],
+//! [`Body`], [`Endpoint`], [`Middleware`], [`StatusCode`], and more.
+//!
+//! # `no_std` Support
+//!
+//! Disable the default `std` feature for `no_std` environments:
+//!
+//! ```toml
+//! skyzen-core = { version = "0.1", default-features = false }
+//! ```
+//!
+//! Most users should use the `skyzen` crate directly rather than depending on
+//! `skyzen-core`.
 
 extern crate alloc;
 #[cfg(feature = "std")]
@@ -15,6 +35,10 @@ mod responder;
 pub use responder::Responder;
 mod server;
 pub use server::Server;
+#[cfg(feature = "std")]
+mod net;
+#[cfg(feature = "std")]
+pub use net::{error_response, MissingRemoteAddr, PeerAddr};
 #[cfg(feature = "openapi")]
 pub mod openapi;
 

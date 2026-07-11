@@ -1,0 +1,13 @@
+[package]
+name = "{{PACKAGE_NAME}}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+skyzen = { version = "0.1", features = ["ws"] }
+skyzen-cloudflare = "0.1"

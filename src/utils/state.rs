@@ -56,3 +56,52 @@ impl<T: Send + Sync + Clone + 'static> Middleware for State<T> {
             .map_err(MiddlewareError::Endpoint)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use http_kit::error::BoxHttpError;
+    use http_kit::HttpError;
+    use skyzen_core::Extractor;
+
+    use super::State;
+    use crate::{Body, Endpoint, Middleware, Request, Response};
+
+    #[derive(Debug)]
+    struct ReadStateEndpoint;
+
+    impl Endpoint for ReadStateEndpoint {
+        type Error = BoxHttpError;
+
+        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+            let State(value) = State::<String>::extract(request)
+                .await
+                .map_err(|error| Box::new(error) as BoxHttpError)?;
+            Ok(Response::new(Body::from(value)))
+        }
+    }
+
+    #[tokio::test]
+    async fn middleware_injects_state_for_downstream_endpoint_and_extractor() {
+        let mut middleware = State("skyzen".to_owned());
+        let mut request = Request::new(Body::empty());
+
+        let response = middleware
+            .handle(&mut request, ReadStateEndpoint)
+            .await
+            .unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "skyzen");
+
+        let extracted = State::<String>::extract(&mut request).await.unwrap();
+        assert_eq!(&*extracted, "skyzen");
+    }
+
+    #[tokio::test]
+    async fn extractor_returns_internal_server_error_when_state_is_missing() {
+        let mut request = Request::new(Body::empty());
+
+        let error = State::<usize>::extract(&mut request).await.unwrap_err();
+
+        assert_eq!(error.status(), crate::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

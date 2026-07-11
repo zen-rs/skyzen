@@ -65,6 +65,7 @@ impl Extractor for Multipart {
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         Some(crate::openapi::ExtractorSchema {
+            location: crate::openapi::ParameterLocation::Body,
             content_type: Some("multipart/form-data"),
             schema: None,
         })

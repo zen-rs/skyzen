@@ -1,0 +1,33 @@
+use serde::{Deserialize, Serialize};
+use skyzen::durable::{DurableObject, WebSocketEvent};
+use skyzen::routing::{CreateRouteNode, Route, Router};
+
+#[derive(Default, Serialize, Deserialize)]
+#[skyzen::durable_object]
+pub struct Room {
+    messages_seen: u64,
+}
+
+impl DurableObject for Room {
+    fn fetch(&mut self) -> Router {
+        Route::new((
+            "/".at(|| async { "room ready" }),
+        ))
+        .build()
+    }
+
+    async fn websocket(
+        &mut self,
+        socket: &skyzen::durable::WebSocketConnection,
+        event: WebSocketEvent,
+        ctx: &skyzen::durable::DurableContext,
+    ) -> Result<(), skyzen::durable::DurableObjectError> {
+        if let WebSocketEvent::Message(message) = event {
+            self.messages_seen += 1;
+            if let Some(text) = message.into_text() {
+                socket.send_text(&format!("echo from room {}: {text}", ctx.id()))?;
+            }
+        }
+        Ok(())
+    }
+}

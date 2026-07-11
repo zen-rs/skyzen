@@ -1,4 +1,4 @@
-//! WebSocket tests for the Skyzen framework.
+//! WebSocket integration tests for the Skyzen Hyper backend.
 
 use async_tungstenite::{
     client_async,

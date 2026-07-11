@@ -2,7 +2,8 @@
 //!
 //! Routes are defined by combining nodes produced by the [`CreateRouteNode`] extension. Path
 //! literals gain builder methods such as `.at(handler)` (GET), `.post(handler)`, `.put(handler)`,
-//! `.delete(handler)`, `.ws(handler)`, and `.route(children)`
+//! `.patch(handler)`, `.delete(handler)`, `.head(handler)`, `.options(handler)`,
+//! `.trace(handler)`, `.ws(handler)`, and `.route(children)`
 //! so you can describe the full tree declaratively. Once a tree is assembled, call [`Route::build`]
 //! to obtain a [`Router`] that can be mounted on a server or invoked directly from tests.
 //!
@@ -59,7 +60,7 @@
 //! };
 //!
 //! let route = Route::new(("/counter".at(|| async { Result::Ok("0") }),))
-//! .middleware(State(0usize));
+//! .with(State(0usize));
 //! ```
 //!
 //! Error handling can also be expressed as middleware. For example, you can catch endpoint errors
@@ -76,7 +77,7 @@
 //! }
 //!
 //! let router = Route::new(("/panic".at(boom),))
-//! .middleware(ErrorHandlingMiddleware::new(|error| async move {
+//! .with(ErrorHandlingMiddleware::new(|error| async move {
 //!     format!("Recovered from {error}")
 //! }))
 //! .build();
@@ -108,7 +109,7 @@
 use std::future::Future;
 use std::{fmt, sync::Arc};
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "ws")]
 use crate::websocket::{WebSocket, WebSocketUpgrade};
@@ -120,7 +121,6 @@ use skyzen_core::{Extractor, Responder};
 /// Type alias for dynamically dispatched endpoints stored in the routing tree.
 pub type BoxEndpoint = AnyEndpoint;
 pub(crate) type EndpointFactory = Arc<dyn Fn() -> BoxEndpoint + Send + Sync>;
-// type SharedMiddleware = Box<dyn Middleware>; // Disabled for now
 
 // Export param types
 mod param;
@@ -181,6 +181,24 @@ impl Route {
         }
     }
 
+    /// Register an alarm handler for Durable Object alarm events.
+    ///
+    /// The handler is an async function with extractors as arguments,
+    /// just like a regular route handler.
+    #[must_use]
+    pub fn on_alarm<H, T, R>(self, handler: H) -> RouteWithAlarm
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        let endpoint = handler::into_endpoint(handler);
+        RouteWithAlarm {
+            route: self,
+            alarm_endpoint: Arc::new(move || AnyEndpoint::new(endpoint.clone())),
+        }
+    }
+
     /// Attach middleware to this route and all nested endpoints.
     #[must_use]
     pub fn middleware<M>(mut self, middleware: M) -> Self
@@ -189,6 +207,17 @@ impl Route {
     {
         self.apply_middleware(middleware);
         self
+    }
+
+    /// Attach middleware to this route and all nested endpoints.
+    ///
+    /// This is an ergonomic alias for [`Route::middleware`].
+    #[must_use]
+    pub fn with<M>(self, middleware: M) -> Self
+    where
+        M: Middleware + Sync + Clone + 'static,
+    {
+        self.middleware(middleware)
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -213,14 +242,14 @@ impl Route {
     /// Generate an [`OpenApi`] document describing this route tree.
     #[must_use]
     pub fn openapi(&self) -> OpenApi {
-        #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
         {
             let mut entries = Vec::new();
             collect_openapi_entries("", &self.nodes, &mut entries);
             OpenApi::from_entries(&entries)
         }
 
-        #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
+        #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
         {
             OpenApi::default()
         }
@@ -230,7 +259,71 @@ impl Route {
     #[must_use]
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.openapi();
-        self.nodes.push(openapi.redoc_route("/api-docs"));
+        self.nodes
+            .push(openapi.redoc_route(openapi::DEFAULT_API_DOCS_MOUNT));
+        self
+    }
+}
+
+/// A [`Route`] with an attached alarm handler.
+///
+/// Created by [`Route::on_alarm`]. Call [`build`](Self::build) to produce a [`Router`].
+pub struct RouteWithAlarm {
+    route: Route,
+    alarm_endpoint: EndpointFactory,
+}
+
+#[allow(clippy::missing_fields_in_debug)]
+impl fmt::Debug for RouteWithAlarm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouteWithAlarm")
+            .field("route", &self.route)
+            .field("has_alarm", &true)
+            .finish()
+    }
+}
+
+impl RouteWithAlarm {
+    /// Attach middleware to this route and all nested endpoints.
+    #[must_use]
+    pub fn middleware<M>(mut self, middleware: M) -> Self
+    where
+        M: Middleware + Sync + Clone + 'static,
+    {
+        self.route.apply_middleware(middleware);
+        self
+    }
+
+    /// Attach middleware to this route and all nested endpoints.
+    ///
+    /// This is an ergonomic alias for [`RouteWithAlarm::middleware`].
+    #[must_use]
+    pub fn with<M>(self, middleware: M) -> Self
+    where
+        M: Middleware + Sync + Clone + 'static,
+    {
+        self.middleware(middleware)
+    }
+
+    /// Build the route, panicking on error.
+    ///
+    /// # Panics
+    /// Panics if the route is invalid.
+    #[must_use]
+    pub fn build(self) -> Router {
+        let alarm_factory = self.alarm_endpoint;
+        let mut router = self.route.build();
+        router.alarm_handler = Some(alarm_factory);
+        router
+    }
+
+    /// Enable the Redoc API documentation endpoint at `/api-docs`.
+    #[must_use]
+    pub fn enable_api_doc(mut self) -> Self {
+        let openapi = self.route.openapi();
+        self.route
+            .nodes
+            .push(openapi.redoc_route(openapi::DEFAULT_API_DOCS_MOUNT));
         self
     }
 }
@@ -329,6 +422,17 @@ impl RouteNode {
         self.with_handler(Method::POST, handler)
     }
 
+    /// Attach a PATCH handler to the current route node.
+    #[must_use]
+    pub fn patch<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::PATCH, handler)
+    }
+
     /// Attach a PUT handler to the current route node.
     #[must_use]
     pub fn put<H, T, R>(self, handler: H) -> Self
@@ -349,6 +453,39 @@ impl RouteNode {
         R: Responder,
     {
         self.with_handler(Method::DELETE, handler)
+    }
+
+    /// Attach a HEAD handler to the current route node.
+    #[must_use]
+    pub fn head<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::HEAD, handler)
+    }
+
+    /// Attach an OPTIONS handler to the current route node.
+    #[must_use]
+    pub fn options<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::OPTIONS, handler)
+    }
+
+    /// Attach a TRACE handler to the current route node.
+    #[must_use]
+    pub fn trace<H, T, R>(self, handler: H) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        self.with_handler(Method::TRACE, handler)
     }
 
     /// Attach an endpoint under the current path with an arbitrary HTTP method.
@@ -496,7 +633,7 @@ where
     RouteNode::new_endpoint(path.into(), method, endpoint, Some(handler_doc))
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 fn collect_openapi_entries(
     path_prefix: &str,
     nodes: &[RouteNode],
@@ -545,6 +682,13 @@ pub trait CreateRouteNode: Sized {
         T: Extractor,
         R: Responder;
 
+    /// Attach a PATCH handler to the path.
+    fn patch<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
+
     /// Attach a PUT handler to the path.
     fn put<H, T, R>(self, handler: H) -> RouteNode
     where
@@ -554,6 +698,27 @@ pub trait CreateRouteNode: Sized {
 
     /// Attach a DELETE handler to the path.
     fn delete<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
+
+    /// Attach a HEAD handler to the path.
+    fn head<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
+
+    /// Attach an OPTIONS handler to the path.
+    fn options<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder;
+
+    /// Attach a TRACE handler to the path.
+    fn trace<H, T, R>(self, handler: H) -> RouteNode
     where
         H: Handler<T, R>,
         T: Extractor,
@@ -607,6 +772,15 @@ where
         endpoint_node_from_handler(self, Method::POST, handler)
     }
 
+    fn patch<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::PATCH, handler)
+    }
+
     fn put<H, T, R>(self, handler: H) -> RouteNode
     where
         H: Handler<T, R>,
@@ -625,6 +799,33 @@ where
         endpoint_node_from_handler(self, Method::DELETE, handler)
     }
 
+    fn head<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::HEAD, handler)
+    }
+
+    fn options<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::OPTIONS, handler)
+    }
+
+    fn trace<H, T, R>(self, handler: H) -> RouteNode
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        endpoint_node_from_handler(self, Method::TRACE, handler)
+    }
+
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
     where
         E: Endpoint + Clone + Send + Sync + 'static,
@@ -636,15 +837,3 @@ where
         RouteNode::new_route(self.into(), Route::new(routes))
     }
 }
-
-// Disabled the Node trait for now since middleware system needs redesign
-// pub trait Node {
-//     fn apply_middleware(
-//         self,
-//         middleware: impl Middleware + 'static,
-//     ) -> impl Node;
-
-//     fn into_endpoints(self) -> Vec<EndpointNode<AnyEndpoint>>;
-// }
-
-// Remove the generic Node implementation for now since we have concrete types

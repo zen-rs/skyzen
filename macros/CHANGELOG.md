@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/zen-rs/skyzen/compare/macros-v0.1.0...macros-v0.1.1) - 2026-07-10
+
+### Other
+
+- Merge branch 'main' into dev
+- Centralize peer addr and improve error handling
+- Add Cloudflare helpers and bump WASM deps
+- Improve test helpers and error handling
+- fix lints
+- Add skyzen-cloudflare-admin crate with reusable control-plane primitives
+- Improve framework test coverage
+- Complete Form extractor, skyzen::test, and OpenAPI alignment
+- Expose wasm env in durable object requests
+- Refactor database API around sqlx-style Db
+- Implement portable serverless services and CLI workflow
+- Add per-crate README, docs, and examples
+- Switch native runtime to smol and update deps
+- Refactor CLI and Cloudflare provider, add helpers
+- Add Cloudflare DB support and datasource sugar
+
 ## [0.1.0](https://github.com/zen-rs/skyzen/releases/tag/macros-v0.1.0) - 2025-12-09
 
 ### Added

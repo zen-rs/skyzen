@@ -50,3 +50,31 @@ macro_rules! impl_deref {
         }
     };
 }
+
+/// Embed a directory at compile time for use with [`EmbeddedStaticDir`].
+///
+/// This wraps [`include_dir::include_dir!`] so downstream crates don't need
+/// `include_dir` in their own `Cargo.toml`.
+///
+/// Example: `skyzen::embed_dir!("$CARGO_MANIFEST_DIR/web-ui/dist")`.
+#[macro_export]
+macro_rules! embed_dir {
+    ($path:tt) => {{
+        use $crate::include_dir;
+        include_dir::include_dir!($path)
+    }};
+}
+
+/// Implement empty `OpenAPI` schema for a type without requiring `utoipa` in downstream crates.
+#[macro_export]
+macro_rules! ignore_openapi {
+    ($ty:ty) => {
+        impl $crate::PartialSchema for $ty {
+            fn schema() -> $crate::openapi::SchemaRef {
+                <$crate::openapi::IgnoreOpenApi<$ty> as $crate::PartialSchema>::schema()
+            }
+        }
+
+        impl $crate::ToSchema for $ty {}
+    };
+}

@@ -38,15 +38,16 @@ impl<T: Send + Sync + Serialize + 'static> Responder for Json<T> {
         Some(vec![crate::openapi::ResponseSchema {
             status: None,
             description: None,
-            schema: None,
+            schema: crate::openapi::maybe_schema_of::<T>(),
             content_type: Some("application/json"),
         }])
     }
 
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(
-        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
+        crate::openapi::maybe_register_schema_for::<T>(defs);
     }
 }
 
@@ -78,26 +79,27 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
             return Err(JsonContentTypeError::Missing);
         }
 
-        let value = request
-            .body_mut()
-            .into_json()
-            .await
-            .map_err(|_| JsonContentTypeError::InvalidPayload)?;
+        let value = request.body_mut().into_json().await.map_err(|error| {
+            tracing::debug!(%error, "failed to deserialize JSON request body");
+            JsonContentTypeError::InvalidPayload
+        })?;
         Ok(Self(value))
     }
 
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         Some(crate::openapi::ExtractorSchema {
+            location: crate::openapi::ParameterLocation::Body,
             content_type: Some("application/json"),
-            schema: None,
+            schema: crate::openapi::maybe_schema_of::<T>(),
         })
     }
 
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(
-        _defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
+        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
+        crate::openapi::maybe_register_schema_for::<T>(defs);
     }
 }
 
@@ -106,8 +108,7 @@ fn is_json_content_type(value: &HeaderValue) -> bool {
         .to_str()
         .ok()
         .and_then(|raw| raw.split(';').next())
-        .map(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
-        .unwrap_or(false)
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
 }
 
 #[cfg(test)]
@@ -162,44 +163,4 @@ mod test {
         let error = Json::<Payload>::extract(&mut request).await.unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
     }
-
-    /* use super::Json;
-    use http_kit::Request;
-    use serde::{Deserialize, Serialize};
-    #[derive(Debug, Serialize, Deserialize)]
-    struct Lexo {
-        firstname: String,
-        age: u8,
-    }
-
-    #[test]
-    fn serialize() {
-        async fn handler() -> Json<Lexo> {
-            Json(Lexo {
-                firstname: "Lexo".to_string(),
-                age: 17,
-            })
-        }
-
-        test_handler!(handler, r#"{"firstname":"Lexo","age":17}"#.to_string());
-    }
-
-    #[test]
-    fn deserialize() {
-        async fn handler(Json(lexo): Json<Lexo>) -> String {
-            let firstname = lexo.firstname;
-            format!("Hello,{firstname}!")
-        }
-
-        test_handler!(
-            handler,
-            "Hello,Lexo!",
-            request = Request::post("http://localhost:8080/")
-                .json(Lexo {
-                    firstname: "Lexo".to_string(),
-                    age: 17
-                })
-                .unwrap()
-        );
-    }*/
 }

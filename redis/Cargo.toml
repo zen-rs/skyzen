@@ -1,0 +1,23 @@
+[package]
+name = "skyzen-redis"
+version = "0.1.0"
+edition = "2021"
+description = "Redis implementation of KeyValueStore for the Skyzen framework"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "README.md"
+keywords = ["redis", "key-value", "skyzen", "services"]
+categories = ["web-programming::http-server", "database"]
+
+[dependencies]
+skyzen-services = { path = "../services" }
+redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "smol-comp"] }
+
+[features]
+default = ["runtime-tokio"]
+# User selects async runtime in their application
+runtime-tokio = ["redis/tokio-comp"]
+runtime-smol = ["redis/smol-comp"]
+
+[lints]
+workspace = true

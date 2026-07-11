@@ -1,6 +1,6 @@
 # Examples
 
-The `examples` directory demonstrates how to target both native and wasm runtimes with the same Skyzen APIs. Run them from the repository root.
+The `examples` directory demonstrates how to target both native and WASM runtimes with the same Skyzen APIs. Run them from the repository root.
 
 ## `native.rs`
 
@@ -10,7 +10,7 @@ Features:
 - Uses the `Query` extractor and `Params` to parse query strings and path parameters.
 - Returns strongly typed JSON via the `Json<T>` responder.
 
-Run locally (defaults to `127.0.0.1:8787`, override with CLI flags such as `--port 3000`):
+Run locally. Skyzen binds an available localhost port by default and logs it, or you can pin one with CLI flags such as `--port 3000`:
 
 ```sh
 cargo run --example native -- --port 3000
@@ -25,21 +25,27 @@ Features:
 - Single `#[skyzen::main]` entry that compiles to both native binaries and WinterCG `fetch` handlers.
 - Simple text routes you can interrogate via `curl` or Cloudflare Worker previews.
 
+Note: this file is an `example` target, so Cargo treats it as a binary.
+For real serverless deployment, prefer a normal `lib` crate with:
+
+```toml
+[lib]
+crate-type = ["cdylib", "rlib"]
+```
+
 Run natively (helpful during development because you get logging, CLI overrides, and Ctrl+C handling automatically):
 
 ```sh
 cargo run --example worker
 ```
 
-Build for wasm32 targets and upload to Cloudflare Workers:
+For real Cloudflare local simulation or deployment, prefer a normal project with `Skyzen.toml`.
+Skyzen CLI will build the wasm target, generate bindings, write the Worker shim, and then call Wrangler for you:
 
 ```sh
-rustup target add wasm32-unknown-unknown
-cargo build --example worker --target wasm32-unknown-unknown --release
-wasm-bindgen --target web target/wasm32-unknown-unknown/release/examples/worker.wasm --out-dir worker-dist
+skyzen dev --provider cloudflare
+skyzen deploy --provider cloudflare
 ```
-
-Deploy the generated artifacts with `wrangler publish worker-dist/worker.js` (create `worker.js` that imports the wasm bundle and forwards `fetch` to it).
 
 ## `openapi.rs`
 
@@ -47,10 +53,60 @@ Features:
 
 - Demonstrates `#[skyzen::openapi]` for handlers along with typed `Json<T>` extractors/responders.
 - Shows how to build a `Router`, call `.openapi()`, and inspect the collected operations.
-- Prints schemas and doc comments when compiled in debug mode (release builds disable OpenAPI instrumentation and log an explicit message).
+- Prints schemas and doc comments from the generated `OpenAPI` description.
 
 Run it locally:
 
 ```sh
 cargo run --example openapi
+```
+
+## `openapi_full.rs`
+
+Features:
+
+- Extended OpenAPI example with multiple annotated handlers.
+- Demonstrates `enable_api_doc()` to serve ReDoc documentation at `/api-docs`.
+- Shows typed request/response schemas with `#[skyzen::openapi]`.
+
+```sh
+cargo run --example openapi_full
+```
+
+## `websocket_echo.rs`
+
+Features:
+
+- Unified WebSocket API that works on both native and WASM targets.
+- Demonstrates text, JSON (`recv_json`/`send`), and binary message handling.
+- Uses the `.ws()` route convenience method.
+
+```sh
+cargo run --example websocket_echo
+```
+
+## `embed_hyper.rs`
+
+Features:
+
+- Demonstrates embedding Skyzen into a custom runtime without the `#[skyzen::main]` macro.
+- Uses `smol` as the async runtime instead of Tokio.
+- Shows direct use of `Hyper.serve()` with a custom executor and TCP listener.
+
+Requires the `hyper` feature:
+
+```sh
+cargo run --example embed_hyper
+```
+
+## `services.rs`
+
+Features:
+
+- Demonstrates portable service abstractions with `Kv` and `Storage` as handler extractors.
+- Uses `InMemoryKv` and `InMemoryStorage` for local development.
+- Shows how to swap to Redis/S3 with a one-line change (commented examples in code).
+
+```sh
+cargo run --example services
 ```

@@ -89,17 +89,18 @@ pub enum WebSocketUpgradeError {
     /// The `OnUpgrade` extension is missing.
     #[error("Missing OnUpgrade extension", status = StatusCode::UPGRADE_REQUIRED)]
     MissingOnUpgrade,
+
+    /// The async executor was not injected by the HTTP backend, so the upgrade cannot be driven.
+    #[error("WebSocket runtime executor is unavailable", status = StatusCode::INTERNAL_SERVER_ERROR)]
+    MissingExecutor,
 }
 
 fn header_has_token(value: &header::HeaderValue, token: &str) -> bool {
-    value
-        .to_str()
-        .map(|value| {
-            value
-                .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case(token))
-        })
-        .unwrap_or(false)
+    value.to_str().is_ok_and(|value| {
+        value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case(token))
+    })
 }
 
 fn parse_protocols(value: Option<&header::HeaderValue>) -> Vec<String> {
@@ -270,7 +271,7 @@ impl WebSocket {
     /// # struct MyData { value: i32 }
     /// # async fn example(mut socket: WebSocket) {
     /// while let Some(Ok(data)) = socket.recv_json::<MyData>().await {
-    ///     println!("Received: {}", data.value);
+    ///     tracing::info!(value = data.value, "received");
     /// }
     /// # }
     /// ```
@@ -340,7 +341,7 @@ impl Stream for WebSocket {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(Ok(to_websocket_msg(message)))),
+            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(to_websocket_msg(message))),
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -574,7 +575,7 @@ impl Stream for WebSocketReceiver {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(Ok(to_websocket_msg(message)))),
+            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(to_websocket_msg(message))),
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -685,8 +686,7 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
 
         if !upgrade_header
             .to_str()
-            .map(|value| value.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false)
+            .is_ok_and(|value| value.eq_ignore_ascii_case("websocket"))
         {
             return Err(WebSocketUpgradeError::InvalidUpgradeHeader);
         }
@@ -781,11 +781,13 @@ impl Responder for WebSocketUpgradeResponder {
         if let Some(callback) = self.callback.take() {
             let on_upgrade = self.upgrade.on_upgrade.clone();
             let config = self.upgrade.config.clone();
+            // Fail closed if the backend never injected an executor, rather than panicking on the
+            // request path.
             let executor = self
                 .upgrade
                 .executor
                 .take()
-                .expect("Executor must be set by the HTTP backend");
+                .ok_or(WebSocketUpgradeError::MissingExecutor)?;
 
             executor
                 .spawn(async move {
@@ -838,16 +840,18 @@ fn to_tungstenite_msg(message: WebSocketMessage) -> TungsteniteMessage {
     }
 }
 
-fn to_websocket_msg(message: TungsteniteMessage) -> WebSocketMessage {
+fn to_websocket_msg(message: TungsteniteMessage) -> WebSocketResult<WebSocketMessage> {
     match message {
-        TungsteniteMessage::Text(text) => {
-            WebSocketMessage::Text(unsafe { ByteStr::from_utf8_unchecked(Bytes::from(text)) })
-        }
-        TungsteniteMessage::Binary(bytes) => WebSocketMessage::Binary(bytes),
-        TungsteniteMessage::Ping(bytes) => WebSocketMessage::Ping(bytes),
-        TungsteniteMessage::Pong(bytes) => WebSocketMessage::Pong(bytes),
-        TungsteniteMessage::Close(_) => WebSocketMessage::Close,
-        TungsteniteMessage::Frame(_) => unimplemented!(),
+        TungsteniteMessage::Text(text) => Ok(WebSocketMessage::Text(unsafe {
+            ByteStr::from_utf8_unchecked(Bytes::from(text))
+        })),
+        TungsteniteMessage::Binary(bytes) => Ok(WebSocketMessage::Binary(bytes)),
+        TungsteniteMessage::Ping(bytes) => Ok(WebSocketMessage::Ping(bytes)),
+        TungsteniteMessage::Pong(bytes) => Ok(WebSocketMessage::Pong(bytes)),
+        TungsteniteMessage::Close(_) => Ok(WebSocketMessage::Close),
+        TungsteniteMessage::Frame(_) => Err(WebSocketError::Protocol(
+            "raw websocket frames are not supported".to_string(),
+        )),
     }
 }
 
@@ -872,6 +876,7 @@ impl From<TungsteniteCloseFrame> for WebSocketCloseFrame {
 fn to_tungstenite_config(config: &WebSocketConfig) -> TungsteniteConfig {
     let mut cfg = TungsteniteConfig::default();
     cfg.max_message_size = config.max_message_size;
+    cfg.max_frame_size = config.max_frame_size;
     cfg
 }
 
@@ -1032,6 +1037,16 @@ mod tests {
         assert!(upgrade.config.max_message_size.is_none());
         let upgraded_again = upgrade.max_message_size(Some(512));
         assert_eq!(upgraded_again.config.max_message_size, Some(512));
+    }
+
+    #[test]
+    fn frame_messages_surface_protocol_error() {
+        use async_tungstenite::tungstenite::protocol::frame::Frame;
+
+        let frame = Frame::ping(Vec::new());
+        let err = to_websocket_msg(TungsteniteMessage::Frame(frame))
+            .expect_err("frame messages are not supported");
+        assert!(matches!(err, WebSocketError::Protocol(_)));
     }
 
     // NOTE: Direct WebSocket tests have been moved to hyper/tests/websocket.rs

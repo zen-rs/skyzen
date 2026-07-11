@@ -30,6 +30,13 @@ pub enum WebSocketError {
     Transport(io::Error),
     /// Protocol-level failure.
     Protocol(String),
+    /// An outbound message exceeds the configured maximum message size.
+    MessageTooLarge {
+        /// Size of the rejected message, in bytes.
+        len: usize,
+        /// Configured maximum message size, in bytes.
+        limit: usize,
+    },
 }
 
 impl From<io::Error> for WebSocketError {
@@ -43,6 +50,10 @@ impl fmt::Display for WebSocketError {
         match self {
             Self::Transport(err) => write!(f, "transport error: {err}"),
             Self::Protocol(err) => write!(f, "protocol error: {err}"),
+            Self::MessageTooLarge { len, limit } => write!(
+                f,
+                "message of {len} bytes exceeds the configured maximum of {limit} bytes"
+            ),
         }
     }
 }

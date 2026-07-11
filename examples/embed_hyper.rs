@@ -39,6 +39,7 @@
 //! Run with: `cargo run --example embed_hyper`
 
 use async_net::TcpListener;
+use executor_core::smol::SmolGlobal;
 use futures_lite::stream;
 use serde::Serialize;
 use skyzen::{
@@ -105,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Serve using the Hyper backend with smol's executor
         Hyper
             .serve(
-                smol::Executor::new(),
+                SmolGlobal,
                 |err| eprintln!("Connection error: {err}"),
                 connections,
                 router,

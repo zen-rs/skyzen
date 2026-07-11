@@ -5,7 +5,8 @@
 //! - ✅ WASM (WinterCG): WebSocket support via `WebSocketPair` API
 //!
 //! **Platform Differences:**
-//! - WASM: 1 MiB message size limit (platform imposed)
+//! - WASM: outbound message size is enforced from `WebSocketConfig::max_message_size`; the host
+//!   runtime may also impose its own cap (e.g. Cloudflare Workers limits messages to 1 MiB)
 //! - WASM: No custom ping/pong frame control
 //! - WASM: Event-driven model vs native stream model
 //!
@@ -112,7 +113,7 @@
 mod types;
 
 #[cfg(target_arch = "wasm32")]
-mod ffi;
+pub(crate) mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(target_arch = "wasm32")]

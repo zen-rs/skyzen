@@ -5,7 +5,7 @@ use std::{
 };
 
 use super::{BoxEndpoint, EndpointFactory, Params, Route, RouteNode, RouteNodeType};
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 use crate::openapi::RouteOpenApiEntry;
 use crate::{openapi::OpenApi, Endpoint, Method, Request, Response, StatusCode};
 
@@ -13,12 +13,11 @@ use http_kit::error::BoxHttpError;
 use http_kit::http_error;
 use matchit::Match;
 use skyzen_core::Extractor;
-use tracing::{error, info};
+use tracing::info;
 
 // The entrance of request,composing of endpoint
 pub struct App {
     endpoint_factory: EndpointFactory,
-    // middlewares: SmallVec<[SharedMiddleware; 5]>, // Simplified for now
 }
 
 impl Debug for App {
@@ -57,7 +56,9 @@ impl App {
 pub struct Router {
     inner: Arc<matchit::Router<Vec<(Method, App)>>>,
     already_router_enabled: bool,
-    #[cfg(all(debug_assertions, feature = "openapi"))]
+    /// Optional alarm handler for Durable Object alarm events.
+    pub(crate) alarm_handler: Option<EndpointFactory>,
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
 }
 
@@ -66,8 +67,9 @@ impl Debug for Router {
         let mut debug_struct = f.debug_struct("Router");
         debug_struct
             .field("inner", &self.inner)
-            .field("already_router_enabled", &self.already_router_enabled);
-        #[cfg(all(debug_assertions, feature = "openapi"))]
+            .field("already_router_enabled", &self.already_router_enabled)
+            .field("has_alarm_handler", &self.alarm_handler.is_some());
+        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
         {
             debug_struct.field("openapi_entries", &self.openapi_entries.len());
         }
@@ -156,15 +158,21 @@ impl Router {
     /// Build an [`OpenApi`] definition containing every route registered on this router.
     #[must_use]
     pub fn openapi(&self) -> OpenApi {
-        #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
         {
             OpenApi::from_entries(&self.openapi_entries)
         }
 
-        #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
+        #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
         {
             OpenApi::default()
         }
+    }
+
+    /// Create a fresh alarm endpoint, if one was registered via [`Route::on_alarm`].
+    #[must_use]
+    pub fn alarm_endpoint(&self) -> Option<BoxEndpoint> {
+        self.alarm_handler.as_ref().map(|factory| factory())
     }
 }
 
@@ -205,7 +213,7 @@ impl From<matchit::InsertError> for RouteBuildError {
 
 type FlattenBuf = HashMap<String, Vec<(Method, App)>>;
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 fn flatten(
     path_prefix: &str,
     route: Vec<RouteNode>,
@@ -223,7 +231,6 @@ fn flatten(
                 endpoint_factory,
                 method,
                 openapi,
-                // middlewares, // Disabled for now
             } => {
                 let entry = buf.entry(path.clone()).or_default();
 
@@ -236,7 +243,7 @@ fn flatten(
     }
 }
 
-#[cfg(not(all(debug_assertions, feature = "openapi")))]
+#[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
 fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
     for node in route {
         let path = format!("{}{}", path_prefix, node.path);
@@ -249,7 +256,6 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
                 endpoint_factory,
                 method,
                 openapi: _,
-                // middlewares, // Disabled for now
             } => {
                 let entry = buf.entry(path).or_default();
                 entry.push((method, App::new(endpoint_factory)));
@@ -264,7 +270,7 @@ fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
 ///
 /// Returns [`RouteBuildError`] if the route tree contains conflicting method registrations or if
 /// the underlying path matcher rejects the route definition.
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     let mut openapi_entries = Vec::new();
@@ -278,14 +284,14 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
 ///
 /// Returns [`RouteBuildError`] if the route tree contains conflicting method registrations or if
 /// the underlying path matcher rejects the route definition.
-#[cfg(not(all(debug_assertions, feature = "openapi")))]
+#[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     flatten("", route.nodes, &mut buf);
     finalize_router(buf, None)
 }
 
-#[cfg(all(debug_assertions, feature = "openapi"))]
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 fn finalize_router(
     buf: HashMap<String, Vec<(Method, App)>>,
     openapi_entries: Option<Vec<RouteOpenApiEntry>>,
@@ -306,11 +312,12 @@ fn finalize_router(
     Ok(Router {
         inner: Arc::new(router),
         already_router_enabled: false,
+        alarm_handler: None,
         openapi_entries: Arc::new(openapi_entries.unwrap_or_default()),
     })
 }
 
-#[cfg(not(all(debug_assertions, feature = "openapi")))]
+#[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
 fn finalize_router(
     buf: HashMap<String, Vec<(Method, App)>>,
     _openapi_entries: Option<Vec<()>>,
@@ -331,6 +338,7 @@ fn finalize_router(
     Ok(Router {
         inner: Arc::new(router),
         already_router_enabled: false,
+        alarm_handler: None,
     })
 }
 
@@ -342,24 +350,8 @@ impl Endpoint for Router {
             path = request.uri().path(),
             "request received"
         );
-        Ok(self.call(request).await.unwrap_or_else(|error| {
-            let mut response = Response::new(http_kit::Body::empty());
-            let status = error.status();
-            *response.status_mut() = status;
-            let error_name = if status.is_server_error() {
-                "Server Error"
-            } else if status.is_client_error() {
-                "Client Error"
-            } else {
-                "Error"
-            };
-            error!(
-                message = error.to_string().as_str(),
-                status = status.as_str(),
-                "{error_name}"
-            );
-            response
-        }))
+        // Propagate errors to let middleware or runtime handle them
+        self.call(request).await
     }
 }
 
@@ -371,8 +363,10 @@ mod tests {
         middleware::ErrorHandlingMiddleware,
         middleware::Middleware,
         routing::{CreateRouteNode, Params, Route},
-        Body, Error, Method, Response, Result, StatusCode,
+        utils::{Form, Json},
+        Body, Error, Method, Response, Result, StatusCode, ToSchema,
     };
+    use serde::{Deserialize, Serialize};
 
     fn get_request(path: &str) -> http_kit::Request {
         request_with_method(path, Method::GET)
@@ -445,6 +439,21 @@ mod tests {
     async fn applies_route_middleware_to_endpoints() {
         let route =
             Route::new(("/ping".at(|| async { Result::Ok("pong") }),)).middleware(HeaderMiddleware);
+
+        let router = build(route).unwrap();
+        let request = get_request("/ping");
+        let response = router.clone().go(request).await.unwrap();
+        let header = response
+            .headers()
+            .get("x-middleware")
+            .expect("header missing");
+        assert_eq!(header.to_str().unwrap(), "applied");
+    }
+
+    #[tokio::test]
+    async fn with_alias_applies_route_middleware_to_endpoints() {
+        let route =
+            Route::new(("/ping".at(|| async { Result::Ok("pong") }),)).with(HeaderMiddleware);
 
         let router = build(route).unwrap();
         let request = get_request("/ping");
@@ -533,6 +542,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routes_extended_http_method_builders() {
+        let router = build(Route::new((
+            "/items".patch(|| async { Result::Ok("patched") }),
+            "/items".head(|| async { Result::Ok("") }),
+            "/items".options(|| async { Result::Ok("options") }),
+            "/items".trace(|| async { Result::Ok("trace") }),
+        )))
+        .unwrap();
+
+        for (method, expected) in [
+            (Method::PATCH, "patched"),
+            (Method::HEAD, ""),
+            (Method::OPTIONS, "options"),
+            (Method::TRACE, "trace"),
+        ] {
+            let request = request_with_method("/items", method);
+            let response = router.clone().go(request).await.unwrap();
+            let body = response.into_body().into_string().await.unwrap();
+            assert_eq!(body, expected);
+        }
+    }
+
+    #[tokio::test]
     async fn exposes_api_docs_at_root() {
         async fn ping() -> Result<&'static str> {
             Ok("pong")
@@ -584,5 +616,134 @@ mod tests {
         let response = router.clone().go(request).await;
         let error = response.unwrap_err();
         assert_eq!(error.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    struct CreateWidget {
+        name: String,
+    }
+
+    #[derive(Debug, Serialize, ToSchema)]
+    struct Widget {
+        id: String,
+        name: String,
+    }
+
+    #[skyzen::openapi]
+    async fn create_widget(Json(body): Json<CreateWidget>) -> Result<Json<Widget>> {
+        Ok(Json(Widget {
+            id: "widget-1".into(),
+            name: body.name,
+        }))
+    }
+
+    #[test]
+    fn openapi_collects_typed_request_and_response_schemas() {
+        let openapi = Route::new(("/widgets".post(create_widget),)).openapi();
+        assert!(openapi.is_enabled());
+
+        let operation = openapi
+            .operations()
+            .iter()
+            .find(|operation| operation.path == "/widgets" && operation.method == Method::POST)
+            .expect("expected POST /widgets operation");
+
+        assert!(
+            operation
+                .parameters
+                .iter()
+                .any(|parameter| parameter.schema.schema.is_some()),
+            "expected documented request schema"
+        );
+        assert!(
+            operation
+                .responses
+                .iter()
+                .any(|response| response.schema.is_some()),
+            "expected documented response schema"
+        );
+    }
+
+    #[derive(Debug, Deserialize, Serialize, ToSchema)]
+    struct LoginFormPayload {
+        user: String,
+        remember: bool,
+    }
+
+    #[skyzen::openapi]
+    async fn submit_form(Form(body): Form<LoginFormPayload>) -> Result<Form<LoginFormPayload>> {
+        Ok(Form(body))
+    }
+
+    #[test]
+    fn openapi_collects_typed_form_request_and_response_schemas() {
+        let openapi = Route::new(("/login".post(submit_form),)).openapi();
+        assert!(openapi.is_enabled());
+
+        let operation = openapi
+            .operations()
+            .iter()
+            .find(|operation| operation.path == "/login" && operation.method == Method::POST)
+            .expect("expected POST /login operation");
+
+        assert!(
+            operation.parameters.iter().any(|parameter| {
+                parameter.schema.content_type == Some("application/x-www-form-urlencoded")
+                    && parameter.schema.schema.is_some()
+            }),
+            "expected documented form request schema"
+        );
+        assert!(
+            operation.responses.iter().any(|response| {
+                response.content_type == Some("application/x-www-form-urlencoded")
+                    && response.schema.is_some()
+            }),
+            "expected documented form response schema"
+        );
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    struct ListParams {
+        page: u32,
+        tag: Option<String>,
+    }
+
+    #[skyzen::openapi]
+    async fn list_items(
+        query: crate::extract::Query<ListParams>,
+        _params: Params,
+    ) -> Result<String> {
+        Ok(format!("page {} tag {:?}", query.0.page, query.0.tag))
+    }
+
+    #[test]
+    fn openapi_emits_query_and_path_parameters_not_request_body() {
+        let spec = Route::new(("/items/{id}".at(list_items),))
+            .openapi()
+            .to_utoipa_spec();
+        let json = serde_json::to_value(&spec).expect("serialize spec");
+        let operation = &json["paths"]["/items/{id}"]["get"];
+
+        let parameters = operation["parameters"]
+            .as_array()
+            .expect("operation should declare parameters");
+        let find = |name: &str| parameters.iter().find(|param| param["name"] == name);
+
+        let id_param = find("id").expect("path parameter `id`");
+        assert_eq!(id_param["in"], "path");
+        assert_eq!(id_param["required"], true);
+
+        let page = find("page").expect("query parameter `page`");
+        assert_eq!(page["in"], "query");
+        assert_eq!(page["required"], true);
+
+        let tag = find("tag").expect("query parameter `tag`");
+        assert_eq!(tag["in"], "query");
+        assert_eq!(tag["required"], false);
+
+        assert!(
+            operation["requestBody"].is_null(),
+            "a GET with query/path params must not declare a request body"
+        );
     }
 }
