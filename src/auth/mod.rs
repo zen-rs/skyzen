@@ -5,6 +5,20 @@
 //! - [`guard`]: Role-based authorization guards for protecting routes
 //! - [`jwt`]: JWT token verification and authentication (requires `jwt` feature, native only)
 //!
+//! # Platform support
+//!
+//! The [`jwt`] module is **native-only**: it is compiled out on `wasm32` targets because its
+//! backing crate (`jsonwebtoken` with the `aws_lc_rs` crypto provider) does not build for
+//! WebAssembly. Neither `JwtAuthenticator` nor `JwtConfig` exist when targeting the edge.
+//!
+//! On Cloudflare Workers (and other WinterCG runtimes), verify JWTs with one of:
+//!
+//! - The platform's built-in access controls (e.g. Cloudflare Access / API Shield), which
+//!   validate tokens before the request reaches your Worker.
+//! - A wasm-compatible JWT crate compiled into your application, wired into your own
+//!   middleware alongside the role guards from [`guard`] (which are fully portable).
+//! - The runtime's WebCrypto API (`crypto.subtle`) via `js-sys`/`web-sys` bindings.
+//!
 //! # Example
 //!
 //! ```rust,ignore
