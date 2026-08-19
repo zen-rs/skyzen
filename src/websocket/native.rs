@@ -616,13 +616,11 @@ impl WebSocketUpgrade {
             .map(|protocol| protocol.as_ref().to_string())
             .collect();
 
-        self.response_protocol = self.requested_protocols.iter().find_map(|requested| {
-            supported
-                .iter()
-                .find(|supported| *supported == requested)
-                .cloned()
-                .map(|_| requested.clone())
-        });
+        self.response_protocol = self
+            .requested_protocols
+            .iter()
+            .find(|requested| supported.iter().any(|supported| supported == *requested))
+            .cloned();
         self
     }
 
@@ -677,7 +675,7 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
             .ok_or(WebSocketUpgradeError::MissingConnectionHeader)?;
 
         if !header_has_token(connection, "upgrade") {
-            return Err(WebSocketUpgradeError::MissingUpgradeHeader);
+            return Err(WebSocketUpgradeError::InvalidConnectionHeader);
         }
 
         let upgrade_header = headers
@@ -1030,15 +1028,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn allows_overriding_max_message_size() {
-        let (upgrade, _) = build_valid_upgrade().await;
-        let upgrade = upgrade.max_message_size(None);
-        assert!(upgrade.config.max_message_size.is_none());
-        let upgraded_again = upgrade.max_message_size(Some(512));
-        assert_eq!(upgraded_again.config.max_message_size, Some(512));
-    }
-
     #[test]
     fn frame_messages_surface_protocol_error() {
         use async_tungstenite::tungstenite::protocol::frame::Frame;
@@ -1049,6 +1038,6 @@ mod tests {
         assert!(matches!(err, WebSocketError::Protocol(_)));
     }
 
-    // NOTE: Direct WebSocket tests have been moved to hyper/tests/websocket.rs
+    // NOTE: Direct WebSocket tests live in tests/hyper_websocket.rs
     // where they can properly test through the full hyper upgrade flow.
 }

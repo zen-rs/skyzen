@@ -66,10 +66,17 @@ impl<C: Unpin + AsyncRead> hyper::rt::Read for ConnectionWrapper<C> {
     ) -> Poll<Result<(), std::io::Error>> {
         let inner = &mut self.get_mut().0;
 
-        // SAFETY: `buf.as_mut()` gives a `&mut [MaybeUninit<u8>]` which we cast to `&mut [u8]`
-        // because `AsyncRead` expects initialized memory. We advance the buffer by the number of
-        // bytes written to maintain correctness.
-        let buffer = unsafe { &mut *(ptr::from_mut(buf.as_mut()) as *mut [u8]) };
+        // SAFETY: `buf.as_mut()` gives a `&mut [MaybeUninit<u8>]`. `AsyncRead` expects
+        // initialized memory, so we first zero every slot; only then is viewing the slice as
+        // `&mut [u8]` sound (a cast without initialization would be UB). We advance the buffer
+        // by the number of bytes written to maintain correctness.
+        let buffer = unsafe {
+            let unfilled = buf.as_mut();
+            for byte in unfilled.iter_mut() {
+                byte.write(0);
+            }
+            &mut *(ptr::from_mut(unfilled) as *mut [u8])
+        };
 
         match Pin::new(inner).poll_read(cx, buffer) {
             Poll::Ready(Ok(n)) => {
@@ -370,20 +377,26 @@ where
                             Some(peer)
                         });
                         let endpoint = endpoint.clone();
-                        let (stream, is_h2) = match sniff_protocol(stream, HTTP2_PREFACE).await {
-                            Ok(result) => result,
-                            Err(error) => {
-                                error!("Failed to read connection preface: {error}");
-                                continue;
-                            }
-                        };
+                        let shared_executor = shared_executor.clone();
+                        let hyper_executor = hyper_executor.clone();
 
-                        if is_h2 {
-                            let service =
-                                IntoService::new(endpoint, shared_executor.clone(), peer_addr);
-                            let hyper_executor = hyper_executor.clone();
-                            executor
-                                .spawn(async move {
+                        // Spawn the per-connection task *before* sniffing the protocol preface.
+                        // Awaiting client bytes inline here would let a single idle client stall
+                        // the accept loop for everyone.
+                        executor
+                            .spawn(async move {
+                                let (stream, is_h2) =
+                                    match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
+                                        Ok(result) => result,
+                                        Err(error) => {
+                                            error!("Failed to read connection preface: {error}");
+                                            return;
+                                        }
+                                    };
+
+                                let service =
+                                    IntoService::new(endpoint, shared_executor, peer_addr);
+                                if is_h2 {
                                     let builder = http2::Builder::new(hyper_executor);
                                     if let Err(error) = builder
                                         .serve_connection(ConnectionWrapper(stream), service)
@@ -391,13 +404,7 @@ where
                                     {
                                         error!("Hyper h2 connection error: {error}");
                                     }
-                                })
-                                .detach();
-                        } else {
-                            let service =
-                                IntoService::new(endpoint, shared_executor.clone(), peer_addr);
-                            executor
-                                .spawn(async move {
+                                } else {
                                     let builder = http1::Builder::new();
                                     if let Err(error) = builder
                                         .serve_connection(ConnectionWrapper(stream), service)
@@ -406,9 +413,9 @@ where
                                     {
                                         error!("Hyper h1 connection error: {error}");
                                     }
-                                })
-                                .detach();
-                        }
+                                }
+                            })
+                            .detach();
                     }
                     Some(Err(error)) => error!("Accept error: {error}"),
                     None => break,
@@ -429,6 +436,35 @@ fn server_addr() -> SocketAddr {
                 .unwrap_or_else(|error| panic!("Invalid SKYZEN_ADDRESS value: {error}"))
         },
     )
+}
+
+/// How long a freshly accepted connection may take to send its protocol preface before the
+/// connection is dropped. Prevents idle clients from pinning per-connection tasks forever.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run [`sniff_protocol`] with a handshake timeout so a client that connects but never sends
+/// any bytes cannot hold a connection task open indefinitely.
+async fn sniff_protocol_with_timeout<C>(
+    stream: C,
+    preface: &[u8],
+) -> std::io::Result<(Prefixed<C>, bool)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    use futures_util::future::{select, Either};
+
+    let sniff = sniff_protocol(stream, preface);
+    futures_util::pin_mut!(sniff);
+    let timer = async_io::Timer::after(HANDSHAKE_TIMEOUT);
+    futures_util::pin_mut!(timer);
+
+    match select(sniff, timer).await {
+        Either::Left((result, _)) => result,
+        Either::Right((_deadline, _)) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out waiting for connection preface",
+        )),
+    }
 }
 
 async fn sniff_protocol<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Prefixed<C>, bool)>

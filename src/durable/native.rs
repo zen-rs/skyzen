@@ -50,7 +50,15 @@ impl<T> Clone for NativeDurableNamespace<T> {
 struct NativeDurableNamespaceInner {
     type_name: &'static str,
     next_id: AtomicU64,
-    instances: RwLock<HashMap<String, Arc<Mutex<NativeDurableSlot>>>>,
+    instances: RwLock<HashMap<String, Arc<NativeDurableInstance>>>,
+}
+
+#[derive(Debug)]
+struct NativeDurableInstance {
+    slot: Mutex<NativeDurableSlot>,
+    /// Serializes handler dispatch per object id, upholding the serial-execution promise
+    /// documented on [`DurableObject`].
+    dispatch: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -204,8 +212,8 @@ where
     async fn slot_for(
         &self,
         id: &DurableObjectId,
-    ) -> Result<Arc<Mutex<NativeDurableSlot>>, DurableObjectError> {
-        let existing_slot = {
+    ) -> Result<Arc<NativeDurableInstance>, DurableObjectError> {
+        let existing_instance = {
             self.inner
                 .instances
                 .read()
@@ -213,19 +221,72 @@ where
                 .get(id.as_str())
                 .cloned()
         };
-        if let Some(slot) = existing_slot {
-            return Ok(slot);
+        if let Some(instance) = existing_instance {
+            return Ok(instance);
         }
 
-        let slot = Arc::new(Mutex::new(NativeDurableSlot::new().await?));
-        let slot = {
+        let slot = NativeDurableSlot::new().await?;
+        self.install_alarm_timer(&slot.alarm, id);
+        let instance = Arc::new(NativeDurableInstance {
+            slot: Mutex::new(slot),
+            dispatch: Mutex::new(()),
+        });
+        let instance = {
             let mut instances = self.inner.instances.write().map_err(lock_poisoned)?;
             instances
                 .entry(id.as_str().to_owned())
-                .or_insert_with(|| Arc::clone(&slot))
+                .or_insert_with(|| Arc::clone(&instance))
                 .clone()
         };
-        Ok(slot)
+        Ok(instance)
+    }
+
+    /// Wire the per-object alarm scheduler to a background timer that invokes the object's
+    /// alarm handler when the scheduled time is reached, mirroring platform behavior.
+    fn install_alarm_timer(&self, scheduler: &NativeAlarmScheduler, id: &DurableObjectId) {
+        let weak = Arc::downgrade(&self.inner);
+        let object_id = id.clone();
+        let alarm_state = Arc::clone(&scheduler.alarm);
+        let generation = Arc::clone(&scheduler.generation);
+
+        scheduler.install_fire_handler(Box::new(move |scheduled_time_ms, expected_generation| {
+            let weak = weak.clone();
+            let object_id = object_id.clone();
+            let alarm_state = Arc::clone(&alarm_state);
+            let generation = Arc::clone(&generation);
+
+            std::thread::spawn(move || {
+                let now = current_unix_ms();
+                if scheduled_time_ms > now {
+                    let delta = u64::try_from(scheduled_time_ms - now).unwrap_or(0);
+                    std::thread::sleep(std::time::Duration::from_millis(delta));
+                }
+
+                // A newer `set_alarm`/`delete_alarm` supersedes this timer.
+                if generation.load(Ordering::SeqCst) != expected_generation {
+                    return;
+                }
+                // Clear the stored alarm before dispatch (platform semantics: a fired alarm
+                // no longer shows up via `get_alarm`).
+                {
+                    let Ok(mut stored) = alarm_state.write() else {
+                        return;
+                    };
+                    if stored.take().is_none() {
+                        return;
+                    }
+                }
+
+                let Some(inner) = weak.upgrade() else { return };
+                let namespace = Self {
+                    inner,
+                    marker: PhantomData,
+                };
+                if let Err(error) = smol::block_on(namespace.alarm(&object_id)) {
+                    tracing::error!(%error, "native durable alarm handler failed");
+                }
+            });
+        }));
     }
 
     async fn fetch(
@@ -233,15 +294,16 @@ where
         id: &DurableObjectId,
         mut request: Request,
     ) -> Result<Response, DurableObjectError> {
-        let slot = self.slot_for(id).await?;
+        let instance = self.slot_for(id).await?;
 
-        // Load the struct state and clone the (independently synchronized) service handles while
-        // holding the slot lock, then release it before dispatching. Holding the lock across
-        // `respond().await` would deadlock if a handler re-enters the same Durable Object id. The
-        // shared `DurableKv`/`DurableDb` keep their own locks, so cross-request state stays
-        // consistent; struct-field state under concurrent same-id access is last-writer-wins.
+        // Serialize the whole load → dispatch → save sequence per object id, upholding the
+        // serial-execution model documented on `DurableObject`. Note that a handler which
+        // re-enters the same object id through its own stub will deadlock, mirroring the
+        // platform's serial input semantics.
+        let _dispatch = instance.dispatch.lock().await;
+
         let mut object = {
-            let slot = slot.lock().await;
+            let slot = instance.slot.lock().await;
             inject_durable_extensions(&mut request, &slot, id.clone());
             slot.load_object::<T>()?
         };
@@ -254,15 +316,17 @@ where
             }
         };
 
-        slot.lock().await.save_object(&object)?;
+        instance.slot.lock().await.save_object(&object)?;
         Ok(response)
     }
 
     async fn alarm(&self, id: &DurableObjectId) -> Result<(), DurableObjectError> {
-        let slot = self.slot_for(id).await?;
+        let instance = self.slot_for(id).await?;
 
-        // See `fetch` for why the lock is released before dispatching the alarm handler.
-        let guard = slot.lock().await;
+        // See `fetch`: alarm dispatch participates in the same per-object serialization.
+        let _dispatch = instance.dispatch.lock().await;
+
+        let guard = instance.slot.lock().await;
         let mut object = guard.load_object::<T>()?;
 
         // `fetch()` returns a `Router`, which exposes the alarm handler registered via
@@ -284,7 +348,7 @@ where
             .map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
 
         // Persist any state the alarm handler wrote through the injected services.
-        slot.lock().await.save_object(&object)?;
+        instance.slot.lock().await.save_object(&object)?;
         Ok(())
     }
 }
@@ -423,9 +487,40 @@ impl DurableConnectionsInner for NativeDurableConnections {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// Handler invoked when an alarm is scheduled; receives the scheduled unix time (ms) and the
+/// schedule generation that must still be current when the timer elapses.
+type AlarmFireHandler = Box<dyn Fn(i64, u64) + Send + Sync>;
+
+#[derive(Clone, Default)]
 struct NativeAlarmScheduler {
     alarm: Arc<RwLock<Option<i64>>>,
+    /// Monotonic schedule counter; each `set_alarm`/`delete_alarm` bumps it so an in-flight
+    /// timer can detect it has been superseded or cancelled.
+    generation: Arc<AtomicU64>,
+    fire: Arc<std::sync::OnceLock<AlarmFireHandler>>,
+}
+
+impl std::fmt::Debug for NativeAlarmScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeAlarmScheduler")
+            .field("alarm", &self.alarm)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeAlarmScheduler {
+    fn install_fire_handler(&self, handler: AlarmFireHandler) {
+        // Only the first installation wins; the handler is wired once per object slot.
+        let _ = self.fire.set(handler);
+    }
+}
+
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 impl AlarmScheduler for NativeAlarmScheduler {
@@ -444,6 +539,11 @@ impl AlarmScheduler for NativeAlarmScheduler {
             })?;
             *alarm = Some(scheduled_time_ms);
         }
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Drive the alarm with a background timer so it actually fires in the simulator.
+        if let Some(fire) = self.fire.get() {
+            fire(scheduled_time_ms, generation);
+        }
         Ok(())
     }
 
@@ -454,6 +554,8 @@ impl AlarmScheduler for NativeAlarmScheduler {
             })?;
             *alarm = None;
         }
+        // Invalidate any pending timer.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -657,8 +759,10 @@ mod tests {
         fn fetch(&mut self) -> crate::routing::Router {
             Route::new((
                 "/increment".post(increment),
+                "/slow_increment".post(slow_increment),
                 "/value".at(value),
                 "/alarm_count".at(alarm_count),
+                "/schedule_alarm".post(schedule_alarm),
             ))
             .on_alarm(run_alarm)
             .build()
@@ -694,6 +798,49 @@ mod tests {
         }
 
         Ok(next.to_string())
+    }
+
+    /// Read-modify-write with an await gap in the middle: if two same-id requests ran
+    /// concurrently, both would read the same value and one update would be lost.
+    async fn slow_increment(db: DurableDb) -> Result<String> {
+        db.query("CREATE TABLE IF NOT EXISTS counter (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .map_err(to_error)?;
+
+        let current = db
+            .query("SELECT value FROM counter LIMIT 1")
+            .fetch_optional::<CounterRow>()
+            .await
+            .map_err(to_error)?
+            .map_or(0, |row| row.value);
+
+        async_io::Timer::after(std::time::Duration::from_millis(50)).await;
+
+        let next = current + 1;
+        if current == 0 {
+            db.query("INSERT INTO counter (value) VALUES (?)")
+                .bind(next)
+                .execute()
+                .await
+                .map_err(to_error)?;
+        } else {
+            db.query("UPDATE counter SET value = ?")
+                .bind(next)
+                .execute()
+                .await
+                .map_err(to_error)?;
+        }
+
+        Ok(next.to_string())
+    }
+
+    async fn schedule_alarm(alarm: skyzen_services::durable::Alarm) -> Result<&'static str> {
+        alarm
+            .set_alarm(super::current_unix_ms() + 50)
+            .await
+            .map_err(to_error)?;
+        Ok("scheduled")
     }
 
     async fn value(db: DurableDb) -> Result<String> {
@@ -811,6 +958,51 @@ mod tests {
 
         assert_eq!(response_text(value_a).await, "2");
         assert_eq!(response_text(value_b).await, "1");
+    }
+
+    #[tokio::test]
+    async fn native_durable_namespace_serializes_same_id_dispatch() {
+        let namespace = NativeDurableNamespace::<CounterObject>::new();
+        let stub = namespace.get_by_name("serial").expect("serial object");
+
+        let (first, second) = tokio::join!(
+            stub.fetch(request(Method::POST, "/slow_increment")),
+            stub.fetch(request(Method::POST, "/slow_increment")),
+        );
+        first.expect("first slow increment");
+        second.expect("second slow increment");
+
+        // Without per-object serialization both requests read 0 and the final value is 1.
+        let value = stub
+            .fetch(request(Method::GET, "/value"))
+            .await
+            .expect("value");
+        assert_eq!(response_text(value).await, "2");
+    }
+
+    #[tokio::test]
+    async fn native_alarm_scheduler_fires_scheduled_alarm() {
+        let namespace = NativeDurableNamespace::<CounterObject>::new();
+        let stub = namespace.get_by_name("timer-alarm").expect("alarm object");
+
+        let response = stub
+            .fetch(request(Method::POST, "/schedule_alarm"))
+            .await
+            .expect("schedule alarm");
+        assert_eq!(response_text(response).await, "scheduled");
+
+        // The background timer should invoke the alarm handler shortly after the deadline.
+        for _ in 0..100u32 {
+            async_io::Timer::after(std::time::Duration::from_millis(50)).await;
+            let response = stub
+                .fetch(request(Method::GET, "/alarm_count"))
+                .await
+                .expect("alarm count");
+            if response_text(response).await == "1" {
+                return;
+            }
+        }
+        panic!("scheduled alarm never fired");
     }
 
     #[tokio::test]
