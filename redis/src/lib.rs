@@ -54,6 +54,40 @@ impl Redis {
     }
 }
 
+/// Build a `SCAN MATCH` pattern that matches exactly the keys starting with `prefix`.
+///
+/// Redis glob metacharacters (`*`, `?`, `[`, `]`, `\`) occurring in the prefix
+/// are escaped with a backslash so they match literally.
+fn scan_pattern(prefix: Option<&str>) -> String {
+    prefix.map_or_else(
+        || "*".to_owned(),
+        |p| {
+            let mut pattern = String::with_capacity(p.len() + 1);
+            for c in p.chars() {
+                if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                    pattern.push('\\');
+                }
+                pattern.push(c);
+            }
+            pattern.push('*');
+            pattern
+        },
+    )
+}
+
+/// Convert a TTL duration to whole milliseconds for `PSETEX`/`SET PX`.
+///
+/// Sub-millisecond durations are rounded up to 1 ms. Zero and overflowing
+/// durations are rejected because Redis requires a positive expiry.
+fn ttl_millis(ttl: core::time::Duration) -> Result<u64, KvError> {
+    if ttl.is_zero() {
+        return Err(KvError::Backend("TTL must be greater than zero".to_owned()));
+    }
+    let millis = ttl.as_millis().max(1);
+    u64::try_from(millis)
+        .map_err(|_| KvError::Backend(format!("TTL of {millis} ms exceeds the supported maximum")))
+}
+
 impl KeyValueStore for Redis {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         let mut conn = self.conn.clone();
@@ -69,6 +103,19 @@ impl KeyValueStore for Redis {
             .map_err(|e| KvError::Backend(e.to_string()))
     }
 
+    async fn put_with_ttl(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: core::time::Duration,
+    ) -> Result<(), KvError> {
+        let millis = ttl_millis(ttl)?;
+        let mut conn = self.conn.clone();
+        conn.pset_ex(key, value, millis)
+            .await
+            .map_err(|e| KvError::Backend(e.to_string()))
+    }
+
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         let mut conn = self.conn.clone();
         conn.del(key)
@@ -78,7 +125,7 @@ impl KeyValueStore for Redis {
 
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, KvError> {
         let mut conn = self.conn.clone();
-        let pattern = prefix.map_or_else(|| "*".to_owned(), |p| format!("{p}*"));
+        let pattern = scan_pattern(prefix);
         let mut iter: redis::AsyncIter<String> = conn
             .scan_match(pattern)
             .await
@@ -89,5 +136,50 @@ impl KeyValueStore for Redis {
             keys.push(key.map_err(|e| KvError::Backend(e.to_string()))?);
         }
         Ok(keys)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scan_pattern, ttl_millis};
+    use core::time::Duration;
+
+    #[test]
+    fn scan_pattern_without_prefix_matches_everything() {
+        assert_eq!(scan_pattern(None), "*");
+    }
+
+    #[test]
+    fn scan_pattern_appends_wildcard_to_plain_prefix() {
+        assert_eq!(scan_pattern(Some("user:")), "user:*");
+    }
+
+    #[test]
+    fn scan_pattern_escapes_glob_metacharacters() {
+        assert_eq!(scan_pattern(Some("a*b")), r"a\*b*");
+        assert_eq!(scan_pattern(Some("a?b")), r"a\?b*");
+        assert_eq!(scan_pattern(Some("a[1]b")), r"a\[1\]b*");
+        assert_eq!(scan_pattern(Some(r"a\b")), r"a\\b*");
+        assert_eq!(scan_pattern(Some(r"*?[]\")), r"\*\?\[\]\\*");
+    }
+
+    #[test]
+    fn ttl_millis_rejects_zero() {
+        assert!(ttl_millis(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn ttl_millis_rounds_sub_millisecond_up_to_one() {
+        assert_eq!(ttl_millis(Duration::from_micros(50)).unwrap(), 1);
+    }
+
+    #[test]
+    fn ttl_millis_converts_whole_durations() {
+        assert_eq!(ttl_millis(Duration::from_secs(2)).unwrap(), 2000);
+    }
+
+    #[test]
+    fn ttl_millis_rejects_overflowing_durations() {
+        assert!(ttl_millis(Duration::MAX).is_err());
     }
 }

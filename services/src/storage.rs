@@ -301,7 +301,7 @@ impl Storage {
 mod tests {
     use super::{
         ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError,
-        StorageNotConfigured, StorageObject,
+        StorageObject,
     };
     use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
     use skyzen_core::Extractor;
@@ -470,15 +470,6 @@ mod tests {
 
         let error = Storage::extract(&mut request).await.unwrap_err();
 
-        assert_eq!(
-            error.status(),
-            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn missing_configuration_error_uses_expected_status() {
-        let error = StorageNotConfigured::new();
         assert_eq!(
             error.status(),
             skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
