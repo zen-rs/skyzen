@@ -12,7 +12,9 @@ use flate2::{
     Compression as FlateCompression,
 };
 use http::{
-    header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY},
+    header::{
+        ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING, VARY,
+    },
     HeaderMap, HeaderValue, Method, StatusCode,
 };
 use http_kit::{http_error, middleware::MiddlewareError, Body, Middleware, Request, Response};
@@ -67,12 +69,34 @@ impl CompressionMiddleware {
     }
 
     fn negotiate_encoding(&self, request: &Request) -> Option<CompressionEncoding> {
-        let mut best: Option<Candidate> = None;
+        let supported = &self.config.encodings;
+        // Per RFC 9110 a specific token takes precedence over `*`; the wildcard
+        // only applies to encodings the client did not list explicitly.
+        let mut specific: SmallVec<[Option<(f32, usize)>; 3]> = smallvec![None; supported.len()];
+        let mut wildcard: Option<(f32, usize)> = None;
         let mut position = 0usize;
         for value in &request.headers().get_all(ACCEPT_ENCODING) {
-            if let Ok(raw) = value.to_str() {
-                parse_header_value(raw, &self.config.encodings, &mut position, &mut best);
+            let Ok(raw) = value.to_str() else { continue };
+            parse_header_value(raw, supported, &mut position, &mut specific, &mut wildcard);
+        }
+
+        let mut best: Option<Candidate> = None;
+        for (idx, encoding) in supported.iter().enumerate() {
+            let Some((quality, position)) = specific[idx].or(wildcard) else {
+                continue;
+            };
+            if quality <= 0.0 {
+                continue;
             }
+            consider_candidate(
+                &mut best,
+                Candidate {
+                    encoding: *encoding,
+                    quality,
+                    position,
+                    supported_order: idx,
+                },
+            );
         }
         best.map(|candidate| candidate.encoding)
     }
@@ -92,6 +116,15 @@ impl CompressionMiddleware {
             return false;
         }
 
+        // Streaming bodies of unknown length (e.g. SSE) must not be buffered.
+        if response.body().len().is_none() {
+            return false;
+        }
+
+        if !is_compressible_content_type(response.headers()) {
+            return false;
+        }
+
         !matches!(response.body().is_empty(), Some(true))
     }
 
@@ -107,7 +140,7 @@ impl CompressionMiddleware {
             .map_err(|_| CompressionError::new())?;
 
         if original.len() < self.config.minimum_size {
-            set_content_length(response, original.len())?;
+            set_content_length(response, original.len());
             *response.body_mut() = Body::from_bytes(original);
             return Ok(());
         }
@@ -117,12 +150,12 @@ impl CompressionMiddleware {
             .map_err(|_| CompressionError::new())?;
 
         if compressed.len() >= original.len() {
-            set_content_length(response, original.len())?;
+            set_content_length(response, original.len());
             *response.body_mut() = Body::from_bytes(original);
             return Ok(());
         }
 
-        set_content_length(response, compressed.len())?;
+        set_content_length(response, compressed.len());
         *response.body_mut() = Body::from_bytes(compressed);
         response
             .headers_mut()
@@ -185,11 +218,17 @@ struct Candidate {
     supported_order: usize,
 }
 
+/// Record the qualities announced by one `Accept-Encoding` header value.
+///
+/// Specific tokens land in `specific` (keyed by supported-encoding index) and
+/// `*` lands in `wildcard`; the first occurrence of a token wins. Zero
+/// qualities are recorded too, so an explicit `gzip;q=0` shadows a wildcard.
 fn parse_header_value(
     value: &str,
     supported: &[CompressionEncoding],
     position: &mut usize,
-    best: &mut Option<Candidate>,
+    specific: &mut [Option<(f32, usize)>],
+    wildcard: &mut Option<(f32, usize)>,
 ) {
     for part in value.split(',') {
         let trimmed = part.trim();
@@ -198,10 +237,6 @@ fn parse_header_value(
         }
 
         let (token, quality) = parse_part(trimmed);
-        if quality == 0.0 {
-            continue;
-        }
-
         let current_position = *position;
         *position += 1;
 
@@ -211,33 +246,65 @@ fn parse_header_value(
                     .iter()
                     .position(|candidate| *candidate == encoding)
                 {
-                    consider_candidate(
-                        best,
-                        Candidate {
-                            encoding,
-                            quality,
-                            position: current_position,
-                            supported_order: idx,
-                        },
-                    );
+                    if specific[idx].is_none() {
+                        specific[idx] = Some((quality, current_position));
+                    }
                 }
             }
             ParsedEncoding::Wildcard => {
-                for (idx, encoding) in supported.iter().enumerate() {
-                    consider_candidate(
-                        best,
-                        Candidate {
-                            encoding: *encoding,
-                            quality,
-                            position: current_position,
-                            supported_order: idx,
-                        },
-                    );
+                if wildcard.is_none() {
+                    *wildcard = Some((quality, current_position));
                 }
             }
             ParsedEncoding::Identity | ParsedEncoding::Unsupported => {}
         }
     }
+}
+
+/// Pragmatic skip list of content types that are already compressed.
+fn is_compressible_content_type(headers: &HeaderMap) -> bool {
+    const PRE_COMPRESSED: &[&str] = &[
+        "application/zip",
+        "application/gzip",
+        "application/x-gzip",
+        "application/x-zip-compressed",
+        "application/zstd",
+        "application/br",
+        "application/pdf",
+        "application/x-7z-compressed",
+        "application/x-rar-compressed",
+        "application/x-bzip2",
+        "application/x-xz",
+    ];
+
+    let Some(value) = headers.get(CONTENT_TYPE) else {
+        return true;
+    };
+    let Ok(raw) = value.to_str() else {
+        return true;
+    };
+    let mime = raw.split(';').next().unwrap_or_default().trim();
+
+    if mime.eq_ignore_ascii_case("text/event-stream") {
+        return false;
+    }
+
+    // SVG is XML text and benefits from compression, unlike raster formats.
+    if mime.eq_ignore_ascii_case("image/svg+xml") {
+        return true;
+    }
+
+    let bytes = mime.as_bytes();
+    let has_prefix = |prefix: &[u8]| {
+        bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+    };
+    if has_prefix(b"image/") || has_prefix(b"video/") || has_prefix(b"audio/") {
+        return false;
+    }
+
+    !PRE_COMPRESSED
+        .iter()
+        .any(|candidate| mime.eq_ignore_ascii_case(candidate))
 }
 
 fn consider_candidate(best: &mut Option<Candidate>, candidate: Candidate) {
@@ -311,23 +378,26 @@ enum ParsedEncoding {
 
 impl ParsedEncoding {
     fn from_token(token: &str) -> Self {
-        let normalized = token.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "gzip" | "x-gzip" => Self::Specific(CompressionEncoding::Gzip),
-            "deflate" => Self::Specific(CompressionEncoding::Deflate),
-            "*" => Self::Wildcard,
-            "identity" => Self::Identity,
-            _ => Self::Unsupported,
+        let token = token.trim();
+        if token.eq_ignore_ascii_case("gzip") || token.eq_ignore_ascii_case("x-gzip") {
+            Self::Specific(CompressionEncoding::Gzip)
+        } else if token.eq_ignore_ascii_case("deflate") {
+            Self::Specific(CompressionEncoding::Deflate)
+        } else if token == "*" {
+            Self::Wildcard
+        } else if token.eq_ignore_ascii_case("identity") {
+            Self::Identity
+        } else {
+            Self::Unsupported
         }
     }
 }
 
-fn set_content_length(response: &mut Response, len: usize) -> Result<(), CompressionError> {
-    let len_header =
-        HeaderValue::from_str(&len.to_string()).map_err(|_| CompressionError::new())?;
-    response.headers_mut().insert(CONTENT_LENGTH, len_header);
+fn set_content_length(response: &mut Response, len: usize) {
+    response
+        .headers_mut()
+        .insert(CONTENT_LENGTH, HeaderValue::from(len));
     response.headers_mut().remove(TRANSFER_ENCODING);
-    Ok(())
 }
 
 fn ensure_vary_accept_encoding(headers: &mut HeaderMap) {
@@ -578,6 +648,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.as_ref(), payload.as_bytes());
+    }
+
+    struct FnEndpoint<F>(F);
+
+    impl<F> Endpoint for FnEndpoint<F>
+    where
+        F: FnMut() -> Response + Send + Sync,
+    {
+        type Error = Infallible;
+        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
+            Ok((self.0)())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skips_streaming_bodies_of_unknown_length() {
+        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let mut request = request_with_encoding(Some("gzip"));
+        let mut endpoint = FnEndpoint(|| {
+            let stream = futures_util::stream::iter(vec![Ok::<_, Infallible>("streamed chunk")]);
+            Response::new(Body::from_stream(stream))
+        });
+
+        let response = middleware
+            .handle(&mut request, &mut endpoint)
+            .await
+            .unwrap();
+
+        assert!(response.headers().get(CONTENT_ENCODING).is_none());
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "streamed chunk");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skips_already_compressed_content_types() {
+        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let mut request = request_with_encoding(Some("gzip"));
+        let payload = "fake png bytes".repeat(50);
+        let body = payload.clone();
+        let mut endpoint = FnEndpoint(move || {
+            let mut response = Response::new(Body::from_bytes(body.clone()));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
+            response
+        });
+
+        let response = middleware
+            .handle(&mut request, &mut endpoint)
+            .await
+            .unwrap();
+
+        assert!(response.headers().get(CONTENT_ENCODING).is_none());
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skips_responses_that_are_already_encoded() {
+        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let mut request = request_with_encoding(Some("gzip"));
+        let payload = "already encoded".repeat(50);
+        let body = payload.clone();
+        let mut endpoint = FnEndpoint(move || {
+            let mut response = Response::new(Body::from_bytes(body.clone()));
+            response
+                .headers_mut()
+                .insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
+            response
+        });
+
+        let response = middleware
+            .handle(&mut request, &mut endpoint)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("br")
+        );
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wildcard_does_not_override_explicit_zero_quality() {
+        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        // `gzip;q=0, *` forbids gzip; the wildcard covers deflate only.
+        let mut request = request_with_encoding(Some("gzip;q=0, *"));
+        let mut endpoint = StaticEndpoint::new(&"payload".repeat(80));
+
+        let response = middleware
+            .handle(&mut request, &mut endpoint)
+            .await
+            .unwrap();
+        let headers = response.headers().clone();
+        let decoded = decode_deflate(response.into_body()).await;
+
+        assert_eq!(decoded, endpoint.payload());
+        assert_eq!(
+            headers
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("deflate")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn specific_quality_beats_wildcard_quality() {
+        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        // `*` at q=1 applies to deflate; gzip keeps its explicit q=0.5.
+        let mut request = request_with_encoding(Some("*, gzip;q=0.5"));
+        let mut endpoint = StaticEndpoint::new(&"payload".repeat(80));
+
+        let response = middleware
+            .handle(&mut request, &mut endpoint)
+            .await
+            .unwrap();
+        let headers = response.headers().clone();
+        let decoded = decode_deflate(response.into_body()).await;
+
+        assert_eq!(decoded, endpoint.payload());
+        assert_eq!(
+            headers
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("deflate")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

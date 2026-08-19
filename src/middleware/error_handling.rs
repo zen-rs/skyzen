@@ -1,6 +1,8 @@
 use std::{fmt::Debug, future::Future, sync::Arc};
 
-use http_kit::{error::BoxHttpError, middleware::MiddlewareError, Middleware, Request, Response};
+use http_kit::{
+    error::BoxHttpError, middleware::MiddlewareError, HttpError, Middleware, Request, Response,
+};
 use skyzen_core::Responder;
 
 /// Handler error with an asynchronous function
@@ -25,7 +27,7 @@ impl<F> Debug for ErrorHandlingMiddleware<F> {
 impl<F, Fut, Res> ErrorHandlingMiddleware<F>
 where
     F: 'static + Send + Sync + Fn(BoxHttpError) -> Fut,
-    Fut: Send + Sync + Future<Output = Res>,
+    Fut: Send + Future<Output = Res>,
     Res: Responder,
 {
     /// New an error handling middleware with provided handler function.
@@ -37,7 +39,7 @@ where
 impl<F, Fut, Res> Middleware for ErrorHandlingMiddleware<F>
 where
     F: 'static + Send + Sync + Fn(BoxHttpError) -> Fut,
-    Fut: Send + Sync + Future<Output = Res>,
+    Fut: Send + Future<Output = Res>,
     Res: Responder,
 {
     type Error = Res::Error;
@@ -50,6 +52,8 @@ where
             Ok(response) => Ok(response),
             Err(error) => {
                 let mut response = Response::new(http_kit::Body::empty());
+                // Preserve the error's status; the responder may still override it.
+                *response.status_mut() = error.status();
                 // We have to erase the error here, since we cannot write Fn(impl HttpError) -> ...
                 (self.f)(Box::new(error) as BoxHttpError)
                     .await

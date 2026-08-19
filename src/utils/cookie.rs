@@ -51,21 +51,26 @@ http_error!(
 impl Extractor for CookieJar {
     type Error = CookieParseError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let cookie = request
-            .headers()
-            .get(header::COOKIE)
-            .map_or(&[] as &[u8], |v| v.as_bytes());
-        let cookies = core::str::from_utf8(cookie)
-            .map_err(|_| CookieParseError::new())?
+        // HTTP/2 allows the Cookie header to be split into several field lines,
+        // so join every occurrence with "; " before parsing.
+        let mut combined = String::new();
+        for value in request.headers().get_all(header::COOKIE) {
+            let value =
+                core::str::from_utf8(value.as_bytes()).map_err(|_| CookieParseError::new())?;
+            if !combined.is_empty() {
+                combined.push_str("; ");
+            }
+            combined.push_str(value);
+        }
+        combined
             .parse::<Self>()
-            .map_err(|_| CookieParseError::new())?;
-        Ok(cookies)
+            .map_err(|_| CookieParseError::new())
     }
 }
 
 http_error!(
     /// Error occurs when setting cookies to response headers.
-    pub CookieSetError, StatusCode::SERVICE_UNAVAILABLE, "Failed to set cookies"
+    pub CookieSetError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to set cookies"
 );
 
 impl Responder for CookieJar {
@@ -104,6 +109,22 @@ mod tests {
         let jar = CookieJar::extract(&mut request).await.unwrap();
 
         assert_eq!(jar.get("session").unwrap().value(), "abc 123");
+        assert_eq!(jar.get("theme").unwrap().value(), "dark");
+    }
+
+    #[tokio::test]
+    async fn joins_multiple_cookie_headers() {
+        let mut request = Request::new(Body::empty());
+        request
+            .headers_mut()
+            .append(COOKIE, HeaderValue::from_static("session=abc"));
+        request
+            .headers_mut()
+            .append(COOKIE, HeaderValue::from_static("theme=dark"));
+
+        let jar = CookieJar::extract(&mut request).await.unwrap();
+
+        assert_eq!(jar.get("session").unwrap().value(), "abc");
         assert_eq!(jar.get("theme").unwrap().value(), "dark");
     }
 
