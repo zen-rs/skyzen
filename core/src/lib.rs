@@ -44,12 +44,12 @@ pub mod openapi;
 
 pub use http_kit::{
     endpoint, header, method, middleware, uri, version, Body, BodyError, Endpoint, Extensions,
-    Method, Middleware, Request, Response, Result, ResultExt, StatusCode, Uri, Version,
+    Method, Middleware, Request, Response, StatusCode, Uri, Version,
 };
 
 /// Error types used in skyzen.
 pub mod error {
-    use std::fmt::{Debug, Display};
+    use core::fmt::{Debug, Display};
 
     // Since `error[E0119]`, we have to wrap `http-kit`'s `Error` here.
     pub use http_kit::error::{BoxHttpError, HttpError};
@@ -60,19 +60,23 @@ pub mod error {
     pub struct Error(http_kit::error::Error);
 
     impl Debug for Error {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             Debug::fmt(&self.0, f)
         }
     }
 
     impl Display for Error {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             Display::fmt(&self.0, f)
         }
     }
 
     impl Error {
         /// Create a new error from any standard error type.
+        ///
+        /// Requires the `std` feature because the conversion goes through
+        /// [`eyre::Report`].
+        #[cfg(feature = "std")]
         pub fn new(e: impl Into<eyre::Report>) -> Self {
             Self(HttpKitError::new(e))
         }
@@ -83,6 +87,9 @@ pub mod error {
         }
 
         /// Consume the error and return the inner `eyre::Report`.
+        ///
+        /// Requires the `std` feature because [`eyre::Report`] itself does.
+        #[cfg(feature = "std")]
         pub fn into_inner(self) -> eyre::Report {
             self.0.into_inner()
         }
@@ -132,4 +139,4 @@ pub mod error {
     }
 }
 
-pub use error::*;
+pub use error::{BoxHttpError, Error, HttpError, Result, ResultExt};
