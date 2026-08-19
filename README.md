@@ -91,9 +91,10 @@ async fn search(Query(query): Query<SearchQuery>, params: Params) -> Json<Page> 
 }
 ```
 
-`Json`, `Query`, `Params`, `Form`, and multipart bodies are extractors out of
-the box. `String`, `&str`, `Json<T>`, `Response`, and `Result<T>` are
-responders. Implement `Extractor` or `Responder` for your own types.
+`Json`, `Form`, `Query`, `Params`, `Multipart`, `State`, `BearerToken`, and
+`ClientIp` are extractors out of the box. `String`, `&str`, `Json<T>`,
+`Response`, and `Result<T>` are responders. Implement `Extractor` or
+`Responder` for your own types.
 
 ## Errors
 
@@ -249,8 +250,9 @@ fn router() -> Router {
 }
 ```
 
-Doc comments become descriptions. Generation is debug-only, so release builds
-don't carry the schema.
+Doc comments become descriptions. Generation is gated on `debug_assertions`
+and native targets, so neither release builds nor Workers bundles carry the
+schema.
 
 ## `#[skyzen::main]`
 
