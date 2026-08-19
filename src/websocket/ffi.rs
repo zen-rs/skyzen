@@ -1,4 +1,4 @@
-//! FFI bindings for WinterCG WebSocket API.
+//! FFI bindings for `WinterCG` WebSocket API.
 //!
 //! This module provides low-level bindings to the WebSocket API available in
 //! WinterCG-compatible runtimes like Cloudflare Workers.
@@ -10,7 +10,7 @@ use wasm_bindgen::prelude::*;
 /// In WinterCG runtimes, this is used for server-side WebSocket upgrades.
 #[wasm_bindgen]
 extern "C" {
-    /// WebSocketPair type from the WinterCG runtime.
+    /// `WebSocketPair` type from the `WinterCG` runtime.
     pub type WebSocketPair;
 
     /// Creates a new WebSocketPair.
@@ -29,7 +29,7 @@ extern "C" {
 /// WebSocket interface for WinterCG runtimes.
 #[wasm_bindgen]
 extern "C" {
-    /// WebSocket type from the WinterCG runtime.
+    /// WebSocket type from the `WinterCG` runtime.
     #[derive(Clone)]
     pub type WebSocket;
 
@@ -61,7 +61,7 @@ extern "C" {
 /// MessageEvent received from WebSocket.
 #[wasm_bindgen]
 extern "C" {
-    /// MessageEvent type.
+    /// `MessageEvent` type.
     pub type MessageEvent;
 
     /// Get the data from the message event.
@@ -72,7 +72,7 @@ extern "C" {
 /// CloseEvent received when WebSocket closes.
 #[wasm_bindgen]
 extern "C" {
-    /// CloseEvent type.
+    /// `CloseEvent` type.
     pub type CloseEvent;
 
     /// Get the close code.
@@ -91,7 +91,7 @@ extern "C" {
 /// ErrorEvent received on WebSocket error.
 #[wasm_bindgen]
 extern "C" {
-    /// ErrorEvent type.
+    /// `ErrorEvent` type.
     pub type ErrorEvent;
 
     /// Get the error message.
@@ -104,6 +104,11 @@ extern "C" {
 /// This creates a Response with status 101 and the client WebSocket attached via the
 /// non-standard `webSocket` init property (a Cloudflare Workers/WinterCG extension),
 /// which is the required format for WebSocket upgrades on those runtimes.
+///
+/// # Errors
+///
+/// Returns the underlying `JsValue` error if the reflective property set or
+/// the `Response` construction is rejected by the runtime.
 pub fn create_websocket_response(client: &WebSocket) -> Result<web_sys::Response, JsValue> {
     let init = web_sys::ResponseInit::new();
     init.set_status(101);
