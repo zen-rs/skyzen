@@ -2,15 +2,19 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fs,
+    path::PathBuf,
+};
 use syn::{
+    Attribute, Data, DeriveInput, Error, Expr, ExprLit, Fields, FnArg, Item, ItemEnum, ItemFn,
+    ItemStruct, Lit, LitInt, LitStr, Meta, MetaNameValue, PatType, ReturnType, Token, Type,
+    Variant,
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
     spanned::Spanned,
-    Attribute, Data, DeriveInput, Error, Expr, ExprLit, Fields, FnArg, Item, ItemEnum, ItemFn,
-    ItemStruct, Lit, LitInt, LitStr, Meta, MetaNameValue, PatType, ReturnType, Token, Type,
-    Variant,
 };
 
 /// Attribute macro that boots a Skyzen Endpoint on native or wasm runtimes.
@@ -930,6 +934,210 @@ fn parse_parameter_schema(pat_type: &mut PatType) -> syn::Result<ParameterMeta> 
     })
 }
 
+/// Field references found in one `#[error("...")]` message, plus a copy of
+/// the message with positional refs rewritten to binding identifiers
+/// (`{0}` -> `{f0}`) so Rust's inline format-arg capture can resolve them.
+struct MessageRefs {
+    rewritten: String,
+    positional: BTreeSet<usize>,
+    named: BTreeSet<String>,
+    saw_escape: bool,
+}
+
+/// Scan a format-style error message for `{0}` / `{field}` references,
+/// honoring `{{` / `}}` escapes and ignoring format specs after `:`.
+fn scan_message_refs(message: &LitStr) -> syn::Result<MessageRefs> {
+    let source = message.value();
+    let mut rewritten = String::with_capacity(source.len());
+    let mut positional = BTreeSet::new();
+    let mut named = BTreeSet::new();
+    let mut saw_escape = false;
+
+    let mut chars = source.chars().peekable();
+    while let Some(current) = chars.next() {
+        if current == '}' {
+            if chars.peek() == Some(&'}') {
+                chars.next();
+                rewritten.push_str("}}");
+                saw_escape = true;
+            } else {
+                rewritten.push('}');
+            }
+            continue;
+        }
+        if current != '{' {
+            rewritten.push(current);
+            continue;
+        }
+        if chars.peek() == Some(&'{') {
+            chars.next();
+            rewritten.push_str("{{");
+            saw_escape = true;
+            continue;
+        }
+
+        let mut argument = String::new();
+        while let Some(&next) = chars.peek() {
+            if next == ':' || next == '}' {
+                break;
+            }
+            argument.push(next);
+            chars.next();
+        }
+        if argument.is_empty() {
+            return Err(Error::new(
+                message.span(),
+                "implicit `{}` placeholders are not supported in #[error(...)] messages; \
+                 use `{0}` or `{field_name}` (escape literal braces as `{{`)",
+            ));
+        }
+        rewritten.push('{');
+        if argument.chars().all(|value| value.is_ascii_digit()) {
+            let index: usize = argument.parse().map_err(|_| {
+                Error::new(
+                    message.span(),
+                    format!("invalid positional placeholder `{{{argument}}}`"),
+                )
+            })?;
+            positional.insert(index);
+            rewritten.push('f');
+        } else {
+            if !is_valid_placeholder_ident(&argument) {
+                return Err(Error::new(
+                    message.span(),
+                    format!(
+                        "`{{{argument}}}` is not a valid field placeholder; \
+                         escape literal braces as `{{{{`"
+                    ),
+                ));
+            }
+            named.insert(argument.clone());
+        }
+        rewritten.push_str(&argument);
+        // The format spec (`:...`) and closing `}` flow through the loop
+        // verbatim on subsequent iterations.
+    }
+
+    Ok(MessageRefs {
+        rewritten,
+        positional,
+        named,
+        saw_escape,
+    })
+}
+
+fn is_valid_placeholder_ident(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|rest| rest.is_ascii_alphanumeric() || rest == '_')
+}
+
+/// Build the match pattern and `Display` write expression for one error
+/// message over one set of fields, interpolating referenced fields
+/// thiserror-style.
+fn display_pattern_and_expr(
+    path: proc_macro2::TokenStream,
+    fields: &Fields,
+    message: &LitStr,
+) -> syn::Result<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
+    let refs = scan_message_refs(message)?;
+    // With no field references the message is still a format string:
+    // `{{`/`}}` escapes must collapse, which `write_str` would not do.
+    let no_ref_expr = || {
+        if refs.saw_escape {
+            quote! { ::core::write!(f, #message) }
+        } else {
+            quote! { f.write_str(#message) }
+        }
+    };
+    match fields {
+        Fields::Unit => {
+            if !refs.positional.is_empty() || !refs.named.is_empty() {
+                return Err(Error::new(
+                    message.span(),
+                    "error message references fields but there are none",
+                ));
+            }
+            let write_expr = no_ref_expr();
+            Ok((path, write_expr))
+        }
+        Fields::Unnamed(unnamed) => {
+            if !refs.named.is_empty() {
+                return Err(Error::new(
+                    message.span(),
+                    "error message uses named placeholders but the fields are unnamed; \
+                     use `{0}`, `{1}`, ...",
+                ));
+            }
+            if let Some(&max) = refs.positional.iter().max()
+                && max >= unnamed.unnamed.len()
+            {
+                return Err(Error::new(
+                    message.span(),
+                    format!(
+                        "error message references field {{{max}}} but there are only {} fields",
+                        unnamed.unnamed.len()
+                    ),
+                ));
+            }
+            if refs.positional.is_empty() {
+                let write_expr = no_ref_expr();
+                return Ok((quote! { #path ( .. ) }, write_expr));
+            }
+            let bindings = (0..unnamed.unnamed.len()).map(|index| {
+                if refs.positional.contains(&index) {
+                    let binding = format_ident!("f{index}");
+                    quote! { #binding }
+                } else {
+                    quote! { _ }
+                }
+            });
+            let rewritten = LitStr::new(&refs.rewritten, message.span());
+            Ok((
+                quote! { #path ( #(#bindings),* ) },
+                quote! { ::core::write!(f, #rewritten) },
+            ))
+        }
+        Fields::Named(named_fields) => {
+            if !refs.positional.is_empty() {
+                return Err(Error::new(
+                    message.span(),
+                    "error message uses positional placeholders but the fields are named; \
+                     use `{field_name}`",
+                ));
+            }
+            let field_names = named_fields
+                .named
+                .iter()
+                .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+                .collect::<BTreeSet<_>>();
+            for name in &refs.named {
+                if !field_names.contains(name) {
+                    return Err(Error::new(
+                        message.span(),
+                        format!("error message references unknown field `{name}`"),
+                    ));
+                }
+            }
+            if refs.named.is_empty() {
+                let write_expr = no_ref_expr();
+                return Ok((quote! { #path { .. } }, write_expr));
+            }
+            let bindings = refs
+                .named
+                .iter()
+                .map(|name| format_ident!("{name}"))
+                .collect::<Vec<_>>();
+            Ok((
+                quote! { #path { #(#bindings,)* .. } },
+                quote! { ::core::write!(f, #message) },
+            ))
+        }
+    }
+}
+
 fn expand_error(args: ErrorArgs, item: Item) -> syn::Result<TokenStream> {
     match item {
         Item::Struct(item_struct) => expand_error_struct(args, item_struct),
@@ -958,13 +1166,18 @@ fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<
         .status
         .unwrap_or_else(|| parse_quote!(::skyzen::StatusCode::INTERNAL_SERVER_ERROR));
 
+    let (pattern, write_expr) =
+        display_pattern_and_expr(quote! { Self }, &item_struct.fields, &message)?;
+
     Ok(quote! {
         #[derive(::core::fmt::Debug)]
         #item_struct
 
         impl #impl_generics ::core::fmt::Display for #ident #ty_generics #where_clause {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                f.write_str(#message)
+                match self {
+                    #pattern => #write_expr,
+                }
             }
         }
 
@@ -1021,8 +1234,14 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
 
         let status_expr = status.unwrap_or_else(|| default_status.clone());
 
+        let variant_path = {
+            let ident = &variant.ident;
+            quote! { Self::#ident }
+        };
+        let (display_pattern, write_expr) =
+            display_pattern_and_expr(variant_path, &variant.fields, &message)?;
         display_arms.push(quote! {
-            #pattern => f.write_str(#message)
+            #display_pattern => #write_expr
         });
 
         status_arms.push(quote! {
@@ -1092,7 +1311,7 @@ fn expand_http_error(input: DeriveInput) -> syn::Result<TokenStream> {
             return Err(Error::new(
                 ident.span(),
                 "HttpError can only be derived for enums",
-            ))
+            ));
         }
     };
 
@@ -1399,13 +1618,12 @@ fn doc_string(attrs: &[Attribute]) -> Option<String> {
             continue;
         }
 
-        if let Meta::NameValue(meta) = &attr.meta {
-            if let Expr::Lit(ExprLit {
+        if let Meta::NameValue(meta) = &attr.meta
+            && let Expr::Lit(ExprLit {
                 lit: Lit::Str(lit), ..
             }) = &meta.value
-            {
-                docs.push(lit.value().trim().to_owned());
-            }
+        {
+            docs.push(lit.value().trim().to_owned());
         }
     }
 
@@ -2878,11 +3096,11 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        database_ident_from_name, default_database_index, documented_extractor_payload,
-        documented_response_payload, first_generic_type, generate_cloudflare_database_init,
-        generate_native_service_init, ident_from_name, load_databases_from_value,
-        load_services_from_value, looks_like_env_name, lookup_table, parse_env_ref,
-        single_generic_type, DatabaseConfig, DatabaseType, ServiceType,
+        DatabaseConfig, DatabaseType, ServiceType, database_ident_from_name,
+        default_database_index, documented_extractor_payload, documented_response_payload,
+        first_generic_type, generate_cloudflare_database_init, generate_native_service_init,
+        ident_from_name, load_databases_from_value, load_services_from_value, looks_like_env_name,
+        lookup_table, parse_env_ref, single_generic_type,
     };
     use quote::ToTokens;
     use syn::parse_quote;
@@ -3050,9 +3268,11 @@ binding = "DB"
         let Err(error) = single_generic_type(&result_ty) else {
             panic!("expected Result<Job, Error> to be rejected");
         };
-        assert!(error
-            .to_string()
-            .contains("expected a single generic argument"));
+        assert!(
+            error
+                .to_string()
+                .contains("expected a single generic argument")
+        );
 
         let first_inner = first_generic_type(&result_ty).expect("first generic");
         assert_eq!(first_inner.into_token_stream().to_string(), "Job");
@@ -3080,10 +3300,12 @@ binding = "DB"
                 default: false,
             },
         ];
-        assert!(default_database_index(&multiple_missing_default)
-            .unwrap_err()
-            .to_string()
-            .contains("require exactly one `default = true`"));
+        assert!(
+            default_database_index(&multiple_missing_default)
+                .unwrap_err()
+                .to_string()
+                .contains("require exactly one `default = true`")
+        );
 
         let multiple_defaults = vec![
             DatabaseConfig {
@@ -3097,10 +3319,12 @@ binding = "DB"
                 default: true,
             },
         ];
-        assert!(default_database_index(&multiple_defaults)
-            .unwrap_err()
-            .to_string()
-            .contains("cannot mark more than one database as `default = true`"));
+        assert!(
+            default_database_index(&multiple_defaults)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot mark more than one database as `default = true`")
+        );
     }
 
     #[test]

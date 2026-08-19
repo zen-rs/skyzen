@@ -10,3 +10,4 @@ ci/workerd/worker.d.ts
 ci/workerd/worker_bg.wasm
 ci/workerd/worker_bg.wasm.d.ts
 .skyzen/
+.codex/
