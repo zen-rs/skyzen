@@ -24,11 +24,11 @@
 //! }
 //! ```
 
-#[cfg(all(target_arch = "wasm32", feature = "sqlite"))]
-compile_error!(
-    "Feature `sqlite` is not supported on wasm32 targets. \
-Use cloud vendor database services instead (for Cloudflare, use skyzen-cloudflare::CfD1 or CfDurableSqlite / skyzen_services::durable::DurableDb)."
-);
+// Note: the native driver features (`postgres`, `mysql`, `sqlite`) are inert on
+// wasm32 targets — sqlx is a non-wasm dependency, and all driver-backed code in
+// `sql.rs` is additionally gated on `not(target_arch = "wasm32")`. On wasm,
+// use cloud vendor database services instead (for Cloudflare, use
+// skyzen-cloudflare::CfD1 or CfDurableSqlite / skyzen_services::durable::DurableDb).
 
 #[macro_use]
 mod macros;
