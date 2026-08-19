@@ -6,9 +6,9 @@ workers_dev = true
 
 [[cloudflare.durable_objects.bindings]]
 name = "ROOMS"
-class_name = "RoomObject"
+class_name = "Room"
 
 [[cloudflare.durable_objects.migrations]]
 tag = "v1"
-new_sqlite_classes = ["RoomObject"]
+new_sqlite_classes = ["Room"]
 

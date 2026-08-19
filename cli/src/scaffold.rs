@@ -287,29 +287,16 @@ fn render(
 mod tests {
     use super::*;
     use crate::args::{Action, CliOptions, Template};
-    use std::{
-        process,
-        process::Command,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::process::Command;
 
-    fn temp_project_dir() -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-        path.push(format!(
-            "skyzen-scaffold-{}-{:?}-{unique}",
-            process::id(),
-            std::thread::current().id()
-        ));
-        path
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("create temp dir")
     }
 
     #[test]
     fn creates_api_template() {
-        let path = temp_project_dir();
+        let dir = temp_dir();
+        let path = dir.path().to_path_buf();
         let options = CliOptions {
             action: Action::New,
             provider: None,
@@ -332,7 +319,8 @@ mod tests {
 
     #[test]
     fn creates_serverless_events_template() {
-        let path = temp_project_dir();
+        let dir = temp_dir();
+        let path = dir.path().to_path_buf();
         let options = CliOptions {
             action: Action::New,
             provider: None,
@@ -350,14 +338,15 @@ mod tests {
         let lib_rs = fs::read_to_string(path.join("src/lib.rs")).expect("lib.rs");
         assert!(cargo_toml.contains("skyzen-cloudflare"));
         assert!(manifest.contains("[[cloudflare.queues.consumers]]"));
-        assert!(manifest.contains("[triggers]"));
+        assert!(manifest.contains("[cloudflare.triggers]"));
         assert!(lib_rs.contains("#[skyzen::queue]"));
         assert!(lib_rs.contains("#[skyzen::scheduled]"));
     }
 
     #[test]
     fn creates_durable_realtime_template() {
-        let path = temp_project_dir();
+        let dir = temp_dir();
+        let path = dir.path().to_path_buf();
         let options = CliOptions {
             action: Action::New,
             provider: None,
@@ -378,9 +367,126 @@ mod tests {
         assert!(durable.contains("#[skyzen::durable_object]"));
     }
 
+    fn all_template_files() -> Vec<(&'static str, Vec<(PathBuf, String)>)> {
+        let root = Path::new("proj");
+        vec![
+            (
+                "api",
+                api_template_files(root, "proj", "proj", "2026-01-01"),
+            ),
+            (
+                "serverless-events",
+                serverless_events_template_files(root, "proj", "proj", "2026-01-01"),
+            ),
+            (
+                "durable-realtime",
+                durable_realtime_template_files(root, "proj", "proj", "2026-01-01"),
+            ),
+        ]
+    }
+
+    fn template_manifest(files: &[(PathBuf, String)], template: &str) -> String {
+        files
+            .iter()
+            .find(|(path, _)| path.ends_with("Skyzen.toml"))
+            .unwrap_or_else(|| panic!("template `{template}` has no Skyzen.toml"))
+            .1
+            .clone()
+    }
+
+    /// `source` declares `struct <name>` as a whole identifier (so `Room`
+    /// does not match `RoomObject`).
+    fn declares_struct(source: &str, name: &str) -> bool {
+        source
+            .match_indices(&format!("struct {name}"))
+            .any(|(index, matched)| {
+                !matches!(
+                    source[index + matched.len()..].chars().next(),
+                    Some(c) if c.is_alphanumeric() || c == '_'
+                )
+            })
+    }
+
+    #[test]
+    fn every_template_manifest_parses() {
+        let dir = temp_dir();
+        for (template, files) in all_template_files() {
+            let contents = template_manifest(&files, template);
+            let manifest_path = dir.path().join(format!("{template}-Skyzen.toml"));
+            fs::write(&manifest_path, contents).expect("write Skyzen.toml");
+
+            let loaded =
+                crate::manifest::LoadedManifest::load(&manifest_path).unwrap_or_else(|error| {
+                    panic!("template `{template}` Skyzen.toml failed to parse: {error:#}")
+                });
+            assert!(
+                loaded.data.cloudflare.is_some(),
+                "template `{template}` Skyzen.toml is missing the [cloudflare] section"
+            );
+        }
+    }
+
+    #[test]
+    fn template_durable_class_names_match_rust_structs() {
+        use crate::providers::cloudflare::collect_local_durable_exports;
+
+        for (template, files) in all_template_files() {
+            let manifest: crate::manifest::SkyzenManifest =
+                toml::from_str(&template_manifest(&files, template)).unwrap_or_else(|error| {
+                    panic!("template `{template}` Skyzen.toml failed to parse: {error}")
+                });
+            let Some(cloudflare) = manifest.cloudflare else {
+                continue;
+            };
+
+            let rust_sources: String = files
+                .iter()
+                .filter(|(path, _)| path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
+                .map(|(_, contents)| contents.as_str())
+                .collect();
+
+            for export in collect_local_durable_exports(&cloudflare) {
+                // `class_name` must be the Rust struct name: the macro exports
+                // `{Struct}Object` and the worker shim re-exports it under the
+                // struct name, which is what wrangler references.
+                assert!(
+                    declares_struct(&rust_sources, &export.public_name),
+                    "template `{template}` declares durable class `{}` but no Rust source \
+                     defines `struct {}`",
+                    export.public_name,
+                    export.public_name
+                );
+                assert_eq!(
+                    export.bindings_export_name,
+                    format!("{}Object", export.public_name),
+                    "shim export name must match the `{{Struct}}Object` wasm export"
+                );
+            }
+
+            for migration in &cloudflare.durable_objects.migrations {
+                for class in migration
+                    .new_classes
+                    .iter()
+                    .chain(&migration.new_sqlite_classes)
+                {
+                    assert!(
+                        cloudflare
+                            .durable_objects
+                            .bindings
+                            .iter()
+                            .any(|binding| binding.class_name == *class),
+                        "template `{template}` migration references `{class}` which has no \
+                         matching durable object binding"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn scaffolded_templates_compile() {
-        let root = temp_project_dir();
+        let dir = temp_dir();
+        let root = dir.path().to_path_buf();
         let shared_target_dir = root.join("target-cache");
 
         compile_template(
