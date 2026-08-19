@@ -175,6 +175,7 @@ async fn serve_static(
     let requested_path = params.get("path").unwrap_or("");
     let sanitized = sanitize_relative_path(requested_path).ok_or(StaticDirError::InvalidPath)?;
     let file_path = resolve_target_path(directory, &sanitized, index_file, spa)
+        .await
         .ok_or(StaticDirError::FileNotFound)?;
 
     let data = read_file(&file_path).await?;
@@ -200,7 +201,7 @@ fn guess_content_type(path: &Path) -> Option<HeaderValue> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_target_path(
+async fn resolve_target_path(
     base: &Path,
     relative: &Path,
     index_file: &str,
@@ -212,13 +213,16 @@ fn resolve_target_path(
         base.join(relative)
     };
 
-    if let Ok(metadata) = std::fs::metadata(&target) {
+    if let Ok(metadata) = async_fs::metadata(&target).await {
         let resolved = if metadata.is_dir() {
             target.join(index_file)
         } else {
             target
         };
-        if std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()) {
+        if async_fs::metadata(&resolved)
+            .await
+            .is_ok_and(|m| m.is_file())
+        {
             return Some(resolved);
         }
     }
@@ -226,7 +230,10 @@ fn resolve_target_path(
     // SPA fallback: only for extensionless paths
     if spa && relative.extension().is_none() {
         let fallback = base.join(index_file);
-        if std::fs::metadata(&fallback).is_ok_and(|m| m.is_file()) {
+        if async_fs::metadata(&fallback)
+            .await
+            .is_ok_and(|m| m.is_file())
+        {
             return Some(fallback);
         }
     }
