@@ -7,7 +7,7 @@ use skyzen_services::{
     QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition, QueueRetry,
 };
 use thiserror::Error;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::future_to_promise;
 
 /// Errors returned by Cloudflare queue and scheduled event wrappers.
@@ -20,11 +20,19 @@ pub enum CfEventError {
     /// Message deserialization failed.
     #[error("cloudflare event serialization error: {0}")]
     Serialization(#[from] serde_wasm_bindgen::Error),
+
+    /// A raw-bytes message body could not be decoded as JSON.
+    #[error("cloudflare event decode error: {0}")]
+    Decode(String),
 }
 
 /// Convert queue/scheduled handler results into a Cloudflare worker return type.
 pub trait IntoWorkerResult {
     /// Convert the handler output to a Cloudflare worker-compatible result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handler's error converted to a `JsValue`.
     fn into_worker_result(self) -> Result<(), JsValue>;
 }
 
@@ -46,6 +54,10 @@ where
 /// Convert queue handler results into Cloudflare queue acknowledgements/retries.
 pub trait IntoQueueWorkerResult {
     /// Convert the handler output to Cloudflare queue operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handler's error, or an ack/retry failure, as a `JsValue`.
     fn into_queue_worker_result(self, batch: &CfQueueBatch) -> Result<(), JsValue>;
 }
 
@@ -216,11 +228,23 @@ impl CfQueueMessage {
 
     /// Deserialize the message body into `T`.
     ///
+    /// Bodies produced with `contentType: "bytes"` (as [`crate::CfQueue`]
+    /// sends them) arrive as an `ArrayBuffer` and are decoded with
+    /// `serde_json`; any other body is deserialized directly from the JS
+    /// value.
+    ///
     /// # Errors
     ///
     /// Returns [`CfEventError`] if the runtime rejects the lookup or deserialization fails.
     pub fn body_json<T: DeserializeOwned>(&self) -> Result<T, CfEventError> {
-        serde_wasm_bindgen::from_value(self.raw_body()?).map_err(Into::into)
+        let raw = self.raw_body()?;
+        if raw.is_instance_of::<js_sys::ArrayBuffer>() || raw.is_instance_of::<js_sys::Uint8Array>()
+        {
+            let bytes = js_sys::Uint8Array::new(&raw).to_vec();
+            return serde_json::from_slice(&bytes)
+                .map_err(|error| CfEventError::Decode(error.to_string()));
+        }
+        serde_wasm_bindgen::from_value(raw).map_err(Into::into)
     }
 
     /// Decode the message into the portable queue message type.

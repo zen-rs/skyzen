@@ -9,7 +9,7 @@ use worker::send::IntoSendFuture;
 use worker_sys::{R2Bucket, R2Object, R2ObjectBody};
 
 use skyzen_services::storage::{
-    ListOptions, ListResult, ObjectMetadata, ObjectStorage, StorageError, StorageObject,
+    ListOptions, ListResult, ObjectMetadata, ObjectStorage, PutOptions, StorageError, StorageObject,
 };
 
 /// A Cloudflare R2 bucket.
@@ -23,30 +23,14 @@ pub struct CfR2 {
     bucket: R2Bucket,
 }
 
-impl Clone for CfR2 {
-    fn clone(&self) -> Self {
-        let js: &JsValue = self.bucket.as_ref();
-        Self {
-            bucket: js.clone().unchecked_into(),
-        }
-    }
-}
-
-unsafe impl Send for CfR2 {}
-unsafe impl Sync for CfR2 {}
-
-impl std::fmt::Debug for CfR2 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CfR2").finish_non_exhaustive()
-    }
-}
+impl_js_handle_traits!(CfR2 { bucket });
 
 impl CfR2 {
     /// Create a `CfR2` from an R2 bucket binding.
     ///
-    /// # Panics
-    ///
-    /// Panics if the binding is not a valid R2 bucket.
+    /// The binding is not validated here; an invalid binding surfaces as a
+    /// JS error on first use. Prefer [`CfR2::from_env`], which checks that
+    /// the binding looks like an R2 bucket.
     #[must_use]
     pub fn new(binding: JsValue) -> Self {
         Self {
@@ -58,11 +42,18 @@ impl CfR2 {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Backend`] if the binding cannot be found.
+    /// Returns [`StorageError::Backend`] if the binding cannot be found or
+    /// does not look like an R2 bucket.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, StorageError> {
         let binding = crate::ffi::get_binding(env, binding_name).map_err(|e| {
             StorageError::Backend(format!("failed to get R2 binding '{binding_name}': {e:?}"))
         })?;
+        crate::ffi::require_methods(
+            &binding,
+            binding_name,
+            &["get", "put", "delete", "list", "head"],
+        )
+        .map_err(js_err)?;
         Ok(Self::new(binding))
     }
 }
@@ -82,6 +73,17 @@ fn extract_custom_metadata(obj: &R2Object) -> HashMap<String, String> {
         .ok()
         .and_then(|m| serde_wasm_bindgen::from_value(m.into()).ok())
         .unwrap_or_default()
+}
+
+/// Extract the upload timestamp (seconds since Unix epoch) from an R2 object.
+fn extract_last_modified(obj: &R2Object) -> Option<u64> {
+    let millis = obj.uploaded().ok()?.get_time();
+    if millis.is_finite() && millis >= 0.0 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some((millis / 1000.0) as u64)
+    } else {
+        None
+    }
 }
 
 impl ObjectStorage for CfR2 {
@@ -113,7 +115,7 @@ impl ObjectStorage for CfR2 {
             key: base.key().map_err(js_err)?,
             size: f64_to_u64(base.size().map_err(js_err)?),
             content_type,
-            last_modified: None,
+            last_modified: extract_last_modified(base),
             metadata: custom,
         };
 
@@ -125,6 +127,49 @@ impl ObjectStorage for CfR2 {
         let promise = self
             .bucket
             .put(key.to_owned(), array.into(), JsValue::UNDEFINED)
+            .map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
+        Ok(())
+    }
+
+    async fn put_with(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        options: PutOptions,
+    ) -> Result<(), StorageError> {
+        let js_options = js_sys::Object::new();
+
+        if let Some(content_type) = &options.content_type {
+            let http_metadata = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &http_metadata,
+                &"contentType".into(),
+                &JsValue::from_str(content_type),
+            )
+            .map_err(js_err)?;
+            js_sys::Reflect::set(&js_options, &"httpMetadata".into(), &http_metadata)
+                .map_err(js_err)?;
+        }
+
+        if !options.metadata.is_empty() {
+            let custom_metadata = js_sys::Object::new();
+            for (name, value) in &options.metadata {
+                js_sys::Reflect::set(
+                    &custom_metadata,
+                    &JsValue::from_str(name),
+                    &JsValue::from_str(value),
+                )
+                .map_err(js_err)?;
+            }
+            js_sys::Reflect::set(&js_options, &"customMetadata".into(), &custom_metadata)
+                .map_err(js_err)?;
+        }
+
+        let array = js_sys::Uint8Array::from(body.as_slice());
+        let promise = self
+            .bucket
+            .put(key.to_owned(), array.into(), js_options.into())
             .map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
@@ -169,24 +214,14 @@ impl ObjectStorage for CfR2 {
 
         let mut objects = Vec::with_capacity(objects_array.length() as usize);
         for i in 0..objects_array.length() {
-            let entry = objects_array.get(i);
-            let key = js_sys::Reflect::get(&entry, &"key".into())
-                .map_err(js_err)?
-                .as_string()
-                .unwrap_or_default();
-            let size = f64_to_u64(
-                js_sys::Reflect::get(&entry, &"size".into())
-                    .map_err(js_err)?
-                    .as_f64()
-                    .unwrap_or(0.0),
-            );
+            let entry: R2Object = objects_array.get(i).unchecked_into();
 
             objects.push(ObjectMetadata {
-                key,
-                size,
-                content_type: None,
-                last_modified: None,
-                metadata: HashMap::new(),
+                key: entry.key().map_err(js_err)?,
+                size: f64_to_u64(entry.size().map_err(js_err)?),
+                content_type: extract_content_type(&entry),
+                last_modified: extract_last_modified(&entry),
+                metadata: extract_custom_metadata(&entry),
             });
         }
 
@@ -213,7 +248,7 @@ impl ObjectStorage for CfR2 {
             key: obj.key().map_err(js_err)?,
             size: f64_to_u64(obj.size().map_err(js_err)?),
             content_type,
-            last_modified: None,
+            last_modified: extract_last_modified(&obj),
             metadata: custom,
         }))
     }
