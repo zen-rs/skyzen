@@ -20,11 +20,11 @@ const APPLICATION_WWW_FORM_URLENCODED: HeaderValue =
     HeaderValue::from_static("application/x-www-form-urlencoded");
 
 http_error!(
-    /// Raised when the request content-type is not `application/x-www-form-urlencoded`.
+    /// Raised when the response body could not be encoded as form data.
     pub FormEncodeError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to encode form data"
 );
 
-impl<T: Send + Sync + Serialize + DeserializeOwned + 'static> Responder for Form<T> {
+impl<T: Send + Sync + Serialize + 'static> Responder for Form<T> {
     type Error = FormEncodeError;
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         *response.body_mut() =
