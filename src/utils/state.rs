@@ -7,7 +7,7 @@ use std::{
 };
 
 use http::StatusCode;
-use http_kit::{http_error, middleware::MiddlewareError, Middleware, Request, Response};
+use http_kit::{middleware::MiddlewareError, Middleware, Request, Response};
 use skyzen_core::Extractor;
 
 /// Share the state of application.
@@ -27,10 +27,33 @@ impl<T: Send + Sync + Clone + 'static> DerefMut for State<T> {
     }
 }
 
-http_error!(
-    /// An error occurred when extracting a missing state from the request extensions.
-    pub StateNotExist, StatusCode::INTERNAL_SERVER_ERROR, "This state does not exist"
-);
+/// An error occurred when extracting a missing state from the request extensions.
+#[derive(Debug)]
+pub struct StateNotExist {
+    type_name: &'static str,
+}
+
+impl StateNotExist {
+    fn new<T>() -> Self {
+        Self {
+            type_name: std::any::type_name::<T>(),
+        }
+    }
+}
+
+impl std::fmt::Display for StateNotExist {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "State of type `{}` does not exist", self.type_name)
+    }
+}
+
+impl std::error::Error for StateNotExist {}
+
+impl http_kit::HttpError for StateNotExist {
+    fn status(&self) -> StatusCode {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
 
 impl<T: Send + Sync + Clone + 'static> Extractor for State<T> {
     type Error = StateNotExist;
@@ -39,7 +62,7 @@ impl<T: Send + Sync + Clone + 'static> Extractor for State<T> {
             .extensions()
             .get::<Self>()
             .cloned()
-            .ok_or(StateNotExist::new())
+            .ok_or_else(StateNotExist::new::<T>)
     }
 }
 
@@ -103,5 +126,6 @@ mod tests {
         let error = State::<usize>::extract(&mut request).await.unwrap_err();
 
         assert_eq!(error.status(), crate::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.to_string().contains("usize"));
     }
 }

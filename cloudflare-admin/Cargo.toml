@@ -2,7 +2,7 @@
 name = "skyzen-cloudflare-admin"
 version = "0.1.0"
 edition = "2024"
-description = "Reusable Cloudflare control-plane API client — DNS, Pages, Access, Workers metadata. Extracted from fkgfw-deploy so any project that manages Cloudflare resources from a Rust CLI can depend on the admin surface without the rest of fkgfw."
+description = "Shared Cloudflare API response envelope types and token-source configuration for building Cloudflare control-plane tooling"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zen-rs/skyzen"
 readme = "../README.md"

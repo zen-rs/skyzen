@@ -30,6 +30,12 @@ pub struct CloudflareBuildPlan {
     pub wasm_output_path: PathBuf,
     pub bindgen_out_name: String,
     pub durable_exports: Vec<DurableObjectExport>,
+    /// Build the wasm artifact with `--release` (used for deploys).
+    pub release: bool,
+    /// Render an `async queue(...)` member into the worker shim.
+    pub has_queue_consumers: bool,
+    /// Render an `async scheduled(...)` member into the worker shim.
+    pub has_cron_triggers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -44,7 +50,7 @@ pub fn prepare(action: Action, manifest: &LoadedManifest) -> Result<ProviderPlan
         .cloudflare
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing [cloudflare] section in Skyzen.toml"))?;
-    let build = resolve_build_plan(manifest, config)?;
+    let build = resolve_build_plan(action, manifest, config)?;
     warn_missing_portable_bindings(manifest, config);
     let wrangler = render_wrangler(config, &manifest.root_dir, &build.entry_js_path)?;
     let wrangler_path = manifest.root_dir.join(".skyzen/gen/wrangler.toml");
@@ -390,6 +396,7 @@ fn relative_posix_path(from_dir: &Path, to_path: &Path) -> Result<String> {
 }
 
 fn resolve_build_plan(
+    action: Action,
     manifest: &LoadedManifest,
     config: &CloudflareSection,
 ) -> Result<CloudflareBuildPlan> {
@@ -444,10 +451,12 @@ fn resolve_build_plan(
         );
     }
 
+    // Deploys ship optimized wasm; dev keeps fast debug builds.
+    let release = matches!(action, Action::Deploy);
     let target_directory = metadata.target_directory;
     let wasm_artifact_path = target_directory
         .join("wasm32-unknown-unknown")
-        .join("debug")
+        .join(if release { "release" } else { "debug" })
         .join(format!("{}.wasm", target.name));
     let entry_js_path = manifest.root_dir.join(&entry_rel);
     let bindings_js_path = output_dir.join(format!("{entry_stem}_bg.js"));
@@ -463,6 +472,9 @@ fn resolve_build_plan(
         wasm_output_path,
         bindgen_out_name: entry_stem.to_owned(),
         durable_exports: collect_local_durable_exports(config),
+        release,
+        has_queue_consumers: !config.queues.consumers.is_empty(),
+        has_cron_triggers: !config.triggers.crons.is_empty(),
     })
 }
 
@@ -479,13 +491,18 @@ fn parse_entry_path(config: &CloudflareSection) -> Result<PathBuf> {
 }
 
 fn run_cargo_build(plan: &CloudflareBuildPlan) -> Result<()> {
-    let status = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .arg("build")
         .arg("--target")
         .arg("wasm32-unknown-unknown")
         .arg("--lib")
         .arg("--manifest-path")
-        .arg(&plan.cargo_manifest_path)
+        .arg(&plan.cargo_manifest_path);
+    if plan.release {
+        command.arg("--release");
+    }
+    let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -562,14 +579,20 @@ fn generate_wasm_bindings(plan: &CloudflareBuildPlan) -> Result<()> {
         .file_name()
         .and_then(OsStr::to_str)
         .expect("wasm file name");
-    let shim = render_worker_shim(bindings_name, wasm_name, &plan.durable_exports);
+    let shim = render_worker_shim(
+        bindings_name,
+        wasm_name,
+        &plan.durable_exports,
+        plan.has_queue_consumers,
+        plan.has_cron_triggers,
+    );
     fs::write(&plan.entry_js_path, shim)
         .with_context(|| format!("failed to write {}", plan.entry_js_path.display()))?;
 
     Ok(())
 }
 
-fn collect_local_durable_exports(config: &CloudflareSection) -> Vec<DurableObjectExport> {
+pub fn collect_local_durable_exports(config: &CloudflareSection) -> Vec<DurableObjectExport> {
     let mut exports = BTreeSet::new();
     for binding in &config.durable_objects.bindings {
         if binding.script_name.is_some() {
@@ -587,6 +610,8 @@ fn render_worker_shim(
     bindings_name: &str,
     wasm_name: &str,
     durable_exports: &[DurableObjectExport],
+    has_queue_consumers: bool,
+    has_cron_triggers: bool,
 ) -> String {
     let durable_exports = durable_exports
         .iter()
@@ -604,10 +629,37 @@ fn render_worker_shim(
         format!("{durable_exports}\n")
     };
 
+    let mut event_exports = String::new();
+    if has_queue_consumers {
+        event_exports.push_str(&render_event_member(
+            "queue",
+            "batch, env, ctx",
+            "#[skyzen::queue]",
+        ));
+    }
+    if has_cron_triggers {
+        event_exports.push_str(&render_event_member(
+            "scheduled",
+            "event, env, ctx",
+            "#[skyzen::scheduled]",
+        ));
+    }
+
     WORKER_SHIM_TEMPLATE
         .replace("__SKYZEN_BINDINGS_JS__", bindings_name)
         .replace("__SKYZEN_WASM__", wasm_name)
         .replace("__SKYZEN_DURABLE_EXPORTS__", &durable_exports)
+        .replace("__SKYZEN_EVENT_EXPORTS__", &event_exports)
+}
+
+/// Render one event-handler member (`queue`/`scheduled`) of the worker's
+/// default export. The wasm export only exists when the matching Skyzen
+/// attribute macro was used, so a clear error is raised instead of a cryptic
+/// `undefined is not a function` when the manifest and code disagree.
+fn render_event_member(name: &str, args: &str, macro_hint: &str) -> String {
+    format!(
+        "  async {name}({args}) {{\n    await ensureInitialized();\n    if (typeof wasmExports.{name} !== \"function\") {{\n      throw new Error(\"Skyzen.toml declares a {name} handler but the wasm module does not export one; annotate a Rust handler with {macro_hint}\");\n    }}\n    return wasmExports.{name}({args});\n  }},\n"
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -657,12 +709,7 @@ fn load_cargo_metadata(root_dir: &Path, cargo_manifest_path: &Path) -> Result<Ca
 mod tests {
     use super::*;
     use crate::manifest::{CfDurableObjects, CfQueues, CfTriggers};
-    use std::{
-        collections::BTreeMap,
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{collections::BTreeMap, fs, path::PathBuf};
 
     #[test]
     fn renders_wrangler_with_bindings() {
@@ -808,7 +855,8 @@ mod tests {
 
     #[test]
     fn resolves_cloudflare_build_plan_from_cdylib_project() {
-        let project_dir = temp_project_dir("cloudflare-build-plan");
+        let dir = temp_project_dir();
+        let project_dir = dir.path().to_path_buf();
         fs::write(
             project_dir.join("Cargo.toml"),
             r#"[package]
@@ -836,8 +884,12 @@ crate-type = ["cdylib", "rlib"]
             },
         };
 
-        let build = resolve_build_plan(&manifest, manifest.data.cloudflare.as_ref().unwrap())
-            .expect("resolve build plan");
+        let build = resolve_build_plan(
+            Action::Dev,
+            &manifest,
+            manifest.data.cloudflare.as_ref().unwrap(),
+        )
+        .expect("resolve build plan");
         assert_eq!(build.entry_js_path, project_dir.join("dist/worker.js"));
         assert_eq!(
             build.bindings_js_path,
@@ -849,14 +901,27 @@ crate-type = ["cdylib", "rlib"]
         );
         assert_eq!(build.bindgen_out_name, "worker");
         assert!(build.durable_exports.is_empty());
+        assert!(!build.release);
         assert!(build
             .wasm_artifact_path
             .ends_with("wasm32-unknown-unknown/debug/demo_worker.wasm"));
+
+        let deploy_build = resolve_build_plan(
+            Action::Deploy,
+            &manifest,
+            manifest.data.cloudflare.as_ref().unwrap(),
+        )
+        .expect("resolve deploy build plan");
+        assert!(deploy_build.release);
+        assert!(deploy_build
+            .wasm_artifact_path
+            .ends_with("wasm32-unknown-unknown/release/demo_worker.wasm"));
     }
 
     #[test]
     fn resolve_build_plan_collects_only_local_durable_exports() {
-        let project_dir = temp_project_dir("cloudflare-build-do-exports");
+        let dir = temp_project_dir();
+        let project_dir = dir.path().to_path_buf();
         fs::write(
             project_dir.join("Cargo.toml"),
             r#"[package]
@@ -898,8 +963,12 @@ crate-type = ["cdylib", "rlib"]
             },
         };
 
-        let build = resolve_build_plan(&manifest, manifest.data.cloudflare.as_ref().unwrap())
-            .expect("resolve build plan");
+        let build = resolve_build_plan(
+            Action::Dev,
+            &manifest,
+            manifest.data.cloudflare.as_ref().unwrap(),
+        )
+        .expect("resolve build plan");
         assert_eq!(
             build.durable_exports,
             vec![DurableObjectExport {
@@ -911,7 +980,8 @@ crate-type = ["cdylib", "rlib"]
 
     #[test]
     fn rejects_cloudflare_build_without_cdylib() {
-        let project_dir = temp_project_dir("cloudflare-build-invalid");
+        let dir = temp_project_dir();
+        let project_dir = dir.path().to_path_buf();
         fs::write(
             project_dir.join("Cargo.toml"),
             r#"[package]
@@ -935,14 +1005,19 @@ edition = "2021"
             },
         };
 
-        let error = resolve_build_plan(&manifest, manifest.data.cloudflare.as_ref().unwrap())
-            .expect_err("missing cdylib should fail");
+        let error = resolve_build_plan(
+            Action::Dev,
+            &manifest,
+            manifest.data.cloudflare.as_ref().unwrap(),
+        )
+        .expect_err("missing cdylib should fail");
         assert!(error.to_string().contains("cdylib"));
     }
 
     #[test]
     fn prepare_cloudflare_includes_build_step_and_wrangler_command() {
-        let project_dir = temp_project_dir("cloudflare-prepare");
+        let dir = temp_project_dir();
+        let project_dir = dir.path().to_path_buf();
         fs::write(
             project_dir.join("Cargo.toml"),
             r#"[package]
@@ -994,30 +1069,42 @@ crate-type = ["cdylib", "rlib"]
                     bindings_export_name: "RoomObject".to_owned(),
                 },
             ],
+            false,
+            false,
         );
 
-        assert!(rendered.contains("import init, { fetch as wasmFetch } from \"./worker_bg.js\";"));
+        assert!(rendered.contains("import init, * as wasmExports from \"./worker_bg.js\";"));
         assert!(rendered.contains("import wasmUrl from \"./worker_bg.wasm\";"));
         assert!(
             rendered.contains("export { SchedulerObject as Scheduler } from \"./worker_bg.js\";")
         );
         assert!(rendered.contains("export { RoomObject as Room } from \"./worker_bg.js\";"));
+        // Durable Object classes must be usable in a fresh isolate before the
+        // first fetch event, so the shim initializes wasm at module load.
+        assert!(rendered.contains("await ensureInitialized();\n\nexport default {"));
     }
 
     #[test]
     fn render_worker_shim_omits_durable_exports_when_empty() {
-        let rendered = render_worker_shim("worker_bg.js", "worker_bg.wasm", &[]);
+        let rendered = render_worker_shim("worker_bg.js", "worker_bg.wasm", &[], false, false);
         assert!(!rendered.contains(" as Scheduler }"));
         assert!(rendered.contains("export default {"));
+        assert!(!rendered.contains("async queue("));
+        assert!(!rendered.contains("async scheduled("));
+        assert!(!rendered.contains("__SKYZEN_EVENT_EXPORTS__"));
     }
 
-    fn temp_project_dir(prefix: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("skyzen-{prefix}-{suffix}"));
-        fs::create_dir_all(&dir).expect("create temp project dir");
-        dir
+    #[test]
+    fn render_worker_shim_wires_queue_and_scheduled_handlers() {
+        let rendered = render_worker_shim("worker_bg.js", "worker_bg.wasm", &[], true, true);
+        assert!(rendered.contains("async queue(batch, env, ctx)"));
+        assert!(rendered.contains("return wasmExports.queue(batch, env, ctx);"));
+        assert!(rendered.contains("async scheduled(event, env, ctx)"));
+        assert!(rendered.contains("return wasmExports.scheduled(event, env, ctx);"));
+        assert!(!rendered.contains("__SKYZEN_EVENT_EXPORTS__"));
+    }
+
+    fn temp_project_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("create temp project dir")
     }
 }

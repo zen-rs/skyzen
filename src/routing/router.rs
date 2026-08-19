@@ -7,13 +7,13 @@ use std::{
 use super::{BoxEndpoint, EndpointFactory, Params, Route, RouteNode, RouteNodeType};
 #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 use crate::openapi::RouteOpenApiEntry;
-use crate::{openapi::OpenApi, Endpoint, Method, Request, Response, StatusCode};
+use crate::{header, openapi::OpenApi, Body, Endpoint, Method, Request, Response, StatusCode};
 
 use http_kit::error::BoxHttpError;
 use http_kit::http_error;
 use matchit::Match;
 use skyzen_core::Extractor;
-use tracing::info;
+use tracing::debug;
 
 // The entrance of request,composing of endpoint
 pub struct App {
@@ -79,57 +79,88 @@ impl Debug for Router {
 
 http_error!(pub NotFound, StatusCode::NOT_FOUND, "Route not found.");
 
-#[derive(Debug, Clone, Copy)]
-struct NotFoundEndpoint;
-
-impl Endpoint for NotFoundEndpoint {
-    type Error = BoxHttpError;
-    async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-        Err(Box::new(NotFound::new()) as BoxHttpError)
-    }
+/// Outcome of matching a request against the routing tree.
+enum RouteLookup<'app> {
+    /// The path and method matched. `head_fallback` marks a HEAD request served
+    /// by the GET handler, whose body must be discarded.
+    Endpoint {
+        app: &'app App,
+        head_fallback: bool,
+        params: Vec<(String, String)>,
+    },
+    /// The path matched but no registered method did.
+    MethodNotAllowed(Vec<Method>),
+    /// No route matched the path.
+    NotFound,
 }
 
 impl Router {
-    fn search<'app, 'path, 'temp>(
-        &'app self,
-        path: &'path str,
-        method: &'temp Method,
-    ) -> Option<Match<'app, 'path, &'app App>>
-    where
-        'app: 'path,
-        'app: 'temp,
-    {
-        if let Ok(Match { value, params }) = self.inner.at(path) {
-            value
-                .iter()
-                .find(|(app_method, ..)| app_method == method)
-                .map(|(.., app)| Match { value: app, params })
-        } else {
-            None
-        }
+    fn lookup(&self, path: &str, method: &Method) -> RouteLookup<'_> {
+        let Ok(Match { value, params }) = self.inner.at(path) else {
+            return RouteLookup::NotFound;
+        };
+
+        let found = value
+            .iter()
+            .find(|(app_method, ..)| app_method == method)
+            .map(|(.., app)| (app, false))
+            .or_else(|| {
+                // A HEAD request without a dedicated handler falls back to the
+                // GET handler; the response body is discarded after it runs.
+                if *method == Method::HEAD {
+                    value
+                        .iter()
+                        .find(|(app_method, ..)| *app_method == Method::GET)
+                        .map(|(.., app)| (app, true))
+                } else {
+                    None
+                }
+            });
+
+        found.map_or_else(
+            || RouteLookup::MethodNotAllowed(allowed_methods(value)),
+            |(app, head_fallback)| RouteLookup::Endpoint {
+                app,
+                head_fallback,
+                params: params
+                    .iter()
+                    .map(|(key, value)| (key.to_owned(), percent_decode(value)))
+                    .collect(),
+            },
+        )
     }
 
     async fn call(&self, request: &mut Request) -> Result<Response, BoxHttpError> {
+        debug!(
+            method = request.method().as_str(),
+            path = request.uri().path(),
+            "request received"
+        );
+
         if self.already_router_enabled {
             request.extensions_mut().insert(self.clone());
         }
 
-        let path = request.uri().path();
-        let method = request.method();
+        let method = request.method().clone();
+        let lookup = self.lookup(request.uri().path(), &method);
 
-        if let Some(Match { value, params }) = self.search(path, method) {
-            let params: Vec<(String, String)> = params
-                .iter()
-                .map(|(key, value)| (key.to_owned(), value.to_owned()))
-                .collect();
-            let params = Params::new(params);
-            request.extensions_mut().insert(params);
+        match lookup {
+            RouteLookup::Endpoint {
+                app,
+                head_fallback,
+                params,
+            } => {
+                request.extensions_mut().insert(Params::new(params));
 
-            let mut endpoint = value.endpoint();
-            endpoint.respond(request).await
-        } else {
-            let mut not_found = NotFoundEndpoint;
-            not_found.respond(request).await
+                let mut endpoint = app.endpoint();
+                let mut response = endpoint.respond(request).await?;
+                if head_fallback {
+                    *response.body_mut() = Body::empty();
+                }
+                Ok(response)
+            }
+            RouteLookup::MethodNotAllowed(allow) => Ok(method_not_allowed_response(&allow)),
+            RouteLookup::NotFound => Err(Box::new(NotFound::new()) as BoxHttpError),
         }
     }
 
@@ -176,7 +207,71 @@ impl Router {
     }
 }
 
-http_error!(pub RouterNotExist, StatusCode::INTERNAL_SERVER_ERROR, "This already router does not exist. Please check whether you have enabled the already router.");
+/// Collect the methods registered for a path, advertising HEAD alongside GET.
+fn allowed_methods(entries: &[(Method, App)]) -> Vec<Method> {
+    let mut methods: Vec<Method> = entries.iter().map(|(method, ..)| method.clone()).collect();
+    if methods.contains(&Method::GET) && !methods.contains(&Method::HEAD) {
+        methods.push(Method::HEAD);
+    }
+    methods
+}
+
+/// Build a `405 Method Not Allowed` response advertising the allowed methods.
+fn method_not_allowed_response(allow: &[Method]) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    let list = allow
+        .iter()
+        .map(Method::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Ok(value) = header::HeaderValue::from_str(&list) {
+        response.headers_mut().insert(header::ALLOW, value);
+    }
+    response
+}
+
+/// Decode percent-encoded octets in a path parameter value.
+///
+/// Invalid percent sequences or non-UTF-8 results leave the raw value untouched
+/// instead of failing the request.
+fn percent_decode(raw: &str) -> String {
+    if !raw.contains('%') {
+        return raw.to_owned();
+    }
+
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            let high = bytes.get(index + 1).copied().and_then(hex_value);
+            let low = bytes.get(index + 2).copied().and_then(hex_value);
+            let (Some(high), Some(low)) = (high, low) else {
+                return raw.to_owned();
+            };
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+
+    String::from_utf8(decoded).unwrap_or_else(|_| raw.to_owned())
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+http_error!(pub RouterNotExist, StatusCode::INTERNAL_SERVER_ERROR, "Router not available in request extensions. Call `enable_programmable_router()` when building the route.");
 
 impl Extractor for Router {
     type Error = RouterNotExist;
@@ -203,6 +298,27 @@ pub enum RouteBuildError {
     },
     /// The underlying `matchit` router rejected the provided path pattern.
     MatchitError(matchit::InsertError),
+}
+
+impl std::fmt::Display for RouteBuildError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RepeatedMethod { path, method } => write!(
+                f,
+                "method `{method}` is registered multiple times for path `{path}`"
+            ),
+            Self::MatchitError(error) => write!(f, "invalid route pattern: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RouteBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MatchitError(error) => Some(error),
+            Self::RepeatedMethod { .. } => None,
+        }
+    }
 }
 
 impl From<matchit::InsertError> for RouteBuildError {
@@ -275,7 +391,7 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     let mut openapi_entries = Vec::new();
     flatten("", route.nodes, &mut buf, &mut openapi_entries);
-    finalize_router(buf, Some(openapi_entries))
+    finalize_router(buf, openapi_entries)
 }
 
 /// Build a [`Router`] from a [`Route`] tree.
@@ -288,13 +404,14 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     let mut buf = HashMap::new();
     flatten("", route.nodes, &mut buf);
-    finalize_router(buf, None)
+    finalize_router(buf)
 }
 
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 fn finalize_router(
     buf: HashMap<String, Vec<(Method, App)>>,
-    openapi_entries: Option<Vec<RouteOpenApiEntry>>,
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))] openapi_entries: Vec<
+        RouteOpenApiEntry,
+    >,
 ) -> Result<Router, RouteBuildError> {
     let mut router = matchit::Router::new();
     for (path, value) in buf {
@@ -313,43 +430,14 @@ fn finalize_router(
         inner: Arc::new(router),
         already_router_enabled: false,
         alarm_handler: None,
-        openapi_entries: Arc::new(openapi_entries.unwrap_or_default()),
-    })
-}
-
-#[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
-fn finalize_router(
-    buf: HashMap<String, Vec<(Method, App)>>,
-    _openapi_entries: Option<Vec<()>>,
-) -> Result<Router, RouteBuildError> {
-    let mut router = matchit::Router::new();
-    for (path, value) in buf {
-        let mut set = HashSet::new();
-        for (method, ..) in &value {
-            if !set.insert(method) {
-                return Err(RouteBuildError::RepeatedMethod {
-                    path,
-                    method: method.clone(),
-                });
-            }
-        } //check route
-        router.insert(path, value)?;
-    }
-    Ok(Router {
-        inner: Arc::new(router),
-        already_router_enabled: false,
-        alarm_handler: None,
+        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        openapi_entries: Arc::new(openapi_entries),
     })
 }
 
 impl Endpoint for Router {
     type Error = BoxHttpError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        info!(
-            method = request.method().as_str(),
-            path = request.uri().path(),
-            "request received"
-        );
         // Propagate errors to let middleware or runtime handle them
         self.call(request).await
     }
@@ -396,18 +484,164 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builds_routes_from_create_route_node_trait() {
-        async fn greet(params: Params) -> Result<String> {
-            let name = params.get("name")?.to_owned();
-            Ok(format!("Hello, {name}!"))
+    async fn returns_method_not_allowed_with_allow_header() {
+        let route = Route::new((
+            "/items".at(|| async { Result::Ok("list") }),
+            "/items".post(|| async { Result::Ok("created") }),
+        ));
+        let router = build(route).unwrap();
+
+        let request = request_with_method("/items", Method::DELETE);
+        let response = router.clone().go(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let allow = response
+            .headers()
+            .get(header::ALLOW)
+            .expect("Allow header missing")
+            .to_str()
+            .unwrap();
+        let methods: Vec<&str> = allow.split(", ").collect();
+        assert!(methods.contains(&"GET"));
+        assert!(methods.contains(&"POST"));
+        // GET implies HEAD via the fallback, so it must be advertised too.
+        assert!(methods.contains(&"HEAD"));
+    }
+
+    #[tokio::test]
+    async fn head_requests_fall_back_to_get_handler() {
+        let route = Route::new(("/doc".at(|| async { Result::Ok("payload") }),));
+        let router = build(route).unwrap();
+
+        let request = request_with_method("/doc", Method::HEAD);
+        let response = router.clone().go(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().into_string().await.unwrap();
+        assert!(body.is_empty(), "HEAD response body must be empty");
+    }
+
+    #[tokio::test]
+    async fn matches_wildcard_routes() {
+        async fn echo(params: Params) -> Result<String> {
+            Ok(params.get("path")?.to_owned())
         }
 
-        let route = Route::new(("/hello/{name}".at(greet),));
-        let router = build(route).unwrap();
-        let request = get_request("/hello/Bob");
-        let response = router.clone().go(request).await.unwrap();
+        let router = build(Route::new(("/files/{*path}".at(echo),))).unwrap();
+        let response = router
+            .clone()
+            .go(get_request("/files/a/b/c.txt"))
+            .await
+            .unwrap();
         let body = response.into_body().into_string().await.unwrap();
-        assert_eq!(body, "Hello, Bob!");
+        assert_eq!(body, "a/b/c.txt");
+    }
+
+    #[tokio::test]
+    async fn prefers_static_segments_over_params() {
+        async fn by_id(params: Params) -> Result<String> {
+            Ok(format!("id:{}", params.get("id")?))
+        }
+
+        let router = build(Route::new((
+            "/items/{id}".at(by_id),
+            "/items/new".at(|| async { Result::Ok("new-form") }),
+        )))
+        .unwrap();
+
+        let response = router.clone().go(get_request("/items/new")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "new-form");
+
+        let response = router.clone().go(get_request("/items/42")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "id:42");
+    }
+
+    #[tokio::test]
+    async fn treats_trailing_slash_as_distinct_route() {
+        let router = build(Route::new((
+            "/dir".at(|| async { Result::Ok("no-slash") }),
+            "/dir/".at(|| async { Result::Ok("slash") }),
+        )))
+        .unwrap();
+
+        let response = router.clone().go(get_request("/dir")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "no-slash");
+
+        let response = router.clone().go(get_request("/dir/")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "slash");
+    }
+
+    #[tokio::test]
+    async fn populates_multiple_params() {
+        async fn show(params: Params) -> Result<String> {
+            Ok(format!("{}/{}", params.get("user")?, params.get("post")?))
+        }
+
+        let router = build(Route::new(("/users/{user}/posts/{post}".at(show),))).unwrap();
+        let response = router
+            .clone()
+            .go(get_request("/users/ada/posts/17"))
+            .await
+            .unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "ada/17");
+    }
+
+    #[tokio::test]
+    async fn percent_decodes_params() {
+        async fn greet(params: Params) -> Result<String> {
+            Ok(params.get("name")?.to_owned())
+        }
+
+        let router = build(Route::new(("/hello/{name}".at(greet),))).unwrap();
+        let response = router
+            .clone()
+            .go(get_request("/hello/John%20Doe"))
+            .await
+            .unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "John Doe");
+
+        // Invalid percent sequences are passed through untouched.
+        let response = router
+            .clone()
+            .go(get_request("/hello/50%25off"))
+            .await
+            .unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "50%off");
+    }
+
+    #[tokio::test]
+    async fn params_can_be_extracted_multiple_times() {
+        async fn greet(first: Params, second: Params) -> Result<String> {
+            Ok(format!("{}+{}", first.get("name")?, second.get("name")?))
+        }
+
+        let router = build(Route::new(("/hello/{name}".at(greet),))).unwrap();
+        let response = router.clone().go(get_request("/hello/Ada")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "Ada+Ada");
+    }
+
+    #[tokio::test]
+    async fn mounts_nested_routes_under_prefix() {
+        let router = build(Route::new((
+            "/api".route(("/v1".route(("/ping".at(|| async { Result::Ok("pong") }),)),)),
+        )))
+        .unwrap();
+
+        let response = router
+            .clone()
+            .go(get_request("/api/v1/ping"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "pong");
     }
 
     #[derive(Clone, Default)]
@@ -448,21 +682,14 @@ mod tests {
             .get("x-middleware")
             .expect("header missing");
         assert_eq!(header.to_str().unwrap(), "applied");
-    }
 
-    #[tokio::test]
-    async fn with_alias_applies_route_middleware_to_endpoints() {
-        let route =
-            Route::new(("/ping".at(|| async { Result::Ok("pong") }),)).with(HeaderMiddleware);
-
-        let router = build(route).unwrap();
-        let request = get_request("/ping");
-        let response = router.clone().go(request).await.unwrap();
-        let header = response
-            .headers()
-            .get("x-middleware")
-            .expect("header missing");
-        assert_eq!(header.to_str().unwrap(), "applied");
+        // `.with` is an alias for `.middleware` and must behave identically.
+        let aliased = build(
+            Route::new(("/ping".at(|| async { Result::Ok("pong") }),)).with(HeaderMiddleware),
+        )
+        .unwrap();
+        let response = aliased.clone().go(get_request("/ping")).await.unwrap();
+        assert!(response.headers().get("x-middleware").is_some());
     }
 
     #[tokio::test]
@@ -480,6 +707,23 @@ mod tests {
         let response = router.clone().go(request).await.unwrap();
         let body = response.into_body().into_string().await.unwrap();
         assert_eq!(body, "handled: boom");
+    }
+
+    #[tokio::test]
+    async fn error_handling_middleware_preserves_error_status() {
+        async fn fail() -> Result<&'static str> {
+            Err(Error::msg("teapot").set_status(StatusCode::IM_A_TEAPOT))
+        }
+
+        let route = Route::new(("/fail".at(fail),)).middleware(ErrorHandlingMiddleware::new(
+            |error| async move { format!("handled: {error}") },
+        ));
+
+        let router = build(route).unwrap();
+        let response = router.clone().go(get_request("/fail")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        let body = response.into_body().into_string().await.unwrap();
+        assert!(body.starts_with("handled:"));
     }
 
     #[tokio::test]

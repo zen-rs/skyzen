@@ -7,10 +7,17 @@ use skyzen_services::{
     DbExecResult, DbValue,
 };
 
-/// In-memory implementation of [`DurableDbBackend`] for testing.
+/// Recording stub implementation of [`DurableDbBackend`] for testing.
 ///
-/// This is a minimal stub that records executed queries.
-/// For full SQL testing, consider using `rusqlite` directly.
+/// **This is not a SQL engine.** It executes nothing: every `query` and
+/// `execute` call records the SQL string and returns an empty
+/// [`DbExecResult`], regardless of the statement. `SELECT`s always produce
+/// zero rows, `INSERT`s store nothing, and invalid SQL succeeds.
+///
+/// Its purpose is asserting *which* statements a handler issued, via
+/// [`executed_queries`](Self::executed_queries). For tests that need real SQL
+/// semantics, use `InMemoryDb` (in-memory `SQLite`, requires a runtime
+/// feature) instead.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryDurableDb {
     queries: Arc<RwLock<Vec<String>>>,
@@ -23,7 +30,10 @@ impl InMemoryDurableDb {
         Self::default()
     }
 
-    /// Get all queries that have been executed.
+    /// Get the SQL strings of all statements issued so far, in order.
+    ///
+    /// Both `query` and `execute` calls are recorded. Bound parameter values
+    /// are not captured.
     ///
     /// # Panics
     ///

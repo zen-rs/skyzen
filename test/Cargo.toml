@@ -10,11 +10,16 @@ keywords = ["http", "web", "framework", "testing"]
 categories = ["web-programming::http-server", "development-tools::testing"]
 
 [dependencies]
+skyzen-core.workspace = true
 skyzen-services.workspace = true
 http-kit.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_urlencoded = "0.7.1"
 insta = { version = "1", features = ["json"] }
+
+[dev-dependencies]
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 
 [features]
 # Mirror the database runtime feature flags exposed by `skyzen-services`.

@@ -19,18 +19,21 @@ futures-core = "0.3"
 sqlparser = "0.58"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-sqlx = { version = "0.8", default-features = false, features = ["json", "postgres", "mysql", "sqlite"] }
+sqlx = { version = "0.8", default-features = false, features = ["json", "chrono", "uuid", "bigdecimal"], optional = true }
 
 [features]
+# All native sqlx drivers are enabled by default; disable default features and
+# pick individual drivers to trim compile times.
+default = ["postgres", "mysql", "sqlite"]
 # Runtime features - user selects in their application
 runtime-tokio-native-tls = ["sqlx/runtime-tokio-native-tls"]
 runtime-tokio-rustls = ["sqlx/runtime-tokio-rustls"]
 runtime-async-std-native-tls = ["sqlx/runtime-async-std-native-tls"]
 runtime-async-std-rustls = ["sqlx/runtime-async-std-rustls"]
-# Database backends
-postgres = []
-mysql = []
-sqlite = []
+# Database backends (native targets only; each forwards to the sqlx driver)
+postgres = ["dep:sqlx", "sqlx/postgres"]
+mysql = ["dep:sqlx", "sqlx/mysql"]
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }

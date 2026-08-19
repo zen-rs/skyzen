@@ -18,10 +18,13 @@
 use std::collections::HashMap;
 
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
+use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use aws_smithy_types::error::display::DisplayErrorContext;
 use skyzen_services::storage::{
-    ListOptions, ListResult, ObjectMetadata, ObjectStorage, StorageError, StorageObject,
+    ListOptions, ListResult, ObjectMetadata, ObjectStorage, PutOptions, StorageError, StorageObject,
 };
 
 /// An S3-compatible object storage backend.
@@ -79,6 +82,17 @@ fn size_u64(size: i64) -> u64 {
     u64::try_from(size).unwrap_or(0)
 }
 
+/// Map an AWS SDK error to a [`StorageError::Backend`] with full error context.
+///
+/// [`DisplayErrorContext`] walks the whole error source chain, so the message
+/// includes the service error code and message instead of just "service error".
+fn backend_error<E>(err: E) -> StorageError
+where
+    E: std::error::Error,
+{
+    StorageError::Backend(DisplayErrorContext(&err).to_string())
+}
+
 impl ObjectStorage for S3Storage {
     async fn get(&self, key: &str) -> Result<Option<StorageObject>, StorageError> {
         let result = self
@@ -113,10 +127,15 @@ impl ObjectStorage for S3Storage {
                 Ok(Some(StorageObject { body, metadata }))
             }
             Err(err) => {
-                if is_not_found(&err) {
+                // Only a typed NoSuchKey means "key absent" — a missing bucket
+                // (NoSuchBucket) is also a 404 but must surface as an error.
+                if err
+                    .as_service_error()
+                    .is_some_and(GetObjectError::is_no_such_key)
+                {
                     Ok(None)
                 } else {
-                    Err(StorageError::Backend(err.to_string()))
+                    Err(backend_error(err))
                 }
             }
         }
@@ -130,7 +149,32 @@ impl ObjectStorage for S3Storage {
             .body(ByteStream::from(body))
             .send()
             .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
+            .map_err(backend_error)?;
+        Ok(())
+    }
+
+    async fn put_with(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        options: PutOptions,
+    ) -> Result<(), StorageError> {
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(body));
+
+        if let Some(content_type) = options.content_type {
+            request = request.content_type(content_type);
+        }
+
+        if !options.metadata.is_empty() {
+            request = request.set_metadata(Some(options.metadata));
+        }
+
+        request.send().await.map_err(backend_error)?;
         Ok(())
     }
 
@@ -141,7 +185,7 @@ impl ObjectStorage for S3Storage {
             .key(key)
             .send()
             .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
+            .map_err(backend_error)?;
         Ok(())
     }
 
@@ -160,10 +204,7 @@ impl ObjectStorage for S3Storage {
             request = request.continuation_token(cursor);
         }
 
-        let output = request
-            .send()
-            .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let output = request.send().await.map_err(backend_error)?;
 
         let objects = output
             .contents()
@@ -206,21 +247,43 @@ impl ObjectStorage for S3Storage {
                 }))
             }
             Err(err) => {
-                if is_not_found(&err) {
+                // Only a typed NotFound means "key absent"; other errors
+                // (including a missing bucket) surface as backend errors.
+                if err
+                    .as_service_error()
+                    .is_some_and(HeadObjectError::is_not_found)
+                {
                     Ok(None)
                 } else {
-                    Err(StorageError::Backend(err.to_string()))
+                    Err(backend_error(err))
                 }
             }
         }
     }
 }
 
-/// Check if an S3 error is a "not found" (`NoSuchKey` / 404).
-fn is_not_found<E: std::fmt::Display>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
-    matches!(
-        err,
-        aws_sdk_s3::error::SdkError::ServiceError(service_err)
-            if service_err.raw().status().as_u16() == 404
-    )
+#[cfg(test)]
+mod tests {
+    use super::{size_u64, timestamp_secs};
+    use aws_smithy_types::DateTime;
+
+    #[test]
+    fn timestamp_secs_converts_positive_epochs() {
+        assert_eq!(
+            timestamp_secs(&DateTime::from_secs(1_700_000_000)),
+            Some(1_700_000_000)
+        );
+    }
+
+    #[test]
+    fn timestamp_secs_rejects_pre_epoch_dates() {
+        assert_eq!(timestamp_secs(&DateTime::from_secs(-1)), None);
+    }
+
+    #[test]
+    fn size_u64_clamps_negative_sizes_to_zero() {
+        assert_eq!(size_u64(-5), 0);
+        assert_eq!(size_u64(0), 0);
+        assert_eq!(size_u64(42), 42);
+    }
 }

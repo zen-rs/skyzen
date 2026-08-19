@@ -1,4 +1,4 @@
-mod cloudflare;
+pub mod cloudflare;
 mod native;
 
 use crate::{
@@ -122,7 +122,7 @@ pub fn prepare(options: &CliOptions) -> Result<PreparedRun> {
             }
 
             let manifest = LoadedManifest::load(&options.manifest)?;
-            ensure_capability_deps(&manifest, Some(provider))?;
+            ensure_capability_deps(&manifest, Some(provider), options.dry_run)?;
             let plan = match provider {
                 Provider::Native => unreachable!("native dev is handled above"),
                 Provider::Cloudflare => cloudflare::prepare(options.action, &manifest)?,

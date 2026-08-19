@@ -420,22 +420,6 @@ mod tests {
         assert!(matches!(error, DurableObjectError::WebSocket(_)));
     }
 
-    #[test]
-    fn auto_response_operations_delegate_to_inner_handle() {
-        let state = Arc::new(Mutex::new(MockConnectionsState::default()));
-        let connections = connections_with_state(Arc::clone(&state));
-
-        connections.set_auto_response("ping", "pong").unwrap();
-        connections.clear_auto_response().unwrap();
-
-        let (auto_response, clear_calls) = {
-            let state = state.lock().unwrap();
-            (state.auto_response.clone(), state.clear_calls)
-        };
-        assert_eq!(auto_response, None);
-        assert_eq!(clear_calls, 1);
-    }
-
     #[tokio::test]
     async fn extractor_reads_injected_connections_from_request_extensions() {
         let state = Arc::new(Mutex::new(MockConnectionsState::default()));

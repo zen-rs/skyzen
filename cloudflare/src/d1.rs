@@ -8,33 +8,21 @@ use wasm_bindgen_futures::JsFuture;
 use worker::send::IntoSendFuture;
 use worker_sys::{D1Database, D1PreparedStatement, D1Result};
 
-use crate::database_error::{js_err, CfDatabaseError};
+use crate::database_error::{integer_to_js_number, js_err, CfDatabaseError};
 
 /// A Cloudflare D1 database binding.
 pub struct CfD1 {
     db: D1Database,
 }
 
-impl Clone for CfD1 {
-    fn clone(&self) -> Self {
-        let js: &JsValue = self.db.as_ref();
-        Self {
-            db: js.clone().unchecked_into(),
-        }
-    }
-}
-
-unsafe impl Send for CfD1 {}
-unsafe impl Sync for CfD1 {}
-
-impl std::fmt::Debug for CfD1 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CfD1").finish_non_exhaustive()
-    }
-}
+impl_js_handle_traits!(CfD1 { db });
 
 impl CfD1 {
     /// Create a `CfD1` from a D1 binding.
+    ///
+    /// The binding is not validated here; an invalid binding surfaces as a
+    /// JS error on first use. Prefer [`CfD1::from_env`], which checks that
+    /// the binding looks like a D1 database.
     #[must_use]
     pub fn new(binding: JsValue) -> Self {
         Self {
@@ -43,22 +31,37 @@ impl CfD1 {
     }
 
     /// Create a `CfD1` from a Workers env by binding name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError::Backend`] if the binding cannot be found
+    /// or does not look like a D1 database.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, CfDatabaseError> {
         let binding = crate::ffi::get_binding(env, binding_name).map_err(|error| {
             CfDatabaseError::Backend(format!(
                 "failed to get D1 binding '{binding_name}': {error:?}"
             ))
         })?;
+        crate::ffi::require_methods(&binding, binding_name, &["prepare", "exec"])
+            .map_err(js_err)?;
         Ok(Self::new(binding))
     }
 
     /// Run SQL directly via D1 `exec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when execution fails.
     pub async fn exec(&self, query: &str) -> Result<JsValue, CfDatabaseError> {
         let promise = self.db.exec(query).map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
     /// Prepare a SQL statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when the statement cannot be prepared.
     pub fn prepare(&self, query: &str) -> Result<CfD1Statement, CfDatabaseError> {
         let stmt = self.db.prepare(query).map_err(js_err)?;
         Ok(CfD1Statement { stmt })
@@ -70,26 +73,15 @@ pub struct CfD1Statement {
     stmt: D1PreparedStatement,
 }
 
-impl Clone for CfD1Statement {
-    fn clone(&self) -> Self {
-        let js: &JsValue = self.stmt.as_ref();
-        Self {
-            stmt: js.clone().unchecked_into(),
-        }
-    }
-}
-
-unsafe impl Send for CfD1Statement {}
-unsafe impl Sync for CfD1Statement {}
-
-impl std::fmt::Debug for CfD1Statement {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CfD1Statement").finish_non_exhaustive()
-    }
-}
+impl_js_handle_traits!(CfD1Statement { stmt });
 
 impl CfD1Statement {
     /// Bind parameters to this prepared statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when a parameter cannot be converted or
+    /// binding fails.
     pub fn bind(&self, params: &[DbValue]) -> Result<Self, CfDatabaseError> {
         let values = js_sys::Array::new();
         for value in params {
@@ -100,48 +92,93 @@ impl CfD1Statement {
     }
 
     /// Execute and return all rows (`stmt.all()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when execution fails.
     pub async fn all(&self) -> Result<JsValue, CfDatabaseError> {
         let promise = self.stmt.all().map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
     /// Execute and return the first row (`stmt.first()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when execution fails.
     pub async fn first(&self) -> Result<JsValue, CfDatabaseError> {
         let promise = self.stmt.first(None).map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
     /// Execute and return raw row arrays (`stmt.raw()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when execution fails.
     pub async fn raw(&self) -> Result<JsValue, CfDatabaseError> {
         let promise = self.stmt.raw().map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
     /// Execute a write statement (`stmt.run()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when execution fails.
     pub async fn run(&self) -> Result<JsValue, CfDatabaseError> {
         let promise = self.stmt.run().map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)
     }
 
-    /// Execute `all()` and deserialize the result into a Rust type.
-    pub async fn all_json<T: DeserializeOwned>(&self) -> Result<T, CfDatabaseError> {
+    /// Execute `all()` and deserialize the result rows (`.results`) into a
+    /// vector of Rust values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when execution or row deserialization
+    /// fails.
+    pub async fn all_json<T: DeserializeOwned>(&self) -> Result<Vec<T>, CfDatabaseError> {
         let value = self.all().await?;
-        serde_wasm_bindgen::from_value(value).map_err(Into::into)
+        let result: D1Result = value.unchecked_into();
+        let rows = result.results().map_err(js_err)?.unwrap_or_default();
+        rows.iter()
+            .map(|row| serde_wasm_bindgen::from_value(row).map_err(Into::into))
+            .collect()
     }
 
-    /// Execute `first()` and deserialize the result into a Rust type.
-    pub async fn first_json<T: DeserializeOwned>(&self) -> Result<T, CfDatabaseError> {
+    /// Execute `first()` and deserialize the row into a Rust type.
+    ///
+    /// Returns `Ok(None)` when the query matches no rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when execution or deserialization fails.
+    pub async fn first_json<T: DeserializeOwned>(&self) -> Result<Option<T>, CfDatabaseError> {
         let value = self.first().await?;
-        serde_wasm_bindgen::from_value(value).map_err(Into::into)
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+        serde_wasm_bindgen::from_value(value)
+            .map(Some)
+            .map_err(Into::into)
     }
 
     /// Execute `raw()` and deserialize the result into a Rust type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when execution or deserialization fails.
     pub async fn raw_json<T: DeserializeOwned>(&self) -> Result<T, CfDatabaseError> {
         let value = self.raw().await?;
         serde_wasm_bindgen::from_value(value).map_err(Into::into)
     }
 
     /// Execute `run()` and deserialize the result into a Rust type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when execution or deserialization fails.
     pub async fn run_json<T: DeserializeOwned>(&self) -> Result<T, CfDatabaseError> {
         let value = self.run().await?;
         serde_wasm_bindgen::from_value(value).map_err(Into::into)
@@ -242,17 +279,5 @@ fn db_value_to_js(value: &DbValue) -> Result<JsValue, CfDatabaseError> {
 }
 
 fn integer_to_js(value: i64) -> Result<JsValue, CfDatabaseError> {
-    const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
-    const MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
-
-    if !(MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value) {
-        return Err(CfDatabaseError::Backend(format!(
-            "D1 integer parameter exceeds JavaScript safe integer range: {value}"
-        )));
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    {
-        Ok(JsValue::from_f64(value as f64))
-    }
+    integer_to_js_number(value).map_err(|message| CfDatabaseError::Backend(format!("D1 {message}")))
 }

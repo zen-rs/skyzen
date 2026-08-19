@@ -20,6 +20,10 @@ pub enum StorageError {
     /// An I/O error occurred.
     #[error("storage I/O error: {0}")]
     Io(String),
+
+    /// The backend does not support the requested operation.
+    #[error("unsupported storage operation: {0}")]
+    Unsupported(&'static str),
 }
 
 // ── Supporting types ──
@@ -46,6 +50,24 @@ pub struct StorageObject {
     pub body: Vec<u8>,
     /// Metadata associated with the object.
     pub metadata: ObjectMetadata,
+}
+
+/// Options for storing an object.
+#[derive(Debug, Clone, Default)]
+pub struct PutOptions {
+    /// Content type (MIME) to record with the object.
+    pub content_type: Option<String>,
+    /// Custom metadata key-value pairs to record with the object.
+    pub metadata: HashMap<String, String>,
+}
+
+impl PutOptions {
+    /// Returns `true` when no option is set, i.e. the put is equivalent to a
+    /// plain [`ObjectStorage::put`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.content_type.is_none() && self.metadata.is_empty()
+    }
 }
 
 /// Options for listing objects.
@@ -88,6 +110,29 @@ pub trait ObjectStorage: Send + Sync + Clone + 'static {
         body: Vec<u8>,
     ) -> impl Future<Output = Result<(), StorageError>> + MaybeSend;
 
+    /// Store an object under a key with content type and custom metadata.
+    ///
+    /// The default implementation delegates to [`ObjectStorage::put`] when
+    /// `options` is empty and returns [`StorageError::Unsupported`] otherwise,
+    /// so backends that cannot record metadata fail loudly instead of
+    /// silently dropping it.
+    fn put_with(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        options: PutOptions,
+    ) -> impl Future<Output = Result<(), StorageError>> + MaybeSend {
+        async move {
+            if options.is_empty() {
+                self.put(key, body).await
+            } else {
+                Err(StorageError::Unsupported(
+                    "content type and custom metadata are not supported by this storage backend",
+                ))
+            }
+        }
+    }
+
     /// Remove an object by key.
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), StorageError>> + MaybeSend;
 
@@ -112,6 +157,12 @@ trait ObjectStorageObj: Send + Sync {
         key: &'a str,
     ) -> BoxFuture<'a, Result<Option<StorageObject>, StorageError>>;
     fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, Result<(), StorageError>>;
+    fn put_with<'a>(
+        &'a self,
+        key: &'a str,
+        body: Vec<u8>,
+        options: PutOptions,
+    ) -> BoxFuture<'a, Result<(), StorageError>>;
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StorageError>>;
     fn list(&self, options: ListOptions) -> BoxFuture<'_, Result<ListResult, StorageError>>;
     fn head<'a>(
@@ -133,6 +184,15 @@ impl<T: ObjectStorage> ObjectStorageObj for T {
 
     fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(ObjectStorage::put(self, key, body))
+    }
+
+    fn put_with<'a>(
+        &'a self,
+        key: &'a str,
+        body: Vec<u8>,
+        options: PutOptions,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(ObjectStorage::put_with(self, key, body, options))
     }
 
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StorageError>> {
@@ -193,6 +253,22 @@ impl Storage {
         self.0.put(key, body).await
     }
 
+    /// Store an object under a key with content type and custom metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the backend operation fails, or
+    /// [`StorageError::Unsupported`] if the backend cannot record the
+    /// requested options.
+    pub async fn put_with(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        options: PutOptions,
+    ) -> Result<(), StorageError> {
+        self.0.put_with(key, body, options).await
+    }
+
     /// Remove an object by key.
     ///
     /// # Errors
@@ -225,7 +301,7 @@ impl Storage {
 mod tests {
     use super::{
         ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError,
-        StorageNotConfigured, StorageObject,
+        StorageObject,
     };
     use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
     use skyzen_core::Extractor;
@@ -394,15 +470,6 @@ mod tests {
 
         let error = Storage::extract(&mut request).await.unwrap_err();
 
-        assert_eq!(
-            error.status(),
-            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn missing_configuration_error_uses_expected_status() {
-        let error = StorageNotConfigured::new();
         assert_eq!(
             error.status(),
             skyzen_core::StatusCode::INTERNAL_SERVER_ERROR

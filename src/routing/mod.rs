@@ -124,7 +124,7 @@ pub(crate) type EndpointFactory = Arc<dyn Fn() -> BoxEndpoint + Send + Sync>;
 
 // Export param types
 mod param;
-pub use param::Params;
+pub use param::{MissingParam, Params};
 
 // Export router types
 mod router;

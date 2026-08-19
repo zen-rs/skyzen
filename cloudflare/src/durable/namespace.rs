@@ -11,23 +11,7 @@ pub struct CfDurableNamespace {
     namespace: DurableObjectNamespace,
 }
 
-impl Clone for CfDurableNamespace {
-    fn clone(&self) -> Self {
-        let js: &JsValue = self.namespace.as_ref();
-        Self {
-            namespace: js.clone().unchecked_into(),
-        }
-    }
-}
-
-unsafe impl Send for CfDurableNamespace {}
-unsafe impl Sync for CfDurableNamespace {}
-
-impl std::fmt::Debug for CfDurableNamespace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CfDurableNamespace").finish_non_exhaustive()
-    }
-}
+impl_js_handle_traits!(CfDurableNamespace { namespace });
 
 impl CfDurableNamespace {
     /// Create from a raw namespace binding.
@@ -108,24 +92,7 @@ pub struct CfDurableObjectStub {
     stub: DurableObject,
 }
 
-impl Clone for CfDurableObjectStub {
-    fn clone(&self) -> Self {
-        let js: &JsValue = self.stub.as_ref();
-        Self {
-            stub: js.clone().unchecked_into(),
-        }
-    }
-}
-
-unsafe impl Send for CfDurableObjectStub {}
-unsafe impl Sync for CfDurableObjectStub {}
-
-impl std::fmt::Debug for CfDurableObjectStub {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CfDurableObjectStub")
-            .finish_non_exhaustive()
-    }
-}
+impl_js_handle_traits!(CfDurableObjectStub { stub });
 
 impl CfDurableObjectStub {
     /// Dispatch request to the remote Durable Object.

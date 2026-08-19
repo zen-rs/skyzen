@@ -1,5 +1,11 @@
 //! Cloudflare Durable Object runtime and service adapters.
 
+/// Storage key under which the framework persists serialized Durable Object
+/// state. It lives in the same `state.storage` keyspace as user data, so
+/// [`CfDurableKv`] hides it from `list` results and preserves it across
+/// `delete_all`.
+pub(crate) const STATE_KEY: &str = "__skyzen_do_state";
+
 pub mod alarm;
 pub mod glue;
 pub mod kv;
