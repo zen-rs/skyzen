@@ -135,12 +135,14 @@ optional = true
 
 
 [features]
-default = ["json", "form", "multipart", "sse", "rt", "openapi", "ws", "static-files", "runtime-async-std-native-tls"]
+default = ["json", "form", "query", "multipart", "sse", "rt", "openapi", "ws", "static-files", "runtime-async-std-native-tls"]
 openapi = ["skyzen-core/openapi"]
 auth = []
 jwt = ["auth", "dep:jsonwebtoken"]
 json = ["http-kit/json"]
-form = ["dep:serde_urlencoded", "http-kit/form"]
+# The `query` feature enables the `Query` extractor without pulling in form bodies.
+query = ["dep:serde_urlencoded"]
+form = ["dep:serde_urlencoded", "http-kit/form", "query"]
 multipart = ["dep:multer", "dep:pin-project-lite"]
 sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
 static-files = []

@@ -33,10 +33,6 @@ extern crate self as skyzen;
 #[macro_use]
 mod macros;
 
-/*#[cfg(test)]
-#[macro_use]
-mod test_helper;*/
-
 pub mod handler;
 
 pub mod routing;
