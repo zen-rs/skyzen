@@ -18,11 +18,13 @@ use http_kit::{
 use crate::openapi::{ResponseSchema, SchemaRef};
 use crate::Error;
 
-/// Transform a object into a part of HTTP response,always is response body,header,etc.
+/// Converts a value into part of an HTTP response, such as the response body or
+/// a set of headers.
 pub trait Responder: Sized + Send + Sync + 'static {
     /// Error type returned when responding fails.
     type Error: HttpError;
-    /// Modify the response,sometime also read the request (but the body may have already been consumed).
+    /// Modify the response. Implementations may also inspect the request, but
+    /// its body may have already been consumed by an extractor.
     ///
     /// # Errors
     ///

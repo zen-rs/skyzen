@@ -13,7 +13,8 @@ use http_kit::{
     Body, HttpError, Method, Request, StatusCode, Uri,
 };
 
-/// Extract a object from request,always is the header,body value,etc.
+/// Extracts a typed value from an HTTP request, such as a header, the body, or
+/// other request metadata.
 pub trait Extractor: Sized + Send + Sync + 'static {
     /// Error type returned when extraction fails.
     type Error: HttpError;
