@@ -205,17 +205,53 @@ impl TestResponse {
 }
 
 /// Resolve a dot-separated path into a JSON value.
+///
+/// A numeric segment is only treated as an array index when the current value
+/// is an array; for objects it is always looked up as a key, so object keys
+/// like `"0"` remain addressable.
 fn resolve_json_path<'a>(
     value: &'a serde_json::Value,
     path: &str,
 ) -> Option<&'a serde_json::Value> {
     let mut current = value;
     for segment in path.split('.') {
-        if let Ok(index) = segment.parse::<usize>() {
-            current = current.get(index)?;
-        } else {
-            current = current.get(segment)?;
-        }
+        current = match current {
+            serde_json::Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            serde_json::Value::Object(map) => map.get(segment)?,
+            _ => return None,
+        };
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::resolve_json_path;
+
+    #[test]
+    fn resolves_object_keys_and_array_indices() {
+        let value = json!({"users": [{"name": "alice"}, {"name": "bob"}]});
+        assert_eq!(
+            resolve_json_path(&value, "users.1.name"),
+            Some(&json!("bob"))
+        );
+    }
+
+    #[test]
+    fn numeric_segments_address_object_keys_when_value_is_an_object() {
+        let value = json!({"counts": {"0": 10, "1": 20}});
+        assert_eq!(resolve_json_path(&value, "counts.0"), Some(&json!(10)));
+        assert_eq!(resolve_json_path(&value, "counts.1"), Some(&json!(20)));
+    }
+
+    #[test]
+    fn missing_paths_resolve_to_none() {
+        let value = json!({"a": [1, 2]});
+        assert_eq!(resolve_json_path(&value, "a.5"), None);
+        assert_eq!(resolve_json_path(&value, "a.not_an_index"), None);
+        assert_eq!(resolve_json_path(&value, "b"), None);
+        assert_eq!(resolve_json_path(&value, "a.0.deeper"), None);
+    }
 }
