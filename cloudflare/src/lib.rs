@@ -12,7 +12,7 @@
 //! - [`CfQueue`] — Cloudflare Queues (implements [`MessageQueue`])
 //! - [`CfD1`] — Cloudflare D1 SQL database
 //! - [`CfCache`] — Cloudflare Cache API
-//! - [`CfDurableSqlite`] — Durable Object `SQLite` (`state.storage.sql`)
+//! - [`CfDurableDb`] — Durable Object `SQLite` (`state.storage.sql`)
 //!
 //! **This crate only works on `wasm32` targets.** On native targets it compiles
 //! as an empty crate.
@@ -34,6 +34,38 @@
 //! [`ObjectStorage`]: skyzen_services::storage::ObjectStorage
 //! [`MessageQueue`]: skyzen_services::queue::MessageQueue
 
+/// Implement `Clone` (via the underlying JS handle), `Send`/`Sync`, and an
+/// opaque `Debug` for a single-field wrapper around a wasm-bindgen JS handle.
+///
+/// # Safety
+///
+/// Workers WASM executes on a single thread, so marking JS handles `Send` and
+/// `Sync` is sound in this environment.
+#[cfg(target_arch = "wasm32")]
+macro_rules! impl_js_handle_traits {
+    ($type:ident { $field:ident }) => {
+        impl Clone for $type {
+            fn clone(&self) -> Self {
+                let js: &::wasm_bindgen::JsValue = self.$field.as_ref();
+                Self {
+                    $field: ::wasm_bindgen::JsCast::unchecked_into(js.clone()),
+                }
+            }
+        }
+
+        // SAFETY: Workers WASM executes on a single thread; JS handles are
+        // safe to mark Send/Sync.
+        unsafe impl Send for $type {}
+        unsafe impl Sync for $type {}
+
+        impl ::std::fmt::Debug for $type {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.debug_struct(stringify!($type)).finish_non_exhaustive()
+            }
+        }
+    };
+}
+
 #[cfg(target_arch = "wasm32")]
 pub mod cache;
 #[cfg(target_arch = "wasm32")]
@@ -42,8 +74,6 @@ pub mod d1;
 pub mod database_error;
 #[cfg(target_arch = "wasm32")]
 pub mod durable;
-#[cfg(target_arch = "wasm32")]
-pub mod durable_sqlite;
 #[cfg(target_arch = "wasm32")]
 pub mod events;
 #[cfg(target_arch = "wasm32")]
@@ -74,8 +104,6 @@ pub use durable::{
     CfDurableObjectStub, CfDurableState, CfWebSocketConnection, DurableObjectRuntime,
 };
 #[cfg(target_arch = "wasm32")]
-pub use durable_sqlite::CfDurableSqlite;
-#[cfg(target_arch = "wasm32")]
 pub use events::{
     CfEventError, CfQueueBatch, CfQueueContext, CfQueueMessage, CfQueueRetryOptions,
     CfScheduleContext, CfScheduledEvent, IntoQueueWorkerResult, IntoWorkerResult,
@@ -105,7 +133,7 @@ pub use worker_sys;
 const _: () = {
     fn assert_send<T: Send>(_: T) {}
 
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::needless_pass_by_value)]
     fn assert_cloudflare_handler_futures_are_send(
         d1: crate::CfD1,
         namespace: crate::CfDurableNamespace,
