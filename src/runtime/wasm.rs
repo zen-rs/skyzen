@@ -26,6 +26,9 @@ pub type ExecutionContext = JsValue;
 
 thread_local! {
     static CURRENT_ENV: RefCell<Option<JsValue>> = const { RefCell::new(None) };
+    /// Type-erased cache of the endpoint built by the app factory, so the router and service
+    /// bindings are constructed once per isolate instead of on every request.
+    static CACHED_ENDPOINT: RefCell<Option<Box<dyn std::any::Any>>> = const { RefCell::new(None) };
 }
 
 /// Get the current WinterCG env during endpoint construction.
@@ -104,8 +107,13 @@ pub fn with_current_env<T>(env: JsValue, f: impl FnOnce() -> T) -> T {
 }
 
 /// Bridge the annotated endpoint into the WinterCG `fetch` contract.
+///
+/// The factory receives the WinterCG environment explicitly (instead of via an ambient
+/// thread-local), so concurrent invocations on the same isolate cannot race each other's
+/// environment while the factory awaits. The built endpoint is cached per isolate thread and
+/// cloned for each request, so the router and service bindings are constructed only once.
 pub async fn launch<Fut, E>(
-    factory: impl FnOnce() -> Fut,
+    factory: impl FnOnce(Env) -> Fut,
     request: Request,
     env: Env,
     ctx: ExecutionContext,
@@ -114,12 +122,28 @@ where
     Fut: Future<Output = E>,
     E: Endpoint + Clone + 'static,
 {
-    // Make env available during factory construction
-    set_current_env(env.clone());
-    let endpoint = factory().await;
-    clear_current_env();
+    let endpoint = match cached_endpoint::<E>() {
+        Some(endpoint) => endpoint,
+        None => {
+            let endpoint = factory(env.clone()).await;
+            store_cached_endpoint(endpoint.clone());
+            endpoint
+        }
+    };
 
     serve(endpoint, request, env, ctx).await
+}
+
+fn cached_endpoint<E: Clone + 'static>() -> Option<E> {
+    CACHED_ENDPOINT.with_borrow(|slot| {
+        slot.as_ref()
+            .and_then(|endpoint| endpoint.downcast_ref::<E>())
+            .cloned()
+    })
+}
+
+fn store_cached_endpoint<E: 'static>(endpoint: E) {
+    CACHED_ENDPOINT.with_borrow_mut(|slot| *slot = Some(Box::new(endpoint)));
 }
 
 async fn serve<E>(
@@ -212,7 +236,11 @@ async fn convert_request(request: Request) -> Result<crate::Request, JsValue> {
     Ok(crate::Request::from(http_request))
 }
 
-async fn convert_response(mut response: crate::Response) -> Result<Response, JsValue> {
+async fn convert_response(response: crate::Response) -> Result<Response, JsValue> {
+    // Only the websocket-extension handling below needs mutable access.
+    #[cfg(feature = "ws")]
+    let mut response = response;
+
     // Handle WebSocket upgrade responses (status 101)
     #[cfg(feature = "ws")]
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -234,6 +262,18 @@ async fn convert_response(mut response: crate::Response) -> Result<Response, JsV
         }
     }
 
+    // A 101 without an attached WebSocket cannot be represented by the standard Response
+    // constructor (it throws an opaque RangeError); fail with a clear error instead.
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        tracing::error!("101 response without an attached WebSocket; returning 500");
+        let init = web_sys::ResponseInit::new();
+        init.set_status(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+        return Response::new_with_opt_str_and_init(
+            Some("101 Switching Protocols response was missing a WebSocket"),
+            &init,
+        );
+    }
+
     let status = response.status().as_u16();
     let init = web_sys::ResponseInit::new();
     init.set_status(status);
@@ -241,7 +281,9 @@ async fn convert_response(mut response: crate::Response) -> Result<Response, JsV
 
     let headers = web_sys::Headers::new()?;
     for (key, value) in response.headers().iter() {
-        headers.append(key.as_str(), value.to_str().unwrap_or_default())?;
+        // Header values are not guaranteed to be ASCII; use a lossy UTF-8 view rather than
+        // silently dropping non-ASCII values.
+        headers.append(key.as_str(), &String::from_utf8_lossy(value.as_bytes()))?;
     }
     init.set_headers(&headers);
 
