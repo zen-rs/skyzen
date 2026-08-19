@@ -63,7 +63,7 @@ impl WebSocket {
         let (tx, rx) = mpsc::unbounded();
 
         // Create event handlers
-        let closures = Self::setup_event_handlers(&socket, tx);
+        let closures = Self::setup_event_handlers(&socket, tx, &config);
 
         Self {
             inner: socket,
@@ -76,36 +76,64 @@ impl WebSocket {
     fn setup_event_handlers(
         socket: &ffi::WebSocket,
         tx: UnboundedSender<WebSocketResult<WebSocketMessage>>,
+        config: &WebSocketConfig,
     ) -> EventClosures {
         // Message handler
         let tx_message = tx.clone();
+        let max_message_size = config.max_message_size;
         let on_message = Closure::wrap(Box::new(move |event: ffi::MessageEvent| {
             let data = event.data();
 
             let message = if let Some(text) = data.as_string() {
                 WebSocketMessage::Text(text.into())
-            } else if js_sys::Uint8Array::instanceof(&data) {
-                let array = js_sys::Uint8Array::from(data);
-                let mut bytes = vec![0u8; array.length() as usize];
-                array.copy_to(&mut bytes);
-                WebSocketMessage::Binary(bytes.into())
+            } else if data.is_instance_of::<js_sys::ArrayBuffer>()
+                || data.is_instance_of::<js_sys::Uint8Array>()
+            {
+                // WinterCG runtimes (e.g. Cloudflare Workers) deliver binary frames as
+                // `ArrayBuffer`; `Uint8Array::new` handles both buffer and view inputs.
+                WebSocketMessage::Binary(js_sys::Uint8Array::new(&data).to_vec().into())
             } else {
                 // Unknown data type, skip
                 return;
             };
+
+            // Enforce the configured inbound size limit, matching native behavior where
+            // async-tungstenite rejects oversized incoming messages.
+            let len = match &message {
+                WebSocketMessage::Text(text) => text.len(),
+                WebSocketMessage::Binary(bytes) => bytes.len(),
+                _ => 0,
+            };
+            if let Some(limit) = max_message_size {
+                if len > limit {
+                    let _ = tx_message
+                        .unbounded_send(Err(WebSocketError::MessageTooLarge { len, limit }));
+                    return;
+                }
+            }
 
             let _ = tx_message.unbounded_send(Ok(message));
         }) as Box<dyn FnMut(ffi::MessageEvent)>);
 
         // Close handler
         let tx_close = tx.clone();
-        let on_close = Closure::wrap(Box::new(move |_event: ffi::CloseEvent| {
+        let on_close = Closure::wrap(Box::new(move |event: ffi::CloseEvent| {
+            tracing::debug!(
+                code = event.code(),
+                reason = %event.reason(),
+                was_clean = event.was_clean(),
+                "websocket closed by peer"
+            );
             let _ = tx_close.unbounded_send(Ok(WebSocketMessage::Close));
+            // Terminate the stream so receive loops observe the end of the connection.
+            tx_close.close_channel();
         }) as Box<dyn FnMut(ffi::CloseEvent)>);
 
         // Error handler
         let on_error = Closure::wrap(Box::new(move |event: ffi::ErrorEvent| {
             let _ = tx.unbounded_send(Err(WebSocketError::Protocol(event.message())));
+            // Terminate the stream so receive loops observe the failure and end.
+            tx.close_channel();
         }) as Box<dyn FnMut(ffi::ErrorEvent)>);
 
         // Attach event listeners
@@ -483,8 +511,10 @@ impl WebSocketUpgrade {
     ///
     /// # Platform Notes
     /// - **Native**: Enforced by async-tungstenite on both directions.
-    /// - **WASM**: Enforced by Skyzen on outbound sends. Note the host runtime may impose its own
-    ///   lower cap (e.g. Cloudflare Workers limits messages to 1 MiB), so set this accordingly.
+    /// - **WASM**: Enforced by Skyzen on both outbound sends and inbound messages (oversized
+    ///   inbound messages surface as [`WebSocketError::MessageTooLarge`] on the receive stream).
+    ///   Note the host runtime may impose its own lower cap (e.g. Cloudflare Workers limits
+    ///   messages to 1 MiB), so set this accordingly.
     #[must_use]
     pub fn max_message_size(mut self, max_size: Option<usize>) -> Self {
         self.config.max_message_size = max_size;
