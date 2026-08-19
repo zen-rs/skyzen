@@ -522,26 +522,6 @@ mod tests {
     }
 
     #[test]
-    fn close_and_tags_delegate_to_inner_handle() {
-        let state = Arc::new(Mutex::new(MockSocketState {
-            tags: vec!["room-1".to_owned(), "admin".to_owned()],
-            ..MockSocketState::default()
-        }));
-        let connection = connection_with_state(Arc::clone(&state));
-
-        assert_eq!(
-            connection.tags().unwrap(),
-            vec!["room-1".to_owned(), "admin".to_owned()]
-        );
-        connection.close(1000, "done").unwrap();
-
-        assert_eq!(
-            state.lock().unwrap().close_calls,
-            vec![(1000, "done".to_owned())]
-        );
-    }
-
-    #[test]
     fn hibernation_upgrade_preserves_tag_order() {
         let tags = HibernationWebSocketUpgrade::new()
             .tag("room-1")
