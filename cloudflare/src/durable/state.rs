@@ -9,20 +9,8 @@ use super::{
     alarm::CfAlarm,
     kv::CfDurableKv,
     sql::CfDurableDb,
-    websocket::{clone_state, CfDurableConnections},
+    websocket::{clone_state, CfDurableConnections, SendSyncDurableState},
 };
-
-struct SendSyncDurableState(worker_sys::DurableObjectState);
-
-// SAFETY: Workers WASM executes on a single thread; JS handles are safe to mark Send/Sync.
-unsafe impl Send for SendSyncDurableState {}
-unsafe impl Sync for SendSyncDurableState {}
-
-impl Clone for SendSyncDurableState {
-    fn clone(&self) -> Self {
-        Self(clone_state(&self.0))
-    }
-}
 
 /// Cloudflare Durable Object state wrapper.
 pub struct CfDurableState {
@@ -51,7 +39,7 @@ impl std::fmt::Debug for CfDurableState {
 impl CfDurableState {
     /// Create from raw Cloudflare `DurableObjectState`.
     #[must_use]
-    pub fn new(state: worker_sys::DurableObjectState, env: JsValue) -> Self {
+    pub const fn new(state: worker_sys::DurableObjectState, env: JsValue) -> Self {
         Self { state, env }
     }
 
