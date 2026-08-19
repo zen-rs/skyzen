@@ -39,7 +39,7 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 - **`skyzen-hyper`** (`hyper/`) - Hyper backend that implements the `Server` trait from `skyzen-core`
 
 **Services abstraction:**
-- **`skyzen-services`** (`services/`) - Platform-agnostic service traits (`KeyValueStore`, `ObjectStorage`, `MessageQueue`) and type-erased extractors (`Kv`, `Storage`, `Queue`, `Db`). Re-exports `sea_orm` for database access
+- **`skyzen-services`** (`services/`) - Platform-agnostic service traits (`KeyValueStore`, `ObjectStorage`, `MessageQueue`) and type-erased extractors (`Kv`, `Storage`, `Queue`, `Db`). Includes a `Db` SQL abstraction built on `sqlx` (Postgres, MySQL, SQLite)
 - **`skyzen-test`** (`test/`) - In-memory mock implementations (`InMemoryKv`, `InMemoryStorage`, `InMemoryQueue`) for testing
 
 **Platform implementations:**
@@ -57,7 +57,7 @@ Services use a two-layer design for type erasure:
 - **Bridge**: blanket impl of `*Obj` for any `T: PublicTrait`
 - **Wrapper** (e.g. `Kv`): holds `Box<dyn *Obj>`, implements `Extractor`, exposes async methods
 
-The `MaybeSend` pattern (`services/src/maybe_send.rs`) conditionally applies `Send` bounds — `Send` on native, no-op on WASM. This allows the same traits to work on both targets.
+The `MaybeSend` alias (`services/src/maybe_send.rs`) requires `Send` on every target; single-threaded WASM platform types satisfy it via explicit `Send`/`Sync` impls in the platform crates (e.g. `skyzen-cloudflare`).
 
 Platform crates depend only on `skyzen-services` (traits), NOT on the `skyzen` main crate.
 
@@ -99,4 +99,4 @@ The workspace enforces strict Clippy lints including `pedantic` and `nursery` gr
 
 ### External Dependency
 
-The framework depends on `http-kit` (git dependency from zen-rs/http-kit) which provides core HTTP types (`Request`, `Response`, `Body`, `Endpoint`, `Middleware`).
+The framework depends on `http-kit` (crates.io) which provides core HTTP types (`Request`, `Response`, `Body`, `Endpoint`, `Middleware`).
