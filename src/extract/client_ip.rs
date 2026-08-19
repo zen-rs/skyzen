@@ -75,8 +75,12 @@ pub enum ClientIpError {
     #[error("Failed to parse address")]
     /// Failed to parse the address.
     AddrParseError(#[from] AddrParseError),
-    /// The remote address is missing.
-    #[error("Missing remote addr, maybe it's not a tcp/udp connection")]
+    /// The remote address is missing. This points at a server configuration
+    /// problem (the backend did not record a peer address), not a bad request.
+    #[error(
+        "Missing remote addr, maybe it's not a tcp/udp connection",
+        status = StatusCode::INTERNAL_SERVER_ERROR
+    )]
     MissingRemoteAddr,
 }
 
@@ -154,12 +158,10 @@ fn parse_bracketed_ipv6(value: &str) -> Result<Option<Ipv6Addr>, ClientIpError> 
 }
 
 fn parse_x_forwarded_for(v: &[u8]) -> Result<Option<IpAddr>, ClientIpError> {
-    if let Some(mut v) = v.split(|v| *v == b',').next() {
-        trim(&mut v);
-        Ok(Some(IpAddr::from_str(std::str::from_utf8(v)?)?))
-    } else {
-        Ok(None)
-    }
+    // `split` always yields at least one (possibly empty) chunk.
+    let mut first = v.split(|v| *v == b',').next().unwrap_or_default();
+    trim(&mut first);
+    Ok(Some(IpAddr::from_str(std::str::from_utf8(first)?)?))
 }
 
 fn split_once(s: &[u8], pat: u8) -> Option<(&[u8], &[u8])> {
@@ -171,13 +173,22 @@ fn split_once(s: &[u8], pat: u8) -> Option<(&[u8], &[u8])> {
     None
 }
 
-fn trim(s: &mut &[u8]) {
-    while let Some(s2) = s.strip_prefix(b" ") {
-        *s = s2;
+/// Strip optional whitespace (spaces and horizontal tabs) from both ends.
+const fn trim(s: &mut &[u8]) {
+    while let Some((first, rest)) = s.split_first() {
+        if matches!(first, b' ' | b'\t') {
+            *s = rest;
+        } else {
+            break;
+        }
     }
 
-    while let Some(s2) = s.strip_suffix(b" ") {
-        *s = s2;
+    while let Some((last, rest)) = s.split_last() {
+        if matches!(last, b' ' | b'\t') {
+            *s = rest;
+        } else {
+            break;
+        }
     }
 }
 

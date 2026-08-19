@@ -1,8 +1,8 @@
 pub use skyzen_core::Extractor;
 
-#[cfg(feature = "form")]
+#[cfg(feature = "query")]
 mod query;
-#[cfg(feature = "form")]
+#[cfg(feature = "query")]
 pub use query::Query;
 
 pub mod client_ip;

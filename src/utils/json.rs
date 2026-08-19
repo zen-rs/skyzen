@@ -103,12 +103,25 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
     }
 }
 
+/// Accept `application/json` as well as any `application/*+json` media type
+/// (e.g. `application/problem+json`).
 fn is_json_content_type(value: &HeaderValue) -> bool {
     value
         .to_str()
         .ok()
         .and_then(|raw| raw.split(';').next())
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        .is_some_and(|mime| {
+            const PREFIX: &[u8] = b"application/";
+            const SUFFIX: &[u8] = b"+json";
+            let mime = mime.trim();
+            if mime.eq_ignore_ascii_case("application/json") {
+                return true;
+            }
+            let bytes = mime.as_bytes();
+            bytes.len() > PREFIX.len() + SUFFIX.len()
+                && bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+                && bytes[bytes.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+        })
 }
 
 #[cfg(test)]
@@ -143,6 +156,32 @@ mod test {
             .await
             .expect("json should parse");
         assert!(payload.ok);
+    }
+
+    #[tokio::test]
+    async fn accepts_json_suffix_media_types() {
+        let mut request = request_with_body(br#"{"ok":true}"#);
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("application/problem+json"),
+        );
+
+        let Json(payload) = Json::<Payload>::extract(&mut request)
+            .await
+            .expect("json should parse");
+        assert!(payload.ok);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_json_payload_with_bad_request() {
+        let mut request = request_with_body(b"{not json");
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("application/json"),
+        );
+
+        let error = Json::<Payload>::extract(&mut request).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
