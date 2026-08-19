@@ -15,6 +15,7 @@ pub struct MissingParam {
 }
 
 impl MissingParam {
+    /// Create an error naming the parameter that was missing.
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
@@ -59,9 +60,11 @@ impl Params {
 impl Extractor for Params {
     type Error = Infallible;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        // Clone rather than remove so the params survive repeated extraction.
         Ok(request
-            .extensions_mut()
-            .remove::<Self>()
+            .extensions()
+            .get::<Self>()
+            .cloned()
             .unwrap_or(Self::empty()))
     }
 
