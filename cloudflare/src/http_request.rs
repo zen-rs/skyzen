@@ -34,8 +34,14 @@ pub enum CfHttpRequestError {
 
 /// Build a `worker::Request` carrying a serialized-as-JSON body.
 ///
-/// `Content-Type: application/json` is always set; `extra_headers` are layered
-/// on top (for `Authorization`, `Accept`, `User-Agent`, etc.).
+/// `Content-Type: application/json` is set unless `extra_headers` already
+/// carries a `Content-Type`; other `extra_headers` (for `Authorization`,
+/// `Accept`, `User-Agent`, etc.) are added as-is.
+///
+/// # Errors
+///
+/// Returns [`CfHttpRequestError`] when the payload cannot be serialized, a
+/// header cannot be added, or the request cannot be constructed.
 pub fn json_request(
     method: worker::Method,
     url: &str,
@@ -46,13 +52,23 @@ pub fn json_request(
         .map_err(|error| CfHttpRequestError::SerializeBody(error.to_string()))?;
     let mut headers: Vec<(&str, &str)> = Vec::with_capacity(extra_headers.len() + 1);
     headers.extend_from_slice(extra_headers);
-    headers.push(("Content-Type", APPLICATION_JSON));
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("Content-Type"))
+    {
+        headers.push(("Content-Type", APPLICATION_JSON));
+    }
     bare_request(method, url, &headers, Some(&body))
 }
 
 /// Build a `worker::Request` with optional raw bytes body.
 ///
 /// Callers supply every header they need; nothing is added implicitly.
+///
+/// # Errors
+///
+/// Returns [`CfHttpRequestError`] when a header cannot be added or the
+/// request cannot be constructed.
 pub fn bare_request(
     method: worker::Method,
     url: &str,
@@ -61,8 +77,10 @@ pub fn bare_request(
 ) -> Result<worker::Request, CfHttpRequestError> {
     let header_map = worker::Headers::new();
     for (name, value) in headers {
+        // `append` keeps duplicate header names (e.g. repeated `Set-Cookie`
+        // or `Accept` entries); `set` would overwrite earlier values.
         header_map
-            .set(name, value)
+            .append(name, value)
             .map_err(|error| CfHttpRequestError::SetHeader {
                 name: (*name).to_owned(),
                 message: error.to_string(),

@@ -7,27 +7,15 @@ use worker::send::IntoSendFuture;
 use worker_sys::{DurableObjectState, DurableObjectStorage};
 
 /// Cloudflare Durable Object KV store backed by `state.storage`.
+///
+/// The framework's internal state key ([`super::STATE_KEY`]) shares this
+/// keyspace: it is filtered out of `list` results and survives `delete_all`,
+/// so user code never sees or destroys framework state.
 pub struct CfDurableKv {
     storage: DurableObjectStorage,
 }
 
-impl Clone for CfDurableKv {
-    fn clone(&self) -> Self {
-        let js: &JsValue = self.storage.as_ref();
-        Self {
-            storage: js.clone().unchecked_into(),
-        }
-    }
-}
-
-unsafe impl Send for CfDurableKv {}
-unsafe impl Sync for CfDurableKv {}
-
-impl std::fmt::Debug for CfDurableKv {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CfDurableKv").finish_non_exhaustive()
-    }
-}
+impl_js_handle_traits!(CfDurableKv { storage });
 
 impl CfDurableKv {
     /// Create from a Durable Object storage handle.
@@ -104,8 +92,14 @@ impl DurableKvStore for CfDurableKv {
     }
 
     async fn delete_all(&self) -> Result<(), DurableKvError> {
+        // `deleteAll` would also wipe the framework's serialized object state
+        // mid-session; snapshot it and restore it afterwards.
+        let state_snapshot = self.get(super::STATE_KEY).await?;
         let promise = self.storage.delete_all().map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)?;
+        if let Some(bytes) = state_snapshot {
+            self.put(super::STATE_KEY, &bytes).await?;
+        }
         Ok(())
     }
 
@@ -123,9 +117,11 @@ impl DurableKvStore for CfDurableKv {
             .map_err(js_err)?;
         }
         if let Some(start) = options.start {
+            // The trait documents `start` as exclusive; Cloudflare's `start`
+            // option is inclusive, so map it to `startAfter`.
             js_sys::Reflect::set(
                 &js_options,
-                &JsValue::from_str("start"),
+                &JsValue::from_str("startAfter"),
                 &JsValue::from_str(start),
             )
             .map_err(js_err)?;
@@ -155,7 +151,10 @@ impl DurableKvStore for CfDurableKv {
 
         let promise = self.storage.list_with_options(js_options).map_err(js_err)?;
         let value = JsFuture::from(promise).into_send().await.map_err(js_err)?;
-        decode_map_entries(value)
+        let mut entries = decode_map_entries(value)?;
+        // Hide the framework's internal state key from user-visible listings.
+        entries.retain(|(key, _)| key != super::STATE_KEY);
+        Ok(entries)
     }
 }
 

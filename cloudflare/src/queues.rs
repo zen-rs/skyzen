@@ -11,6 +11,10 @@ use skyzen_services::queue::{MessageQueue, QueueError};
 ///
 /// Wraps the Queue binding from the Workers environment.
 ///
+/// Messages are sent with `contentType: "bytes"` so the raw payload reaches
+/// the consumer as an `ArrayBuffer` instead of being JSON-mangled by the
+/// platform default content type.
+///
 /// # Safety
 ///
 /// WASM in Workers is single-threaded, so `Send` and `Sync` are safe.
@@ -18,30 +22,14 @@ pub struct CfQueue {
     queue: worker_sys::Queue,
 }
 
-impl Clone for CfQueue {
-    fn clone(&self) -> Self {
-        let js: &JsValue = self.queue.as_ref();
-        Self {
-            queue: js.clone().unchecked_into(),
-        }
-    }
-}
-
-unsafe impl Send for CfQueue {}
-unsafe impl Sync for CfQueue {}
-
-impl std::fmt::Debug for CfQueue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CfQueue").finish_non_exhaustive()
-    }
-}
+impl_js_handle_traits!(CfQueue { queue });
 
 impl CfQueue {
     /// Create a `CfQueue` from a Queue binding.
     ///
-    /// # Panics
-    ///
-    /// Panics if the binding is not a valid Queue.
+    /// The binding is not validated here; an invalid binding surfaces as a
+    /// JS error on first use. Prefer [`CfQueue::from_env`], which checks
+    /// that the binding looks like a Queue.
     #[must_use]
     pub fn new(binding: JsValue) -> Self {
         Self {
@@ -53,23 +41,40 @@ impl CfQueue {
     ///
     /// # Errors
     ///
-    /// Returns [`QueueError::Backend`] if the binding cannot be found.
+    /// Returns [`QueueError::Backend`] if the binding cannot be found or
+    /// does not look like a Queue.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, QueueError> {
         let binding = crate::ffi::get_binding(env, binding_name).map_err(|e| {
             QueueError::Backend(format!(
                 "failed to get Queue binding '{binding_name}': {e:?}"
             ))
         })?;
+        crate::ffi::require_methods(&binding, binding_name, &["send", "sendBatch"])
+            .map_err(js_err)?;
         Ok(Self::new(binding))
     }
 }
 
+/// Build a `{ contentType: "bytes" }` send-options object.
+///
+/// Cloudflare's default `contentType` is `"json"`, which would JSON-stringify
+/// a `Uint8Array` into index-keyed garbage; `"bytes"` delivers the payload to
+/// the consumer as an `ArrayBuffer`.
+fn bytes_content_type_options() -> Result<js_sys::Object, QueueError> {
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(&options, &"contentType".into(), &"bytes".into()).map_err(js_err)?;
+    Ok(options)
+}
+
 impl MessageQueue for CfQueue {
     async fn send(&self, message: &[u8]) -> Result<(), QueueError> {
-        let array = js_sys::Uint8Array::from(message);
+        // `Uint8Array::from` copies into an exactly sized buffer, so the
+        // ArrayBuffer holds precisely the message bytes.
+        let buffer = js_sys::Uint8Array::from(message).buffer();
+        let options = bytes_content_type_options()?;
         let promise = self
             .queue
-            .send(array.into(), JsValue::UNDEFINED)
+            .send(buffer.into(), options.into())
             .map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
@@ -80,10 +85,10 @@ impl MessageQueue for CfQueue {
         #[allow(clippy::cast_possible_truncation)]
         let batch = js_sys::Array::new_with_length(messages.len() as u32);
         for (i, msg) in messages.iter().enumerate() {
-            let array = js_sys::Uint8Array::from(msg.as_slice());
+            let buffer = js_sys::Uint8Array::from(msg.as_slice()).buffer();
             let item = js_sys::Object::new();
-            js_sys::Reflect::set(&item, &"body".into(), &array)
-                .map_err(|e| QueueError::Backend(format!("{e:?}")))?;
+            js_sys::Reflect::set(&item, &"body".into(), &buffer).map_err(js_err)?;
+            js_sys::Reflect::set(&item, &"contentType".into(), &"bytes".into()).map_err(js_err)?;
             #[allow(clippy::cast_possible_truncation)]
             batch.set(i as u32, item.into());
         }

@@ -194,11 +194,12 @@ mod tests {
 
     #[test]
     fn watch_paths_include_existing_project_files() {
-        let root = std::env::temp_dir().join("skyzen-dev-watch-paths");
+        let dir = tempfile::tempdir().expect("create temp project dir");
+        let root = dir.path();
         std::fs::create_dir_all(root.join("src")).expect("create src");
         std::fs::write(root.join("Cargo.toml"), "").expect("write Cargo.toml");
 
-        let watched = watch_paths(&root);
+        let watched = watch_paths(root);
         assert!(watched.contains(&root.join("src")));
         assert!(watched.contains(&root.join("Cargo.toml")));
     }

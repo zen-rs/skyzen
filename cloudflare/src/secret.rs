@@ -34,6 +34,11 @@ pub enum CfSecretError {
 
 /// Read a required string binding. Returns an error when the binding is
 /// missing or non-string.
+///
+/// # Errors
+///
+/// Returns [`CfSecretError`] when the binding cannot be read, is missing,
+/// or is not a string.
 pub fn required_string(env: &JsValue, binding: &str) -> Result<String, CfSecretError> {
     let value =
         Reflect::get(env, &JsValue::from_str(binding)).map_err(|_| CfSecretError::Reflect {
@@ -51,6 +56,11 @@ pub fn required_string(env: &JsValue, binding: &str) -> Result<String, CfSecretE
 
 /// Read an optional string binding. Returns `Ok(None)` when the binding is
 /// undefined or null. Returns `Err` only when the binding is present but not
+/// a string.
+///
+/// # Errors
+///
+/// Returns [`CfSecretError::NotString`] when the binding is present but not
 /// a string.
 pub fn optional_string(env: &JsValue, binding: &str) -> Result<Option<String>, CfSecretError> {
     let Ok(value) = Reflect::get(env, &JsValue::from_str(binding)) else {

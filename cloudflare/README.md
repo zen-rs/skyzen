@@ -21,14 +21,14 @@ Cloudflare Workers service implementations for the Skyzen framework.
 | `CfQueue` | `MessageQueue` | [Queues](https://developers.cloudflare.com/queues/) |
 | `CfD1` | `DbBackend` + raw D1 API | [D1](https://developers.cloudflare.com/d1/) |
 | `CfCache` | raw Cache API | [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) |
-| `CfDurableSqlite` | — (direct SQL API) | [Durable Objects SQLite](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
+| `CfDurableDb` | `DurableDbBackend` | [Durable Objects SQLite](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
 
 ## Usage
 
 All types are created from the Workers environment using binding names:
 
 ```rust
-use skyzen_cloudflare::{CfCache, CfD1, CfDurableSqlite, CfKv, CfQueue, CfR2};
+use skyzen_cloudflare::{CfCache, CfD1, CfDurableDb, CfKv, CfQueue, CfR2};
 
 // From a Workers request handler (env is a JsValue):
 let kv = CfKv::from_env(&env, "MY_KV")?;
@@ -119,17 +119,24 @@ helpers are designed to be awaited directly inside Skyzen handlers without leaki
 
 ### Durable Object SQLite
 
-For SQL storage inside Durable Object classes using `state.storage.sql`:
+For SQL storage inside Durable Object classes using `state.storage.sql`, with
+bind parameters and row deserialization:
 
 ```rust
-let sql = CfDurableSqlite::from_state(&state)?;
-let cursor = sql.exec("CREATE TABLE IF NOT EXISTS counter (id TEXT PRIMARY KEY, value INTEGER)")?;
+use skyzen_services::durable::DurableDb;
+
+let db = DurableDb::new(CfDurableDb::from_state(&state)?);
+db.execute(
+    "CREATE TABLE IF NOT EXISTS counter (id TEXT PRIMARY KEY, value INTEGER)",
+    &[],
+)
+.await?;
 ```
 
 ## D1 vs Durable Object SQLite
 
-| Feature | `CfD1` | `CfDurableSqlite` |
-|---------|--------|-------------------|
+| Feature | `CfD1` | `CfDurableDb` |
+|---------|--------|---------------|
 | Scope | Global (Workers env binding) | Per-object instance |
 | Access | Via `env` in request handler | Via `state` in DO class |
 | Use case | Shared relational data | Per-entity state |
