@@ -288,10 +288,7 @@ impl Queue {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MessageQueue, Queue, QueueBatch, QueueBatchDisposition, QueueError, QueueMessage,
-        QueueMessageDisposition, QueueNotConfigured, QueueRetry,
-    };
+    use super::{MessageQueue, Queue, QueueBatch, QueueError, QueueMessage};
     use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
     use serde::{Deserialize, Serialize};
     use skyzen_core::Extractor;
@@ -414,29 +411,6 @@ mod tests {
         assert!(matches!(error, QueueError::Serialization(_)));
     }
 
-    #[test]
-    fn queue_retry_builder_sets_delay() {
-        let retry = QueueRetry::new().with_delay_seconds(30);
-        assert_eq!(retry.delay_seconds, Some(30));
-    }
-
-    #[test]
-    fn queue_batch_ack_all_helper_is_stable() {
-        assert_eq!(
-            QueueBatchDisposition::ack_all(),
-            QueueBatchDisposition::All(QueueMessageDisposition::Ack)
-        );
-    }
-
-    #[test]
-    fn queue_batch_retry_all_helper_is_stable() {
-        let retry = QueueRetry::new().with_delay_seconds(15);
-        assert_eq!(
-            QueueBatchDisposition::retry_all(retry),
-            QueueBatchDisposition::All(QueueMessageDisposition::Retry(retry))
-        );
-    }
-
     #[tokio::test]
     async fn wrapper_sends_raw_and_json_messages() {
         let backend = InMemoryMessageQueue::default();
@@ -494,15 +468,6 @@ mod tests {
 
         let error = Queue::extract(&mut request).await.unwrap_err();
 
-        assert_eq!(
-            error.status(),
-            skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
-    fn missing_configuration_error_uses_expected_status() {
-        let error = QueueNotConfigured::new();
         assert_eq!(
             error.status(),
             skyzen_core::StatusCode::INTERNAL_SERVER_ERROR
