@@ -273,7 +273,7 @@ renamed_classes = [{ from = "Old", to = "New" }]
 |-----|------|-------------|
 | `tag` | string | **Required.** Migration version tag (e.g. `"v1"`, `"v2"`) — bump whenever class definitions change |
 | `new_classes` | string[] | Classes to create (standard storage) |
-| `new_sqlite_classes` | string[] | Classes to create (SQLite storage, for `CfDurableSqlite`) |
+| `new_sqlite_classes` | string[] | Classes to create (SQLite-backed Durable Object storage) |
 | `deleted_classes` | string[] | Classes to remove |
 | `renamed_classes` | object[] | Classes to rename (`{ from = "Old", to = "New" }`) |
 

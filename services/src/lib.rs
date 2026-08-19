@@ -28,7 +28,7 @@
 // wasm32 targets — sqlx is a non-wasm dependency, and all driver-backed code in
 // `sql.rs` is additionally gated on `not(target_arch = "wasm32")`. On wasm,
 // use cloud vendor database services instead (for Cloudflare, use
-// skyzen-cloudflare::CfD1 or CfDurableSqlite / skyzen_services::durable::DurableDb).
+// skyzen-cloudflare::CfD1 or skyzen_services::durable::DurableDb).
 
 #[macro_use]
 mod macros;
