@@ -6,7 +6,9 @@ use skyzen::durable::{
 use wasm_bindgen::{JsCast, JsValue};
 use worker_sys::ext::WebSocketExt;
 
-struct SendSyncDurableState(worker_sys::DurableObjectState);
+/// A `Send`/`Sync` wrapper around a Durable Object state handle, shared by
+/// the websocket and state adapters.
+pub(crate) struct SendSyncDurableState(pub(crate) worker_sys::DurableObjectState);
 
 // SAFETY: Workers WASM executes on a single thread; JS handles are safe to mark Send/Sync.
 unsafe impl Send for SendSyncDurableState {}
