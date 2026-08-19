@@ -189,10 +189,10 @@ JSON responses are automatically pretty-printed in snapshots. Manage snapshots w
 Load test data from JSON strings:
 
 ```rust
-use skyzen_test::fixtures::{from_json_str, from_json_array};
+use skyzen_test::fixtures::from_json_str;
 
 let user: User = from_json_str(r#"{"id": 1, "name": "alice"}"#).unwrap();
-let users: Vec<User> = from_json_array(r#"[{"id": 1, "name": "alice"}]"#).unwrap();
+let users: Vec<User> = from_json_str(r#"[{"id": 1, "name": "alice"}]"#).unwrap();
 ```
 
 ## Full Example
