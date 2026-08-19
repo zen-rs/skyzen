@@ -1,7 +1,9 @@
 //! Integration tests for the `#[skyzen::test]` macro.
 
+use serde::{Deserialize, Serialize};
 use skyzen::{
     routing::{CreateRouteNode, Route, Router},
+    utils::Form,
     Result,
 };
 use skyzen_services::Kv;
@@ -25,4 +27,34 @@ async fn injects_mock_kv_into_test_context(kv: Kv, ctx: TestContext) {
     let response = ctx.client(app()).get("/greeting").send().await;
     response.assert_status(200);
     response.assert_body_contains("hello from macro");
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Login {
+    user: String,
+    remember: bool,
+}
+
+async fn submit_login(Form(login): Form<Login>) -> Result<String> {
+    Ok(format!("user={};remember={}", login.user, login.remember))
+}
+
+fn form_app() -> Router {
+    Route::new(("/login".post(submit_login),)).build()
+}
+
+#[skyzen::test]
+async fn form_helper_drives_the_form_extractor(ctx: TestContext) {
+    let response = ctx
+        .client(form_app())
+        .post("/login")
+        .form(&Login {
+            user: "amélie".to_owned(),
+            remember: true,
+        })
+        .send()
+        .await;
+
+    response.assert_status(200);
+    response.assert_body_contains("user=amélie;remember=true");
 }
