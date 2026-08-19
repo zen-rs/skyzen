@@ -15,9 +15,9 @@ use crate::{Body, BodyError, Endpoint, HttpError, StatusCode};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-/// Alias matching the WinterCG request object.
+/// Alias matching the `WinterCG` request object.
 pub type Request = web_sys::Request;
-/// Alias for the WinterCG response object.
+/// Alias for the `WinterCG` response object.
 pub type Response = web_sys::Response;
 /// Alias for arbitrary environment bindings.
 pub type Env = JsValue;
@@ -31,10 +31,11 @@ thread_local! {
     static CACHED_ENDPOINT: RefCell<Option<Box<dyn std::any::Any>>> = const { RefCell::new(None) };
 }
 
-/// Get the current WinterCG env during endpoint construction.
+/// Get the current `WinterCG` env during endpoint construction.
 /// Can be called multiple times during the factory call in the fetch handler.
+#[must_use]
 pub fn current_env() -> Option<JsValue> {
-    CURRENT_ENV.with_borrow(|env| env.clone())
+    CURRENT_ENV.with_borrow(std::clone::Clone::clone)
 }
 
 fn set_current_env(env: JsValue) {
@@ -53,7 +54,7 @@ impl Drop for CurrentEnvGuard {
     }
 }
 
-/// Wrapper for WinterCG env, usable in request extensions.
+/// Wrapper for `WinterCG` env, usable in request extensions.
 /// SAFETY: WASM is single-threaded, so Send+Sync is safe.
 #[derive(Clone, Debug)]
 pub struct WasmEnv(JsValue);
@@ -62,19 +63,21 @@ unsafe impl Send for WasmEnv {}
 unsafe impl Sync for WasmEnv {}
 
 impl WasmEnv {
-    /// Wrap a raw WinterCG environment value.
+    /// Wrap a raw `WinterCG` environment value.
     #[must_use]
-    pub fn new(env: JsValue) -> Self {
+    pub const fn new(env: JsValue) -> Self {
         Self(env)
     }
 
-    /// Get the inner JsValue.
+    /// Get the inner `JsValue`.
+    #[must_use]
     pub fn into_inner(self) -> JsValue {
         self.0
     }
 
-    /// Get a reference to the inner JsValue.
-    pub fn as_js(&self) -> &JsValue {
+    /// Get a reference to the inner `JsValue`.
+    #[must_use]
+    pub const fn as_js(&self) -> &JsValue {
         &self.0
     }
 }
@@ -106,12 +109,17 @@ pub fn with_current_env<T>(env: JsValue, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Bridge the annotated endpoint into the WinterCG `fetch` contract.
+/// Bridge the annotated endpoint into the `WinterCG` `fetch` contract.
 ///
-/// The factory receives the WinterCG environment explicitly (instead of via an ambient
+/// The factory receives the `WinterCG` environment explicitly (instead of via an ambient
 /// thread-local), so concurrent invocations on the same isolate cannot race each other's
 /// environment while the factory awaits. The built endpoint is cached per isolate thread and
 /// cloned for each request, so the router and service bindings are constructed only once.
+///
+/// # Errors
+///
+/// Returns a `JsValue` error when the incoming request or outgoing response
+/// cannot be converted across the JS boundary.
 pub async fn launch<Fut, E>(
     factory: impl FnOnce(Env) -> Fut,
     request: Request,
@@ -122,13 +130,12 @@ where
     Fut: Future<Output = E>,
     E: Endpoint + Clone + 'static,
 {
-    let endpoint = match cached_endpoint::<E>() {
-        Some(endpoint) => endpoint,
-        None => {
-            let endpoint = factory(env.clone()).await;
-            store_cached_endpoint(endpoint.clone());
-            endpoint
-        }
+    let endpoint = if let Some(endpoint) = cached_endpoint::<E>() {
+        endpoint
+    } else {
+        let endpoint = factory(env.clone()).await;
+        store_cached_endpoint(endpoint.clone());
+        endpoint
     };
 
     serve(endpoint, request, env, ctx).await
@@ -155,23 +162,23 @@ async fn serve<E>(
 where
     E: Endpoint + Clone + 'static,
 {
-    let mut sky_request = convert_request(request).await?;
+    let mut sky_request = convert_request(&request)?;
     // Make WinterCG env available via request extensions
     sky_request.extensions_mut().insert(WasmEnv::new(env));
 
     let response = match endpoint.respond(&mut sky_request).await {
         Ok(response) => response,
-        Err(error) => error_to_response(error),
+        Err(error) => error_to_response(&error),
     };
 
-    convert_response(response).await
+    convert_response(response)
 }
 
-/// Convert an HttpError to an HTTP response.
+/// Convert an `HttpError` to an HTTP response.
 ///
 /// For server errors (5xx), the error message is hidden to avoid leaking internals.
 /// For client errors (4xx) and others, the error message is included in the response.
-fn error_to_response(error: impl HttpError) -> crate::Response {
+fn error_to_response(error: &impl HttpError) -> crate::Response {
     let status = error.status();
     let error_message = error.to_string();
 
@@ -205,7 +212,7 @@ fn error_to_response(error: impl HttpError) -> crate::Response {
     response
 }
 
-async fn convert_request(request: Request) -> Result<crate::Request, JsValue> {
+fn convert_request(request: &Request) -> Result<crate::Request, JsValue> {
     let method = request
         .method()
         .parse::<http::Method>()
@@ -231,12 +238,12 @@ async fn convert_request(request: Request) -> Result<crate::Request, JsValue> {
     }
 
     let http_request = builder
-        .body(request_body(request)?)
+        .body(request_body(request))
         .map_err(|error| JsValue::from_str(&format!("Failed to build request: {error}")))?;
     Ok(crate::Request::from(http_request))
 }
 
-async fn convert_response(response: crate::Response) -> Result<Response, JsValue> {
+fn convert_response(response: crate::Response) -> Result<Response, JsValue> {
     // Only the websocket-extension handling below needs mutable access.
     #[cfg(feature = "ws")]
     let mut response = response;
@@ -280,7 +287,7 @@ async fn convert_response(response: crate::Response) -> Result<Response, JsValue
     init.set_status_text(response.status().canonical_reason().unwrap_or("OK"));
 
     let headers = web_sys::Headers::new()?;
-    for (key, value) in response.headers().iter() {
+    for (key, value) in response.headers() {
         // Header values are not guaranteed to be ASCII; use a lossy UTF-8 view rather than
         // silently dropping non-ASCII values.
         headers.append(key.as_str(), &String::from_utf8_lossy(value.as_bytes()))?;
@@ -291,13 +298,13 @@ async fn convert_response(response: crate::Response) -> Result<Response, JsValue
     Response::new_with_opt_readable_stream_and_init(Some(&body), &init)
 }
 
-fn request_body(request: Request) -> Result<Body, JsValue> {
+fn request_body(request: &Request) -> Body {
     let Some(raw_stream) = request.body() else {
-        return Ok(Body::empty());
+        return Body::empty();
     };
 
     let stream = wasm_streams::ReadableStream::from_raw(raw_stream).into_stream();
-    Ok(Body::from_stream(JsReadableBody { inner: stream }))
+    Body::from_stream(JsReadableBody { inner: stream })
 }
 
 fn response_body_stream(body: Body) -> web_sys::ReadableStream {
@@ -310,6 +317,7 @@ struct JsReadableBody {
 }
 
 // SAFETY: WinterCG WASM request streams are confined to the single-threaded JS event loop.
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for JsReadableBody {}
 // SAFETY: `JsReadableBody` is only polled by the single-threaded WASM runtime.
 unsafe impl Sync for JsReadableBody {}
@@ -320,8 +328,8 @@ impl Stream for JsReadableBody {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner).poll_next(cx).map(|item| {
             item.map(|result| match result {
-                Ok(value) => js_value_to_body_bytes(value),
-                Err(error) => Err(body_stream_error(js_value_to_error_message(error))),
+                Ok(value) => js_value_to_body_bytes(&value),
+                Err(error) => Err(body_stream_error(js_value_to_error_message(&error))),
             })
         })
     }
@@ -336,16 +344,20 @@ impl Stream for BodyReadableStream {
     type Item = Result<JsValue, JsValue>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.body)
-            .poll_next(cx)
-            .map(|item| item.map(|result| result.map(bytes_to_js_value).map_err(body_error_to_js)))
+        Pin::new(&mut self.body).poll_next(cx).map(|item| {
+            item.map(|result| {
+                result
+                    .map(|bytes| bytes_to_js_value(&bytes))
+                    .map_err(|error| body_error_to_js(&error))
+            })
+        })
     }
 }
 
-fn js_value_to_body_bytes(value: JsValue) -> Result<Vec<u8>, BodyError> {
+fn js_value_to_body_bytes(value: &JsValue) -> Result<Vec<u8>, BodyError> {
     if value.is_instance_of::<js_sys::Uint8Array>() || value.is_instance_of::<js_sys::ArrayBuffer>()
     {
-        Ok(js_sys::Uint8Array::new(&value).to_vec())
+        Ok(js_sys::Uint8Array::new(value).to_vec())
     } else {
         Err(body_stream_error(
             "request body stream yielded a non-byte chunk",
@@ -353,15 +365,15 @@ fn js_value_to_body_bytes(value: JsValue) -> Result<Vec<u8>, BodyError> {
     }
 }
 
-fn bytes_to_js_value(bytes: bytes::Bytes) -> JsValue {
+fn bytes_to_js_value(bytes: &bytes::Bytes) -> JsValue {
     js_sys::Uint8Array::from(bytes.as_ref()).into()
 }
 
-fn body_error_to_js(error: BodyError) -> JsValue {
+fn body_error_to_js(error: &BodyError) -> JsValue {
     JsValue::from_str(&error.to_string())
 }
 
-fn js_value_to_error_message(value: JsValue) -> String {
+fn js_value_to_error_message(value: &JsValue) -> String {
     value
         .as_string()
         .unwrap_or_else(|| format!("request body stream read failed: {value:?}"))
