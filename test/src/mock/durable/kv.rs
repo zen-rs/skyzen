@@ -107,3 +107,109 @@ impl DurableKvStore for InMemoryDurableKv {
 fn lock_err<T>(_: T) -> DurableKvError {
     DurableKvError::Backend("lock poisoned".to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use skyzen_services::durable::kv::{DurableKvStore, DurableListOptions};
+
+    use super::InMemoryDurableKv;
+
+    async fn seeded() -> InMemoryDurableKv {
+        let kv = InMemoryDurableKv::new();
+        for key in ["a", "b", "c", "d"] {
+            kv.put(key, key.as_bytes()).await.unwrap();
+        }
+        kv
+    }
+
+    fn keys(entries: Vec<(String, Vec<u8>)>) -> Vec<String> {
+        entries.into_iter().map(|(key, _)| key).collect()
+    }
+
+    /// Pins the documented contract: `start` is **exclusive**.
+    #[tokio::test]
+    async fn list_start_bound_is_exclusive() {
+        let kv = seeded().await;
+        let entries = kv
+            .list(DurableListOptions {
+                start: Some("b"),
+                ..DurableListOptions::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(keys(entries), vec!["c", "d"]);
+    }
+
+    /// Pins the documented contract: `end` is **exclusive**.
+    #[tokio::test]
+    async fn list_end_bound_is_exclusive() {
+        let kv = seeded().await;
+        let entries = kv
+            .list(DurableListOptions {
+                end: Some("c"),
+                ..DurableListOptions::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(keys(entries), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn list_reverse_returns_descending_order() {
+        let kv = seeded().await;
+        let entries = kv
+            .list(DurableListOptions {
+                reverse: true,
+                ..DurableListOptions::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(keys(entries), vec!["d", "c", "b", "a"]);
+    }
+
+    /// `limit` applies after ordering, so a reverse listing keeps the
+    /// **highest** keys.
+    #[tokio::test]
+    async fn list_limit_truncates_after_ordering() {
+        let kv = seeded().await;
+
+        let ascending = kv
+            .list(DurableListOptions {
+                limit: Some(2),
+                ..DurableListOptions::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(keys(ascending), vec!["a", "b"]);
+
+        let descending = kv
+            .list(DurableListOptions {
+                limit: Some(2),
+                reverse: true,
+                ..DurableListOptions::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(keys(descending), vec!["d", "c"]);
+    }
+
+    #[tokio::test]
+    async fn list_combines_prefix_bounds_and_reverse() {
+        let kv = InMemoryDurableKv::new();
+        for key in ["p:1", "p:2", "p:3", "q:1"] {
+            kv.put(key, b"v").await.unwrap();
+        }
+
+        let entries = kv
+            .list(DurableListOptions {
+                prefix: Some("p:"),
+                start: Some("p:1"),
+                end: Some("p:3"),
+                reverse: true,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(keys(entries), vec!["p:2"]);
+    }
+}
