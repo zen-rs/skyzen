@@ -1,55 +1,30 @@
-//! Cloudflare control-plane API primitives used by any project that needs
-//! to manage Cloudflare resources (DNS records, Pages projects, Access
-//! applications, Workers routes, …) from a Rust host tool.
+//! Shared Cloudflare API response types and token-source configuration for
+//! Rust tools that talk to the Cloudflare control-plane API.
 //!
-//! The crate exposes:
+//! This is **not** a full API client — it carries no HTTP transport and no
+//! endpoint wrappers. The crate exposes:
 //!
-//! - [`CloudflareError`] — error type shared across every API call.
 //! - [`CfApiResponse`] / [`CfApiError`] — the common `{success, errors,
-//!   result}` envelope Cloudflare wraps every response in.
+//!   result}` envelope Cloudflare wraps every response in, with
+//!   [`CfApiResponse::into_result`] to unwrap it.
+//! - [`CloudflareError`] — the error type `into_result` produces, with
+//!   `From` conversions for IO and JSON errors.
 //! - [`TokenSource`] — marker indicating whether the caller holds a proper
 //!   API token (full permissions) or a wrangler-derived OAuth token
 //!   (limited to zones the user owns through dashboard login).
 //!
-//! Concrete high-level clients (DNS record CRUD, Access app lifecycle,
-//! Pages project creation) compose these primitives. This crate is
-//! deliberately kept as a small, stable kernel so that project-specific
-//! orchestration can live in downstream crates without pulling the
-//! primitives in through a private vendoring path.
+//! Concrete clients (HTTP transport, endpoint orchestration) live in
+//! downstream crates that build on these types.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Errors returned by Cloudflare admin operations.
+/// Errors produced when unwrapping Cloudflare API response envelopes.
 #[derive(Debug, Error)]
 pub enum CloudflareError {
-    /// An HTTP request failed before Cloudflare returned a structured API response.
-    #[error("HTTP request failed: {0}")]
-    Http(String),
-
     /// Cloudflare returned one or more API-level errors.
     #[error("API error: {0}")]
     Api(String),
-
-    /// The `wrangler` executable was not available on `PATH`.
-    #[error("wrangler not installed. Install with: npm install -g wrangler")]
-    WranglerNotInstalled,
-
-    /// A `wrangler` command exited unsuccessfully.
-    #[error("wrangler command failed: {0}")]
-    WranglerFailed(String),
-
-    /// Wrangler did not have an authenticated Cloudflare session.
-    #[error("not logged in to Cloudflare. Run: wrangler login")]
-    NotLoggedIn,
-
-    /// A response or configuration file could not be parsed.
-    #[error("failed to parse response: {0}")]
-    Parse(String),
-
-    /// The Cloudflare configuration directory could not be found.
-    #[error("config directory not found")]
-    ConfigDirNotFound,
 
     /// Filesystem IO failed while reading Cloudflare configuration.
     #[error("IO error: {0}")]
@@ -58,14 +33,6 @@ pub enum CloudflareError {
     /// JSON serialization or deserialization failed.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-
-    /// The provided API token lacks permissions required by the requested endpoint.
-    #[error(
-        "API token missing required permissions for {0}. \
-         Create a token at https://dash.cloudflare.com/profile/api-tokens \
-         with the appropriate scopes and set it as CLOUDFLARE_API_TOKEN."
-    )]
-    InsufficientPermissions(String),
 }
 
 /// Standard Cloudflare API response envelope: `{ success, errors, result }`.
@@ -92,6 +59,10 @@ impl<T> CfApiResponse<T> {
         if self.success {
             self.result
                 .ok_or_else(|| CloudflareError::Api("missing result payload".into()))
+        } else if self.errors.is_empty() {
+            Err(CloudflareError::Api(
+                "Cloudflare reported failure without error details".into(),
+            ))
         } else {
             let joined = self
                 .errors
@@ -123,4 +94,61 @@ pub enum TokenSource {
     /// permissions; only works against endpoints the interactive login
     /// scopes covered.
     WranglerOAuth,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn into_result_returns_payload_on_success() {
+        let response = CfApiResponse {
+            success: true,
+            errors: Vec::new(),
+            result: Some(42_u32),
+        };
+        assert_eq!(response.into_result().expect("payload"), 42);
+    }
+
+    #[test]
+    fn into_result_errors_when_success_lacks_payload() {
+        let response: CfApiResponse<u32> = CfApiResponse {
+            success: true,
+            errors: Vec::new(),
+            result: None,
+        };
+        let error = response.into_result().expect_err("missing payload");
+        assert!(error.to_string().contains("missing result payload"));
+    }
+
+    #[test]
+    fn into_result_joins_error_envelope_messages() {
+        let response: CfApiResponse<u32> = CfApiResponse {
+            success: false,
+            errors: vec![
+                CfApiError {
+                    code: 7003,
+                    message: "no such zone".into(),
+                },
+                CfApiError {
+                    code: 9109,
+                    message: "invalid token".into(),
+                },
+            ],
+            result: None,
+        };
+        let error = response.into_result().expect_err("error envelope");
+        assert_eq!(error.to_string(), "API error: no such zone, invalid token");
+    }
+
+    #[test]
+    fn into_result_explains_empty_error_envelope() {
+        let response: CfApiResponse<u32> = CfApiResponse {
+            success: false,
+            errors: Vec::new(),
+            result: None,
+        };
+        let error = response.into_result().expect_err("failure without details");
+        assert!(error.to_string().contains("failure without error details"));
+    }
 }
