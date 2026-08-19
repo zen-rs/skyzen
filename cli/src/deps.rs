@@ -17,7 +17,11 @@ struct DesiredDependency {
     disable_default_features: bool,
 }
 
-pub fn ensure_capability_deps(manifest: &LoadedManifest, provider: Option<Provider>) -> Result<()> {
+pub fn ensure_capability_deps(
+    manifest: &LoadedManifest,
+    provider: Option<Provider>,
+    dry_run: bool,
+) -> Result<()> {
     let cargo_toml_path = manifest.root_dir.join("Cargo.toml");
     if !cargo_toml_path.exists() {
         return Ok(());
@@ -71,8 +75,16 @@ pub fn ensure_capability_deps(manifest: &LoadedManifest, provider: Option<Provid
     }
 
     if changed {
-        fs::write(&cargo_toml_path, document.to_string())
-            .with_context(|| format!("failed to write {}", cargo_toml_path.display()))?;
+        if dry_run {
+            println!(
+                "[dry-run] would update {} with capability dependencies: {}",
+                cargo_toml_path.display(),
+                wanted.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        } else {
+            fs::write(&cargo_toml_path, document.to_string())
+                .with_context(|| format!("failed to write {}", cargo_toml_path.display()))?;
+        }
     }
 
     Ok(())
@@ -262,33 +274,8 @@ mod tests {
         CloudflareDatabaseSection, CloudflareSection, CloudflareServiceSection, DatabaseEntry,
         NativeDatabaseSection, NativeSection, NativeServiceSection, ServiceEntry, SkyzenManifest,
     };
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    fn temp_project_dir() -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-        path.push(format!("skyzen-cli-deps-{unique}"));
-        fs::create_dir_all(&path).expect("failed to create temp project dir");
-        path
-    }
-
-    #[test]
-    fn adds_required_dependencies_for_portable_services_and_database() {
-        let root_dir = temp_project_dir();
-        let cargo_toml = root_dir.join("Cargo.toml");
-        fs::write(
-            &cargo_toml,
-            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .expect("write Cargo.toml");
-
-        let manifest = LoadedManifest {
+    fn sample_manifest(root_dir: std::path::PathBuf) -> LoadedManifest {
+        LoadedManifest {
             root_dir,
             data: SkyzenManifest {
                 service: vec![ServiceEntry {
@@ -332,14 +319,37 @@ mod tests {
                     ..CloudflareSection::default()
                 }),
             },
-        };
+        }
+    }
 
-        ensure_capability_deps(&manifest, Some(Provider::Cloudflare)).expect("deps sync");
+    const SAMPLE_CARGO_TOML: &str =
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+    #[test]
+    fn adds_required_dependencies_for_portable_services_and_database() {
+        let dir = tempfile::tempdir().expect("create temp project dir");
+        let cargo_toml = dir.path().join("Cargo.toml");
+        fs::write(&cargo_toml, SAMPLE_CARGO_TOML).expect("write Cargo.toml");
+
+        let manifest = sample_manifest(dir.path().to_path_buf());
+        ensure_capability_deps(&manifest, Some(Provider::Cloudflare), false).expect("deps sync");
         let updated = fs::read_to_string(&cargo_toml).expect("read Cargo.toml");
         assert!(updated.contains("skyzen-services"));
         assert!(updated.contains("skyzen-redis"));
         assert!(updated.contains("skyzen-cloudflare"));
         assert!(updated.contains("runtime-tokio-rustls"));
         assert!(updated.contains("postgres"));
+    }
+
+    #[test]
+    fn dry_run_leaves_cargo_toml_untouched() {
+        let dir = tempfile::tempdir().expect("create temp project dir");
+        let cargo_toml = dir.path().join("Cargo.toml");
+        fs::write(&cargo_toml, SAMPLE_CARGO_TOML).expect("write Cargo.toml");
+
+        let manifest = sample_manifest(dir.path().to_path_buf());
+        ensure_capability_deps(&manifest, Some(Provider::Cloudflare), true).expect("deps sync");
+        let contents = fs::read_to_string(&cargo_toml).expect("read Cargo.toml");
+        assert_eq!(contents, SAMPLE_CARGO_TOML);
     }
 }
