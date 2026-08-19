@@ -104,7 +104,12 @@ pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
 
 // Re-exported for macro-generated registrations without requiring downstream crates to depend on
 // `linkme` directly.
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+//
+// NOTE: this and the `HANDLER_SPECS`/`HandlerSpec` items below are deliberately *not* gated on
+// the `openapi` feature: `#[skyzen::openapi]`-generated code in downstream crates references them
+// under `cfg(all(debug_assertions, not(target_arch = "wasm32")))` — a condition that cannot
+// depend on skyzen's features, because it is evaluated against the downstream crate.
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
 pub use linkme;
 
 mod builtins;
@@ -202,13 +207,13 @@ where
     }
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
 /// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
 #[linkme::distributed_slice]
 #[linkme(crate = ::skyzen::openapi::linkme)]
 pub static HANDLER_SPECS: [HandlerSpec] = [..];
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
 #[derive(Debug, Clone, Copy)]
 /// Metadata captured for every handler annotated with `#[skyzen::openapi]`.
 pub struct HandlerSpec {

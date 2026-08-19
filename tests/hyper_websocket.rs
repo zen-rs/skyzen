@@ -256,6 +256,62 @@ async fn websocket_uses_custom_max_message_size() {
 }
 
 #[tokio::test]
+async fn websocket_rejects_messages_exceeding_max_message_size() {
+    use skyzen::websocket::WebSocketError;
+
+    let (error_tx, error_rx) = tokio::sync::oneshot::channel::<WebSocketError>();
+    let error_tx = Arc::new(std::sync::Mutex::new(Some(error_tx)));
+
+    let (mut client, _, handle) = spawn_router(
+        Route::new(("/limited".at(move |upgrade: WebSocketUpgrade| {
+            let error_tx = Arc::clone(&error_tx);
+            async move {
+                upgrade
+                    .max_message_size(Some(8))
+                    .on_upgrade(move |mut socket| async move {
+                        while let Some(result) = socket.next().await {
+                            match result {
+                                Ok(_) => {}
+                                Err(error) => {
+                                    let sender = error_tx.lock().unwrap().take();
+                                    if let Some(tx) = sender {
+                                        let _ = tx.send(error);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    })
+            }
+        }),)),
+        "ws://localhost/limited",
+    )
+    .await;
+
+    // Well within the limit: no error is produced.
+    client
+        .send(Message::text("ok"))
+        .await
+        .expect("send small message");
+
+    // Exceeds the configured 8-byte cap: the server-side receive loop must surface an error.
+    client
+        .send(Message::text("x".repeat(64)))
+        .await
+        .expect("send oversized message");
+
+    let error = error_rx.await.expect("server never observed an error");
+    assert!(
+        matches!(error, WebSocketError::Protocol(_)),
+        "expected protocol error for oversized message, got: {error}"
+    );
+
+    let _ = client.close(None).await;
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn websocket_json_convenience_methods() {
     use serde::{Deserialize, Serialize};
 

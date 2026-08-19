@@ -52,7 +52,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(steps) => steps,
         Err(error) => return error.to_compile_error().into(),
     };
-    let native_factory = quote! {
+    let factory_body = quote! {
         async move {
             let endpoint = #entry_call;
             #(#datasource_wrap_steps)*
@@ -60,7 +60,16 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
             endpoint
         }
     };
-    let wasm_factory = native_factory.clone();
+    let native_factory = factory_body.clone();
+    // On wasm the factory receives the WinterCG env explicitly (as `__skyzen_wasm_env`), so
+    // endpoint construction never depends on an ambient thread-local that concurrent
+    // invocations could race.
+    let wasm_factory = quote! {
+        move |__skyzen_wasm_env: ::skyzen::runtime::wasm::Env| {
+            let _ = &__skyzen_wasm_env;
+            #factory_body
+        }
+    };
 
     let init_logging = if options.default_logger {
         quote! { ::skyzen::runtime::native::init_logging(); }
@@ -93,7 +102,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
             env: ::skyzen::runtime::wasm::Env,
             ctx: ::skyzen::runtime::wasm::ExecutionContext,
         ) -> Result<::skyzen::runtime::wasm::Response, ::skyzen::wasm_bindgen::JsValue> {
-            ::skyzen::runtime::wasm::launch(|| #wasm_factory, request, env, ctx).await
+            ::skyzen::runtime::wasm::launch(#wasm_factory, request, env, ctx).await
         }
     };
 
@@ -440,16 +449,21 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         fn_ident.to_string().to_uppercase()
     );
 
+    // All generated items are gated on `debug_assertions` + native targets only. The condition
+    // must not mention any cargo feature: these `cfg`s are evaluated against the *user's* crate
+    // features, and downstream crates have no feature named `openapi`. The referenced
+    // `::skyzen::openapi` symbols exist whenever skyzen itself is compiled for a native debug
+    // build, independent of skyzen's `openapi` feature.
     Ok(quote! {
         #function
 
-        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         const _: fn() = || {
             #(#assertions)*
         };
 
         #(
-            #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+            #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
             #schema_collector_defs
         )*
 
@@ -558,7 +572,11 @@ fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
         .collect::<syn::Result<Vec<_>>>()?;
     function.block.stmts.extend(original_body);
 
+    let manifest_tracking = manifest_tracking_tokens();
+
     Ok(quote! {
+        #manifest_tracking
+
         #function
 
         #(#outer_attrs)*
@@ -1375,10 +1393,24 @@ fn normalize_status_lit(lit: &LitInt) -> syn::Result<Expr> {
     let value = lit
         .base10_parse::<u16>()
         .map_err(|_| Error::new(lit.span(), "status code literal must fit within u16"))?;
+    validate_status_code(value, lit.span())?;
     Ok(parse_quote! {
         ::skyzen::StatusCode::from_u16(#value)
             .expect("invalid HTTP status code literal")
     })
+}
+
+/// Reject out-of-range HTTP status literals at expansion time instead of letting
+/// `StatusCode::from_u16` panic at runtime on every request.
+fn validate_status_code(value: u16, span: proc_macro2::Span) -> syn::Result<()> {
+    if (100..=999).contains(&value) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            span,
+            format!("invalid HTTP status code `{value}`: must be in the range 100..=999"),
+        ))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1941,7 +1973,11 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
         });
     }
 
+    let manifest_tracking = manifest_tracking_tokens();
+
     Ok(quote! {
+        #manifest_tracking
+
         #[doc(hidden)]
         pub mod __skyzen_config {
             #(#generated_items)*
@@ -1949,6 +1985,26 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
 
         pub use __skyzen_config::*;
     })
+}
+
+/// Emit a `const _: &str = include_str!(...)` referencing `Skyzen.toml` (when it exists) so
+/// cargo tracks the file and rebuilds when it changes; the `fs::read_to_string` performed by
+/// the proc macros is invisible to cargo's change detection.
+fn manifest_tracking_tokens() -> proc_macro2::TokenStream {
+    let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") else {
+        return proc_macro2::TokenStream::new();
+    };
+    let config_path = PathBuf::from(manifest_dir).join("Skyzen.toml");
+    if !config_path.exists() {
+        return proc_macro2::TokenStream::new();
+    }
+    let path_lit = LitStr::new(
+        &config_path.display().to_string(),
+        proc_macro2::Span::call_site(),
+    );
+    quote! {
+        const _: &str = include_str!(#path_lit);
+    }
 }
 
 fn datasource_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>> {
@@ -1996,11 +2052,9 @@ fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>>
     let mut steps = Vec::with_capacity(services.len() + databases.len() + 1);
     let mut seen_service_types = HashSet::new();
 
-    steps.push(quote! {
-        #[cfg(target_arch = "wasm32")]
-        let __skyzen_wasm_env = ::skyzen::runtime::wasm::current_env()
-            .expect("WinterCG env not available during portable capability initialization");
-    });
+    // On wasm, `__skyzen_wasm_env` is bound by the factory closure parameter generated in
+    // `#[skyzen::main]`; the environment is threaded explicitly rather than read from a
+    // thread-local that concurrent invocations could race.
 
     for service in &services {
         if !seen_service_types.insert(service.service_type) {
@@ -3054,8 +3108,9 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                     let state = #clone_state_ident(&self.state);
                     let env = #clone_env_ident(&self.env);
                     ::skyzen::wasm_bindgen_futures::future_to_promise(async move {
-                        let code = u16::try_from(code)
-                            .expect("Cloudflare websocket close code must fit within u16");
+                        // Clamp out-of-range close codes to 1005 ("no status received") rather
+                        // than panicking inside the Durable Object event path.
+                        let code = u16::try_from(code).unwrap_or(1005);
                         ::skyzen_cloudflare::durable::invoke_websocket_close::<#self_ident>(
                             state,
                             env,
@@ -3325,6 +3380,27 @@ binding = "DB"
                 .to_string()
                 .contains("cannot mark more than one database as `default = true`")
         );
+    }
+
+    #[test]
+    fn status_code_literals_are_validated_at_expansion_time() {
+        use super::{normalize_status_lit, validate_status_code};
+        use proc_macro2::Span;
+
+        assert!(validate_status_code(100, Span::call_site()).is_ok());
+        assert!(validate_status_code(404, Span::call_site()).is_ok());
+        assert!(validate_status_code(999, Span::call_site()).is_ok());
+
+        assert!(validate_status_code(0, Span::call_site()).is_err());
+        assert!(validate_status_code(1000, Span::call_site()).is_err());
+        let error = validate_status_code(99, Span::call_site()).unwrap_err();
+        assert!(error.to_string().contains("must be in the range 100..=999"));
+
+        let valid: syn::LitInt = parse_quote!(404);
+        assert!(normalize_status_lit(&valid).is_ok());
+        let invalid: syn::LitInt = parse_quote!(99);
+        let error = normalize_status_lit(&invalid).unwrap_err();
+        assert!(error.to_string().contains("invalid HTTP status code `99`"));
     }
 
     #[test]

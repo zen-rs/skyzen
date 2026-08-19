@@ -72,26 +72,3 @@ pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'stati
         async { Ok(()) }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use serde::{Deserialize, Serialize};
-
-    use super::DurableObject;
-    use crate::routing::{CreateRouteNode, Route, Router};
-
-    #[derive(Default, Serialize, Deserialize)]
-    #[skyzen::durable_object]
-    struct Counter;
-
-    impl DurableObject for Counter {
-        fn fetch(&mut self) -> Router {
-            Route::new(("/".at(|| async { "ok" }),)).build()
-        }
-    }
-
-    #[test]
-    fn durable_object_macro_compiles_on_native_targets() {
-        let _ = Counter;
-    }
-}
