@@ -152,9 +152,14 @@ pub struct CfDurableObjects {
     pub migrations: Vec<CfDurableMigration>,
 }
 
+/// A `[[cloudflare.durable_objects.bindings]]` entry.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct CfDurableBinding {
     pub name: String,
+    /// The Rust struct name of the `#[skyzen::durable_object]` type (e.g.
+    /// `Room`). The macro exports the class as `{struct}Object` from the wasm
+    /// bindings and the generated worker shim re-exports it under this name,
+    /// which is also what wrangler sees. Do NOT append `Object` yourself.
     pub class_name: String,
     pub script_name: Option<String>,
 }

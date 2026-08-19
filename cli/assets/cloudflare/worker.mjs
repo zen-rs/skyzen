@@ -1,19 +1,24 @@
-import init, { fetch as wasmFetch } from "./__SKYZEN_BINDINGS_JS__";
+import init, * as wasmExports from "./__SKYZEN_BINDINGS_JS__";
 import wasmUrl from "./__SKYZEN_WASM__";
 __SKYZEN_DURABLE_EXPORTS__
 
 let initPromise;
 
-async function ensureInitialized() {
+function ensureInitialized() {
   if (!initPromise) {
     initPromise = init({ module_or_path: wasmUrl });
   }
-  await initPromise;
+  return initPromise;
 }
+
+// Durable Object classes are constructed by the runtime before any handler
+// runs, so the wasm module must be ready at module load. Workers ESM supports
+// top-level await; the awaits inside each handler are a safety net.
+await ensureInitialized();
 
 export default {
   async fetch(request, env, ctx) {
     await ensureInitialized();
-    return wasmFetch(request, env, ctx);
+    return wasmExports.fetch(request, env, ctx);
   },
-};
+__SKYZEN_EVENT_EXPORTS__};

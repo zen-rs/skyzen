@@ -19,9 +19,15 @@ extern "C" {
     #[wasm_bindgen(method, catch)]
     pub fn get(this: &KvNamespace, key: &str, options: &JsValue) -> Result<Promise, JsValue>;
 
-    /// Put a key-value pair. Returns a promise.
+    /// Put a key-value pair with options (e.g. `{ expirationTtl }`). Pass
+    /// `JsValue::UNDEFINED` as `options` for a plain put. Returns a promise.
     #[wasm_bindgen(method, catch)]
-    pub fn put(this: &KvNamespace, key: &str, value: &JsValue) -> Result<Promise, JsValue>;
+    pub fn put(
+        this: &KvNamespace,
+        key: &str,
+        value: &JsValue,
+        options: &JsValue,
+    ) -> Result<Promise, JsValue>;
 
     /// Delete a key. Returns a promise.
     #[wasm_bindgen(method, catch)]
@@ -47,4 +53,25 @@ pub fn get_binding(env: &JsValue, name: &str) -> Result<JsValue, JsValue> {
         )));
     }
     Ok(binding)
+}
+
+/// Duck-type check that a binding exposes the given methods.
+///
+/// A wrongly typed binding (e.g. an R2 bucket wired to a KV service) fails
+/// with a clear error at startup instead of an opaque JS error on first use.
+///
+/// # Errors
+///
+/// Returns `JsValue` naming the first missing method.
+pub fn require_methods(binding: &JsValue, name: &str, methods: &[&str]) -> Result<(), JsValue> {
+    for method in methods {
+        let value = js_sys::Reflect::get(binding, &JsValue::from_str(method))?;
+        if !value.is_function() {
+            return Err(JsValue::from_str(&format!(
+                "Cloudflare Workers binding '{name}' has no `{method}` method; \
+                 is it bound to the right service type?"
+            )));
+        }
+    }
+    Ok(())
 }

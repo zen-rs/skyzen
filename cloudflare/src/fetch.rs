@@ -12,11 +12,16 @@ pub struct CfFetch;
 
 impl CfFetch {
     /// Create a new global fetch wrapper.
+    #[must_use]
     pub const fn new() -> Self {
         Self
     }
 
     /// Dispatch a request through the Worker global `fetch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfFetchError::Backend`] when the fetch or body read fails.
     pub fn request<'a>(
         &'a self,
         request: &'a Request,
@@ -38,6 +43,12 @@ impl CfFetch {
     }
 
     /// Dispatch a request and return the body as bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfFetchError::Backend`] when the fetch or body read fails.
+    // The explicit `impl Future + Send` return is part of the API contract.
+    #[allow(clippy::manual_async_fn)]
     pub fn request_bytes<'a>(
         &'a self,
         request: &'a Request,
@@ -49,6 +60,12 @@ impl CfFetch {
     }
 
     /// Dispatch a request and return the body as text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfFetchError::Backend`] when the fetch or body read fails.
+    // The explicit `impl Future + Send` return is part of the API contract.
+    #[allow(clippy::manual_async_fn)]
     pub fn request_text<'a>(
         &'a self,
         request: &'a Request,
@@ -60,6 +77,12 @@ impl CfFetch {
     }
 
     /// Dispatch a request and deserialize the body as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfFetchError::Backend`] when the fetch or body read fails.
+    // The explicit `impl Future + Send` return is part of the API contract.
+    #[allow(clippy::manual_async_fn)]
     pub fn request_json<'a, T>(
         &'a self,
         request: &'a Request,
@@ -91,10 +114,12 @@ impl std::fmt::Display for CfFetchError {
 
 impl std::error::Error for CfFetchError {}
 
+#[allow(clippy::needless_pass_by_value)]
 fn js_err(error: wasm_bindgen::JsValue) -> CfFetchError {
     CfFetchError::Backend(format!("{error:?}"))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn worker_err(error: worker::Error) -> CfFetchError {
     CfFetchError::Backend(error.to_string())
 }

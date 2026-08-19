@@ -21,3 +21,22 @@ pub enum CfDatabaseError {
 pub(crate) fn js_err(e: JsValue) -> CfDatabaseError {
     CfDatabaseError::Backend(format!("{e:?}"))
 }
+
+/// Convert an `i64` SQL parameter into a JS number, rejecting values outside
+/// the JS safe-integer range (`±2^53 - 1`) that would silently lose
+/// precision. Shared by the D1 and Durable Object `SQLite` backends.
+pub(crate) fn integer_to_js_number(value: i64) -> Result<JsValue, String> {
+    const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+    const MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
+
+    if !(MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value) {
+        return Err(format!(
+            "integer parameter exceeds JavaScript safe integer range: {value}"
+        ));
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    {
+        Ok(JsValue::from_f64(value as f64))
+    }
+}
