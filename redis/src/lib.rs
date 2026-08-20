@@ -18,6 +18,11 @@
 //!
 //! - `runtime-tokio` — Use Tokio as the async runtime
 //! - `runtime-smol` — Use Smol as the async runtime
+//!
+//! At least one of them must be enabled; with neither, this crate exposes
+//! nothing (the upstream `redis` crate cannot build its async support without
+//! a runtime).
+#![cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
 
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};

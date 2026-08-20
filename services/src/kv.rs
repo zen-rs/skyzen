@@ -366,7 +366,7 @@ mod tests {
         let kv = Kv::new(InMemoryKeyValueStore::default());
 
         let error = kv
-            .put_with_ttl("key", b"value", core::time::Duration::from_secs(60))
+            .put_with_ttl("key", b"value", core::time::Duration::from_mins(1))
             .await
             .unwrap_err();
         assert!(matches!(error, KvError::Unsupported(_)));

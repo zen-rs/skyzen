@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn expires_at_adds_whole_seconds() {
         assert_eq!(
-            expires_at_epoch_seconds(100, Duration::from_secs(60)).unwrap(),
+            expires_at_epoch_seconds(100, Duration::from_mins(1)).unwrap(),
             160
         );
     }

@@ -181,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn positive_ttl_keeps_the_value_visible_until_expiry() {
         let kv = InMemoryKv::new();
-        kv.put_with_ttl("session", b"data", Duration::from_secs(3600))
+        kv.put_with_ttl("session", b"data", Duration::from_hours(1))
             .await
             .unwrap();
 
