@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn ttl_seconds_converts_whole_seconds() {
-        assert_eq!(ttl_seconds(Duration::from_secs(3600)).unwrap(), 3600);
+        assert_eq!(ttl_seconds(Duration::from_hours(1)).unwrap(), 3600);
     }
 
     #[test]

@@ -91,7 +91,9 @@ jobs:
           cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}"
 
       - name: Build worker example
-        run: cargo build --example worker --release --target wasm32-unknown-unknown --no-default-features --features json,form
+        # `-p skyzen` is required: without it cargo builds every default
+        # workspace member, and the native-only ones do not compile for wasm32.
+        run: cargo build -p skyzen --example worker --release --target wasm32-unknown-unknown --no-default-features --features json,form
 
       - name: Generate bindings
         run: |
