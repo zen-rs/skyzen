@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/zen-rs/skyzen/compare/v0.1.1...v0.1.2) - 2026-08-19
+
+### Added
+
+- *(macros)* interpolate fields in #[skyzen::error] messages
+
+### Fixed
+
+- *(license)* dual-license the root crate like the rest of the workspace
+- *(cloudflare)* drop unnecessary mut on durable router binding
+
+### Other
+
+- correct README extractor list and OpenAPI gating
+- add AGENTS.md and ignore .codex/
+- rewrite README
+
 ## [0.1.1](https://github.com/zen-rs/skyzen/compare/v0.1.0...v0.1.1) - 2025-12-10
 
 ### Other
