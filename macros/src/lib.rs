@@ -77,6 +77,13 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // The runtime always takes a shutdown hook; without `on_shutdown` it is a no-op, so there is
+    // one launch path rather than two.
+    let shutdown_hook = options
+        .on_shutdown
+        .as_ref()
+        .map_or_else(|| quote! { || async {} }, |path| quote! { || #path() });
+
     let output = quote! {
         ::skyzen::import_config!();
 
@@ -87,7 +94,11 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
             #init_logging
             let __skyzen_listen_addr =
                 ::skyzen::runtime::native::apply_cli_overrides(::std::env::args());
-            ::skyzen::runtime::native::launch(__skyzen_listen_addr, || #native_factory);
+            ::skyzen::runtime::native::launch(
+                __skyzen_listen_addr,
+                || #native_factory,
+                #shutdown_hook,
+            );
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -2874,32 +2885,46 @@ fn default_database_index(databases: &[DatabaseConfig]) -> syn::Result<Option<us
 
 struct MainOptions {
     default_logger: bool,
+    /// Path to an async function run once the server has finished draining.
+    on_shutdown: Option<syn::Path>,
 }
 
 impl MainOptions {
     fn from_args(args: &Punctuated<MetaNameValue, Token![,]>) -> syn::Result<Self> {
         let mut options = Self {
             default_logger: true,
+            on_shutdown: None,
         };
 
         for meta in args {
-            if !meta.path.is_ident("default_logger") {
-                return Err(Error::new_spanned(
-                    &meta.path,
-                    "unsupported option, expected `default_logger = true|false`",
-                ));
-            }
-
-            let value = match &meta.value {
-                Expr::Lit(ExprLit {
+            if meta.path.is_ident("default_logger") {
+                let Expr::Lit(ExprLit {
                     lit: Lit::Bool(bool_lit),
                     ..
-                }) => bool_lit.value,
-                other => {
-                    return Err(Error::new_spanned(other, "expected boolean literal"));
+                }) = &meta.value
+                else {
+                    return Err(Error::new_spanned(&meta.value, "expected boolean literal"));
+                };
+                options.default_logger = bool_lit.value;
+            } else if meta.path.is_ident("on_shutdown") {
+                let Expr::Path(path) = &meta.value else {
+                    return Err(Error::new_spanned(
+                        &meta.value,
+                        "expected the path of an async function, such as                          `on_shutdown = flush_pool`",
+                    ));
+                };
+                if options.on_shutdown.replace(path.path.clone()).is_some() {
+                    return Err(Error::new_spanned(
+                        &meta.path,
+                        "duplicate `on_shutdown` argument",
+                    ));
                 }
-            };
-            options.default_logger = value;
+            } else {
+                return Err(Error::new_spanned(
+                    &meta.path,
+                    "unsupported option, expected `default_logger = true|false` or                      `on_shutdown = <async fn path>`",
+                ));
+            }
         }
 
         Ok(options)

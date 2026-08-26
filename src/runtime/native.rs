@@ -10,6 +10,7 @@ use std::{
 use crate::{extract::PeerAddr, Endpoint};
 use async_channel::{bounded, Receiver};
 use async_net::TcpListener;
+use core::convert::Infallible;
 use executor_core::{
     smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
 };
@@ -25,6 +26,7 @@ use hyper::{
     server::conn::{http1, http2},
     service::Service,
 };
+use skyzen_hyper::AsyncIoTimer;
 use tracing::{debug, error, info, warn};
 use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -316,15 +318,37 @@ fn shutdown_signal() -> Receiver<()> {
     rx
 }
 
+/// How long outstanding connections are given to finish after the accept loop stops.
+///
+/// A request still streaming a response when the deadline elapses is severed; the runtime says
+/// so in its final log line rather than claiming a graceful shutdown.
+pub const SHUTDOWN_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the accept loop had left to clean up when it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shutdown {
+    /// Connections still in flight when the grace period elapsed, and therefore cut off.
+    pub severed: usize,
+}
+
 /// Build the executor and serve the provided endpoint over Hyper.
+///
+/// After `Ctrl+C` the listener stops accepting, outstanding connections are awaited for up to
+/// [`SHUTDOWN_GRACE_PERIOD`], and only then does `on_shutdown` run — so a cleanup hook observes a
+/// server with no requests still in flight.
 ///
 /// # Panics
 ///
 /// Panics if the global executor fails to initialize.
-pub fn launch<Fut, E>(addr: Option<SocketAddr>, factory: impl FnOnce() -> Fut)
-where
+pub fn launch<Fut, E, Hook, HookFut>(
+    addr: Option<SocketAddr>,
+    factory: impl FnOnce() -> Fut,
+    on_shutdown: Hook,
+) where
     Fut: Future<Output = E> + Send + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
+    Hook: FnOnce() -> HookFut,
+    HookFut: Future<Output = ()>,
 {
     let executor = SmolGlobal;
     if try_init_global_executor(executor).is_err() {
@@ -337,13 +361,39 @@ where
         let endpoint = factory().await;
         let addr = addr.unwrap_or_else(server_addr);
         match run_server(executor, endpoint, addr).await {
-            Ok(()) => info!("Skyzen server shut down gracefully"),
+            Ok(Shutdown { severed: 0 }) => info!("Skyzen server shut down gracefully"),
+            Ok(Shutdown { severed }) => warn!(
+                connections = severed,
+                grace_period_secs = SHUTDOWN_GRACE_PERIOD.as_secs(),
+                "Shutdown deadline elapsed with connections still in flight; they were severed"
+            ),
             Err(error) => error!("Skyzen server terminated: {error}"),
         }
+
+        on_shutdown().await;
     });
 }
 
-async fn run_server<Exec, E>(executor: Exec, endpoint: E, addr: SocketAddr) -> std::io::Result<()>
+/// Wait for every connection task to finish, or for the grace period to elapse.
+///
+/// Each connection task holds a clone of the channel's sender, so `recv` resolves — with a
+/// closed-channel error, since nothing is ever sent — exactly when the last one is dropped. The
+/// senders still alive at the deadline are the connections being cut off.
+async fn drain_connections(connections: &Receiver<Infallible>) -> usize {
+    let drained = std::pin::pin!(connections.recv());
+    let deadline = std::pin::pin!(async_io::Timer::after(SHUTDOWN_GRACE_PERIOD));
+
+    match futures_util::future::select(drained, deadline).await {
+        futures_util::future::Either::Left(..) => 0,
+        futures_util::future::Either::Right(..) => connections.sender_count(),
+    }
+}
+
+async fn run_server<Exec, E>(
+    executor: Exec,
+    endpoint: E,
+    addr: SocketAddr,
+) -> std::io::Result<Shutdown>
 where
     Exec: CoreExecutor + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
@@ -357,6 +407,10 @@ where
     let executor = Arc::new(executor);
     let hyper_executor = HyperExecutor(Arc::clone(&executor));
     let shared_executor: Arc<AnyExecutor> = Arc::new(AnyExecutor::new(Arc::clone(&executor)));
+
+    // Nothing is ever sent through this channel: it exists so that dropping the last sender
+    // tells the accept loop every connection task has finished.
+    let (connection_guard, connections) = bounded::<Infallible>(1);
 
     let mut incoming = listener.incoming();
     let shutdown_rx = shutdown_signal();
@@ -379,12 +433,16 @@ where
                         let endpoint = endpoint.clone();
                         let shared_executor = shared_executor.clone();
                         let hyper_executor = hyper_executor.clone();
+                        let guard = connection_guard.clone();
 
                         // Spawn the per-connection task *before* sniffing the protocol preface.
                         // Awaiting client bytes inline here would let a single idle client stall
                         // the accept loop for everyone.
                         executor
                             .spawn(async move {
+                                // Held for the lifetime of the connection so the shutdown path
+                                // can tell when the last one has finished.
+                                let _guard = guard;
                                 let (stream, is_h2) =
                                     match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
                                         Ok(result) => result,
@@ -397,7 +455,9 @@ where
                                 let service =
                                     IntoService::new(endpoint, shared_executor, peer_addr);
                                 if is_h2 {
-                                    let builder = http2::Builder::new(hyper_executor);
+                                    let mut builder = http2::Builder::new(hyper_executor);
+                                    // Without a timer hyper silently disables its h2 keep-alive.
+                                    builder.timer(AsyncIoTimer);
                                     if let Err(error) = builder
                                         .serve_connection(ConnectionWrapper(stream), service)
                                         .await
@@ -405,7 +465,10 @@ where
                                         error!("Hyper h2 connection error: {error}");
                                     }
                                 } else {
-                                    let builder = http1::Builder::new();
+                                    let mut builder = http1::Builder::new();
+                                    // Without a timer hyper silently disables its header read
+                                    // timeout, so a slow-loris client would hold the connection.
+                                    builder.timer(AsyncIoTimer);
                                     if let Err(error) = builder
                                         .serve_connection(ConnectionWrapper(stream), service)
                                         .with_upgrades()
@@ -424,7 +487,10 @@ where
         }
     }
 
-    Ok(())
+    // Release the accept loop's own handle so only live connections keep the channel open.
+    drop(connection_guard);
+    let severed = drain_connections(&connections).await;
+    Ok(Shutdown { severed })
 }
 
 fn server_addr() -> SocketAddr {
