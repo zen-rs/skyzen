@@ -733,11 +733,12 @@ async fn email_handler(
     env: skyzen::runtime::wasm::Env,
     ctx: skyzen_cloudflare::CfEventContext,
 ) -> Result<(), skyzen_cloudflare::CfEventError> {
-    if message.from_address()?.ends_with("@blocked.invalid") {
-        message.reject("not accepted")?;
+    // Reject rather than silently drop: the sending server is told why.
+    if message.raw_size()? > 10 * 1024 * 1024 {
+        message.reject("message too large")?;
         return Ok(());
     }
-    message.forward("archive@example.invalid").await
+    message.forward("archive@lexo.cool").await
 }
 
 #[cfg(target_arch = "wasm32")]
