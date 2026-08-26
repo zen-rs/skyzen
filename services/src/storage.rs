@@ -2,9 +2,31 @@
 //!
 //! Provides a platform-agnostic interface for object/blob storage.
 //! Implementations include S3, Cloudflare R2, Azure Blob, and in-memory (for testing).
+//!
+//! # Whole objects versus byte ranges
+//!
+//! [`ObjectStorage::get`] and [`ObjectStorage::put`] move an object as one `Vec<u8>`, which is a
+//! hard ceiling on an edge runtime: a Cloudflare Worker has about 128 MB of memory, so a video or
+//! a database dump cannot round-trip through them. Three additions avoid materializing the whole
+//! body — [`get_stream`](ObjectStorage::get_stream) and
+//! [`put_stream`](ObjectStorage::put_stream) for chunked transfer,
+//! [`get_range`](ObjectStorage::get_range) for serving HTTP `Range` requests, and
+//! [`presign_get`](ObjectStorage::presign_get) / [`presign_put`](ObjectStorage::presign_put) for
+//! keeping large transfers off the application server entirely.
 
-use core::future::Future;
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use std::collections::HashMap;
+
+use bytes::Bytes;
+use futures_core::Stream;
+use http_kit::{
+    header::{HeaderName, HeaderValue},
+    Method,
+};
 
 // ── Error type ──
 
@@ -120,6 +142,168 @@ pub struct ListResult {
     pub cursor: Option<String>,
 }
 
+/// A chunked object body.
+///
+/// Wraps a boxed `Stream` of [`Bytes`] so neither the trait nor the [`Storage`] wrapper has to
+/// name a concrete stream type, and so a body can cross the type-erased service boundary without
+/// being buffered. `StorageStream` itself implements [`Stream`], so it can be forwarded straight
+/// into a response body.
+pub struct StorageStream(futures_core::stream::BoxStream<'static, Result<Bytes, StorageError>>);
+
+impl core::fmt::Debug for StorageStream {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StorageStream").finish_non_exhaustive()
+    }
+}
+
+impl StorageStream {
+    /// Wrap any `Send` stream of byte chunks.
+    pub fn new(stream: impl Stream<Item = Result<Bytes, StorageError>> + Send + 'static) -> Self {
+        Self(Box::pin(stream))
+    }
+
+    /// A stream that yields one already-buffered chunk.
+    ///
+    /// Useful for backends that have no chunked API of their own but should still satisfy
+    /// [`ObjectStorage::get_stream`].
+    pub fn once(chunk: impl Into<Bytes>) -> Self {
+        Self::new(Once(Some(chunk.into())))
+    }
+
+    /// Drain the stream into one contiguous buffer.
+    ///
+    /// This gives up the whole point of streaming, so use it only where the body is known to be
+    /// small — a mock, a test assertion, or a backend whose write API takes a full buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`StorageError`] the stream yields.
+    pub async fn into_bytes(mut self) -> Result<Vec<u8>, StorageError> {
+        let mut buffer = Vec::new();
+        while let Some(chunk) = core::future::poll_fn(|cx| Pin::new(&mut self).poll_next(cx)).await
+        {
+            buffer.extend_from_slice(&chunk?);
+        }
+        Ok(buffer)
+    }
+}
+
+impl Stream for StorageStream {
+    type Item = Result<Bytes, StorageError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().0.as_mut().poll_next(cx)
+    }
+}
+
+/// A stream yielding a single pre-built chunk.
+struct Once(Option<Bytes>);
+
+impl Stream for Once {
+    type Item = Result<Bytes, StorageError>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.get_mut().0.take().map(Ok))
+    }
+}
+
+/// The slice of an object to read.
+///
+/// Mirrors the two forms an HTTP `Range` header can take, so a handler can pass a parsed request
+/// range straight through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRange {
+    /// `length` bytes starting at `offset`, or everything from `offset` when `length` is `None`.
+    FromStart {
+        /// Zero-based index of the first byte to read.
+        offset: u64,
+        /// How many bytes to read; `None` reads to the end of the object.
+        length: Option<u64>,
+    },
+    /// The last N bytes of the object (HTTP's `Range: bytes=-N`).
+    Suffix(u64),
+}
+
+impl ByteRange {
+    /// Everything from `offset` to the end of the object.
+    #[must_use]
+    pub const fn from_start(offset: u64) -> Self {
+        Self::FromStart {
+            offset,
+            length: None,
+        }
+    }
+
+    /// `length` bytes starting at `offset`.
+    #[must_use]
+    pub const fn slice(offset: u64, length: u64) -> Self {
+        Self::FromStart {
+            offset,
+            length: Some(length),
+        }
+    }
+
+    /// The last `length` bytes of the object.
+    #[must_use]
+    pub const fn suffix(length: u64) -> Self {
+        Self::Suffix(length)
+    }
+
+    /// Resolve the range against an object of `total` bytes, returning `start..end`.
+    ///
+    /// Returns `None` when the range selects nothing — an offset at or past the end, or a
+    /// zero-length request — which is the case a backend reports as an unsatisfiable range rather
+    /// than as an empty success. A range that runs past the end is clamped, as HTTP requires.
+    #[must_use]
+    pub const fn resolve(self, total: u64) -> Option<core::ops::Range<u64>> {
+        let (start, end) = match self {
+            Self::FromStart { offset, length } => {
+                if offset >= total {
+                    return None;
+                }
+                let end = match length {
+                    Some(length) => {
+                        let requested = offset.saturating_add(length);
+                        if requested < total {
+                            requested
+                        } else {
+                            total
+                        }
+                    }
+                    None => total,
+                };
+                (offset, end)
+            }
+            Self::Suffix(length) => {
+                if length == 0 {
+                    return None;
+                }
+                (total.saturating_sub(length), total)
+            }
+        };
+
+        if start >= end {
+            None
+        } else {
+            Some(start..end)
+        }
+    }
+}
+
+/// A pre-authorized request a client can issue directly against the storage backend.
+///
+/// Handing one of these to a browser keeps a large upload or download off the application server
+/// entirely, which is the normal way to move big objects on S3, R2 and Azure Blob.
+#[derive(Debug, Clone)]
+pub struct PresignedRequest {
+    /// The URL to issue the request against; the authorization is embedded in it.
+    pub url: String,
+    /// The HTTP method the signature covers. Using another method invalidates it.
+    pub method: Method,
+    /// Headers the client must send verbatim for the signature to verify.
+    pub headers: Vec<(HeaderName, HeaderValue)>,
+}
+
 // ── Layer 1: Public trait ──
 
 /// A platform-agnostic object storage interface.
@@ -177,6 +361,91 @@ pub trait ObjectStorage: Send + Sync + Clone + 'static {
         &self,
         key: &str,
     ) -> impl Future<Output = Result<Option<ObjectMetadata>, StorageError>> + Send;
+
+    /// Retrieve an object's body as a stream of chunks.
+    ///
+    /// `None` means the object does not exist. Backends without a chunked read return
+    /// [`StorageError::Unsupported`] rather than quietly buffering the whole object, which would
+    /// defeat the point of asking for a stream.
+    fn get_stream(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<StorageStream>, StorageError>> + Send {
+        let _ = key;
+        async {
+            Err(StorageError::Unsupported(
+                "streaming reads are not supported by this storage backend",
+            ))
+        }
+    }
+
+    /// Store an object from a stream of chunks.
+    ///
+    /// `content_length` is the total size when the caller knows it; backends that require a length
+    /// up front (or that would otherwise have to buffer to discover it) may reject a `None`.
+    fn put_stream(
+        &self,
+        key: &str,
+        stream: StorageStream,
+        content_length: Option<u64>,
+        options: PutOptions,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        let _ = (key, stream, content_length, options);
+        async {
+            Err(StorageError::Unsupported(
+                "streaming writes are not supported by this storage backend",
+            ))
+        }
+    }
+
+    /// Retrieve part of an object.
+    ///
+    /// The returned [`StorageObject::body`] holds only the requested slice, while
+    /// [`ObjectMetadata::size`] keeps reporting the size of the whole object, so a handler can
+    /// build a `Content-Range` from both. `None` means the object does not exist; a range that
+    /// selects nothing is [`StorageError::Unsupported`]'s neighbour rather than an empty success —
+    /// see [`ByteRange::resolve`].
+    fn get_range(
+        &self,
+        key: &str,
+        range: ByteRange,
+    ) -> impl Future<Output = Result<Option<StorageObject>, StorageError>> + Send {
+        let _ = (key, range);
+        async {
+            Err(StorageError::Unsupported(
+                "ranged reads are not supported by this storage backend",
+            ))
+        }
+    }
+
+    /// Mint a pre-authorized request a client can use to download the object directly.
+    fn presign_get(
+        &self,
+        key: &str,
+        expires_in: core::time::Duration,
+    ) -> impl Future<Output = Result<PresignedRequest, StorageError>> + Send {
+        let _ = (key, expires_in);
+        async {
+            Err(StorageError::Unsupported(
+                "presigned URLs are not supported by this storage backend",
+            ))
+        }
+    }
+
+    /// Mint a pre-authorized request a client can use to upload the object directly.
+    fn presign_put(
+        &self,
+        key: &str,
+        expires_in: core::time::Duration,
+        options: PutOptions,
+    ) -> impl Future<Output = Result<PresignedRequest, StorageError>> + Send {
+        let _ = (key, expires_in, options);
+        async {
+            Err(StorageError::Unsupported(
+                "presigned URLs are not supported by this storage backend",
+            ))
+        }
+    }
 }
 
 // ── Layer 2: Generated object-safe trait ──
@@ -194,6 +463,30 @@ service_obj! {
     async fn delete<'a>(&'a self, key: &'a str) -> Result<(), StorageError>;
     async fn list(&'_ self, options: ListOptions) -> Result<ListResult, StorageError>;
     async fn head<'a>(&'a self, key: &'a str) -> Result<Option<ObjectMetadata>, StorageError>;
+    async fn get_stream<'a>(&'a self, key: &'a str) -> Result<Option<StorageStream>, StorageError>;
+    async fn put_stream<'a>(
+        &'a self,
+        key: &'a str,
+        stream: StorageStream,
+        content_length: Option<u64>,
+        options: PutOptions,
+    ) -> Result<(), StorageError>;
+    async fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: ByteRange,
+    ) -> Result<Option<StorageObject>, StorageError>;
+    async fn presign_get<'a>(
+        &'a self,
+        key: &'a str,
+        expires_in: core::time::Duration,
+    ) -> Result<PresignedRequest, StorageError>;
+    async fn presign_put<'a>(
+        &'a self,
+        key: &'a str,
+        expires_in: core::time::Duration,
+        options: PutOptions,
+    ) -> Result<PresignedRequest, StorageError>;
 }
 
 // ── User-facing wrapper ──
@@ -276,13 +569,84 @@ impl Storage {
     pub async fn head(&self, key: &str) -> Result<Option<ObjectMetadata>, StorageError> {
         self.0.head(key).await
     }
+
+    /// Retrieve an object's body as a stream of chunks, without buffering the whole object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Unsupported`] if the backend has no chunked read, or another
+    /// [`StorageError`] if the backend operation fails.
+    pub async fn get_stream(&self, key: &str) -> Result<Option<StorageStream>, StorageError> {
+        self.0.get_stream(key).await
+    }
+
+    /// Store an object from a stream of chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Unsupported`] if the backend has no chunked write, or another
+    /// [`StorageError`] if the backend operation fails.
+    pub async fn put_stream(
+        &self,
+        key: &str,
+        stream: StorageStream,
+        content_length: Option<u64>,
+        options: PutOptions,
+    ) -> Result<(), StorageError> {
+        self.0
+            .put_stream(key, stream, content_length, options)
+            .await
+    }
+
+    /// Retrieve part of an object, for answering an HTTP `Range` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Unsupported`] if the backend has no ranged read, or another
+    /// [`StorageError`] if the backend operation fails.
+    pub async fn get_range(
+        &self,
+        key: &str,
+        range: ByteRange,
+    ) -> Result<Option<StorageObject>, StorageError> {
+        self.0.get_range(key, range).await
+    }
+
+    /// Mint a pre-authorized request a client can use to download the object directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Unsupported`] if the backend cannot presign, or another
+    /// [`StorageError`] if the backend operation fails.
+    pub async fn presign_get(
+        &self,
+        key: &str,
+        expires_in: core::time::Duration,
+    ) -> Result<PresignedRequest, StorageError> {
+        self.0.presign_get(key, expires_in).await
+    }
+
+    /// Mint a pre-authorized request a client can use to upload the object directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Unsupported`] if the backend cannot presign, or another
+    /// [`StorageError`] if the backend operation fails.
+    pub async fn presign_put(
+        &self,
+        key: &str,
+        expires_in: core::time::Duration,
+        options: PutOptions,
+    ) -> Result<PresignedRequest, StorageError> {
+        self.0.presign_put(key, expires_in, options).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError,
-        StorageObject,
+        ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError,
+        StorageObject, StorageStream,
     };
     use http_kit::{Body, Endpoint, HttpError, Response};
     use skyzen_core::Extractor;
@@ -443,6 +807,78 @@ mod tests {
         let extracted = Storage::extract(&mut request).await.unwrap();
         let object = extracted.get("file.txt").await.unwrap().unwrap();
         assert_eq!(object.body, b"hello".to_vec());
+    }
+
+    #[test]
+    fn byte_range_resolves_against_a_known_object_size() {
+        assert_eq!(ByteRange::slice(2, 3).resolve(10), Some(2..5));
+        // A range that runs past the end is clamped, as HTTP requires.
+        assert_eq!(ByteRange::slice(8, 100).resolve(10), Some(8..10));
+        assert_eq!(ByteRange::from_start(4).resolve(10), Some(4..10));
+        assert_eq!(ByteRange::suffix(3).resolve(10), Some(7..10));
+        // A suffix longer than the object is the whole object.
+        assert_eq!(ByteRange::suffix(50).resolve(10), Some(0..10));
+    }
+
+    #[test]
+    fn byte_range_reports_an_unsatisfiable_selection_as_none() {
+        assert_eq!(ByteRange::from_start(10).resolve(10), None);
+        assert_eq!(ByteRange::slice(3, 0).resolve(10), None);
+        assert_eq!(ByteRange::suffix(0).resolve(10), None);
+        assert_eq!(ByteRange::from_start(0).resolve(0), None);
+    }
+
+    #[tokio::test]
+    async fn storage_stream_round_trips_a_buffered_chunk() {
+        let stream = StorageStream::once(b"hello".to_vec());
+        assert_eq!(stream.into_bytes().await.unwrap(), b"hello".to_vec());
+    }
+
+    #[tokio::test]
+    async fn streaming_range_and_presign_default_to_unsupported() {
+        let storage = Storage::new(InMemoryObjectStorage::default());
+
+        assert!(matches!(
+            storage.get_stream("file.txt").await.unwrap_err(),
+            StorageError::Unsupported(_)
+        ));
+        assert!(matches!(
+            storage
+                .put_stream(
+                    "file.txt",
+                    StorageStream::once(b"data".to_vec()),
+                    Some(4),
+                    super::PutOptions::default(),
+                )
+                .await
+                .unwrap_err(),
+            StorageError::Unsupported(_)
+        ));
+        assert!(matches!(
+            storage
+                .get_range("file.txt", ByteRange::slice(0, 1))
+                .await
+                .unwrap_err(),
+            StorageError::Unsupported(_)
+        ));
+        assert!(matches!(
+            storage
+                .presign_get("file.txt", core::time::Duration::from_mins(15))
+                .await
+                .unwrap_err(),
+            StorageError::Unsupported(_)
+        ));
+        assert!(matches!(
+            storage
+                .presign_put(
+                    "file.txt",
+                    core::time::Duration::from_mins(15),
+                    super::PutOptions::default(),
+                )
+                .await
+                .unwrap_err(),
+            StorageError::Unsupported(_)
+        ));
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ Extractor (handler arg)     ← Pulled from request extensions automatically
 | Trait | Wrapper | Operations |
 |-------|---------|------------|
 | `KeyValueStore` | `Kv` | `get`, `put`, `put_with_ttl`, `delete`, `exists`, `list` + the atomics below + `get_json`, `get_text`, `put_json`, `list_all` |
-| `ObjectStorage` | `Storage` | `get`, `put`, `put_with`, `delete`, `list`, `head` |
+| `ObjectStorage` | `Storage` | `get`, `put`, `put_with`, `delete`, `list`, `head`, `get_stream`, `put_stream`, `get_range`, `presign_get`, `presign_put` |
 | `MessageQueue` | `Queue` | `send`, `send_batch`, `send_with`, `receive`, `ack`, `nack` + `send_json`, `send_json_batch`, `receive_json` |
 | `DbBackend` | `Db` | `query(...).bind(...).fetch_*`, `execute` |
 
@@ -64,6 +64,28 @@ for key in page.keys { /* ... */ }
 
 `Kv::list_all(prefix)` drains every page for you. It is documented as potentially expensive: it
 holds the whole key set in memory and, on `DynamoDB`, is a full table scan.
+
+### Moving Large Objects
+
+`get`/`put` move an object as one `Vec<u8>`, which is a hard ceiling on an edge runtime: a
+Cloudflare Worker has roughly 128 MB of memory, so a video or a database dump cannot round-trip
+through them. Three additions avoid materializing the body:
+
+| Method | Use |
+|--------|-----|
+| `get_stream(key)` / `put_stream(key, stream, content_length, options)` | chunked transfer through a `StorageStream` (a boxed `Stream<Item = Result<Bytes, StorageError>>`) |
+| `get_range(key, ByteRange)` | answering an HTTP `Range` request without downloading the whole object |
+| `presign_get(key, expires_in)` / `presign_put(key, expires_in, options)` | handing the client a `PresignedRequest` so the transfer never touches your server |
+
+`ByteRange` mirrors the two forms an HTTP `Range` header can take — `FromStart { offset, length }`
+and `Suffix(n)` — and `ByteRange::resolve(total)` clamps one against a known object size, returning
+`None` for a range that selects nothing. A ranged `StorageObject` carries only the requested slice
+in `body` while `metadata.size` still reports the whole object, which is exactly the pair a
+`Content-Range` header needs.
+
+All five have `StorageError::Unsupported` defaults this wave; provider crates implement them
+natively as each platform's wave lands. `InMemoryStorage` implements all of them, presigning a
+deterministic `memory://` URL that is documented as **not fetchable**.
 
 ### Producing and Consuming Queue Messages
 
