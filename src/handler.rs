@@ -50,6 +50,26 @@ impl<E: Extractor, R: Responder> core::error::Error for HandlerError<E, R> {}
 
 /// An HTTP handler.
 /// This trait is a wrapper trait for `Fn` types. You will rarely use this type directly.
+// Verified rendering at the `.at(handler)` registration site:
+//   error[E0277]: `fn(NotAnExtractor) -> impl Future<Output = &'static str> {bad_arg}` is not a
+//                 Skyzen handler
+//     --> src/main.rs:11:33
+//      |
+//   11 |     let _ = Route::new(("/a".at(bad_arg),));
+//      |                              -- ^^^^^^^ not a handler
+//      = note: a handler is an `async fn` (or closure) whose arguments all implement `Extractor`
+//              and whose return type implements `Responder`
+//      = note: the future a handler returns must be `Send`: ...
+//      = note: a handler takes at most 15 arguments; ...
+//      = note: common fixes: ...
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a Skyzen handler",
+    label = "not a handler",
+    note = "a handler is an `async fn` (or closure) whose arguments all implement `Extractor` and whose return type implements `Responder`",
+    note = "the future a handler returns must be `Send`: do not hold an `Rc` or a `MutexGuard` across an `.await`",
+    note = "a handler takes at most 15 arguments; group the rest into one extractor",
+    note = "common fixes: take path parameters as `Path<T>` or `Params`, take a body as `Json<T>`/`Bytes`/`String`, and return `Json<T>`, `String` or `Result<T>` rather than a bare value"
+)]
 pub trait Handler<T: Extractor, R: Responder>: Send + Sync + Clone + 'static {
     /// Handle the request and make a response.
     fn call_handler(

@@ -71,10 +71,16 @@ impl Requirement {
 /// [`RequestBodyLimit`](crate::RequestBodyLimit) in force and reject an oversized payload with
 /// `413`. Implement a body-reading extractor with [`take_body_bytes`](crate::take_body_bytes) or
 /// [`take_body_stream`](crate::take_body_stream) so it participates in both rules.
-// The `note` lines below render under the trait-bound error at the `.at(handler)` call site, e.g.
-//   error[E0277]: `MyType` is not an extractor, so it cannot be a handler argument
+// Verified rendering wherever an `Extractor` bound is unsatisfied:
+//   error[E0277]: `NotAnExtractor` is not an extractor, so it cannot be a handler argument
 //      = note: every handler argument must implement `skyzen::Extractor`: `Json<T>`, `Form<T>`,
-//              `Query<T>`, `Path<T>`, `Params`, `HeaderMap`, `String`, `Bytes`, `State<T>`, ...
+//              `Query<T>`, `Path<T>`, `Params`, `HeaderMap`, `String`, `Bytes`, `State<T>` are
+//              built in
+//      = note: wrap an argument in `Option<T>` or `Result<T, BoxHttpError>` to inspect its
+//              rejection yourself
+//      = note: extractors are owned values: `&str` and other borrows cannot be extracted
+// In a handler position the `Handler` bound fails first and shadows this, which is why that
+// trait's message names both halves.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not an extractor, so it cannot be a handler argument",
     label = "not an `Extractor`",
