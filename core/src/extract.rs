@@ -1,18 +1,19 @@
 use core::any::{type_name, TypeId};
-use core::mem;
 use core::{convert::Infallible, future::Future};
 
+use crate::body::{take_body_bytes, take_body_stream, BodyAlreadyConsumed, BodyReadError};
 #[cfg(feature = "openapi")]
 use crate::openapi::{ExtractorSchema, ParameterLocation, SchemaRef};
 use alloc::boxed::Box;
 #[cfg(feature = "openapi")]
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 use http_kit::error::BoxHttpError;
+use http_kit::header::HeaderMap;
 use http_kit::{
-    http_error,
     utils::{ByteStr, Bytes},
-    Body, HttpError, Method, Request, StatusCode, Uri,
+    Body, HttpError, Method, Request, Uri,
 };
 
 /// A value an extractor needs some middleware to have put into the request.
@@ -61,6 +62,26 @@ impl Requirement {
 
 /// Extracts a typed value from an HTTP request, such as a header, the body, or
 /// other request metadata.
+///
+/// # Reading the body
+///
+/// An extractor that reads the request body *takes* it, and records that it did so, so a second
+/// body-consuming extractor in the same handler signature is rejected with `500` naming both
+/// rather than silently observing an empty body. Buffering extractors also honour the
+/// [`RequestBodyLimit`](crate::RequestBodyLimit) in force and reject an oversized payload with
+/// `413`. Implement a body-reading extractor with [`take_body_bytes`](crate::take_body_bytes) or
+/// [`take_body_stream`](crate::take_body_stream) so it participates in both rules.
+// The `note` lines below render under the trait-bound error at the `.at(handler)` call site, e.g.
+//   error[E0277]: `MyType` is not an extractor, so it cannot be a handler argument
+//      = note: every handler argument must implement `skyzen::Extractor`: `Json<T>`, `Form<T>`,
+//              `Query<T>`, `Path<T>`, `Params`, `HeaderMap`, `String`, `Bytes`, `State<T>`, ...
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an extractor, so it cannot be a handler argument",
+    label = "not an `Extractor`",
+    note = "every handler argument must implement `skyzen::Extractor`: `Json<T>`, `Form<T>`, `Query<T>`, `Path<T>`, `Params`, `HeaderMap`, `String`, `Bytes`, `State<T>` are built in",
+    note = "wrap an argument in `Option<T>` or `Result<T, BoxHttpError>` to inspect its rejection yourself",
+    note = "extractors are owned values: `&str` and other borrows cannot be extracted"
+)]
 pub trait Extractor: Sized + Send + Sync + 'static {
     /// Error type returned when extraction fails.
     type Error: HttpError;
@@ -170,13 +191,11 @@ macro_rules! impl_tuple_extractor {
 
 tuples!(impl_tuple_extractor);
 
-http_error!(pub InvalidBody, StatusCode::BAD_REQUEST, "Failed to read request body");
-
+/// Buffers the whole request body, up to the [`RequestBodyLimit`](crate::RequestBodyLimit).
 impl Extractor for Bytes {
-    type Error = InvalidBody;
+    type Error = BodyReadError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let body = mem::replace(request.body_mut(), Body::empty());
-        body.into_bytes().await.map_err(|_| InvalidBody::new())
+        take_body_bytes::<Self>(request).await
     }
 
     #[cfg(feature = "openapi")]
@@ -189,11 +208,13 @@ impl Extractor for Bytes {
     }
 }
 
+/// Buffers the whole request body as UTF-8, up to the
+/// [`RequestBodyLimit`](crate::RequestBodyLimit).
 impl Extractor for ByteStr {
-    type Error = InvalidBody;
+    type Error = BodyReadError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let body = mem::replace(request.body_mut(), Body::empty());
-        body.into_string().await.map_err(|_| InvalidBody::new())
+        let bytes = take_body_bytes::<Self>(request).await?;
+        Self::from_utf8(bytes).map_err(|_| crate::body::InvalidBody::new().into())
     }
 
     #[cfg(feature = "openapi")]
@@ -206,10 +227,36 @@ impl Extractor for ByteStr {
     }
 }
 
-impl Extractor for Body {
-    type Error = Infallible;
+/// Buffers the whole request body as UTF-8 through the same path as [`ByteStr`], up to the
+/// [`RequestBodyLimit`](crate::RequestBodyLimit).
+impl Extractor for String {
+    type Error = BodyReadError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(mem::replace(request.body_mut(), Self::empty()))
+        let bytes = take_body_bytes::<Self>(request).await?;
+        let text = ByteStr::from_utf8(bytes).map_err(|_| crate::body::InvalidBody::new())?;
+        Ok(text.as_str().into())
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<ExtractorSchema> {
+        Some(ExtractorSchema {
+            location: ParameterLocation::Body,
+            content_type: Some("text/plain; charset=utf-8"),
+            schema: None,
+        })
+    }
+}
+
+/// Hands the request body's stream to the handler.
+///
+/// This is the one body extractor that does **not** apply the
+/// [`RequestBodyLimit`](crate::RequestBodyLimit): it buffers nothing, so there is nothing to cap —
+/// whatever the handler reads from the stream is the handler's own budget to enforce. It still
+/// takes the body, so a later body-consuming extractor in the same signature is rejected.
+impl Extractor for Body {
+    type Error = BodyAlreadyConsumed;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        take_body_stream::<Self>(request)
     }
 
     #[cfg(feature = "openapi")]
@@ -219,6 +266,15 @@ impl Extractor for Body {
             content_type: Some("application/octet-stream"),
             schema: None,
         })
+    }
+}
+
+/// Clones the request headers, symmetric with the [`Responder`](crate::Responder) impl that
+/// merges a `HeaderMap` into the response.
+impl Extractor for HeaderMap {
+    type Error = Infallible;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        Ok(request.headers().clone())
     }
 }
 
@@ -236,6 +292,19 @@ impl Extractor for Method {
     }
 }
 
+/// Turns a failed extraction into `None`.
+///
+/// `Option<T>` erases *why* `T` was unavailable: `Option<Json<Payload>>` is `None` alike for "no
+/// body was sent", "the content type was wrong" and "the body was `{not json`". A handler that
+/// reads `None` as "the client omitted this" therefore accepts malformed input as absence, and the
+/// caller gets a `200` with no hint that their request was wrong. Prefer
+/// [`Result<T, BoxHttpError>`](Extractor#impl-Extractor-for-Result<T,+Box<dyn+HttpError>>), which
+/// keeps the rejection — including its status — and lets the handler decide.
+///
+/// For a body-consuming `T` the body is taken (and so poisoned for any later body extractor) even
+/// when the extraction fails, because the marker is recorded at the moment the body is taken
+/// rather than when parsing succeeds. `Option<Form<T>>` returning `None` has still consumed the
+/// body.
 // `requirements()` is deliberately *not* forwarded here or on `Result<T, BoxHttpError>`: both
 // wrappers exist so the handler can cope with `T` being unavailable, so a missing provision is a
 // case the handler asked to see rather than a wiring mistake to reject at build time.
