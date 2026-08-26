@@ -164,7 +164,17 @@ impl CfJurisdiction {
     }
 }
 
-/// Cloudflare Durable Object stub wrapper.
+/// A handle on one Durable Object instance.
+///
+/// # Why fetch and not RPC
+///
+/// Cloudflare's newer Durable Object API lets a caller invoke methods on the stub directly, which
+/// is more ergonomic than encoding a call as a synthetic HTTP request. Reaching it from Rust means
+/// exporting a **JavaScript class extending `DurableObject`** whose public methods form the RPC
+/// surface, and `wasm-bindgen` emits standalone classes only — it cannot extend an imported base
+/// class. So the generated Durable Object class exports `fetch`, `alarm` and the hibernation
+/// websocket handlers, and `fetch` is what a stub can call. Encoding a cross-object call as a
+/// request is the cost; it is a wasm-bindgen limitation rather than a design choice.
 pub struct CfDurableObjectStub {
     stub: DurableObject,
 }
