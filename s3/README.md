@@ -107,9 +107,19 @@ async fn manual_setup() -> S3Storage {
 |--------|-------------|
 | `get(key)` | Retrieves an object and its metadata. |
 | `put(key, body)` | Uploads a byte buffer to the specified key. |
+| `put_with(key, body, options)` | Uploads with content type, custom metadata, cache control, content encoding/disposition, a storage class, and an MD5 the service verifies. |
 | `delete(key)` | Removes an object from the bucket. |
 | `list(options)` | Lists objects with optional prefix, limit, and pagination. |
 | `head(key)` | Retrieves object metadata without the body. |
+| `get_stream(key)` | Streams the body off S3 in chunks, without buffering the object. |
+| `put_stream(key, stream, length, options)` | Uploads from a stream; bodies past 16 MiB become a real multipart upload with 8 MiB parts, aborted on any failure. |
+| `get_range(key, range)` | Serves an HTTP `Range` — the body is the slice, the metadata still reports the whole object's size. |
+| `presign_get(key, expires_in)` | Mints a URL a browser can download from directly. |
+| `presign_put(key, expires_in, options)` | Mints a URL a browser can upload to directly, keeping large uploads off the application server. |
+
+`list` reports only what `ListObjectsV2` returns — key, size, last-modified and ETag — so
+`content_type` is always `None` and `metadata` always empty in a listing. Filling them in would
+cost one `HeadObject` per key; call `head(key)` for the object you actually need.
 
 ## Related Crates
 
