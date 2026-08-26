@@ -58,10 +58,10 @@ async fn read_missing_state() -> Result<String> {
 }
 
 /// A plain standard error has no HTTP meaning, so the handler states one and adds a breadcrumb.
-async fn read_missing_file() -> Result<String> {
-    std::fs::read_to_string("/nonexistent/skyzen/config.toml")
+async fn read_missing_env() -> Result<String> {
+    std::env::var("SKYZEN_TEST_UNSET_UPSTREAM_API_KEY")
         .status(StatusCode::SERVICE_UNAVAILABLE)
-        .context("loading the application config")
+        .context("reading the upstream API key")
 }
 
 fn app() -> Router {
@@ -72,7 +72,7 @@ fn app() -> Router {
         "/ttl".at(write_with_ttl),
         "/secret".at(read_backend_secret),
         "/state".at(read_missing_state),
-        "/file".at(read_missing_file),
+        "/env".at(read_missing_env),
     ))
     .build()
 }
@@ -128,7 +128,7 @@ async fn backend_failures_are_still_redacted() {
 
 #[tokio::test]
 async fn plain_errors_take_the_status_the_caller_states() {
-    let response = TestContext::new().client(app()).get("/file").send().await;
+    let response = TestContext::new().client(app()).get("/env").send().await;
 
     // 503 is a 5xx, so the breadcrumb stays in the log and the body stays generic.
     response.assert_status(503);

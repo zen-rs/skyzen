@@ -326,7 +326,7 @@ pub mod error {
             self.ok_or_else(|| {
                 status
                     .canonical_reason()
-                    .map_or_else(|| Error::msg(status), Error::msg)
+                    .map_or_else(|| Error::msg(status.as_u16()), Error::msg)
                     .set_status(status)
             })
         }

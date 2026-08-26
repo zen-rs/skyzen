@@ -273,11 +273,11 @@ Errors with no HTTP meaning of their own do not convert implicitly — that is d
 ```rust
 use skyzen::{Context, Result, ResultExt, StatusCode};
 
-async fn read_config(path: &str) -> Result<String> {
+async fn read_api_key() -> Result<String> {
     // `.status(...)` states the status; `.context(...)` adds a breadcrumb and keeps it.
-    std::fs::read_to_string(path)
+    std::env::var("UPSTREAM_API_KEY")
         .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .context("loading the application config")
+        .context("reading the upstream API key")
 }
 ```
 
