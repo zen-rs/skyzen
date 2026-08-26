@@ -59,7 +59,8 @@ pub mod runtime;
 
 /// Attribute & derive macros exported by Skyzen.
 pub use skyzen_macros::{
-    durable_object, error, import_config, main, openapi, queue, scheduled, test, HttpError,
+    durable_object, email, error, import_config, main, openapi, queue, scheduled, tail, test,
+    HttpError,
 };
 
 /// Static asset helpers for building file servers.

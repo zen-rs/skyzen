@@ -110,8 +110,9 @@ pub use durable::{
 };
 #[cfg(target_arch = "wasm32")]
 pub use events::{
-    CfEventError, CfQueueBatch, CfQueueContext, CfQueueMessage, CfQueueRetryOptions,
-    CfScheduleContext, CfScheduledEvent, IntoQueueWorkerResult, IntoWorkerResult,
+    CfEmailMessage, CfEventContext, CfEventError, CfQueueBatch, CfQueueMessage,
+    CfQueueRetryOptions, CfScheduleContext, CfScheduledEvent, CfTailEvent, IntoQueueWorkerResult,
+    IntoWorkerResult, TailException, TailLog, TailTraceItem,
 };
 #[cfg(target_arch = "wasm32")]
 pub use fetch::{CfFetch, CfFetchError};

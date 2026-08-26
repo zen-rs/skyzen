@@ -79,6 +79,56 @@ extern "C" {
     ) -> Result<JsValue, JsValue>;
 }
 
+// ── Email Workers ──
+
+/// The message an Email Worker's `email` handler receives.
+///
+/// Cloudflare calls this a `ForwardableEmailMessage`. `worker-sys` has no binding for it, so the
+/// shape is declared here from the platform's documented interface.
+#[wasm_bindgen]
+extern "C" {
+    /// An inbound email routed to this Worker.
+    #[wasm_bindgen(extends = js_sys::Object)]
+    #[derive(Debug, Clone)]
+    pub type EmailMessageSys;
+
+    /// The envelope sender (`MAIL FROM`), not the `From:` header.
+    #[wasm_bindgen(method, catch, getter, js_name = from)]
+    pub fn sender(this: &EmailMessageSys) -> Result<String, JsValue>;
+
+    /// The envelope recipient (`RCPT TO`), not the `To:` header.
+    #[wasm_bindgen(method, catch, getter, js_name = to)]
+    pub fn recipient(this: &EmailMessageSys) -> Result<String, JsValue>;
+
+    /// The parsed message headers.
+    #[wasm_bindgen(method, catch, getter)]
+    pub fn headers(this: &EmailMessageSys) -> Result<web_sys::Headers, JsValue>;
+
+    /// The raw RFC 5322 message, as a stream.
+    #[wasm_bindgen(method, catch, getter)]
+    pub fn raw(this: &EmailMessageSys) -> Result<web_sys::ReadableStream, JsValue>;
+
+    /// The size of the raw message in bytes.
+    #[wasm_bindgen(method, catch, getter, js_name = rawSize)]
+    pub fn raw_size(this: &EmailMessageSys) -> Result<f64, JsValue>;
+
+    /// Reject the message, giving the sending server the reason.
+    #[wasm_bindgen(method, catch, js_name = setReject)]
+    pub fn set_reject(this: &EmailMessageSys, reason: &str) -> Result<(), JsValue>;
+
+    /// Forward the message to a verified destination address.
+    #[wasm_bindgen(method, catch)]
+    pub fn forward(
+        this: &EmailMessageSys,
+        rcpt_to: &str,
+        headers: &JsValue,
+    ) -> Result<Promise, JsValue>;
+
+    /// Reply to the message with an `EmailMessage` built by JS.
+    #[wasm_bindgen(method, catch)]
+    pub fn reply(this: &EmailMessageSys, message: &JsValue) -> Result<Promise, JsValue>;
+}
+
 // ── Helpers ──
 
 /// Get a binding from the Workers env object by name.

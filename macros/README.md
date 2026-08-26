@@ -40,7 +40,7 @@ Exports a Cloudflare queue-consumer entrypoint on wasm targets while leaving the
 async fn queue(
     batch: skyzen_cloudflare::CfQueueBatch,
     env: skyzen::runtime::wasm::Env,
-    ctx: skyzen_cloudflare::CfQueueContext,
+    ctx: skyzen_cloudflare::CfEventContext,
 ) -> Result<(), skyzen_cloudflare::CfEventError> {
     batch.ack_all()?;
     Ok(())
@@ -62,6 +62,42 @@ async fn scheduled(
     Ok(())
 }
 ```
+
+### `#[skyzen::email]`
+
+Exports a Cloudflare Email Worker entrypoint on wasm targets, for mail routed to the Worker:
+
+```rust
+#[cfg(target_arch = "wasm32")]
+#[skyzen::email]
+async fn email(
+    message: skyzen_cloudflare::CfEmailMessage,
+    env: skyzen::runtime::wasm::Env,
+    ctx: skyzen_cloudflare::CfEventContext,
+) -> Result<(), skyzen_cloudflare::CfEventError> {
+    message.forward("archive@example.invalid").await
+}
+```
+
+The first argument must be `CfEmailMessage`.
+
+### `#[skyzen::tail]`
+
+Exports a Cloudflare Tail Worker entrypoint on wasm targets, receiving another Worker's logs and
+exceptions:
+
+```rust
+#[cfg(target_arch = "wasm32")]
+#[skyzen::tail]
+async fn tail(
+    traces: Vec<skyzen_cloudflare::TailTraceItem>,
+    env: skyzen::runtime::wasm::Env,
+) -> Result<(), skyzen_cloudflare::CfEventError> {
+    Ok(())
+}
+```
+
+The first argument is either `CfTailEvent` (the raw batch) or `Vec<TailTraceItem>` (decoded).
 
 ### `#[skyzen::durable_object]`
 

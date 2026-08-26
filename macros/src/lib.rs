@@ -252,6 +252,46 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into()
 }
 
+/// Export a Cloudflare Email Worker entrypoint on wasm targets.
+#[proc_macro_attribute]
+pub fn email(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args =
+        parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
+    if !args.is_empty() {
+        return Error::new_spanned(
+            quote! { #args },
+            "#[skyzen::email] does not take arguments; remove them",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let function = parse_macro_input!(item as ItemFn);
+    expand_cloudflare_event(function, CloudflareEventKind::Email)
+        .unwrap_or_else(|error| error.to_compile_error())
+        .into()
+}
+
+/// Export a Cloudflare Tail Worker entrypoint on wasm targets.
+#[proc_macro_attribute]
+pub fn tail(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args =
+        parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
+    if !args.is_empty() {
+        return Error::new_spanned(
+            quote! { #args },
+            "#[skyzen::tail] does not take arguments; remove them",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let function = parse_macro_input!(item as ItemFn);
+    expand_cloudflare_event(function, CloudflareEventKind::Tail)
+        .unwrap_or_else(|error| error.to_compile_error())
+        .into()
+}
+
 /// Export a Cloudflare Durable Object class for a `DurableObject` impl block.
 #[proc_macro_attribute]
 pub fn durable_object(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -3126,6 +3166,20 @@ impl MainOptions {
 enum CloudflareEventKind {
     Queue,
     Scheduled,
+    Email,
+    Tail,
+}
+
+impl CloudflareEventKind {
+    /// The `WinterCG` export name, which is also the attribute's own name.
+    const fn export_name(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Scheduled => "scheduled",
+            Self::Email => "email",
+            Self::Tail => "tail",
+        }
+    }
 }
 
 fn expand_cloudflare_event(
@@ -3134,21 +3188,17 @@ fn expand_cloudflare_event(
 ) -> syn::Result<proc_macro2::TokenStream> {
     let is_async = function.sig.asyncness.is_some();
     let original_ident = function.sig.ident.clone();
-    let internal_ident = match kind {
-        CloudflareEventKind::Queue if original_ident == "queue" => {
-            format_ident!("__skyzen_entry_queue")
-        }
-        CloudflareEventKind::Scheduled if original_ident == "scheduled" => {
-            format_ident!("__skyzen_entry_scheduled")
-        }
-        _ => original_ident,
+    let export_name = kind.export_name();
+    // The handler keeps its own name unless it already *is* the export name, in which case the
+    // generated wrapper would collide with it.
+    let internal_ident = if original_ident == export_name {
+        format_ident!("__skyzen_entry_{export_name}")
+    } else {
+        original_ident
     };
     function.sig.ident = internal_ident.clone();
 
-    let wrapper_ident = match kind {
-        CloudflareEventKind::Queue => format_ident!("queue"),
-        CloudflareEventKind::Scheduled => format_ident!("scheduled"),
-    };
+    let wrapper_ident = format_ident!("{export_name}");
 
     let (wrapper_signature, wrapper_args) = build_cloudflare_event_wrapper(&function, kind)?;
 
@@ -3167,7 +3217,7 @@ fn expand_cloudflare_event(
                 &__skyzen_raw_cf_batch,
             )
         }},
-        CloudflareEventKind::Scheduled => {
+        CloudflareEventKind::Scheduled | CloudflareEventKind::Email | CloudflareEventKind::Tail => {
             quote! { ::skyzen_cloudflare::IntoWorkerResult::into_worker_result(#call) }
         }
     };
@@ -3239,6 +3289,16 @@ fn build_cloudflare_event_wrapper(
             __skyzen_event_env: ::skyzen::runtime::wasm::Env,
             __skyzen_raw_ctx: ::skyzen_cloudflare::worker_sys::ScheduleContext
         },
+        CloudflareEventKind::Email => quote! {
+            __skyzen_raw_email: ::skyzen_cloudflare::ffi::EmailMessageSys,
+            __skyzen_event_env: ::skyzen::runtime::wasm::Env,
+            __skyzen_raw_ctx: ::skyzen_cloudflare::worker_sys::Context
+        },
+        CloudflareEventKind::Tail => quote! {
+            __skyzen_raw_traces: ::skyzen::js_sys::Array,
+            __skyzen_event_env: ::skyzen::runtime::wasm::Env,
+            __skyzen_raw_ctx: ::skyzen_cloudflare::worker_sys::Context
+        },
     };
 
     Ok((wrapper_signature, quote! { #(#call_args),* }))
@@ -3274,6 +3334,17 @@ fn event_argument_expr(
                     .map_err(|error| ::skyzen::wasm_bindgen::JsValue::from_str(&error.to_string()))?,
             )
         }),
+        CloudflareEventKind::Email if ident == "CfEmailMessage" => Ok(quote! {
+            ::skyzen_cloudflare::CfEmailMessage::new(__skyzen_raw_email.clone())
+        }),
+        CloudflareEventKind::Tail if ident == "CfTailEvent" => Ok(quote! {
+            ::skyzen_cloudflare::CfTailEvent::new(__skyzen_raw_traces.clone())
+        }),
+        CloudflareEventKind::Tail if ident == "Vec" => Ok(quote! {
+            ::skyzen_cloudflare::CfTailEvent::new(__skyzen_raw_traces.clone())
+                .traces()
+                .map_err(|error| ::skyzen::wasm_bindgen::JsValue::from_str(&error.to_string()))?
+        }),
         CloudflareEventKind::Queue => Err(Error::new_spanned(
             ty,
             "the first #[skyzen::queue] argument must be `CfQueueBatch` or `QueueBatch<T>`",
@@ -3281,6 +3352,14 @@ fn event_argument_expr(
         CloudflareEventKind::Scheduled => Err(Error::new_spanned(
             ty,
             "the first #[skyzen::scheduled] argument must be `CfScheduledEvent` or `ScheduledTick`",
+        )),
+        CloudflareEventKind::Email => Err(Error::new_spanned(
+            ty,
+            "the first #[skyzen::email] argument must be `CfEmailMessage`",
+        )),
+        CloudflareEventKind::Tail => Err(Error::new_spanned(
+            ty,
+            "the first #[skyzen::tail] argument must be `CfTailEvent` or `Vec<TailTraceItem>`",
         )),
     }
 }
@@ -3291,19 +3370,23 @@ fn context_argument_expr(
 ) -> syn::Result<proc_macro2::TokenStream> {
     let ident = last_type_ident(ty)?;
     match (kind, ident.as_str()) {
-        (CloudflareEventKind::Queue, "CfQueueContext") => {
-            Ok(quote! { ::skyzen_cloudflare::CfQueueContext::new(__skyzen_raw_ctx) })
-        }
+        (
+            CloudflareEventKind::Queue | CloudflareEventKind::Email | CloudflareEventKind::Tail,
+            "CfEventContext",
+        ) => Ok(quote! { ::skyzen_cloudflare::CfEventContext::new(__skyzen_raw_ctx) }),
         (CloudflareEventKind::Scheduled, "CfScheduleContext") => {
             Ok(quote! { ::skyzen_cloudflare::CfScheduleContext::new(__skyzen_raw_ctx) })
         }
-        (CloudflareEventKind::Queue, _) => Err(Error::new_spanned(
-            ty,
-            "the third #[skyzen::queue] argument must be `CfQueueContext`",
-        )),
         (CloudflareEventKind::Scheduled, _) => Err(Error::new_spanned(
             ty,
             "the third #[skyzen::scheduled] argument must be `CfScheduleContext`",
+        )),
+        (kind, _) => Err(Error::new_spanned(
+            ty,
+            format!(
+                "the third #[skyzen::{}] argument must be `CfEventContext`",
+                kind.export_name()
+            ),
         )),
     }
 }
