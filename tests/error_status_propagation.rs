@@ -12,12 +12,12 @@ use skyzen_services::{DbError, KvError};
 use skyzen_test::TestContext;
 
 /// Stands in for a query whose row is absent; the natural response is 404.
-fn lookup_row() -> core::result::Result<String, DbError> {
+const fn lookup_row() -> core::result::Result<String, DbError> {
     Err(DbError::RowNotFound)
 }
 
 /// Stands in for a backend that cannot honour the requested operation; the response is 501.
-fn store_with_ttl() -> core::result::Result<(), KvError> {
+const fn store_with_ttl() -> core::result::Result<(), KvError> {
     Err(KvError::Unsupported("time-to-live"))
 }
 
