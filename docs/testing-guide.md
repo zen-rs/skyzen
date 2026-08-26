@@ -30,7 +30,19 @@ let kv = Kv::new(mock);
 kv.put("key", b"value").await.unwrap();
 let val = kv.get("key").await.unwrap();
 assert_eq!(val, Some(b"value".to_vec()));
+
+// The atomic primitives are real, not stubs: each runs under the store's
+// write lock, so a lock or a rate limiter behaves the way it will on Redis.
+assert!(kv.put_if_absent("lock", b"held").await.unwrap());
+assert!(!kv.put_if_absent("lock", b"stolen").await.unwrap());
+assert_eq!(kv.increment("hits", 1).await.unwrap(), 1);
 ```
+
+**TTL fidelity.** By default the mock honours whatever `Duration` it is given, which is *more*
+permissive than production: a test that stores a 5-second nonce and asserts it has expired passes
+here while Cloudflare KV keeps that nonce alive for a full minute. Use
+`InMemoryKv::strict_cloudflare()` — or `InMemoryKv::new().with_min_ttl(d)` for another platform's
+floor — when the code under test depends on a short expiry.
 
 ### `InMemoryStorage`
 
@@ -46,7 +58,16 @@ let storage = Storage::new(mock);
 storage.put("file.txt", b"hello".to_vec()).await.unwrap();
 let obj = storage.get("file.txt").await.unwrap().unwrap();
 assert_eq!(obj.body, b"hello");
+
+// The byte path is implemented too: streams, real range arithmetic, and a
+// presigned URL that is deterministic and deliberately *not* fetchable.
+let slice = storage.get_range("file.txt", ByteRange::slice(1, 3)).await.unwrap().unwrap();
+assert_eq!(slice.body, b"ell");
+assert_eq!(slice.metadata.size, 5); // still the whole object, for Content-Range
 ```
+
+`presign_get`/`presign_put` return a `memory://` URL: nothing serves that scheme, so a test that
+accidentally follows one fails at connect time instead of reaching a real bucket.
 
 ### `InMemoryQueue`
 
@@ -60,7 +81,18 @@ let mock = InMemoryQueue::new();
 let queue = Queue::new(mock);
 
 queue.send(b"message").await.unwrap();
+
+// Consumption is modelled the way a pull-based broker works, not as a plain
+// pop: a receive leases the message and hides it for the visibility timeout,
+// `ack` deletes it, `nack` reschedules it, and every delivery bumps `attempts`.
+let received = queue.receive(ReceiveOptions::new()).await.unwrap();
+assert_eq!(received[0].attempts, Some(1));
+queue.ack(&received[0].receipt).await.unwrap();
 ```
+
+The mock never sleeps — it has no runtime to long-poll with — so `ReceiveOptions::wait` returns
+whatever is visible immediately. Drive expiry with a zero or very short visibility timeout rather
+than by sleeping.
 
 ### `InMemoryDb`
 
@@ -126,6 +158,49 @@ let response = client
     .body("raw bytes")
     .send()
     .await;
+
+// HEAD and OPTIONS — the latter is what exercises a CORS preflight,
+// which router-wide layers answer.
+let response = client.head("/users/1").send().await;
+let response = client.options("/users").send().await;
+
+// Any other method, including one chosen at runtime
+let response = client.request(Method::TRACE, "/debug").send().await;
+```
+
+Every verb helper delegates to `request(method, path)`, so a route registered for a method the
+helpers do not name is still reachable.
+
+## Injecting Services
+
+`TestContext` carries all seven portable services into every request its clients send:
+
+```rust
+let ctx = TestContext::new()
+    .with_kv(Kv::new(InMemoryKv::new()))
+    .with_storage(Storage::new(InMemoryStorage::new()))
+    .with_queue(Queue::new(InMemoryQueue::new()))
+    .with_db(db)
+    .with_durable_kv(DurableKv::new(InMemoryDurableKv::new()))
+    .with_durable_db(DurableDb::new(InMemoryDurableDb::new()))
+    .with_alarm(Alarm::new(InMemoryAlarm::new()));
+```
+
+`#[skyzen::test]` does this for you: name any of `Kv`, `Storage`, `Queue`, `Db`, `DurableKv`,
+`DurableDb`, `Alarm`, a generated database wrapper, or `TestContext` as a parameter and the macro
+constructs the mock, hands it to the test, and forwards it into the context. A `TestContext`
+parameter on its own provisions all of them, so a handler under test can extract whichever it
+needs:
+
+```rust
+#[skyzen::test]
+async fn alarm_is_scheduled(durable_kv: DurableKv, alarm: Alarm, ctx: TestContext) {
+    ctx.client(app()).post("/schedule").send().await.assert_status(200);
+
+    // The handler and the test share the same mocks.
+    assert_eq!(alarm.get_alarm().await.unwrap(), Some(1337));
+    assert!(durable_kv.get("scheduled").await.unwrap().is_some());
+}
 ```
 
 ## Response Assertions

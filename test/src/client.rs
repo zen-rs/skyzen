@@ -5,9 +5,8 @@ use http_kit::{
     Body, Endpoint, Method, Request, Response,
 };
 use serde::Serialize;
-use skyzen_services::{Db, Kv, Queue, Storage};
 
-use crate::assertions::TestResponse;
+use crate::{assertions::TestResponse, context::InjectedServices};
 
 /// How a buffered header interacts with previously set values of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,98 +23,66 @@ enum HeaderMode {
 #[derive(Debug)]
 pub struct TestClient<E> {
     endpoint: E,
-    kv: Option<Kv>,
-    storage: Option<Storage>,
-    queue: Option<Queue>,
-    db: Option<Db>,
+    services: InjectedServices,
 }
 
 impl<E: Endpoint + Clone> TestClient<E> {
     /// Create a new test client wrapping the given endpoint.
-    pub(crate) const fn new(
-        endpoint: E,
-        kv: Option<Kv>,
-        storage: Option<Storage>,
-        queue: Option<Queue>,
-        db: Option<Db>,
-    ) -> Self {
-        Self {
-            endpoint,
-            kv,
-            storage,
-            queue,
-            db,
-        }
+    pub(crate) const fn new(endpoint: E, services: InjectedServices) -> Self {
+        Self { endpoint, services }
+    }
+
+    /// Start building a request with any method.
+    ///
+    /// The verb helpers below delegate here; use it directly for a method they do not cover, or
+    /// for one built at runtime.
+    #[must_use]
+    pub fn request(&self, method: Method, path: &str) -> RequestBuilder<E> {
+        RequestBuilder::new(self.endpoint.clone(), method, path, self.services.clone())
     }
 
     /// Start building a GET request.
     #[must_use]
     pub fn get(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(
-            self.endpoint.clone(),
-            Method::GET,
-            path,
-            self.kv.clone(),
-            self.storage.clone(),
-            self.queue.clone(),
-            self.db.clone(),
-        )
+        self.request(Method::GET, path)
     }
 
     /// Start building a POST request.
     #[must_use]
     pub fn post(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(
-            self.endpoint.clone(),
-            Method::POST,
-            path,
-            self.kv.clone(),
-            self.storage.clone(),
-            self.queue.clone(),
-            self.db.clone(),
-        )
+        self.request(Method::POST, path)
     }
 
     /// Start building a PUT request.
     #[must_use]
     pub fn put(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(
-            self.endpoint.clone(),
-            Method::PUT,
-            path,
-            self.kv.clone(),
-            self.storage.clone(),
-            self.queue.clone(),
-            self.db.clone(),
-        )
+        self.request(Method::PUT, path)
     }
 
     /// Start building a PATCH request.
     #[must_use]
     pub fn patch(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(
-            self.endpoint.clone(),
-            Method::PATCH,
-            path,
-            self.kv.clone(),
-            self.storage.clone(),
-            self.queue.clone(),
-            self.db.clone(),
-        )
+        self.request(Method::PATCH, path)
     }
 
     /// Start building a DELETE request.
     #[must_use]
     pub fn delete(&self, path: &str) -> RequestBuilder<E> {
-        RequestBuilder::new(
-            self.endpoint.clone(),
-            Method::DELETE,
-            path,
-            self.kv.clone(),
-            self.storage.clone(),
-            self.queue.clone(),
-            self.db.clone(),
-        )
+        self.request(Method::DELETE, path)
+    }
+
+    /// Start building a HEAD request.
+    #[must_use]
+    pub fn head(&self, path: &str) -> RequestBuilder<E> {
+        self.request(Method::HEAD, path)
+    }
+
+    /// Start building an OPTIONS request.
+    ///
+    /// This is what exercises a CORS preflight, which router-wide layers answer.
+    #[must_use]
+    pub fn options(&self, path: &str) -> RequestBuilder<E> {
+        self.request(Method::OPTIONS, path)
     }
 }
 
@@ -127,32 +94,18 @@ pub struct RequestBuilder<E> {
     uri: String,
     headers: Vec<(String, String, HeaderMode)>,
     body: Body,
-    kv: Option<Kv>,
-    storage: Option<Storage>,
-    queue: Option<Queue>,
-    db: Option<Db>,
+    services: InjectedServices,
 }
 
 impl<E: Endpoint> RequestBuilder<E> {
-    fn new(
-        endpoint: E,
-        method: Method,
-        path: &str,
-        kv: Option<Kv>,
-        storage: Option<Storage>,
-        queue: Option<Queue>,
-        db: Option<Db>,
-    ) -> Self {
+    fn new(endpoint: E, method: Method, path: &str, services: InjectedServices) -> Self {
         Self {
             endpoint,
             method,
             uri: path.to_owned(),
             headers: Vec::new(),
             body: Body::empty(),
-            kv,
-            storage,
-            queue,
-            db,
+            services,
         }
     }
 
@@ -255,18 +208,7 @@ impl<E: Endpoint> RequestBuilder<E> {
             }
         }
 
-        if let Some(kv) = &self.kv {
-            request.extensions_mut().insert(kv.clone());
-        }
-        if let Some(storage) = &self.storage {
-            request.extensions_mut().insert(storage.clone());
-        }
-        if let Some(queue) = &self.queue {
-            request.extensions_mut().insert(queue.clone());
-        }
-        if let Some(db) = &self.db {
-            request.extensions_mut().insert(db.clone());
-        }
+        self.services.install(&mut request);
 
         let mut endpoint = self.endpoint;
         // Capture the request identity before `respond` takes the request mutably.
@@ -414,6 +356,98 @@ mod tests {
 
         response.assert_status(200);
         response.assert_body_contains("tags=second;");
+    }
+
+    #[derive(Debug, Clone)]
+    struct MethodEchoEndpoint;
+
+    impl Endpoint for MethodEchoEndpoint {
+        type Error = std::convert::Infallible;
+
+        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+            Ok(Response::new(Body::from(request.method().to_string())))
+        }
+    }
+
+    #[tokio::test]
+    async fn head_and_options_reach_the_endpoint() {
+        let client = TestContext::new().client(MethodEchoEndpoint);
+
+        assert_eq!(client.head("/resource").send().await.body_text(), "HEAD");
+        // A CORS preflight is the reason OPTIONS needs to be reachable at all.
+        assert_eq!(
+            client.options("/resource").send().await.body_text(),
+            "OPTIONS"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_builds_a_method_the_verb_helpers_do_not_cover() {
+        let response = TestContext::new()
+            .client(MethodEchoEndpoint)
+            .request(http_kit::Method::TRACE, "/resource")
+            .send()
+            .await;
+
+        response.assert_status(200);
+        assert_eq!(response.body_text(), "TRACE");
+    }
+
+    #[tokio::test]
+    async fn durable_services_ride_the_context_into_the_request() {
+        use skyzen_services::durable::{Alarm, DurableDb, DurableKv};
+
+        use crate::mock::{InMemoryAlarm, InMemoryDurableDb, InMemoryDurableKv};
+
+        #[derive(Debug, Clone)]
+        struct DurableEndpoint;
+
+        impl Endpoint for DurableEndpoint {
+            type Error = std::convert::Infallible;
+
+            async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+                use skyzen_core::Extractor as _;
+
+                let kv = DurableKv::extract(request)
+                    .await
+                    .expect("durable kv should be injected");
+                let db = DurableDb::extract(request)
+                    .await
+                    .expect("durable db should be injected");
+                let alarm = Alarm::extract(request)
+                    .await
+                    .expect("alarm should be injected");
+
+                kv.put("visited", b"1").await.expect("durable kv put");
+                db.query("SELECT 1").execute().await.expect("durable query");
+                alarm.set_alarm(1337).await.expect("alarm set");
+
+                Ok(Response::new(Body::from("ok")))
+            }
+        }
+
+        let durable_kv = InMemoryDurableKv::new();
+        let durable_db = InMemoryDurableDb::new();
+        let alarm = InMemoryAlarm::new();
+
+        let response = TestContext::new()
+            .with_durable_kv(DurableKv::new(durable_kv.clone()))
+            .with_durable_db(DurableDb::new(durable_db.clone()))
+            .with_alarm(Alarm::new(alarm.clone()))
+            .client(DurableEndpoint)
+            .get("/durable")
+            .send()
+            .await;
+
+        response.assert_status(200);
+        assert_eq!(
+            skyzen_services::durable::DurableKvStore::get(&durable_kv, "visited")
+                .await
+                .unwrap(),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(durable_db.executed_queries().len(), 1);
+        assert_eq!(alarm.scheduled_time(), Some(1337));
     }
 
     #[tokio::test]
