@@ -86,6 +86,10 @@ pub struct ObjectMetadata {
     /// The object's key (path).
     pub key: String,
     /// Size in bytes.
+    ///
+    /// Always the size of the whole object, including on a
+    /// [`get_range`](ObjectStorage::get_range) result whose body holds only the requested slice —
+    /// that is what a handler needs to render a `Content-Range`.
     pub size: u64,
     /// Content type (MIME), if known.
     pub content_type: Option<String>,
@@ -93,6 +97,15 @@ pub struct ObjectMetadata {
     pub last_modified: Option<u64>,
     /// Custom metadata key-value pairs.
     pub metadata: HashMap<String, String>,
+    /// The object's entity tag in the quoted HTTP form (`"d41d8cd9…"`), when the backend reports
+    /// one.
+    ///
+    /// Quoted because that is the form an `ETag` / `If-None-Match` header carries, so a handler can
+    /// pass it straight through. Backends that natively hand back a bare digest (R2's `etag`) fill
+    /// this from their HTTP-shaped field (R2's `httpEtag`) instead.
+    pub etag: Option<String>,
+    /// The backend's own version identifier for this object, when it versions objects.
+    pub version: Option<String>,
 }
 
 /// A retrieved storage object, including its body and metadata.
@@ -105,20 +118,163 @@ pub struct StorageObject {
 }
 
 /// Options for storing an object.
+///
+/// `content_type` and `metadata` are the two every backend records. The rest are *extended*
+/// options — generic object-storage concepts (S3, R2 and Azure Blob all have them) that an
+/// individual backend may not be wired for yet. A backend never drops one silently: it honours
+/// what it can and hands the rest to [`reject_unsupported`](Self::reject_unsupported).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PutOptions {
     /// Content type (MIME) to record with the object.
     pub content_type: Option<String>,
     /// Custom metadata key-value pairs to record with the object.
     pub metadata: HashMap<String, String>,
+    /// `Cache-Control` to serve the object with.
+    pub cache_control: Option<String>,
+    /// `Content-Encoding` to serve the object with.
+    pub content_encoding: Option<String>,
+    /// `Content-Disposition` to serve the object with.
+    pub content_disposition: Option<String>,
+    /// The backend's storage tier for this object (S3's `STANDARD`/`GLACIER`, R2's
+    /// `Standard`/`InfrequentAccess`). Spelled the way the backend spells it.
+    pub storage_class: Option<String>,
+    /// The raw MD5 digest of `body`, for the backend to verify the upload against.
+    ///
+    /// Raw digest bytes, not hex and not base64: each backend encodes them the way its own API
+    /// wants. A mismatch is the backend's error, which is the point of sending it.
+    pub content_md5: Option<Vec<u8>>,
+}
+
+/// One extended [`PutOptions`] field — everything past content type and custom metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PutOption {
+    /// [`PutOptions::cache_control`].
+    CacheControl,
+    /// [`PutOptions::content_encoding`].
+    ContentEncoding,
+    /// [`PutOptions::content_disposition`].
+    ContentDisposition,
+    /// [`PutOptions::storage_class`].
+    StorageClass,
+    /// [`PutOptions::content_md5`].
+    ContentMd5,
+}
+
+impl PutOption {
+    /// Every extended option, in the order [`PutOptions`] declares them.
+    pub const ALL: [Self; 5] = [
+        Self::CacheControl,
+        Self::ContentEncoding,
+        Self::ContentDisposition,
+        Self::StorageClass,
+        Self::ContentMd5,
+    ];
+
+    /// What [`PutOptions::reject_unsupported`] reports when a backend cannot honour this option.
+    const fn unsupported(self) -> &'static str {
+        match self {
+            Self::CacheControl => "cache control is not supported by this storage backend",
+            Self::ContentEncoding => "content encoding is not supported by this storage backend",
+            Self::ContentDisposition => {
+                "content disposition is not supported by this storage backend"
+            }
+            Self::StorageClass => "storage classes are not supported by this storage backend",
+            Self::ContentMd5 => "upload checksums are not supported by this storage backend",
+        }
+    }
 }
 
 impl PutOptions {
+    /// Options that record nothing beyond the body.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `content_type` as the object's MIME type.
+    #[must_use]
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Record one custom metadata entry alongside the object.
+    #[must_use]
+    pub fn with_metadata(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(name.into(), value.into());
+        self
+    }
+
+    /// Serve the object with this `Cache-Control`.
+    #[must_use]
+    pub fn with_cache_control(mut self, cache_control: impl Into<String>) -> Self {
+        self.cache_control = Some(cache_control.into());
+        self
+    }
+
+    /// Serve the object with this `Content-Encoding`.
+    #[must_use]
+    pub fn with_content_encoding(mut self, content_encoding: impl Into<String>) -> Self {
+        self.content_encoding = Some(content_encoding.into());
+        self
+    }
+
+    /// Serve the object with this `Content-Disposition`.
+    #[must_use]
+    pub fn with_content_disposition(mut self, content_disposition: impl Into<String>) -> Self {
+        self.content_disposition = Some(content_disposition.into());
+        self
+    }
+
+    /// Store the object in this backend-named storage tier.
+    #[must_use]
+    pub fn with_storage_class(mut self, storage_class: impl Into<String>) -> Self {
+        self.storage_class = Some(storage_class.into());
+        self
+    }
+
+    /// Have the backend verify the upload against this raw MD5 digest.
+    #[must_use]
+    pub fn with_content_md5(mut self, digest: impl Into<Vec<u8>>) -> Self {
+        self.content_md5 = Some(digest.into());
+        self
+    }
+
     /// Returns `true` when no option is set, i.e. the put is equivalent to a
     /// plain [`ObjectStorage::put`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.content_type.is_none() && self.metadata.is_empty()
+        self.content_type.is_none() && self.metadata.is_empty() && self.extended().next().is_none()
+    }
+
+    /// Which extended options this request actually sets.
+    pub fn extended(&self) -> impl Iterator<Item = PutOption> + '_ {
+        PutOption::ALL.into_iter().filter(|option| match option {
+            PutOption::CacheControl => self.cache_control.is_some(),
+            PutOption::ContentEncoding => self.content_encoding.is_some(),
+            PutOption::ContentDisposition => self.content_disposition.is_some(),
+            PutOption::StorageClass => self.storage_class.is_some(),
+            PutOption::ContentMd5 => self.content_md5.is_some(),
+        })
+    }
+
+    /// Fail when this request sets an extended option the backend does not honour.
+    ///
+    /// `honoured` names the options the caller has actually wired into its request; anything else
+    /// that is set becomes a [`StorageError::Unsupported`] instead of being dropped on the way to
+    /// the backend, so a caller that asked for `Cache-Control` never gets a silent success from a
+    /// backend that ignored it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Unsupported`] naming the first set option that is not in `honoured`.
+    pub fn reject_unsupported(&self, honoured: &[PutOption]) -> Result<(), StorageError> {
+        self.extended()
+            .find(|option| !honoured.contains(option))
+            .map_or(Ok(()), |option| {
+                Err(StorageError::Unsupported(option.unsupported()))
+            })
     }
 }
 
@@ -669,6 +825,8 @@ mod tests {
                 content_type: None,
                 last_modified: None,
                 metadata: HashMap::new(),
+                etag: None,
+                version: None,
             }
         }
     }
@@ -879,6 +1037,40 @@ mod tests {
                 .unwrap_err(),
             StorageError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn put_options_report_the_extended_options_a_backend_cannot_honour() {
+        use super::{PutOption, PutOptions};
+
+        let plain = PutOptions::new()
+            .with_content_type("text/plain")
+            .with_metadata("owner", "tests");
+        assert!(!plain.is_empty());
+        assert_eq!(plain.extended().count(), 0);
+        plain
+            .reject_unsupported(&[])
+            .expect("content type and metadata are honoured everywhere");
+
+        let extended = PutOptions::new()
+            .with_cache_control("public, max-age=60")
+            .with_storage_class("InfrequentAccess");
+        assert_eq!(
+            extended.extended().collect::<Vec<_>>(),
+            vec![PutOption::CacheControl, PutOption::StorageClass]
+        );
+        // A backend that wires up only one of the two still refuses the other.
+        assert!(matches!(
+            extended
+                .reject_unsupported(&[PutOption::CacheControl])
+                .unwrap_err(),
+            StorageError::Unsupported(_)
+        ));
+        extended
+            .reject_unsupported(&PutOption::ALL)
+            .expect("a backend honouring everything accepts everything");
+
+        assert!(PutOptions::new().is_empty());
     }
 
     #[tokio::test]

@@ -62,11 +62,11 @@ pub use queue::{
     SendOptions,
 };
 pub use sql::{
-    Db, DbBackend, DbDialect, DbError, DbExecResult, DbQuery, DbTransaction, DbTransactionBackend,
-    DbTransactionQuery, DbValue, QuerySource, SqlQuery,
+    BatchStatement, Db, DbBackend, DbDialect, DbError, DbExecResult, DbQuery, DbTransaction,
+    DbTransactionBackend, DbTransactionQuery, DbValue, QuerySource, SqlQuery,
 };
 pub use storage::{
-    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest,
+    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest, PutOption,
     PutOptions, Storage, StorageError, StorageObject, StorageStream,
 };
 

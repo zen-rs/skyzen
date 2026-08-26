@@ -57,6 +57,8 @@ impl ObjectStorage for AzureBlob {
                 content_type: None,
                 last_modified: None,
                 metadata: HashMap::new(),
+                etag: None,
+                version: None,
             },
             Err(error) => return Err(storage_error(error)),
         };
@@ -78,6 +80,12 @@ impl ObjectStorage for AzureBlob {
         body: Vec<u8>,
         options: PutOptions,
     ) -> Result<(), StorageError> {
+        // Wave E widened `PutOptions` with cache control, content encoding/disposition, storage
+        // class and an upload checksum. Azure Blob has most of them, but wiring them belongs to
+        // the Azure wave — until then a caller that sets one is told so rather than having it
+        // dropped.
+        options.reject_unsupported(&[])?;
+
         let mut request = self.operator.write_with(key, body);
         if let Some(content_type) = &options.content_type {
             request = request.content_type(content_type);
@@ -163,6 +171,8 @@ fn stat_metadata(key: &str, metadata: &opendal::Metadata) -> ObjectMetadata {
             .last_modified()
             .and_then(|timestamp| u64::try_from(timestamp.into_inner().as_second()).ok()),
         metadata: metadata.user_metadata().cloned().unwrap_or_default(),
+        etag: metadata.etag().map(ToOwned::to_owned),
+        version: metadata.version().map(ToOwned::to_owned),
     }
 }
 
@@ -240,6 +250,8 @@ mod tests {
             content_type: None,
             last_modified: None,
             metadata: HashMap::new(),
+            etag: None,
+            version: None,
         }
     }
 

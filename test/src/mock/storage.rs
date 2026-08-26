@@ -25,8 +25,9 @@ const MEMORY_URL_SCHEME: &str = "memory";
 #[derive(Debug, Clone)]
 struct StoredObject {
     body: Vec<u8>,
-    content_type: Option<String>,
-    metadata: HashMap<String, String>,
+    /// Everything the put asked to record, kept whole so no option is dropped as
+    /// [`PutOptions`] grows.
+    options: PutOptions,
     last_modified: u64,
 }
 
@@ -104,8 +105,7 @@ impl InMemoryStorage {
                 key.to_owned(),
                 StoredObject {
                     body,
-                    content_type: options.content_type,
-                    metadata: options.metadata,
+                    options,
                     last_modified: unix_now(),
                 },
             );
@@ -128,9 +128,13 @@ fn metadata_for(key: &str, object: &StoredObject) -> ObjectMetadata {
     ObjectMetadata {
         key: key.to_owned(),
         size: object.body.len() as u64,
-        content_type: object.content_type.clone(),
+        content_type: object.options.content_type.clone(),
         last_modified: Some(object.last_modified),
-        metadata: object.metadata.clone(),
+        metadata: object.options.metadata.clone(),
+        // A HashMap keeps no version history and mints no entity tag, and inventing either would
+        // let a test assert on something no real backend guarantees.
+        etag: None,
+        version: None,
     }
 }
 
@@ -302,6 +306,9 @@ impl ObjectStorage for InMemoryStorage {
         options: PutOptions,
     ) -> Result<PresignedRequest, StorageError> {
         self.take_injected_failure()?;
+        // Only the content type turns into a header the presigned request can carry; anything
+        // further would have to be dropped, so it is refused instead.
+        options.reject_unsupported(&[])?;
         let mut request = presigned(Method::PUT, key, expires_in);
         if let Some(content_type) = options.content_type {
             let value = HeaderValue::from_str(&content_type).map_err(|error| {
@@ -409,10 +416,10 @@ mod tests {
             .put_with(
                 "report.pdf",
                 b"%PDF".to_vec(),
-                PutOptions {
-                    content_type: Some("application/pdf".to_owned()),
-                    metadata: metadata.clone(),
-                },
+                metadata.iter().fold(
+                    PutOptions::new().with_content_type("application/pdf"),
+                    |options, (name, value)| options.with_metadata(name, value),
+                ),
             )
             .await
             .unwrap();
@@ -438,10 +445,7 @@ mod tests {
                 "clip.bin",
                 StorageStream::once(b"streamed".to_vec()),
                 Some(8),
-                PutOptions {
-                    content_type: Some("application/octet-stream".to_owned()),
-                    metadata: HashMap::new(),
-                },
+                PutOptions::new().with_content_type("application/octet-stream"),
             )
             .await
             .unwrap();
@@ -552,10 +556,7 @@ mod tests {
             .presign_put(
                 "report.pdf",
                 Duration::from_mins(15),
-                PutOptions {
-                    content_type: Some("application/pdf".to_owned()),
-                    metadata: HashMap::new(),
-                },
+                PutOptions::new().with_content_type("application/pdf"),
             )
             .await
             .unwrap();
