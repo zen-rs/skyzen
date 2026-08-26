@@ -75,6 +75,15 @@ fn extract_custom_metadata(obj: &R2Object) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Extract the object's entity tag in the quoted HTTP form.
+///
+/// R2 exposes both `etag` (a bare hex digest) and `httpEtag` (the same digest quoted, ready for an
+/// `ETag` header). [`ObjectMetadata::etag`] is documented as the quoted form, so `httpEtag` is the
+/// one that goes there.
+fn extract_etag(obj: &R2Object) -> Option<String> {
+    obj.http_etag().ok()
+}
+
 /// Extract the upload timestamp (seconds since Unix epoch) from an R2 object.
 fn extract_last_modified(obj: &R2Object) -> Option<u64> {
     let millis = obj.uploaded().ok()?.get_time();
@@ -117,6 +126,8 @@ impl ObjectStorage for CfR2 {
             content_type,
             last_modified: extract_last_modified(base),
             metadata: custom,
+            etag: extract_etag(base),
+            version: base.version().ok(),
         };
 
         Ok(Some(StorageObject { body, metadata }))
@@ -138,6 +149,10 @@ impl ObjectStorage for CfR2 {
         body: Vec<u8>,
         options: PutOptions,
     ) -> Result<(), StorageError> {
+        // Only content type and custom metadata are wired below, so anything further is refused
+        // rather than dropped.
+        options.reject_unsupported(&[])?;
+
         let js_options = js_sys::Object::new();
 
         if let Some(content_type) = &options.content_type {
@@ -222,6 +237,8 @@ impl ObjectStorage for CfR2 {
                 content_type: extract_content_type(&entry),
                 last_modified: extract_last_modified(&entry),
                 metadata: extract_custom_metadata(&entry),
+                etag: extract_etag(&entry),
+                version: entry.version().ok(),
             });
         }
 
@@ -250,6 +267,8 @@ impl ObjectStorage for CfR2 {
             content_type,
             last_modified: extract_last_modified(&obj),
             metadata: custom,
+            etag: extract_etag(&obj),
+            version: obj.version().ok(),
         }))
     }
 }
