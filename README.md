@@ -460,8 +460,14 @@ async fn save_file(
 |---|---|---|---|---|---|
 | **Key-Value** (`Kv`) | [`skyzen-redis`](redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
 | **Object Storage** (`Storage`) | [`skyzen-s3`](s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
-| **Message Queue** (`Queue`) | — | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
+| **Message Queue** (`Queue`) | [`SqsQueue`](aws/) | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
 | **SQL Database** (`Db`) | `Db` via SQLx (Postgres/MySQL/SQLite) | `Db` via D1 | Planned | Planned | `InMemoryDb` (SQLite) |
+
+The **Native Server** column names what a native deployment can wire, not a separate implementation:
+runtime and provider are independent axes, so a backend that is a plain HTTP client — `SqsQueue`,
+`DynamoKv`, `S3Storage` — works just as well from a native server as from anywhere else. `SqsQueue`
+appears twice for that reason, and it is what `[native.service.*]` wiring in `Skyzen.toml` builds for
+`backend = "sqs"`. Use `InMemoryQueue` for local development.
 
 ### Wiring Backends
 
