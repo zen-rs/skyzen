@@ -74,6 +74,12 @@ impl DurableDbBackend for CfDurableDb {
     }
 }
 
+/// Convert a bound parameter to the JS value Durable Object SQL accepts.
+///
+/// The storage API takes only `null`, numbers, strings and `ArrayBuffer`s, so the richer
+/// [`DbValue`] variants are rendered in the textual form `SQLite` compares and stores them as:
+/// RFC 3339 for a timestamp, the hyphenated form for a UUID, the exact decimal rendering for a
+/// decimal, and compact JSON for a document.
 fn db_value_to_js(value: &DbValue) -> Result<JsValue, DurableDbError> {
     match value {
         DbValue::Null => Ok(JsValue::NULL),
@@ -83,6 +89,10 @@ fn db_value_to_js(value: &DbValue) -> Result<JsValue, DurableDbError> {
         DbValue::Real(v) => Ok(JsValue::from_f64(*v)),
         DbValue::Text(v) => Ok(JsValue::from_str(v)),
         DbValue::Blob(v) => Ok(js_sys::Uint8Array::from(v.as_slice()).into()),
+        DbValue::Timestamp(v) => Ok(JsValue::from_str(&v.to_rfc3339())),
+        DbValue::Uuid(v) => Ok(JsValue::from_str(&v.to_string())),
+        DbValue::Decimal(v) => Ok(JsValue::from_str(&v.to_string())),
+        DbValue::Json(v) => Ok(JsValue::from_str(&v.to_string())),
     }
 }
 

@@ -53,7 +53,7 @@ pub mod queue;
 pub mod sql;
 pub mod storage;
 
-pub use durable::{DurableDb, DurableDbBackend, DurableDbError};
+pub use durable::{DurableDb, DurableDbBackend, DurableDbError, DurableDbQuery};
 pub use events::ScheduledTick;
 pub use kv::{KeyValueStore, Kv, KvError, KvListOptions, KvListResult};
 pub use queue::{
@@ -61,7 +61,10 @@ pub use queue::{
     QueueMessage, QueueMessageDisposition, QueueRetry, ReceiveOptions, ReceivedMessage,
     SendOptions,
 };
-pub use sql::{Db, DbBackend, DbError, DbExecResult, DbTransaction, DbTransactionBackend, DbValue};
+pub use sql::{
+    Db, DbBackend, DbDialect, DbError, DbExecResult, DbQuery, DbTransaction, DbTransactionBackend,
+    DbTransactionQuery, DbValue, QuerySource, SqlQuery,
+};
 pub use storage::{
     ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest,
     PutOptions, Storage, StorageError, StorageObject, StorageStream,

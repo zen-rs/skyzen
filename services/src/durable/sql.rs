@@ -1,10 +1,9 @@
 //! Durable Object database abstraction.
 
 use core::future::Future;
+use std::borrow::Cow;
 
-use serde::de::DeserializeOwned;
-
-use crate::sql::{prepare_query_sql, DbDialect, DbError, DbExecResult, DbValue};
+use crate::sql::{DbDialect, DbError, DbExecResult, DbValue, QuerySource, SqlQuery};
 
 /// Errors from Durable Object database operations.
 #[derive(Debug, thiserror::Error)]
@@ -127,11 +126,7 @@ impl DurableDb {
     /// supported and will fail the placeholder/parameter count check.
     #[must_use]
     pub const fn query<'a>(&'a self, sql: &'a str) -> DurableDbQuery<'a> {
-        DurableDbQuery {
-            db: self,
-            sql,
-            params: Vec::new(),
-        }
+        SqlQuery::new(self, Cow::Borrowed(sql))
     }
 
     /// Get the on-disk database size in bytes.
@@ -144,87 +139,29 @@ impl DurableDb {
     }
 }
 
-/// Query builder for [`DurableDb`].
-#[derive(Debug)]
-pub struct DurableDbQuery<'a> {
-    db: &'a DurableDb,
-    sql: &'a str,
-    params: Vec<DbValue>,
-}
+/// The query builder returned by [`DurableDb::query`].
+///
+/// Durable Object SQL is `SQLite`, so it shares [`SqlQuery`] — and with it the `?`-placeholder
+/// rewriting and the `LIMIT 1` that `fetch_one`/`fetch_optional` append — with [`Db`](crate::Db).
+pub type DurableDbQuery<'a> = SqlQuery<'a, &'a DurableDb>;
 
-impl DurableDbQuery<'_> {
-    /// Bind a parameter value to the query.
-    #[must_use]
-    pub fn bind<T>(mut self, value: T) -> Self
-    where
-        T: Into<DbValue>,
-    {
-        self.params.push(value.into());
-        self
+impl QuerySource for &DurableDb {
+    type Error = DurableDbError;
+
+    fn dialect(&self) -> DbDialect {
+        DbDialect::Sqlite
     }
 
-    /// Execute a statement that does not return rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if placeholder validation, backend execution, or
-    /// result conversion fails.
-    pub async fn execute(self) -> Result<DbExecResult, DurableDbError> {
-        let sql = prepare_query_sql(self.sql, self.params.len(), DbDialect::Sqlite)?;
-        self.db.0.execute(&sql, &self.params).await
+    async fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<DbExecResult, Self::Error> {
+        self.0.query(sql, params).await
     }
 
-    /// Execute a query and deserialize all rows into `T`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if placeholder validation, backend execution, or row
-    /// deserialization fails.
-    pub async fn fetch_all<T>(self) -> Result<Vec<T>, DurableDbError>
-    where
-        T: DeserializeOwned,
-    {
-        let sql = prepare_query_sql(self.sql, self.params.len(), DbDialect::Sqlite)?;
-        let result = self.db.0.query(&sql, &self.params).await?;
-        result
-            .rows
-            .into_iter()
-            .map(|row| serde_json::from_value(row).map_err(Into::into))
-            .collect()
-    }
-
-    /// Execute a query and deserialize the first row into `T`, if present.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if placeholder validation, backend execution, or row
-    /// deserialization fails.
-    pub async fn fetch_optional<T>(self) -> Result<Option<T>, DurableDbError>
-    where
-        T: DeserializeOwned,
-    {
-        let sql = prepare_query_sql(self.sql, self.params.len(), DbDialect::Sqlite)?;
-        let result = self.db.0.query(&sql, &self.params).await?;
-        result
-            .rows
-            .into_iter()
-            .next()
-            .map(|row| serde_json::from_value(row).map_err(Into::into))
-            .transpose()
-    }
-
-    /// Execute a query and deserialize exactly one row into `T`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if execution fails or the query returns no rows.
-    pub async fn fetch_one<T>(self) -> Result<T, DurableDbError>
-    where
-        T: DeserializeOwned,
-    {
-        self.fetch_optional()
-            .await?
-            .ok_or(DurableDbError::RowNotFound)
+    async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, Self::Error> {
+        self.0.execute(sql, params).await
     }
 }
 
