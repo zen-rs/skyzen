@@ -94,7 +94,7 @@ hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 http-body-util = "0.1.3"
 # Optional native dependencies
 tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "signal"], optional = true }
-skyzen-hyper = { workspace = true, optional = true }
+skyzen-hyper.workspace = true
 jsonwebtoken = { version = "10", optional = true, features = ["aws_lc_rs"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
@@ -162,9 +162,10 @@ rt = []
 # The `hyper` feature provides the Hyper server adapter (`skyzen::hyper`).
 # Use this when embedding Skyzen into your own application with a custom runtime.
 # You only need to bring your own tokio runtime; no need to import hyper or hyper-util directly.
-# Note: hyper and http-body-util are always available on native targets; this feature
-# enables the skyzen-hyper convenience wrapper.
-hyper = ["dep:skyzen-hyper"]
+# Note: `skyzen-hyper` is a plain native dependency — the built-in runtime installs its
+# `hyper::rt::Timer` rather than carrying a second copy — so this feature only controls whether
+# the adapter is re-exported as `skyzen::hyper`.
+hyper = []
 
 [[example]]
 name = "embed_hyper"
