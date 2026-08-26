@@ -73,21 +73,21 @@ fn strip_prefix(uri: &Uri, prefix: &str) -> Option<Uri> {
     // The prefix is matched on the raw path, before percent-decoding, so a `%2F` inside a segment
     // cannot smuggle its way past the mount point.
     let rest = path.strip_prefix(prefix)?;
-    let rest = if rest.is_empty() { "/" } else { rest };
+    // A prefix of `/`, or one written with a trailing slash, takes the leading slash with it —
+    // and a rootless remainder is not a path the mounted router could ever match. Put it back.
+    let mut rewritten = String::with_capacity(rest.len() + uri.query().map_or(1, |q| q.len() + 2));
+    if !rest.starts_with('/') {
+        rewritten.push('/');
+    }
+    rewritten.push_str(rest);
 
-    let path_and_query = match uri.query() {
-        Some(query) => {
-            let mut buffer = String::with_capacity(rest.len() + query.len() + 1);
-            buffer.push_str(rest);
-            buffer.push('?');
-            buffer.push_str(query);
-            buffer.parse::<PathAndQuery>().ok()?
-        }
-        None => rest.parse::<PathAndQuery>().ok()?,
-    };
+    if let Some(query) = uri.query() {
+        rewritten.push('?');
+        rewritten.push_str(query);
+    }
 
     let mut parts = uri.clone().into_parts();
-    parts.path_and_query = Some(path_and_query);
+    parts.path_and_query = Some(rewritten.parse::<PathAndQuery>().ok()?);
     Uri::from_parts(parts).ok()
 }
 
@@ -113,6 +113,16 @@ mod tests {
     fn the_bare_mount_point_becomes_the_root() {
         assert_eq!(rewrite("/api", "/api"), "/");
         assert_eq!(rewrite("/api/", "/api"), "/");
+    }
+
+    #[test]
+    fn a_prefix_that_takes_the_leading_slash_with_it_leaves_a_rooted_path() {
+        // Mounted at the root, or written with a trailing slash: the remainder must not come back
+        // rootless, or the mounted router could never match it.
+        assert_eq!(rewrite("/users", "/"), "/users");
+        assert_eq!(rewrite("/users?page=2", "/"), "/users?page=2");
+        assert_eq!(rewrite("/api/users", "/api/"), "/users");
+        assert_eq!(rewrite("/api/", "/api/"), "/");
     }
 
     #[test]
