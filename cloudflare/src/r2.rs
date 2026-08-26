@@ -613,7 +613,7 @@ impl CfR2MultipartUpload {
     ///
     /// # Errors
     ///
-    /// [`StorageError`] when the runtime rejects the completion — a missing part or a mis-sized
+    /// [`StorageError`] when the runtime rejects the completion — a missing part or a wrong-sized
     /// one fails here rather than producing a corrupt object.
     pub async fn complete(
         self,
