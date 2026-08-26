@@ -22,12 +22,48 @@ Extractor (handler arg)     ← Pulled from request extensions automatically
 
 | Trait | Wrapper | Operations |
 |-------|---------|------------|
-| `KeyValueStore` | `Kv` | `get`, `put`, `delete`, `list` + `get_json`, `get_text`, `put_json` |
-| `ObjectStorage` | `Storage` | `get`, `put`, `delete`, `list`, `head` |
+| `KeyValueStore` | `Kv` | `get`, `put`, `put_with_ttl`, `delete`, `exists`, `list` + the atomics below + `get_json`, `get_text`, `put_json`, `list_all` |
+| `ObjectStorage` | `Storage` | `get`, `put`, `put_with`, `delete`, `list`, `head` |
 | `MessageQueue` | `Queue` | `send`, `send_batch` + `send_json`, `send_json_batch` |
 | `DbBackend` | `Db` | `query(...).bind(...).fetch_*`, `execute` |
 
 Cloudflare-specific primitives such as `CfD1`, `DurableDb`, and Durable Objects are provider extensions, not part of the portable core.
+
+### Atomic KV Primitives
+
+A KV store is only usable for locks, idempotency keys and rate limiters if it can write
+conditionally, so `KeyValueStore` also carries:
+
+| Method | Returns | Use |
+|--------|---------|-----|
+| `put_if_absent(key, value)` | `true` when written | distributed lock, idempotency key |
+| `compare_and_swap(key, expected, new)` | `true` when swapped | optimistic concurrency |
+| `increment(key, delta)` | the new counter value | rate limits, counters |
+| `expire(key, ttl)` | `false` when the key is absent | sliding-expiration sessions |
+
+`compare_and_swap` reports a lost race as `Ok(false)`, not as an error — losing an optimistic
+update is an ordinary outcome, and `KvError::Conflict` is reserved for conflicts a backend raises
+on its own. Each of these has a `KvError::Unsupported` default, so a backend without the primitive
+(Cloudflare KV has no conditional write) fails loudly instead of degrading to a racy
+read-modify-write.
+
+### Listing
+
+`list` takes `KvListOptions { prefix, limit, cursor }` and returns `KvListResult { keys, cursor }`,
+mirroring `ObjectStorage::list`. Pagination is the platform's own — Redis `SCAN`, `DynamoDB`'s
+`ExclusiveStartKey`, Cloudflare KV's list cursor — so a large namespace is never materialized at
+once:
+
+```rust
+let page = kv
+    .list(KvListOptions::new().with_prefix("session:").with_limit(100))
+    .await?;
+for key in page.keys { /* ... */ }
+// `page.cursor` is `Some(..)` while more keys remain.
+```
+
+`Kv::list_all(prefix)` drains every page for you. It is documented as potentially expensive: it
+holds the whole key set in memory and, on `DynamoDB`, is a full table scan.
 
 ## Writing a Handler
 

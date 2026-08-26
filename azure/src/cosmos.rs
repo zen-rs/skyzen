@@ -8,7 +8,7 @@ use azure_data_cosmos::{clients::ContainerClient, CosmosError, FeedScope, Query}
 use base64::Engine;
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use skyzen_services::kv::{KeyValueStore, KvError};
+use skyzen_services::kv::{KeyValueStore, KvError, KvListOptions, KvListResult};
 
 /// Document schema for key-value items in Cosmos DB.
 #[derive(Debug, Serialize, Deserialize)]
@@ -155,14 +155,27 @@ impl KeyValueStore for CosmosKv {
         }
     }
 
-    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, KvError> {
+    /// List one page of keys.
+    ///
+    /// Cosmos paginates through an opaque continuation token that the SDK's item pager owns
+    /// internally rather than surfacing per item, so this honours `prefix` and `limit` and always
+    /// reports `cursor: None`; a caller asking for more than `limit` keys must widen the limit.
+    /// Resumable Cosmos listing is left to the Azure provider wave, where the pager's continuation
+    /// handling belongs with the rest of the Cosmos work.
+    async fn list(&self, options: KvListOptions) -> Result<KvListResult, KvError> {
+        if options.cursor.is_some() {
+            return Err(KvError::Unsupported(
+                "resumable listing is not supported by the Cosmos DB key-value backend",
+            ));
+        }
+
         // Parameterize the prefix instead of interpolating it into the query
         // text, so no prefix content can alter the query (Cosmos SQL string
         // escaping uses backslashes, which naive quoting mishandles).
-        let query = match prefix {
+        let query = match options.prefix.as_deref() {
             None => Query::from("SELECT c.id FROM c"),
-            Some(p) => Query::from("SELECT c.id FROM c WHERE STARTSWITH(c.id, @prefix)")
-                .with_parameter("@prefix", p)
+            Some(prefix) => Query::from("SELECT c.id FROM c WHERE STARTSWITH(c.id, @prefix)")
+                .with_parameter("@prefix", prefix)
                 .map_err(kv_backend_err)?,
         };
 
@@ -173,14 +186,18 @@ impl KeyValueStore for CosmosKv {
             .await
             .map_err(kv_backend_err)?;
 
+        let limit = options.limit.unwrap_or(usize::MAX);
         let mut keys = Vec::new();
-        while let Some(item) = pager.try_next().await.map_err(kv_backend_err)? {
+        while keys.len() < limit {
+            let Some(item) = pager.try_next().await.map_err(kv_backend_err)? else {
+                break;
+            };
             if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
                 keys.push(id.to_owned());
             }
         }
 
-        Ok(keys)
+        Ok(KvListResult { keys, cursor: None })
     }
 }
 

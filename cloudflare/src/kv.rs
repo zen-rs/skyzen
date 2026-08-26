@@ -5,7 +5,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use worker::send::IntoSendFuture;
 
-use skyzen_services::kv::{KeyValueStore, KvError};
+use skyzen_services::kv::{KeyValueStore, KvError, KvListOptions, KvListResult};
 
 use crate::ffi;
 
@@ -118,58 +118,60 @@ impl KeyValueStore for CfKv {
         Ok(())
     }
 
-    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, KvError> {
-        let mut keys = Vec::new();
-        let mut cursor: Option<String> = None;
-
-        // KV list is paginated (1000 keys per page); follow the cursor until
-        // the backend reports the listing is complete.
-        loop {
-            let options = js_sys::Object::new();
-            if let Some(p) = prefix {
-                js_sys::Reflect::set(&options, &"prefix".into(), &JsValue::from_str(p))
-                    .map_err(js_err)?;
-            }
-            if let Some(c) = &cursor {
-                js_sys::Reflect::set(&options, &"cursor".into(), &JsValue::from_str(c))
-                    .map_err(js_err)?;
-            }
-
-            let promise = self.ns.list(&options).map_err(js_err)?;
-            let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
-
-            // Result is { keys: [{name}, ...], list_complete, cursor }
-            let keys_val = js_sys::Reflect::get(&result, &"keys".into()).map_err(js_err)?;
-            let keys_array = js_sys::Array::from(&keys_val);
-
-            for i in 0..keys_array.length() {
-                let entry = keys_array.get(i);
-                let name = js_sys::Reflect::get(&entry, &"name".into()).map_err(js_err)?;
-                let name = name.as_string().ok_or_else(|| {
-                    KvError::backend(format!("KV list returned a non-string key name: {name:?}"))
-                })?;
-                keys.push(name);
-            }
-
-            let complete = js_sys::Reflect::get(&result, &"list_complete".into())
-                .ok()
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            if complete {
-                break;
-            }
-
-            cursor = js_sys::Reflect::get(&result, &"cursor".into())
-                .ok()
-                .and_then(|v| v.as_string());
-            if cursor.is_none() {
-                // Defensive: an incomplete listing without a cursor would
-                // otherwise loop forever.
-                break;
-            }
+    /// List one page of keys using Cloudflare KV's own list cursor.
+    ///
+    /// KV pages at 1000 keys and reports `list_complete` plus a `cursor`; both are handed straight
+    /// through, so a caller paginates at the platform's own granularity instead of the worker
+    /// buffering an entire namespace inside its 128 MB memory limit.
+    async fn list(&self, options: KvListOptions) -> Result<KvListResult, KvError> {
+        let js_options = js_sys::Object::new();
+        if let Some(prefix) = options.prefix.as_deref() {
+            js_sys::Reflect::set(&js_options, &"prefix".into(), &JsValue::from_str(prefix))
+                .map_err(js_err)?;
+        }
+        if let Some(cursor) = options.cursor.as_deref() {
+            js_sys::Reflect::set(&js_options, &"cursor".into(), &JsValue::from_str(cursor))
+                .map_err(js_err)?;
+        }
+        if let Some(limit) = options.limit {
+            #[allow(clippy::cast_precision_loss)]
+            js_sys::Reflect::set(
+                &js_options,
+                &"limit".into(),
+                &JsValue::from_f64(limit as f64),
+            )
+            .map_err(js_err)?;
         }
 
-        Ok(keys)
+        let promise = self.ns.list(&js_options).map_err(js_err)?;
+        let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
+
+        // Result is { keys: [{name}, ...], list_complete, cursor }
+        let keys_val = js_sys::Reflect::get(&result, &"keys".into()).map_err(js_err)?;
+        let keys_array = js_sys::Array::from(&keys_val);
+        let mut keys = Vec::with_capacity(keys_array.length() as usize);
+
+        for index in 0..keys_array.length() {
+            let entry = keys_array.get(index);
+            let name = js_sys::Reflect::get(&entry, &"name".into()).map_err(js_err)?;
+            let name = name.as_string().ok_or_else(|| {
+                KvError::backend(format!("KV list returned a non-string key name: {name:?}"))
+            })?;
+            keys.push(name);
+        }
+
+        let complete = js_sys::Reflect::get(&result, &"list_complete".into())
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        // An incomplete listing without a cursor cannot be resumed; reporting no cursor ends the
+        // scan instead of handing the caller a token that would restart it from the beginning.
+        let cursor = (!complete)
+            .then(|| js_sys::Reflect::get(&result, &"cursor".into()).ok())
+            .flatten()
+            .and_then(|value| value.as_string());
+
+        Ok(KvListResult { keys, cursor })
     }
 }
 

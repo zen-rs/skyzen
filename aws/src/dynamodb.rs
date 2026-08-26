@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
 use aws_smithy_types::error::display::DisplayErrorContext;
-use skyzen_services::kv::{KeyValueStore, KvError};
+use skyzen_services::kv::{KeyValueStore, KvError, KvListOptions, KvListResult};
 
 /// A `DynamoDB`-backed key-value store.
 ///
@@ -67,6 +67,17 @@ impl DynamoKv {
     pub fn with_ttl_attribute(mut self, ttl_attribute: impl Into<String>) -> Self {
         self.ttl_attribute = ttl_attribute.into();
         self
+    }
+
+    /// Rebuild a scan's `ExclusiveStartKey` from a continuation token.
+    ///
+    /// The token is the partition key of the last item the previous page examined, and the table's
+    /// only key attribute is that partition key, so the item key round-trips exactly.
+    fn start_key_for(&self, cursor: &str) -> HashMap<String, AttributeValue> {
+        HashMap::from([(
+            self.key_attribute.clone(),
+            AttributeValue::S(cursor.to_owned()),
+        )])
     }
 
     /// The current time as seconds since the Unix epoch.
@@ -207,10 +218,20 @@ impl KeyValueStore for DynamoKv {
         Ok(())
     }
 
-    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, KvError> {
+    /// List one page of keys using `DynamoDB`'s own `ExclusiveStartKey` cursor.
+    ///
+    /// A scan page can come back empty while still having more table left — the `limit` bounds
+    /// items *examined*, and the TTL filter is applied after — so the loop keeps scanning until
+    /// the requested number of keys is collected or the table is exhausted. The cursor handed to
+    /// the caller is the partition key of the last examined item, which is enough to rebuild
+    /// `ExclusiveStartKey` because the table's only key attribute is that partition key.
+    async fn list(&self, options: KvListOptions) -> Result<KvListResult, KvError> {
         let now_secs = Self::now_epoch_seconds()?;
         let mut keys = Vec::new();
-        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
+        let mut exclusive_start_key = options
+            .cursor
+            .as_deref()
+            .map(|cursor| self.start_key_for(cursor));
 
         loop {
             // Exclude items whose TTL already passed: DynamoDB deletes them lazily.
@@ -222,38 +243,41 @@ impl KeyValueStore for DynamoKv {
                 .expression_attribute_names("#ttl", &self.ttl_attribute)
                 .expression_attribute_values(":now", AttributeValue::N(now_secs.to_string()));
 
-            if let Some(p) = prefix {
+            if let Some(prefix) = options.prefix.as_deref() {
                 scan = scan
                     .filter_expression(format!("begins_with(#pk, :prefix) AND {not_expired}"))
                     .expression_attribute_names("#pk", &self.key_attribute)
-                    .expression_attribute_values(":prefix", AttributeValue::S(p.to_owned()));
+                    .expression_attribute_values(":prefix", AttributeValue::S(prefix.to_owned()));
             } else {
                 scan = scan.filter_expression(not_expired);
             }
 
-            if let Some(ref start) = exclusive_start_key {
-                scan = scan.set_exclusive_start_key(Some(start.clone()));
+            if let Some(limit) = options.limit.and_then(|limit| i32::try_from(limit).ok()) {
+                scan = scan.limit(limit);
             }
+            scan = scan.set_exclusive_start_key(exclusive_start_key);
 
             let output = scan.send().await.map_err(backend_error)?;
 
-            if let Some(items) = output.items {
-                for item in &items {
-                    if let Some(key_attr) = item.get(&self.key_attribute) {
-                        if let Ok(s) = key_attr.as_s() {
-                            keys.push(s.clone());
-                        }
-                    }
+            for item in output.items.iter().flatten() {
+                if let Some(Ok(key)) = item.get(&self.key_attribute).map(AttributeValue::as_s) {
+                    keys.push(key.clone());
                 }
             }
 
             exclusive_start_key = output.last_evaluated_key;
-            if exclusive_start_key.is_none() {
-                break;
+            let Some(start_key) = &exclusive_start_key else {
+                return Ok(KvListResult { keys, cursor: None });
+            };
+
+            if options.limit.is_some_and(|limit| keys.len() >= limit) {
+                let cursor = start_key
+                    .get(&self.key_attribute)
+                    .and_then(|attr| attr.as_s().ok())
+                    .cloned();
+                return Ok(KvListResult { keys, cursor });
             }
         }
-
-        Ok(keys)
     }
 }
 
