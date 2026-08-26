@@ -377,7 +377,7 @@ its 405.
 |---|---|
 | `Cors` | Answers preflight requests and decorates cross-origin responses; rejects credentials + wildcard origin at construction |
 | `CompressionMiddleware` | gzip/deflate negotiation, skipping HEAD and unknown-length streams |
-| `BodyLimit` | Publishes the `RequestBodyLimit` extension (2 MiB by default) that body extractors enforce |
+| `BodyLimit` | Publishes the `RequestBodyLimit` extension (2 MiB by default); the extension is the contract body extractors are to enforce, which is not yet wired up |
 | `Timeout` | Abandons a request that outruns its budget with `408` (native targets only) |
 | `ErrorHandlingMiddleware` | Renders endpoint errors into responses |
 | `AuthMiddleware` | Authenticates the request and injects `AuthUser<U>` |

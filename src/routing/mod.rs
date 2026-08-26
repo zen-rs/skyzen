@@ -641,7 +641,10 @@ impl RouteNode {
     /// Attach a handler that answers every method reaching this path.
     ///
     /// A path with an `any` handler never produces a 405; more specific method registrations on
-    /// the same path still win.
+    /// the same path still win. Because `any` covers `HEAD` itself, such a request is answered by
+    /// the handler rather than by the GET fallback, so the handler is responsible for its own
+    /// empty body. `any` carries no `OpenAPI` operation, since there is no single method to
+    /// document it under.
     #[must_use]
     pub fn any<H, T, R>(self, handler: H) -> Self
     where
@@ -945,6 +948,8 @@ pub trait CreateRouteNode: Sized {
         R: Responder;
 
     /// Attach a handler that answers every method reaching this path.
+    ///
+    /// See [`RouteNode::any`] for how it interacts with `HEAD` and `OpenAPI`.
     fn any<H, T, R>(self, handler: H) -> RouteNode
     where
         H: Handler<T, R>,

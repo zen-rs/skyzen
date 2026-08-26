@@ -19,9 +19,10 @@ use skyzen_core::{
 /// .with(BodyLimit::disabled());
 /// ```
 ///
-/// The middleware only publishes the limit. Enforcement lives in the body extractors
-/// (`Bytes`, `ByteStr`, `Json`, `Form`, `Multipart`), which read it back with
-/// [`RequestBodyLimit::of`] and reject an oversized payload with `413 Payload Too Large`.
+/// This middleware only publishes the limit; the extension is the contract. Body extractors
+/// (`Bytes`, `ByteStr`, `Json`, `Form`, `Multipart`) are expected to read it back with
+/// [`RequestBodyLimit::of`] and reject an oversized payload with `413 Payload Too Large` — that
+/// enforcement is not in place yet, so today the limit is advertised but not applied.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BodyLimit(RequestBodyLimit);
 

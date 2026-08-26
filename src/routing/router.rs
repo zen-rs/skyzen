@@ -304,10 +304,10 @@ impl Router {
 
     /// Wrap the whole router in `middleware`, including its 404 and 405 responses.
     ///
-    /// Layers registered here run outside those registered with
-    /// [`Route::layer`](crate::routing::Route::layer). Prefer `Route::layer` where you can: only
-    /// layers known before the build take part in the wiring validation
-    /// [`Route::try_build`](crate::routing::Route::try_build) performs.
+    /// Each call wraps what is already there, so the most recent call is the outermost layer and
+    /// everything registered with [`Route::layer`](crate::routing::Route::layer) stays innermost.
+    /// Prefer `Route::layer` where you can: only layers known before the build take part in the
+    /// wiring validation [`Route::try_build`](crate::routing::Route::try_build) performs.
     #[must_use]
     pub fn layer<M: Middleware>(mut self, middleware: M) -> Self {
         Arc::make_mut(&mut self.layers).insert(0, boxed(middleware));
