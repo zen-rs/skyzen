@@ -72,8 +72,11 @@ service_http_error!(KvError {
 pub struct KvListOptions {
     /// Only list keys that start with this prefix.
     pub prefix: Option<String>,
-    /// Maximum number of keys to return in this page. `None` lets the backend pick its own page
-    /// size, which is **not** the same as "every key": follow the returned cursor to see the rest.
+    /// Target number of keys for this page. `None` lets the backend pick its own page size, which
+    /// is **not** the same as "every key": follow the returned cursor to see the rest.
+    ///
+    /// A backend may return more — see [`KeyValueStore::list`] for why the surplus cannot be
+    /// dropped — but never more than one native page beyond it.
     pub limit: Option<usize>,
     /// Continuation token from the previous page's [`KvListResult::cursor`].
     pub cursor: Option<String>,
@@ -242,11 +245,16 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
 
     /// List one page of keys.
     ///
-    /// Backends return at most [`KvListOptions::limit`] keys and, when more remain, a
-    /// [`KvListResult::cursor`] to resume from. Pagination is the backend's native one wherever it
-    /// has one (Redis `SCAN`, `DynamoDB`'s `ExclusiveStartKey`, Cloudflare KV's list cursor), so a
-    /// large namespace never has to be materialized at once — use
-    /// [`Kv::list_all`] when you really do want every key.
+    /// When more keys remain the page carries a [`KvListResult::cursor`] to resume from.
+    /// Pagination is the backend's native one wherever it has one (Redis `SCAN`, `DynamoDB`'s
+    /// `ExclusiveStartKey`, Cloudflare KV's list cursor), so a large namespace never has to be
+    /// materialized at once — use [`Kv::list_all`] when you really do want every key.
+    ///
+    /// [`KvListOptions::limit`] is a **target** page size, not a hard cap. Cursors are positional,
+    /// so a backend that has already read past the limit cannot drop the surplus without those
+    /// keys being skipped on resume; it returns them instead. Overshoot is bounded by one native
+    /// page — up to Redis' `COUNT` per `SCAN` step, up to one `DynamoDB` scan page. Cloudflare KV
+    /// and the in-memory mock honour the limit exactly.
     fn list(
         &self,
         options: KvListOptions,

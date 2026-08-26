@@ -62,6 +62,11 @@ for key in page.keys { /* ... */ }
 // `page.cursor` is `Some(..)` while more keys remain.
 ```
 
+`limit` is a target, not a hard cap: cursors are positional, so a backend that has already read
+past it cannot drop the surplus without those keys being skipped on resume. Overshoot is bounded
+by one native page (Redis' `SCAN COUNT`, one `DynamoDB` scan page); Cloudflare KV and
+`InMemoryKv` honour the limit exactly.
+
 `Kv::list_all(prefix)` drains every page for you. It is documented as potentially expensive: it
 holds the whole key set in memory and, on `DynamoDB`, is a full table scan.
 
