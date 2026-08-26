@@ -313,10 +313,21 @@ where
 
     /// Register `T` and its dependencies into the components map.
     #[doc(hidden)]
+    #[cfg(feature = "openapi")]
     pub fn maybe_register(&self, defs: &mut BTreeMap<String, SchemaRef>) {
-        let _ = defs;
-        #[cfg(feature = "openapi")]
         register_type::<T>(defs);
+    }
+
+    /// Registering is a no-op without the `openapi` feature: nothing ever reads the components
+    /// map, so the probe keeps its signature and does nothing.
+    ///
+    /// This is a separate `const` definition rather than one body holding a `#[cfg]`ed statement
+    /// so the feature-off form is genuinely const, which is what `clippy::missing_const_for_fn`
+    /// asks for on the wasm builds that turn `openapi` off.
+    #[doc(hidden)]
+    #[cfg(not(feature = "openapi"))]
+    pub const fn maybe_register(&self, defs: &mut BTreeMap<String, SchemaRef>) {
+        let _ = defs;
     }
 }
 
