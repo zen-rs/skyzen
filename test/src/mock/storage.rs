@@ -70,7 +70,7 @@ impl InMemoryStorage {
             .expect("InMemoryStorage lock poisoned");
         slot.take().map_or(Ok(()), |message| {
             drop(slot);
-            Err(StorageError::Backend(message))
+            Err(StorageError::backend(message))
         })
     }
 
@@ -295,7 +295,9 @@ mod tests {
         storage.fail_next_with("bucket unavailable");
 
         let error = storage.get("key").await.unwrap_err();
-        assert!(matches!(error, StorageError::Backend(message) if message == "bucket unavailable"));
+        assert!(
+            matches!(&error, StorageError::Backend { message, .. } if message == "bucket unavailable")
+        );
 
         assert!(storage.get("key").await.unwrap().is_some());
     }

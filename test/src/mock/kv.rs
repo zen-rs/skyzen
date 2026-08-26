@@ -65,7 +65,7 @@ impl InMemoryKv {
         let mut slot = self.fail_next.write().expect("InMemoryKv lock poisoned");
         slot.take().map_or(Ok(()), |message| {
             drop(slot);
-            Err(KvError::Backend(message))
+            Err(KvError::backend(message))
         })
     }
 
@@ -207,7 +207,7 @@ mod tests {
         kv.fail_next_with("redis is down");
 
         let error = kv.get("key").await.unwrap_err();
-        assert!(matches!(error, KvError::Backend(message) if message == "redis is down"));
+        assert!(matches!(&error, KvError::Backend { message, .. } if message == "redis is down"));
 
         // The failure is consumed; the store works again.
         assert_eq!(kv.get("key").await.unwrap(), Some(b"value".to_vec()));

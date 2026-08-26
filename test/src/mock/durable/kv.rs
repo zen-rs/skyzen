@@ -105,7 +105,7 @@ impl DurableKvStore for InMemoryDurableKv {
 }
 
 fn lock_err<T>(_: T) -> DurableKvError {
-    DurableKvError::Backend("lock poisoned".to_owned())
+    DurableKvError::backend("lock poisoned")
 }
 
 #[cfg(test)]

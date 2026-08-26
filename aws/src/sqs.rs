@@ -51,9 +51,9 @@ impl SqsQueue {
 /// includes the service error code and message instead of just "service error".
 fn backend_error<E>(err: E) -> QueueError
 where
-    E: std::error::Error,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    QueueError::Backend(DisplayErrorContext(&err).to_string())
+    QueueError::backend_with(DisplayErrorContext(&err).to_string(), err)
 }
 
 /// Whether a character is allowed in an SQS message body.
@@ -165,7 +165,7 @@ impl MessageQueue for SqsQueue {
             let result = batch.send().await.map_err(backend_error)?;
 
             if !result.failed.is_empty() {
-                return Err(QueueError::Backend(batch_failure_message(&result.failed)));
+                return Err(QueueError::backend(batch_failure_message(&result.failed)));
             }
         }
 

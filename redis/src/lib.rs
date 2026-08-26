@@ -44,11 +44,12 @@ impl Redis {
     ///
     /// Returns [`KvError::Backend`] if the connection cannot be established.
     pub async fn connect(url: &str) -> Result<Self, KvError> {
-        let client = Client::open(url).map_err(|e| KvError::Backend(e.to_string()))?;
+        let client =
+            Client::open(url).map_err(|error| KvError::backend_with(error.to_string(), error))?;
         let conn = client
             .get_connection_manager()
             .await
-            .map_err(|e| KvError::Backend(e.to_string()))?;
+            .map_err(|error| KvError::backend_with(error.to_string(), error))?;
         Ok(Self { conn })
     }
 
@@ -86,11 +87,11 @@ fn scan_pattern(prefix: Option<&str>) -> String {
 /// durations are rejected because Redis requires a positive expiry.
 fn ttl_millis(ttl: core::time::Duration) -> Result<u64, KvError> {
     if ttl.is_zero() {
-        return Err(KvError::Backend("TTL must be greater than zero".to_owned()));
+        return Err(KvError::backend("TTL must be greater than zero"));
     }
     let millis = ttl.as_millis().max(1);
     u64::try_from(millis)
-        .map_err(|_| KvError::Backend(format!("TTL of {millis} ms exceeds the supported maximum")))
+        .map_err(|_| KvError::backend(format!("TTL of {millis} ms exceeds the supported maximum")))
 }
 
 impl KeyValueStore for Redis {
@@ -98,14 +99,14 @@ impl KeyValueStore for Redis {
         let mut conn = self.conn.clone();
         conn.get(key)
             .await
-            .map_err(|e| KvError::Backend(e.to_string()))
+            .map_err(|error| KvError::backend_with(error.to_string(), error))
     }
 
     async fn put(&self, key: &str, value: &[u8]) -> Result<(), KvError> {
         let mut conn = self.conn.clone();
         conn.set(key, value)
             .await
-            .map_err(|e| KvError::Backend(e.to_string()))
+            .map_err(|error| KvError::backend_with(error.to_string(), error))
     }
 
     async fn put_with_ttl(
@@ -118,14 +119,14 @@ impl KeyValueStore for Redis {
         let mut conn = self.conn.clone();
         conn.pset_ex(key, value, millis)
             .await
-            .map_err(|e| KvError::Backend(e.to_string()))
+            .map_err(|error| KvError::backend_with(error.to_string(), error))
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         let mut conn = self.conn.clone();
         conn.del(key)
             .await
-            .map_err(|e| KvError::Backend(e.to_string()))
+            .map_err(|error| KvError::backend_with(error.to_string(), error))
     }
 
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, KvError> {
@@ -134,11 +135,11 @@ impl KeyValueStore for Redis {
         let mut iter: redis::AsyncIter<String> = conn
             .scan_match(pattern)
             .await
-            .map_err(|e| KvError::Backend(e.to_string()))?;
+            .map_err(|error| KvError::backend_with(error.to_string(), error))?;
 
         let mut keys = Vec::new();
         while let Some(key) = iter.next_item().await {
-            keys.push(key.map_err(|e| KvError::Backend(e.to_string()))?);
+            keys.push(key.map_err(|error| KvError::backend_with(error.to_string(), error))?);
         }
         Ok(keys)
     }

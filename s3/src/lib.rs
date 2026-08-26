@@ -88,9 +88,9 @@ fn size_u64(size: i64) -> u64 {
 /// includes the service error code and message instead of just "service error".
 fn backend_error<E>(err: E) -> StorageError
 where
-    E: std::error::Error,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    StorageError::Backend(DisplayErrorContext(&err).to_string())
+    StorageError::backend_with(DisplayErrorContext(&err).to_string(), err)
 }
 
 impl ObjectStorage for S3Storage {

@@ -193,26 +193,26 @@ impl DbBackend for CfD1 {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DbError> {
         let statement = self
             .prepare(query)
-            .map_err(|error| DbError::Backend(error.to_string()))?
+            .map_err(|error| DbError::backend(error.to_string()))?
             .bind(params)
-            .map_err(|error| DbError::Backend(error.to_string()))?;
+            .map_err(|error| DbError::backend(error.to_string()))?;
         let value = statement
             .all()
             .await
-            .map_err(|error| DbError::Backend(error.to_string()))?;
+            .map_err(|error| DbError::backend(error.to_string()))?;
         d1_result_to_exec_result(value)
     }
 
     async fn execute(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DbError> {
         let statement = self
             .prepare(query)
-            .map_err(|error| DbError::Backend(error.to_string()))?
+            .map_err(|error| DbError::backend(error.to_string()))?
             .bind(params)
-            .map_err(|error| DbError::Backend(error.to_string()))?;
+            .map_err(|error| DbError::backend(error.to_string()))?;
         let value = statement
             .run()
             .await
-            .map_err(|error| DbError::Backend(error.to_string()))?;
+            .map_err(|error| DbError::backend(error.to_string()))?;
         d1_result_to_exec_result(value)
     }
 }
@@ -228,23 +228,23 @@ fn d1_result_to_exec_result(value: JsValue) -> Result<DbExecResult, DbError> {
     let result: D1Result = value.unchecked_into();
     let success = result
         .success()
-        .map_err(|error| DbError::Backend(format!("{error:?}")))?;
+        .map_err(|error| DbError::backend(format!("{error:?}")))?;
     if !success {
         let message = result
             .error()
-            .map_err(|error| DbError::Backend(format!("{error:?}")))?
+            .map_err(|error| DbError::backend(format!("{error:?}")))?
             .unwrap_or_else(|| "unknown D1 error".to_owned());
-        return Err(DbError::Backend(message));
+        return Err(DbError::backend(message));
     }
 
     let rows = result
         .results()
-        .map_err(|error| DbError::Backend(format!("{error:?}")))?
+        .map_err(|error| DbError::backend(format!("{error:?}")))?
         .map(|rows| {
             rows.iter()
                 .map(|row| {
                     serde_wasm_bindgen::from_value(row)
-                        .map_err(|error| DbError::Backend(error.to_string()))
+                        .map_err(|error| DbError::backend(error.to_string()))
                 })
                 .collect::<Result<Vec<serde_json::Value>, DbError>>()
         })
@@ -253,10 +253,10 @@ fn d1_result_to_exec_result(value: JsValue) -> Result<DbExecResult, DbError> {
 
     let meta = result
         .meta()
-        .map_err(|error| DbError::Backend(format!("{error:?}")))
+        .map_err(|error| DbError::backend(format!("{error:?}")))
         .and_then(|meta| {
             serde_wasm_bindgen::from_value::<D1Meta>(meta.into())
-                .map_err(|error| DbError::Backend(error.to_string()))
+                .map_err(|error| DbError::backend(error.to_string()))
         })
         .unwrap_or_default();
 

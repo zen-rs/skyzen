@@ -49,7 +49,7 @@ impl DurableDbBackend for CfDurableDb {
         for index in 0..rows_array.length() {
             let row = rows_array.get(index);
             let row: Value = serde_wasm_bindgen::from_value(row).map_err(|error| {
-                DurableDbError::Backend(format!("failed to deserialize sql row: {error}"))
+                DurableDbError::backend(format!("failed to deserialize sql row: {error}"))
             })?;
             rows.push(row);
         }
@@ -79,7 +79,7 @@ fn db_value_to_js(value: &DbValue) -> Result<JsValue, DurableDbError> {
         DbValue::Null => Ok(JsValue::NULL),
         DbValue::Boolean(v) => Ok(JsValue::from_bool(*v)),
         DbValue::Integer(v) => integer_to_js_number(*v)
-            .map_err(|message| DurableDbError::Backend(format!("durable sql {message}"))),
+            .map_err(|message| DurableDbError::backend(format!("durable sql {message}"))),
         DbValue::Real(v) => Ok(JsValue::from_f64(*v)),
         DbValue::Text(v) => Ok(JsValue::from_str(v)),
         DbValue::Blob(v) => Ok(js_sys::Uint8Array::from(v.as_slice()).into()),
@@ -88,7 +88,7 @@ fn db_value_to_js(value: &DbValue) -> Result<JsValue, DurableDbError> {
 
 fn f64_to_u64(value: f64, source: &str) -> Result<u64, DurableDbError> {
     if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
-        return Err(DurableDbError::Backend(format!(
+        return Err(DurableDbError::backend(format!(
             "{source} returned invalid numeric value: {value}"
         )));
     }
@@ -101,5 +101,5 @@ fn f64_to_u64(value: f64, source: &str) -> Result<u64, DurableDbError> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn js_err(error: JsValue) -> DurableDbError {
-    DurableDbError::Backend(format!("{error:?}"))
+    DurableDbError::backend(format!("{error:?}"))
 }

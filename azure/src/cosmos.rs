@@ -67,7 +67,7 @@ fn encode_value(data: &[u8]) -> String {
 fn decode_value(encoded: &str) -> Result<Vec<u8>, KvError> {
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|e| KvError::Backend(format!("base64 decode error: {e}")))
+        .map_err(|e| KvError::backend(format!("base64 decode error: {e}")))
 }
 
 /// Convert a TTL duration to whole seconds for Cosmos DB's `ttl` field.
@@ -77,7 +77,7 @@ fn decode_value(encoded: &str) -> Result<Vec<u8>, KvError> {
 /// accepts for the field.
 fn ttl_seconds(ttl: core::time::Duration) -> Result<i32, KvError> {
     if ttl.is_zero() {
-        return Err(KvError::Backend("TTL must be greater than zero".to_owned()));
+        return Err(KvError::backend("TTL must be greater than zero"));
     }
     let mut seconds = ttl.as_secs();
     if ttl.subsec_nanos() > 0 {
@@ -85,7 +85,7 @@ fn ttl_seconds(ttl: core::time::Duration) -> Result<i32, KvError> {
     }
     // Cosmos DB stores `ttl` as a 32-bit signed integer.
     i32::try_from(seconds).map_err(|_| {
-        KvError::Backend(format!(
+        KvError::backend(format!(
             "TTL of {seconds} s exceeds the Cosmos DB maximum of {} s",
             i32::MAX
         ))
@@ -184,8 +184,8 @@ impl KeyValueStore for CosmosKv {
     }
 }
 
-fn kv_backend_err<E: std::fmt::Display>(e: E) -> KvError {
-    KvError::Backend(e.to_string())
+fn kv_backend_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> KvError {
+    KvError::backend_with(e.to_string(), e)
 }
 
 fn is_not_found(error: &CosmosError) -> bool {

@@ -14,13 +14,26 @@ type DurableKvEntries = Vec<(String, Vec<u8>)>;
 #[derive(Debug, thiserror::Error)]
 pub enum DurableKvError {
     /// The underlying storage backend returned an error.
-    #[error("durable kv error: {0}")]
-    Backend(String),
+    #[error("durable kv error: {message}")]
+    Backend {
+        /// A human-readable description of what the backend was asked to do.
+        message: String,
+        /// The backend's own error, when it hands one back.
+        #[source]
+        source: Option<crate::BoxError>,
+    },
 
     /// Serialization or deserialization failed.
     #[error("durable kv serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }
+
+backend_error!(DurableKvError);
+
+service_http_error!(DurableKvError {
+    Self::Backend { .. } => INTERNAL_SERVER_ERROR,
+    Self::Serialization(_) => INTERNAL_SERVER_ERROR,
+});
 
 /// Options for listing keys in Durable Object storage.
 #[derive(Debug, Default, Clone)]
@@ -319,7 +332,7 @@ mod tests {
             let data = self
                 .data
                 .read()
-                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+                .map_err(|_| DurableKvError::backend("lock poisoned"))?;
             Ok(data.get(key).cloned())
         }
 
@@ -330,7 +343,7 @@ mod tests {
             let data = self
                 .data
                 .read()
-                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+                .map_err(|_| DurableKvError::backend("lock poisoned"))?;
             Ok(keys
                 .iter()
                 .filter_map(|key| {
@@ -343,7 +356,7 @@ mod tests {
         async fn put(&self, key: &str, value: &[u8]) -> Result<(), DurableKvError> {
             self.data
                 .write()
-                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?
+                .map_err(|_| DurableKvError::backend("lock poisoned"))?
                 .insert(key.to_owned(), value.to_vec());
             Ok(())
         }
@@ -353,7 +366,7 @@ mod tests {
                 let mut data = self
                     .data
                     .write()
-                    .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+                    .map_err(|_| DurableKvError::backend("lock poisoned"))?;
                 for (key, value) in entries {
                     data.insert((*key).to_owned(), value.to_vec());
                 }
@@ -365,7 +378,7 @@ mod tests {
             Ok(self
                 .data
                 .write()
-                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?
+                .map_err(|_| DurableKvError::backend("lock poisoned"))?
                 .remove(key)
                 .is_some())
         }
@@ -374,7 +387,7 @@ mod tests {
             let mut data = self
                 .data
                 .write()
-                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+                .map_err(|_| DurableKvError::backend("lock poisoned"))?;
             Ok(keys
                 .iter()
                 .filter(|key| data.remove(**key).is_some())
@@ -384,7 +397,7 @@ mod tests {
         async fn delete_all(&self) -> Result<(), DurableKvError> {
             self.data
                 .write()
-                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?
+                .map_err(|_| DurableKvError::backend("lock poisoned"))?
                 .clear();
             Ok(())
         }
@@ -396,7 +409,7 @@ mod tests {
             let data = self
                 .data
                 .read()
-                .map_err(|_| DurableKvError::Backend("lock poisoned".to_owned()))?;
+                .map_err(|_| DurableKvError::backend("lock poisoned"))?;
             let iter: Box<dyn Iterator<Item = (&String, &Vec<u8>)>> = if options.reverse {
                 Box::new(data.iter().rev())
             } else {

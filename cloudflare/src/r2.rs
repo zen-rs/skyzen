@@ -46,7 +46,7 @@ impl CfR2 {
     /// does not look like an R2 bucket.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, StorageError> {
         let binding = crate::ffi::get_binding(env, binding_name).map_err(|e| {
-            StorageError::Backend(format!("failed to get R2 binding '{binding_name}': {e:?}"))
+            StorageError::backend(format!("failed to get R2 binding '{binding_name}': {e:?}"))
         })?;
         crate::ffi::require_methods(
             &binding,
@@ -186,7 +186,7 @@ impl ObjectStorage for CfR2 {
 
         if let Some(ref prefix) = options.prefix {
             js_sys::Reflect::set(&js_options, &"prefix".into(), &JsValue::from_str(prefix))
-                .map_err(|e| StorageError::Backend(format!("{e:?}")))?;
+                .map_err(|e| StorageError::backend(format!("{e:?}")))?;
         }
 
         if let Some(limit) = options.limit {
@@ -197,12 +197,12 @@ impl ObjectStorage for CfR2 {
                 &"limit".into(),
                 &JsValue::from_f64(limit as f64),
             )
-            .map_err(|e| StorageError::Backend(format!("{e:?}")))?;
+            .map_err(|e| StorageError::backend(format!("{e:?}")))?;
         }
 
         if let Some(ref cursor) = options.cursor {
             js_sys::Reflect::set(&js_options, &"cursor".into(), &JsValue::from_str(cursor))
-                .map_err(|e| StorageError::Backend(format!("{e:?}")))?;
+                .map_err(|e| StorageError::backend(format!("{e:?}")))?;
         }
 
         let promise = self.bucket.list(js_options.into()).map_err(js_err)?;
@@ -259,7 +259,7 @@ impl ObjectStorage for CfR2 {
 /// Takes ownership to match `Result<_, JsValue>::map_err` signature.
 #[allow(clippy::needless_pass_by_value)]
 fn js_err(e: JsValue) -> StorageError {
-    StorageError::Backend(format!("{e:?}"))
+    StorageError::backend(format!("{e:?}"))
 }
 
 /// Safely convert a JS f64 size value to u64.

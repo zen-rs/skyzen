@@ -47,8 +47,14 @@ use sqlx::Row;
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     /// The underlying database backend returned an error.
-    #[error("database error: {0}")]
-    Backend(String),
+    #[error("database error: {message}")]
+    Backend {
+        /// A human-readable description of what the backend was asked to do.
+        message: String,
+        /// The backend's own error, when it hands one back.
+        #[source]
+        source: Option<crate::BoxError>,
+    },
 
     /// Serialization or deserialization failed.
     #[error("database serialization error: {0}")]
@@ -77,7 +83,31 @@ pub enum DbError {
     /// The database backend does not support transactions.
     #[error("database transactions are not supported by this backend")]
     TransactionsUnsupported,
+
+    /// A write failed because a concurrent transaction changed the same rows.
+    #[error("database conflict: a concurrent write changed the same rows")]
+    Conflict,
+
+    /// The backend rejected the request because the caller is over its rate limit.
+    #[error("database request was throttled by the backend")]
+    Throttled {
+        /// How long the backend asked the caller to wait, when it says.
+        retry_after: Option<core::time::Duration>,
+    },
 }
+
+backend_error!(DbError);
+
+service_http_error!(DbError {
+    Self::Backend { .. } => INTERNAL_SERVER_ERROR,
+    Self::Serialization(_) => INTERNAL_SERVER_ERROR,
+    Self::ParameterCountMismatch { .. } => INTERNAL_SERVER_ERROR,
+    Self::SqlParse(_) => INTERNAL_SERVER_ERROR,
+    Self::RowNotFound => NOT_FOUND,
+    Self::TransactionsUnsupported => NOT_IMPLEMENTED,
+    Self::Conflict => CONFLICT,
+    Self::Throttled { .. } => TOO_MANY_REQUESTS,
+});
 
 #[cfg(all(
     not(target_arch = "wasm32"),
@@ -85,7 +115,10 @@ pub enum DbError {
 ))]
 impl From<sqlx::Error> for DbError {
     fn from(error: sqlx::Error) -> Self {
-        Self::Backend(error.to_string())
+        if matches!(error, sqlx::Error::RowNotFound) {
+            return Self::RowNotFound;
+        }
+        Self::backend_with(error.to_string(), error)
     }
 }
 

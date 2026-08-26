@@ -75,7 +75,7 @@ impl DurableKvStore for CfDurableKv {
         let promise = self.storage.delete(key).map_err(js_err)?;
         let value = JsFuture::from(promise).into_send().await.map_err(js_err)?;
         value.as_bool().ok_or_else(|| {
-            DurableKvError::Backend(format!(
+            DurableKvError::backend(format!(
                 "DurableObjectStorage.delete returned non-boolean value: {value:?}"
             ))
         })
@@ -160,7 +160,7 @@ impl DurableKvStore for CfDurableKv {
 
 fn decode_map_entries(value: JsValue) -> Result<Vec<(String, Vec<u8>)>, DurableKvError> {
     let map: js_sys::Map = value.dyn_into().map_err(|value| {
-        DurableKvError::Backend(format!(
+        DurableKvError::backend(format!(
             "DurableObjectStorage returned non-Map list result: {value:?}"
         ))
     })?;
@@ -168,19 +168,19 @@ fn decode_map_entries(value: JsValue) -> Result<Vec<(String, Vec<u8>)>, DurableK
     let mut entries = Vec::new();
     let iter = js_sys::try_iter(map.as_ref())
         .map_err(js_err)?
-        .ok_or_else(|| DurableKvError::Backend("Map iterator unavailable".to_owned()))?;
+        .ok_or_else(|| DurableKvError::backend("Map iterator unavailable"))?;
 
     for entry in iter {
         let entry = entry.map_err(js_err)?;
         let pair = js_sys::Array::from(&entry);
         if pair.length() != 2 {
-            return Err(DurableKvError::Backend(
+            return Err(DurableKvError::backend(
                 "Map entry must contain [key, value]".to_owned(),
             ));
         }
 
         let key = pair.get(0).as_string().ok_or_else(|| {
-            DurableKvError::Backend(format!("Map entry key is not string: {:?}", pair.get(0)))
+            DurableKvError::backend(format!("Map entry key is not string: {:?}", pair.get(0)))
         })?;
         let value = pair.get(1);
         let value = decode_required_bytes(&value)?;
@@ -204,17 +204,17 @@ fn decode_required_bytes(value: &JsValue) -> Result<Vec<u8>, DurableKvError> {
     if value.is_instance_of::<js_sys::ArrayBuffer>() {
         return Ok(js_sys::Uint8Array::new(value).to_vec());
     }
-    Err(DurableKvError::Backend(format!(
+    Err(DurableKvError::backend(format!(
         "Expected Uint8Array/ArrayBuffer from DurableObjectStorage, got {value:?}"
     )))
 }
 
 fn to_usize(value: &JsValue, source: &str) -> Result<usize, DurableKvError> {
     let number = value.as_f64().ok_or_else(|| {
-        DurableKvError::Backend(format!("{source} returned non-number value: {value:?}"))
+        DurableKvError::backend(format!("{source} returned non-number value: {value:?}"))
     })?;
     if !number.is_finite() || number < 0.0 || number.fract() != 0.0 {
-        return Err(DurableKvError::Backend(format!(
+        return Err(DurableKvError::backend(format!(
             "{source} returned invalid count value: {number}"
         )));
     }
@@ -227,5 +227,5 @@ fn to_usize(value: &JsValue, source: &str) -> Result<usize, DurableKvError> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn js_err(error: JsValue) -> DurableKvError {
-    DurableKvError::Backend(format!("{error:?}"))
+    DurableKvError::backend(format!("{error:?}"))
 }

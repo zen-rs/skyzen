@@ -13,8 +13,14 @@ use crate::{
 #[derive(Debug, thiserror::Error)]
 pub enum DurableDbError {
     /// The underlying storage backend returned an error.
-    #[error("durable database error: {0}")]
-    Backend(String),
+    #[error("durable database error: {message}")]
+    Backend {
+        /// A human-readable description of what the backend was asked to do.
+        message: String,
+        /// The backend's own error, when it hands one back.
+        #[source]
+        source: Option<crate::BoxError>,
+    },
 
     /// Serialization or deserialization failed.
     #[error("durable database serialization error: {0}")]
@@ -41,19 +47,29 @@ pub enum DurableDbError {
     RowNotFound,
 }
 
+backend_error!(DurableDbError);
+
+service_http_error!(DurableDbError {
+    Self::Backend { .. } => INTERNAL_SERVER_ERROR,
+    Self::Serialization(_) => INTERNAL_SERVER_ERROR,
+    Self::ParameterCountMismatch { .. } => INTERNAL_SERVER_ERROR,
+    Self::SqlParse(_) => INTERNAL_SERVER_ERROR,
+    Self::RowNotFound => NOT_FOUND,
+});
+
 impl From<DbError> for DurableDbError {
     fn from(error: DbError) -> Self {
         match error {
-            DbError::Backend(message) => Self::Backend(message),
+            DbError::Backend { message, source } => Self::Backend { message, source },
             DbError::Serialization(error) => Self::Serialization(error),
             DbError::ParameterCountMismatch { expected, actual } => {
                 Self::ParameterCountMismatch { expected, actual }
             }
             DbError::SqlParse(message) => Self::SqlParse(message),
             DbError::RowNotFound => Self::RowNotFound,
-            DbError::TransactionsUnsupported => {
-                Self::Backend(DbError::TransactionsUnsupported.to_string())
-            }
+            error @ (DbError::TransactionsUnsupported
+            | DbError::Conflict
+            | DbError::Throttled { .. }) => Self::backend_with(error.to_string(), error),
         }
     }
 }

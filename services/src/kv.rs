@@ -15,8 +15,14 @@ use crate::maybe_send::{BoxFuture, MaybeSend};
 #[derive(Debug, thiserror::Error)]
 pub enum KvError {
     /// The underlying storage backend returned an error.
-    #[error("kv store error: {0}")]
-    Backend(String),
+    #[error("kv store error: {message}")]
+    Backend {
+        /// A human-readable description of what the backend was asked to do.
+        message: String,
+        /// The backend's own error, when it hands one back.
+        #[source]
+        source: Option<crate::BoxError>,
+    },
 
     /// Serialization or deserialization failed.
     #[error("kv serialization error: {0}")]
@@ -29,7 +35,34 @@ pub enum KvError {
     /// The backend does not support the requested operation.
     #[error("unsupported kv operation: {0}")]
     Unsupported(&'static str),
+
+    /// A conditional write failed because the stored value changed underneath it.
+    #[error("kv conflict: the stored value changed before the write was applied")]
+    Conflict,
+
+    /// The backend rejected the request because the caller is over its rate limit.
+    #[error("kv request was throttled by the backend")]
+    Throttled {
+        /// How long the backend asked the caller to wait, when it says.
+        retry_after: Option<core::time::Duration>,
+    },
+
+    /// The configured credentials were rejected by the backend.
+    #[error("kv credentials were rejected by the backend")]
+    Unauthorized,
 }
+
+backend_error!(KvError);
+
+service_http_error!(KvError {
+    Self::Backend { .. } => INTERNAL_SERVER_ERROR,
+    Self::Serialization(_) => INTERNAL_SERVER_ERROR,
+    Self::Decode(_) => INTERNAL_SERVER_ERROR,
+    Self::Unsupported(_) => NOT_IMPLEMENTED,
+    Self::Conflict => CONFLICT,
+    Self::Throttled { .. } => TOO_MANY_REQUESTS,
+    Self::Unauthorized => INTERNAL_SERVER_ERROR,
+});
 
 // ── Layer 1: Public trait (NOT object-safe, but ergonomic for implementors) ──
 
@@ -273,14 +306,14 @@ mod tests {
             let data = self
                 .data
                 .read()
-                .map_err(|_| KvError::Backend("lock poisoned".to_owned()))?;
+                .map_err(|_| KvError::backend("lock poisoned"))?;
             Ok(data.get(key).cloned())
         }
 
         async fn put(&self, key: &str, value: &[u8]) -> Result<(), KvError> {
             self.data
                 .write()
-                .map_err(|_| KvError::Backend("lock poisoned".to_owned()))?
+                .map_err(|_| KvError::backend("lock poisoned"))?
                 .insert(key.to_owned(), value.to_vec());
             Ok(())
         }
@@ -288,7 +321,7 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<(), KvError> {
             self.data
                 .write()
-                .map_err(|_| KvError::Backend("lock poisoned".to_owned()))?
+                .map_err(|_| KvError::backend("lock poisoned"))?
                 .remove(key);
             Ok(())
         }
@@ -298,7 +331,7 @@ mod tests {
                 let data = self
                     .data
                     .read()
-                    .map_err(|_| KvError::Backend("lock poisoned".to_owned()))?;
+                    .map_err(|_| KvError::backend("lock poisoned"))?;
                 data.keys()
                     .filter(|key| prefix.is_none_or(|prefix| key.starts_with(prefix)))
                     .cloned()

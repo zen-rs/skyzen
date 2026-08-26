@@ -33,7 +33,7 @@ impl AlarmScheduler for InMemoryAlarm {
         let scheduled = self
             .scheduled
             .read()
-            .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))?;
+            .map_err(|_| AlarmError::backend("lock poisoned"))?;
         Ok(*scheduled)
     }
 
@@ -41,8 +41,7 @@ impl AlarmScheduler for InMemoryAlarm {
         *self
             .scheduled
             .write()
-            .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? =
-            Some(scheduled_time_ms);
+            .map_err(|_| AlarmError::backend("lock poisoned"))? = Some(scheduled_time_ms);
         Ok(())
     }
 
@@ -50,7 +49,7 @@ impl AlarmScheduler for InMemoryAlarm {
         *self
             .scheduled
             .write()
-            .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? = None;
+            .map_err(|_| AlarmError::backend("lock poisoned"))? = None;
         Ok(())
     }
 }

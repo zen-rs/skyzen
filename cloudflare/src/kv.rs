@@ -46,7 +46,7 @@ impl CfKv {
     /// not look like a KV namespace.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, KvError> {
         let binding = ffi::get_binding(env, binding_name).map_err(|e| {
-            KvError::Backend(format!("failed to get KV binding '{binding_name}': {e:?}"))
+            KvError::backend(format!("failed to get KV binding '{binding_name}': {e:?}"))
         })?;
         ffi::require_methods(&binding, binding_name, &["get", "put", "delete", "list"])
             .map_err(js_err)?;
@@ -58,7 +58,7 @@ impl KeyValueStore for CfKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         let options = js_sys::Object::new();
         js_sys::Reflect::set(&options, &"type".into(), &"arrayBuffer".into())
-            .map_err(|e| KvError::Backend(format!("{e:?}")))?;
+            .map_err(|e| KvError::backend(format!("{e:?}")))?;
 
         let promise = self.ns.get(key, &options).map_err(js_err)?;
         let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
@@ -146,7 +146,7 @@ impl KeyValueStore for CfKv {
                 let entry = keys_array.get(i);
                 let name = js_sys::Reflect::get(&entry, &"name".into()).map_err(js_err)?;
                 let name = name.as_string().ok_or_else(|| {
-                    KvError::Backend(format!("KV list returned a non-string key name: {name:?}"))
+                    KvError::backend(format!("KV list returned a non-string key name: {name:?}"))
                 })?;
                 keys.push(name);
             }
@@ -178,5 +178,5 @@ impl KeyValueStore for CfKv {
 /// Takes ownership to match `Result<_, JsValue>::map_err` signature.
 #[allow(clippy::needless_pass_by_value)]
 fn js_err(e: JsValue) -> KvError {
-    KvError::Backend(format!("{e:?}"))
+    KvError::backend(format!("{e:?}"))
 }

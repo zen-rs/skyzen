@@ -52,7 +52,7 @@ impl DurableDbBackend for InMemoryDurableDb {
     ) -> Result<DbExecResult, DurableDbError> {
         self.queries
             .write()
-            .map_err(|_| DurableDbError::Backend("lock poisoned".to_owned()))?
+            .map_err(|_| DurableDbError::backend("lock poisoned"))?
             .push(query.to_owned());
         Ok(DbExecResult::default())
     }

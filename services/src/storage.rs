@@ -14,8 +14,14 @@ use crate::maybe_send::{BoxFuture, MaybeSend};
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     /// The underlying storage backend returned an error.
-    #[error("storage error: {0}")]
-    Backend(String),
+    #[error("storage error: {message}")]
+    Backend {
+        /// A human-readable description of what the backend was asked to do.
+        message: String,
+        /// The backend's own error, when it hands one back.
+        #[source]
+        source: Option<crate::BoxError>,
+    },
 
     /// An I/O error occurred.
     #[error("storage I/O error: {0}")]
@@ -24,7 +30,33 @@ pub enum StorageError {
     /// The backend does not support the requested operation.
     #[error("unsupported storage operation: {0}")]
     Unsupported(&'static str),
+
+    /// A conditional write failed because the stored object changed underneath it.
+    #[error("storage conflict: the object changed before the write was applied")]
+    Conflict,
+
+    /// The backend rejected the request because the caller is over its rate limit.
+    #[error("storage request was throttled by the backend")]
+    Throttled {
+        /// How long the backend asked the caller to wait, when it says.
+        retry_after: Option<core::time::Duration>,
+    },
+
+    /// The configured credentials were rejected by the backend.
+    #[error("storage credentials were rejected by the backend")]
+    Unauthorized,
 }
+
+backend_error!(StorageError);
+
+service_http_error!(StorageError {
+    Self::Backend { .. } => INTERNAL_SERVER_ERROR,
+    Self::Io(_) => INTERNAL_SERVER_ERROR,
+    Self::Unsupported(_) => NOT_IMPLEMENTED,
+    Self::Conflict => CONFLICT,
+    Self::Throttled { .. } => TOO_MANY_REQUESTS,
+    Self::Unauthorized => INTERNAL_SERVER_ERROR,
+});
 
 // ── Supporting types ──
 
@@ -333,7 +365,7 @@ mod tests {
             let data = self
                 .data
                 .read()
-                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?;
+                .map_err(|_| StorageError::backend("lock poisoned"))?;
             Ok(data.get(key).map(|body| StorageObject {
                 body: body.clone(),
                 metadata: Self::metadata_for(key, body),
@@ -343,7 +375,7 @@ mod tests {
         async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StorageError> {
             self.data
                 .write()
-                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?
+                .map_err(|_| StorageError::backend("lock poisoned"))?
                 .insert(key.to_owned(), body);
             Ok(())
         }
@@ -351,7 +383,7 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<(), StorageError> {
             self.data
                 .write()
-                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?
+                .map_err(|_| StorageError::backend("lock poisoned"))?
                 .remove(key);
             Ok(())
         }
@@ -361,7 +393,7 @@ mod tests {
                 let data = self
                     .data
                     .read()
-                    .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?;
+                    .map_err(|_| StorageError::backend("lock poisoned"))?;
                 data.iter()
                     .filter(|(key, _)| {
                         options
@@ -387,7 +419,7 @@ mod tests {
             let data = self
                 .data
                 .read()
-                .map_err(|_| StorageError::Backend("lock poisoned".to_owned()))?;
+                .map_err(|_| StorageError::backend("lock poisoned"))?;
             Ok(data.get(key).map(|body| Self::metadata_for(key, body)))
         }
     }

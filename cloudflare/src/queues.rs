@@ -45,7 +45,7 @@ impl CfQueue {
     /// does not look like a Queue.
     pub fn from_env(env: &JsValue, binding_name: &str) -> Result<Self, QueueError> {
         let binding = crate::ffi::get_binding(env, binding_name).map_err(|e| {
-            QueueError::Backend(format!(
+            QueueError::backend(format!(
                 "failed to get Queue binding '{binding_name}': {e:?}"
             ))
         })?;
@@ -107,5 +107,5 @@ impl MessageQueue for CfQueue {
 /// Takes ownership to match `Result<_, JsValue>::map_err` signature.
 #[allow(clippy::needless_pass_by_value)]
 fn js_err(e: JsValue) -> QueueError {
-    QueueError::Backend(format!("{e:?}"))
+    QueueError::backend(format!("{e:?}"))
 }

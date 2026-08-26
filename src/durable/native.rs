@@ -528,15 +528,16 @@ impl AlarmScheduler for NativeAlarmScheduler {
         let alarm = self
             .alarm
             .read()
-            .map_err(|_| AlarmError::Backend("native durable alarm lock poisoned".to_owned()))?;
+            .map_err(|_| AlarmError::backend("native durable alarm lock poisoned"))?;
         Ok(*alarm)
     }
 
     async fn set_alarm(&self, scheduled_time_ms: i64) -> Result<(), AlarmError> {
         {
-            let mut alarm = self.alarm.write().map_err(|_| {
-                AlarmError::Backend("native durable alarm lock poisoned".to_owned())
-            })?;
+            let mut alarm = self
+                .alarm
+                .write()
+                .map_err(|_| AlarmError::backend("native durable alarm lock poisoned"))?;
             *alarm = Some(scheduled_time_ms);
         }
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -549,9 +550,10 @@ impl AlarmScheduler for NativeAlarmScheduler {
 
     async fn delete_alarm(&self) -> Result<(), AlarmError> {
         {
-            let mut alarm = self.alarm.write().map_err(|_| {
-                AlarmError::Backend("native durable alarm lock poisoned".to_owned())
-            })?;
+            let mut alarm = self
+                .alarm
+                .write()
+                .map_err(|_| AlarmError::backend("native durable alarm lock poisoned"))?;
             *alarm = None;
         }
         // Invalidate any pending timer.
@@ -659,7 +661,7 @@ impl DurableKvStore for NativeDurableKvStore {
 }
 
 fn kv_lock_err<T>(_: T) -> DurableKvError {
-    DurableKvError::Backend("native durable KV lock poisoned".to_owned())
+    DurableKvError::backend("native durable KV lock poisoned")
 }
 
 #[derive(Debug, Clone)]
@@ -730,9 +732,9 @@ impl DurableDbBackend for NativeDurableDbStore {
 
         let bytes = page_count
             .checked_mul(page_size)
-            .ok_or_else(|| DurableDbError::Backend("native durable DB size overflow".to_owned()))?;
+            .ok_or_else(|| DurableDbError::backend("native durable DB size overflow"))?;
         u64::try_from(bytes)
-            .map_err(|_| DurableDbError::Backend("native durable DB size was negative".to_owned()))
+            .map_err(|_| DurableDbError::backend("native durable DB size was negative"))
     }
 }
 

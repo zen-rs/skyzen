@@ -10,9 +10,21 @@ use crate::maybe_send::{BoxFuture, MaybeSend};
 #[derive(Debug, thiserror::Error)]
 pub enum AlarmError {
     /// The underlying storage backend returned an error.
-    #[error("alarm error: {0}")]
-    Backend(String),
+    #[error("alarm error: {message}")]
+    Backend {
+        /// A human-readable description of what the backend was asked to do.
+        message: String,
+        /// The backend's own error, when it hands one back.
+        #[source]
+        source: Option<crate::BoxError>,
+    },
 }
+
+backend_error!(AlarmError);
+
+service_http_error!(AlarmError {
+    Self::Backend { .. } => INTERNAL_SERVER_ERROR,
+});
 
 // ── Layer 1: Public trait ──
 
@@ -127,7 +139,7 @@ mod tests {
             let scheduled = self
                 .scheduled
                 .read()
-                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))?;
+                .map_err(|_| AlarmError::backend("lock poisoned"))?;
             Ok(*scheduled)
         }
 
@@ -135,8 +147,7 @@ mod tests {
             *self
                 .scheduled
                 .write()
-                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? =
-                Some(scheduled_time_ms);
+                .map_err(|_| AlarmError::backend("lock poisoned"))? = Some(scheduled_time_ms);
             Ok(())
         }
 
@@ -144,7 +155,7 @@ mod tests {
             *self
                 .scheduled
                 .write()
-                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? = None;
+                .map_err(|_| AlarmError::backend("lock poisoned"))? = None;
             Ok(())
         }
     }

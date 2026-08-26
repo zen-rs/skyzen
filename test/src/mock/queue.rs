@@ -46,7 +46,7 @@ impl InMemoryQueue {
         let mut slot = self.fail_next.write().expect("InMemoryQueue lock poisoned");
         slot.take().map_or(Ok(()), |message| {
             drop(slot);
-            Err(QueueError::Backend(message))
+            Err(QueueError::backend(message))
         })
     }
 
@@ -157,7 +157,9 @@ mod tests {
         queue.fail_next_with("queue unreachable");
 
         let error = queue.send(b"lost").await.unwrap_err();
-        assert!(matches!(error, QueueError::Backend(message) if message == "queue unreachable"));
+        assert!(
+            matches!(&error, QueueError::Backend { message, .. } if message == "queue unreachable")
+        );
 
         queue.send(b"delivered").await.unwrap();
         assert_eq!(queue.messages(), vec![b"delivered".to_vec()]);

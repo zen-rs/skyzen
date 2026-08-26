@@ -16,13 +16,44 @@ use crate::maybe_send::{BoxFuture, MaybeSend};
 #[derive(Debug, thiserror::Error)]
 pub enum QueueError {
     /// The underlying queue backend returned an error.
-    #[error("queue error: {0}")]
-    Backend(String),
+    #[error("queue error: {message}")]
+    Backend {
+        /// A human-readable description of what the backend was asked to do.
+        message: String,
+        /// The backend's own error, when it hands one back.
+        #[source]
+        source: Option<crate::BoxError>,
+    },
 
     /// Serialization failed.
     #[error("queue serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// A conditional operation failed because the queue state changed underneath it.
+    #[error("queue conflict: the message state changed before the operation was applied")]
+    Conflict,
+
+    /// The backend rejected the request because the caller is over its rate limit.
+    #[error("queue request was throttled by the backend")]
+    Throttled {
+        /// How long the backend asked the caller to wait, when it says.
+        retry_after: Option<core::time::Duration>,
+    },
+
+    /// The configured credentials were rejected by the backend.
+    #[error("queue credentials were rejected by the backend")]
+    Unauthorized,
 }
+
+backend_error!(QueueError);
+
+service_http_error!(QueueError {
+    Self::Backend { .. } => INTERNAL_SERVER_ERROR,
+    Self::Serialization(_) => INTERNAL_SERVER_ERROR,
+    Self::Conflict => CONFLICT,
+    Self::Throttled { .. } => TOO_MANY_REQUESTS,
+    Self::Unauthorized => INTERNAL_SERVER_ERROR,
+});
 
 /// Retry options for queue consumers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -306,7 +337,7 @@ mod tests {
         async fn send(&self, message: &[u8]) -> Result<(), QueueError> {
             self.messages
                 .write()
-                .map_err(|_| QueueError::Backend("lock poisoned".to_owned()))?
+                .map_err(|_| QueueError::backend("lock poisoned"))?
                 .push(message.to_vec());
             Ok(())
         }
@@ -314,7 +345,7 @@ mod tests {
         async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<(), QueueError> {
             self.messages
                 .write()
-                .map_err(|_| QueueError::Backend("lock poisoned".to_owned()))?
+                .map_err(|_| QueueError::backend("lock poisoned"))?
                 .extend(messages.iter().cloned());
             Ok(())
         }

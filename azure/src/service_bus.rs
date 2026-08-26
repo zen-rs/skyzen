@@ -70,7 +70,7 @@ impl MessageQueue for ServiceBusQueue {
         self.client
             .send_message(&body, None)
             .await
-            .map_err(|e| QueueError::Backend(e.to_string()))?;
+            .map_err(|error| QueueError::backend_with(error.to_string(), error))?;
         Ok(())
     }
 
@@ -81,7 +81,7 @@ impl MessageQueue for ServiceBusQueue {
     async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<(), QueueError> {
         for (index, msg) in messages.iter().enumerate() {
             self.send(msg).await.map_err(|error| {
-                QueueError::Backend(format!(
+                QueueError::backend(format!(
                     "batch send failed at message {index} of {}: {error} \
                      (messages before index {index} were already delivered)",
                     messages.len()

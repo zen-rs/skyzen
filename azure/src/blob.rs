@@ -44,7 +44,7 @@ impl ObjectStorage for AzureBlob {
             Ok(stat) => {
                 let mut metadata = stat_metadata(key, &stat);
                 metadata.size = u64::try_from(body.len()).map_err(|error| {
-                    StorageError::Backend(format!("Azure blob size overflow: {error}"))
+                    StorageError::backend(format!("Azure blob size overflow: {error}"))
                 })?;
                 metadata
             }
@@ -52,7 +52,7 @@ impl ObjectStorage for AzureBlob {
             Err(error) if error.kind() == ErrorKind::NotFound => ObjectMetadata {
                 key: key.to_owned(),
                 size: u64::try_from(body.len()).map_err(|error| {
-                    StorageError::Backend(format!("Azure blob size overflow: {error}"))
+                    StorageError::backend(format!("Azure blob size overflow: {error}"))
                 })?,
                 content_type: None,
                 last_modified: None,
@@ -193,8 +193,8 @@ fn clamp_page(
     }
 }
 
-fn storage_error(error: impl std::fmt::Display) -> StorageError {
-    StorageError::Backend(error.to_string())
+fn storage_error(error: impl std::error::Error + Send + Sync + 'static) -> StorageError {
+    StorageError::backend_with(error.to_string(), error)
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -210,17 +210,17 @@ fn decode_blob_list_cursor(cursor: Option<&str>) -> Result<Option<String>, Stora
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|error| {
-            StorageError::Backend(format!("invalid Azure blob cursor encoding: {error}"))
+            StorageError::backend(format!("invalid Azure blob cursor encoding: {error}"))
         })?;
     let cursor: AzureBlobListCursor = serde_json::from_slice(&bytes).map_err(|error| {
-        StorageError::Backend(format!("invalid Azure blob cursor payload: {error}"))
+        StorageError::backend(format!("invalid Azure blob cursor payload: {error}"))
     })?;
     Ok(Some(cursor.last_key))
 }
 
 fn encode_blob_list_cursor(cursor: &AzureBlobListCursor) -> Result<String, StorageError> {
     let payload = serde_json::to_vec(cursor).map_err(|error| {
-        StorageError::Backend(format!("failed to serialize Azure blob cursor: {error}"))
+        StorageError::backend(format!("failed to serialize Azure blob cursor: {error}"))
     })?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload))
 }

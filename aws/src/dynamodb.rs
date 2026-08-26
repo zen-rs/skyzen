@@ -74,7 +74,7 @@ impl DynamoKv {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .map_err(|e| KvError::Backend(format!("system clock before Unix epoch: {e}")))
+            .map_err(|e| KvError::backend(format!("system clock before Unix epoch: {e}")))
     }
 }
 
@@ -84,9 +84,9 @@ impl DynamoKv {
 /// includes the service error code and message instead of just "service error".
 fn backend_error<E>(err: E) -> KvError
 where
-    E: std::error::Error,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    KvError::Backend(DisplayErrorContext(&err).to_string())
+    KvError::backend_with(DisplayErrorContext(&err).to_string(), err)
 }
 
 /// Compute the expiry timestamp for a TTL, rounding sub-second parts up.
@@ -95,17 +95,17 @@ where
 /// unrepresentable one) would silently drop the write.
 fn expires_at_epoch_seconds(now_secs: u64, ttl: core::time::Duration) -> Result<u64, KvError> {
     if ttl.is_zero() {
-        return Err(KvError::Backend("TTL must be greater than zero".to_owned()));
+        return Err(KvError::backend("TTL must be greater than zero"));
     }
     let mut seconds = ttl.as_secs();
     if ttl.subsec_nanos() > 0 {
         seconds = seconds
             .checked_add(1)
-            .ok_or_else(|| KvError::Backend("TTL overflows the epoch-seconds range".to_owned()))?;
+            .ok_or_else(|| KvError::backend("TTL overflows the epoch-seconds range"))?;
     }
     now_secs
         .checked_add(seconds)
-        .ok_or_else(|| KvError::Backend("TTL overflows the epoch-seconds range".to_owned()))
+        .ok_or_else(|| KvError::backend("TTL overflows the epoch-seconds range"))
 }
 
 /// Whether an item's TTL attribute marks it as already expired.
@@ -133,7 +133,7 @@ fn extract_value(item: &HashMap<String, AttributeValue>, key: &str) -> Result<Ve
         .and_then(|v| v.as_b().ok())
         .map(|b| b.as_ref().to_vec())
         .ok_or_else(|| {
-            KvError::Backend(format!(
+            KvError::backend(format!(
                 "item for key {key:?} exists but its `value` attribute is missing or not binary"
             ))
         })
