@@ -692,9 +692,12 @@ fn worker() -> Router {
 
 On `wasm32-unknown-unknown`, `#[skyzen::main]` automatically generates the WinterCG `fetch` export.
 
-### Serverless Queue and Cron Handlers
+### Serverless Event Handlers
 
-Export Queue batch consumers and Cron triggers with dedicated attributes:
+Cloudflare documents six Worker handlers. Skyzen exports all six: `fetch` from `#[skyzen::main]`,
+the Durable Object `alarm` from `Route::on_alarm`, and the four below from dedicated attributes.
+
+Export Queue batch consumers and Cron triggers:
 
 ```rust
 #[cfg(target_arch = "wasm32")]
@@ -702,7 +705,7 @@ Export Queue batch consumers and Cron triggers with dedicated attributes:
 async fn queue_handler(
     batch: skyzen_cloudflare::CfQueueBatch,
     env: skyzen::runtime::wasm::Env,
-    ctx: skyzen_cloudflare::CfQueueContext,
+    ctx: skyzen_cloudflare::CfEventContext,
 ) -> Result<(), skyzen_cloudflare::CfEventError> {
     batch.ack_all()?;
     Ok(())
@@ -715,6 +718,37 @@ async fn cron_handler(
     env: skyzen::runtime::wasm::Env,
     ctx: skyzen_cloudflare::CfScheduleContext,
 ) -> Result<(), skyzen_cloudflare::CfEventError> {
+    Ok(())
+}
+```
+
+Process inbound mail with `#[skyzen::email]` and consume another Worker's logs with
+`#[skyzen::tail]`:
+
+```rust
+#[cfg(target_arch = "wasm32")]
+#[skyzen::email]
+async fn email_handler(
+    message: skyzen_cloudflare::CfEmailMessage,
+    env: skyzen::runtime::wasm::Env,
+    ctx: skyzen_cloudflare::CfEventContext,
+) -> Result<(), skyzen_cloudflare::CfEventError> {
+    if message.from_address()?.ends_with("@blocked.invalid") {
+        message.reject("not accepted")?;
+        return Ok(());
+    }
+    message.forward("archive@example.invalid").await
+}
+
+#[cfg(target_arch = "wasm32")]
+#[skyzen::tail]
+async fn tail_handler(
+    traces: Vec<skyzen_cloudflare::TailTraceItem>,
+    env: skyzen::runtime::wasm::Env,
+) -> Result<(), skyzen_cloudflare::CfEventError> {
+    for trace in traces {
+        tracing::info!(script = ?trace.script_name, outcome = ?trace.outcome, "traced invocation");
+    }
     Ok(())
 }
 ```

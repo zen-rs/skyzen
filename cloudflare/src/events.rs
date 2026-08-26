@@ -10,6 +10,7 @@ use skyzen_services::{
 use thiserror::Error;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::future_to_promise;
+use worker::send::IntoSendFuture;
 
 /// Errors returned by Cloudflare queue and scheduled event wrappers.
 #[derive(Debug, Error)]
@@ -133,13 +134,18 @@ where
     }
 }
 
-/// A Cloudflare queue consumer context.
+/// The `ExecutionContext` a queue, email or tail handler receives.
+///
+/// One type for the three, because the platform hands all three the same `ExecutionContext`
+/// object. The `scheduled` handler gets a differently-typed one, wrapped by
+/// [`CfScheduleContext`]; the fetch handler's is [`skyzen::runtime::WorkerContext`], which is
+/// dual-target because a fetch handler is the one that also runs natively.
 #[derive(Debug)]
-pub struct CfQueueContext {
+pub struct CfEventContext {
     inner: worker_sys::Context,
 }
 
-impl CfQueueContext {
+impl CfEventContext {
     /// Create from the raw worker context.
     #[must_use]
     pub const fn new(inner: worker_sys::Context) -> Self {
@@ -533,6 +539,290 @@ impl CfScheduleContext {
                 Ok(JsValue::UNDEFINED)
             }))
             .map_err(js_err)
+    }
+}
+
+// ── Email Workers ──
+
+/// An inbound email delivered to an `#[skyzen::email]` handler.
+///
+/// The three things a handler can do with a message are
+/// [`forward`](Self::forward) it to a verified destination,
+/// [`reject`](Self::reject) it so the sending server is told why, or read it and do neither —
+/// which silently drops it, so say which one you meant.
+#[derive(Debug, Clone)]
+pub struct CfEmailMessage {
+    inner: crate::ffi::EmailMessageSys,
+}
+
+impl CfEmailMessage {
+    /// Create from the raw platform message.
+    #[must_use]
+    pub const fn new(inner: crate::ffi::EmailMessageSys) -> Self {
+        Self { inner }
+    }
+
+    /// The envelope sender (SMTP `MAIL FROM`).
+    ///
+    /// This is the address the sending server authenticated as, not the `From:` header — which is
+    /// attacker-controlled and is what phishing forges. Authorization decisions belong here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the runtime rejects the lookup.
+    pub fn from_address(&self) -> Result<String, CfEventError> {
+        self.inner.sender().map_err(js_err)
+    }
+
+    /// The envelope recipient (SMTP `RCPT TO`) — the routed address, not the `To:` header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the runtime rejects the lookup.
+    pub fn to_address(&self) -> Result<String, CfEventError> {
+        self.inner.recipient().map_err(js_err)
+    }
+
+    /// The parsed message headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the runtime rejects the lookup.
+    pub fn headers(&self) -> Result<web_sys::Headers, CfEventError> {
+        self.inner.headers().map_err(js_err)
+    }
+
+    /// One header by name, case-insensitively, or `None` when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the runtime rejects the lookup.
+    pub fn header(&self, name: &str) -> Result<Option<String>, CfEventError> {
+        self.headers()?.get(name).map_err(js_err)
+    }
+
+    /// The size of the raw RFC 5322 message in bytes.
+    ///
+    /// Check this before [`raw_bytes`](Self::raw_bytes): a Worker has roughly 128 MB of memory and
+    /// an inbound message can be tens of megabytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the runtime rejects the lookup or reports a non-integer size.
+    pub fn raw_size(&self) -> Result<u64, CfEventError> {
+        let size = self.inner.raw_size().map_err(js_err)?;
+        if !size.is_finite() || size < 0.0 {
+            return Err(CfEventError::Runtime(format!(
+                "email `rawSize` is not a byte count: {size}"
+            )));
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Ok(size as u64)
+    }
+
+    /// The raw RFC 5322 message as a stream, for parsing without buffering it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the runtime rejects the lookup.
+    pub fn raw_stream(&self) -> Result<web_sys::ReadableStream, CfEventError> {
+        self.inner.raw().map_err(js_err)
+    }
+
+    /// Read the whole raw message into memory.
+    ///
+    /// Buffers the entire message, so check [`raw_size`](Self::raw_size) first for anything that
+    /// might be large. The stream is drained through a `Response`, which is the runtime's own
+    /// buffering path rather than a hand-rolled reader loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the stream cannot be read.
+    pub async fn raw_bytes(&self) -> Result<Vec<u8>, CfEventError> {
+        let stream = self.raw_stream()?;
+        let response =
+            web_sys::Response::new_with_opt_readable_stream(Some(&stream)).map_err(js_err)?;
+        let promise = response.array_buffer().map_err(js_err)?;
+        let buffer = wasm_bindgen_futures::JsFuture::from(promise)
+            .into_send()
+            .await
+            .map_err(js_err)?;
+        Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+    }
+
+    /// Reject the message, so the sending server is told why rather than believing it was
+    /// delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the runtime rejects the call.
+    pub fn reject(&self, reason: &str) -> Result<(), CfEventError> {
+        self.inner.set_reject(reason).map_err(js_err)
+    }
+
+    /// Forward the message to a destination address verified on the account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the address is not verified or the runtime rejects the forward.
+    pub async fn forward(&self, rcpt_to: &str) -> Result<(), CfEventError> {
+        self.forward_inner(rcpt_to, &JsValue::UNDEFINED).await
+    }
+
+    /// Forward the message, adding headers to the forwarded copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the address is not verified or the runtime rejects the forward.
+    pub async fn forward_with_headers(
+        &self,
+        rcpt_to: &str,
+        headers: &web_sys::Headers,
+    ) -> Result<(), CfEventError> {
+        self.forward_inner(rcpt_to, headers.as_ref()).await
+    }
+
+    async fn forward_inner(&self, rcpt_to: &str, headers: &JsValue) -> Result<(), CfEventError> {
+        let promise = self.inner.forward(rcpt_to, headers).map_err(js_err)?;
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .into_send()
+            .await
+            .map_err(js_err)?;
+        Ok(())
+    }
+
+    /// Reply to the message with an `EmailMessage` value built on the JS side.
+    ///
+    /// The reply has to be constructed with the `EmailMessage` class from Cloudflare's
+    /// `cloudflare:email` module, and `wasm-bindgen` cannot import from a runtime module — so this
+    /// takes the constructed value rather than pretending to build one. Pass it in from the worker
+    /// shim, or use [`forward`](Self::forward), which needs no such object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the runtime rejects the reply.
+    pub async fn reply(&self, message: &JsValue) -> Result<(), CfEventError> {
+        let promise = self.inner.reply(message).map_err(js_err)?;
+        wasm_bindgen_futures::JsFuture::from(promise)
+            .into_send()
+            .await
+            .map_err(js_err)?;
+        Ok(())
+    }
+}
+
+// ── Tail Workers ──
+
+/// One log line a traced Worker emitted.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TailLog {
+    /// `log`, `warn`, `error`, `debug`, …
+    pub level: Option<String>,
+    /// When the line was emitted, in milliseconds since the Unix epoch.
+    pub timestamp: Option<i64>,
+    /// The arguments passed to the logging call, as an array of arbitrary JSON values.
+    pub message: serde_json::Value,
+}
+
+/// One uncaught exception from a traced Worker.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TailException {
+    /// The error's constructor name.
+    pub name: Option<String>,
+    /// The error's message.
+    pub message: Option<String>,
+    /// When it was thrown, in milliseconds since the Unix epoch.
+    pub timestamp: Option<i64>,
+}
+
+/// One traced invocation of another Worker.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TailTraceItem {
+    /// The name of the Worker that produced the trace.
+    pub script_name: Option<String>,
+    /// How the invocation ended: `ok`, `exception`, `exceededCpu`, `canceled`, …
+    pub outcome: Option<String>,
+    /// When the invocation started, in milliseconds since the Unix epoch.
+    pub event_timestamp: Option<i64>,
+    /// Everything the Worker logged.
+    pub logs: Vec<TailLog>,
+    /// Everything it threw.
+    pub exceptions: Vec<TailException>,
+    /// CPU milliseconds consumed, when the platform reports it.
+    pub cpu_time: Option<f64>,
+    /// Wall-clock milliseconds elapsed, when the platform reports it.
+    pub wall_time: Option<f64>,
+    /// Whether the platform dropped logs or exceptions to stay within its limits.
+    ///
+    /// A `true` here means the trace is incomplete, which matters a great deal to anything
+    /// counting errors downstream.
+    pub truncated: bool,
+    /// The whole trace item exactly as the platform sent it.
+    ///
+    /// The `event` field alone is a union over fetch, scheduled, queue, alarm and email
+    /// invocations, and the platform keeps extending it — so nothing is discarded.
+    #[serde(skip)]
+    pub raw: serde_json::Value,
+}
+
+/// The batch of traces delivered to an `#[skyzen::tail]` handler.
+///
+/// A Tail Worker receives the logs and exceptions of *another* Worker, which is how an
+/// observability pipeline is built on Workers: forward them to a queue, a log sink or an analytics
+/// dataset.
+#[derive(Debug, Clone)]
+pub struct CfTailEvent {
+    inner: js_sys::Array,
+}
+
+impl CfTailEvent {
+    /// Create from the raw array of trace items.
+    #[must_use]
+    pub const fn new(inner: js_sys::Array) -> Self {
+        Self { inner }
+    }
+
+    /// The raw array, for fields the typed shape does not name.
+    #[must_use]
+    pub const fn raw(&self) -> &js_sys::Array {
+        &self.inner
+    }
+
+    /// How many invocations this batch covers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.length() as usize
+    }
+
+    /// Whether the batch is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Decode the batch into typed trace items.
+    ///
+    /// Decoding goes through `serde_json::Value` so the untouched item survives into
+    /// [`TailTraceItem::raw`], and so the typed pass is plain serde.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if a trace item is not a plain JSON object or has an unexpected
+    /// field type.
+    pub fn traces(&self) -> Result<Vec<TailTraceItem>, CfEventError> {
+        self.inner
+            .iter()
+            .map(|item| {
+                let raw: serde_json::Value = serde_wasm_bindgen::from_value(item)?;
+                let mut trace: TailTraceItem = serde_json::from_value(raw.clone())
+                    .map_err(|error| CfEventError::Decode(error.to_string()))?;
+                trace.raw = raw;
+                Ok(trace)
+            })
+            .collect()
     }
 }
 
