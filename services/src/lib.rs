@@ -63,7 +63,8 @@ pub use queue::{
 };
 pub use sql::{Db, DbBackend, DbError, DbExecResult, DbTransaction, DbTransactionBackend, DbValue};
 pub use storage::{
-    ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError, StorageObject,
+    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest,
+    PutOptions, Storage, StorageError, StorageObject, StorageStream,
 };
 
 #[cfg(test)]
