@@ -5,11 +5,16 @@
 //!
 //! # Key Modules
 //!
-//! - [`routing`] — Tree-based routing with path parameters and HTTP method matching
-//! - [`extract`] — Extract typed data from requests (JSON, query strings, path params, headers)
-//! - [`responder`] — Convert types into HTTP responses (`Json<T>`, `String`, `StatusCode`, etc.)
+//! - [`routing`] — Tree-based routing with path parameters, HTTP method matching, and `nest`ing
+//!   of an already-built [`Router`](routing::Router)
+//! - [`extract`] — Extract typed data from requests: [`Json<T>`](utils::Json),
+//!   [`Query<T>`](extract::Query), [`Path<T>`](extract::Path), [`HeaderMap`](header::HeaderMap),
+//!   and the body as `Bytes` or `String`
+//! - [`responder`] — Convert types into HTTP responses: [`Json<T>`](utils::Json), `String`,
+//!   [`StatusCode`], and tuples such as `(StatusCode, Json<T>)`
 //! - [`handler`] — Async functions with extractors as arguments become endpoints automatically
-//! - [`utils`] — Common utilities including `Json<T>` and `Redirect`
+//! - [`utils`] — Common utilities including [`Json<T>`](utils::Json),
+//!   [`Redirect`](utils::Redirect), [`Html<T>`](utils::Html) and [`CookieJar`](utils::CookieJar)
 //! - [`mod@openapi`] — Automatic `OpenAPI` documentation from annotated handlers
 //! - [`runtime`] — Runtime primitives for `#[skyzen::main]`
 //! - [`websocket`] — Unified WebSocket API across native and WASM (requires `ws` feature)
