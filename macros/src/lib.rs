@@ -362,6 +362,34 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                     ::skyzen::openapi::register_schema_for::<#payload_ty>(schemas);
                 }
             });
+        } else if let Some(payload_ty) = probed_extractor_payload(ty)? {
+            // `Path<T>` names no parameters of its own — the route pattern does — so its payload
+            // only supplies types, and a payload that does not describe itself (a tuple, say)
+            // simply leaves those parameters at their untyped default rather than failing to
+            // compile. Hence the probe rather than the `schema_of` assertion above.
+            assertions.push(quote! { let _ = ::skyzen::openapi::extractor_schema_of::<#ty>; });
+            parameter_schema_fns.push(quote! { #schema_ident });
+            schema_collector_idents.push(collector_ident.clone());
+            schema_collector_defs.push(quote! {
+                fn #schema_ident() -> Option<::skyzen::openapi::ExtractorSchema> {
+                    let mut schema = ::skyzen::openapi::extractor_schema_of::<#ty>()?;
+                    schema.schema = {
+                        use ::skyzen::openapi::MaybeSchemaProbe as _;
+                        ::skyzen::openapi::SchemaProbe::<#payload_ty>::new().maybe_schema()
+                    };
+                    Some(schema)
+                }
+
+                fn #collector_ident(
+                    schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
+                ) {
+                    ::skyzen::openapi::register_extractor_schemas_for::<#ty>(schemas);
+                    {
+                        use ::skyzen::openapi::MaybeSchemaProbe as _;
+                        ::skyzen::openapi::SchemaProbe::<#payload_ty>::new().maybe_register(schemas);
+                    }
+                }
+            });
         } else {
             assertions.push(quote! { let _ = ::skyzen::openapi::extractor_schema_of::<#ty>; });
             parameter_schema_fns.push(quote! { ::skyzen::openapi::extractor_schema_of::<#ty> });
@@ -927,6 +955,19 @@ fn documented_extractor_payload(ty: &Type) -> syn::Result<Option<(Type, &'static
             single_generic_type(ty)?,
             "application/x-www-form-urlencoded",
         ))),
+        _ => Ok(None),
+    }
+}
+
+/// The payload of an extractor whose schema is worth reporting when it exists, but whose absence
+/// is not an error — today, `Path<T>`.
+fn probed_extractor_payload(ty: &Type) -> syn::Result<Option<Type>> {
+    let Some(ident) = last_type_ident_token(ty) else {
+        return Ok(None);
+    };
+
+    match ident.to_string().as_str() {
+        "Path" => Ok(Some(single_generic_type(ty)?)),
         _ => Ok(None),
     }
 }

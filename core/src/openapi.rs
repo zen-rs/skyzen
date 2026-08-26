@@ -21,6 +21,8 @@ pub enum ParameterLocation {
     Query,
     /// Read from a request header.
     Header,
+    /// Read from the route's captured `{name}` path segments.
+    Path,
 }
 
 /// Schema information captured for an extractor argument.
