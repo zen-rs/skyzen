@@ -2793,10 +2793,22 @@ fn generate_native_service_init(
                 ),
                 proc_macro2::Span::call_site(),
             );
+            // `SqsQueue::from_env` builds a *standard* queue and refuses a `.fifo` URL, which needs
+            // a message group id on every send. A FIFO queue is wired in code with
+            // `SqsQueue::fifo`, so the manifest path reports the mismatch rather than hiding it.
+            let connect_message = LitStr::new(
+                &format!(
+                    "portable service `{}` cannot use the SQS queue named by `{}`",
+                    service.name, env_key
+                ),
+                proc_macro2::Span::call_site(),
+            );
             Ok(quote! {{
                 let url = ::std::env::var(#env_lit)
                     .unwrap_or_else(|_| panic!("{}", #missing_message));
-                let backend = ::skyzen_aws::SqsQueue::from_env(&url).await;
+                let backend = ::skyzen_aws::SqsQueue::from_env(&url)
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message));
                 ::skyzen_services::Queue::new(backend)
             }})
         }
