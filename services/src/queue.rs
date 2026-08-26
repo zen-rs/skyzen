@@ -8,8 +8,6 @@ use core::future::Future;
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::maybe_send::{BoxFuture, MaybeSend};
-
 // ── Error type ──
 
 /// Errors that can occur during message queue operations.
@@ -222,37 +220,21 @@ impl QueueBatchDisposition {
 /// User code interacts through the [`Queue`] wrapper, never this trait directly.
 pub trait MessageQueue: Send + Sync + Clone + 'static {
     /// Send a single message.
-    fn send(&self, message: &[u8]) -> impl Future<Output = Result<(), QueueError>> + MaybeSend;
+    fn send(&self, message: &[u8]) -> impl Future<Output = Result<(), QueueError>> + Send;
 
     /// Send a batch of messages.
     fn send_batch(
         &self,
         messages: &[Vec<u8>],
-    ) -> impl Future<Output = Result<(), QueueError>> + MaybeSend;
+    ) -> impl Future<Output = Result<(), QueueError>> + Send;
 }
 
-// ── Layer 2: Private object-safe trait ──
+// ── Layer 2: Generated object-safe trait ──
 
-trait MessageQueueObj: Send + Sync {
-    fn send<'a>(&'a self, message: &'a [u8]) -> BoxFuture<'a, Result<(), QueueError>>;
-    fn send_batch<'a>(&'a self, messages: &'a [Vec<u8>]) -> BoxFuture<'a, Result<(), QueueError>>;
-    fn clone_box(&self) -> Box<dyn MessageQueueObj>;
-}
-
-// ── Bridge ──
-
-impl<T: MessageQueue> MessageQueueObj for T {
-    fn send<'a>(&'a self, message: &'a [u8]) -> BoxFuture<'a, Result<(), QueueError>> {
-        Box::pin(MessageQueue::send(self, message))
-    }
-
-    fn send_batch<'a>(&'a self, messages: &'a [Vec<u8>]) -> BoxFuture<'a, Result<(), QueueError>> {
-        Box::pin(MessageQueue::send_batch(self, messages))
-    }
-
-    fn clone_box(&self) -> Box<dyn MessageQueueObj> {
-        Box::new(self.clone())
-    }
+service_obj! {
+    MessageQueueObj: MessageQueue;
+    async fn send<'a>(&'a self, message: &'a [u8]) -> Result<(), QueueError>;
+    async fn send_batch<'a>(&'a self, messages: &'a [Vec<u8>]) -> Result<(), QueueError>;
 }
 
 // ── User-facing wrapper ──

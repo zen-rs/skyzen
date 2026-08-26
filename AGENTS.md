@@ -70,17 +70,15 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 ### 1. Services Abstraction (Two-Trait Pattern)
 Services use a two-layer design for dynamic dispatch and type erasure:
 - **Public Trait** (e.g. `KeyValueStore`): Uses `impl Future` returns for ergonomic implementors. Not object-safe.
-- **Internal Trait** (e.g. `KeyValueStoreObj`): Uses `BoxFuture` returns, making it object-safe for dynamic dispatch via `Box<dyn KeyValueStoreObj>`.
-- **Bridge**: Blanket implementation of `*Obj` for any `T: PublicTrait`.
+- **Internal Trait** (e.g. `KeyValueStoreObj`): Uses `BoxFuture` returns, making it object-safe for dynamic dispatch via `Box<dyn KeyValueStoreObj>`. It and its blanket bridge are **generated** by the `service_obj!` macro (`services/src/macros.rs`) from the public trait's signatures, so adding a service method is a single-site change. The one exception is `DbTransactionBackendObj`, whose `&mut self` / `self: Box<Self>` shape the macro does not cover.
 - **Wrapper** (e.g. `Kv`): Holds `Box<dyn KeyValueStoreObj>`, implements `Extractor`, and exposes high-level async convenience methods (`get_json`, `put_json`, etc.).
 
 *Rule:* Platform crates depend **only** on `skyzen-services` (the trait definitions), **never** on the root `skyzen` crate.
 
-### 2. The `MaybeSend` Pattern
-Multi-threaded native runtimes (Tokio, smol) require futures to be `Send`, while single-threaded WebAssembly runtimes cannot satisfy `Send` for DOM/JS handle types.
-- On non-wasm32: `pub trait MaybeSend: Send {}`
-- On wasm32: `pub trait MaybeSend {}`
-Service traits use `MaybeSend` as a future bound so the same trait definition compiles cleanly across all targets without repetitive `#[cfg]` branches in user code.
+### 2. Service Futures Are `Send` On Every Target
+Service wrappers travel in `http::Extensions`, which requires `Send + Sync` unconditionally — including on wasm32 — so there is no target where a `!Send` service future would help. Every service trait therefore writes a plain `Send` bound, with no alias and no `#[cfg]` split.
+
+WebAssembly backends still work because portability is bought where the JS handles live, not in the trait: `skyzen-cloudflare` wraps each `JsValue` handle in a newtype carrying a contained `unsafe impl Send + Sync`, sound because a Workers isolate is single-threaded and never moves the handle across threads, and drives JS promises through `worker::send::IntoSendFuture`. A new wasm backend follows the same recipe.
 
 ### 3. Middleware, Layers & Build-Time Wiring
 

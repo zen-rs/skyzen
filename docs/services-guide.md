@@ -160,25 +160,41 @@ Provider crates for AWS and Azure are still available, but they are infrastructu
 | Message Queue | — | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
 | Portable SQL | `Db` via sqlx | `Db` via D1 | planned wiring | planned wiring | — |
 
-## The `MaybeSend` Pattern
+## Service Futures Are `Send`, Including On WASM
 
-Skyzen services must work on both native (where futures need `Send` for multi-threaded runtimes) and WASM (where `Send` is not required and often impossible). The `MaybeSend` trait solves this:
+Every service trait bounds its futures with a plain `Send`, on every target:
 
 ```rust
-// On native (not wasm32):
-pub trait MaybeSend: Send {}
-impl<T: Send> MaybeSend for T {}
-
-// On wasm32:
-pub trait MaybeSend {}
-impl<T> MaybeSend for T {}
+pub trait KeyValueStore: Send + Sync + Clone + 'static {
+    fn get(&self, key: &str) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + Send;
+}
 ```
 
-Service traits use `MaybeSend` as a bound instead of `Send`. This means:
-- On native, futures must be `Send` (as expected for Tokio/smol)
-- On WASM, any future works (no `Send` requirement)
+There is no conditional relaxation on `wasm32`, and no alias hiding one. The wrappers (`Kv`,
+`Storage`, `Queue`, `Db`, …) are handed to handlers through `http::Extensions`, whose entries are
+required to be `Send + Sync` regardless of target, so a `!Send` service future could not be stored
+there anyway.
 
-The same trait definition compiles on both targets without `#[cfg]` in user code.
+WASM backends satisfy the bound at the JS boundary instead of in the trait. Each backend struct in
+`skyzen-cloudflare` holds its JS handle in a private field and gets `Clone`/`Debug` plus a
+contained `unsafe impl Send + Sync` from one macro:
+
+```rust
+pub struct CfKv {
+    ns: ffi::KvNamespace,
+}
+
+// Emits Clone, Debug, and:
+//   SAFETY: Workers WASM executes on a single thread; JS handles are safe
+//   to mark Send/Sync.
+//   unsafe impl Send for CfKv {}
+//   unsafe impl Sync for CfKv {}
+impl_js_handle_traits!(CfKv { ns });
+```
+
+Awaited promises go through `worker::send::IntoSendFuture` (`JsFuture::from(promise).into_send()`),
+which re-labels a `!Send` JS future as `Send` under the same single-threaded argument. Writing a new
+WASM backend means following that recipe — not weakening the trait.
 
 ## Database Access
 

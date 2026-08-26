@@ -6,8 +6,6 @@
 use core::future::Future;
 use std::collections::HashMap;
 
-use crate::maybe_send::{BoxFuture, MaybeSend};
-
 // ── Error type ──
 
 /// Errors that can occur during object storage operations.
@@ -133,14 +131,14 @@ pub trait ObjectStorage: Send + Sync + Clone + 'static {
     fn get(
         &self,
         key: &str,
-    ) -> impl Future<Output = Result<Option<StorageObject>, StorageError>> + MaybeSend;
+    ) -> impl Future<Output = Result<Option<StorageObject>, StorageError>> + Send;
 
     /// Store an object under a key.
     fn put(
         &self,
         key: &str,
         body: Vec<u8>,
-    ) -> impl Future<Output = Result<(), StorageError>> + MaybeSend;
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Store an object under a key with content type and custom metadata.
     ///
@@ -153,7 +151,7 @@ pub trait ObjectStorage: Send + Sync + Clone + 'static {
         key: &str,
         body: Vec<u8>,
         options: PutOptions,
-    ) -> impl Future<Output = Result<(), StorageError>> + MaybeSend {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
             if options.is_empty() {
                 self.put(key, body).await
@@ -166,85 +164,36 @@ pub trait ObjectStorage: Send + Sync + Clone + 'static {
     }
 
     /// Remove an object by key.
-    fn delete(&self, key: &str) -> impl Future<Output = Result<(), StorageError>> + MaybeSend;
+    fn delete(&self, key: &str) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// List objects matching the given options.
     fn list(
         &self,
         options: ListOptions,
-    ) -> impl Future<Output = Result<ListResult, StorageError>> + MaybeSend;
+    ) -> impl Future<Output = Result<ListResult, StorageError>> + Send;
 
     /// Retrieve metadata for an object without downloading the body.
     fn head(
         &self,
         key: &str,
-    ) -> impl Future<Output = Result<Option<ObjectMetadata>, StorageError>> + MaybeSend;
+    ) -> impl Future<Output = Result<Option<ObjectMetadata>, StorageError>> + Send;
 }
 
-// ── Layer 2: Private object-safe trait ──
+// ── Layer 2: Generated object-safe trait ──
 
-trait ObjectStorageObj: Send + Sync {
-    fn get<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> BoxFuture<'a, Result<Option<StorageObject>, StorageError>>;
-    fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, Result<(), StorageError>>;
-    fn put_with<'a>(
+service_obj! {
+    ObjectStorageObj: ObjectStorage;
+    async fn get<'a>(&'a self, key: &'a str) -> Result<Option<StorageObject>, StorageError>;
+    async fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> Result<(), StorageError>;
+    async fn put_with<'a>(
         &'a self,
         key: &'a str,
         body: Vec<u8>,
         options: PutOptions,
-    ) -> BoxFuture<'a, Result<(), StorageError>>;
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StorageError>>;
-    fn list(&self, options: ListOptions) -> BoxFuture<'_, Result<ListResult, StorageError>>;
-    fn head<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> BoxFuture<'a, Result<Option<ObjectMetadata>, StorageError>>;
-    fn clone_box(&self) -> Box<dyn ObjectStorageObj>;
-}
-
-// ── Bridge ──
-
-impl<T: ObjectStorage> ObjectStorageObj for T {
-    fn get<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> BoxFuture<'a, Result<Option<StorageObject>, StorageError>> {
-        Box::pin(ObjectStorage::get(self, key))
-    }
-
-    fn put<'a>(&'a self, key: &'a str, body: Vec<u8>) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(ObjectStorage::put(self, key, body))
-    }
-
-    fn put_with<'a>(
-        &'a self,
-        key: &'a str,
-        body: Vec<u8>,
-        options: PutOptions,
-    ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(ObjectStorage::put_with(self, key, body, options))
-    }
-
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(ObjectStorage::delete(self, key))
-    }
-
-    fn list(&self, options: ListOptions) -> BoxFuture<'_, Result<ListResult, StorageError>> {
-        Box::pin(ObjectStorage::list(self, options))
-    }
-
-    fn head<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> BoxFuture<'a, Result<Option<ObjectMetadata>, StorageError>> {
-        Box::pin(ObjectStorage::head(self, key))
-    }
-
-    fn clone_box(&self) -> Box<dyn ObjectStorageObj> {
-        Box::new(self.clone())
-    }
+    ) -> Result<(), StorageError>;
+    async fn delete<'a>(&'a self, key: &'a str) -> Result<(), StorageError>;
+    async fn list(&'_ self, options: ListOptions) -> Result<ListResult, StorageError>;
+    async fn head<'a>(&'a self, key: &'a str) -> Result<Option<ObjectMetadata>, StorageError>;
 }
 
 // ── User-facing wrapper ──
