@@ -267,6 +267,13 @@ fn d1_result_to_exec_result(value: JsValue) -> Result<DbExecResult, DbError> {
     })
 }
 
+/// Convert a bound parameter to the JS value D1 accepts.
+///
+/// D1's binding API takes only `null`, numbers, strings and `ArrayBuffer`s, so the richer
+/// [`DbValue`] variants are rendered in the textual form `SQLite` compares and stores them as:
+/// RFC 3339 for a timestamp, the hyphenated form for a UUID, the exact decimal rendering for a
+/// decimal, and compact JSON for a document — the last of which `SQLite`'s JSON functions read
+/// directly.
 fn db_value_to_js(value: &DbValue) -> Result<JsValue, CfDatabaseError> {
     match value {
         DbValue::Null => Ok(JsValue::NULL),
@@ -275,6 +282,10 @@ fn db_value_to_js(value: &DbValue) -> Result<JsValue, CfDatabaseError> {
         DbValue::Real(value) => Ok(JsValue::from_f64(*value)),
         DbValue::Text(value) => Ok(JsValue::from_str(value)),
         DbValue::Blob(value) => Ok(js_sys::Uint8Array::from(value.as_slice()).into()),
+        DbValue::Timestamp(value) => Ok(JsValue::from_str(&value.to_rfc3339())),
+        DbValue::Uuid(value) => Ok(JsValue::from_str(&value.to_string())),
+        DbValue::Decimal(value) => Ok(JsValue::from_str(&value.to_string())),
+        DbValue::Json(value) => Ok(JsValue::from_str(&value.to_string())),
     }
 }
 
