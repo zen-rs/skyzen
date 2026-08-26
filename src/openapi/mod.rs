@@ -11,7 +11,7 @@ use std::{
 use crate::{
     extract::Extractor,
     responder::Responder,
-    routing::{IntoRouteNode, RouteNode},
+    routing::{IntoRouteNode, MethodFilter, RouteNode},
     Body, Endpoint, Request, Response, Route,
 };
 use http_kit::{header, http_error, Method, StatusCode};
@@ -667,8 +667,20 @@ impl Endpoint for OpenApiRedocEndpoint {
 fn redoc_route(endpoint: OpenApiRedocEndpoint, mount_path: String) -> RouteNode {
     let wildcard_suffix = "/{*path}";
     let route = Route::new((
-        RouteNode::new_endpoint("", Method::GET, endpoint.clone(), None),
-        RouteNode::new_endpoint(wildcard_suffix, Method::GET, endpoint, None),
+        RouteNode::new_endpoint(
+            "",
+            MethodFilter::Exact(Method::GET),
+            endpoint.clone(),
+            None,
+            Vec::new(),
+        ),
+        RouteNode::new_endpoint(
+            wildcard_suffix,
+            MethodFilter::Exact(Method::GET),
+            endpoint,
+            None,
+            Vec::new(),
+        ),
     ));
 
     RouteNode::new_route(mount_path, route)

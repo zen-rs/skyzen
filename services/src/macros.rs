@@ -56,10 +56,17 @@ macro_rules! service_http_error {
 /// - `Debug` (opaque, `finish_non_exhaustive`),
 /// - the `*NotConfigured` extractor error (HTTP 500),
 /// - the [`Extractor`](skyzen_core::Extractor) impl that reads the wrapper from request extensions,
-/// - the [`Middleware`](http_kit::middleware::Middleware) impl that injects the wrapper into them.
+/// - the [`Middleware`](skyzen_core::middleware::Middleware) impl that injects the wrapper into
+///   them, declaring the wrapper as one of its `provisions()`.
 ///
 /// Centralising this keeps the seven service wrappers byte-for-byte consistent and means a change to
 /// the injection/extraction contract is made in exactly one place.
+///
+/// The `Extractor` impl deliberately declares **no** `requirements()`, so `Route::try_build` never
+/// rejects a route for a service it cannot see. Route middleware is not the only way a wrapper
+/// reaches a request: `#[skyzen::main]` wraps the built router with the services declared in
+/// `Skyzen.toml`, and `skyzen_test::TestClient` inserts them straight into the extensions. Either
+/// path would turn a correctly wired application into a build-time panic.
 macro_rules! service_extractor {
     ($wrapper:ident, $not_configured:ident, $message:literal $(,)?) => {
         impl ::core::clone::Clone for $wrapper {
@@ -94,20 +101,18 @@ macro_rules! service_extractor {
             }
         }
 
-        impl ::http_kit::middleware::Middleware for $wrapper {
-            type Error = ::core::convert::Infallible;
-            async fn handle<N: ::http_kit::Endpoint>(
-                &mut self,
+        impl ::skyzen_core::middleware::Middleware for $wrapper {
+            async fn handle(
+                &self,
                 request: &mut ::http_kit::Request,
-                mut next: N,
-            ) -> ::core::result::Result<
-                ::http_kit::Response,
-                ::http_kit::middleware::MiddlewareError<N::Error, Self::Error>,
-            > {
+                next: ::skyzen_core::middleware::Next<'_>,
+            ) -> ::core::result::Result<::http_kit::Response, ::skyzen_core::Error> {
                 request.extensions_mut().insert(self.clone());
-                next.respond(request)
-                    .await
-                    .map_err(::http_kit::middleware::MiddlewareError::Endpoint)
+                next.run(request).await
+            }
+
+            fn provisions(&self) -> ::std::vec::Vec<::core::any::TypeId> {
+                ::std::vec![::core::any::TypeId::of::<Self>()]
             }
         }
     };

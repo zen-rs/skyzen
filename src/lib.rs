@@ -74,17 +74,18 @@ pub use include_dir;
 pub use http_kit;
 #[doc(inline)]
 pub use http_kit::{
-    header, Body, BodyError, Endpoint, HttpError, Method, Middleware, Request, Response,
-    StatusCode, Uri,
+    header, Body, BodyError, Endpoint, HttpError, Method, Request, Response, StatusCode, Uri,
 };
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use js_sys;
 #[doc(inline)]
+pub use middleware::Middleware;
+#[doc(inline)]
 pub use routing::{CreateRouteNode, Route};
 pub use skyzen_core::error::*;
 pub use skyzen_core::Server;
-pub use skyzen_core::{error_response, log_endpoint_error};
+pub use skyzen_core::{error_response, log_endpoint_error, ErrorChain, RequestBodyLimit};
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use wasm_bindgen;
@@ -115,17 +116,21 @@ pub mod middleware;
 
 #[doc(hidden)]
 pub mod __private {
-    use crate::{Endpoint, Middleware};
+    use crate::{
+        middleware::{layer, Layered, Middleware},
+        Endpoint,
+    };
 
-    pub fn with_middleware<E, M>(
-        endpoint: E,
-        middleware: M,
-    ) -> http_kit::endpoint::WithMiddleware<E, M>
+    /// Wrap the endpoint `#[skyzen::main]` produced with one service injector.
+    ///
+    /// Applied outside `Route::build`, so the services declared in `Skyzen.toml` reach every
+    /// request without the route tree having to know about them.
+    pub fn with_middleware<E, M>(endpoint: E, middleware: M) -> Layered<E>
     where
-        E: Endpoint,
+        E: Endpoint + Clone + Send + Sync + 'static,
         M: Middleware,
     {
-        http_kit::endpoint::WithMiddleware::new(endpoint, middleware)
+        layer(endpoint, middleware)
     }
 }
 

@@ -424,7 +424,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct ReadStorageEndpoint;
 
     impl Endpoint for ReadStorageEndpoint {
@@ -484,10 +484,10 @@ mod tests {
         let mut storage = Storage::new(backend);
         let mut request = http_kit::Request::new(Body::empty());
 
-        let response = storage
-            .handle(&mut request, ReadStorageEndpoint)
-            .await
-            .unwrap();
+        let response =
+            ::skyzen_core::middleware::apply(&storage, &mut request, ReadStorageEndpoint)
+                .await
+                .unwrap();
         let body = response.into_body().into_string().await.unwrap();
         assert_eq!(body, "hello");
 

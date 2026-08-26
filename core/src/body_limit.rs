@@ -1,6 +1,10 @@
 //! The per-request cap on how many body bytes an extractor may buffer.
 
+use core::convert::Infallible;
+
 use http_kit::Request;
+
+use crate::Extractor;
 
 /// How many request-body bytes the body extractors may buffer for one request.
 ///
@@ -50,6 +54,14 @@ impl RequestBodyLimit {
 impl Default for RequestBodyLimit {
     fn default() -> Self {
         Self::new(Self::DEFAULT)
+    }
+}
+
+/// Reads the limit in force for the current request, so a handler can size its own reads.
+impl Extractor for RequestBodyLimit {
+    type Error = Infallible;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        Ok(Self::of(request))
     }
 }
 
