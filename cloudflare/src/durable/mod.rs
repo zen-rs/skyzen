@@ -20,7 +20,7 @@ pub use glue::{
     DurableObjectRuntime,
 };
 pub use kv::CfDurableKv;
-pub use namespace::{CfDurableNamespace, CfDurableObjectStub};
+pub use namespace::{CfDurableNamespace, CfDurableObjectStub, CfJurisdiction};
 pub use sql::CfDurableDb;
 pub use state::CfDurableState;
 pub use websocket::{CfDurableConnections, CfWebSocketConnection};

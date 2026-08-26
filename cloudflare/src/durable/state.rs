@@ -1,9 +1,16 @@
 //! Durable Object state adapter and extension injection.
 
+use core::future::Future;
+
 use skyzen::durable::DurableObjectState as HibernationDurableObjectState;
 use skyzen::durable::{DurableConnections, DurableContext, DurableObjectError, DurableObjectId};
 use skyzen_services::durable::{Alarm, DurableDb, DurableKv};
-use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::{future_to_promise, JsFuture};
+use worker::send::IntoSendFuture;
+
+use crate::ffi;
 
 use super::{
     alarm::CfAlarm,
@@ -77,6 +84,49 @@ impl CfDurableState {
     pub fn alarm(&self) -> Result<Alarm, DurableObjectError> {
         let scheduler = CfAlarm::from_state(&self.state).map_err(to_runtime_error)?;
         Ok(Alarm::new(scheduler))
+    }
+
+    /// Run `critical_section` with the object's input gates closed.
+    ///
+    /// While it runs, the runtime queues every other event — incoming fetches, alarms and
+    /// websocket messages — instead of interleaving them. That is the platform's answer to two
+    /// problems Skyzen's own state model makes concrete: initialization that must finish before
+    /// the first request is served, and a sequence of writes that must land together even though
+    /// it spans an `await`.
+    ///
+    /// A failure inside the critical section aborts the Durable Object, which is deliberate on
+    /// Cloudflare's part: an object whose initialization failed has no safe state to serve from,
+    /// so it is torn down and rebuilt rather than left half-constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableObjectError::Runtime`] if the state handle does not expose
+    /// `blockConcurrencyWhile` or the runtime rejects the call.
+    pub async fn block_concurrency_while<F>(
+        &self,
+        critical_section: F,
+    ) -> Result<(), DurableObjectError>
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        // `once_into_js` hands ownership of the closure to JS, so nothing `!Send` is held across
+        // the await below and this future stays `Send` like the rest of the Durable Object API.
+        let callback = Closure::once_into_js(move || {
+            future_to_promise(async move {
+                critical_section.await;
+                Ok(JsValue::UNDEFINED)
+            })
+        });
+
+        let state: &ffi::DurableObjectStateExt = self.state.unchecked_ref();
+        let promise = state
+            .block_concurrency_while(callback.unchecked_ref())
+            .map_err(runtime_err)?;
+        JsFuture::from(promise)
+            .into_send()
+            .await
+            .map_err(runtime_err)?;
+        Ok(())
     }
 
     /// Build the websocket connections extractor wrapper.
