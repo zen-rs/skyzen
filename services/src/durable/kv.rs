@@ -4,8 +4,6 @@ use core::future::Future;
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::maybe_send::{BoxFuture, MaybeSend};
-
 type DurableKvEntries = Vec<(String, Vec<u8>)>;
 
 // ── Error type ──
@@ -61,122 +59,70 @@ pub trait DurableKvStore: Send + Sync + Clone + 'static {
     fn get(
         &self,
         key: &str,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, DurableKvError>> + MaybeSend;
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, DurableKvError>> + Send;
 
     /// Retrieve multiple values by keys.
     fn get_multiple(
         &self,
         keys: &[&str],
-    ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + MaybeSend;
+    ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + Send;
 
     /// Store a value under a key.
     fn put(
         &self,
         key: &str,
         value: &[u8],
-    ) -> impl Future<Output = Result<(), DurableKvError>> + MaybeSend;
+    ) -> impl Future<Output = Result<(), DurableKvError>> + Send;
 
     /// Store multiple key-value pairs atomically.
     fn put_multiple(
         &self,
         entries: &[(&str, &[u8])],
-    ) -> impl Future<Output = Result<(), DurableKvError>> + MaybeSend;
+    ) -> impl Future<Output = Result<(), DurableKvError>> + Send;
 
     /// Delete a key. Returns whether the key existed.
-    fn delete(&self, key: &str) -> impl Future<Output = Result<bool, DurableKvError>> + MaybeSend;
+    fn delete(&self, key: &str) -> impl Future<Output = Result<bool, DurableKvError>> + Send;
 
     /// Delete multiple keys. Returns the number of keys deleted.
     fn delete_multiple(
         &self,
         keys: &[&str],
-    ) -> impl Future<Output = Result<usize, DurableKvError>> + MaybeSend;
+    ) -> impl Future<Output = Result<usize, DurableKvError>> + Send;
 
     /// Delete all keys.
-    fn delete_all(&self) -> impl Future<Output = Result<(), DurableKvError>> + MaybeSend;
+    fn delete_all(&self) -> impl Future<Output = Result<(), DurableKvError>> + Send;
 
     /// List key-value pairs matching the given options.
     fn list(
         &self,
         options: DurableListOptions<'_>,
-    ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + MaybeSend;
+    ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + Send;
 }
 
-// ── Layer 2: Private object-safe trait ──
+// ── Layer 2: Generated object-safe trait ──
 
-trait DurableKvStoreObj: Send + Sync {
-    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, DurableKvError>>;
-    fn get_multiple<'a>(
+service_obj! {
+    DurableKvStoreObj: DurableKvStore;
+    async fn get<'a>(&'a self, key: &'a str) -> Result<Option<Vec<u8>>, DurableKvError>;
+    async fn get_multiple<'a>(
         &'a self,
         keys: &'a [&'a str],
-    ) -> BoxFuture<'a, Result<DurableKvEntries, DurableKvError>>;
-    fn put<'a>(
-        &'a self,
-        key: &'a str,
-        value: &'a [u8],
-    ) -> BoxFuture<'a, Result<(), DurableKvError>>;
-    fn put_multiple<'a>(
+    ) -> Result<DurableKvEntries, DurableKvError>;
+    async fn put<'a>(&'a self, key: &'a str, value: &'a [u8]) -> Result<(), DurableKvError>;
+    async fn put_multiple<'a>(
         &'a self,
         entries: &'a [(&'a str, &'a [u8])],
-    ) -> BoxFuture<'a, Result<(), DurableKvError>>;
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<bool, DurableKvError>>;
-    fn delete_multiple<'a>(
+    ) -> Result<(), DurableKvError>;
+    async fn delete<'a>(&'a self, key: &'a str) -> Result<bool, DurableKvError>;
+    async fn delete_multiple<'a>(
         &'a self,
         keys: &'a [&'a str],
-    ) -> BoxFuture<'a, Result<usize, DurableKvError>>;
-    fn delete_all(&self) -> BoxFuture<'_, Result<(), DurableKvError>>;
-    fn list<'a>(
+    ) -> Result<usize, DurableKvError>;
+    async fn delete_all(&'_ self) -> Result<(), DurableKvError>;
+    async fn list<'a>(
         &'a self,
         options: DurableListOptions<'a>,
-    ) -> BoxFuture<'a, Result<DurableKvEntries, DurableKvError>>;
-    fn clone_box(&self) -> Box<dyn DurableKvStoreObj>;
-}
-
-// ── Bridge ──
-
-impl<T: DurableKvStore> DurableKvStoreObj for T {
-    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, DurableKvError>> {
-        Box::pin(DurableKvStore::get(self, key))
-    }
-    fn get_multiple<'a>(
-        &'a self,
-        keys: &'a [&'a str],
-    ) -> BoxFuture<'a, Result<DurableKvEntries, DurableKvError>> {
-        Box::pin(DurableKvStore::get_multiple(self, keys))
-    }
-    fn put<'a>(
-        &'a self,
-        key: &'a str,
-        value: &'a [u8],
-    ) -> BoxFuture<'a, Result<(), DurableKvError>> {
-        Box::pin(DurableKvStore::put(self, key, value))
-    }
-    fn put_multiple<'a>(
-        &'a self,
-        entries: &'a [(&'a str, &'a [u8])],
-    ) -> BoxFuture<'a, Result<(), DurableKvError>> {
-        Box::pin(DurableKvStore::put_multiple(self, entries))
-    }
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<bool, DurableKvError>> {
-        Box::pin(DurableKvStore::delete(self, key))
-    }
-    fn delete_multiple<'a>(
-        &'a self,
-        keys: &'a [&'a str],
-    ) -> BoxFuture<'a, Result<usize, DurableKvError>> {
-        Box::pin(DurableKvStore::delete_multiple(self, keys))
-    }
-    fn delete_all(&self) -> BoxFuture<'_, Result<(), DurableKvError>> {
-        Box::pin(DurableKvStore::delete_all(self))
-    }
-    fn list<'a>(
-        &'a self,
-        options: DurableListOptions<'a>,
-    ) -> BoxFuture<'a, Result<DurableKvEntries, DurableKvError>> {
-        Box::pin(DurableKvStore::list(self, options))
-    }
-    fn clone_box(&self) -> Box<dyn DurableKvStoreObj> {
-        Box::new(self.clone())
-    }
+    ) -> Result<DurableKvEntries, DurableKvError>;
 }
 
 // ── User-facing wrapper ──

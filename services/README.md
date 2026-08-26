@@ -66,12 +66,17 @@ async fn update_profile(
 }
 ```
 
-## Platform Compatibility (`MaybeSend`)
+## Platform Compatibility
 
-Skyzen supports both multi-threaded native runtimes and single-threaded WASM environments. To handle this, `skyzen-services` uses the `MaybeSend` pattern:
+Service traits require `Send` futures on **every** target, WASM included: the wrappers are handed
+to handlers through `http::Extensions`, whose entries must be `Send + Sync` unconditionally, so a
+`!Send` service future could never be stored there.
 
-- **Native**: `MaybeSend` resolves to `Send`. All futures and traits require `Send` bounds for thread safety.
-- **WASM**: `MaybeSend` is a no-op. This allows using JS-backed types (like `WebSocket` or `ReadableStream`) which are inherently `!Send`.
+Single-threaded WASM backends still work, because portability is bought at the JS boundary rather
+than in the trait: `skyzen-cloudflare` keeps each JS handle in a newtype with a contained
+`unsafe impl Send + Sync` (sound because a Workers isolate never moves it across threads) and
+awaits promises through `worker::send::IntoSendFuture`. See
+[docs/services-guide.md](../docs/services-guide.md) for the full recipe.
 
 ## Feature Flags
 

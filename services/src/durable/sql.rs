@@ -4,10 +4,7 @@ use core::future::Future;
 
 use serde::de::DeserializeOwned;
 
-use crate::{
-    maybe_send::{BoxFuture, MaybeSend},
-    sql::{prepare_query_sql, DbDialect, DbError, DbExecResult, DbValue},
-};
+use crate::sql::{prepare_query_sql, DbDialect, DbError, DbExecResult, DbValue};
 
 /// Errors from Durable Object database operations.
 #[derive(Debug, thiserror::Error)]
@@ -81,58 +78,32 @@ pub trait DurableDbBackend: Send + Sync + Clone + 'static {
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send;
 
     /// Execute a statement that does not return rows.
     fn execute(
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send;
 
     /// Get the on-disk database size in bytes.
-    fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + MaybeSend;
+    fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send;
 }
 
-trait DurableDbBackendObj: Send + Sync {
-    fn query<'a>(
+service_obj! {
+    DurableDbBackendObj: DurableDbBackend;
+    async fn query<'a>(
         &'a self,
         query: &'a str,
         params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DurableDbError>>;
-    fn execute<'a>(
+    ) -> Result<DbExecResult, DurableDbError>;
+    async fn execute<'a>(
         &'a self,
         query: &'a str,
         params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DurableDbError>>;
-    fn database_size(&self) -> BoxFuture<'_, Result<u64, DurableDbError>>;
-    fn clone_box(&self) -> Box<dyn DurableDbBackendObj>;
-}
-
-impl<T: DurableDbBackend> DurableDbBackendObj for T {
-    fn query<'a>(
-        &'a self,
-        query: &'a str,
-        params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DurableDbError>> {
-        Box::pin(DurableDbBackend::query(self, query, params))
-    }
-
-    fn execute<'a>(
-        &'a self,
-        query: &'a str,
-        params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DurableDbError>> {
-        Box::pin(DurableDbBackend::execute(self, query, params))
-    }
-
-    fn database_size(&self) -> BoxFuture<'_, Result<u64, DurableDbError>> {
-        Box::pin(DurableDbBackend::database_size(self))
-    }
-
-    fn clone_box(&self) -> Box<dyn DurableDbBackendObj> {
-        Box::new(self.clone())
-    }
+    ) -> Result<DbExecResult, DurableDbError>;
+    async fn database_size(&'_ self) -> Result<u64, DurableDbError>;
 }
 
 /// Type-erased Durable Object database extractor.

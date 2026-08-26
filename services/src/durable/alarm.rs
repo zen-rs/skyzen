@@ -2,8 +2,6 @@
 
 use core::future::Future;
 
-use crate::maybe_send::{BoxFuture, MaybeSend};
-
 // ── Error type ──
 
 /// Errors from Durable Object alarm operations.
@@ -34,42 +32,25 @@ service_http_error!(AlarmError {
 /// that will trigger the Durable Object's alarm handler.
 pub trait AlarmScheduler: Send + Sync + Clone + 'static {
     /// Get the currently scheduled alarm time (ms since epoch), if any.
-    fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, AlarmError>> + MaybeSend;
+    fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, AlarmError>> + Send;
 
     /// Schedule an alarm at the given time (ms since epoch).
     fn set_alarm(
         &self,
         scheduled_time_ms: i64,
-    ) -> impl Future<Output = Result<(), AlarmError>> + MaybeSend;
+    ) -> impl Future<Output = Result<(), AlarmError>> + Send;
 
     /// Delete the currently scheduled alarm.
-    fn delete_alarm(&self) -> impl Future<Output = Result<(), AlarmError>> + MaybeSend;
+    fn delete_alarm(&self) -> impl Future<Output = Result<(), AlarmError>> + Send;
 }
 
-// ── Layer 2: Private object-safe trait ──
+// ── Layer 2: Generated object-safe trait ──
 
-trait AlarmSchedulerObj: Send + Sync {
-    fn get_alarm(&self) -> BoxFuture<'_, Result<Option<i64>, AlarmError>>;
-    fn set_alarm(&self, scheduled_time_ms: i64) -> BoxFuture<'_, Result<(), AlarmError>>;
-    fn delete_alarm(&self) -> BoxFuture<'_, Result<(), AlarmError>>;
-    fn clone_box(&self) -> Box<dyn AlarmSchedulerObj>;
-}
-
-// ── Bridge ──
-
-impl<T: AlarmScheduler> AlarmSchedulerObj for T {
-    fn get_alarm(&self) -> BoxFuture<'_, Result<Option<i64>, AlarmError>> {
-        Box::pin(AlarmScheduler::get_alarm(self))
-    }
-    fn set_alarm(&self, scheduled_time_ms: i64) -> BoxFuture<'_, Result<(), AlarmError>> {
-        Box::pin(AlarmScheduler::set_alarm(self, scheduled_time_ms))
-    }
-    fn delete_alarm(&self) -> BoxFuture<'_, Result<(), AlarmError>> {
-        Box::pin(AlarmScheduler::delete_alarm(self))
-    }
-    fn clone_box(&self) -> Box<dyn AlarmSchedulerObj> {
-        Box::new(self.clone())
-    }
+service_obj! {
+    AlarmSchedulerObj: AlarmScheduler;
+    async fn get_alarm(&'_ self) -> Result<Option<i64>, AlarmError>;
+    async fn set_alarm(&'_ self, scheduled_time_ms: i64) -> Result<(), AlarmError>;
+    async fn delete_alarm(&'_ self) -> Result<(), AlarmError>;
 }
 
 // ── User-facing wrapper ──
