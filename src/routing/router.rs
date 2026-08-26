@@ -1496,4 +1496,67 @@ mod tests {
             "a GET with query/path params must not declare a request body"
         );
     }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    struct ItemPath {
+        id: u64,
+    }
+
+    #[skyzen::openapi]
+    async fn show_item(
+        crate::extract::Path(path): crate::extract::Path<ItemPath>,
+    ) -> Result<String> {
+        Ok(path.id.to_string())
+    }
+
+    #[test]
+    fn a_path_extractor_types_the_route_pattern_parameter_exactly_once() {
+        let spec = Route::new(("/items/{id}".at(show_item),))
+            .openapi()
+            .to_utoipa_spec();
+        let json = serde_json::to_value(&spec).expect("serialize spec");
+        let parameters = json["paths"]["/items/{id}"]["get"]["parameters"]
+            .as_array()
+            .expect("operation should declare parameters");
+
+        let described: Vec<_> = parameters
+            .iter()
+            .filter(|parameter| parameter["name"] == "id")
+            .collect();
+        assert_eq!(
+            described.len(),
+            1,
+            "the route pattern and the extractor describe the same parameter"
+        );
+        assert_eq!(described[0]["in"], "path");
+        assert_eq!(described[0]["required"], true);
+        assert_eq!(
+            described[0]["schema"]["type"], "integer",
+            "the extractor's type must replace the untyped string default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_extractor_deserializes_the_captured_segments() {
+        async fn show(path: crate::extract::Path<(String, u32)>) -> Result<String> {
+            let crate::extract::Path((user, post)) = path;
+            Ok(format!("{user}/{post}"))
+        }
+
+        let router = build(Route::new(("/users/{user}/posts/{post}".at(show),))).unwrap();
+        let response = router
+            .clone()
+            .go(get_request("/users/ada/posts/17"))
+            .await
+            .unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "ada/17");
+
+        let response = router
+            .clone()
+            .go(get_request("/users/ada/posts/seventeen"))
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

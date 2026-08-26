@@ -40,6 +40,15 @@ impl Params {
         Self(vec)
     }
 
+    /// The captured parameters, in the order the route pattern declares them.
+    ///
+    /// [`Path<T>`](crate::extract::Path) deserializes from exactly this list; reach for it here
+    /// only when the parameter names are not known until runtime.
+    #[must_use]
+    pub fn pairs(&self) -> &[(String, String)] {
+        &self.0
+    }
+
     pub(crate) const fn empty() -> Self {
         Self(Vec::new())
     }
