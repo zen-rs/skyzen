@@ -34,6 +34,14 @@ use skyzen_redis::Redis;
 let redis = Redis::connect("redis://127.0.0.1:6379").await.unwrap();
 ```
 
+Or from `REDIS_URL`, the way every other Skyzen backend reads its configuration:
+
+```rust
+use skyzen_redis::Redis;
+
+let redis = Redis::from_env().await.unwrap();
+```
+
 Or from an existing connection manager:
 
 ```rust
@@ -42,6 +50,17 @@ use redis::aio::ConnectionManager;
 let conn = ConnectionManager::new(client).await?;
 let redis = Redis::from_connection_manager(conn);
 ```
+
+### Atomic primitives
+
+Beyond get/put/delete/list, this backend implements the whole `KeyValueStore` surface on Redis'
+own commands: `put_if_absent` (`SET NX`) for distributed locks and idempotency keys,
+`compare_and_swap` (a Lua script, since Redis has no compare-and-swap command and a GET/SET pair is
+not atomic), `increment` (`INCRBY`) for rate-limit counters, `expire` (`PEXPIRE`) for sliding
+sessions, and `exists` (`EXISTS`).
+
+Redis Cluster and Sentinel are out of scope: this type speaks to a single endpoint, so a key that
+hashes to another slot comes back as a `MOVED` error rather than being followed.
 
 ### Wiring into a Skyzen App
 
