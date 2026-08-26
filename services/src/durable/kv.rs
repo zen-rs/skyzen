@@ -428,7 +428,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct ReadDurableKvEndpoint;
 
     impl Endpoint for ReadDurableKvEndpoint {
@@ -540,8 +540,7 @@ mod tests {
         let mut kv = DurableKv::new(store);
         let mut request = http_kit::Request::new(Body::empty());
 
-        let response = kv
-            .handle(&mut request, ReadDurableKvEndpoint)
+        let response = ::skyzen_core::middleware::apply(&kv, &mut request, ReadDurableKvEndpoint)
             .await
             .unwrap();
         let body = response.into_body().into_string().await.unwrap();

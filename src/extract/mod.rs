@@ -1,4 +1,4 @@
-pub use skyzen_core::Extractor;
+pub use skyzen_core::{Extractor, RequestBodyLimit, Requirement};
 
 #[cfg(feature = "query")]
 mod query;

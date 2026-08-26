@@ -1,10 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
+    convert::Infallible,
     fmt::{Debug, Formatter},
     sync::Arc,
 };
 
-use super::{BoxEndpoint, EndpointFactory, Params, Route, RouteNode, RouteNodeType};
+use super::{
+    join_path, BoxEndpoint, EndpointFactory, MethodFilter, Params, Route, RouteNode, RouteNodeType,
+};
 #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 use crate::openapi::RouteOpenApiEntry;
 use crate::{header, openapi::OpenApi, Body, Endpoint, Method, Request, Response, StatusCode};
@@ -12,27 +15,61 @@ use crate::{header, openapi::OpenApi, Body, Endpoint, Method, Request, Response,
 use http_kit::error::BoxHttpError;
 use http_kit::http_error;
 use matchit::Match;
-use skyzen_core::Extractor;
+use skyzen_core::{
+    error_response,
+    middleware::{boxed, BoxFuture, BoxMiddleware, Dispatch, Middleware, Next},
+    Error, Extractor, RequestBodyLimit, Requirement,
+};
 use tracing::debug;
 
-// The entrance of request,composing of endpoint
-pub struct App {
+/// One registered handler plus the middleware wrapping it.
+struct App {
     endpoint_factory: EndpointFactory,
+    middleware: Vec<BoxMiddleware>,
 }
 
 impl Debug for App {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("App").finish_non_exhaustive()
+        f.debug_struct("App")
+            .field("middleware", &self.middleware.len())
+            .finish_non_exhaustive()
     }
 }
 
 impl App {
-    fn new(endpoint_factory: EndpointFactory) -> Self {
-        Self { endpoint_factory }
+    /// Run this endpoint's middleware chain and then the endpoint.
+    async fn run(&self, request: &mut Request) -> Result<Response, Error> {
+        let terminal = FactoryDispatch(&self.endpoint_factory);
+        Next::new(&self.middleware, &terminal).run(request).await
     }
+}
 
-    fn endpoint(&self) -> BoxEndpoint {
-        (self.endpoint_factory)()
+/// The handlers registered for one path.
+#[derive(Debug, Default)]
+struct MethodTable {
+    entries: Vec<(Method, App)>,
+    /// Handler registered with `.any`, answering whatever the exact entries do not.
+    any: Option<App>,
+}
+
+/// Chain terminal that serves a request from a freshly built endpoint.
+struct FactoryDispatch<'a>(&'a EndpointFactory);
+
+impl Dispatch for FactoryDispatch<'_> {
+    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+        Box::pin(async move {
+            let mut endpoint = (self.0)();
+            endpoint.respond(request).await.map_err(Error::from)
+        })
+    }
+}
+
+/// Chain terminal that performs route matching once the router's layers have run.
+struct MatchDispatch<'r>(&'r Router);
+
+impl Dispatch for MatchDispatch<'_> {
+    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+        Box::pin(self.0.dispatch_matched(request))
     }
 }
 
@@ -54,7 +91,12 @@ impl App {
 /// ```
 #[derive(Clone)]
 pub struct Router {
-    inner: Arc<matchit::Router<Vec<(Method, App)>>>,
+    inner: Arc<matchit::Router<MethodTable>>,
+    /// Middleware wrapping the entire dispatch, outermost first.
+    layers: Arc<Vec<BoxMiddleware>>,
+    fallback: Option<EndpointFactory>,
+    method_not_allowed: Option<EndpointFactory>,
+    routes: Arc<Vec<(MethodFilter, String)>>,
     already_router_enabled: bool,
     /// Optional alarm handler for Durable Object alarm events.
     pub(crate) alarm_handler: Option<EndpointFactory>,
@@ -66,7 +108,10 @@ impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut debug_struct = f.debug_struct("Router");
         debug_struct
-            .field("inner", &self.inner)
+            .field("routes", &self.routes)
+            .field("layers", &self.layers.len())
+            .field("has_fallback", &self.fallback.is_some())
+            .field("has_method_not_allowed", &self.method_not_allowed.is_some())
             .field("already_router_enabled", &self.already_router_enabled)
             .field("has_alarm_handler", &self.alarm_handler.is_some());
         #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
@@ -77,7 +122,57 @@ impl Debug for Router {
     }
 }
 
-http_error!(pub NotFound, StatusCode::NOT_FOUND, "Route not found.");
+http_error!(
+    /// The error the built-in 404 response is rendered from.
+    pub NotFound,
+    StatusCode::NOT_FOUND,
+    "Route not found."
+);
+
+/// The methods registered for the path a `405` was produced for.
+///
+/// Available to a [`Route::method_not_allowed`](crate::routing::Route::method_not_allowed)
+/// handler, which the router runs with this value in the request extensions.
+#[derive(Debug, Clone, Default)]
+pub struct AllowedMethods(Vec<Method>);
+
+impl AllowedMethods {
+    /// The registered methods, in registration order, with `HEAD` synthesized alongside `GET`.
+    #[must_use]
+    pub fn methods(&self) -> &[Method] {
+        &self.0
+    }
+
+    /// Render the methods as an `Allow` header value.
+    #[must_use]
+    pub fn header_value(&self) -> Option<header::HeaderValue> {
+        let list = self
+            .0
+            .iter()
+            .map(Method::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        header::HeaderValue::from_str(&list).ok()
+    }
+}
+
+impl std::ops::Deref for AllowedMethods {
+    type Target = [Method];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Extractor for AllowedMethods {
+    type Error = Infallible;
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        Ok(request
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_default())
+    }
+}
 
 /// Outcome of matching a request against the routing tree.
 enum RouteLookup<'app> {
@@ -91,16 +186,17 @@ enum RouteLookup<'app> {
     /// The path matched but no registered method did.
     MethodNotAllowed(Vec<Method>),
     /// No route matched the path.
-    NotFound,
+    Unmatched,
 }
 
 impl Router {
     fn lookup(&self, path: &str, method: &Method) -> RouteLookup<'_> {
         let Ok(Match { value, params }) = self.inner.at(path) else {
-            return RouteLookup::NotFound;
+            return RouteLookup::Unmatched;
         };
 
         let found = value
+            .entries
             .iter()
             .find(|(app_method, ..)| app_method == method)
             .map(|(.., app)| (app, false))
@@ -109,16 +205,18 @@ impl Router {
                 // GET handler; the response body is discarded after it runs.
                 if *method == Method::HEAD {
                     value
+                        .entries
                         .iter()
                         .find(|(app_method, ..)| *app_method == Method::GET)
                         .map(|(.., app)| (app, true))
                 } else {
                     None
                 }
-            });
+            })
+            .or_else(|| value.any.as_ref().map(|app| (app, false)));
 
         found.map_or_else(
-            || RouteLookup::MethodNotAllowed(allowed_methods(value)),
+            || RouteLookup::MethodNotAllowed(allowed_methods(&value.entries)),
             |(app, head_fallback)| RouteLookup::Endpoint {
                 app,
                 head_fallback,
@@ -130,7 +228,43 @@ impl Router {
         )
     }
 
-    async fn call(&self, request: &mut Request) -> Result<Response, BoxHttpError> {
+    /// Match the request and run the endpoint it selects, or the fallback that stands in for it.
+    ///
+    /// Router layers have already run by the time this is reached, which is what lets a CORS or
+    /// tracing layer see the 404 and 405 responses produced here.
+    async fn dispatch_matched(&self, request: &mut Request) -> Result<Response, Error> {
+        let method = request.method().clone();
+        match self.lookup(request.uri().path(), &method) {
+            RouteLookup::Endpoint {
+                app,
+                head_fallback,
+                params,
+            } => {
+                request.extensions_mut().insert(Params::new(params));
+                let mut response = app.run(request).await?;
+                if head_fallback {
+                    *response.body_mut() = Body::empty();
+                }
+                Ok(response)
+            }
+            RouteLookup::MethodNotAllowed(allow) => {
+                let allow = AllowedMethods(allow);
+                match &self.method_not_allowed {
+                    Some(factory) => {
+                        request.extensions_mut().insert(allow);
+                        run_endpoint(factory, request).await
+                    }
+                    None => Ok(method_not_allowed_response(&allow)),
+                }
+            }
+            RouteLookup::Unmatched => match &self.fallback {
+                Some(factory) => run_endpoint(factory, request).await,
+                None => Ok(error_response(&NotFound::new())),
+            },
+        }
+    }
+
+    async fn call(&self, request: &mut Request) -> Result<Response, Error> {
         debug!(
             method = request.method().as_str(),
             path = request.uri().path(),
@@ -140,31 +274,20 @@ impl Router {
         if self.already_router_enabled {
             request.extensions_mut().insert(self.clone());
         }
-
-        let method = request.method().clone();
-        let lookup = self.lookup(request.uri().path(), &method);
-
-        match lookup {
-            RouteLookup::Endpoint {
-                app,
-                head_fallback,
-                params,
-            } => {
-                request.extensions_mut().insert(Params::new(params));
-
-                let mut endpoint = app.endpoint();
-                let mut response = endpoint.respond(request).await?;
-                if head_fallback {
-                    *response.body_mut() = Body::empty();
-                }
-                Ok(response)
-            }
-            RouteLookup::MethodNotAllowed(allow) => Ok(method_not_allowed_response(&allow)),
-            RouteLookup::NotFound => Err(Box::new(NotFound::new()) as BoxHttpError),
+        // Insert-if-absent: a router mounted as an endpoint inside another router must not clear
+        // the outer router's `BodyLimit`.
+        if request.extensions().get::<RequestBodyLimit>().is_none() {
+            request.extensions_mut().insert(RequestBodyLimit::default());
         }
+
+        let terminal = MatchDispatch(self);
+        Next::new(&self.layers, &terminal).run(request).await
     }
 
     /// Dispatch the provided [`Request`] through the router and return the produced [`Response`].
+    ///
+    /// Unmatched paths and unregistered methods produce an ordinary `Ok` response carrying the
+    /// 404 or 405 status, so a caller inspects `response.status()` rather than the error.
     ///
     /// # Errors
     ///
@@ -173,7 +296,27 @@ impl Router {
     /// Cloning a router is cheap, so prefer `router.clone().go(request)` when invoking it from
     /// tests or asynchronous workers.
     pub async fn go(&self, mut request: Request) -> Result<Response, BoxHttpError> {
-        self.call(&mut request).await
+        self.call(&mut request)
+            .await
+            .map_err(Error::into_boxed_http_error)
+    }
+
+    /// Wrap the whole router in `middleware`, including its 404 and 405 responses.
+    ///
+    /// Layers registered here run outside those registered with
+    /// [`Route::layer`](crate::routing::Route::layer). Prefer `Route::layer` where you can: only
+    /// layers known before the build take part in the wiring validation
+    /// [`Route::try_build`](crate::routing::Route::try_build) performs.
+    #[must_use]
+    pub fn layer<M: Middleware>(mut self, middleware: M) -> Self {
+        Arc::make_mut(&mut self.layers).insert(0, boxed(middleware));
+        self
+    }
+
+    /// Every `(method, path)` pair the router answers, for introspection and tests.
+    #[must_use]
+    pub fn routes(&self) -> &[(MethodFilter, String)] {
+        &self.routes
     }
 
     /// Enable extraction of the current router through [`Extractor`](skyzen_core::Extractor).
@@ -207,6 +350,12 @@ impl Router {
     }
 }
 
+/// Build and run a stored endpoint once.
+async fn run_endpoint(factory: &EndpointFactory, request: &mut Request) -> Result<Response, Error> {
+    let mut endpoint = factory();
+    endpoint.respond(request).await.map_err(Error::from)
+}
+
 /// Collect the methods registered for a path, advertising HEAD alongside GET.
 fn allowed_methods(entries: &[(Method, App)]) -> Vec<Method> {
     let mut methods: Vec<Method> = entries.iter().map(|(method, ..)| method.clone()).collect();
@@ -217,15 +366,10 @@ fn allowed_methods(entries: &[(Method, App)]) -> Vec<Method> {
 }
 
 /// Build a `405 Method Not Allowed` response advertising the allowed methods.
-fn method_not_allowed_response(allow: &[Method]) -> Response {
+fn method_not_allowed_response(allow: &AllowedMethods) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-    let list = allow
-        .iter()
-        .map(Method::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if let Ok(value) = header::HeaderValue::from_str(&list) {
+    if let Some(value) = allow.header_value() {
         response.headers_mut().insert(header::ALLOW, value);
     }
     response
@@ -296,6 +440,25 @@ pub enum RouteBuildError {
         /// Conflicting HTTP method.
         method: Method,
     },
+    /// More than one catch-all handler was registered for the same path.
+    RepeatedAny {
+        /// Path that already has a catch-all handler.
+        path: String,
+    },
+    /// The assembled path could never match a request.
+    InvalidPath {
+        /// The path as the route tree assembled it.
+        path: String,
+    },
+    /// An endpoint needs a value that no middleware on its ancestor chain provides.
+    MissingProvision {
+        /// Path of the endpoint whose wiring is incomplete.
+        path: String,
+        /// Which requests that endpoint answers.
+        method: MethodFilter,
+        /// The value that is missing.
+        requirement: Requirement,
+    },
     /// The underlying `matchit` router rejected the provided path pattern.
     MatchitError(matchit::InsertError),
 }
@@ -307,6 +470,26 @@ impl std::fmt::Display for RouteBuildError {
                 f,
                 "method `{method}` is registered multiple times for path `{path}`"
             ),
+            Self::RepeatedAny { path } => write!(
+                f,
+                "path `{path}` registers more than one catch-all (`any`) handler"
+            ),
+            Self::InvalidPath { path } => write!(
+                f,
+                "route path `{path}` cannot match any request: every mount prefix must start \
+                 with `/`"
+            ),
+            Self::MissingProvision {
+                path,
+                method,
+                requirement,
+            } => write!(
+                f,
+                "`{method} {path}` extracts `{}`, but nothing on its route provides it; add {} to \
+                 the route, or to the router with `.layer(..)`",
+                requirement.description(),
+                requirement.hint()
+            ),
             Self::MatchitError(error) => write!(f, "invalid route pattern: {error}"),
         }
     }
@@ -316,7 +499,7 @@ impl std::error::Error for RouteBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MatchitError(error) => Some(error),
-            Self::RepeatedMethod { .. } => None,
+            _ => None,
         }
     }
 }
@@ -327,107 +510,130 @@ impl From<matchit::InsertError> for RouteBuildError {
     }
 }
 
-type FlattenBuf = HashMap<String, Vec<(Method, App)>>;
+/// One endpoint, flattened out of the tree with its full path and ancestor middleware.
+struct FlatEndpoint {
+    method: MethodFilter,
+    factory: EndpointFactory,
+    middleware: Vec<BoxMiddleware>,
+    requirements: Vec<Requirement>,
+}
 
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+type FlattenBuf = HashMap<String, Vec<FlatEndpoint>>;
+
 fn flatten(
     path_prefix: &str,
-    route: Vec<RouteNode>,
+    nodes: Vec<RouteNode>,
     buf: &mut FlattenBuf,
-    openapi_entries: &mut Vec<RouteOpenApiEntry>,
-) {
-    for node in route {
-        let path = format!("{}{}", path_prefix, node.path);
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))] openapi_entries: &mut Vec<
+        RouteOpenApiEntry,
+    >,
+) -> Result<(), RouteBuildError> {
+    for node in nodes {
+        let path = join_path(path_prefix, &node.path);
 
         match node.node_type {
             RouteNodeType::Route(route) => {
-                flatten(&path, route.nodes, buf, openapi_entries);
+                flatten(
+                    &path,
+                    route.into_mounted_nodes(),
+                    buf,
+                    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+                    openapi_entries,
+                )?;
             }
             RouteNodeType::Endpoint {
                 endpoint_factory,
                 method,
                 openapi,
+                requirements,
+                middleware,
             } => {
-                let entry = buf.entry(path.clone()).or_default();
-
-                entry.push((method.clone(), App::new(endpoint_factory)));
-                if let Some(openapi) = openapi {
-                    openapi_entries.push(RouteOpenApiEntry::new(path, method, openapi));
+                if !path.starts_with('/') {
+                    return Err(RouteBuildError::InvalidPath { path });
                 }
+
+                #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+                if let (Some(openapi), MethodFilter::Exact(exact)) = (openapi, &method) {
+                    openapi_entries.push(RouteOpenApiEntry::new(
+                        path.clone(),
+                        exact.clone(),
+                        openapi,
+                    ));
+                }
+                #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
+                let _ = openapi;
+
+                buf.entry(path).or_default().push(FlatEndpoint {
+                    method,
+                    factory: endpoint_factory,
+                    middleware,
+                    requirements,
+                });
             }
         }
     }
-}
 
-#[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
-fn flatten(path_prefix: &str, route: Vec<RouteNode>, buf: &mut FlattenBuf) {
-    for node in route {
-        let path = format!("{}{}", path_prefix, node.path);
-
-        match node.node_type {
-            RouteNodeType::Route(route) => {
-                flatten(&path, route.nodes, buf);
-            }
-            RouteNodeType::Endpoint {
-                endpoint_factory,
-                method,
-                openapi: _,
-            } => {
-                let entry = buf.entry(path).or_default();
-                entry.push((method, App::new(endpoint_factory)));
-            }
-        }
-    }
+    Ok(())
 }
 
 /// Build a [`Router`] from the provided [`Route`].
 ///
 /// # Errors
 ///
-/// Returns [`RouteBuildError`] if the route tree contains conflicting method registrations or if
-/// the underlying path matcher rejects the route definition.
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+/// Returns [`RouteBuildError`] if the route tree contains conflicting method registrations, an
+/// unusable path, an endpoint whose extractors are not wired, or if the underlying path matcher
+/// rejects the route definition.
 pub fn build(route: Route) -> Result<Router, RouteBuildError> {
-    let mut buf = HashMap::new();
+    let Route {
+        nodes,
+        layers,
+        fallback,
+        method_not_allowed,
+    } = route;
+
+    let mut buf = FlattenBuf::new();
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
     let mut openapi_entries = Vec::new();
-    flatten("", route.nodes, &mut buf, &mut openapi_entries);
-    finalize_router(buf, openapi_entries)
-}
+    flatten(
+        "",
+        nodes,
+        &mut buf,
+        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        &mut openapi_entries,
+    )?;
 
-/// Build a [`Router`] from a [`Route`] tree.
-///
-/// # Errors
-///
-/// Returns [`RouteBuildError`] if the route tree contains conflicting method registrations or if
-/// the underlying path matcher rejects the route definition.
-#[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
-pub fn build(route: Route) -> Result<Router, RouteBuildError> {
-    let mut buf = HashMap::new();
-    flatten("", route.nodes, &mut buf);
-    finalize_router(buf)
-}
+    let global_provisions: HashSet<std::any::TypeId> = layers
+        .iter()
+        .flat_map(|layer| layer.provisions_dyn())
+        .collect();
 
-fn finalize_router(
-    buf: HashMap<String, Vec<(Method, App)>>,
-    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))] openapi_entries: Vec<
-        RouteOpenApiEntry,
-    >,
-) -> Result<Router, RouteBuildError> {
-    let mut router = matchit::Router::new();
-    for (path, value) in buf {
-        let mut set = HashSet::new();
-        for (method, ..) in &value {
-            if !set.insert(method) {
-                return Err(RouteBuildError::RepeatedMethod {
-                    path,
-                    method: method.clone(),
-                });
-            }
-        } //check route
-        router.insert(path, value)?;
+    for entry in fallback.iter().chain(method_not_allowed.iter()) {
+        check_requirements(
+            "<fallback>",
+            &MethodFilter::Any,
+            entry.requirements.iter(),
+            &global_provisions,
+        )?;
     }
+
+    let mut matcher = matchit::Router::new();
+    let mut routes = Vec::new();
+    for (path, endpoints) in buf {
+        let table = build_method_table(&path, endpoints, &global_provisions, &mut routes)?;
+        matcher.insert(path, table)?;
+    }
+    routes.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
+    });
+
     Ok(Router {
-        inner: Arc::new(router),
+        inner: Arc::new(matcher),
+        layers: Arc::new(layers),
+        fallback: fallback.map(|entry| entry.factory),
+        method_not_allowed: method_not_allowed.map(|entry| entry.factory),
+        routes: Arc::new(routes),
         already_router_enabled: false,
         alarm_handler: None,
         #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
@@ -435,26 +641,103 @@ fn finalize_router(
     })
 }
 
+/// Assemble one path's handlers, rejecting duplicate registrations and unwired extractors.
+fn build_method_table(
+    path: &str,
+    endpoints: Vec<FlatEndpoint>,
+    global_provisions: &HashSet<std::any::TypeId>,
+    routes: &mut Vec<(MethodFilter, String)>,
+) -> Result<MethodTable, RouteBuildError> {
+    let mut table = MethodTable::default();
+    let mut seen = HashSet::new();
+
+    for endpoint in endpoints {
+        let mut provisions = global_provisions.clone();
+        provisions.extend(
+            endpoint
+                .middleware
+                .iter()
+                .flat_map(|middleware| middleware.provisions_dyn()),
+        );
+        check_requirements(
+            path,
+            &endpoint.method,
+            endpoint.requirements.iter(),
+            &provisions,
+        )?;
+
+        let app = App {
+            endpoint_factory: endpoint.factory,
+            middleware: endpoint.middleware,
+        };
+
+        routes.push((endpoint.method.clone(), path.to_owned()));
+        match endpoint.method {
+            MethodFilter::Exact(method) => {
+                if !seen.insert(method.clone()) {
+                    return Err(RouteBuildError::RepeatedMethod {
+                        path: path.to_owned(),
+                        method,
+                    });
+                }
+                table.entries.push((method, app));
+            }
+            MethodFilter::Any => {
+                if table.any.replace(app).is_some() {
+                    return Err(RouteBuildError::RepeatedAny {
+                        path: path.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(table)
+}
+
+fn check_requirements<'a>(
+    path: &str,
+    method: &MethodFilter,
+    requirements: impl Iterator<Item = &'a Requirement>,
+    provisions: &HashSet<std::any::TypeId>,
+) -> Result<(), RouteBuildError> {
+    for requirement in requirements {
+        if !provisions.contains(&requirement.type_id()) {
+            return Err(RouteBuildError::MissingProvision {
+                path: path.to_owned(),
+                method: method.clone(),
+                requirement: *requirement,
+            });
+        }
+    }
+    Ok(())
+}
+
 impl Endpoint for Router {
     type Error = BoxHttpError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         // Propagate errors to let middleware or runtime handle them
-        self.call(request).await
+        self.call(request)
+            .await
+            .map_err(Error::into_boxed_http_error)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build, RouteBuildError};
+    use super::{build, MethodFilter, RouteBuildError};
     use crate::{
         header,
-        middleware::ErrorHandlingMiddleware,
-        middleware::Middleware,
-        routing::{CreateRouteNode, Params, Route},
+        middleware::{from_fn, ErrorHandlingMiddleware, Middleware, Next},
+        routing::{AllowedMethods, CreateRouteNode, Params, Route},
         utils::{Form, Json},
-        Body, Error, Method, Response, Result, StatusCode, ToSchema,
+        Body, Error, Method, Request, Response, Result, StatusCode, ToSchema,
     };
     use serde::{Deserialize, Serialize};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn get_request(path: &str) -> http_kit::Request {
         request_with_method(path, Method::GET)
@@ -644,23 +927,65 @@ mod tests {
         assert_eq!(body, "pong");
     }
 
-    #[derive(Clone, Default)]
+    #[tokio::test]
+    async fn collapses_duplicate_separators_between_mount_and_child() {
+        let router = build(Route::new((
+            "/api/".route(("/v1".at(|| async { Result::Ok("pong") }),)),
+        )))
+        .unwrap();
+
+        assert_eq!(
+            router.routes(),
+            [(MethodFilter::Exact(Method::GET), "/api/v1".to_owned())]
+        );
+        let response = router.clone().go(get_request("/api/v1")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn rejects_a_mount_prefix_without_a_leading_slash() {
+        let error = build(Route::new((
+            "api".route(("/v1".at(|| async { Result::Ok("pong") }),)),
+        )))
+        .unwrap_err();
+
+        let RouteBuildError::InvalidPath { path } = &error else {
+            panic!("expected an invalid-path error, got {error:?}");
+        };
+        assert_eq!(path, "api/v1");
+        assert!(error.to_string().contains("api/v1"));
+    }
+
+    #[test]
+    fn routes_lists_every_registration() {
+        let router = build(Route::new((
+            "/items"
+                .at(|| async { Result::Ok("list") })
+                .post(|| async { Result::Ok("new") }),
+            "/health".any(|| async { Result::Ok("ok") }),
+        )))
+        .unwrap();
+
+        assert_eq!(
+            router.routes(),
+            [
+                (MethodFilter::Any, "/health".to_owned()),
+                (MethodFilter::Exact(Method::GET), "/items".to_owned()),
+                (MethodFilter::Exact(Method::POST), "/items".to_owned()),
+            ]
+        );
+    }
+
+    #[derive(Debug, Default)]
     struct HeaderMiddleware;
 
     impl Middleware for HeaderMiddleware {
-        type Error = std::convert::Infallible;
-        async fn handle<N: crate::Endpoint>(
-            &mut self,
-            request: &mut crate::Request,
-            mut next: N,
-        ) -> std::result::Result<
-            Response,
-            http_kit::middleware::MiddlewareError<N::Error, Self::Error>,
-        > {
-            let mut response = next
-                .respond(request)
-                .await
-                .map_err(http_kit::middleware::MiddlewareError::Endpoint)?;
+        async fn handle(
+            &self,
+            request: &mut Request,
+            next: Next<'_>,
+        ) -> std::result::Result<Response, Error> {
+            let mut response = next.run(request).await?;
             response.headers_mut().insert(
                 header::HeaderName::from_static("x-middleware"),
                 header::HeaderValue::from_static("applied"),
@@ -690,6 +1015,84 @@ mod tests {
         .unwrap();
         let response = aliased.clone().go(get_request("/ping")).await.unwrap();
         assert!(response.headers().get("x-middleware").is_some());
+    }
+
+    #[tokio::test]
+    async fn node_middleware_covers_only_its_own_node() {
+        let router = build(Route::new((
+            "/marked"
+                .at(|| async { Result::Ok("yes") })
+                .with(HeaderMiddleware),
+            "/plain".at(|| async { Result::Ok("no") }),
+        )))
+        .unwrap();
+
+        let marked = router.clone().go(get_request("/marked")).await.unwrap();
+        assert!(marked.headers().contains_key("x-middleware"));
+
+        let plain = router.clone().go(get_request("/plain")).await.unwrap();
+        assert!(!plain.headers().contains_key("x-middleware"));
+    }
+
+    #[tokio::test]
+    async fn middleware_state_is_shared_across_requests() {
+        /// A middleware that counts, written the obvious way. Before middleware became
+        /// `&self`-shared, each request saw its own clone and this stayed at 1 forever.
+        #[derive(Debug, Default)]
+        struct CountRequests {
+            seen: AtomicUsize,
+        }
+
+        impl Middleware for CountRequests {
+            async fn handle(
+                &self,
+                request: &mut Request,
+                next: Next<'_>,
+            ) -> std::result::Result<Response, Error> {
+                let seen = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response = next.run(request).await?;
+                response.headers_mut().insert(
+                    header::HeaderName::from_static("x-seen"),
+                    header::HeaderValue::from_str(&seen.to_string()).unwrap(),
+                );
+                Ok(response)
+            }
+        }
+
+        let router = build(
+            Route::new(("/ping".at(|| async { Result::Ok("pong") }),))
+                .with(CountRequests::default()),
+        )
+        .unwrap();
+
+        for expected in ["1", "2", "3"] {
+            let response = router.clone().go(get_request("/ping")).await.unwrap();
+            assert_eq!(response.headers().get("x-seen").unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn closure_middleware_shares_its_captured_state() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        let router = build(
+            Route::new(("/ping".at(|| async { Result::Ok("pong") }),)).layer(from_fn(
+                move |request, next| {
+                    let counter = Arc::clone(&counter);
+                    Box::pin(async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        next.run(request).await
+                    })
+                },
+            )),
+        )
+        .unwrap();
+
+        router.clone().go(get_request("/ping")).await.unwrap();
+        router.clone().go(get_request("/missing")).await.unwrap();
+
+        // The layer also saw the request that matched no route.
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -738,6 +1141,16 @@ mod tests {
             RouteBuildError::RepeatedMethod { path, method }
             if path == "/dup" && method == Method::GET
         ));
+    }
+
+    #[test]
+    fn prevents_duplicate_catch_all_handlers() {
+        let error = build(Route::new((
+            "/dup".any(|| async { Result::Ok("first") }),
+            "/dup".any(|| async { Result::Ok("second") }),
+        )))
+        .unwrap_err();
+        assert!(matches!(error, RouteBuildError::RepeatedAny { path } if path == "/dup"));
     }
 
     #[tokio::test]
@@ -792,6 +1205,7 @@ mod tests {
             "/items".head(|| async { Result::Ok("") }),
             "/items".options(|| async { Result::Ok("options") }),
             "/items".trace(|| async { Result::Ok("trace") }),
+            "/items".on(Method::CONNECT, || async { Result::Ok("connect") }),
         )))
         .unwrap();
 
@@ -800,9 +1214,31 @@ mod tests {
             (Method::HEAD, ""),
             (Method::OPTIONS, "options"),
             (Method::TRACE, "trace"),
+            (Method::CONNECT, "connect"),
         ] {
             let request = request_with_method("/items", method);
             let response = router.clone().go(request).await.unwrap();
+            let body = response.into_body().into_string().await.unwrap();
+            assert_eq!(body, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn any_answers_every_method_but_yields_to_exact_registrations() {
+        let router = build(Route::new((
+            "/thing".any(|| async { Result::Ok("any") }),
+            "/thing".post(|| async { Result::Ok("post") }),
+        )))
+        .unwrap();
+
+        for (method, expected) in [
+            (Method::GET, "any"),
+            (Method::DELETE, "any"),
+            (Method::POST, "post"),
+        ] {
+            let request = request_with_method("/thing", method);
+            let response = router.clone().go(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
             let body = response.into_body().into_string().await.unwrap();
             assert_eq!(body, expected);
         }
@@ -831,6 +1267,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_routes_require_upgrades() {
         use crate::header::{self, HeaderValue};
+        use http_kit::HttpError;
 
         let route = Route::new(("/ws".ws(|_socket| async move {}),));
         let router = build(route).unwrap();
@@ -856,10 +1293,78 @@ mod tests {
     #[tokio::test]
     async fn returns_not_found_for_missing_routes() {
         let router = build(Route::new(())).unwrap();
-        let request = get_request("/unknown");
-        let response = router.clone().go(request).await;
-        let error = response.unwrap_err();
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        let response = router.clone().go(get_request("/unknown")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, r#"{"error":"Route not found."}"#);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_handler_replaces_the_built_in_404() {
+        let router = build(
+            Route::new(("/known".at(|| async { Result::Ok("here") }),)).fallback(
+                |uri: crate::Uri| async move { Result::Ok(format!("no such page: {}", uri.path())) },
+            ),
+        )
+        .unwrap();
+
+        let response = router.clone().go(get_request("/nowhere")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "no such page: /nowhere");
+    }
+
+    #[tokio::test]
+    async fn a_method_not_allowed_handler_can_read_the_registered_methods() {
+        async fn rejected(allowed: AllowedMethods) -> Result<String> {
+            Ok(allowed
+                .methods()
+                .iter()
+                .map(Method::as_str)
+                .collect::<Vec<_>>()
+                .join("|"))
+        }
+
+        let router = build(
+            Route::new(("/items".at(|| async { Result::Ok("list") }),))
+                .method_not_allowed(rejected),
+        )
+        .unwrap();
+
+        let response = router
+            .clone()
+            .go(request_with_method("/items", Method::DELETE))
+            .await
+            .unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "GET|HEAD");
+    }
+
+    #[tokio::test]
+    async fn a_router_layer_wraps_the_not_found_path() {
+        let router = build(
+            Route::new(("/known".at(|| async { Result::Ok("here") }),)).layer(HeaderMiddleware),
+        )
+        .unwrap();
+
+        let response = router.clone().go(get_request("/nowhere")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().contains_key("x-middleware"));
+    }
+
+    #[tokio::test]
+    async fn a_post_build_router_layer_also_wraps_everything() {
+        let router = build(Route::new(("/known".at(|| async { Result::Ok("here") }),)))
+            .unwrap()
+            .layer(HeaderMiddleware);
+
+        let response = router
+            .clone()
+            .go(request_with_method("/known", Method::DELETE))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(response.headers().contains_key("x-middleware"));
     }
 
     #[derive(Debug, Deserialize, ToSchema)]

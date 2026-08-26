@@ -2023,20 +2023,17 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
             }
 
             impl ::skyzen::middleware::Middleware for #ident {
-                type Error = ::std::convert::Infallible;
-
-                async fn handle<N: ::skyzen::Endpoint>(
-                    &mut self,
+                async fn handle(
+                    &self,
                     request: &mut ::skyzen::Request,
-                    mut next: N,
-                ) -> ::std::result::Result<
-                    ::skyzen::Response,
-                    ::skyzen::http_kit::middleware::MiddlewareError<N::Error, Self::Error>,
-                > {
+                    next: ::skyzen::middleware::Next<'_>,
+                ) -> ::std::result::Result<::skyzen::Response, ::skyzen::Error> {
                     request.extensions_mut().insert(self.clone());
-                    next.respond(request)
-                        .await
-                        .map_err(::skyzen::http_kit::middleware::MiddlewareError::Endpoint)
+                    next.run(request).await
+                }
+
+                fn provisions(&self) -> ::std::vec::Vec<::std::any::TypeId> {
+                    ::std::vec![::std::any::TypeId::of::<Self>()]
                 }
             }
 
@@ -2125,20 +2122,17 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
             }
 
             impl ::skyzen::middleware::Middleware for #ident {
-                type Error = ::std::convert::Infallible;
-
-                async fn handle<N: ::skyzen::Endpoint>(
-                    &mut self,
+                async fn handle(
+                    &self,
                     request: &mut ::skyzen::Request,
-                    mut next: N,
-                ) -> ::std::result::Result<
-                    ::skyzen::Response,
-                    ::skyzen::http_kit::middleware::MiddlewareError<N::Error, Self::Error>,
-                > {
+                    next: ::skyzen::middleware::Next<'_>,
+                ) -> ::std::result::Result<::skyzen::Response, ::skyzen::Error> {
                     request.extensions_mut().insert(self.clone());
-                    next.respond(request)
-                        .await
-                        .map_err(::skyzen::http_kit::middleware::MiddlewareError::Endpoint)
+                    next.run(request).await
+                }
+
+                fn provisions(&self) -> ::std::vec::Vec<::std::any::TypeId> {
+                    ::std::vec![::std::any::TypeId::of::<Self>()]
                 }
             }
         });

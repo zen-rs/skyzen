@@ -170,7 +170,7 @@ fn main() -> Router {
         "/articles"
             .at(list_articles)
             .post(create_article)
-            .route(("/articles/{id}".at(get_article),)),
+            .route(("/{id}".at(get_article),)),
         "/legacy/ping".at(legacy_ping),
     ));
 

@@ -160,7 +160,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct ReadAlarmEndpoint;
 
     impl Endpoint for ReadAlarmEndpoint {
@@ -200,7 +200,9 @@ mod tests {
         let mut alarm = Alarm::new(scheduler);
         let mut request = http_kit::Request::new(Body::empty());
 
-        let response = alarm.handle(&mut request, ReadAlarmEndpoint).await.unwrap();
+        let response = ::skyzen_core::middleware::apply(&alarm, &mut request, ReadAlarmEndpoint)
+            .await
+            .unwrap();
         let body = response.into_body().into_string().await.unwrap();
         assert_eq!(body, "1337");
 
