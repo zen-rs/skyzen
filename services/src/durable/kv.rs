@@ -313,7 +313,7 @@ mod tests {
     use super::{
         DurableKv, DurableKvError, DurableKvNotConfigured, DurableKvStore, DurableListOptions,
     };
-    use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
+    use http_kit::{Body, Endpoint, HttpError, Response};
     use serde::{Deserialize, Serialize};
     use skyzen_core::Extractor;
     use std::{
@@ -537,7 +537,7 @@ mod tests {
     async fn middleware_injects_durable_kv_for_downstream_endpoint_and_extractor() {
         let store = InMemoryDurableKvStore::default();
         store.put("message", b"hello").await.unwrap();
-        let mut kv = DurableKv::new(store);
+        let kv = DurableKv::new(store);
         let mut request = http_kit::Request::new(Body::empty());
 
         let response = ::skyzen_core::middleware::apply(&kv, &mut request, ReadDurableKvEndpoint)

@@ -379,9 +379,12 @@ pub fn launch<Fut, E, Hook, HookFut>(
 /// Each connection task holds a clone of the channel's sender, so `recv` resolves — with a
 /// closed-channel error, since nothing is ever sent — exactly when the last one is dropped. The
 /// senders still alive at the deadline are the connections being cut off.
-async fn drain_connections(connections: &Receiver<Infallible>) -> usize {
+async fn drain_connections(
+    connections: &Receiver<Infallible>,
+    grace_period: std::time::Duration,
+) -> usize {
     let drained = std::pin::pin!(connections.recv());
-    let deadline = std::pin::pin!(async_io::Timer::after(SHUTDOWN_GRACE_PERIOD));
+    let deadline = std::pin::pin!(async_io::Timer::after(grace_period));
 
     match futures_util::future::select(drained, deadline).await {
         futures_util::future::Either::Left(..) => 0,
@@ -489,7 +492,7 @@ where
 
     // Release the accept loop's own handle so only live connections keep the channel open.
     drop(connection_guard);
-    let severed = drain_connections(&connections).await;
+    let severed = drain_connections(&connections, SHUTDOWN_GRACE_PERIOD).await;
     Ok(Shutdown { severed })
 }
 
@@ -638,7 +641,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_cli_overrides, server_addr, sniff_protocol, Prefixed};
+    use super::{apply_cli_overrides, drain_connections, server_addr, sniff_protocol, Prefixed};
     use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use serial_test::serial;
     use std::{
@@ -838,6 +841,26 @@ mod tests {
         assert_eq!(
             apply_cli_overrides(["skyzen".to_owned(), "--port=8080".to_owned()]),
             Some("127.0.0.1:8080".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_returns_once_every_connection_guard_is_dropped() {
+        let (guard, connections) = async_channel::bounded::<std::convert::Infallible>(1);
+        let held = guard.clone();
+        drop(guard);
+
+        // One connection still running: the deadline wins and reports it as severed.
+        assert_eq!(
+            drain_connections(&connections, std::time::Duration::from_millis(10)).await,
+            1
+        );
+
+        // Once it finishes, draining completes with nothing severed.
+        drop(held);
+        assert_eq!(
+            drain_connections(&connections, std::time::Duration::from_secs(30)).await,
+            0
         );
     }
 

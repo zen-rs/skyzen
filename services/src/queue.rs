@@ -320,7 +320,7 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::{MessageQueue, Queue, QueueBatch, QueueError, QueueMessage};
-    use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
+    use http_kit::{Body, Endpoint, HttpError, Response};
     use serde::{Deserialize, Serialize};
     use skyzen_core::Extractor;
     use std::{
@@ -476,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn middleware_injects_queue_for_downstream_endpoint_and_extractor() {
         let backend = InMemoryMessageQueue::default();
-        let mut queue = Queue::new(backend.clone());
+        let queue = Queue::new(backend.clone());
         let mut request = http_kit::Request::new(Body::empty());
 
         let response = ::skyzen_core::middleware::apply(&queue, &mut request, QueueSendEndpoint)

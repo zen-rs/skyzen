@@ -193,9 +193,16 @@ impl Middleware for Cors {
     async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
         let origin = request.headers().get(header::ORIGIN).cloned();
         let Some(allow_origin) = self.allow_origin_for(origin.as_ref()) else {
-            // Not an accepted origin (or not a cross-origin request at all): pass through
-            // untouched so a same-origin caller sees the normal response.
-            return next.run(request).await;
+            // Not an accepted origin (or not a cross-origin request at all): pass the response
+            // through undecorated, but still declare that it varies by `Origin` — otherwise a
+            // shared cache could hand this undecorated response to an origin that *is* allowed.
+            let mut response = next.run(request).await?;
+            if self.varies_by_origin() {
+                response
+                    .headers_mut()
+                    .append(header::VARY, HeaderValue::from_static("origin"));
+            }
+            return Ok(response);
         };
 
         if is_preflight(request) {
@@ -239,10 +246,11 @@ impl CorsBuilder {
             match HeaderValue::from_str(origin) {
                 Ok(value) => values.push(value),
                 Err(_) => {
-                    self.invalid.get_or_insert(CorsConfigError::InvalidValue {
-                        field: "allow_origin",
-                        value: origin.to_owned(),
-                    });
+                    self.invalid
+                        .get_or_insert_with(|| CorsConfigError::InvalidValue {
+                            field: "allow_origin",
+                            value: origin.to_owned(),
+                        });
                 }
             }
         }
@@ -391,7 +399,7 @@ mod tests {
 
     const APP: &str = "https://app.lexo.cool";
 
-    fn preflight(path: &str, requested: Method) -> Request {
+    fn preflight(path: &str, requested: &Method) -> Request {
         let mut request = Request::new(Body::empty());
         *request.method_mut() = Method::OPTIONS;
         *request.uri_mut() = path.parse().expect("valid path");
@@ -422,7 +430,7 @@ mod tests {
             .build();
 
         let response = router
-            .go(preflight("/items", Method::DELETE))
+            .go(preflight("/items", &Method::DELETE))
             .await
             .unwrap();
 
@@ -456,7 +464,10 @@ mod tests {
             .layer(cors())
             .build();
 
-        let response = router.go(preflight("/missing", Method::GET)).await.unwrap();
+        let response = router
+            .go(preflight("/missing", &Method::GET))
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(response
@@ -508,6 +519,8 @@ mod tests {
         assert!(!response
             .headers()
             .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        // A shared cache must not serve this undecorated response to an allowed origin.
+        assert_eq!(response.headers().get(header::VARY).unwrap(), "origin");
     }
 
     #[test]
