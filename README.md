@@ -132,13 +132,16 @@ fn router() -> Router {
 - `{name}` matches a single path segment.
 - `{*path}` matches the remainder of the path (wildcard).
 
+`Path<T>` deserializes the captured segments into a tuple, a struct, or a single primitive, so a
+malformed segment is a `400` naming it rather than a `.parse()` in every handler. `Params` remains
+the escape hatch for names only known at runtime.
+
 ```rust
+use skyzen::extract::Path;
 use skyzen::routing::{CreateRouteNode, Params, Route};
 use skyzen::Result;
 
-async fn get_user_post(params: Params) -> Result<String> {
-    let user_id = params.get("user_id")?;
-    let post_id = params.get("post_id")?;
+async fn get_user_post(Path((user_id, post_id)): Path<(String, u64)>) -> Result<String> {
     Ok(format!("User {user_id}, Post {post_id}"))
 }
 
@@ -177,20 +180,18 @@ A handler is an `async fn` whose arguments implement `Extractor` and whose retur
 
 ```rust
 use skyzen::{
-    extract::{BearerToken, ClientIp, Query},
-    routing::Params,
+    extract::{BearerToken, ClientIp, Path, Query},
     utils::{Json, State},
     Result, StatusCode,
 };
 
 async fn update_profile(
-    params: Params,
+    Path(user_id): Path<u64>,
     token: BearerToken,
     ip: ClientIp,
     State(db): State<DatabasePool>,
     Json(payload): Json<ProfileUpdate>,
 ) -> Result<(StatusCode, Json<UserProfile>)> {
-    let user_id = params.get("id")?;
     let profile = db.update_user(user_id, payload).await?;
     Ok((StatusCode::OK, Json(profile)))
 }
@@ -203,7 +204,8 @@ async fn update_profile(
 | `Json<T>` | `skyzen::utils::Json` | Deserializes a JSON request body (`T: DeserializeOwned`) |
 | `Query<T>` | `skyzen::extract::Query` | Deserializes URL query parameters |
 | `Form<T>` | `skyzen::utils::Form` | Deserializes `application/x-www-form-urlencoded` form bodies |
-| `Params` | `skyzen::routing::Params` | Accesses path parameters (`params.get("id")?`) |
+| `Path<T>` | `skyzen::extract::Path` | Deserializes the route's captured `{name}` segments into a struct, tuple, or primitive |
+| `Params` | `skyzen::routing::Params` | Accesses path parameters by name at runtime (`params.get("id")?`) |
 | `Multipart` | `skyzen::utils::Multipart` | Streams multipart form data and file uploads |
 | `State<T>` | `skyzen::utils::State` | Extracts shared state attached to the route via `.with(State(...))` |
 | `BearerToken` | `skyzen::extract::BearerToken` | Extracts the bearer token from the `Authorization` header |
@@ -211,6 +213,7 @@ async fn update_profile(
 | `Kv`, `Storage`, `Queue`, `Db` | `skyzen_services::*` | Portable cloud services injected into the request context |
 | `Body`, `Bytes`, `ByteStr` | `skyzen::http_kit::*` | Raw request body representations |
 | `HeaderMap`, `Uri`, `Method` | `skyzen::http_kit::*` | HTTP request metadata |
+| `TypedHeader<H>` | `skyzen::extract::TypedHeader` | One RFC-typed header via the `headers` crate (requires the `typed-header` feature) |
 
 ### Built-in Responders
 
@@ -222,7 +225,8 @@ async fn update_profile(
 | `(StatusCode, T)` | Pairs an explicit HTTP status code with any responder `T` |
 | `(HeaderMap, T)` | Sets custom response headers alongside a responder `T` |
 | `Result<T, E>` | Returns `T` on `Ok`, or maps `E: HttpError` to an HTTP error response |
-| `Redirect` | Returns an HTTP 301, 302, 303, 307, or 308 redirect response |
+| `Redirect` | `skyzen::utils::Redirect` — 302 (`to`), 303 (`see_other`), 307 (`temporary`), 308 (`permanent`), or any status via `with_status` |
+| `Html<T>` | Sends its payload as `text/html; charset=utf-8` |
 | `Sse` | Streams Server-Sent Events |
 
 ---
@@ -573,8 +577,7 @@ struct Item {
 
 /// Retrieve an item by unique identifier.
 #[skyzen::openapi]
-async fn get_item(params: skyzen::routing::Params) -> Result<Json<Item>> {
-    let id: u64 = params.get("id")?.parse().unwrap_or(0);
+async fn get_item(skyzen::extract::Path(id): skyzen::extract::Path<u64>) -> Result<Json<Item>> {
     Ok(Json(Item {
         id,
         title: format!("Item #{id}"),
