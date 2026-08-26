@@ -7,8 +7,6 @@ use core::future::Future;
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::maybe_send::{BoxFuture, MaybeSend};
-
 // ── Error type ──
 
 /// Errors that can occur during key-value store operations.
@@ -72,11 +70,10 @@ service_http_error!(KvError {
 /// User code interacts through the [`Kv`] wrapper, never this trait directly.
 pub trait KeyValueStore: Send + Sync + Clone + 'static {
     /// Retrieve a value by key.
-    fn get(&self, key: &str) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + MaybeSend;
+    fn get(&self, key: &str) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + Send;
 
     /// Store a value under a key.
-    fn put(&self, key: &str, value: &[u8])
-        -> impl Future<Output = Result<(), KvError>> + MaybeSend;
+    fn put(&self, key: &str, value: &[u8]) -> impl Future<Output = Result<(), KvError>> + Send;
 
     /// Store a value under a key with a time-to-live.
     ///
@@ -88,7 +85,7 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
         key: &str,
         value: &[u8],
         ttl: core::time::Duration,
-    ) -> impl Future<Output = Result<(), KvError>> + MaybeSend {
+    ) -> impl Future<Output = Result<(), KvError>> + Send {
         let _ = (key, value, ttl);
         async {
             Err(KvError::Unsupported(
@@ -98,7 +95,7 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
     }
 
     /// Remove a value by key.
-    fn delete(&self, key: &str) -> impl Future<Output = Result<(), KvError>> + MaybeSend;
+    fn delete(&self, key: &str) -> impl Future<Output = Result<(), KvError>> + Send;
 
     /// List keys matching an optional prefix.
     ///
@@ -108,56 +105,23 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
     fn list(
         &self,
         prefix: Option<&str>,
-    ) -> impl Future<Output = Result<Vec<String>, KvError>> + MaybeSend;
+    ) -> impl Future<Output = Result<Vec<String>, KvError>> + Send;
 }
 
-// ── Layer 2: Private object-safe trait (BoxFuture + clone_box) ──
+// ── Layer 2: Generated object-safe trait (BoxFuture + clone_box) ──
 
-trait KeyValueStoreObj: Send + Sync {
-    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, KvError>>;
-    fn put<'a>(&'a self, key: &'a str, value: &'a [u8]) -> BoxFuture<'a, Result<(), KvError>>;
-    fn put_with_ttl<'a>(
+service_obj! {
+    KeyValueStoreObj: KeyValueStore;
+    async fn get<'a>(&'a self, key: &'a str) -> Result<Option<Vec<u8>>, KvError>;
+    async fn put<'a>(&'a self, key: &'a str, value: &'a [u8]) -> Result<(), KvError>;
+    async fn put_with_ttl<'a>(
         &'a self,
         key: &'a str,
         value: &'a [u8],
         ttl: core::time::Duration,
-    ) -> BoxFuture<'a, Result<(), KvError>>;
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), KvError>>;
-    fn list<'a>(&'a self, prefix: Option<&'a str>) -> BoxFuture<'a, Result<Vec<String>, KvError>>;
-    fn clone_box(&self) -> Box<dyn KeyValueStoreObj>;
-}
-
-// ── Bridge: any Clone + KeyValueStore auto-implements KeyValueStoreObj ──
-
-impl<T: KeyValueStore> KeyValueStoreObj for T {
-    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, KvError>> {
-        Box::pin(KeyValueStore::get(self, key))
-    }
-
-    fn put<'a>(&'a self, key: &'a str, value: &'a [u8]) -> BoxFuture<'a, Result<(), KvError>> {
-        Box::pin(KeyValueStore::put(self, key, value))
-    }
-
-    fn put_with_ttl<'a>(
-        &'a self,
-        key: &'a str,
-        value: &'a [u8],
-        ttl: core::time::Duration,
-    ) -> BoxFuture<'a, Result<(), KvError>> {
-        Box::pin(KeyValueStore::put_with_ttl(self, key, value, ttl))
-    }
-
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), KvError>> {
-        Box::pin(KeyValueStore::delete(self, key))
-    }
-
-    fn list<'a>(&'a self, prefix: Option<&'a str>) -> BoxFuture<'a, Result<Vec<String>, KvError>> {
-        Box::pin(KeyValueStore::list(self, prefix))
-    }
-
-    fn clone_box(&self) -> Box<dyn KeyValueStoreObj> {
-        Box::new(self.clone())
-    }
+    ) -> Result<(), KvError>;
+    async fn delete<'a>(&'a self, key: &'a str) -> Result<(), KvError>;
+    async fn list<'a>(&'a self, prefix: Option<&'a str>) -> Result<Vec<String>, KvError>;
 }
 
 // ── User-facing wrapper ──

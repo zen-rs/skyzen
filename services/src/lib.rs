@@ -1,5 +1,3 @@
-#![cfg_attr(target_arch = "wasm32", allow(clippy::future_not_send))]
-
 //! Portable service abstractions for the Skyzen framework.
 //!
 //! This crate defines platform-agnostic traits and extractors for common
@@ -39,10 +37,18 @@ mod macros;
 /// been rendered for the client.
 pub type BoxError = Box<dyn core::error::Error + Send + Sync + 'static>;
 
+/// Boxed future returned by the object-safe mirror of each service trait.
+///
+/// Service futures are always `Send`, on every target: the wrappers travel in
+/// [`http::Extensions`], which requires `Send + Sync` unconditionally. Single-threaded WebAssembly
+/// backends satisfy that by wrapping their JS handles in newtypes with a contained `unsafe impl
+/// Send` — sound because a Workers isolate never moves them across threads — not by relaxing the
+/// bound here.
+pub(crate) type BoxFuture<'a, T> = futures_core::future::BoxFuture<'a, T>;
+
 pub mod durable;
 pub mod events;
 pub mod kv;
-mod maybe_send;
 pub mod queue;
 pub mod sql;
 pub mod storage;

@@ -35,7 +35,7 @@ use sqlparser::{
     tokenizer::{Location, Token, TokenWithSpan, Tokenizer},
 };
 
-use crate::maybe_send::{BoxFuture, MaybeSend};
+use crate::BoxFuture;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
@@ -264,21 +264,21 @@ pub trait DbBackend: Send + Sync + Clone + 'static {
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DbError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + Send;
 
     /// Execute a statement that does not return rows.
     fn execute(
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DbError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + Send;
 
     /// Begin a database transaction.
     ///
     /// # Errors
     ///
     /// Returns an error if the backend cannot create a transaction.
-    fn begin(&self) -> impl Future<Output = Result<DbTransaction, DbError>> + MaybeSend {
+    fn begin(&self) -> impl Future<Output = Result<DbTransaction, DbError>> + Send {
         async { Err(DbError::TransactionsUnsupported) }
     }
 }
@@ -293,46 +293,51 @@ pub trait DbTransactionBackend: Send + 'static {
         &mut self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DbError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + Send;
 
     /// Execute a statement that does not return rows inside this transaction.
     fn execute(
         &mut self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DbError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + Send;
 
     /// Commit this transaction.
     ///
     /// # Errors
     ///
     /// Returns an error if the backend cannot commit the transaction.
-    fn commit(self) -> impl Future<Output = Result<(), DbError>> + MaybeSend
+    fn commit(self) -> impl Future<Output = Result<(), DbError>> + Send
     where
         Self: Sized;
 
     /// Roll back this transaction.
-    fn rollback(self) -> impl Future<Output = Result<(), DbError>> + MaybeSend
+    fn rollback(self) -> impl Future<Output = Result<(), DbError>> + Send
     where
         Self: Sized;
 }
 
-trait DbBackendObj: Send + Sync {
+service_obj! {
+    DbBackendObj: DbBackend;
     fn dialect(&self) -> DbDialect;
-    fn query<'a>(
+    async fn query<'a>(
         &'a self,
         query: &'a str,
         params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DbError>>;
-    fn execute<'a>(
+    ) -> Result<DbExecResult, DbError>;
+    async fn execute<'a>(
         &'a self,
         query: &'a str,
         params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DbError>>;
-    fn begin(&self) -> BoxFuture<'_, Result<DbTransaction, DbError>>;
-    fn clone_box(&self) -> Box<dyn DbBackendObj>;
+    ) -> Result<DbExecResult, DbError>;
+    async fn begin(&'_ self) -> Result<DbTransaction, DbError>;
 }
 
+/// The object-safe mirror of [`DbTransactionBackend`].
+///
+/// Transactions are the one service that `service_obj!` cannot generate: their methods take
+/// `&mut self`, `commit`/`rollback` consume the backend through `self: Box<Self>`, and there is no
+/// `clone_box` because a transaction is not clonable.
 trait DbTransactionBackendObj: Send {
     fn dialect(&self) -> DbDialect;
     fn query<'a>(
@@ -347,36 +352,6 @@ trait DbTransactionBackendObj: Send {
     ) -> BoxFuture<'a, Result<DbExecResult, DbError>>;
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), DbError>>;
     fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), DbError>>;
-}
-
-impl<T: DbBackend> DbBackendObj for T {
-    fn dialect(&self) -> DbDialect {
-        DbBackend::dialect(self)
-    }
-
-    fn query<'a>(
-        &'a self,
-        query: &'a str,
-        params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DbError>> {
-        Box::pin(DbBackend::query(self, query, params))
-    }
-
-    fn execute<'a>(
-        &'a self,
-        query: &'a str,
-        params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DbError>> {
-        Box::pin(DbBackend::execute(self, query, params))
-    }
-
-    fn begin(&self) -> BoxFuture<'_, Result<DbTransaction, DbError>> {
-        Box::pin(DbBackend::begin(self))
-    }
-
-    fn clone_box(&self) -> Box<dyn DbBackendObj> {
-        Box::new(self.clone())
-    }
 }
 
 impl<T: DbTransactionBackend> DbTransactionBackendObj for T {

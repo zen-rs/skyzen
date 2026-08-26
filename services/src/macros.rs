@@ -49,6 +49,81 @@ macro_rules! service_http_error {
     };
 }
 
+/// Generate a service's object-safe `*Obj` trait and its blanket bridge from the public trait's
+/// method signatures.
+///
+/// Every service is defined twice: once as an ergonomic public trait returning `impl Future`, and
+/// once as an object-safe mirror returning [`BoxFuture`](crate::BoxFuture) so the wrapper can hold
+/// a `Box<dyn _>`. The mirror and the bridge that forwards to the public trait are derivable from
+/// the public signatures alone, so they are generated here instead of being written out seven
+/// times — adding a method to a service is then a single-site change.
+///
+/// Methods are listed in the order the trait declares them, synchronous ones first:
+///
+/// ```ignore
+/// service_obj! {
+///     KeyValueStoreObj: KeyValueStore;
+///     async fn get<'a>(&'a self, key: &'a str) -> Result<Option<Vec<u8>>, KvError>;
+///     async fn delete_all(&'_ self) -> Result<(), KvError>;
+/// }
+/// ```
+///
+/// Write the signature exactly as the object-safe trait needs it: a named `<'a>` binds every
+/// borrowed argument to the borrow of `self`, which is what lets the boxed future hold them, and
+/// `&'_ self` marks a method whose future borrows nothing else. The return type is the public
+/// trait's `Output`; the macro wraps it in `BoxFuture` carrying that same `self` lifetime.
+macro_rules! service_obj {
+    (
+        $(#[$meta:meta])*
+        $obj:ident: $public:ident;
+        $(
+            fn $sync_method:ident(&self $(, $sync_arg:ident: $sync_arg_ty:ty)* $(,)?)
+                -> $sync_ret:ty;
+        )*
+        $(
+            async fn $method:ident $(<$lifetime:lifetime>)? (
+                & $self_lifetime:lifetime self
+                $(, $arg:ident: $arg_ty:ty)* $(,)?
+            ) -> $ret:ty;
+        )+
+    ) => {
+        $(#[$meta])*
+        trait $obj: Send + Sync {
+            $(
+                fn $sync_method(&self $(, $sync_arg: $sync_arg_ty)*) -> $sync_ret;
+            )*
+            $(
+                fn $method $(<$lifetime>)? (
+                    & $self_lifetime self
+                    $(, $arg: $arg_ty)*
+                ) -> $crate::BoxFuture<$self_lifetime, $ret>;
+            )+
+            /// Clone the concrete backend that sits behind this trait object.
+            fn clone_box(&self) -> ::std::boxed::Box<dyn $obj>;
+        }
+
+        impl<T: $public> $obj for T {
+            $(
+                fn $sync_method(&self $(, $sync_arg: $sync_arg_ty)*) -> $sync_ret {
+                    <Self as $public>::$sync_method(self $(, $sync_arg)*)
+                }
+            )*
+            $(
+                fn $method $(<$lifetime>)? (
+                    & $self_lifetime self
+                    $(, $arg: $arg_ty)*
+                ) -> $crate::BoxFuture<$self_lifetime, $ret> {
+                    ::std::boxed::Box::pin(<Self as $public>::$method(self $(, $arg)*))
+                }
+            )+
+
+            fn clone_box(&self) -> ::std::boxed::Box<dyn $obj> {
+                ::std::boxed::Box::new(::core::clone::Clone::clone(self))
+            }
+        }
+    };
+}
+
 /// Generate the boilerplate plumbing shared by every type-erased service wrapper.
 ///
 /// Given a newtype wrapper whose single field is a `Box<dyn _Obj>` exposing `clone_box`, this emits:
