@@ -567,9 +567,7 @@ struct ParameterMeta {
 #[derive(Debug, Clone)]
 enum TestParamKind {
     TestContext,
-    Kv,
-    Storage,
-    Queue,
+    Service(TestService),
     Db,
     NamedDatabase {
         type_ident: proc_macro2::Ident,
@@ -577,18 +575,90 @@ enum TestParamKind {
     },
 }
 
-#[derive(Default)]
-struct TestRequirements {
-    test_context: bool,
-    services: TestServiceRequirements,
-    databases: TestDatabaseRequirements,
+/// A portable service a `#[skyzen::test]` function can ask for by parameter type.
+///
+/// Each variant knows the three things the expansion needs — the binding its mock lives in, how to
+/// build that mock, and the `TestContext` builder that forwards it into requests — so adding a
+/// service is one variant plus one match arm each, not a bool and three parallel `if` blocks.
+///
+/// `Ord` fixes the order the mocks are constructed in, keeping the expansion deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TestService {
+    Kv,
+    Storage,
+    Queue,
+    DurableKv,
+    DurableDb,
+    Alarm,
+}
+
+impl TestService {
+    /// Every service, for the case where a test asks for a `TestContext` and could reach any.
+    const ALL: [Self; 6] = [
+        Self::Kv,
+        Self::Storage,
+        Self::Queue,
+        Self::DurableKv,
+        Self::DurableDb,
+        Self::Alarm,
+    ];
+
+    /// The snake-case name shared by this service's binding and its `TestContext` builder.
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Kv => "kv",
+            Self::Storage => "storage",
+            Self::Queue => "queue",
+            Self::DurableKv => "durable_kv",
+            Self::DurableDb => "durable_db",
+            Self::Alarm => "alarm",
+        }
+    }
+
+    /// The local the constructed mock is bound to inside the generated test body.
+    fn binding_ident(self) -> proc_macro2::Ident {
+        format_ident!("__skyzen_test_{}", self.slug())
+    }
+
+    /// The [`TestContext`](skyzen_test::TestContext) builder that forwards this service.
+    fn context_builder(self) -> proc_macro2::Ident {
+        format_ident!("with_{}", self.slug())
+    }
+
+    /// The expression that builds this service's wrapper around its in-memory mock.
+    fn construction(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Kv => quote! {
+                ::skyzen_services::Kv::new(::skyzen_test::mock::InMemoryKv::new())
+            },
+            Self::Storage => quote! {
+                ::skyzen_services::Storage::new(::skyzen_test::mock::InMemoryStorage::new())
+            },
+            Self::Queue => quote! {
+                ::skyzen_services::Queue::new(::skyzen_test::mock::InMemoryQueue::new())
+            },
+            Self::DurableKv => quote! {
+                ::skyzen_services::durable::DurableKv::new(
+                    ::skyzen_test::mock::InMemoryDurableKv::new(),
+                )
+            },
+            Self::DurableDb => quote! {
+                ::skyzen_services::durable::DurableDb::new(
+                    ::skyzen_test::mock::InMemoryDurableDb::new(),
+                )
+            },
+            Self::Alarm => quote! {
+                ::skyzen_services::durable::Alarm::new(::skyzen_test::mock::InMemoryAlarm::new())
+            },
+        }
+    }
 }
 
 #[derive(Default)]
-struct TestServiceRequirements {
-    kv: bool,
-    storage: bool,
-    queue: bool,
+struct TestRequirements {
+    test_context: bool,
+    services: BTreeSet<TestService>,
+    databases: TestDatabaseRequirements,
 }
 
 #[derive(Default)]
@@ -702,10 +772,11 @@ fn collect_test_param_bindings(
         );
     }
 
+    // A `TestContext` is what the handler under test is exercised through, and the handler may
+    // extract any portable service, so asking for one provisions all of them. Each mock is a
+    // couple of empty `Arc<RwLock<_>>`s, so the ones a test never touches cost nothing.
     if requirements.test_context {
-        requirements.services.kv = true;
-        requirements.services.storage = true;
-        requirements.services.queue = true;
+        requirements.services.extend(TestService::ALL);
     }
 
     Ok(TestParamBindings {
@@ -728,22 +799,11 @@ fn push_test_param_binding(
                 let #pat: #ty = __skyzen_test_context.clone();
             });
         }
-        TestParamKind::Kv => {
-            requirements.services.kv = true;
+        TestParamKind::Service(service) => {
+            requirements.services.insert(service);
+            let binding = service.binding_ident();
             statements.push(quote! {
-                let #pat: #ty = __skyzen_test_kv.clone();
-            });
-        }
-        TestParamKind::Storage => {
-            requirements.services.storage = true;
-            statements.push(quote! {
-                let #pat: #ty = __skyzen_test_storage.clone();
-            });
-        }
-        TestParamKind::Queue => {
-            requirements.services.queue = true;
-            statements.push(quote! {
-                let #pat: #ty = __skyzen_test_queue.clone();
+                let #pat: #ty = #binding.clone();
             });
         }
         TestParamKind::Db => {
@@ -786,24 +846,11 @@ fn push_test_service_setup(
     requirements: &TestRequirements,
     statements: &mut Vec<proc_macro2::TokenStream>,
 ) {
-    if requirements.services.kv {
+    for service in &requirements.services {
+        let binding = service.binding_ident();
+        let construction = service.construction();
         statements.push(quote! {
-            let __skyzen_test_kv =
-                ::skyzen_services::Kv::new(::skyzen_test::mock::InMemoryKv::new());
-        });
-    }
-
-    if requirements.services.storage {
-        statements.push(quote! {
-            let __skyzen_test_storage =
-                ::skyzen_services::Storage::new(::skyzen_test::mock::InMemoryStorage::new());
-        });
-    }
-
-    if requirements.services.queue {
-        statements.push(quote! {
-            let __skyzen_test_queue =
-                ::skyzen_services::Queue::new(::skyzen_test::mock::InMemoryQueue::new());
+            let #binding = #construction;
         });
     }
 }
@@ -893,21 +940,11 @@ fn push_test_context_setup(
     statements.push(quote! {
         let mut __skyzen_test_context = ::skyzen_test::TestContext::new();
     });
-    if requirements.services.kv {
+    for service in &requirements.services {
+        let binding = service.binding_ident();
+        let builder = service.context_builder();
         statements.push(quote! {
-            __skyzen_test_context = __skyzen_test_context.with_kv(__skyzen_test_kv.clone());
-        });
-    }
-    if requirements.services.storage {
-        statements.push(quote! {
-            __skyzen_test_context =
-                __skyzen_test_context.with_storage(__skyzen_test_storage.clone());
-        });
-    }
-    if requirements.services.queue {
-        statements.push(quote! {
-            __skyzen_test_context =
-                __skyzen_test_context.with_queue(__skyzen_test_queue.clone());
+            __skyzen_test_context = __skyzen_test_context.#builder(#binding.clone());
         });
     }
     if requirements.databases.default_db {
@@ -931,10 +968,13 @@ fn classify_test_param(
     let ident_name = ident.to_string();
     match ident_name.as_str() {
         "TestContext" => Ok(TestParamKind::TestContext),
-        "Kv" => Ok(TestParamKind::Kv),
-        "Storage" => Ok(TestParamKind::Storage),
-        "Queue" => Ok(TestParamKind::Queue),
+        "Kv" => Ok(TestParamKind::Service(TestService::Kv)),
+        "Storage" => Ok(TestParamKind::Service(TestService::Storage)),
+        "Queue" => Ok(TestParamKind::Service(TestService::Queue)),
         "Db" => Ok(TestParamKind::Db),
+        "DurableKv" => Ok(TestParamKind::Service(TestService::DurableKv)),
+        "DurableDb" => Ok(TestParamKind::Service(TestService::DurableDb)),
+        "Alarm" => Ok(TestParamKind::Service(TestService::Alarm)),
         _ => database_types
             .iter()
             .find(|(_, type_ident)| *type_ident == ident)
@@ -942,7 +982,7 @@ fn classify_test_param(
                 || {
                     Err(Error::new_spanned(
                         ty,
-                        "unsupported #[skyzen::test] parameter type; supported types are `TestContext`, `Kv`, `Storage`, `Queue`, `Db`, and generated database wrappers",
+                        "unsupported #[skyzen::test] parameter type; supported types are `TestContext`, `Kv`, `Storage`, `Queue`, `Db`, `DurableKv`, `DurableDb`, `Alarm`, and generated database wrappers",
                     ))
                 },
                 |(database_index, type_ident)| {
@@ -3721,6 +3761,64 @@ binding = "DB"
                 .to_string()
                 .contains("cannot mark more than one database as `default = true`")
         );
+    }
+
+    #[test]
+    fn the_test_macro_recognises_every_portable_service_including_the_durable_ones() {
+        use super::{TestParamKind, TestService, classify_test_param};
+
+        let cases = [
+            ("Kv", TestService::Kv),
+            ("Storage", TestService::Storage),
+            ("Queue", TestService::Queue),
+            ("DurableKv", TestService::DurableKv),
+            ("DurableDb", TestService::DurableDb),
+            ("Alarm", TestService::Alarm),
+        ];
+
+        for (name, expected) in cases {
+            let ty: syn::Type = syn::parse_str(name).expect("type should parse");
+            let kind = classify_test_param(&ty, &[]).expect(name);
+            assert!(
+                matches!(kind, TestParamKind::Service(service) if service == expected),
+                "{name} should classify as {expected:?}"
+            );
+        }
+
+        // A fully qualified path resolves through its last segment, too.
+        let ty: syn::Type =
+            syn::parse_str("skyzen_services::durable::Alarm").expect("type should parse");
+        assert!(matches!(
+            classify_test_param(&ty, &[]).expect("qualified Alarm"),
+            TestParamKind::Service(TestService::Alarm)
+        ));
+    }
+
+    #[test]
+    fn an_unknown_test_parameter_lists_the_durable_types_it_could_have_been() {
+        use super::classify_test_param;
+
+        let ty: syn::Type = syn::parse_str("Nonsense").expect("type should parse");
+        let message = classify_test_param(&ty, &[])
+            .expect_err("unknown parameter types must be rejected")
+            .to_string();
+
+        for expected in ["`Kv`", "`DurableKv`", "`DurableDb`", "`Alarm`"] {
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn each_service_names_one_binding_and_one_context_builder() {
+        use super::TestService;
+
+        for service in TestService::ALL {
+            let binding = service.binding_ident().to_string();
+            let builder = service.context_builder().to_string();
+            assert_eq!(binding, format!("__skyzen_test_{}", service.slug()));
+            assert_eq!(builder, format!("with_{}", service.slug()));
+            assert!(!service.construction().is_empty());
+        }
     }
 
     #[test]
