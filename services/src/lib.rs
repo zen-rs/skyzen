@@ -57,8 +57,9 @@ pub use durable::{DurableDb, DurableDbBackend, DurableDbError};
 pub use events::ScheduledTick;
 pub use kv::{KeyValueStore, Kv, KvError, KvListOptions, KvListResult};
 pub use queue::{
-    MessageQueue, Queue, QueueBatch, QueueBatchDisposition, QueueError, QueueMessage,
-    QueueMessageDisposition, QueueRetry,
+    MessageQueue, MessageReceipt, Queue, QueueBatch, QueueBatchDisposition, QueueError,
+    QueueMessage, QueueMessageDisposition, QueueRetry, ReceiveOptions, ReceivedMessage,
+    SendOptions,
 };
 pub use sql::{Db, DbBackend, DbError, DbExecResult, DbTransaction, DbTransactionBackend, DbValue};
 pub use storage::{
@@ -138,6 +139,10 @@ mod http_status_tests {
             (
                 &QueueError::backend("send failed"),
                 StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                &QueueError::Unsupported("receive"),
+                StatusCode::NOT_IMPLEMENTED,
             ),
             (&QueueError::Conflict, StatusCode::CONFLICT),
             (
