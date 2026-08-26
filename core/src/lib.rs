@@ -30,8 +30,11 @@ extern crate std;
 #[macro_use]
 mod macros;
 
-mod body_limit;
-pub use body_limit::RequestBodyLimit;
+mod body;
+pub use body::{
+    take_body_bytes, take_body_stream, BodyAlreadyConsumed, BodyConsumed, BodyExtractorError,
+    BodyReadError, InvalidBody, PayloadTooLarge, RequestBodyLimit,
+};
 mod extract;
 pub use extract::{Extractor, Requirement};
 pub mod middleware;
