@@ -213,7 +213,7 @@ impl<E: Endpoint> RequestBuilder<E> {
     /// Panics if the value cannot be serialized as a URL-encoded form.
     #[must_use]
     pub fn form<T: Serialize>(mut self, value: &T) -> Self {
-        let encoded = serde_urlencoded::to_string(value)
+        let encoded = serde_html_form::to_string(value)
             .expect("failed to serialize request body as URL-encoded form");
         self.body = Body::from(encoded);
         self.headers.push((
