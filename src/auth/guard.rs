@@ -27,7 +27,8 @@
 
 use http::StatusCode;
 
-use crate::{extract::Extractor, utils::State, Request};
+use crate::{extract::Extractor, middleware::auth::AuthUser, Request};
+use skyzen_core::Requirement;
 
 /// Trait for types that can provide role information.
 ///
@@ -104,7 +105,7 @@ where
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         let user = request
             .extensions()
-            .get::<State<U>>()
+            .get::<AuthUser<U>>()
             .ok_or(AuthorizationError::NotAuthenticated)?
             .0
             .clone();
@@ -114,6 +115,12 @@ where
         } else {
             Err(AuthorizationError::Forbidden)
         }
+    }
+
+    fn requirements() -> Vec<Requirement> {
+        vec![Requirement::of::<AuthUser<U>>(
+            "`.with(AuthMiddleware::new(authenticator))`",
+        )]
     }
 }
 
@@ -169,7 +176,7 @@ macro_rules! define_role_guard {
 
                 let user = request
                     .extensions()
-                    .get::<$crate::utils::State<U>>()
+                    .get::<$crate::middleware::auth::AuthUser<U>>()
                     .ok_or($crate::auth::guard::AuthorizationError::NotAuthenticated)?
                     .0
                     .clone();
@@ -180,6 +187,12 @@ macro_rules! define_role_guard {
                     Err($crate::auth::guard::AuthorizationError::Forbidden)
                 }
             }
+
+            fn requirements() -> ::std::vec::Vec<$crate::extract::Requirement> {
+                ::std::vec![$crate::extract::Requirement::of::<
+                    $crate::middleware::auth::AuthUser<U>,
+                >("`.with(AuthMiddleware::new(authenticator))`")]
+            }
         }
     };
 }
@@ -189,7 +202,7 @@ mod tests {
     use skyzen_core::Extractor;
 
     use super::{Admin, AuthorizationError, HasRoles};
-    use crate::utils::State;
+    use crate::middleware::auth::AuthUser;
 
     #[derive(Clone, Debug)]
     struct TestUser {
@@ -214,7 +227,7 @@ mod tests {
             .body(http_kit::Body::empty())
             .unwrap();
 
-        request.extensions_mut().insert(State(user.clone()));
+        request.extensions_mut().insert(AuthUser(user.clone()));
 
         let result = Admin::<TestUser>::extract(&mut request).await;
         assert!(result.is_ok());
@@ -232,7 +245,7 @@ mod tests {
             .body(http_kit::Body::empty())
             .unwrap();
 
-        request.extensions_mut().insert(State(user));
+        request.extensions_mut().insert(AuthUser(user));
 
         let result = Admin::<TestUser>::extract(&mut request).await;
         assert!(matches!(result, Err(AuthorizationError::Forbidden)));

@@ -9,7 +9,7 @@ use include_dir::{Dir, File};
 
 use crate::{
     header::{self, HeaderValue},
-    routing::{IntoRouteNode, Params, Route, RouteNode},
+    routing::{IntoRouteNode, MethodFilter, Params, Route, RouteNode},
     Endpoint, Method, Request, Response, StatusCode,
 };
 use skyzen_core::Extractor;
@@ -116,12 +116,6 @@ impl EmbeddedStaticDir {
     }
 }
 
-impl IntoRouteNode for Route {
-    fn into_route_node(self) -> RouteNode {
-        RouteNode::new_route("", self)
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 impl IntoRouteNode for StaticDir {
     fn into_route_node(self) -> RouteNode {
@@ -158,8 +152,20 @@ where
         "/{*path}"
     };
     let route = Route::new((
-        RouteNode::new_endpoint("", Method::GET, endpoint.clone(), None),
-        RouteNode::new_endpoint(wildcard_suffix, Method::GET, endpoint, None),
+        RouteNode::new_endpoint(
+            "",
+            MethodFilter::Exact(Method::GET),
+            endpoint.clone(),
+            None,
+            Vec::new(),
+        ),
+        RouteNode::new_endpoint(
+            wildcard_suffix,
+            MethodFilter::Exact(Method::GET),
+            endpoint,
+            None,
+            Vec::new(),
+        ),
     ));
 
     RouteNode::new_route(mount_path, route)

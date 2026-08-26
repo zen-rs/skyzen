@@ -17,7 +17,11 @@ use http::{
     },
     HeaderMap, HeaderValue, Method, StatusCode,
 };
-use http_kit::{http_error, middleware::MiddlewareError, Body, Middleware, Request, Response};
+use http_kit::{http_error, Body, Request, Response};
+use skyzen_core::{
+    middleware::{Middleware, Next},
+    Error,
+};
 use smallvec::{smallvec, SmallVec};
 
 type EncodingList = SmallVec<[CompressionEncoding; 3]>;
@@ -166,22 +170,12 @@ impl CompressionMiddleware {
 }
 
 impl Middleware for CompressionMiddleware {
-    type Error = CompressionError;
-    async fn handle<N: http_kit::Endpoint>(
-        &mut self,
-        request: &mut Request,
-        mut next: N,
-    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
-        let mut response = next
-            .respond(request)
-            .await
-            .map_err(MiddlewareError::Endpoint)?;
+    async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        let mut response = next.run(request).await?;
 
         if Self::is_response_eligible(request, &response) {
             if let Some(encoding) = self.negotiate_encoding(request) {
-                self.compress_response(&mut response, encoding)
-                    .await
-                    .map_err(MiddlewareError::Middleware)?;
+                self.compress_response(&mut response, encoding).await?;
             }
         }
 
@@ -492,11 +486,13 @@ impl CompressionLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::apply;
     use flate2::read::{GzDecoder, ZlibDecoder};
     use http::{header::CONTENT_ENCODING, HeaderValue};
     use http_kit::Endpoint;
     use std::{convert::Infallible, io::Read};
 
+    #[derive(Clone)]
     struct StaticEndpoint {
         payload: String,
         vary: Option<HeaderValue>,
@@ -563,12 +559,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn compresses_with_gzip_when_client_accepts() {
-        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new().minimum_size(0);
         let mut request = request_with_encoding(Some("gzip"));
-        let mut endpoint = StaticEndpoint::new(&"Hello World!".repeat(50));
+        let endpoint = StaticEndpoint::new(&"Hello World!".repeat(50));
 
-        let response = middleware
-            .handle(&mut request, &mut endpoint)
+        let response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
         let headers = response.headers().clone();
@@ -585,12 +580,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn skips_compression_without_matching_encoding() {
-        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new().minimum_size(0);
         let mut request = request_with_encoding(None);
-        let mut endpoint = StaticEndpoint::new("plain body");
+        let endpoint = StaticEndpoint::new("plain body");
 
-        let mut response = middleware
-            .handle(&mut request, &mut endpoint)
+        let mut response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
 
@@ -607,12 +601,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn honors_deflate_quality_order() {
-        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new().minimum_size(0);
         let mut request = request_with_encoding(Some("gzip;q=0.5, deflate;q=1"));
-        let mut endpoint = StaticEndpoint::new(&"payload".repeat(80));
+        let endpoint = StaticEndpoint::new(&"payload".repeat(80));
 
-        let response = middleware
-            .handle(&mut request, &mut endpoint)
+        let response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
         let headers = response.headers().clone();
@@ -630,12 +623,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn enforces_minimum_size() {
         let payload = "tiny";
-        let mut middleware = CompressionMiddleware::new().minimum_size(payload.len() + 1);
+        let middleware = CompressionMiddleware::new().minimum_size(payload.len() + 1);
         let mut request = request_with_encoding(Some("gzip"));
-        let mut endpoint = StaticEndpoint::new(payload);
+        let endpoint = StaticEndpoint::new(payload);
 
-        let mut response = middleware
-            .handle(&mut request, &mut endpoint)
+        let mut response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
         assert!(response.headers().get(CONTENT_ENCODING).is_none());
@@ -650,11 +642,12 @@ mod tests {
         assert_eq!(body.as_ref(), payload.as_bytes());
     }
 
+    #[derive(Clone)]
     struct FnEndpoint<F>(F);
 
     impl<F> Endpoint for FnEndpoint<F>
     where
-        F: FnMut() -> Response + Send + Sync,
+        F: Fn() -> Response + Clone + Send + Sync + 'static,
     {
         type Error = Infallible;
         async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
@@ -664,15 +657,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn skips_streaming_bodies_of_unknown_length() {
-        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new().minimum_size(0);
         let mut request = request_with_encoding(Some("gzip"));
-        let mut endpoint = FnEndpoint(|| {
+        let endpoint = FnEndpoint(|| {
             let stream = futures_util::stream::iter(vec![Ok::<_, Infallible>("streamed chunk")]);
             Response::new(Body::from_stream(stream))
         });
 
-        let response = middleware
-            .handle(&mut request, &mut endpoint)
+        let response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
 
@@ -683,11 +675,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn skips_already_compressed_content_types() {
-        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new().minimum_size(0);
         let mut request = request_with_encoding(Some("gzip"));
         let payload = "fake png bytes".repeat(50);
         let body = payload.clone();
-        let mut endpoint = FnEndpoint(move || {
+        let endpoint = FnEndpoint(move || {
             let mut response = Response::new(Body::from_bytes(body.clone()));
             response
                 .headers_mut()
@@ -695,8 +687,7 @@ mod tests {
             response
         });
 
-        let response = middleware
-            .handle(&mut request, &mut endpoint)
+        let response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
 
@@ -707,11 +698,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn skips_responses_that_are_already_encoded() {
-        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new().minimum_size(0);
         let mut request = request_with_encoding(Some("gzip"));
         let payload = "already encoded".repeat(50);
         let body = payload.clone();
-        let mut endpoint = FnEndpoint(move || {
+        let endpoint = FnEndpoint(move || {
             let mut response = Response::new(Body::from_bytes(body.clone()));
             response
                 .headers_mut()
@@ -719,8 +710,7 @@ mod tests {
             response
         });
 
-        let response = middleware
-            .handle(&mut request, &mut endpoint)
+        let response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
 
@@ -737,13 +727,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn wildcard_does_not_override_explicit_zero_quality() {
-        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new().minimum_size(0);
         // `gzip;q=0, *` forbids gzip; the wildcard covers deflate only.
         let mut request = request_with_encoding(Some("gzip;q=0, *"));
-        let mut endpoint = StaticEndpoint::new(&"payload".repeat(80));
+        let endpoint = StaticEndpoint::new(&"payload".repeat(80));
 
-        let response = middleware
-            .handle(&mut request, &mut endpoint)
+        let response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
         let headers = response.headers().clone();
@@ -760,13 +749,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn specific_quality_beats_wildcard_quality() {
-        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new().minimum_size(0);
         // `*` at q=1 applies to deflate; gzip keeps its explicit q=0.5.
         let mut request = request_with_encoding(Some("*, gzip;q=0.5"));
-        let mut endpoint = StaticEndpoint::new(&"payload".repeat(80));
+        let endpoint = StaticEndpoint::new(&"payload".repeat(80));
 
-        let response = middleware
-            .handle(&mut request, &mut endpoint)
+        let response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
         let headers = response.headers().clone();
@@ -783,21 +771,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn appends_vary_header_once() {
-        let mut middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new().minimum_size(0);
         let mut request = request_with_encoding(Some("gzip"));
-        let mut endpoint = StaticEndpoint::new(&"payload".repeat(60))
+        let endpoint = StaticEndpoint::new(&"payload".repeat(60))
             .with_vary(HeaderValue::from_static("Accept-Language"));
 
-        let response = middleware
-            .handle(&mut request, &mut endpoint)
+        let response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
         let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
         assert_eq!(vary, "Accept-Language, Accept-Encoding");
 
         // Run again to ensure we do not duplicate the header.
-        let response = middleware
-            .handle(&mut request, &mut endpoint)
+        let response = apply(&middleware, &mut request, endpoint.clone())
             .await
             .unwrap();
         let vary = response.headers().get(VARY).unwrap().to_str().unwrap();

@@ -351,7 +351,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct QueueSendEndpoint;
 
     impl Endpoint for QueueSendEndpoint {
@@ -479,7 +479,9 @@ mod tests {
         let mut queue = Queue::new(backend.clone());
         let mut request = http_kit::Request::new(Body::empty());
 
-        let response = queue.handle(&mut request, QueueSendEndpoint).await.unwrap();
+        let response = ::skyzen_core::middleware::apply(&queue, &mut request, QueueSendEndpoint)
+            .await
+            .unwrap();
         let body = response.into_body().into_string().await.unwrap();
         assert_eq!(body, "queued");
 

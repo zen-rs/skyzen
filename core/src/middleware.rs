@@ -54,7 +54,7 @@ use core::{
     pin::Pin,
 };
 
-use http_kit::{Request, Response};
+use http_kit::{Endpoint, Request, Response};
 
 use crate::error::Error;
 
@@ -191,6 +191,42 @@ impl<'a> Next<'a> {
             }
             None => self.terminal.dispatch(request).await,
         }
+    }
+}
+
+/// Run one middleware around one endpoint, for a single request.
+///
+/// The chain machinery normally lives inside the router; this is the direct form, for unit tests
+/// that exercise a middleware on its own and for embedding a middleware around a bare endpoint.
+///
+/// # Errors
+///
+/// Propagates whatever the middleware or the endpoint failed with.
+pub async fn apply<M, E>(
+    middleware: &M,
+    request: &mut Request,
+    endpoint: E,
+) -> Result<Response, Error>
+where
+    M: Middleware,
+    E: Endpoint + Clone + Send + Sync + 'static,
+{
+    let terminal = CloneEndpoint(endpoint);
+    middleware.handle(request, Next::new(&[], &terminal)).await
+}
+
+/// Chain terminal that serves a request from a fresh clone of a shared endpoint.
+struct CloneEndpoint<E>(E);
+
+impl<E> Dispatch for CloneEndpoint<E>
+where
+    E: Endpoint + Clone + Send + Sync + 'static,
+{
+    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+        Box::pin(async move {
+            let mut endpoint = self.0.clone();
+            endpoint.respond(request).await.map_err(Error::from)
+        })
     }
 }
 
