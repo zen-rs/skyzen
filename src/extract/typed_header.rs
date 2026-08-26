@@ -26,7 +26,7 @@ pub struct TypedHeader<H>(pub H);
 
 impl_deref!(TypedHeader);
 
-/// Raised when a typed header is absent or unparseable.
+/// Raised when a typed header is absent or malformed.
 #[skyzen::error]
 pub enum TypedHeaderError {
     /// The request carries no such header.
@@ -42,7 +42,7 @@ impl<H: Header + Send + Sync + 'static> Extractor for TypedHeader<H> {
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         let name = H::name();
         let all = request.headers().get_all(name);
-        // `Header::decode` cannot tell "absent" from "unparseable" — it reports the same error for
+        // `Header::decode` cannot tell "absent" from "malformed" — it reports the same error for
         // both — so absence is checked first, and the two get distinct messages.
         if all.iter().next().is_none() {
             return Err(TypedHeaderError::Missing(name.to_string()));
