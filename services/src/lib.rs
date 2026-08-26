@@ -57,8 +57,8 @@ pub use durable::{DurableDb, DurableDbBackend, DurableDbError, DurableDbQuery};
 pub use events::ScheduledTick;
 pub use kv::{KeyValueStore, Kv, KvError, KvListOptions, KvListResult};
 pub use queue::{
-    MessageQueue, MessageReceipt, Queue, QueueBatch, QueueBatchDisposition, QueueError,
-    QueueMessage, QueueMessageDisposition, QueueRetry, ReceiveOptions, ReceivedMessage,
+    BatchSendFailure, MessageQueue, MessageReceipt, Queue, QueueBatch, QueueBatchDisposition,
+    QueueError, QueueMessage, QueueMessageDisposition, QueueRetry, ReceiveOptions, ReceivedMessage,
     SendOptions,
 };
 pub use sql::{
@@ -74,7 +74,7 @@ pub use storage::{
 mod http_status_tests {
     use super::{
         durable::{AlarmError, DurableKvError},
-        BoxError, DbError, DurableDbError, KvError, QueueError, StorageError,
+        BatchSendFailure, BoxError, DbError, DurableDbError, KvError, QueueError, StorageError,
     };
     use core::error::Error as StdError;
     use http_kit::{HttpError, StatusCode};
@@ -154,6 +154,16 @@ mod http_status_tests {
                 StatusCode::TOO_MANY_REQUESTS,
             ),
             (&QueueError::Unauthorized, StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                &QueueError::PartialBatch {
+                    failures: vec![BatchSendFailure {
+                        index: 3,
+                        code: "InternalError".to_owned(),
+                        message: "something broke".to_owned(),
+                    }],
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ]);
     }
 

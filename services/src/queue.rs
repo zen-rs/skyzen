@@ -45,6 +45,33 @@ pub enum QueueError {
     /// The configured credentials were rejected by the backend.
     #[error("queue credentials were rejected by the backend")]
     Unauthorized,
+
+    /// A [`send_batch`](MessageQueue::send_batch) enqueued some of its messages and not others.
+    ///
+    /// Batch sends are not atomic on any backend that has them, so this reports *which* messages
+    /// were rejected rather than leaving the caller to guess: every message the batch carried whose
+    /// index is absent from `failures` was enqueued, and re-sending only the failures is what
+    /// recovers the batch.
+    #[error("{} of the batch's messages were rejected by the backend", failures.len())]
+    PartialBatch {
+        /// The rejected entries, each naming its position in the slice the caller passed.
+        failures: Vec<BatchSendFailure>,
+    },
+}
+
+/// One message a [`send_batch`](MessageQueue::send_batch) could not enqueue.
+///
+/// `index` is the position in the slice the caller handed to `send_batch`, not the backend's own
+/// per-request entry id, so it indexes the caller's data directly however the backend chunked the
+/// request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchSendFailure {
+    /// Position of the rejected message in the slice passed to `send_batch`.
+    pub index: usize,
+    /// The backend's error code for this entry, verbatim.
+    pub code: String,
+    /// The backend's human-readable message for this entry.
+    pub message: String,
 }
 
 backend_error!(QueueError);
@@ -56,6 +83,7 @@ service_http_error!(QueueError {
     Self::Conflict => CONFLICT,
     Self::Throttled { .. } => TOO_MANY_REQUESTS,
     Self::Unauthorized => INTERNAL_SERVER_ERROR,
+    Self::PartialBatch { .. } => INTERNAL_SERVER_ERROR,
 });
 
 /// Retry options for queue consumers.
@@ -400,6 +428,11 @@ pub trait MessageQueue: Send + Sync + Clone + 'static {
     fn send(&self, message: &[u8]) -> impl Future<Output = Result<(), QueueError>> + Send;
 
     /// Send a batch of messages.
+    ///
+    /// Delivery is at-least-once and **not atomic** on any backend: a backend that rejects some
+    /// entries while accepting others reports [`QueueError::PartialBatch`], whose
+    /// [`BatchSendFailure::index`] values index this very slice, so the caller can retry exactly
+    /// the messages that did not make it.
     fn send_batch(
         &self,
         messages: &[Vec<u8>],
@@ -523,7 +556,9 @@ impl Queue {
     ///
     /// # Errors
     ///
-    /// Returns [`QueueError`] if the backend operation fails.
+    /// Returns [`QueueError::PartialBatch`] when the backend rejected some entries and enqueued
+    /// the rest — its [`BatchSendFailure::index`] values index `messages` — or another
+    /// [`QueueError`] if the backend operation fails outright.
     pub async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<(), QueueError> {
         self.0.send_batch(messages).await
     }
