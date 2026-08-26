@@ -313,6 +313,15 @@ async fn load_state<T>(state: &worker_sys::DurableObjectState) -> Result<LoadedO
 where
     T: DurableObject,
 {
+    // An object that keeps its state in storage itself has no blob to restore, so the read and the
+    // parse are skipped rather than performed and discarded.
+    if !T::PERSIST {
+        return Ok(LoadedObject {
+            object: T::default(),
+            snapshot: None,
+        });
+    }
+
     let kv = DurableKv::new(CfDurableKv::from_state(state).map_err(|error| {
         JsValue::from_str(&format!(
             "failed to initialize durable kv for state load: {error}"
@@ -338,7 +347,8 @@ where
 
 /// Persist the object's serialized state, skipping the storage write when the
 /// bytes are identical to what [`load_state`] read (read-only events would
-/// otherwise write on every invocation).
+/// otherwise write on every invocation), and skipping it entirely for an object
+/// that opted out with `PERSIST = false`.
 async fn save_state<T>(
     state: &worker_sys::DurableObjectState,
     loaded: &LoadedObject<T>,
@@ -346,6 +356,10 @@ async fn save_state<T>(
 where
     T: DurableObject,
 {
+    if !T::PERSIST {
+        return Ok(());
+    }
+
     let bytes = serde_json::to_vec(&loaded.object).map_err(|error| {
         JsValue::from_str(&format!(
             "failed to serialize durable state '{SKYZEN_STATE_KEY}': {error}"

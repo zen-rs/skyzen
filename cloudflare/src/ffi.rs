@@ -47,6 +47,38 @@ extern "C" {
     pub fn list(this: &KvNamespace, options: &JsValue) -> Result<Promise, JsValue>;
 }
 
+// ── Durable Objects ──
+
+/// Durable Object methods `worker-sys` does not bind.
+///
+/// The typed `worker_sys::DurableObjectState` and `DurableObjectNamespace` are cast into these
+/// with `unchecked_ref` at the call site; they describe the same JS objects.
+#[wasm_bindgen]
+extern "C" {
+    /// `DurableObjectState`, seen through the methods missing from `worker-sys`.
+    #[wasm_bindgen(extends = js_sys::Object)]
+    pub type DurableObjectStateExt;
+
+    /// Run `callback` with the object's input gates closed, so no other event interleaves with it.
+    /// Returns a promise that resolves when the callback's own promise does.
+    #[wasm_bindgen(method, catch, js_name = blockConcurrencyWhile)]
+    pub fn block_concurrency_while(
+        this: &DurableObjectStateExt,
+        callback: &js_sys::Function,
+    ) -> Result<Promise, JsValue>;
+
+    /// `DurableObjectNamespace`, seen through the methods missing from `worker-sys`.
+    #[wasm_bindgen(extends = js_sys::Object)]
+    pub type DurableObjectNamespaceExt;
+
+    /// Restrict the namespace to a data-residency jurisdiction, returning a new namespace.
+    #[wasm_bindgen(method, catch)]
+    pub fn jurisdiction(
+        this: &DurableObjectNamespaceExt,
+        jurisdiction: &str,
+    ) -> Result<JsValue, JsValue>;
+}
+
 // ── Helpers ──
 
 /// Get a binding from the Workers env object by name.

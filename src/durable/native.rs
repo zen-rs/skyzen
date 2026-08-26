@@ -85,10 +85,20 @@ impl NativeDurableSlot {
         })
     }
 
+    /// Restore the user's object, or produce a fresh one when the type opted out of
+    /// framework-managed persistence.
+    ///
+    /// The simulator honours [`DurableObject::PERSIST`] for the same reason the Cloudflare runtime
+    /// does: an object that stores its own state must behave identically on both, or a bug only
+    /// shows up after deployment.
     fn load_object<T>(&self) -> Result<T, DurableObjectError>
     where
         T: DurableObject,
     {
+        if !T::PERSIST {
+            return Ok(T::default());
+        }
+
         self.state
             .as_deref()
             .map(|bytes| {
@@ -103,6 +113,10 @@ impl NativeDurableSlot {
     where
         T: DurableObject,
     {
+        if !T::PERSIST {
+            return Ok(());
+        }
+
         self.state = Some(
             serde_json::to_vec(object)
                 .map_err(|error| DurableObjectError::Serialization(error.to_string()))?,
@@ -874,6 +888,38 @@ mod tests {
         Ok(current.to_string())
     }
 
+    /// Framework-managed state: the hit count survives between events because the runtime
+    /// serializes the whole object after each one.
+    #[derive(Default, Serialize, Deserialize)]
+    struct BlobCounter {
+        hits: u64,
+    }
+
+    impl DurableObject for BlobCounter {
+        fn fetch(&mut self) -> crate::routing::Router {
+            self.hits += 1;
+            let hits = self.hits;
+            Route::new(("/hits".at(move || async move { hits.to_string() }),)).build()
+        }
+    }
+
+    /// The same shape with `PERSIST = false`: nothing is stored, so every event starts from
+    /// `Default` and the count never climbs past one.
+    #[derive(Default, Serialize, Deserialize)]
+    struct ScratchCounter {
+        hits: u64,
+    }
+
+    impl DurableObject for ScratchCounter {
+        const PERSIST: bool = false;
+
+        fn fetch(&mut self) -> crate::routing::Router {
+            self.hits += 1;
+            let hits = self.hits;
+            Route::new(("/hits".at(move || async move { hits.to_string() }),)).build()
+        }
+    }
+
     fn request(method: Method, path: &str) -> Request {
         let mut request = Request::new(Body::empty());
         *request.method_mut() = method;
@@ -888,6 +934,30 @@ mod tests {
             .await
             .expect("response body");
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    #[tokio::test]
+    async fn persist_false_skips_the_framework_state_round_trip() {
+        let blob = NativeDurableNamespace::<BlobCounter>::new();
+        let stub = blob.get_by_name("blob").expect("blob object");
+        for expected in ["1", "2", "3"] {
+            let response = stub
+                .fetch(request(Method::GET, "/hits"))
+                .await
+                .expect("blob hit");
+            assert_eq!(response_text(response).await, expected);
+        }
+
+        let scratch = NativeDurableNamespace::<ScratchCounter>::new();
+        let stub = scratch.get_by_name("scratch").expect("scratch object");
+        for _ in 0..3u32 {
+            let response = stub
+                .fetch(request(Method::GET, "/hits"))
+                .await
+                .expect("scratch hit");
+            // Nothing was saved, so the object is rebuilt from `Default` on every event.
+            assert_eq!(response_text(response).await, "1");
+        }
     }
 
     #[tokio::test]
