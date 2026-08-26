@@ -1,7 +1,6 @@
 //! Multipart form data utilities module.
 //! It provides an extractor for `multipart/form-data` requests.
 
-use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -15,6 +14,7 @@ use http_kit::utils::{Bytes, Stream as LiteStream};
 use http_kit::BodyError;
 use multer::Field as MulterField;
 use pin_project_lite::pin_project;
+use skyzen_core::{take_body_stream, BodyExtractorError, RequestBodyLimit};
 
 /// Extractor that parses `multipart/form-data` bodies.
 #[derive(Debug)]
@@ -22,11 +22,25 @@ pub struct Multipart {
     inner: multer::Multipart<'static>,
 }
 
+/// What a [`Multipart`] extraction can fail with: the body was unavailable, or it carried no
+/// usable boundary.
+pub type MultipartRejection = BodyExtractorError<MultipartBoundaryError>;
+
 impl Multipart {
-    fn from_parts(boundary: String, body: Body) -> Self {
-        Self {
-            inner: multer::Multipart::new(RequestBodyStream::new(body), boundary),
-        }
+    fn from_parts(boundary: String, body: Body, limit: RequestBodyLimit) -> Self {
+        let stream = RequestBodyStream::new(body);
+        let inner = match limit.max_bytes() {
+            // The whole multipart stream — every field plus the framing — shares the request's
+            // budget, so multer stops reading at the same point a buffering extractor would.
+            Some(max_bytes) => multer::Multipart::with_constraints(
+                stream,
+                boundary,
+                multer::Constraints::new()
+                    .size_limit(multer::SizeLimit::new().whole_stream(max_bytes as u64)),
+            ),
+            None => multer::Multipart::new(stream, boundary),
+        };
+        Self { inner }
     }
 
     /// Yields the next [`Field`] if available.
@@ -57,13 +71,17 @@ impl Multipart {
 )]
 pub struct MultipartBoundaryError(String);
 
+/// Streams the request body, so the [`RequestBodyLimit`] in force becomes a multer
+/// whole-stream constraint rather than a buffer cap; exceeding it surfaces as
+/// `413 Payload Too Large` from [`Multipart::next_field`].
 impl Extractor for Multipart {
-    type Error = MultipartBoundaryError;
+    type Error = MultipartRejection;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let boundary = boundary_from_headers(request.headers())?;
-
-        let body = mem::replace(request.body_mut(), Body::empty());
-        Ok(Self::from_parts(boundary, body))
+        let boundary =
+            boundary_from_headers(request.headers()).map_err(MultipartRejection::Parse)?;
+        let limit = RequestBodyLimit::of(request);
+        let body = take_body_stream::<Self>(request)?;
+        Ok(Self::from_parts(boundary, body, limit))
     }
 
     #[cfg(feature = "openapi")]
@@ -265,5 +283,26 @@ mod tests {
 
         let error = Multipart::extract(&mut request).await.unwrap_err();
         assert_eq!(error.status(), crate::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn the_body_limit_becomes_a_whole_stream_constraint() {
+        let boundary = "boundary";
+        let payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"greeting\"\r\n\r\nHello Skyzen!\r\n--{boundary}--\r\n"
+        );
+
+        let mut request = Request::new(Body::from_bytes(payload));
+        request.headers_mut().insert(
+            crate::header::CONTENT_TYPE,
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+        );
+        request
+            .extensions_mut()
+            .insert(skyzen_core::RequestBodyLimit::new(16));
+
+        let mut multipart = Multipart::extract(&mut request).await.unwrap();
+        let error = multipart.next_field().await.unwrap_err();
+        assert_eq!(error.status(), crate::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
