@@ -269,13 +269,20 @@ impl<E: Endpoint> RequestBuilder<E> {
         }
 
         let mut endpoint = self.endpoint;
+        // Capture the request identity before `respond` takes the request mutably.
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
         // Render endpoint errors exactly the way production server backends
         // do (see `skyzen_core::error_response`): 5xx bodies are redacted to
         // a generic message, everything else surfaces the error's display
-        // message as JSON.
+        // message as JSON. The log line is the shared one too, so a test can
+        // observe the same record production emits.
         let response: Response = match endpoint.respond(&mut request).await {
             Ok(resp) => resp,
-            Err(err) => skyzen_core::error_response(&err),
+            Err(err) => {
+                skyzen_core::log_endpoint_error(&err, &method, path.as_str());
+                skyzen_core::error_response(&err)
+            }
         };
 
         TestResponse::new(response).await

@@ -26,6 +26,52 @@ pub enum CfEventError {
     Decode(String),
 }
 
+/// Renders an error together with its `source()` chain, so one log line carries the whole cause.
+struct ErrorChain<'a>(&'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.0, f)?;
+        let mut source = self.0.source();
+        while let Some(cause) = source {
+            write!(f, ": {cause}")?;
+            source = cause.source();
+        }
+        Ok(())
+    }
+}
+
+/// Record a failing event handler before the error is thrown to the Workers runtime.
+///
+/// The platform only ever sees an unstructured string, so this is the framework's one chance to
+/// emit a structured record with the full cause chain — the same treatment HTTP errors get.
+fn log_event_error(error: &(dyn std::error::Error + 'static)) -> JsValue {
+    tracing::error!(error = %ErrorChain(error), "cloudflare event handler failed");
+    JsValue::from_str(&error.to_string())
+}
+
+/// Record a failing queue handler, naming the message ids the failure applies to.
+///
+/// Whether the batch is retried is decided by the platform from the thrown error, so the ids are
+/// the only way an operator can tell which messages were affected. They are read back from the
+/// batch; if the runtime refuses that lookup the error is still logged without them.
+fn log_queue_error(error: &(dyn std::error::Error + 'static), batch: &CfQueueBatch) -> JsValue {
+    let queue = batch.queue().ok();
+    let ids = batch.messages().ok().map(|messages| {
+        messages
+            .iter()
+            .map(|message| message.id().unwrap_or_else(|_| "<unknown>".to_owned()))
+            .collect::<Vec<_>>()
+    });
+    tracing::error!(
+        queue = queue.as_deref().unwrap_or("<unknown>"),
+        messages = ?ids,
+        error = %ErrorChain(error),
+        "cloudflare queue handler failed"
+    );
+    JsValue::from_str(&error.to_string())
+}
+
 /// Convert queue/scheduled handler results into a Cloudflare worker return type.
 pub trait IntoWorkerResult {
     /// Convert the handler output to a Cloudflare worker-compatible result.
@@ -44,10 +90,10 @@ impl IntoWorkerResult for () {
 
 impl<E> IntoWorkerResult for Result<(), E>
 where
-    E: std::fmt::Display,
+    E: std::error::Error + 'static,
 {
     fn into_worker_result(self) -> Result<(), JsValue> {
-        self.map_err(|error| JsValue::from_str(&error.to_string()))
+        self.map_err(|error| log_event_error(&error))
     }
 }
 
@@ -65,19 +111,19 @@ impl IntoQueueWorkerResult for () {
     fn into_queue_worker_result(self, batch: &CfQueueBatch) -> Result<(), JsValue> {
         batch
             .ack_all()
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+            .map_err(|error| log_queue_error(&error, batch))
     }
 }
 
 impl<E> IntoQueueWorkerResult for Result<(), E>
 where
-    E: std::fmt::Display,
+    E: std::error::Error + 'static,
 {
     fn into_queue_worker_result(self, batch: &CfQueueBatch) -> Result<(), JsValue> {
-        self.map_err(|error| JsValue::from_str(&error.to_string()))?;
+        self.map_err(|error| log_queue_error(&error, batch))?;
         batch
             .ack_all()
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+            .map_err(|error| log_queue_error(&error, batch))
     }
 }
 
@@ -85,19 +131,19 @@ impl IntoQueueWorkerResult for QueueBatchDisposition {
     fn into_queue_worker_result(self, batch: &CfQueueBatch) -> Result<(), JsValue> {
         batch
             .apply_disposition(self)
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+            .map_err(|error| log_queue_error(&error, batch))
     }
 }
 
 impl<E> IntoQueueWorkerResult for Result<QueueBatchDisposition, E>
 where
-    E: std::fmt::Display,
+    E: std::error::Error + 'static,
 {
     fn into_queue_worker_result(self, batch: &CfQueueBatch) -> Result<(), JsValue> {
-        let disposition = self.map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let disposition = self.map_err(|error| log_queue_error(&error, batch))?;
         batch
             .apply_disposition(disposition)
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+            .map_err(|error| log_queue_error(&error, batch))
     }
 }
 

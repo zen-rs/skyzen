@@ -11,7 +11,7 @@ use futures_core::Stream;
 use http_kit::http_error;
 use skyzen_core::Extractor;
 
-use crate::{Body, BodyError, Endpoint, HttpError, StatusCode};
+use crate::{Body, BodyError, Endpoint, StatusCode};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -166,50 +166,22 @@ where
     // Make WinterCG env available via request extensions
     sky_request.extensions_mut().insert(WasmEnv::new(env));
 
+    // Capture the request identity before `respond` takes the request mutably, so the error log
+    // can name the call that failed the way the native backends do.
+    let method = sky_request.method().clone();
+    let path = sky_request.uri().path().to_owned();
+
     let response = match endpoint.respond(&mut sky_request).await {
         Ok(response) => response,
-        Err(error) => error_to_response(&error),
+        Err(error) => {
+            // Log and render through the shared helpers so every backend emits the same fields
+            // and applies the same 4xx/5xx redaction policy.
+            skyzen_core::log_endpoint_error(&error, &method, path.as_str());
+            skyzen_core::error_response(&error)
+        }
     };
 
     convert_response(response)
-}
-
-/// Convert an `HttpError` to an HTTP response.
-///
-/// For server errors (5xx), the error message is hidden to avoid leaking internals.
-/// For client errors (4xx) and others, the error message is included in the response.
-fn error_to_response(error: &impl HttpError) -> crate::Response {
-    let status = error.status();
-    let error_message = error.to_string();
-
-    // For 5xx server errors, hide internal details
-    // For 4xx client errors and others, show the error message
-    let body_message = if status.is_server_error() {
-        tracing::error!(
-            status = status.as_u16(),
-            error = %error_message,
-            "Internal server error"
-        );
-        "Internal server error".to_string()
-    } else {
-        tracing::warn!(
-            status = status.as_u16(),
-            error = %error_message,
-            "Client error"
-        );
-        error_message
-    };
-
-    // Create JSON error response using serde_json for proper escaping
-    let body = serde_json::json!({ "error": body_message }).to_string();
-
-    let mut response = crate::Response::new(Body::from(body));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        http::header::HeaderValue::from_static("application/json"),
-    );
-    response
 }
 
 fn convert_request(request: &Request) -> Result<crate::Request, JsValue> {

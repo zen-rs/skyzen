@@ -84,6 +84,7 @@ pub use js_sys;
 pub use routing::{CreateRouteNode, Route};
 pub use skyzen_core::error::*;
 pub use skyzen_core::Server;
+pub use skyzen_core::{error_response, log_endpoint_error};
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use wasm_bindgen;

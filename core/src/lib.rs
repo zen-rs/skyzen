@@ -38,7 +38,7 @@ pub use server::Server;
 #[cfg(feature = "std")]
 mod net;
 #[cfg(feature = "std")]
-pub use net::{error_response, MissingRemoteAddr, PeerAddr};
+pub use net::{error_response, log_endpoint_error, MissingRemoteAddr, PeerAddr};
 #[cfg(feature = "openapi")]
 pub mod openapi;
 

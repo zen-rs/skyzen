@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{extract::PeerAddr, Endpoint, HttpError};
+use crate::{extract::PeerAddr, Endpoint};
 use async_channel::{bounded, Receiver};
 use async_net::TcpListener;
 use executor_core::{
@@ -550,27 +550,9 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                     response
                 }
                 Err(err) => {
-                    let status = err.status();
-                    if status.is_server_error() {
-                        error!(
-                            method = method.as_str(),
-                            path = path.as_str(),
-                            status = status.as_u16(),
-                            error = %err,
-                            "internal server error"
-                        );
-                    } else {
-                        warn!(
-                            method = method.as_str(),
-                            path = path.as_str(),
-                            status = status.as_u16(),
-                            error = %err,
-                            "client error"
-                        );
-                    }
-
-                    // Build the JSON error body via the shared serde-backed helper (5xx details are
-                    // hidden there) instead of ad-hoc string formatting.
+                    // Log and render through the shared helpers so every backend emits the same
+                    // fields and applies the same 4xx/5xx redaction policy.
+                    skyzen_core::log_endpoint_error(&err, &method, path.as_str());
                     skyzen_core::error_response(&err)
                 }
             };

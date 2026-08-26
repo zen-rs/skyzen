@@ -6,7 +6,7 @@
 
 use std::net::SocketAddr;
 
-use http_kit::{header, http_error, Body, HttpError, Request, Response, StatusCode};
+use http_kit::{header, http_error, Body, HttpError, Method, Request, Response, StatusCode};
 use serde::Serialize;
 
 use crate::Extractor;
@@ -55,6 +55,51 @@ impl Extractor for PeerAddr {
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
+}
+
+/// Renders an error together with its `source()` chain, so one log line carries the whole cause.
+struct ErrorChain<'a>(&'a dyn HttpError);
+
+impl core::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self.0, f)?;
+        let mut source = self.0.source();
+        while let Some(cause) = source {
+            write!(f, ": {cause}")?;
+            source = cause.source();
+        }
+        Ok(())
+    }
+}
+
+/// Emit the endpoint-error log line that every Skyzen backend shares.
+///
+/// Server (5xx) errors log at `error`, everything else at `warn`, and both carry the request's
+/// method and path plus the error's full `source()` chain — the chain is the only place the
+/// detail survives for a 5xx, whose response body is redacted.
+///
+/// Backends call this immediately before [`error_response`] so the operator-facing record and the
+/// client-facing body are produced by the same policy in every runtime.
+pub fn log_endpoint_error(error: &dyn HttpError, method: &Method, path: &str) {
+    let status = error.status();
+    let chain = ErrorChain(error);
+    if status.is_server_error() {
+        tracing::error!(
+            method = method.as_str(),
+            path,
+            status = status.as_u16(),
+            error = %chain,
+            "internal server error"
+        );
+    } else {
+        tracing::warn!(
+            method = method.as_str(),
+            path,
+            status = status.as_u16(),
+            error = %chain,
+            "client error"
+        );
+    }
 }
 
 /// Convert an endpoint error into an HTTP response carrying a JSON body.

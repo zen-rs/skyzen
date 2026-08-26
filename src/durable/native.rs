@@ -26,7 +26,7 @@ use super::{
     DurableConnections, DurableConnectionsInner, DurableObject, DurableObjectError,
     DurableObjectId, WebSocketConnection,
 };
-use crate::{Body, Endpoint, HttpError, Method, Request, Response};
+use crate::{Body, Endpoint, Method, Request, Response};
 
 const ALARM_REQUEST_PATH: &str = "/__skyzen_alarm";
 
@@ -308,11 +308,19 @@ where
             slot.load_object::<T>()?
         };
 
+        // Capture the request identity before `respond` takes the request mutably, so the error
+        // log can name the call that failed the way the HTTP backends do.
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+
         let response = {
             let mut endpoint = object.fetch();
             match endpoint.respond(&mut request).await {
                 Ok(response) => response,
-                Err(error) => error_to_response(&error),
+                Err(error) => {
+                    skyzen_core::log_endpoint_error(&error, &method, path.as_str());
+                    skyzen_core::error_response(&error)
+                }
             }
         };
 
@@ -435,27 +443,6 @@ fn alarm_request() -> Result<Request, http::Error> {
     *request.method_mut() = Method::POST;
     *request.uri_mut() = ALARM_REQUEST_PATH.parse()?;
     Ok(request)
-}
-
-fn error_to_response(error: &dyn HttpError) -> Response {
-    let status = error.status();
-    let message = error.to_string();
-
-    let body = if status.is_server_error() {
-        tracing::error!(status = status.as_u16(), error = %message, "durable fetch internal error");
-        serde_json::json!({ "error": "Internal server error" }).to_string()
-    } else {
-        tracing::warn!(status = status.as_u16(), error = %message, "durable fetch client error");
-        serde_json::json!({ "error": message }).to_string()
-    };
-
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        crate::header::CONTENT_TYPE,
-        crate::header::HeaderValue::from_static("application/json"),
-    );
-    response
 }
 
 fn lock_poisoned<T>(_: T) -> DurableObjectError {
