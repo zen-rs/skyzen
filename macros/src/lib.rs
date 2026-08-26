@@ -236,6 +236,18 @@ pub fn durable_object(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Error helper that implements `Display`, `Error`, and `HttpError`.
+///
+/// On a **struct**, `message = "..."` is required and supplies the `Display` text; `status = ...`
+/// sets the HTTP status (default `500`).
+///
+/// On an **enum**, every variant carries its own `#[error("...", status = ...)]`, and an
+/// enum-level `status = ...` supplies the default those variants override. An enum-level
+/// `message` is rejected, because a per-variant message is always required and an enum-level one
+/// could never be used.
+///
+/// A single field may be marked `#[source]` to become the error's cause, or `#[from]` to be both
+/// the cause and the input of a generated `From` conversion. `#[from]` requires the variant (or
+/// struct) to have exactly one field.
 #[proc_macro_attribute]
 pub fn error(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as ErrorArgs);
