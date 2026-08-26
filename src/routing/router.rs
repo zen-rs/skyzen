@@ -1629,6 +1629,32 @@ mod tests {
         assert_eq!(body, "/search q=rust");
     }
 
+    #[tokio::test]
+    async fn a_router_mounted_at_the_root_or_a_trailing_slash_still_routes() {
+        async fn echo(uri: crate::Uri) -> Result<String> {
+            Ok(uri.path().to_owned())
+        }
+
+        for prefix in ["/", "/api/"] {
+            let inner = build(Route::new(("/users".at(echo),))).unwrap();
+            let router = build(Route::new((prefix.nest(inner),))).unwrap();
+
+            let path = if prefix == "/" {
+                "/users"
+            } else {
+                "/api/users"
+            };
+            let response = router.clone().go(get_request(path)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a router mounted at `{prefix}` should answer `{path}`"
+            );
+            let body = response.into_body().into_string().await.unwrap();
+            assert_eq!(body, "/users", "mounted at `{prefix}`");
+        }
+    }
+
     #[test]
     fn a_router_cannot_be_mounted_under_a_pattern_prefix() {
         let inner = build(Route::new(("/x".at(|| async { Result::Ok("x") }),))).unwrap();
