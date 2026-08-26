@@ -5,6 +5,9 @@ mod query;
 #[cfg(feature = "query")]
 pub use query::Query;
 
+mod path;
+pub use path::{Path, PathError};
+
 pub mod client_ip;
 pub use client_ip::{ClientIp, PeerAddr};
 
