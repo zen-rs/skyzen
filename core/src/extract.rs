@@ -115,64 +115,68 @@ pub trait Extractor: Sized + Send + Sync + 'static {
 }
 
 macro_rules! impl_tuple_extractor {
-    ($($ty:ident),*) => {
+    // The unit tuple extracts nothing, so its body has nothing to await and no variant to carry an
+    // error. It is written out separately rather than folded into the variadic arm below, which
+    // would generate an `async fn` with no `.await` and an uninhabited error enum with no variants.
+    () => {
+        /// A handler taking no arguments still names an extractor: the empty tuple, which reads
+        /// nothing from the request and cannot fail.
+        impl Extractor for () {
+            type Error = Infallible;
+            fn extract(
+                _request: &mut Request,
+            ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+                core::future::ready(Ok(()))
+            }
+        }
+    };
+    ($($ty:ident),+) => {
         const _:() = {
             // To prevent these macro-generated errors from overwhelming users.
             #[doc(hidden)]
-            pub enum TupleExtractorError<$($ty:Extractor),*> {
-                $($ty(<$ty as Extractor>::Error),)*
+            pub enum TupleExtractorError<$($ty:Extractor),+> {
+                $($ty(<$ty as Extractor>::Error),)+
             }
 
-            impl <$($ty: Extractor),*>core::fmt::Display for TupleExtractorError<$($ty),*> {
-                #[allow(unused_variables)]
+            impl <$($ty: Extractor),+>core::fmt::Display for TupleExtractorError<$($ty),+> {
                 fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                     match self {
-                        $(TupleExtractorError::$ty(e) => write!(f,"{}",e),)*
-                        #[allow(unreachable_patterns)]
-                        _ => unreachable!(),
+                        $(TupleExtractorError::$ty(e) => write!(f,"{}",e),)+
                     }
                 }
             }
 
-            impl <$($ty: Extractor),*>core::fmt::Debug for TupleExtractorError<$($ty),*> {
-                #[allow(unused_variables)]
+            impl <$($ty: Extractor),+>core::fmt::Debug for TupleExtractorError<$($ty),+> {
                 fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                     match self {
-                        $(TupleExtractorError::$ty(e) => write!(f,"{:?}",e),)*
-                        #[allow(unreachable_patterns)]
-                        _ => unreachable!(),
+                        $(TupleExtractorError::$ty(e) => write!(f,"{:?}",e),)+
                     }
                 }
             }
 
-            impl <$($ty: Extractor),*>core::error::Error for TupleExtractorError<$($ty),*> {}
+            impl <$($ty: Extractor),+>core::error::Error for TupleExtractorError<$($ty),+> {}
 
-            impl <$($ty: Extractor),*>http_kit::HttpError for TupleExtractorError<$($ty),*> {
+            impl <$($ty: Extractor),+>http_kit::HttpError for TupleExtractorError<$($ty),+> {
                 fn status(&self) -> http_kit::StatusCode {
                     match self {
-                        $(TupleExtractorError::$ty(e) => e.status(),)*
-                        #[allow(unreachable_patterns)]
-                        _ => unreachable!(),
+                        $(TupleExtractorError::$ty(e) => e.status(),)+
                     }
                 }
             }
 
 
             #[allow(non_snake_case)]
-            #[allow(unused_variables)]
-            #[allow(clippy::unused_unit)]
-            impl<$($ty:Extractor,)*> Extractor for ($($ty,)*) {
-                type Error = TupleExtractorError<$($ty),*>;
+            impl<$($ty:Extractor,)+> Extractor for ($($ty,)+) {
+                type Error = TupleExtractorError<$($ty),+>;
                 async fn extract(request:&mut Request) -> Result<Self,Self::Error>{
                     Ok(($($ty::extract(request).await.map_err(|error|{
                         TupleExtractorError::$ty(error)
-                    })?,)*))
+                    })?,)+))
                 }
 
                 fn requirements() -> alloc::vec::Vec<crate::extract::Requirement> {
-                    #[allow(unused_mut)]
                     let mut requirements = alloc::vec::Vec::new();
-                    $(requirements.extend(<$ty as Extractor>::requirements());)*
+                    $(requirements.extend(<$ty as Extractor>::requirements());)+
                     requirements
                 }
 
@@ -188,7 +192,7 @@ macro_rules! impl_tuple_extractor {
                 fn register_openapi_schemas(
                     defs: &mut alloc::collections::BTreeMap<String, crate::openapi::SchemaRef>,
                 ) {
-                    $(<$ty as Extractor>::register_openapi_schemas(defs);)*
+                    $(<$ty as Extractor>::register_openapi_schemas(defs);)+
                 }
             }
         };
@@ -261,8 +265,8 @@ impl Extractor for String {
 /// takes the body, so a later body-consuming extractor in the same signature is rejected.
 impl Extractor for Body {
     type Error = BodyAlreadyConsumed;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        take_body_stream::<Self>(request)
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(take_body_stream::<Self>(request))
     }
 
     #[cfg(feature = "openapi")]
@@ -279,22 +283,22 @@ impl Extractor for Body {
 /// merges a `HeaderMap` into the response.
 impl Extractor for HeaderMap {
     type Error = Infallible;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(request.headers().clone())
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(Ok(request.headers().clone()))
     }
 }
 
 impl Extractor for Uri {
     type Error = Infallible;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(request.uri().clone())
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(Ok(request.uri().clone()))
     }
 }
 
 impl Extractor for Method {
     type Error = Infallible;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(request.method().clone())
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(Ok(request.method().clone()))
     }
 }
 

@@ -259,13 +259,14 @@ mod tests {
     use super::{
         DurableKv, DurableKvError, DurableKvNotConfigured, DurableKvStore, DurableListOptions,
     };
+    use core::future::{ready, Future};
     use http_kit::{Body, Endpoint, HttpError, Response};
     use serde::{Deserialize, Serialize};
     use skyzen_core::Extractor;
     use std::{
         collections::BTreeMap,
         convert::Infallible,
-        sync::{Arc, RwLock},
+        sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
     };
 
     #[derive(Clone, Default)]
@@ -273,89 +274,24 @@ mod tests {
         data: Arc<RwLock<BTreeMap<String, Vec<u8>>>>,
     }
 
-    impl DurableKvStore for InMemoryDurableKvStore {
-        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, DurableKvError> {
-            let data = self
-                .data
+    impl InMemoryDurableKvStore {
+        fn read(&self) -> Result<RwLockReadGuard<'_, BTreeMap<String, Vec<u8>>>, DurableKvError> {
+            self.data
                 .read()
-                .map_err(|_| DurableKvError::backend("lock poisoned"))?;
-            Ok(data.get(key).cloned())
+                .map_err(|_| DurableKvError::backend("lock poisoned"))
         }
 
-        async fn get_multiple(
-            &self,
-            keys: &[&str],
-        ) -> Result<Vec<(String, Vec<u8>)>, DurableKvError> {
-            let data = self
-                .data
-                .read()
-                .map_err(|_| DurableKvError::backend("lock poisoned"))?;
-            Ok(keys
-                .iter()
-                .filter_map(|key| {
-                    data.get(*key)
-                        .map(|value| ((*key).to_owned(), value.clone()))
-                })
-                .collect())
-        }
-
-        async fn put(&self, key: &str, value: &[u8]) -> Result<(), DurableKvError> {
+        fn write(&self) -> Result<RwLockWriteGuard<'_, BTreeMap<String, Vec<u8>>>, DurableKvError> {
             self.data
                 .write()
-                .map_err(|_| DurableKvError::backend("lock poisoned"))?
-                .insert(key.to_owned(), value.to_vec());
-            Ok(())
+                .map_err(|_| DurableKvError::backend("lock poisoned"))
         }
 
-        async fn put_multiple(&self, entries: &[(&str, &[u8])]) -> Result<(), DurableKvError> {
-            {
-                let mut data = self
-                    .data
-                    .write()
-                    .map_err(|_| DurableKvError::backend("lock poisoned"))?;
-                for (key, value) in entries {
-                    data.insert((*key).to_owned(), value.to_vec());
-                }
-            }
-            Ok(())
-        }
-
-        async fn delete(&self, key: &str) -> Result<bool, DurableKvError> {
-            Ok(self
-                .data
-                .write()
-                .map_err(|_| DurableKvError::backend("lock poisoned"))?
-                .remove(key)
-                .is_some())
-        }
-
-        async fn delete_multiple(&self, keys: &[&str]) -> Result<usize, DurableKvError> {
-            let mut data = self
-                .data
-                .write()
-                .map_err(|_| DurableKvError::backend("lock poisoned"))?;
-            Ok(keys
-                .iter()
-                .filter(|key| data.remove(**key).is_some())
-                .count())
-        }
-
-        async fn delete_all(&self) -> Result<(), DurableKvError> {
-            self.data
-                .write()
-                .map_err(|_| DurableKvError::backend("lock poisoned"))?
-                .clear();
-            Ok(())
-        }
-
-        async fn list(
+        fn list_entries(
             &self,
-            options: DurableListOptions<'_>,
+            options: &DurableListOptions<'_>,
         ) -> Result<Vec<(String, Vec<u8>)>, DurableKvError> {
-            let data = self
-                .data
-                .read()
-                .map_err(|_| DurableKvError::backend("lock poisoned"))?;
+            let data = self.read()?;
             let iter: Box<dyn Iterator<Item = (&String, &Vec<u8>)>> = if options.reverse {
                 Box::new(data.iter().rev())
             } else {
@@ -371,6 +307,78 @@ mod tests {
                 .take(options.limit.unwrap_or(usize::MAX))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect())
+        }
+    }
+
+    // A `BTreeMap` behind a lock answers every call synchronously, so the futures are ready on
+    // creation rather than `async` blocks with nothing to await.
+    impl DurableKvStore for InMemoryDurableKvStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl Future<Output = Result<Option<Vec<u8>>, DurableKvError>> + Send {
+            ready(self.read().map(|data| data.get(key).cloned()))
+        }
+
+        fn get_multiple(
+            &self,
+            keys: &[&str],
+        ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + Send {
+            ready(self.read().map(|data| {
+                keys.iter()
+                    .filter_map(|key| {
+                        data.get(*key)
+                            .map(|value| ((*key).to_owned(), value.clone()))
+                    })
+                    .collect()
+            }))
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: &[u8],
+        ) -> impl Future<Output = Result<(), DurableKvError>> + Send {
+            ready(self.write().map(|mut data| {
+                data.insert(key.to_owned(), value.to_vec());
+            }))
+        }
+
+        fn put_multiple(
+            &self,
+            entries: &[(&str, &[u8])],
+        ) -> impl Future<Output = Result<(), DurableKvError>> + Send {
+            ready(self.write().map(|mut data| {
+                for (key, value) in entries {
+                    data.insert((*key).to_owned(), value.to_vec());
+                }
+            }))
+        }
+
+        fn delete(&self, key: &str) -> impl Future<Output = Result<bool, DurableKvError>> + Send {
+            ready(self.write().map(|mut data| data.remove(key).is_some()))
+        }
+
+        fn delete_multiple(
+            &self,
+            keys: &[&str],
+        ) -> impl Future<Output = Result<usize, DurableKvError>> + Send {
+            ready(self.write().map(|mut data| {
+                keys.iter()
+                    .filter(|key| data.remove(**key).is_some())
+                    .count()
+            }))
+        }
+
+        fn delete_all(&self) -> impl Future<Output = Result<(), DurableKvError>> + Send {
+            ready(self.write().map(|mut data| data.clear()))
+        }
+
+        fn list(
+            &self,
+            options: DurableListOptions<'_>,
+        ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + Send {
+            ready(self.list_entries(&options))
         }
     }
 

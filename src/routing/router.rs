@@ -1,3 +1,4 @@
+use core::future::{ready, Future};
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -167,12 +168,14 @@ impl std::ops::Deref for AllowedMethods {
 
 impl Extractor for AllowedMethods {
     type Error = Infallible;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(request
+    // Reading the set back out of the extensions is a synchronous clone, so the future is ready on
+    // creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(Ok(request
             .extensions()
             .get::<Self>()
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default()))
     }
 }
 
@@ -427,13 +430,16 @@ http_error!(pub RouterNotExist, StatusCode::INTERNAL_SERVER_ERROR, "Router not a
 
 impl Extractor for Router {
     type Error = RouterNotExist;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let router = request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or(RouterNotExist::new())?;
-        Ok(router)
+    // Reading the router back out of the extensions is a synchronous clone, so the future is ready
+    // on creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(
+            request
+                .extensions()
+                .get::<Self>()
+                .cloned()
+                .ok_or(RouterNotExist::new()),
+        )
     }
 }
 

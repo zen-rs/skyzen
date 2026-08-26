@@ -1,5 +1,6 @@
 use crate::{extract::Extractor, Request, StatusCode};
 
+use core::future::{ready, Future};
 use serde::de::DeserializeOwned;
 use serde_html_form::from_str;
 
@@ -24,12 +25,14 @@ pub struct QueryError(String);
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
     type Error = QueryError;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+    // The query string is already on the request, so the future is ready on creation rather than
+    // an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
         let data = request.uri().query().unwrap_or_default();
-        Ok(Self(from_str(data).map_err(|error| {
+        ready(from_str(data).map(Self).map_err(|error| {
             tracing::debug!(%error, "failed to parse query string");
             QueryError(error.to_string())
-        })?))
+        }))
     }
 
     #[cfg(feature = "openapi")]

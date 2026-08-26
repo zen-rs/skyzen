@@ -1,5 +1,6 @@
 //! OpenAPI helpers powered by `utoipa` schemas.
 
+use core::future::{ready, Future};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::{
@@ -693,8 +694,13 @@ http_error!(
 
 impl Endpoint for OpenApiRedocEndpoint {
     type Error = OpenApiRedocDisabledError;
-    async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-        self.html.as_ref().map_or_else(
+    // The document is rendered at build time, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn respond(
+        &mut self,
+        _request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ready(self.html.as_ref().map_or_else(
             || Err(OpenApiRedocDisabledError::new()),
             |html| {
                 let mut response = Response::new(Body::from(html.as_bytes().to_vec()));
@@ -704,7 +710,7 @@ impl Endpoint for OpenApiRedocEndpoint {
                 );
                 Ok(response)
             },
-        )
+        ))
     }
 }
 

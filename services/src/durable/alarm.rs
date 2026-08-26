@@ -103,6 +103,7 @@ impl Alarm {
 #[cfg(test)]
 mod tests {
     use super::{Alarm, AlarmError, AlarmNotConfigured, AlarmScheduler};
+    use core::future::{ready, Future};
     use http_kit::{Body, Endpoint, HttpError, Response};
     use skyzen_core::Extractor;
     use std::{
@@ -115,29 +116,36 @@ mod tests {
         scheduled: Arc<RwLock<Option<i64>>>,
     }
 
+    impl InMemoryAlarmScheduler {
+        fn store(&self, scheduled_time_ms: Option<i64>) -> Result<(), AlarmError> {
+            self.scheduled
+                .write()
+                .map_err(|_| AlarmError::backend("lock poisoned"))
+                .map(|mut scheduled| *scheduled = scheduled_time_ms)
+        }
+    }
+
+    // A single `Option` behind a lock answers every call synchronously, so the futures are ready
+    // on creation rather than `async` blocks with nothing to await.
     impl AlarmScheduler for InMemoryAlarmScheduler {
-        async fn get_alarm(&self) -> Result<Option<i64>, AlarmError> {
-            let scheduled = self
-                .scheduled
-                .read()
-                .map_err(|_| AlarmError::backend("lock poisoned"))?;
-            Ok(*scheduled)
+        fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, AlarmError>> + Send {
+            ready(
+                self.scheduled
+                    .read()
+                    .map_err(|_| AlarmError::backend("lock poisoned"))
+                    .map(|scheduled| *scheduled),
+            )
         }
 
-        async fn set_alarm(&self, scheduled_time_ms: i64) -> Result<(), AlarmError> {
-            *self
-                .scheduled
-                .write()
-                .map_err(|_| AlarmError::backend("lock poisoned"))? = Some(scheduled_time_ms);
-            Ok(())
+        fn set_alarm(
+            &self,
+            scheduled_time_ms: i64,
+        ) -> impl Future<Output = Result<(), AlarmError>> + Send {
+            ready(self.store(Some(scheduled_time_ms)))
         }
 
-        async fn delete_alarm(&self) -> Result<(), AlarmError> {
-            *self
-                .scheduled
-                .write()
-                .map_err(|_| AlarmError::backend("lock poisoned"))? = None;
-            Ok(())
+        fn delete_alarm(&self) -> impl Future<Output = Result<(), AlarmError>> + Send {
+            ready(self.store(None))
         }
     }
 

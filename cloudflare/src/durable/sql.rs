@@ -1,5 +1,6 @@
 //! Cloudflare Durable Object `SQLite` adapter for [`DurableDbBackend`].
 
+use core::future::{ready, Future};
 use serde_json::Value;
 use skyzen_services::{
     durable::sql::{DurableDbBackend, DurableDbError},
@@ -35,8 +36,12 @@ impl CfDurableDb {
     }
 }
 
-impl DurableDbBackend for CfDurableDb {
-    async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+impl CfDurableDb {
+    /// Run one statement against the Durable Object's `SQLite` storage.
+    ///
+    /// The storage API is synchronous, so this does the whole job; the trait methods only wrap the
+    /// result in a ready future.
+    fn exec(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
         let bindings = js_sys::Array::new();
         for value in params {
             bindings.push(&db_value_to_js(value)?);
@@ -60,17 +65,29 @@ impl DurableDbBackend for CfDurableDb {
             rows_written: f64_to_u64(cursor.rows_written(), "rowsWritten")?,
         })
     }
+}
 
-    async fn execute(
+// The Durable Object storage API is synchronous, so each future is ready on creation rather than
+// an `async` block with nothing to await.
+impl DurableDbBackend for CfDurableDb {
+    fn query(
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> Result<DbExecResult, DurableDbError> {
-        self.query(query, params).await
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+        ready(self.exec(query, params))
     }
 
-    async fn database_size(&self) -> Result<u64, DurableDbError> {
-        f64_to_u64(self.sql.database_size(), "databaseSize")
+    fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+        ready(self.exec(query, params))
+    }
+
+    fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
+        ready(f64_to_u64(self.sql.database_size(), "databaseSize"))
     }
 }
 

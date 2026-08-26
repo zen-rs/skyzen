@@ -1,5 +1,6 @@
 //! In-memory object storage for testing.
 
+use core::future::{ready, Future};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -138,94 +139,117 @@ fn metadata_for(key: &str, object: &StoredObject) -> ObjectMetadata {
     }
 }
 
+// A `HashMap` behind a lock answers every call but `put_stream` synchronously, so those futures
+// are ready on creation rather than `async` blocks with nothing to await.
 impl ObjectStorage for InMemoryStorage {
-    async fn get(&self, key: &str) -> Result<Option<StorageObject>, StorageError> {
-        self.take_injected_failure()?;
-        let data = self.data.read().expect("InMemoryStorage lock poisoned");
-        Ok(data.get(key).map(|object| StorageObject {
-            metadata: metadata_for(key, object),
-            body: object.body.clone(),
+    fn get(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<StorageObject>, StorageError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let data = self.data.read().expect("InMemoryStorage lock poisoned");
+            data.get(key).map(|object| StorageObject {
+                metadata: metadata_for(key, object),
+                body: object.body.clone(),
+            })
         }))
     }
 
-    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StorageError> {
-        self.take_injected_failure()?;
-        self.insert(key, body, PutOptions::default());
-        Ok(())
+    fn put(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        ready(
+            self.take_injected_failure()
+                .map(|()| self.insert(key, body, PutOptions::default())),
+        )
     }
 
-    async fn put_with(
+    fn put_with(
         &self,
         key: &str,
         body: Vec<u8>,
         options: PutOptions,
-    ) -> Result<(), StorageError> {
-        self.take_injected_failure()?;
-        self.insert(key, body, options);
-        Ok(())
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        ready(
+            self.take_injected_failure()
+                .map(|()| self.insert(key, body, options)),
+        )
     }
 
-    async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        self.take_injected_failure()?;
-        self.data
-            .write()
-            .expect("InMemoryStorage lock poisoned")
-            .remove(key);
-        Ok(())
+    fn delete(&self, key: &str) -> impl Future<Output = Result<(), StorageError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            self.data
+                .write()
+                .expect("InMemoryStorage lock poisoned")
+                .remove(key);
+        }))
     }
 
-    async fn list(&self, options: ListOptions) -> Result<ListResult, StorageError> {
-        self.take_injected_failure()?;
-        let data = self.data.read().expect("InMemoryStorage lock poisoned");
-        let mut objects: Vec<ObjectMetadata> = data
-            .iter()
-            .filter(|(key, _)| {
-                options
-                    .prefix
-                    .as_ref()
-                    .is_none_or(|prefix| key.starts_with(prefix))
-            })
-            .filter(|(key, _)| {
-                // The cursor is the last key of the previous page; resume
-                // strictly after it.
-                options
-                    .cursor
-                    .as_ref()
-                    .is_none_or(|cursor| key.as_str() > cursor.as_str())
-            })
-            .map(|(key, object)| metadata_for(key, object))
-            .collect();
-        drop(data);
+    fn list(
+        &self,
+        options: ListOptions,
+    ) -> impl Future<Output = Result<ListResult, StorageError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let data = self.data.read().expect("InMemoryStorage lock poisoned");
+            let mut objects: Vec<ObjectMetadata> = data
+                .iter()
+                .filter(|(key, _)| {
+                    options
+                        .prefix
+                        .as_ref()
+                        .is_none_or(|prefix| key.starts_with(prefix))
+                })
+                .filter(|(key, _)| {
+                    // The cursor is the last key of the previous page; resume
+                    // strictly after it.
+                    options
+                        .cursor
+                        .as_ref()
+                        .is_none_or(|cursor| key.as_str() > cursor.as_str())
+                })
+                .map(|(key, object)| metadata_for(key, object))
+                .collect();
+            drop(data);
 
-        objects.sort_by(|a, b| a.key.cmp(&b.key));
+            objects.sort_by(|a, b| a.key.cmp(&b.key));
 
-        let mut cursor = None;
-        if let Some(limit) = options.limit {
-            if objects.len() > limit {
-                objects.truncate(limit);
-                cursor = objects.last().map(|object| object.key.clone());
+            let mut cursor = None;
+            if let Some(limit) = options.limit {
+                if objects.len() > limit {
+                    objects.truncate(limit);
+                    cursor = objects.last().map(|object| object.key.clone());
+                }
             }
-        }
 
-        Ok(ListResult { objects, cursor })
+            ListResult { objects, cursor }
+        }))
     }
 
-    async fn head(&self, key: &str) -> Result<Option<ObjectMetadata>, StorageError> {
-        self.take_injected_failure()?;
-        let data = self.data.read().expect("InMemoryStorage lock poisoned");
-        Ok(data.get(key).map(|object| metadata_for(key, object)))
+    fn head(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<ObjectMetadata>, StorageError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let data = self.data.read().expect("InMemoryStorage lock poisoned");
+            data.get(key).map(|object| metadata_for(key, object))
+        }))
     }
 
     /// Stream the stored buffer back as a single chunk.
     ///
     /// The mock has nothing to chunk over, so the stream yields once; what it exercises is the
     /// caller's streaming path, not the backend's.
-    async fn get_stream(&self, key: &str) -> Result<Option<StorageStream>, StorageError> {
-        self.take_injected_failure()?;
-        let data = self.data.read().expect("InMemoryStorage lock poisoned");
-        Ok(data
-            .get(key)
-            .map(|object| StorageStream::once(object.body.clone())))
+    fn get_stream(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<StorageStream>, StorageError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let data = self.data.read().expect("InMemoryStorage lock poisoned");
+            data.get(key)
+                .map(|object| StorageStream::once(object.body.clone()))
+        }))
     }
 
     /// Drain the stream into a buffer and store it.
@@ -253,72 +277,77 @@ impl ObjectStorage for InMemoryStorage {
         Ok(())
     }
 
-    async fn get_range(
+    fn get_range(
         &self,
         key: &str,
         range: ByteRange,
-    ) -> Result<Option<StorageObject>, StorageError> {
-        self.take_injected_failure()?;
-        let stored = {
-            let data = self.data.read().expect("InMemoryStorage lock poisoned");
-            data.get(key).cloned()
-        };
-        let Some(object) = stored else {
-            return Ok(None);
-        };
+    ) -> impl Future<Output = Result<Option<StorageObject>, StorageError>> + Send {
+        ready(self.take_injected_failure().and_then(|()| {
+            let stored = {
+                let data = self.data.read().expect("InMemoryStorage lock poisoned");
+                data.get(key).cloned()
+            };
+            let Some(object) = stored else {
+                return Ok(None);
+            };
 
-        let total = object.body.len() as u64;
-        let resolved = range.resolve(total).ok_or_else(|| {
-            StorageError::Io(format!(
-                "range {range:?} selects nothing in an object of {total} bytes"
-            ))
-        })?;
-        // `resolve` clamps both ends to the buffer's own length, so neither conversion can fail.
-        let bounds = usize::try_from(resolved.start)
-            .and_then(|start| usize::try_from(resolved.end).map(|end| start..end));
-        let bounds = bounds.map_err(|_| {
-            StorageError::Io(format!(
-                "range {range:?} does not fit this platform's usize"
-            ))
-        })?;
+            let total = object.body.len() as u64;
+            let resolved = range.resolve(total).ok_or_else(|| {
+                StorageError::Io(format!(
+                    "range {range:?} selects nothing in an object of {total} bytes"
+                ))
+            })?;
+            // `resolve` clamps both ends to the buffer's own length, so neither conversion can
+            // fail.
+            let bounds = usize::try_from(resolved.start)
+                .and_then(|start| usize::try_from(resolved.end).map(|end| start..end));
+            let bounds = bounds.map_err(|_| {
+                StorageError::Io(format!(
+                    "range {range:?} does not fit this platform's usize"
+                ))
+            })?;
 
-        // The metadata keeps reporting the whole object's size so a caller can build a
-        // `Content-Range` from the pair.
-        Ok(Some(StorageObject {
-            body: object.body[bounds].to_vec(),
-            metadata: metadata_for(key, &object),
+            // The metadata keeps reporting the whole object's size so a caller can build a
+            // `Content-Range` from the pair.
+            Ok(Some(StorageObject {
+                body: object.body[bounds].to_vec(),
+                metadata: metadata_for(key, &object),
+            }))
         }))
     }
 
-    async fn presign_get(
+    fn presign_get(
         &self,
         key: &str,
         expires_in: Duration,
-    ) -> Result<PresignedRequest, StorageError> {
-        self.take_injected_failure()?;
-        Ok(presigned(Method::GET, key, expires_in))
+    ) -> impl Future<Output = Result<PresignedRequest, StorageError>> + Send {
+        ready(
+            self.take_injected_failure()
+                .map(|()| presigned(Method::GET, key, expires_in)),
+        )
     }
 
-    async fn presign_put(
+    fn presign_put(
         &self,
         key: &str,
         expires_in: Duration,
         options: PutOptions,
-    ) -> Result<PresignedRequest, StorageError> {
-        self.take_injected_failure()?;
-        // Only the content type turns into a header the presigned request can carry; anything
-        // further would have to be dropped, so it is refused instead.
-        options.reject_unsupported(&[])?;
-        let mut request = presigned(Method::PUT, key, expires_in);
-        if let Some(content_type) = options.content_type {
-            let value = HeaderValue::from_str(&content_type).map_err(|error| {
-                StorageError::Io(format!(
-                    "content type {content_type:?} is not a header value: {error}"
-                ))
-            })?;
-            request.headers.push((header::CONTENT_TYPE, value));
-        }
-        Ok(request)
+    ) -> impl Future<Output = Result<PresignedRequest, StorageError>> + Send {
+        ready(self.take_injected_failure().and_then(|()| {
+            // Only the content type turns into a header the presigned request can carry; anything
+            // further would have to be dropped, so it is refused instead.
+            options.reject_unsupported(&[])?;
+            let mut request = presigned(Method::PUT, key, expires_in);
+            if let Some(content_type) = options.content_type {
+                let value = HeaderValue::from_str(&content_type).map_err(|error| {
+                    StorageError::Io(format!(
+                        "content type {content_type:?} is not a header value: {error}"
+                    ))
+                })?;
+                request.headers.push((header::CONTENT_TYPE, value));
+            }
+            Ok(request)
+        }))
     }
 }
 

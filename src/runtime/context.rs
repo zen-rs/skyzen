@@ -1,6 +1,9 @@
 //! The request's execution context — work that outlives the response.
 
-use core::{fmt, future::Future};
+use core::{
+    fmt,
+    future::{ready, Future},
+};
 
 use http_kit::http_error;
 use skyzen_core::Extractor;
@@ -74,12 +77,18 @@ pub struct WorkerContext(Inner);
 impl Extractor for WorkerContext {
     type Error = WorkerContextNotConfigured;
 
-    async fn extract(request: &mut crate::Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or_else(WorkerContextNotConfigured::new)
+    // Reading the context back out of the extensions is a synchronous clone, so the future is
+    // ready on creation rather than an `async` block with nothing to await.
+    fn extract(
+        request: &mut crate::Request,
+    ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(
+            request
+                .extensions()
+                .get::<Self>()
+                .cloned()
+                .ok_or_else(WorkerContextNotConfigured::new),
+        )
     }
 }
 

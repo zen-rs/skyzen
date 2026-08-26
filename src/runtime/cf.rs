@@ -7,6 +7,7 @@
 //! extensions for [`CfProperties`] to extract.
 
 use core::fmt;
+use core::future::{ready, Future};
 
 use serde::Deserialize;
 use skyzen_core::Extractor;
@@ -141,8 +142,12 @@ pub struct CfPropertiesSlot(pub Result<CfProperties, String>);
 impl Extractor for CfProperties {
     type Error = CfPropertiesUnavailable;
 
-    async fn extract(request: &mut crate::Request) -> Result<Self, Self::Error> {
-        match request.extensions().get::<CfPropertiesSlot>() {
+    // The properties were decoded during request conversion, so the future is ready on creation
+    // rather than an `async` block with nothing to await.
+    fn extract(
+        request: &mut crate::Request,
+    ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(match request.extensions().get::<CfPropertiesSlot>() {
             Some(CfPropertiesSlot(Ok(properties))) => Ok(properties.clone()),
             Some(CfPropertiesSlot(Err(error))) => Err(CfPropertiesUnavailable(
                 "the runtime sent a `request.cf` object this build could not decode",
@@ -153,7 +158,7 @@ impl Extractor for CfProperties {
                  other WinterCG host",
                 None,
             )),
-        }
+        })
     }
 }
 

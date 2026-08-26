@@ -3,10 +3,10 @@
 //! This module provides WebSocket support for WinterCG-compatible runtimes
 //! (like Cloudflare Workers) using the `WebSocketPair` API.
 
-// Futures here hold JS handles, which are single-threaded by design, and several
-// send/close methods are `async` purely for signature parity with the native
-// backend (where they genuinely await).
-#![allow(clippy::future_not_send, clippy::unused_async)]
+// Futures here hold JS handles, which are single-threaded by design. The host runtime's send and
+// close calls are synchronous, so those methods return a ready future rather than an `async` block
+// with nothing to await — call sites still `.await` them exactly as they do on the native backend.
+#![allow(clippy::future_not_send)]
 
 use crate::{
     header,
@@ -26,6 +26,7 @@ use serde::Serialize;
 use skyzen_core::{Extractor, Responder};
 use std::{
     cell::RefCell,
+    future::{ready, Future},
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
@@ -172,12 +173,18 @@ impl WebSocket {
     ///
     /// Returns [`WebSocketError`] if the message exceeds the configured size
     /// limit or the runtime rejects the send.
-    pub async fn send_text(&mut self, text: impl Into<ByteStr>) -> WebSocketResult<()> {
+    pub fn send_text(
+        &mut self,
+        text: impl Into<ByteStr>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
         let text = text.into();
-        ensure_within_limit(&self.config, text.len())?;
-        self.inner
-            .send(&JsValue::from_str(&text))
-            .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
+        ready(
+            ensure_within_limit(&self.config, text.len()).and_then(|()| {
+                self.inner
+                    .send(&JsValue::from_str(&text))
+                    .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
+            }),
+        )
     }
 
     /// Send raw binary data without JSON serialization.
@@ -186,13 +193,19 @@ impl WebSocket {
     ///
     /// Returns [`WebSocketError`] if the message exceeds the configured size
     /// limit or the runtime rejects the send.
-    pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+    pub fn send_binary(
+        &mut self,
+        data: impl Into<Vec<u8>>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
         let bytes = data.into();
-        ensure_within_limit(&self.config, bytes.len())?;
-        let array = js_sys::Uint8Array::from(&bytes[..]);
-        self.inner
-            .send(&array.into())
-            .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
+        ready(
+            ensure_within_limit(&self.config, bytes.len()).and_then(|()| {
+                let array = js_sys::Uint8Array::from(&bytes[..]);
+                self.inner
+                    .send(&array.into())
+                    .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
+            }),
+        )
     }
 
     /// Send a ping frame with optional payload.
@@ -204,10 +217,13 @@ impl WebSocket {
     /// # Errors
     ///
     /// Always returns [`WebSocketError::Protocol`] on WASM.
-    pub async fn send_ping(&mut self, _data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
-        Err(WebSocketError::Protocol(
+    pub fn send_ping(
+        &mut self,
+        _data: impl Into<Vec<u8>>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
+        ready(Err(WebSocketError::Protocol(
             "Ping frames not supported on WASM platform".into(),
-        ))
+        )))
     }
 
     /// Send a pong frame with optional payload.
@@ -219,10 +235,13 @@ impl WebSocket {
     /// # Errors
     ///
     /// Always returns [`WebSocketError::Protocol`] on WASM.
-    pub async fn send_pong(&mut self, _data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
-        Err(WebSocketError::Protocol(
+    pub fn send_pong(
+        &mut self,
+        _data: impl Into<Vec<u8>>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
+        ready(Err(WebSocketError::Protocol(
             "Pong frames not supported on WASM platform".into(),
-        ))
+        )))
     }
 
     /// Send a [`WebSocketMessage`] without additional processing.
@@ -274,13 +293,16 @@ impl WebSocket {
     /// # Errors
     ///
     /// Currently never fails on WASM; the `Result` mirrors the native API.
-    pub async fn close(&mut self, close_frame: Option<WebSocketCloseFrame>) -> WebSocketResult<()> {
+    pub fn close(
+        &mut self,
+        close_frame: Option<WebSocketCloseFrame>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
         if let Some(frame) = close_frame {
             self.inner.close(Some(frame.code), Some(&frame.reason));
         } else {
             self.inner.close(None, None);
         }
-        Ok(())
+        ready(Ok(()))
     }
 
     /// Split the websocket into independent sender and receiver halves.
@@ -348,12 +370,18 @@ impl WebSocketSender {
     ///
     /// Returns [`WebSocketError`] if the message exceeds the configured size
     /// limit or the runtime rejects the send.
-    pub async fn send_text(&mut self, text: impl Into<ByteStr>) -> WebSocketResult<()> {
+    pub fn send_text(
+        &mut self,
+        text: impl Into<ByteStr>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
         let text = text.into();
-        ensure_within_limit(&self.config, text.len())?;
-        self.inner
-            .send(&JsValue::from_str(&text))
-            .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
+        ready(
+            ensure_within_limit(&self.config, text.len()).and_then(|()| {
+                self.inner
+                    .send(&JsValue::from_str(&text))
+                    .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
+            }),
+        )
     }
 
     /// Send raw binary data without JSON serialization.
@@ -362,13 +390,19 @@ impl WebSocketSender {
     ///
     /// Returns [`WebSocketError`] if the message exceeds the configured size
     /// limit or the runtime rejects the send.
-    pub async fn send_binary(&mut self, data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
+    pub fn send_binary(
+        &mut self,
+        data: impl Into<Vec<u8>>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
         let bytes = data.into();
-        ensure_within_limit(&self.config, bytes.len())?;
-        let array = js_sys::Uint8Array::from(&bytes[..]);
-        self.inner
-            .send(&array.into())
-            .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
+        ready(
+            ensure_within_limit(&self.config, bytes.len()).and_then(|()| {
+                let array = js_sys::Uint8Array::from(&bytes[..]);
+                self.inner
+                    .send(&array.into())
+                    .map_err(|e| WebSocketError::Protocol(format!("{e:?}")))
+            }),
+        )
     }
 
     /// Send a ping frame with optional payload.
@@ -380,10 +414,13 @@ impl WebSocketSender {
     /// # Errors
     ///
     /// Always returns [`WebSocketError::Protocol`] on WASM.
-    pub async fn send_ping(&mut self, _data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
-        Err(WebSocketError::Protocol(
+    pub fn send_ping(
+        &mut self,
+        _data: impl Into<Vec<u8>>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
+        ready(Err(WebSocketError::Protocol(
             "Ping frames not supported on WASM platform".into(),
-        ))
+        )))
     }
 
     /// Send a pong frame with optional payload.
@@ -395,10 +432,13 @@ impl WebSocketSender {
     /// # Errors
     ///
     /// Always returns [`WebSocketError::Protocol`] on WASM.
-    pub async fn send_pong(&mut self, _data: impl Into<Vec<u8>>) -> WebSocketResult<()> {
-        Err(WebSocketError::Protocol(
+    pub fn send_pong(
+        &mut self,
+        _data: impl Into<Vec<u8>>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
+        ready(Err(WebSocketError::Protocol(
             "Pong frames not supported on WASM platform".into(),
-        ))
+        )))
     }
 
     /// Send a [`WebSocketMessage`] without additional processing.
@@ -422,13 +462,16 @@ impl WebSocketSender {
     /// # Errors
     ///
     /// Currently never fails on WASM; the `Result` mirrors the native API.
-    pub async fn close(&mut self, close_frame: Option<WebSocketCloseFrame>) -> WebSocketResult<()> {
+    pub fn close(
+        &mut self,
+        close_frame: Option<WebSocketCloseFrame>,
+    ) -> impl Future<Output = WebSocketResult<()>> {
         if let Some(frame) = close_frame {
             self.inner.close(Some(frame.code), Some(&frame.reason));
         } else {
             self.inner.close(None, None);
         }
-        Ok(())
+        ready(Ok(()))
     }
 
     /// Access the underlying websocket configuration.
@@ -636,48 +679,55 @@ fn header_has_token(value: &header::HeaderValue, token: &str) -> bool {
 impl Extractor for WebSocketUpgrade {
     type Error = WebSocketUpgradeError;
 
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        // Validate WebSocket upgrade request
-        if request.method() != Method::GET {
-            return Err(WebSocketUpgradeError::MethodNotAllowed);
-        }
-
-        let headers = request.headers();
-
-        // Check Sec-WebSocket-Key
-        headers
-            .get(header::SEC_WEBSOCKET_KEY)
-            .ok_or(WebSocketUpgradeError::MissingSecWebSocketKey)?;
-
-        // Check Connection header
-        let connection = headers
-            .get(header::CONNECTION)
-            .ok_or(WebSocketUpgradeError::MissingConnectionHeader)?;
-
-        if !header_has_token(connection, "upgrade") {
-            return Err(WebSocketUpgradeError::InvalidConnectionHeader);
-        }
-
-        // Check Upgrade header
-        let upgrade_header = headers
-            .get(header::UPGRADE)
-            .ok_or(WebSocketUpgradeError::MissingUpgradeHeader)?;
-
-        if !upgrade_header
-            .to_str()
-            .is_ok_and(|value| value.eq_ignore_ascii_case("websocket"))
-        {
-            return Err(WebSocketUpgradeError::InvalidUpgradeHeader);
-        }
-
-        // Check version
-        match headers.get(header::SEC_WEBSOCKET_VERSION) {
-            Some(version) if version == "13" => {}
-            _ => return Err(WebSocketUpgradeError::UnsupportedVersion),
-        }
-
-        Ok(Self::new())
+    // The handshake is validated from the request's own headers, so the future is ready on
+    // creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(validate_upgrade(request))
     }
+}
+
+/// Check the handshake headers of an incoming upgrade request.
+fn validate_upgrade(request: &Request) -> Result<WebSocketUpgrade, WebSocketUpgradeError> {
+    // Validate WebSocket upgrade request
+    if request.method() != Method::GET {
+        return Err(WebSocketUpgradeError::MethodNotAllowed);
+    }
+
+    let headers = request.headers();
+
+    // Check Sec-WebSocket-Key
+    headers
+        .get(header::SEC_WEBSOCKET_KEY)
+        .ok_or(WebSocketUpgradeError::MissingSecWebSocketKey)?;
+
+    // Check Connection header
+    let connection = headers
+        .get(header::CONNECTION)
+        .ok_or(WebSocketUpgradeError::MissingConnectionHeader)?;
+
+    if !header_has_token(connection, "upgrade") {
+        return Err(WebSocketUpgradeError::InvalidConnectionHeader);
+    }
+
+    // Check Upgrade header
+    let upgrade_header = headers
+        .get(header::UPGRADE)
+        .ok_or(WebSocketUpgradeError::MissingUpgradeHeader)?;
+
+    if !upgrade_header
+        .to_str()
+        .is_ok_and(|value| value.eq_ignore_ascii_case("websocket"))
+    {
+        return Err(WebSocketUpgradeError::InvalidUpgradeHeader);
+    }
+
+    // Check version
+    match headers.get(header::SEC_WEBSOCKET_VERSION) {
+        Some(version) if version == "13" => {}
+        _ => return Err(WebSocketUpgradeError::UnsupportedVersion),
+    }
+
+    Ok(WebSocketUpgrade::new())
 }
 
 /// Wrapper to make `ffi::WebSocket` Send/Sync safe in single-threaded WASM environment.

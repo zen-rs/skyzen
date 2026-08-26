@@ -1,5 +1,6 @@
 //! In-memory Durable Object KV store for testing.
 
+use core::future::{ready, Future};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
@@ -19,66 +20,95 @@ impl InMemoryDurableKv {
     }
 }
 
+// A `BTreeMap` behind a lock answers every call synchronously, so each future is ready on creation
+// rather than an `async` block with nothing to await.
 impl DurableKvStore for InMemoryDurableKv {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, DurableKvError> {
-        let data = self.data.read().map_err(lock_err)?;
-        Ok(data.get(key).cloned())
+    fn get(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, DurableKvError>> + Send {
+        ready(
+            self.data
+                .read()
+                .map_err(lock_err)
+                .map(|data| data.get(key).cloned()),
+        )
     }
 
-    async fn get_multiple(&self, keys: &[&str]) -> Result<Vec<(String, Vec<u8>)>, DurableKvError> {
-        let data = self.data.read().map_err(lock_err)?;
-        Ok(keys
-            .iter()
-            .filter_map(|k| data.get(*k).map(|v| ((*k).to_owned(), v.clone())))
-            .collect())
+    fn get_multiple(
+        &self,
+        keys: &[&str],
+    ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + Send {
+        ready(self.data.read().map_err(lock_err).map(|data| {
+            keys.iter()
+                .filter_map(|k| data.get(*k).map(|v| ((*k).to_owned(), v.clone())))
+                .collect()
+        }))
     }
 
-    async fn put(&self, key: &str, value: &[u8]) -> Result<(), DurableKvError> {
-        self.data
-            .write()
-            .map_err(lock_err)?
-            .insert(key.to_owned(), value.to_vec());
-        Ok(())
+    fn put(
+        &self,
+        key: &str,
+        value: &[u8],
+    ) -> impl Future<Output = Result<(), DurableKvError>> + Send {
+        ready(self.data.write().map_err(lock_err).map(|mut guard| {
+            guard.insert(key.to_owned(), value.to_vec());
+        }))
     }
 
-    async fn put_multiple(&self, entries: &[(&str, &[u8])]) -> Result<(), DurableKvError> {
-        let mut guard = self.data.write().map_err(lock_err)?;
-        for (k, v) in entries {
-            guard.insert((*k).to_owned(), v.to_vec());
-        }
-        drop(guard);
-        Ok(())
+    fn put_multiple(
+        &self,
+        entries: &[(&str, &[u8])],
+    ) -> impl Future<Output = Result<(), DurableKvError>> + Send {
+        ready(self.data.write().map_err(lock_err).map(|mut guard| {
+            for (k, v) in entries {
+                guard.insert((*k).to_owned(), v.to_vec());
+            }
+        }))
     }
 
-    async fn delete(&self, key: &str) -> Result<bool, DurableKvError> {
-        Ok(self.data.write().map_err(lock_err)?.remove(key).is_some())
+    fn delete(&self, key: &str) -> impl Future<Output = Result<bool, DurableKvError>> + Send {
+        ready(
+            self.data
+                .write()
+                .map_err(lock_err)
+                .map(|mut guard| guard.remove(key).is_some()),
+        )
     }
 
-    async fn delete_multiple(&self, keys: &[&str]) -> Result<usize, DurableKvError> {
-        let mut guard = self.data.write().map_err(lock_err)?;
-        let count = keys.iter().filter(|k| guard.remove(**k).is_some()).count();
-        drop(guard);
-        Ok(count)
+    fn delete_multiple(
+        &self,
+        keys: &[&str],
+    ) -> impl Future<Output = Result<usize, DurableKvError>> + Send {
+        ready(
+            self.data
+                .write()
+                .map_err(lock_err)
+                .map(|mut guard| keys.iter().filter(|k| guard.remove(**k).is_some()).count()),
+        )
     }
 
-    async fn delete_all(&self) -> Result<(), DurableKvError> {
-        self.data.write().map_err(lock_err)?.clear();
-        Ok(())
+    fn delete_all(&self) -> impl Future<Output = Result<(), DurableKvError>> + Send {
+        ready(
+            self.data
+                .write()
+                .map_err(lock_err)
+                .map(|mut guard| guard.clear()),
+        )
     }
 
-    async fn list(
+    fn list(
         &self,
         options: DurableListOptions<'_>,
-    ) -> Result<Vec<(String, Vec<u8>)>, DurableKvError> {
-        let data = self.data.read().map_err(lock_err)?;
-        let iter: Box<dyn Iterator<Item = (&String, &Vec<u8>)>> = if options.reverse {
-            Box::new(data.iter().rev())
-        } else {
-            Box::new(data.iter())
-        };
+    ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + Send {
+        ready(self.data.read().map_err(lock_err).map(|data| {
+            let iter: Box<dyn Iterator<Item = (&String, &Vec<u8>)>> = if options.reverse {
+                Box::new(data.iter().rev())
+            } else {
+                Box::new(data.iter())
+            };
 
-        let result: Vec<(String, Vec<u8>)> = iter
-            .filter(|(k, _)| {
+            iter.filter(|(k, _)| {
                 if let Some(prefix) = options.prefix {
                     if !k.starts_with(prefix) {
                         return false;
@@ -98,9 +128,8 @@ impl DurableKvStore for InMemoryDurableKv {
             })
             .take(options.limit.unwrap_or(usize::MAX))
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        Ok(result)
+            .collect()
+        }))
     }
 }
 

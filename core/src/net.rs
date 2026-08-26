@@ -4,6 +4,7 @@
 //! `skyzen-hyper` adapter) so that peer-address handling and error-to-response conversion are
 //! defined exactly once.
 
+use core::future::Future;
 use std::net::SocketAddr;
 
 use http_kit::{header, http_error, Body, HttpError, Method, Request, Response, StatusCode};
@@ -43,12 +44,14 @@ impl core::ops::Deref for PeerAddr {
 
 impl Extractor for PeerAddr {
     type Error = MissingRemoteAddr;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .copied()
-            .ok_or(MissingRemoteAddr::new())
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(
+            request
+                .extensions()
+                .get::<Self>()
+                .copied()
+                .ok_or(MissingRemoteAddr::new()),
+        )
     }
 }
 

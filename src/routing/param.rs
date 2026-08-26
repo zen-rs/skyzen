@@ -1,3 +1,4 @@
+use core::future::{ready, Future};
 use std::convert::Infallible;
 use std::fmt;
 
@@ -68,13 +69,15 @@ impl Params {
 
 impl Extractor for Params {
     type Error = Infallible;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+    // Reading the params back out of the extensions is a synchronous clone, so the future is ready
+    // on creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
         // Clone rather than remove so the params survive repeated extraction.
-        Ok(request
+        ready(Ok(request
             .extensions()
             .get::<Self>()
             .cloned()
-            .unwrap_or(Self::empty()))
+            .unwrap_or(Self::empty())))
     }
 
     // Individual path parameters are derived from the route's `{name}` segments when the OpenAPI
