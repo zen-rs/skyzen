@@ -12,6 +12,7 @@
 //! - [`CfQueue`] — Cloudflare Queues (implements [`MessageQueue`])
 //! - [`CfD1`] — Cloudflare D1 SQL database
 //! - [`CfService`] — Cloudflare service bindings (Worker-to-Worker over HTTP)
+//! - [`CfAssets`] — Cloudflare Static Assets binding
 //! - [`CfSecretStore`] — Cloudflare Secrets Store bindings
 //! - [`CfCache`] — Cloudflare Cache API
 //! - [`CfDurableDb`] — Durable Object `SQLite` (`state.storage.sql`)
@@ -115,7 +116,7 @@ pub use events::{
     IntoWorkerResult, TailException, TailLog, TailTraceItem,
 };
 #[cfg(target_arch = "wasm32")]
-pub use fetch::{CfFetch, CfFetchError};
+pub use fetch::{CfFetch, CfFetchError, CfFetchOptions};
 #[cfg(target_arch = "wasm32")]
 pub use http_request::{bare_request, json_request, CfHttpRequestError};
 #[cfg(target_arch = "wasm32")]
@@ -130,7 +131,7 @@ pub use secret::{
     CfSecretStore,
 };
 #[cfg(target_arch = "wasm32")]
-pub use service::{CfService, CfServiceError};
+pub use service::{CfAssets, CfService, CfServiceError};
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use worker;

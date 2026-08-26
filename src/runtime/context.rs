@@ -208,6 +208,34 @@ impl WorkerContext {
         self.call_method("waitUntil", Some(&promise.into()))
     }
 
+    /// The values a calling Worker attached to this request over a service binding.
+    ///
+    /// `wasm32`-only: `ctx.props` exists because one Worker invoked another and passed context
+    /// along with the call, which has no meaning for a request that arrived over the network.
+    /// Returns `Ok(None)` when nothing was attached, which is every request that did not come
+    /// through a service binding.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkerContextError`] when the props are present but do not deserialize into `T` — a
+    /// caller and callee that disagree about the shape is a wiring bug worth failing on.
+    pub fn props<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, WorkerContextError> {
+        use wasm_bindgen::JsValue;
+
+        let props = js_sys::Reflect::get(&self.0 .0, &JsValue::from_str("props"))
+            .map_err(|error| WorkerContextError::new(format!("{error:?}")))?;
+        if props.is_undefined() || props.is_null() {
+            return Ok(None);
+        }
+        serde_wasm_bindgen::from_value(props)
+            .map(Some)
+            .map_err(|error| {
+                WorkerContextError::new(format!(
+                    "the calling Worker's `ctx.props` did not deserialize: {error}"
+                ))
+            })
+    }
+
     /// Tell the runtime to fall through to the origin if this request throws.
     ///
     /// `wasm32`-only: failing open to an origin is a Cloudflare routing behaviour with no native
