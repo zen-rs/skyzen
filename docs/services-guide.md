@@ -251,8 +251,13 @@ Provider crates for AWS and Azure are still available, but they are infrastructu
 |---------|--------|------------|-----|-------|------|
 | Key-Value | [`skyzen-redis`](../redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
 | Object Storage | [`skyzen-s3`](../s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
-| Message Queue | — | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
+| Message Queue | [`SqsQueue`](../aws/) | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
 | Portable SQL | `Db` via sqlx | `Db` via D1 | planned wiring | planned wiring | — |
+
+The **Native** column names what a native deployment can wire, not a separate implementation.
+Runtime and provider are independent axes, so a backend that is a plain HTTP client — `SqsQueue`,
+`DynamoKv`, `S3Storage` — is reachable from a native server too; `SqsQueue` appears twice for that
+reason, and `[native.service.*]` wiring with `backend = "sqs"` builds exactly it.
 
 ## Service Futures Are `Send`, Including On WASM
 
