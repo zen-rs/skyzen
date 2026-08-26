@@ -26,7 +26,13 @@
 
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
-use skyzen_services::kv::{KeyValueStore, KvError};
+use skyzen_services::kv::{KeyValueStore, KvError, KvListOptions, KvListResult};
+
+/// How many keys one `SCAN` step asks Redis to examine.
+///
+/// `COUNT` is a hint about work done per step, not a result count; 100 is Redis' own default
+/// trade-off between round trips and how long a single step blocks the server.
+const SCAN_COUNT: usize = 100;
 
 /// A Redis-backed key-value store.
 ///
@@ -81,6 +87,20 @@ fn scan_pattern(prefix: Option<&str>) -> String {
     )
 }
 
+/// Parse a caller-supplied continuation token back into a Redis `SCAN` cursor.
+///
+/// The token is Redis' own cursor rendered as decimal, so anything else was not produced by
+/// [`KeyValueStore::list`] and is rejected rather than silently restarting the scan.
+fn parse_scan_cursor(cursor: Option<&str>) -> Result<u64, KvError> {
+    cursor.map_or(Ok(0), |cursor| {
+        cursor.parse().map_err(|_| {
+            KvError::backend(format!(
+                "list cursor {cursor:?} is not a Redis SCAN cursor; pass back the cursor from the previous page"
+            ))
+        })
+    })
+}
+
 /// Convert a TTL duration to whole milliseconds for `PSETEX`/`SET PX`.
 ///
 /// Sub-millisecond durations are rounded up to 1 ms. Zero and overflowing
@@ -129,26 +149,68 @@ impl KeyValueStore for Redis {
             .map_err(|error| KvError::backend_with(error.to_string(), error))
     }
 
-    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, KvError> {
+    /// List one page of keys using Redis' own `SCAN` cursor.
+    ///
+    /// A `SCAN` step returns "up to about `COUNT`" keys — it may return fewer, more, or none at
+    /// all while still having work left — so the loop keeps stepping until the requested `limit`
+    /// is reached or the cursor comes back as `0`. The cursor handed to the caller is Redis'
+    /// cursor verbatim.
+    ///
+    /// Redis makes no de-duplication guarantee across a full `SCAN`: a key present for the whole
+    /// scan is returned at least once, but keys can repeat when the keyspace is rehashed
+    /// mid-scan.
+    async fn list(&self, options: KvListOptions) -> Result<KvListResult, KvError> {
         let mut conn = self.conn.clone();
-        let pattern = scan_pattern(prefix);
-        let mut iter: redis::AsyncIter<String> = conn
-            .scan_match(pattern)
-            .await
-            .map_err(|error| KvError::backend_with(error.to_string(), error))?;
-
+        let pattern = scan_pattern(options.prefix.as_deref());
+        let mut cursor = parse_scan_cursor(options.cursor.as_deref())?;
         let mut keys = Vec::new();
-        while let Some(key) = iter.next_item().await {
-            keys.push(key.map_err(|error| KvError::backend_with(error.to_string(), error))?);
+
+        loop {
+            let (next, page): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(SCAN_COUNT)
+                .query_async(&mut conn)
+                .await
+                .map_err(|error| KvError::backend_with(error.to_string(), error))?;
+
+            keys.extend(page);
+            cursor = next;
+
+            if cursor == 0 {
+                return Ok(KvListResult { keys, cursor: None });
+            }
+            if options.limit.is_some_and(|limit| keys.len() >= limit) {
+                return Ok(KvListResult {
+                    keys,
+                    cursor: Some(cursor.to_string()),
+                });
+            }
         }
-        Ok(keys)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_pattern, ttl_millis};
+    use super::{parse_scan_cursor, scan_pattern, ttl_millis};
     use core::time::Duration;
+
+    #[test]
+    fn absent_cursor_starts_a_fresh_scan() {
+        assert_eq!(parse_scan_cursor(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn cursor_round_trips_through_its_decimal_rendering() {
+        assert_eq!(parse_scan_cursor(Some("17408")).unwrap(), 17408);
+    }
+
+    #[test]
+    fn a_cursor_from_another_backend_is_rejected_rather_than_restarting() {
+        assert!(parse_scan_cursor(Some("eyJrZXkiOiJhIn0=")).is_err());
+    }
 
     #[test]
     fn scan_pattern_without_prefix_matches_everything() {

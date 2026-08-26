@@ -33,8 +33,12 @@ struct UploadRequest {
 }
 
 /// List all file metadata keys stored in KV.
+///
+/// `list_all` drains the backend's list cursor, which suits a demo namespace; a real listing
+/// endpoint should page with `kv.list(KvListOptions::new().with_prefix("file:").with_limit(n))`
+/// and hand the returned cursor back to the client.
 async fn list_files(kv: Kv) -> SkyResult<Json<Vec<String>>> {
-    let keys = kv.list(Some("file:")).await?;
+    let keys = kv.list_all(Some("file:")).await?;
     Ok(Json(keys))
 }
 

@@ -55,7 +55,7 @@ pub mod storage;
 
 pub use durable::{DurableDb, DurableDbBackend, DurableDbError};
 pub use events::ScheduledTick;
-pub use kv::{KeyValueStore, Kv, KvError};
+pub use kv::{KeyValueStore, Kv, KvError, KvListOptions, KvListResult};
 pub use queue::{
     MessageQueue, Queue, QueueBatch, QueueBatchDisposition, QueueError, QueueMessage,
     QueueMessageDisposition, QueueRetry,
