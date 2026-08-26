@@ -12,7 +12,7 @@ use crate::{
 };
 use futures_core::Stream;
 use http_kit::utils::{Bytes, Stream as LiteStream};
-use http_kit::{http_error, BodyError};
+use http_kit::BodyError;
 use multer::Field as MulterField;
 use pin_project_lite::pin_project;
 
@@ -48,15 +48,19 @@ impl Multipart {
     }
 }
 
-http_error!(
-    /// Error indicating that the multipart boundary is missing or invalid.
-    pub MultipartBoundaryError, StatusCode::UNSUPPORTED_MEDIA_TYPE, "Expected content type `multipart/form-data` with a boundary");
+/// Error indicating that the multipart boundary is missing or invalid.
+///
+/// Carries the reason the boundary could not be read so the 4xx response is actionable.
+#[skyzen::error(
+    message = "Expected content type `multipart/form-data` with a boundary: {0}",
+    status = StatusCode::UNSUPPORTED_MEDIA_TYPE
+)]
+pub struct MultipartBoundaryError(String);
 
 impl Extractor for Multipart {
     type Error = MultipartBoundaryError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let boundary =
-            boundary_from_headers(request.headers()).ok_or(MultipartBoundaryError::new())?;
+        let boundary = boundary_from_headers(request.headers())?;
 
         let body = mem::replace(request.body_mut(), Body::empty());
         Ok(Self::from_parts(boundary, body))
@@ -193,9 +197,13 @@ impl std::error::Error for MultipartError {
     }
 }
 
-fn boundary_from_headers(headers: &HeaderMap) -> Option<String> {
-    let content_type = headers.get(CONTENT_TYPE)?.to_str().ok()?;
-    multer::parse_boundary(content_type).ok()
+fn boundary_from_headers(headers: &HeaderMap) -> Result<String, MultipartBoundaryError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .ok_or_else(|| MultipartBoundaryError("no content type header".to_owned()))?
+        .to_str()
+        .map_err(|error| MultipartBoundaryError(error.to_string()))?;
+    multer::parse_boundary(content_type).map_err(|error| MultipartBoundaryError(error.to_string()))
 }
 
 pin_project! {

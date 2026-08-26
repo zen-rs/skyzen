@@ -1,6 +1,5 @@
 use crate::{extract::Extractor, Request, StatusCode};
 
-use http_kit::http_error;
 use serde::de::DeserializeOwned;
 use serde_urlencoded::from_str;
 
@@ -10,9 +9,15 @@ pub struct Query<T>(pub T);
 
 impl_deref!(Query);
 
-http_error!(
-    /// An error occurred while parsing the query string.
-    pub QueryError, StatusCode::BAD_REQUEST, "Failed to parse query string");
+/// An error occurred while parsing the query string.
+///
+/// Carries the deserializer's own message so the 4xx response tells the caller which parameter
+/// was wrong, rather than only saying that something was.
+#[skyzen::error(
+    message = "Failed to parse query string: {0}",
+    status = StatusCode::BAD_REQUEST
+)]
+pub struct QueryError(String);
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
     type Error = QueryError;
@@ -20,7 +25,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
         let data = request.uri().query().unwrap_or_default();
         Ok(Self(from_str(data).map_err(|error| {
             tracing::debug!(%error, "failed to parse query string");
-            QueryError::new()
+            QueryError(error.to_string())
         })?))
     }
 
@@ -73,6 +78,15 @@ mod tests {
         let mut request = request("http://localhost/search?q=rust&page=two");
         let error = Query::<Search>::extract(&mut request).await.unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let message = error.to_string();
+        assert!(
+            message.starts_with("Failed to parse query string: "),
+            "rejection should keep its prefix, got {message}"
+        );
+        assert!(
+            message.contains("invalid digit"),
+            "rejection should carry the deserializer detail, got {message}"
+        );
     }
     fn request(uri: &str) -> http_kit::Request {
         let mut request = http_kit::Request::new(Body::empty());

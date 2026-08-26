@@ -64,8 +64,11 @@ pub enum JsonContentTypeError {
     )]
     Unsupported,
     /// The payload could not be parsed as JSON.
-    #[error("Failed to parse JSON payload", status = StatusCode::BAD_REQUEST)]
-    InvalidPayload,
+    ///
+    /// Carries the deserializer's own message so the 4xx response tells the caller which field
+    /// was wrong, rather than only saying that something was.
+    #[error("Failed to parse JSON payload: {0}", status = StatusCode::BAD_REQUEST)]
+    InvalidPayload(String),
 }
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
@@ -81,7 +84,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
 
         let value = request.body_mut().into_json().await.map_err(|error| {
             tracing::debug!(%error, "failed to deserialize JSON request body");
-            JsonContentTypeError::InvalidPayload
+            JsonContentTypeError::InvalidPayload(error.to_string())
         })?;
         Ok(Self(value))
     }
@@ -182,6 +185,15 @@ mod test {
 
         let error = Json::<Payload>::extract(&mut request).await.unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let message = error.to_string();
+        assert!(
+            message.starts_with("Failed to parse JSON payload: "),
+            "rejection should keep its prefix, got {message}"
+        );
+        assert!(
+            message.contains("line 1"),
+            "rejection should carry the deserializer detail, got {message}"
+        );
     }
 
     #[tokio::test]

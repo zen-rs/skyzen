@@ -69,8 +69,11 @@ pub enum FormContentTypeError {
     )]
     Unsupported,
     /// The payload could not be parsed as form data.
-    #[error("Failed to parse form data", status = StatusCode::BAD_REQUEST)]
-    InvalidPayload,
+    ///
+    /// Carries the deserializer's own message so the 4xx response tells the caller which field
+    /// was wrong, rather than only saying that something was.
+    #[error("Failed to parse form data: {0}", status = StatusCode::BAD_REQUEST)]
+    InvalidPayload(String),
 }
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
@@ -93,7 +96,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
         let body = core::mem::replace(request.body_mut(), http_kit::Body::empty());
         let data = body.into_string().await.map_err(|error| {
             tracing::debug!(%error, "failed to read form request body");
-            FormContentTypeError::InvalidPayload
+            FormContentTypeError::InvalidPayload(error.to_string())
         })?;
         extract(&data)
     }
@@ -116,9 +119,10 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
 }
 
 fn extract<T: Send + Sync + DeserializeOwned>(data: &str) -> Result<Form<T>, FormContentTypeError> {
-    from_str(data)
-        .map(Form)
-        .map_err(|_| FormContentTypeError::InvalidPayload)
+    from_str(data).map(Form).map_err(|error| {
+        tracing::debug!(%error, "failed to deserialize form data");
+        FormContentTypeError::InvalidPayload(error.to_string())
+    })
 }
 
 impl_deref!(Form);
@@ -192,7 +196,16 @@ mod tests {
             http_kit::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
         let error = Form::<Payload>::extract(&mut request).await.unwrap_err();
-        assert!(matches!(error, FormContentTypeError::InvalidPayload));
+        assert!(matches!(error, FormContentTypeError::InvalidPayload(_)));
+        let message = error.to_string();
+        assert!(
+            message.starts_with("Failed to parse form data: "),
+            "rejection should keep its prefix, got {message}"
+        );
+        assert!(
+            message.contains("invalid digit"),
+            "rejection should carry the deserializer detail, got {message}"
+        );
     }
 
     #[tokio::test]
