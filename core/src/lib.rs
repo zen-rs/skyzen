@@ -6,10 +6,11 @@
 //!
 //! - [`Extractor`] — Pull typed data from HTTP requests
 //! - [`Responder`] — Convert types into HTTP responses
+//! - [`Middleware`] — Wrap request handling, sharing one value across every request
 //! - [`Server`] — HTTP server backend trait (implemented by `skyzen-hyper`)
 //!
 //! Also re-exports HTTP primitives from `http-kit`: [`Request`], [`Response`],
-//! [`Body`], [`Endpoint`], [`Middleware`], [`StatusCode`], and more.
+//! [`Body`], [`Endpoint`], [`StatusCode`], and more.
 //!
 //! # `no_std` Support
 //!
@@ -29,8 +30,12 @@ extern crate std;
 #[macro_use]
 mod macros;
 
+mod body_limit;
+pub use body_limit::RequestBodyLimit;
 mod extract;
-pub use extract::Extractor;
+pub use extract::{Extractor, Requirement};
+pub mod middleware;
+pub use middleware::Middleware;
 mod responder;
 pub use responder::Responder;
 mod server;
@@ -43,8 +48,8 @@ pub use net::{error_response, log_endpoint_error, MissingRemoteAddr, PeerAddr};
 pub mod openapi;
 
 pub use http_kit::{
-    endpoint, header, method, middleware, uri, version, Body, BodyError, Endpoint, Extensions,
-    Method, Middleware, Request, Response, StatusCode, Uri, Version,
+    endpoint, header, method, uri, version, Body, BodyError, Endpoint, Extensions, Method, Request,
+    Response, StatusCode, Uri, Version,
 };
 
 /// Error types used in skyzen.
@@ -56,6 +61,40 @@ pub mod error {
     pub use http_kit::error::{BoxHttpError, HttpError};
 
     use http_kit::{Error as HttpKitError, StatusCode};
+
+    /// Renders an error together with its [`source`](StdError::source) chain, so one log line
+    /// carries the whole cause.
+    ///
+    /// Works for anything that implements [`StdError`], including the unsized `dyn HttpError` and
+    /// `dyn StdError` trait objects every backend logs.
+    ///
+    /// ```rust
+    /// use skyzen_core::error::{Error, ErrorChain};
+    ///
+    /// let error = Error::msg("inner").context("outer");
+    /// assert_eq!(ErrorChain(&error).to_string(), "outer: inner");
+    /// ```
+    pub struct ErrorChain<'a, E: ?Sized>(pub &'a E);
+
+    impl<E: ?Sized + StdError> Display for ErrorChain<'_, E> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            Display::fmt(self.0, f)?;
+            let mut source = self.0.source();
+            while let Some(cause) = source {
+                write!(f, ": {cause}")?;
+                source = cause.source();
+            }
+            Ok(())
+        }
+    }
+
+    impl<E: ?Sized + StdError> Debug for ErrorChain<'_, E> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_tuple("ErrorChain")
+                .field(&alloc::format!("{self}"))
+                .finish()
+        }
+    }
 
     /// A dynamically typed error carrying an HTTP status code.
     ///
@@ -479,4 +518,4 @@ pub mod error {
     }
 }
 
-pub use error::{BoxHttpError, Context, Error, HttpError, Result, ResultExt};
+pub use error::{BoxHttpError, Context, Error, ErrorChain, HttpError, Result, ResultExt};
