@@ -1,9 +1,12 @@
 use crate::{extract::Extractor, Request, StatusCode};
 
 use serde::de::DeserializeOwned;
-use serde_urlencoded::from_str;
+use serde_html_form::from_str;
 
 /// Parse query from Uri.
+///
+/// Repeated keys collect into a sequence, so `?tags=a&tags=b` deserializes into a
+/// `tags: Vec<String>` field.
 #[derive(Debug, Clone)]
 pub struct Query<T>(pub T);
 
@@ -58,6 +61,28 @@ mod tests {
     struct Search {
         q: String,
         page: u8,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Filter {
+        tags: Option<Vec<String>>,
+    }
+
+    #[tokio::test]
+    async fn collects_repeated_keys_into_a_sequence() {
+        let mut request = request("http://localhost/search?tags=a&tags=b");
+        let Query(filter) = Query::<Filter>::extract(&mut request).await.unwrap();
+        assert_eq!(
+            filter.tags.as_deref(),
+            Some(["a".to_owned(), "b".to_owned()].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_sequence_stays_none() {
+        let mut request = request("http://localhost/search");
+        let Query(filter) = Query::<Filter>::extract(&mut request).await.unwrap();
+        assert_eq!(filter.tags, None);
     }
 
     #[tokio::test]

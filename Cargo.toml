@@ -117,8 +117,16 @@ wasm-streams = "0.5"
 web-sys = { version = "0.3.87", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
 futures-channel = { version = "0.3.32", optional = true }
 
-[dependencies.serde_urlencoded]
-version = "0.7.1"
+# `serde_html_form` rather than `serde_urlencoded`: it deserializes repeated keys
+# (`tags=a&tags=b`) into `Vec<_>`, which the query and form extractors both need.
+[dependencies.serde_html_form]
+version = "0.4"
+optional = true
+
+# Typed header parsing (`TypedHeader<H>`) and the conditional/range headers the static file
+# server needs.
+[dependencies.headers]
+version = "0.4"
 optional = true
 
 [dependencies.itoa]
@@ -141,11 +149,15 @@ auth = []
 jwt = ["auth", "dep:jsonwebtoken"]
 json = ["http-kit/json"]
 # The `query` feature enables the `Query` extractor without pulling in form bodies.
-query = ["dep:serde_urlencoded"]
-form = ["dep:serde_urlencoded", "http-kit/form", "query"]
+query = ["dep:serde_html_form"]
+form = ["dep:serde_html_form", "query"]
 multipart = ["dep:multer", "dep:pin-project-lite"]
 sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
-static-files = []
+# The static file server emits and honours `ETag`, `Last-Modified` and `Range`, which it parses
+# and renders with the `headers` crate rather than by hand.
+static-files = ["dep:headers"]
+# `TypedHeader<H>` plus the `skyzen::headers` re-export.
+typed-header = ["dep:headers"]
 runtime-async-std-native-tls = ["skyzen-services/runtime-async-std-native-tls"]
 runtime-async-std-rustls = ["skyzen-services/runtime-async-std-rustls"]
 ws = [
