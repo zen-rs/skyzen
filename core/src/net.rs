@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use http_kit::{header, http_error, Body, HttpError, Method, Request, Response, StatusCode};
 use serde::Serialize;
 
-use crate::Extractor;
+use crate::{error::ErrorChain, Extractor};
 
 http_error!(
     /// Raised when the connection metadata does not expose the remote address.
@@ -55,21 +55,6 @@ impl Extractor for PeerAddr {
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
-}
-
-/// Renders an error together with its `source()` chain, so one log line carries the whole cause.
-struct ErrorChain<'a>(&'a dyn HttpError);
-
-impl core::fmt::Display for ErrorChain<'_> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Display::fmt(self.0, f)?;
-        let mut source = self.0.source();
-        while let Some(cause) = source {
-            write!(f, ": {cause}")?;
-            source = cause.source();
-        }
-        Ok(())
-    }
 }
 
 /// Emit the endpoint-error log line that every Skyzen backend shares.
