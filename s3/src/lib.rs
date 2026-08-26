@@ -108,6 +108,8 @@ impl ObjectStorage for S3Storage {
                 let content_type = output.content_type().map(ToOwned::to_owned);
                 let last_modified = output.last_modified().and_then(timestamp_secs);
                 let user_metadata = output.metadata().cloned().unwrap_or_default();
+                let etag = output.e_tag().map(ToOwned::to_owned);
+                let version = output.version_id().map(ToOwned::to_owned);
 
                 let body = output
                     .body
@@ -122,6 +124,8 @@ impl ObjectStorage for S3Storage {
                     content_type,
                     last_modified,
                     metadata: user_metadata,
+                    etag,
+                    version,
                 };
 
                 Ok(Some(StorageObject { body, metadata }))
@@ -165,6 +169,11 @@ impl ObjectStorage for S3Storage {
             .bucket(&self.bucket)
             .key(key)
             .body(ByteStream::from(body));
+
+        // Wave E widened `PutOptions` with cache control, content encoding/disposition, storage
+        // class and an upload checksum. S3 has all five, but wiring them belongs to the S3 wave —
+        // until then a caller that sets one is told so rather than having it dropped.
+        options.reject_unsupported(&[])?;
 
         if let Some(content_type) = options.content_type {
             request = request.content_type(content_type);
@@ -215,6 +224,9 @@ impl ObjectStorage for S3Storage {
                 content_type: None,
                 last_modified: obj.last_modified().and_then(timestamp_secs),
                 metadata: HashMap::new(),
+                etag: obj.e_tag().map(ToOwned::to_owned),
+                // ListObjectsV2 reports the current version only, without naming it.
+                version: None,
             })
             .collect();
 
@@ -244,6 +256,8 @@ impl ObjectStorage for S3Storage {
                     content_type,
                     last_modified,
                     metadata: output.metadata().cloned().unwrap_or_default(),
+                    etag: output.e_tag().map(ToOwned::to_owned),
+                    version: output.version_id().map(ToOwned::to_owned),
                 }))
             }
             Err(err) => {

@@ -114,6 +114,10 @@ pub enum DbError {
     #[error("database transactions are not supported by this backend")]
     TransactionsUnsupported,
 
+    /// The database backend cannot run a set of statements as one atomic batch.
+    #[error("database atomic batches are not supported by this backend")]
+    BatchesUnsupported,
+
     /// A write failed because a concurrent transaction changed the same rows.
     #[error("database conflict: a concurrent write changed the same rows")]
     Conflict,
@@ -135,6 +139,7 @@ service_http_error!(DbError {
     Self::SqlParse(_) => INTERNAL_SERVER_ERROR,
     Self::RowNotFound => NOT_FOUND,
     Self::TransactionsUnsupported => NOT_IMPLEMENTED,
+    Self::BatchesUnsupported => NOT_IMPLEMENTED,
     Self::Conflict => CONFLICT,
     Self::Throttled { .. } => TOO_MANY_REQUESTS,
 });
@@ -314,6 +319,37 @@ pub struct DbExecResult {
     pub rows_written: u64,
 }
 
+/// One statement in an atomic batch.
+///
+/// Built the same way a [`Db::query`] is — `?` placeholders in the SQL, one bound value per
+/// placeholder — but held rather than executed, so a whole set can be handed to
+/// [`Db::execute_batch`] at once.
+#[derive(Debug, Clone)]
+pub struct BatchStatement {
+    /// The SQL to run, with `?` for every bind placeholder on every dialect.
+    pub sql: String,
+    /// The values bound to those placeholders, in order.
+    pub params: Vec<DbValue>,
+}
+
+impl BatchStatement {
+    /// Start a statement with no bound values yet.
+    #[must_use]
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            params: Vec::new(),
+        }
+    }
+
+    /// Bind the next parameter value.
+    #[must_use]
+    pub fn bind(mut self, value: impl Into<DbValue>) -> Self {
+        self.params.push(value.into());
+        self
+    }
+}
+
 /// SQL dialect expected by a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbDialect {
@@ -351,6 +387,19 @@ pub trait DbBackend: Send + Sync + Clone + 'static {
     /// Returns an error if the backend cannot create a transaction.
     fn begin(&self) -> impl Future<Output = Result<DbTransaction, DbError>> + Send {
         async { Err(DbError::TransactionsUnsupported) }
+    }
+
+    /// Run `statements` as one atomic unit, returning one result per statement in order.
+    ///
+    /// Either every statement lands or none does. The SQL arrives already rewritten for this
+    /// backend's dialect, exactly as it does for [`query`](DbBackend::query) and
+    /// [`execute`](DbBackend::execute) — [`Db::execute_batch`] does the rewriting.
+    fn execute_batch(
+        &self,
+        statements: Vec<BatchStatement>,
+    ) -> impl Future<Output = Result<Vec<DbExecResult>, DbError>> + Send {
+        let _ = statements;
+        async { Err(DbError::BatchesUnsupported) }
     }
 }
 
@@ -402,6 +451,10 @@ service_obj! {
         params: &'a [DbValue],
     ) -> Result<DbExecResult, DbError>;
     async fn begin(&'_ self) -> Result<DbTransaction, DbError>;
+    async fn execute_batch(
+        &'_ self,
+        statements: Vec<BatchStatement>,
+    ) -> Result<Vec<DbExecResult>, DbError>;
 }
 
 /// The object-safe mirror of [`DbTransactionBackend`].
@@ -483,11 +536,52 @@ impl Db {
 
     /// Begin a database transaction.
     ///
+    /// # Portability
+    ///
+    /// An interactive transaction — `BEGIN`, then application logic between statements, then
+    /// `COMMIT` — needs a connection the caller holds open, which the serverless SQL backends do
+    /// not offer. Cloudflare D1 in particular runs every statement in auto-commit and returns
+    /// [`DbError::BatchesUnsupported`]'s neighbour, [`DbError::TransactionsUnsupported`], here.
+    /// [`execute_batch`](Self::execute_batch) is the portable atomic path: it is a real
+    /// transaction on the native sqlx backends and D1's own `batch()` on D1.
+    ///
     /// # Errors
     ///
     /// Returns an error if the backend cannot create a transaction.
     pub async fn begin(&self) -> Result<DbTransaction, DbError> {
         self.0.begin().await
+    }
+
+    /// Run `statements` as one atomic unit, returning one result per statement in order.
+    ///
+    /// Either every statement lands or none does. This is the atomicity primitive that works on
+    /// every backend, including the ones that cannot hold a connection open for
+    /// [`begin`](Self::begin).
+    ///
+    /// Each statement's SQL is rewritten for the backend's dialect and checked against its bound
+    /// parameter count first, exactly as [`query`](Self::query) does — so `?` placeholders are
+    /// correct everywhere, `PostgreSQL` included.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::BatchesUnsupported`] when the backend has no atomic batch, a
+    /// placeholder-rewriting error for a malformed statement, or whatever the backend reports for
+    /// the statement that failed.
+    pub async fn execute_batch(
+        &self,
+        statements: Vec<BatchStatement>,
+    ) -> Result<Vec<DbExecResult>, DbError> {
+        let dialect = self.0.dialect();
+        let statements = statements
+            .into_iter()
+            .map(|statement| {
+                Ok(BatchStatement {
+                    sql: prepare_query_sql(&statement.sql, statement.params.len(), dialect)?,
+                    params: statement.params,
+                })
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        self.0.execute_batch(statements).await
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "postgres"))]
@@ -1038,6 +1132,35 @@ impl DbBackend for NativeDbBackend {
             Self::Sqlite(pool) => NativeDbTransaction::Sqlite(pool.begin().await?),
         };
         Ok(DbTransaction::new(tx))
+    }
+
+    /// Run the batch inside one real sqlx transaction.
+    ///
+    /// Every statement goes through the row-returning path so a `SELECT` inside a batch hands its
+    /// rows back, matching D1's `batch()`. The first failure rolls the whole thing back; the
+    /// commit only happens once all of them have succeeded.
+    async fn execute_batch(
+        &self,
+        statements: Vec<BatchStatement>,
+    ) -> Result<Vec<DbExecResult>, DbError> {
+        let mut transaction = DbBackend::begin(self).await?;
+        let mut results = Vec::with_capacity(statements.len());
+
+        for statement in &statements {
+            match transaction.0.query(&statement.sql, &statement.params).await {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    // The batch is all-or-nothing, so a failure here discards the statements that
+                    // already ran. A rollback that itself fails is reported instead, because then
+                    // the caller genuinely does not know what landed.
+                    transaction.rollback().await?;
+                    return Err(error);
+                }
+            }
+        }
+
+        transaction.commit().await?;
+        Ok(results)
     }
 }
 
@@ -1791,11 +1914,90 @@ mod fallback_tests {
     )
 ))]
 mod tests {
-    use super::Db;
+    use super::{BatchStatement, Db};
 
     #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
     struct CountRow {
         count: i64,
+    }
+
+    #[tokio::test]
+    async fn execute_batch_commits_every_statement_and_returns_selected_rows() {
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory sqlite should connect");
+        db.query("CREATE TABLE entries (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .expect("schema should be created");
+
+        let results = db
+            .execute_batch(vec![
+                BatchStatement::new("INSERT INTO entries (value) VALUES (?)").bind(1_i64),
+                BatchStatement::new("INSERT INTO entries (value) VALUES (?)").bind(2_i64),
+                BatchStatement::new("SELECT COUNT(*) AS count FROM entries"),
+            ])
+            .await
+            .expect("batch should commit");
+
+        assert_eq!(results.len(), 3);
+        // A `SELECT` inside a batch hands its rows back, matching D1's `batch()`.
+        assert_eq!(results[2].rows, vec![serde_json::json!({ "count": 2_i64 })]);
+
+        let row = db
+            .query("SELECT COUNT(*) AS count FROM entries")
+            .fetch_one::<CountRow>()
+            .await
+            .expect("count query should succeed");
+        assert_eq!(row, CountRow { count: 2 });
+    }
+
+    #[tokio::test]
+    async fn execute_batch_rolls_back_every_statement_when_one_fails() {
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory sqlite should connect");
+        db.query("CREATE TABLE entries (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .expect("schema should be created");
+
+        db.execute_batch(vec![
+            BatchStatement::new("INSERT INTO entries (value) VALUES (?)").bind(1_i64),
+            BatchStatement::new("INSERT INTO absent_table (value) VALUES (?)").bind(2_i64),
+        ])
+        .await
+        .expect_err("a statement against a missing table should fail the batch");
+
+        let row = db
+            .query("SELECT COUNT(*) AS count FROM entries")
+            .fetch_one::<CountRow>()
+            .await
+            .expect("count query should succeed");
+        // The first insert is discarded with the rest: the batch is all-or-nothing.
+        assert_eq!(row, CountRow { count: 0 });
+    }
+
+    #[tokio::test]
+    async fn execute_batch_checks_placeholders_against_bound_values() {
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory sqlite should connect");
+
+        let error = db
+            .execute_batch(vec![BatchStatement::new(
+                "INSERT INTO entries (value) VALUES (?)",
+            )])
+            .await
+            .expect_err("a statement with an unbound placeholder should be rejected");
+
+        assert!(matches!(
+            error,
+            super::DbError::ParameterCountMismatch {
+                expected: 1,
+                actual: 0
+            }
+        ));
     }
 
     #[tokio::test]

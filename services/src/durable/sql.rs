@@ -64,6 +64,7 @@ impl From<DbError> for DurableDbError {
             DbError::SqlParse(message) => Self::SqlParse(message),
             DbError::RowNotFound => Self::RowNotFound,
             error @ (DbError::TransactionsUnsupported
+            | DbError::BatchesUnsupported
             | DbError::Conflict
             | DbError::Throttled { .. }) => Self::backend_with(error.to_string(), error),
         }
