@@ -2,7 +2,7 @@
 //!
 //! Both servers stream rather than buffer, and both speak the caching half of HTTP: they emit an
 //! `ETag`, answer `If-None-Match` and `If-Modified-Since` with `304 Not Modified`, and serve a
-//! single `Range` as `206 Partial Content` so media can be seeked.
+//! single `Range` as `206 Partial Content` so media can be scrubbed.
 //!
 //! Two deliberate limits: a multi-range request is answered with the whole file and `200`, because
 //! `multipart/byteranges` is rarely worth its complexity, and `If-Range` is not consulted — an
