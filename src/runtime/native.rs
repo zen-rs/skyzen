@@ -7,7 +7,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{extract::PeerAddr, Endpoint};
+use crate::{
+    extract::PeerAddr,
+    runtime::{context::ShutdownGuard, WorkerContext},
+    Endpoint,
+};
 use async_channel::{bounded, Receiver};
 use async_net::TcpListener;
 use core::convert::Infallible;
@@ -437,6 +441,10 @@ where
                         let shared_executor = shared_executor.clone();
                         let hyper_executor = hyper_executor.clone();
                         let guard = connection_guard.clone();
+                        // A second token, handed to the request's `WorkerContext` so post-response
+                        // work it spawns keeps shutdown waiting too — the connection's own token
+                        // is released as soon as the connection closes.
+                        let guard_token = connection_guard.clone();
 
                         // Spawn the per-connection task *before* sniffing the protocol preface.
                         // Awaiting client bytes inline here would let a single idle client stall
@@ -455,8 +463,12 @@ where
                                         }
                                     };
 
-                                let service =
-                                    IntoService::new(endpoint, shared_executor, peer_addr);
+                                let service = IntoService::new(
+                                    endpoint,
+                                    shared_executor,
+                                    peer_addr,
+                                    ShutdownGuard(guard_token),
+                                );
                                 if is_h2 {
                                     let mut builder = http2::Builder::new(hyper_executor);
                                     // Without a timer hyper silently disables its h2 keep-alive.
@@ -566,14 +578,23 @@ struct IntoService<E> {
     endpoint: E,
     executor: Arc<AnyExecutor>,
     peer_addr: Option<SocketAddr>,
+    /// A clone of the accept loop's drain token, so [`WorkerContext::wait_until`] can register
+    /// post-response work with graceful shutdown.
+    shutdown_guard: ShutdownGuard,
 }
 
 impl<E: Endpoint + Clone> IntoService<E> {
-    const fn new(endpoint: E, executor: Arc<AnyExecutor>, peer_addr: Option<SocketAddr>) -> Self {
+    const fn new(
+        endpoint: E,
+        executor: Arc<AnyExecutor>,
+        peer_addr: Option<SocketAddr>,
+        shutdown_guard: ShutdownGuard,
+    ) -> Self {
         Self {
             endpoint,
             executor,
             peer_addr,
+            shutdown_guard,
         }
     }
 }
@@ -591,6 +612,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
         let mut endpoint = self.endpoint.clone();
         let executor = self.executor.clone();
         let peer_addr = self.peer_addr;
+        let context = WorkerContext::new(self.executor.clone(), self.shutdown_guard.clone());
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
             let method = req.method().clone();
@@ -603,6 +625,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 }));
             request.extensions_mut().insert(on_upgrade);
             request.extensions_mut().insert(executor);
+            request.extensions_mut().insert(context);
             if let Some(peer_addr) = peer_addr {
                 request.extensions_mut().insert(PeerAddr(peer_addr));
             }
@@ -858,6 +881,42 @@ mod tests {
 
         // Once it finishes, draining completes with nothing severed.
         drop(held);
+        assert_eq!(
+            drain_connections(&connections, std::time::Duration::from_secs(30)).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_until_keeps_shutdown_waiting_for_post_response_work() {
+        use super::{ShutdownGuard, WorkerContext};
+        use executor_core::{smol::SmolGlobal, AnyExecutor};
+        use std::sync::Arc;
+
+        let (guard, connections) = async_channel::bounded::<std::convert::Infallible>(1);
+        let (release, wait_for_release) = async_channel::bounded::<()>(1);
+
+        let context = WorkerContext::new(
+            Arc::new(AnyExecutor::new(SmolGlobal)),
+            ShutdownGuard(guard.clone()),
+        );
+        context
+            .wait_until(async move {
+                let _ = wait_for_release.recv().await;
+            })
+            .expect("the native context always accepts post-response work");
+
+        // The request is over: the connection's own token and the context that spawned the work
+        // are both gone, but the spawned task holds a token of its own.
+        drop(context);
+        drop(guard);
+        assert_eq!(
+            drain_connections(&connections, std::time::Duration::from_millis(50)).await,
+            1
+        );
+
+        // Letting the post-response work finish releases the last token, and the drain completes.
+        release.send(()).await.expect("the task should be waiting");
         assert_eq!(
             drain_connections(&connections, std::time::Duration::from_secs(30)).await,
             0
