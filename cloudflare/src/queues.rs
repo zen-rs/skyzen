@@ -5,7 +5,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use worker::send::IntoSendFuture;
 
-use skyzen_services::queue::{MessageQueue, QueueError};
+use skyzen_services::queue::{MessageQueue, QueueError, SendOptions};
+
+/// Cloudflare Queues caps a producer-side delay at 12 hours.
+const MAX_DELAY_SECS: u64 = 43_200;
 
 /// A Cloudflare Workers Queue.
 ///
@@ -75,6 +78,41 @@ impl MessageQueue for CfQueue {
         let promise = self
             .queue
             .send(buffer.into(), options.into())
+            .map_err(js_err)?;
+        JsFuture::from(promise).into_send().await.map_err(js_err)?;
+        Ok(())
+    }
+
+    /// Send one message, optionally holding it invisible for a while first.
+    ///
+    /// Cloudflare's `delaySeconds` is whole seconds, so a sub-second delay is rounded *up*: a
+    /// message asked to wait must not become visible early.
+    async fn send_with(&self, message: &[u8], options: SendOptions) -> Result<(), QueueError> {
+        let js_options = bytes_content_type_options()?;
+        if let Some(delay) = options.delay {
+            let mut seconds = delay.as_secs();
+            if delay.subsec_nanos() > 0 {
+                seconds = seconds.saturating_add(1);
+            }
+            if seconds > MAX_DELAY_SECS {
+                return Err(QueueError::backend(format!(
+                    "Cloudflare Queues delays a message by at most {MAX_DELAY_SECS} seconds \
+                     (12 hours); got {seconds}"
+                )));
+            }
+            #[allow(clippy::cast_precision_loss)]
+            js_sys::Reflect::set(
+                &js_options,
+                &"delaySeconds".into(),
+                &JsValue::from_f64(seconds as f64),
+            )
+            .map_err(js_err)?;
+        }
+
+        let buffer = js_sys::Uint8Array::from(message).buffer();
+        let promise = self
+            .queue
+            .send(buffer.into(), js_options.into())
             .map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())

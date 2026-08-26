@@ -1,7 +1,25 @@
 //! Cloudflare D1 database wrapper.
+//!
+//! # Transactions
+//!
+//! D1 runs every statement in auto-commit and offers no interactive transaction: there is no
+//! connection for a Worker to hold open across `BEGIN` … `COMMIT`. [`CfD1::batch`] — surfaced
+//! portably as [`Db::execute_batch`](skyzen_services::Db::execute_batch) — is D1's transaction
+//! primitive, and the whole sequence rolls back if any statement in it fails.
+//! [`DbBackend::begin`] therefore keeps its
+//! [`TransactionsUnsupported`](DbError::TransactionsUnsupported) default rather than faking one
+//! with `exec("BEGIN")`, which Cloudflare documents as unsafe outside maintenance.
+//!
+//! # Sessions API
+//!
+//! D1's read replication (`withSession`) is not wrapped. Using it correctly means threading a
+//! *bookmark* — the token naming how far a replica must have caught up — out of every response and
+//! back into the next request, which is a cross-request contract rather than a method call: it has
+//! to be modelled in the framework's request/response types before a wrapper here would be more
+//! than a footgun that silently serves stale reads.
 
 use serde::de::DeserializeOwned;
-use skyzen_services::{DbBackend, DbError, DbExecResult, DbValue};
+use skyzen_services::{BatchStatement, DbBackend, DbError, DbExecResult, DbValue};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -65,6 +83,29 @@ impl CfD1 {
     pub fn prepare(&self, query: &str) -> Result<CfD1Statement, CfDatabaseError> {
         let stmt = self.db.prepare(query).map_err(js_err)?;
         Ok(CfD1Statement { stmt })
+    }
+
+    /// Run a sequence of prepared statements as one transaction.
+    ///
+    /// This is D1's only atomicity primitive: the statements run in order, and if one fails the
+    /// whole sequence is rolled back. The returned values are the raw `D1Result` objects, one per
+    /// statement, in the same order — the same shape [`CfD1Statement::all`] hands back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when the runtime rejects the batch or a statement fails.
+    pub async fn batch(
+        &self,
+        statements: &[CfD1Statement],
+    ) -> Result<Vec<JsValue>, CfDatabaseError> {
+        let array = js_sys::Array::new();
+        for statement in statements {
+            array.push(statement.stmt.as_ref());
+        }
+
+        let promise = self.db.batch(array).map_err(js_err)?;
+        let results = JsFuture::from(promise).into_send().await.map_err(js_err)?;
+        Ok(js_sys::Array::from(&results).iter().collect())
     }
 }
 
@@ -214,6 +255,39 @@ impl DbBackend for CfD1 {
             .await
             .map_err(|error| DbError::backend(error.to_string()))?;
         d1_result_to_exec_result(value)
+    }
+
+    /// Run the batch through D1's `batch()`, which is a transaction.
+    ///
+    /// Nothing here has to unwind on failure the way the native sqlx backend does: D1 rolls the
+    /// whole sequence back itself and reports the statement that failed.
+    async fn execute_batch(
+        &self,
+        statements: Vec<BatchStatement>,
+    ) -> Result<Vec<DbExecResult>, DbError> {
+        let prepared = statements
+            .iter()
+            .map(|statement| {
+                self.prepare(&statement.sql)
+                    .and_then(|prepared| prepared.bind(&statement.params))
+                    .map_err(|error| DbError::backend(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+
+        let results = self
+            .batch(&prepared)
+            .await
+            .map_err(|error| DbError::backend(error.to_string()))?;
+
+        if results.len() != prepared.len() {
+            return Err(DbError::backend(format!(
+                "D1 batch returned {} results for {} statements",
+                results.len(),
+                prepared.len()
+            )));
+        }
+
+        results.into_iter().map(d1_result_to_exec_result).collect()
     }
 }
 

@@ -11,6 +11,8 @@
 //! - [`CfR2`] — Cloudflare R2 (implements [`ObjectStorage`])
 //! - [`CfQueue`] — Cloudflare Queues (implements [`MessageQueue`])
 //! - [`CfD1`] — Cloudflare D1 SQL database
+//! - [`CfService`] — Cloudflare service bindings (Worker-to-Worker over HTTP)
+//! - [`CfSecretStore`] — Cloudflare Secrets Store bindings
 //! - [`CfCache`] — Cloudflare Cache API
 //! - [`CfDurableDb`] — Durable Object `SQLite` (`state.storage.sql`)
 //!
@@ -90,6 +92,8 @@ pub mod queues;
 pub mod r2;
 #[cfg(target_arch = "wasm32")]
 pub mod secret;
+#[cfg(target_arch = "wasm32")]
+pub mod service;
 
 #[cfg(target_arch = "wasm32")]
 pub use cache::{CfCache, CfCacheDeletionOutcome, CfCacheError};
@@ -113,15 +117,18 @@ pub use fetch::{CfFetch, CfFetchError};
 #[cfg(target_arch = "wasm32")]
 pub use http_request::{bare_request, json_request, CfHttpRequestError};
 #[cfg(target_arch = "wasm32")]
-pub use kv::CfKv;
+pub use kv::{CfKv, CfKvPutOptions, CfKvValueWithMetadata};
 #[cfg(target_arch = "wasm32")]
 pub use queues::CfQueue;
 #[cfg(target_arch = "wasm32")]
-pub use r2::CfR2;
+pub use r2::{CfR2, CfR2Conditional, CfR2ConditionalGet, CfR2MultipartUpload, CfR2UploadedPart};
 #[cfg(target_arch = "wasm32")]
 pub use secret::{
     optional_string as optional_secret, required_string as required_secret, CfSecretError,
+    CfSecretStore,
 };
+#[cfg(target_arch = "wasm32")]
+pub use service::{CfService, CfServiceError};
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use worker;
@@ -158,5 +165,32 @@ const _: () = {
         assert_send(cache.put_url("https://example.com", worker::Response::empty().unwrap()));
         assert_send(fetch.request(&request));
         assert_send(fetch.request_bytes(&request));
+    }
+
+    #[allow(dead_code, clippy::needless_pass_by_value)]
+    fn assert_wave_e_futures_are_send(
+        kv: crate::CfKv,
+        r2: crate::CfR2,
+        d1: crate::CfD1,
+        service: crate::CfService,
+        request: worker::Request,
+    ) {
+        use skyzen_services::storage::ObjectStorage as _;
+
+        assert_send(kv.get_with_cache_ttl("key", ::core::time::Duration::from_mins(1)));
+        assert_send(kv.get_with_metadata::<serde_json::Value>("key"));
+        assert_send(kv.put_with_options("key", b"value", crate::CfKvPutOptions::new()));
+        assert_send(r2.get_if("key", crate::CfR2Conditional::new()));
+        assert_send(r2.delete_many(&["key"]));
+        assert_send(r2.create_multipart_upload("key"));
+        assert_send(r2.get_stream("key"));
+        assert_send(r2.get_range("key", skyzen_services::storage::ByteRange::slice(0, 1)));
+        assert_send(d1.batch(&[]));
+        assert_send(service.fetch(&request));
+        assert_send(service.fetch_json::<serde_json::Value>(&request));
+        assert_send(crate::CfSecretStore::get(
+            &wasm_bindgen::JsValue::NULL,
+            "SECRET",
+        ));
     }
 };
