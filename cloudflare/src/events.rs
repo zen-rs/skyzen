@@ -249,6 +249,32 @@ impl CfQueueMessage {
         }
     }
 
+    /// How many times this message has been delivered, counting this one.
+    ///
+    /// The platform starts at 1, so a value above 1 means an earlier delivery was retried or left
+    /// unacknowledged — which is what a handler checks before giving up on a poison message and
+    /// acking it away rather than retrying forever.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfEventError`] if the runtime rejects the lookup or reports a non-integer count.
+    pub fn attempts(&self) -> Result<u32, CfEventError> {
+        let value = js_sys::Reflect::get(self.inner.as_ref(), &JsValue::from_str("attempts"))
+            .map_err(js_err)?;
+        let attempts = value.as_f64().ok_or_else(|| {
+            CfEventError::Runtime(format!(
+                "queue message `attempts` is not a number: {value:?}"
+            ))
+        })?;
+        if !attempts.is_finite() || attempts.fract() != 0.0 || attempts < 0.0 {
+            return Err(CfEventError::Runtime(format!(
+                "queue message `attempts` is not a whole non-negative count: {attempts}"
+            )));
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Ok(attempts as u32)
+    }
+
     /// Access the raw message body as a JS value.
     ///
     /// # Errors
