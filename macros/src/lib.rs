@@ -1168,9 +1168,8 @@ fn expand_error(args: ErrorArgs, item: Item) -> syn::Result<TokenStream> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<TokenStream> {
-    let ident = &item_struct.ident;
-    let generics = &item_struct.generics;
+fn expand_error_struct(args: ErrorArgs, mut item_struct: ItemStruct) -> syn::Result<TokenStream> {
+    let generics = item_struct.generics.clone();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let message = args.message.ok_or_else(|| {
@@ -1184,8 +1183,43 @@ fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<
         .status
         .unwrap_or_else(|| parse_quote!(::skyzen::StatusCode::INTERNAL_SERVER_ERROR));
 
+    let field_source = extract_field_source(&mut item_struct.fields)?;
+    let ident = &item_struct.ident;
+
     let (pattern, write_expr) =
         display_pattern_and_expr(quote! { Self }, &item_struct.fields, &message)?;
+
+    let self_path = quote! { Self };
+    let mut source_arms = Vec::new();
+    let mut from_conversion = quote! {};
+
+    if let Some(field_source) = &field_source {
+        let binding = source_binding();
+        let source_pattern = field_source.binding.pattern(&self_path);
+        source_arms.push(quote! {
+            #source_pattern => ::core::option::Option::Some(#binding)
+        });
+
+        if field_source.from {
+            from_conversion = from_impl(
+                &impl_generics,
+                ident,
+                &ty_generics,
+                where_clause,
+                &self_path,
+                field_source,
+            );
+        }
+    }
+
+    let error_impl = error_impl(
+        &impl_generics,
+        ident,
+        &ty_generics,
+        where_clause,
+        &source_arms,
+        true,
+    );
 
     Ok(quote! {
         #[derive(::core::fmt::Debug)]
@@ -1199,13 +1233,15 @@ fn expand_error_struct(args: ErrorArgs, item_struct: ItemStruct) -> syn::Result<
             }
         }
 
-        impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {}
+        #error_impl
 
         impl #impl_generics ::skyzen::HttpError for #ident #ty_generics #where_clause {
             fn status(&self) -> ::skyzen::StatusCode {
                 #status
             }
         }
+
+        #from_conversion
     }
     .into())
 }
@@ -1215,81 +1251,90 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
     let generics = &item_enum.generics;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-    let ErrorArgs { status, .. } = args;
+    let ErrorArgs { status, message } = args;
+    if let Some(message) = message {
+        return Err(Error::new(
+            message.span(),
+            "`message = \"...\"` has no effect on an enum; give each variant its own \
+             #[error(\"...\")] message instead",
+        ));
+    }
+
     let default_status =
         status.unwrap_or_else(|| parse_quote!(::skyzen::StatusCode::INTERNAL_SERVER_ERROR));
 
     let mut display_arms = Vec::new();
     let mut status_arms = Vec::new();
+    let mut source_arms = Vec::new();
     let mut from_impls = Vec::new();
     let mut cleaned_variants = Punctuated::new();
+    let mut variant_count = 0usize;
 
     for variant in item_enum.variants {
-        let variant_ident = variant.ident.clone();
+        variant_count += 1;
         let (
             variant,
             VariantMeta {
                 message,
                 status,
-                from,
+                source,
             },
         ) = parse_variant(variant)?;
-
-        let pattern = match &variant.fields {
-            Fields::Unit => {
-                let ident = &variant.ident;
-                quote! { Self::#ident }
-            }
-            Fields::Unnamed(_) => {
-                let ident = &variant.ident;
-                quote! { Self::#ident ( .. ) }
-            }
-            Fields::Named(_) => {
-                let ident = &variant.ident;
-                quote! { Self::#ident { .. } }
-            }
-        };
-
-        let status_expr = status.unwrap_or_else(|| default_status.clone());
 
         let variant_path = {
             let ident = &variant.ident;
             quote! { Self::#ident }
         };
+        let wildcard_pattern = match &variant.fields {
+            Fields::Unit => quote! { #variant_path },
+            Fields::Unnamed(_) => quote! { #variant_path ( .. ) },
+            Fields::Named(_) => quote! { #variant_path { .. } },
+        };
+
+        let status_expr = status.unwrap_or_else(|| default_status.clone());
+
         let (display_pattern, write_expr) =
-            display_pattern_and_expr(variant_path, &variant.fields, &message)?;
+            display_pattern_and_expr(variant_path.clone(), &variant.fields, &message)?;
         display_arms.push(quote! {
             #display_pattern => #write_expr
         });
 
         status_arms.push(quote! {
-            #pattern => #status_expr
+            #wildcard_pattern => #status_expr
         });
 
-        if let Some(from_info) = from {
-            let binding = format_ident!("__skyzen_from");
-            let ctor = match from_info.style {
-                VariantFromStyle::Unnamed => {
-                    quote! { Self::#variant_ident(#binding) }
-                }
-                VariantFromStyle::Named(field_ident) => {
-                    quote! { Self::#variant_ident { #field_ident: #binding } }
-                }
-            };
-            let ty = from_info.ty;
-            from_impls.push(quote! {
-                impl #impl_generics ::core::convert::From<#ty> for #ident #ty_generics #where_clause {
-                    fn from(#binding: #ty) -> Self {
-                        #ctor
-                    }
-                }
+        if let Some(field_source) = source {
+            let binding = source_binding();
+            let source_pattern = field_source.binding.pattern(&variant_path);
+            source_arms.push(quote! {
+                #source_pattern => ::core::option::Option::Some(#binding)
             });
+
+            if field_source.from {
+                from_impls.push(from_impl(
+                    &impl_generics,
+                    ident,
+                    &ty_generics,
+                    where_clause,
+                    &variant_path,
+                    &field_source,
+                ));
+            }
         }
 
         cleaned_variants.push(variant);
     }
 
     item_enum.variants = cleaned_variants;
+
+    let error_impl = error_impl(
+        &impl_generics,
+        ident,
+        &ty_generics,
+        where_clause,
+        &source_arms,
+        source_arms.len() == variant_count,
+    );
 
     Ok(quote! {
         #[derive(::core::fmt::Debug)]
@@ -1303,7 +1348,7 @@ fn expand_error_enum(args: ErrorArgs, mut item_enum: ItemEnum) -> syn::Result<To
             }
         }
 
-        impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {}
+        #error_impl
 
         impl #impl_generics ::skyzen::HttpError for #ident #ty_generics #where_clause {
             fn status(&self) -> ::skyzen::StatusCode {
@@ -1459,17 +1504,114 @@ impl Parse for ErrorArgs {
 struct VariantMeta {
     message: LitStr,
     status: Option<Expr>,
-    from: Option<VariantFrom>,
+    source: Option<FieldSource>,
 }
 
-struct VariantFrom {
+/// The field a variant (or struct) exposes as its `Error::source`.
+struct FieldSource {
     ty: Type,
-    style: VariantFromStyle,
+    binding: FieldBinding,
+    /// Whether the field was marked `#[from]`, which additionally generates a `From` impl.
+    from: bool,
 }
 
-enum VariantFromStyle {
-    Unnamed,
+/// How to bind the source field inside a match pattern.
+enum FieldBinding {
+    /// A tuple field at `index`, out of `len` fields in total.
+    Positional { index: usize, len: usize },
+    /// A named field.
     Named(syn::Ident),
+}
+
+/// The identifier the generated `source()` binds the source field to.
+fn source_binding() -> syn::Ident {
+    format_ident!("__skyzen_source")
+}
+
+impl FieldBinding {
+    /// Build the constructor expression a `From` impl uses to build this variant.
+    fn construct(
+        &self,
+        path: &proc_macro2::TokenStream,
+        value: &syn::Ident,
+    ) -> proc_macro2::TokenStream {
+        match self {
+            Self::Positional { .. } => quote! { #path(#value) },
+            Self::Named(ident) => quote! { #path { #ident: #value } },
+        }
+    }
+
+    /// Build the match pattern that binds this field for the generated `source()`.
+    fn pattern(&self, path: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+        let binding = source_binding();
+        match self {
+            Self::Positional { index, len } => {
+                let fields = (0..*len).map(|position| {
+                    if position == *index {
+                        quote! { #binding }
+                    } else {
+                        quote! { _ }
+                    }
+                });
+                quote! { #path(#(#fields),*) }
+            }
+            Self::Named(ident) => quote! { #path { #ident: #binding, .. } },
+        }
+    }
+}
+
+/// Build the `From<Source>` impl that constructs `path` from a `#[from]`-marked field.
+fn from_impl(
+    impl_generics: &syn::ImplGenerics<'_>,
+    ident: &syn::Ident,
+    ty_generics: &syn::TypeGenerics<'_>,
+    where_clause: Option<&syn::WhereClause>,
+    path: &proc_macro2::TokenStream,
+    field_source: &FieldSource,
+) -> proc_macro2::TokenStream {
+    let value = format_ident!("__skyzen_from");
+    let ctor = field_source.binding.construct(path, &value);
+    let ty = &field_source.ty;
+    quote! {
+        impl #impl_generics ::core::convert::From<#ty> for #ident #ty_generics #where_clause {
+            fn from(#value: #ty) -> Self {
+                #ctor
+            }
+        }
+    }
+}
+
+/// Assemble the `core::error::Error` impl, emitting `source()` only when some arm produces one.
+fn error_impl(
+    impl_generics: &syn::ImplGenerics<'_>,
+    ident: &syn::Ident,
+    ty_generics: &syn::TypeGenerics<'_>,
+    where_clause: Option<&syn::WhereClause>,
+    source_arms: &[proc_macro2::TokenStream],
+    exhaustive: bool,
+) -> proc_macro2::TokenStream {
+    if source_arms.is_empty() {
+        return quote! {
+            impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {}
+        };
+    }
+
+    let fallback = if exhaustive {
+        quote! {}
+    } else {
+        quote! { _ => ::core::option::Option::None, }
+    };
+
+    quote! {
+        impl #impl_generics ::core::error::Error for #ident #ty_generics #where_clause {
+            fn source(&self) -> ::core::option::Option<&(dyn ::core::error::Error + 'static)> {
+                match self {
+                    #(#source_arms,)*
+                    #fallback
+                }
+            }
+        }
+    }
 }
 
 fn parse_variant(mut variant: Variant) -> syn::Result<(Variant, VariantMeta)> {
@@ -1493,7 +1635,7 @@ fn parse_variant(mut variant: Variant) -> syn::Result<(Variant, VariantMeta)> {
             "each variant must include #[error(\"...\")]",
         )
     })?;
-    meta.from = extract_variant_from(&mut variant.fields)?;
+    meta.source = extract_field_source(&mut variant.fields)?;
 
     variant.attrs = other_attrs;
     Ok((variant, meta))
@@ -1565,82 +1707,99 @@ fn parse_variant_error_attr(attr: &Attribute) -> syn::Result<VariantMeta> {
         Ok(VariantMeta {
             message,
             status,
-            from: None,
+            source: None,
         })
     })
 }
 
-fn extract_variant_from(fields: &mut Fields) -> syn::Result<Option<VariantFrom>> {
-    match fields {
-        Fields::Unit => Ok(None),
-        Fields::Unnamed(unnamed) => {
-            let count = unnamed.unnamed.len();
-            let mut info = None;
-            for field in &mut unnamed.unnamed {
-                if take_from_attr(&mut field.attrs)? {
-                    if info.is_some() {
-                        return Err(Error::new(field.ty.span(), "duplicate #[from] attribute"));
-                    }
-                    if count != 1 {
-                        return Err(Error::new(
-                            field.ty.span(),
-                            "#[from] is only supported on tuple variants with a single field",
-                        ));
-                    }
-                    info = Some(VariantFrom {
-                        ty: field.ty.clone(),
-                        style: VariantFromStyle::Unnamed,
-                    });
-                }
-            }
-            Ok(info)
+/// Strip the `#[from]`/`#[source]` marker off whichever field carries it and describe it.
+///
+/// `#[from]` implies `#[source]`: the wrapped value becomes both the conversion input and the
+/// error's cause, matching `thiserror`.
+fn extract_field_source(fields: &mut Fields) -> syn::Result<Option<FieldSource>> {
+    let len = fields.len();
+    let mut info: Option<FieldSource> = None;
+
+    for (index, field) in fields.iter_mut().enumerate() {
+        let marker = take_source_attrs(&mut field.attrs)?;
+        let Some(marker) = marker else { continue };
+
+        if info.is_some() {
+            return Err(Error::new(
+                field.ty.span(),
+                "only one field may be marked #[from] or #[source]",
+            ));
         }
-        Fields::Named(named) => {
-            let count = named.named.len();
-            let mut info = None;
-            for field in &mut named.named {
-                if take_from_attr(&mut field.attrs)? {
-                    if info.is_some() {
-                        return Err(Error::new(field.ty.span(), "duplicate #[from] attribute"));
-                    }
-                    if count != 1 {
-                        return Err(Error::new(
-                            field.ty.span(),
-                            "#[from] is only supported on struct variants with a single field",
-                        ));
-                    }
-                    let ident = field.ident.clone().ok_or_else(|| {
-                        Error::new(field.ty.span(), "unnamed field in struct variant")
-                    })?;
-                    info = Some(VariantFrom {
-                        ty: field.ty.clone(),
-                        style: VariantFromStyle::Named(ident),
-                    });
-                }
-            }
-            Ok(info)
+
+        if marker.from && len != 1 {
+            return Err(Error::new(
+                field.ty.span(),
+                "#[from] is only supported on variants with a single field; use #[source] instead",
+            ));
         }
+
+        let binding = field
+            .ident
+            .clone()
+            .map_or(FieldBinding::Positional { index, len }, FieldBinding::Named);
+
+        info = Some(FieldSource {
+            ty: field.ty.clone(),
+            binding,
+            from: marker.from,
+        });
     }
+
+    Ok(info)
 }
 
-fn take_from_attr(attrs: &mut Vec<Attribute>) -> syn::Result<bool> {
-    let mut found = false;
+/// Which of `#[from]` / `#[source]` a field carried.
+struct SourceMarker {
+    from: bool,
+}
+
+fn take_source_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<Option<SourceMarker>> {
+    let mut from = false;
+    let mut source = false;
     let mut retained = Vec::new();
+
     for attr in attrs.drain(..) {
-        if attr.path().is_ident("from") {
-            if !matches!(attr.meta, Meta::Path(_)) {
-                return Err(Error::new_spanned(attr, "#[from] does not take arguments"));
-            }
-            if found {
-                return Err(Error::new(attr.span(), "duplicate #[from] attribute"));
-            }
-            found = true;
-        } else {
+        let is_from = attr.path().is_ident("from");
+        let is_source = attr.path().is_ident("source");
+
+        if !is_from && !is_source {
             retained.push(attr);
+            continue;
+        }
+
+        let name = if is_from { "#[from]" } else { "#[source]" };
+        if !matches!(attr.meta, Meta::Path(_)) {
+            return Err(Error::new_spanned(
+                attr,
+                format!("{name} does not take arguments"),
+            ));
+        }
+        if (is_from && from) || (is_source && source) {
+            return Err(Error::new(
+                attr.span(),
+                format!("duplicate {name} attribute"),
+            ));
+        }
+
+        if is_from {
+            from = true;
+        } else {
+            source = true;
         }
     }
+
     *attrs = retained;
-    Ok(found)
+
+    if from || source {
+        Ok(Some(SourceMarker { from }))
+    } else {
+        Ok(None)
+    }
 }
 
 fn doc_string(attrs: &[Attribute]) -> Option<String> {
@@ -3399,7 +3558,9 @@ binding = "DB"
         let valid: syn::LitInt = parse_quote!(404);
         assert!(normalize_status_lit(&valid).is_ok());
         let invalid: syn::LitInt = parse_quote!(99);
-        let error = normalize_status_lit(&invalid).unwrap_err();
+        let Err(error) = normalize_status_lit(&invalid) else {
+            panic!("status literal 99 must be rejected");
+        };
         assert!(error.to_string().contains("invalid HTTP status code `99`"));
     }
 

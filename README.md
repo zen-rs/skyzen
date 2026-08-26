@@ -234,7 +234,7 @@ Define typed application errors with `#[skyzen::error]`. This macro implements `
 ```rust
 use skyzen::{error, StatusCode};
 
-#[skyzen::error(message = "internal server error")]
+#[skyzen::error]
 pub enum AppError {
     #[error("item with id {0} was not found", status = NOT_FOUND)]
     NotFound(u64),
