@@ -1,3 +1,4 @@
+use core::any::{type_name, TypeId};
 use core::mem;
 use core::{convert::Infallible, future::Future};
 
@@ -6,12 +7,57 @@ use crate::openapi::{ExtractorSchema, ParameterLocation, SchemaRef};
 use alloc::boxed::Box;
 #[cfg(feature = "openapi")]
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use http_kit::error::BoxHttpError;
 use http_kit::{
     http_error,
     utils::{ByteStr, Bytes},
     Body, HttpError, Method, Request, StatusCode, Uri,
 };
+
+/// A value an extractor needs some middleware to have put into the request.
+///
+/// Extractors that read a value back out of the request extensions declare it here so the route
+/// tree can be checked at build time instead of failing with a 500 on the first request that
+/// reaches the endpoint. Report a requirement only when route-attached middleware is the *only*
+/// way the value can arrive; a value that a runtime, a test harness or a generated entrypoint may
+/// also inject cannot be validated this way and must not be declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Requirement {
+    type_id: TypeId,
+    description: &'static str,
+    hint: &'static str,
+}
+
+impl Requirement {
+    /// Declare that `T` must be present in the request extensions, suggesting `hint` as the fix.
+    #[must_use]
+    pub fn of<T: 'static>(hint: &'static str) -> Self {
+        Self {
+            type_id: TypeId::of::<T>(),
+            description: type_name::<T>(),
+            hint,
+        }
+    }
+
+    /// The type that must be present.
+    #[must_use]
+    pub const fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+
+    /// A human-readable name for the missing type.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        self.description
+    }
+
+    /// The call that would satisfy this requirement, quoted for an error message.
+    #[must_use]
+    pub const fn hint(&self) -> &'static str {
+        self.hint
+    }
+}
 
 /// Extracts a typed value from an HTTP request, such as a header, the body, or
 /// other request metadata.
@@ -20,6 +66,14 @@ pub trait Extractor: Sized + Send + Sync + 'static {
     type Error: HttpError;
     /// Read the request and parse a value.
     fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send;
+
+    /// Values this extractor needs route middleware to provide.
+    ///
+    /// Defaults to nothing. See [`Requirement`] for when declaring one is sound.
+    #[must_use]
+    fn requirements() -> Vec<Requirement> {
+        Vec::new()
+    }
 
     /// Describe the extractor's `OpenAPI` schema, if available.
     #[cfg(feature = "openapi")]
@@ -86,6 +140,13 @@ macro_rules! impl_tuple_extractor {
                     Ok(($($ty::extract(request).await.map_err(|error|{
                         TupleExtractorError::$ty(error)
                     })?,)*))
+                }
+
+                fn requirements() -> alloc::vec::Vec<crate::extract::Requirement> {
+                    #[allow(unused_mut)]
+                    let mut requirements = alloc::vec::Vec::new();
+                    $(requirements.extend(<$ty as Extractor>::requirements());)*
+                    requirements
                 }
 
                 // A tuple combines several extractors, but `openapi()` can only describe one, so it
@@ -175,6 +236,9 @@ impl Extractor for Method {
     }
 }
 
+// `requirements()` is deliberately *not* forwarded here or on `Result<T, BoxHttpError>`: both
+// wrappers exist so the handler can cope with `T` being unavailable, so a missing provision is a
+// case the handler asked to see rather than a wiring mistake to reject at build time.
 impl<T: Extractor> Extractor for Option<T> {
     type Error = Infallible;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
