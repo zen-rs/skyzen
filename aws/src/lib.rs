@@ -14,12 +14,17 @@
 //! use skyzen_services::{Kv, Queue};
 //!
 //! let kv = Kv::new(DynamoKv::from_env("my-table").await);
-//! let queue = Queue::new(SqsQueue::from_env("https://sqs.us-east-1.amazonaws.com/123/my-queue").await);
+//! let queue = Queue::new(
+//!     SqsQueue::from_env("https://sqs.us-east-1.amazonaws.com/123/my-queue").await?,
+//! );
 //! ```
 //!
 //! [`KeyValueStore`]: skyzen_services::kv::KeyValueStore
 //! [`ObjectStorage`]: skyzen_services::storage::ObjectStorage
 //! [`MessageQueue`]: skyzen_services::queue::MessageQueue
+
+#[cfg(any(feature = "dynamodb", feature = "sqs"))]
+mod errors;
 
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
@@ -31,4 +36,4 @@ pub use dynamodb::DynamoKv;
 #[cfg(feature = "s3")]
 pub use skyzen_s3::S3Storage;
 #[cfg(feature = "sqs")]
-pub use sqs::SqsQueue;
+pub use sqs::{SqsDeduplication, SqsQueue};

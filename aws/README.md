@@ -16,9 +16,19 @@ AWS platform implementations for the [Skyzen](https://github.com/zen-rs/skyzen) 
   - Uses a configurable partition key (defaults to `"pk"`).
   - Stores values as binary (`B`) attributes in a `"value"` column.
   - Supports prefix-based listing via Scan operations.
+  - Atomic primitives (`put_if_absent`, `compare_and_swap`, `increment`, `expire`) run on DynamoDB
+    condition expressions, and treat an item whose TTL has passed as absent even before DynamoDB's
+    lazy sweeper removes it.
+  - `with_consistent_reads(true)` opts `get`/`exists` into `ConsistentRead`.
 - **`SqsQueue`**: A `MessageQueue` implementation using Amazon SQS.
-  - Automatically handles Base64 encoding/decoding for binary payloads (since SQS is text-based).
-  - Supports batch sending (automatically chunked into batches of 10).
+  - Automatically handles Base64 encoding/decoding for binary payloads (since SQS is text-based),
+    tagged with a `skyzen-content-encoding` message attribute that `receive` reverses.
+  - Full pull consumption: `receive` (long polling, visibility timeout), `ack` (`DeleteMessage`)
+    and `nack` (`ChangeMessageVisibility`).
+  - Supports batch sending (automatically chunked into batches of 10), reporting rejected entries
+    as `QueueError::PartialBatch` with each failure's index in the caller's slice.
+  - FIFO queues via `SqsQueue::fifo`, which sends a `MessageGroupId` with every message; a `.fifo`
+    URL without a group id (or a standard URL with one) is refused at construction.
 - **`S3Storage`**: Amazon S3 implementation of `ObjectStorage` (re-exported from `skyzen-s3`).
 
 ## Installation
@@ -79,16 +89,39 @@ async fn main() {
 
 ```rust
 use skyzen_aws::SqsQueue;
-use skyzen_services::Queue;
+use skyzen_services::{Queue, ReceiveOptions};
 
 #[tokio::main]
 async fn main() {
     let queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/my-queue";
-    let backend = SqsQueue::from_env(queue_url).await;
+    let backend = SqsQueue::from_env(queue_url).await.unwrap();
     let queue = Queue::new(backend);
 
     // Send binary payload (auto-encoded to Base64)
     queue.send(b"important-task").await.unwrap();
+
+    // Pull it back, then settle the lease
+    for message in queue.receive(ReceiveOptions::new()).await.unwrap() {
+        queue.ack(&message.receipt).await.unwrap();
+    }
+}
+```
+
+A FIFO queue needs a message group id on every send, so it is built with a different constructor —
+`SqsQueue::from_env` refuses a `.fifo` URL rather than failing on the first message:
+
+```rust
+use skyzen_aws::{SqsDeduplication, SqsQueue};
+
+#[tokio::main]
+async fn main() {
+    let queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/orders.fifo";
+    let backend = SqsQueue::fifo_from_env(queue_url, "customer-42")
+        .await
+        .unwrap()
+        // Only needed when the queue does not have ContentBasedDeduplication enabled.
+        .with_deduplication(SqsDeduplication::ContentHash)
+        .unwrap();
 }
 ```
 
