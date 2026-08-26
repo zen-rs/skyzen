@@ -335,7 +335,7 @@ mod tests {
         ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError,
         StorageObject,
     };
-    use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
+    use http_kit::{Body, Endpoint, HttpError, Response};
     use skyzen_core::Extractor;
     use std::{
         collections::HashMap,
@@ -481,7 +481,7 @@ mod tests {
     async fn middleware_injects_storage_for_downstream_endpoint_and_extractor() {
         let backend = InMemoryObjectStorage::default();
         backend.put("file.txt", b"hello".to_vec()).await.unwrap();
-        let mut storage = Storage::new(backend);
+        let storage = Storage::new(backend);
         let mut request = http_kit::Request::new(Body::empty());
 
         let response =

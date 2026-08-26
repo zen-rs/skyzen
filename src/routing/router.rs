@@ -104,6 +104,7 @@ pub struct Router {
     openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
 }
 
+#[allow(clippy::missing_fields_in_debug)] // the endpoint factories have nothing to render
 impl Debug for Router {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut debug_struct = f.debug_struct("Router");

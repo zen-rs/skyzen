@@ -275,7 +275,7 @@ impl Route {
     /// Attach middleware to this route and all nested endpoints.
     #[must_use]
     pub fn middleware<M: Middleware>(mut self, middleware: M) -> Self {
-        self.apply_middleware(boxed(middleware));
+        self.apply_middleware(&boxed(middleware));
         self
     }
 
@@ -327,9 +327,9 @@ impl Route {
         self
     }
 
-    fn apply_middleware(&mut self, middleware: BoxMiddleware) {
+    fn apply_middleware(&mut self, middleware: &BoxMiddleware) {
         for node in &mut self.nodes {
-            node.apply_middleware(&middleware);
+            node.apply_middleware(middleware);
         }
     }
 
@@ -350,7 +350,7 @@ impl Route {
         // Applying pushes to the front of each endpoint's stack, so replaying the layers in
         // reverse leaves the first-registered layer outermost, exactly as at the root.
         let layers = std::mem::take(&mut self.layers);
-        for layer in layers.into_iter().rev() {
+        for layer in layers.iter().rev() {
             self.apply_middleware(layer);
         }
         self.nodes
@@ -504,7 +504,7 @@ impl RouteNode {
 
     fn apply_middleware(&mut self, middleware: &BoxMiddleware) {
         match &mut self.node_type {
-            RouteNodeType::Route(route) => route.apply_middleware(Arc::clone(middleware)),
+            RouteNodeType::Route(route) => route.apply_middleware(middleware),
             RouteNodeType::Endpoint {
                 middleware: stack, ..
             } => stack.insert(0, Arc::clone(middleware)),

@@ -122,7 +122,7 @@ impl Alarm {
 #[cfg(test)]
 mod tests {
     use super::{Alarm, AlarmError, AlarmNotConfigured, AlarmScheduler};
-    use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
+    use http_kit::{Body, Endpoint, HttpError, Response};
     use skyzen_core::Extractor;
     use std::{
         convert::Infallible,
@@ -197,7 +197,7 @@ mod tests {
     async fn middleware_injects_alarm_for_downstream_endpoint_and_extractor() {
         let scheduler = InMemoryAlarmScheduler::default();
         scheduler.set_alarm(1337).await.unwrap();
-        let mut alarm = Alarm::new(scheduler);
+        let alarm = Alarm::new(scheduler);
         let mut request = http_kit::Request::new(Body::empty());
 
         let response = ::skyzen_core::middleware::apply(&alarm, &mut request, ReadAlarmEndpoint)

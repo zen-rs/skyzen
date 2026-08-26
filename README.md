@@ -323,6 +323,97 @@ fn router() -> Router {
 }
 ```
 
+### Writing middleware
+
+A middleware is a value that sees every request on the way in and every response on the way out.
+It takes `&self` and is shared across requests, so state kept in an atomic or a channel really
+persists:
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+use skyzen::{middleware::{Middleware, Next}, Error, Request, Response};
+
+#[derive(Debug, Default)]
+struct CountRequests {
+    seen: AtomicUsize,
+}
+
+impl Middleware for CountRequests {
+    async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        self.seen.fetch_add(1, Ordering::Relaxed);
+        next.run(request).await
+    }
+}
+```
+
+For one-off behaviour, `middleware::from_fn` takes a closure returning a boxed future:
+
+```rust
+use skyzen::middleware::from_fn;
+
+let log = from_fn(|request, next| {
+    Box::pin(async move {
+        tracing::info!(path = request.uri().path(), "request received");
+        next.run(request).await
+    })
+});
+```
+
+### Attachment scopes
+
+| Call | Covers |
+|---|---|
+| `RouteNode::with(m)` | one path node's endpoints |
+| `Route::with(m)` / `Route::middleware(m)` | every endpoint in the subtree |
+| `Route::layer(m)` / `Router::layer(m)` | the entire router, **including its 404 and 405 responses** |
+
+CORS, tracing and request-id middleware belong on `layer`: a preflight `OPTIONS` arrives at a path
+whose registered methods are `GET`/`POST`, so it has to be answered before the router synthesizes
+its 405.
+
+### Shipped middleware
+
+| Middleware | Purpose |
+|---|---|
+| `Cors` | Answers preflight requests and decorates cross-origin responses; rejects credentials + wildcard origin at construction |
+| `CompressionMiddleware` | gzip/deflate negotiation, skipping HEAD and unknown-length streams |
+| `BodyLimit` | Publishes the `RequestBodyLimit` extension (2 MiB by default) that body extractors enforce |
+| `Timeout` | Abandons a request that outruns its budget with `408` (native targets only) |
+| `ErrorHandlingMiddleware` | Renders endpoint errors into responses |
+| `AuthMiddleware` | Authenticates the request and injects `AuthUser<U>` |
+| `State<T>`, `Kv`, `Storage`, `Queue`, `Db` | Inject a value the matching extractor reads back |
+
+### Custom 404 and 405 responses
+
+`Route::fallback` and `Route::method_not_allowed` take ordinary handlers, and both run inside the
+router's layers. The method-not-allowed handler can read the registered methods back with the
+`AllowedMethods` extractor:
+
+```rust
+use skyzen::{routing::{AllowedMethods, CreateRouteNode, Route}, Method, Result, Uri};
+
+async fn not_found(uri: Uri) -> Result<String> {
+    Ok(format!("no such page: {}", uri.path()))
+}
+
+async fn wrong_method(allowed: AllowedMethods) -> Result<String> {
+    Ok(format!("try one of {:?}", allowed.methods()))
+}
+
+let router = Route::new(("/items".at(|| async { Result::Ok("[]") }),))
+    .fallback(not_found)
+    .method_not_allowed(wrong_method)
+    .build();
+```
+
+### Wiring checked at build time
+
+`Route::build()` walks the tree and fails if a handler extracts a `State<T>` or `AuthUser<U>` that
+no middleware on its route provides, naming the path and the call that would fix it — instead of
+returning a 500 on the first request that reaches the endpoint. `Route::try_build()` returns the
+`RouteBuildError` rather than panicking, and `Router::routes()` lists every registered
+`(method, path)` for introspection.
+
 ---
 
 ## Portable Services

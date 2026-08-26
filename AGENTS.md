@@ -82,21 +82,39 @@ Multi-threaded native runtimes (Tokio, smol) require futures to be `Send`, while
 - On wasm32: `pub trait MaybeSend {}`
 Service traits use `MaybeSend` as a future bound so the same trait definition compiles cleanly across all targets without repetitive `#[cfg]` branches in user code.
 
-### 3. Handler, Extractor & Responder System
+### 3. Middleware, Layers & Build-Time Wiring
+
+- `skyzen_core::middleware::Middleware` takes **`&self`**. The router stores each middleware once
+  as `Arc<dyn MiddlewareObj>` and never clones it per request, so state kept in an atomic or a
+  channel persists. `Next::run(request)` continues the chain and hides the endpoint/middleware
+  error split behind `skyzen::Error`.
+- The trait lives in `skyzen-core`, not `skyzen`: `skyzen-services`' `service_extractor!` macro
+  implements it and only depends on core.
+- Three attachment scopes, narrowest first: `RouteNode::with` (one node), `Route::with` (subtree),
+  `Route::layer` / `Router::layer` (the whole router, **including the 404/405 paths** — this is what
+  makes CORS preflight answerable). Applying middleware pushes it to the front of the endpoint's
+  stack, so the last call is outermost.
+- `Route::build()` validates wiring: an endpoint whose extractors declare `Extractor::requirements()`
+  must have those `TypeId`s in the `provisions()` of middleware on its ancestor chain.
+  **Only declare a requirement when route middleware is the sole supply path** — `State<T>` and
+  `AuthUser<U>` qualify; the service wrappers do not, because `#[skyzen::main]` and
+  `skyzen_test::TestClient` also inject them out of band.
+
+### 4. Handler, Extractor & Responder System
 - **Extractors** (`skyzen_core::Extractor`): Types that extract themselves from a `&mut Request`. Tuples of extractors implement `Extractor` automatically.
 - **Responders** (`skyzen_core::Responder`): Types that mutate a `&mut Response`. Tuples of responders compose automatically.
 - **Handlers** (`skyzen::handler`): Any async function taking extractors as arguments and returning a responder is automatically converted into an `Endpoint`.
 
-### 4. Dual-Target Runtime (`#[skyzen::main]`)
+### 5. Dual-Target Runtime (`#[skyzen::main]`)
 - **Native**: Sets up a Tokio runtime, installs a `tracing` subscriber, parses CLI args (`--port`, `--host`, `--listen`), and handles graceful shutdown on `Ctrl+C`.
 - **WASM**: Generates the WinterCG `fetch` export. Cloudflare Workers events use dedicated macros: `#[skyzen::queue]`, `#[skyzen::scheduled]`, and `#[skyzen::durable_object]`.
 
-### 5. Error Handling & Log Security
+### 6. Error Handling & Log Security
 - `#[skyzen::error]` generates `Display`, `Error`, and `HttpError` implementations with status code attributes.
 - **4xx errors** return formatted JSON messages to clients.
 - **5xx errors** return generic `"Internal server error"` to prevent leaking internal database/system information to clients while preserving detailed logs on the server.
 
-### 6. WebSockets
+### 7. WebSockets
 - Native backend uses `async-tungstenite`.
 - WASM backend uses `WebSocketPair` FFI bindings.
 - Both share a unified interface: `socket.next()`, `socket.send_text()`, `socket.send_binary()`, `socket.recv_json::<T>()`, `socket.send(&json)`.
@@ -106,6 +124,6 @@ Service traits use `MaybeSend` as a future bound so the same trait definition co
 ## Coding Conventions & Workspace Lints
 
 - **Strict Clippy Lints**: The workspace enforces `pedantic` and `nursery` lint groups. All crates warn on `missing_docs` and `missing_debug_implementations`.
-- **Dependencies**: Core HTTP primitives (`Request`, `Response`, `Body`, `Endpoint`, `Middleware`) come from `http-kit`.
+- **Dependencies**: Core HTTP primitives (`Request`, `Response`, `Body`, `Endpoint`) come from `http-kit`. The `Middleware` trait is Skyzen's own, in `skyzen-core`.
 - **Formatting**: Run `cargo fmt` before finishing changes.
 
