@@ -591,7 +591,10 @@ impl MessageQueue for SqsQueue {
     /// the failures is a matter of re-sending those elements.
     ///
     /// A chunk that fails as a whole (a throttle, a credential rejection, a transport error) stops
-    /// the send there; chunks already accepted stay delivered.
+    /// the send there and surfaces as that error rather than as a `PartialBatch`. Chunks already
+    /// accepted stay delivered, and per-entry failures collected before it cannot ride along on an
+    /// error of a different shape — so a caller recovering from one has to treat the whole batch as
+    /// being of unknown state, which at-least-once delivery already allows for.
     async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<(), QueueError> {
         let mut failures = Vec::new();
 
