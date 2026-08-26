@@ -3,6 +3,7 @@
 use std::future::Future;
 
 use serde::de::DeserializeOwned;
+use skyzen::ErrorChain;
 use skyzen_services::{
     QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition, QueueRetry,
 };
@@ -24,21 +25,6 @@ pub enum CfEventError {
     /// A raw-bytes message body could not be decoded as JSON.
     #[error("cloudflare event decode error: {0}")]
     Decode(String),
-}
-
-/// Renders an error together with its `source()` chain, so one log line carries the whole cause.
-struct ErrorChain<'a>(&'a (dyn std::error::Error + 'static));
-
-impl std::fmt::Display for ErrorChain<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self.0, f)?;
-        let mut source = self.0.source();
-        while let Some(cause) = source {
-            write!(f, ": {cause}")?;
-            source = cause.source();
-        }
-        Ok(())
-    }
 }
 
 /// Record a failing event handler before the error is thrown to the Workers runtime.
