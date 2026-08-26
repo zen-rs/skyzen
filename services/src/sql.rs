@@ -26,14 +26,44 @@
 //! constructors such as [`Db::connect_sqlite`] only exist on non-wasm targets
 //! with the matching feature enabled; on wasm32 targets, use a platform
 //! backend (e.g. Cloudflare D1) instead.
+//!
+//! # Rows travel as JSON, and what that costs
+//!
+//! [`DbExecResult::rows`] is a `Vec<serde_json::Value>`: every backend converts its driver's
+//! native row into JSON, and `fetch_all`/`fetch_one` then deserialize that into the caller's
+//! struct. One portable row representation is what lets the same handler run against sqlx and
+//! against Cloudflare D1, but JSON cannot represent everything SQL can, and the conversions have
+//! consequences worth knowing before they surprise you at runtime:
+//!
+//! - **`NUMERIC` / `DECIMAL` arrive as strings.** They are exact, and JSON numbers are not, so the
+//!   converters render them with `to_string()`. A field typed `f64` will therefore fail to
+//!   deserialize; type it as `String`, or as `bigdecimal::BigDecimal`, whose `Deserialize` accepts
+//!   the string form.
+//! - **Blobs arrive as arrays of integers**, because JSON has no byte string. A `Vec<u8>` field
+//!   deserializes fine; a `#[serde(with = "serde_bytes")]` field does not.
+//! - **Integers above 2^53** are exact in `serde_json`'s own number type, but lose precision the
+//!   moment the value passes through a `f64` — which is what happens if a row is re-serialized by
+//!   a JSON implementation without 64-bit integer support.
+//! - **`NaN` and infinity have no JSON representation** and render as `null`.
+//! - **Timestamps, dates, times and UUIDs arrive as strings** — RFC 3339 for `TIMESTAMPTZ`, the
+//!   driver's textual form otherwise. `chrono` and `uuid` both deserialize from exactly those, so
+//!   a typed field round-trips; a hand-rolled parser may not.
+//!
+//! The bind direction has none of these limits: [`DbValue`] carries `Timestamp`, `Uuid`, `Decimal`
+//! and `Json` variants that each backend encodes natively (with the one documented exception on
+//! [`DbValue::Decimal`]), so a parameter never has to be stringified by the caller.
 
 use std::{borrow::Cow, future::Future};
 
+use bigdecimal::BigDecimal;
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlparser::{
     dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
+    keywords::Keyword,
     tokenizer::{Location, Token, TokenWithSpan, Tokenizer},
 };
+use uuid::Uuid;
 
 use crate::BoxFuture;
 
@@ -123,6 +153,11 @@ impl From<sqlx::Error> for DbError {
 }
 
 /// A SQL parameter value.
+///
+/// The variants beyond the six SQL storage classes exist so a caller can bind a timestamp, a UUID,
+/// an exact decimal or a JSON document without stringifying it by hand and relying on the
+/// database's implicit cast. Each backend encodes them in its own native form where it has one —
+/// see [`DbValue::Decimal`] for the one place that is not true.
 #[derive(Debug, Clone)]
 pub enum DbValue {
     /// A null value.
@@ -137,6 +172,18 @@ pub enum DbValue {
     Text(String),
     /// A blob value.
     Blob(Vec<u8>),
+    /// An instant in time, bound as `TIMESTAMPTZ` / `TIMESTAMP` / an ISO-8601 `TEXT` value.
+    Timestamp(DateTime<Utc>),
+    /// A UUID, bound as `UUID` on `PostgreSQL` and as bytes elsewhere.
+    Uuid(Uuid),
+    /// An exact decimal, bound as `NUMERIC` / `DECIMAL`.
+    ///
+    /// `SQLite` has no decimal type and sqlx has no `SQLite` encoder for one, so on that backend
+    /// the value is bound as its decimal `TEXT` rendering. Comparisons against it are then string
+    /// comparisons, which is a real difference in behaviour, not just in storage.
+    Decimal(BigDecimal),
+    /// A JSON document, bound as `JSON` / `JSONB` where the backend has one.
+    Json(serde_json::Value),
 }
 
 impl From<bool> for DbValue {
@@ -220,6 +267,30 @@ impl From<Vec<u8>> for DbValue {
 impl From<&[u8]> for DbValue {
     fn from(value: &[u8]) -> Self {
         Self::Blob(value.to_vec())
+    }
+}
+
+impl From<DateTime<Utc>> for DbValue {
+    fn from(value: DateTime<Utc>) -> Self {
+        Self::Timestamp(value)
+    }
+}
+
+impl From<Uuid> for DbValue {
+    fn from(value: Uuid) -> Self {
+        Self::Uuid(value)
+    }
+}
+
+impl From<BigDecimal> for DbValue {
+    fn from(value: BigDecimal) -> Self {
+        Self::Decimal(value)
+    }
+}
+
+impl From<serde_json::Value> for DbValue {
+    fn from(value: serde_json::Value) -> Self {
+        Self::Json(value)
     }
 }
 
@@ -407,11 +478,7 @@ impl Db {
     /// the placeholder/parameter count check.
     #[must_use]
     pub const fn query<'a>(&'a self, sql: &'a str) -> DbQuery<'a> {
-        DbQuery {
-            db: self,
-            sql: Cow::Borrowed(sql),
-            params: Vec::new(),
-        }
+        SqlQuery::new(self, Cow::Borrowed(sql))
     }
 
     /// Begin a database transaction.
@@ -492,11 +559,7 @@ impl DbTransaction {
 
     /// Start building a SQL query within this transaction.
     pub const fn query<'a>(&'a mut self, sql: &'a str) -> DbTransactionQuery<'a> {
-        DbTransactionQuery {
-            tx: self,
-            sql: Cow::Borrowed(sql),
-            params: Vec::new(),
-        }
+        SqlQuery::new(self, Cow::Borrowed(sql))
     }
 
     /// Commit this transaction.
@@ -518,15 +581,107 @@ impl DbTransaction {
     }
 }
 
-/// A query builder for [`Db`].
+/// The execution surface the query builder is written against.
+///
+/// [`Db`], [`DbTransaction`] and [`DurableDb`](crate::durable::DurableDb) differ only in how they
+/// run a prepared statement and which error they report, so [`SqlQuery`] is implemented once over
+/// this trait instead of three times over the three of them. It is plumbing, not an extension
+/// point: implementing it outside this crate buys nothing, because the builder is only reachable
+/// from the three `query()` methods.
+pub trait QuerySource: Send {
+    /// The error this source reports.
+    ///
+    /// The `From` bounds are what let the shared builder raise a placeholder-rewriting failure or
+    /// a row-decoding failure without knowing which of the three errors it is producing.
+    type Error: From<DbError> + From<serde_json::Error> + Send;
+
+    /// Which SQL dialect statements run through this source are written in.
+    fn dialect(&self) -> DbDialect;
+
+    /// Execute a statement that returns rows.
+    fn query(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, Self::Error>> + Send;
+
+    /// Execute a statement that does not return rows.
+    fn execute(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, Self::Error>> + Send;
+}
+
+impl QuerySource for &Db {
+    type Error = DbError;
+
+    fn dialect(&self) -> DbDialect {
+        self.0.dialect()
+    }
+
+    async fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<DbExecResult, Self::Error> {
+        self.0.query(sql, params).await
+    }
+
+    async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, Self::Error> {
+        self.0.execute(sql, params).await
+    }
+}
+
+impl QuerySource for &mut DbTransaction {
+    type Error = DbError;
+
+    fn dialect(&self) -> DbDialect {
+        self.0.dialect()
+    }
+
+    async fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<DbExecResult, Self::Error> {
+        self.0.query(sql, params).await
+    }
+
+    async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, Self::Error> {
+        self.0.execute(sql, params).await
+    }
+}
+
+/// A SQL query being built.
+///
+/// One builder serves [`Db`], [`DbTransaction`] and
+/// [`DurableDb`](crate::durable::DurableDb) — see the [`DbQuery`], [`DbTransactionQuery`] and
+/// [`DurableDbQuery`](crate::durable::DurableDbQuery) aliases, which are what the three `query()`
+/// methods hand back.
 #[derive(Debug)]
-pub struct DbQuery<'a> {
-    db: &'a Db,
+pub struct SqlQuery<'a, S> {
+    source: S,
     sql: Cow<'a, str>,
     params: Vec<DbValue>,
 }
 
-impl DbQuery<'_> {
+/// The query builder returned by [`Db::query`].
+pub type DbQuery<'a> = SqlQuery<'a, &'a Db>;
+
+/// The query builder returned by [`DbTransaction::query`].
+pub type DbTransactionQuery<'a> = SqlQuery<'a, &'a mut DbTransaction>;
+
+impl<'a, S> SqlQuery<'a, S> {
+    /// Start a query against `source`.
+    pub(crate) const fn new(source: S, sql: Cow<'a, str>) -> Self {
+        Self {
+            source,
+            sql,
+            params: Vec::new(),
+        }
+    }
+
     /// Bind a parameter value to the query.
     #[must_use]
     pub fn bind<T>(mut self, value: T) -> Self
@@ -536,16 +691,18 @@ impl DbQuery<'_> {
         self.params.push(value.into());
         self
     }
+}
 
+impl<S: QuerySource> SqlQuery<'_, S> {
     /// Execute a statement that does not return rows.
     ///
     /// # Errors
     ///
     /// Returns an error if placeholder rewriting, backend execution, or result
     /// conversion fails.
-    pub async fn execute(self) -> Result<DbExecResult, DbError> {
-        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.db.0.dialect())?;
-        self.db.0.execute(&sql, &self.params).await
+    pub async fn execute(mut self) -> Result<DbExecResult, S::Error> {
+        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.source.dialect())?;
+        self.source.execute(&sql, &self.params).await
     }
 
     /// Execute a query and deserialize all rows into `T`.
@@ -554,12 +711,12 @@ impl DbQuery<'_> {
     ///
     /// Returns an error if placeholder rewriting, backend execution, or row
     /// deserialization fails.
-    pub async fn fetch_all<T>(self) -> Result<Vec<T>, DbError>
+    pub async fn fetch_all<T>(mut self) -> Result<Vec<T>, S::Error>
     where
         T: DeserializeOwned,
     {
-        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.db.0.dialect())?;
-        let result = self.db.0.query(&sql, &self.params).await?;
+        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.source.dialect())?;
+        let result = self.source.query(&sql, &self.params).await?;
         result
             .rows
             .into_iter()
@@ -569,16 +726,23 @@ impl DbQuery<'_> {
 
     /// Execute a query and deserialize the first row into `T`, if present.
     ///
+    /// A `LIMIT 1` is appended when the statement is a `SELECT` that does not already bound its
+    /// own result set, so the backend stops after the row that is actually used instead of
+    /// transferring and converting every match. See [`append_single_row_limit`] for exactly when
+    /// that applies.
+    ///
     /// # Errors
     ///
     /// Returns an error if placeholder rewriting, backend execution, or row
     /// deserialization fails.
-    pub async fn fetch_optional<T>(self) -> Result<Option<T>, DbError>
+    pub async fn fetch_optional<T>(mut self) -> Result<Option<T>, S::Error>
     where
         T: DeserializeOwned,
     {
-        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.db.0.dialect())?;
-        let result = self.db.0.query(&sql, &self.params).await?;
+        let dialect = self.source.dialect();
+        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), dialect)?;
+        let sql = append_single_row_limit(&sql, dialect)?;
+        let result = self.source.query(&sql, &self.params).await?;
         result
             .rows
             .into_iter()
@@ -592,93 +756,13 @@ impl DbQuery<'_> {
     /// # Errors
     ///
     /// Returns an error if execution fails or the query returns no rows.
-    pub async fn fetch_one<T>(self) -> Result<T, DbError>
+    pub async fn fetch_one<T>(self) -> Result<T, S::Error>
     where
         T: DeserializeOwned,
     {
-        self.fetch_optional().await?.ok_or(DbError::RowNotFound)
-    }
-}
-
-/// A query builder scoped to a mutable transaction.
-#[derive(Debug)]
-pub struct DbTransactionQuery<'a> {
-    tx: &'a mut DbTransaction,
-    sql: Cow<'a, str>,
-    params: Vec<DbValue>,
-}
-
-impl DbTransactionQuery<'_> {
-    /// Bind a parameter value to the query.
-    #[must_use]
-    pub fn bind<T>(mut self, value: T) -> Self
-    where
-        T: Into<DbValue>,
-    {
-        self.params.push(value.into());
-        self
-    }
-
-    /// Execute a statement that does not return rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if placeholder rewriting, backend execution, or result
-    /// conversion fails.
-    pub async fn execute(self) -> Result<DbExecResult, DbError> {
-        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.tx.0.dialect())?;
-        self.tx.0.execute(&sql, &self.params).await
-    }
-
-    /// Execute a query and deserialize all rows into `T`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if placeholder rewriting, backend execution, or row
-    /// deserialization fails.
-    pub async fn fetch_all<T>(self) -> Result<Vec<T>, DbError>
-    where
-        T: DeserializeOwned,
-    {
-        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.tx.0.dialect())?;
-        let result = self.tx.0.query(&sql, &self.params).await?;
-        result
-            .rows
-            .into_iter()
-            .map(|row| serde_json::from_value(row).map_err(Into::into))
-            .collect()
-    }
-
-    /// Execute a query and deserialize the first row into `T`, if present.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if placeholder rewriting, backend execution, or row
-    /// deserialization fails.
-    pub async fn fetch_optional<T>(self) -> Result<Option<T>, DbError>
-    where
-        T: DeserializeOwned,
-    {
-        let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.tx.0.dialect())?;
-        let result = self.tx.0.query(&sql, &self.params).await?;
-        result
-            .rows
-            .into_iter()
-            .next()
-            .map(|row| serde_json::from_value(row).map_err(Into::into))
-            .transpose()
-    }
-
-    /// Execute a query and deserialize exactly one row into `T`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if execution fails or the query returns no rows.
-    pub async fn fetch_one<T>(self) -> Result<T, DbError>
-    where
-        T: DeserializeOwned,
-    {
-        self.fetch_optional().await?.ok_or(DbError::RowNotFound)
+        self.fetch_optional()
+            .await?
+            .ok_or_else(|| DbError::RowNotFound.into())
     }
 }
 
@@ -730,6 +814,77 @@ pub(crate) fn prepare_query_sql(
 
     Ok(rendered)
 }
+
+/// Append `LIMIT 1` to a statement whose caller only reads the first row.
+///
+/// `fetch_one` and `fetch_optional` otherwise pay for every matching row: the backend transfers
+/// them all and the converter turns each into a `serde_json::Value` before all but one is dropped.
+/// `LIMIT 1` is understood by all three dialects, so no dialect-specific rendering is needed —
+/// only the decision of whether appending it is safe, which is deliberately conservative:
+///
+/// - the statement must start with `SELECT` or `WITH`, so `INSERT ... RETURNING`, `CALL` and DDL
+///   are left alone;
+/// - it must contain no `LIMIT`, `FETCH`, `TOP` or `OFFSET` of its own, since the caller's own
+///   bound wins and a second `LIMIT` is a syntax error;
+/// - it must contain no `FOR` (`FOR UPDATE`, `FOR SHARE`) or `INTO`, because `LIMIT` has to
+///   precede those clauses rather than follow them;
+/// - it must contain no `;` except a trailing one, so a multi-statement string is never rewritten.
+///
+/// Anything that fails a check is returned unchanged, which costs the optimization and nothing
+/// else. The clause goes on its own line so a trailing `--` comment cannot swallow it.
+fn append_single_row_limit(sql: &str, dialect: DbDialect) -> Result<Cow<'_, str>, DbError> {
+    /// Clauses that either already bound the result set or must come after `LIMIT`.
+    const BLOCKING: &[Keyword] = &[
+        Keyword::LIMIT,
+        Keyword::FETCH,
+        Keyword::TOP,
+        Keyword::OFFSET,
+        Keyword::FOR,
+        Keyword::INTO,
+    ];
+
+    let tokens = tokenize_sql(sql, dialect)?;
+
+    let starts_a_query = tokens
+        .iter()
+        .find_map(|token| match &token.token {
+            Token::Word(word) => Some(word.keyword),
+            _ => None,
+        })
+        .is_some_and(|keyword| matches!(keyword, Keyword::SELECT | Keyword::WITH));
+    if !starts_a_query {
+        return Ok(Cow::Borrowed(sql));
+    }
+
+    let last_meaningful = tokens
+        .iter()
+        .rposition(|token| !matches!(token.token, Token::Whitespace(_)));
+    let has_inner_semicolon = tokens.iter().enumerate().any(|(index, token)| {
+        matches!(token.token, Token::SemiColon) && Some(index) != last_meaningful
+    });
+    if has_inner_semicolon {
+        return Ok(Cow::Borrowed(sql));
+    }
+
+    let bounded_already = tokens.iter().any(|token| match &token.token {
+        Token::Word(word) => BLOCKING.contains(&word.keyword),
+        _ => false,
+    });
+    if bounded_already {
+        return Ok(Cow::Borrowed(sql));
+    }
+
+    let trimmed = sql.trim_end();
+    let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
+    let mut rendered = String::with_capacity(body.len() + LIMIT_ONE_CLAUSE.len());
+    rendered.push_str(body);
+    rendered.push_str(LIMIT_ONE_CLAUSE);
+    Ok(Cow::Owned(rendered))
+}
+
+/// The clause [`append_single_row_limit`] adds, newline-prefixed so a trailing `--` comment in the
+/// caller's SQL cannot comment it out.
+const LIMIT_ONE_CLAUSE: &str = "\nLIMIT 1";
 
 fn tokenize_sql(query: &str, dialect: DbDialect) -> Result<Vec<TokenWithSpan>, DbError> {
     match dialect {
@@ -951,8 +1106,19 @@ impl DbTransactionBackend for NativeDbTransaction {
     not(target_arch = "wasm32"),
     any(feature = "postgres", feature = "mysql", feature = "sqlite")
 ))]
+/// Bind every [`DbValue`] onto a sqlx query.
+///
+/// The first argument names how [`DbValue::Decimal`] is encoded: `numeric` for the backends sqlx
+/// can encode a `BigDecimal` for (`PostgreSQL`, `MySQL`) and `decimal_text` for `SQLite`, which has
+/// no decimal type and therefore no encoder.
 macro_rules! bind_query_values {
-    ($query:expr, $params:expr) => {{
+    (@decimal numeric, $query:expr, $value:expr) => {
+        $query.bind($value.clone())
+    };
+    (@decimal decimal_text, $query:expr, $value:expr) => {
+        $query.bind($value.to_string())
+    };
+    ($decimal:ident, $query:expr, $params:expr) => {{
         let mut query = $query;
         for value in $params {
             query = match value {
@@ -962,6 +1128,10 @@ macro_rules! bind_query_values {
                 DbValue::Real(value) => query.bind(*value),
                 DbValue::Text(value) => query.bind(value.clone()),
                 DbValue::Blob(value) => query.bind(value.clone()),
+                DbValue::Timestamp(value) => query.bind(*value),
+                DbValue::Uuid(value) => query.bind(*value),
+                DbValue::Decimal(value) => bind_query_values!(@decimal $decimal, query, value),
+                DbValue::Json(value) => query.bind(value.clone()),
             };
         }
         query
@@ -986,7 +1156,7 @@ async fn execute_postgres_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    let query = bind_query_values!(sqlx::query(query), params);
+    let query = bind_query_values!(numeric, sqlx::query(query), params);
     let result = query.execute(executor).await?;
     Ok(DbExecResult {
         rows: Vec::new(),
@@ -1013,7 +1183,7 @@ async fn execute_mysql_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
 {
-    let query = bind_query_values!(sqlx::query(query), params);
+    let query = bind_query_values!(numeric, sqlx::query(query), params);
     let result = query.execute(executor).await?;
     Ok(DbExecResult {
         rows: Vec::new(),
@@ -1040,7 +1210,7 @@ async fn execute_sqlite_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let query = bind_query_values!(sqlx::query(query), params);
+    let query = bind_query_values!(decimal_text, sqlx::query(query), params);
     let result = query.execute(executor).await?;
     Ok(DbExecResult {
         rows: Vec::new(),
@@ -1067,7 +1237,7 @@ async fn query_postgres_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    let query = bind_query_values!(sqlx::query(query), params);
+    let query = bind_query_values!(numeric, sqlx::query(query), params);
     let rows = query.fetch_all(executor).await?;
     let rows_json = rows
         .iter()
@@ -1098,7 +1268,7 @@ async fn query_mysql_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
 {
-    let query = bind_query_values!(sqlx::query(query), params);
+    let query = bind_query_values!(numeric, sqlx::query(query), params);
     let rows = query.fetch_all(executor).await?;
     let rows_json = rows
         .iter()
@@ -1129,7 +1299,7 @@ async fn query_sqlite_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let query = bind_query_values!(sqlx::query(query), params);
+    let query = bind_query_values!(decimal_text, sqlx::query(query), params);
     let rows = query.fetch_all(executor).await?;
     let rows_json = rows
         .iter()
@@ -1369,6 +1539,128 @@ where
 }
 
 #[cfg(test)]
+mod single_row_tests {
+    use super::{append_single_row_limit, DbDialect};
+
+    fn limited(sql: &str) -> String {
+        append_single_row_limit(sql, DbDialect::Postgres)
+            .expect("statement should tokenize")
+            .into_owned()
+    }
+
+    #[test]
+    fn a_plain_select_gets_a_limit() {
+        assert_eq!(
+            limited("SELECT * FROM events WHERE user_id = $1"),
+            "SELECT * FROM events WHERE user_id = $1\nLIMIT 1"
+        );
+    }
+
+    #[test]
+    fn a_cte_query_gets_a_limit() {
+        assert_eq!(
+            limited("WITH recent AS (SELECT 1) SELECT * FROM recent"),
+            "WITH recent AS (SELECT 1) SELECT * FROM recent\nLIMIT 1"
+        );
+    }
+
+    #[test]
+    fn the_limit_goes_before_a_trailing_semicolon() {
+        assert_eq!(
+            limited("SELECT * FROM events;  "),
+            "SELECT * FROM events\nLIMIT 1"
+        );
+    }
+
+    #[test]
+    fn the_limit_survives_a_trailing_line_comment() {
+        let rendered = limited("SELECT * FROM events -- newest first");
+        assert!(rendered.ends_with("\nLIMIT 1"), "{rendered}");
+    }
+
+    #[test]
+    fn a_statement_that_already_bounds_itself_is_left_alone() {
+        for sql in [
+            "SELECT * FROM events LIMIT 10",
+            "SELECT * FROM events OFFSET 5",
+            "SELECT * FROM events FETCH FIRST 3 ROWS ONLY",
+            "SELECT TOP 1 * FROM events",
+        ] {
+            assert_eq!(limited(sql), sql, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_clause_that_must_follow_limit_blocks_the_rewrite() {
+        // `LIMIT` has to precede `FOR UPDATE`, so appending would be a syntax error.
+        for sql in [
+            "SELECT * FROM events FOR UPDATE",
+            "SELECT * FROM events FOR SHARE",
+            "SELECT id INTO archive FROM events",
+        ] {
+            assert_eq!(limited(sql), sql, "{sql}");
+        }
+    }
+
+    #[test]
+    fn only_a_query_is_rewritten() {
+        for sql in [
+            "INSERT INTO events (id) VALUES ($1) RETURNING id",
+            "UPDATE events SET seen = true RETURNING id",
+            "DELETE FROM events RETURNING id",
+            "CALL do_something()",
+        ] {
+            assert_eq!(limited(sql), sql, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_multi_statement_string_is_never_rewritten() {
+        let sql = "SELECT 1; SELECT 2";
+        assert_eq!(limited(sql), sql);
+    }
+
+    #[test]
+    fn every_dialect_accepts_the_same_clause() {
+        for dialect in [DbDialect::Postgres, DbDialect::MySql, DbDialect::Sqlite] {
+            let rendered = append_single_row_limit("SELECT * FROM t", dialect)
+                .expect("statement should tokenize");
+            assert_eq!(rendered, "SELECT * FROM t\nLIMIT 1");
+        }
+    }
+}
+
+#[cfg(test)]
+mod db_value_tests {
+    use super::DbValue;
+    use bigdecimal::BigDecimal;
+    use chrono::{DateTime, Utc};
+    use core::str::FromStr;
+    use uuid::Uuid;
+
+    #[test]
+    fn rich_types_convert_without_being_stringified_by_the_caller() {
+        let timestamp = DateTime::<Utc>::from_str("2024-05-06T07:08:09Z").expect("valid RFC 3339");
+        assert!(matches!(DbValue::from(timestamp), DbValue::Timestamp(_)));
+
+        let id = Uuid::from_str("550e8400-e29b-41d4-a716-446655440000").expect("valid UUID");
+        assert!(matches!(DbValue::from(id), DbValue::Uuid(_)));
+
+        let amount = BigDecimal::from_str("19.99").expect("valid decimal");
+        assert!(matches!(DbValue::from(amount), DbValue::Decimal(_)));
+
+        let document = serde_json::json!({ "kind": "email" });
+        assert!(matches!(DbValue::from(document), DbValue::Json(_)));
+    }
+
+    #[test]
+    fn an_absent_rich_value_still_binds_as_null() {
+        let missing: Option<Uuid> = None;
+        assert!(matches!(DbValue::from(missing), DbValue::Null));
+    }
+}
+
+#[cfg(test)]
 mod prepare_tests {
     use super::{prepare_query_sql, DbDialect, DbError};
 
@@ -1556,6 +1848,88 @@ mod tests {
             .await
             .expect("count query should succeed");
         assert_eq!(row, CountRow { count: 0 });
+    }
+
+    #[tokio::test]
+    async fn sqlite_binds_the_rich_parameter_types() {
+        use bigdecimal::BigDecimal;
+        use chrono::{DateTime, Utc};
+        use core::str::FromStr as _;
+        use uuid::Uuid;
+
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory sqlite should connect");
+        db.query(
+            "CREATE TABLE orders (
+                placed_at TEXT,
+                id BLOB,
+                amount TEXT,
+                payload TEXT
+            )",
+        )
+        .execute()
+        .await
+        .expect("schema should be created");
+
+        let placed_at = DateTime::<Utc>::from_str("2024-05-06T07:08:09Z").expect("valid RFC 3339");
+        let id = Uuid::from_str("550e8400-e29b-41d4-a716-446655440000").expect("valid UUID");
+        db.query("INSERT INTO orders (placed_at, id, amount, payload) VALUES (?, ?, ?, ?)")
+            .bind(placed_at)
+            .bind(id)
+            .bind(BigDecimal::from_str("19.99").expect("valid decimal"))
+            .bind(serde_json::json!({ "kind": "email" }))
+            .execute()
+            .await
+            .expect("insert should succeed");
+
+        let row: serde_json::Value = db
+            .query("SELECT amount FROM orders")
+            .fetch_one()
+            .await
+            .expect("select should succeed");
+        // SQLite has no decimal type, so the exact value is stored as its own rendering rather
+        // than being rounded through a float.
+        assert_eq!(row["amount"], serde_json::json!("19.99"));
+    }
+
+    #[tokio::test]
+    async fn fetch_optional_stops_at_the_first_row() {
+        #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+        struct ValueRow {
+            value: i64,
+        }
+
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory sqlite should connect");
+        db.query("CREATE TABLE entries (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .expect("schema should be created");
+        for value in 1..=3_i64 {
+            db.query("INSERT INTO entries (value) VALUES (?)")
+                .bind(value)
+                .execute()
+                .await
+                .expect("insert should succeed");
+        }
+
+        // The injected `LIMIT 1` means the backend returns one row, not three.
+        let first: ValueRow = db
+            .query("SELECT value FROM entries ORDER BY value")
+            .fetch_one()
+            .await
+            .expect("select should succeed");
+        assert_eq!(first, ValueRow { value: 1 });
+
+        // A statement that bounds itself is left alone and still yields its own first row.
+        let bounded: Option<ValueRow> = db
+            .query("SELECT value FROM entries ORDER BY value DESC LIMIT 2")
+            .fetch_optional()
+            .await
+            .expect("select should succeed");
+        assert_eq!(bounded, Some(ValueRow { value: 3 }));
     }
 
     #[tokio::test]

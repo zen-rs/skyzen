@@ -18,6 +18,13 @@ thiserror = "2"
 futures-core = "0.3"
 bytes = "1"
 sqlparser = "0.58"
+# The parameter types `DbValue` carries. These are named directly rather than through
+# `sqlx::types` because `DbValue` must exist on wasm32, where sqlx is not compiled at all; the
+# versions are the ones sqlx 0.8 re-exports, so cargo unifies them into one crate and a bound
+# `DateTime`/`Uuid`/`BigDecimal` is the same type sqlx's `Encode` impls expect.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = "1"
+bigdecimal = "0.4"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 sqlx = { version = "0.8", default-features = false, features = ["json", "chrono", "uuid", "bigdecimal"], optional = true }
