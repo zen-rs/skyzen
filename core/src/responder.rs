@@ -11,7 +11,7 @@ use http_kit::header::{HeaderMap, HeaderName, HeaderValue};
 use http_kit::HttpError;
 use http_kit::{
     utils::{AsyncBufRead, ByteStr, Bytes},
-    Body, Request, Response,
+    Body, Request, Response, StatusCode,
 };
 
 #[cfg(feature = "openapi")]
@@ -20,6 +20,19 @@ use crate::Error;
 
 /// Converts a value into part of an HTTP response, such as the response body or
 /// a set of headers.
+///
+/// Responders compose: a tuple applies each element left to right, so `(StatusCode::CREATED,
+/// Json(article))` sets the status and then the body.
+// The `note` lines below render under the trait-bound error at the `.at(handler)` call site, e.g.
+//   error[E0277]: `MyType` cannot be returned from a handler: it is not a `Responder`
+//      = note: return `String`, `&'static str`, `Bytes`, `Json<T>`, `StatusCode`, `Redirect`, ...
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be returned from a handler: it is not a `Responder`",
+    label = "not a `Responder`",
+    note = "return `String`, `&'static str`, `Bytes`, `Json<T>`, `StatusCode`, `Redirect`, a `Response`, or a tuple of responders such as `(StatusCode, Json<T>)`",
+    note = "to send a value as JSON, wrap it in `skyzen::utils::Json`",
+    note = "`Result<T, E>` is a responder when `T: Responder` and `E: HttpError`"
+)]
 pub trait Responder: Sized + Send + Sync + 'static {
     /// Error type returned when responding fails.
     type Error: HttpError;
@@ -218,6 +231,25 @@ impl<T: Responder> Responder for core::result::Result<T, Error> {
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
         T::register_openapi_schemas(defs);
+    }
+}
+
+/// Sets the response status, leaving everything else alone.
+///
+/// Because tuple responders apply left to right, `(StatusCode::CREATED, Json(article))` is the
+/// idiomatic way to answer with an explicit status and a body.
+impl Responder for StatusCode {
+    type Error = Infallible;
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
+        *response.status_mut() = self;
+        Ok(())
+    }
+
+    // The status is a runtime value, so there is no single documented status to advertise; the
+    // responder it is paired with contributes the schema.
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<ResponseSchema>> {
+        None
     }
 }
 
