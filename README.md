@@ -229,7 +229,7 @@ async fn update_profile(
 
 ## Error Handling
 
-Define typed application errors with `#[skyzen::error]`. This macro implements `std::error::Error`, `Display`, and `HttpError`, mapping each variant to an HTTP status code with message formatting:
+Define typed application errors with `#[skyzen::error]`. This macro implements `std::error::Error` (including `source()` for `#[from]`/`#[source]` fields), `Display`, and `HttpError`, mapping each variant to an HTTP status code with message formatting:
 
 ```rust
 use skyzen::{error, StatusCode};
@@ -253,10 +253,40 @@ pub enum AppError {
 }
 ```
 
+### Mixing Error Types with `skyzen::Result`
+
+A handler that fails in more than one way returns `skyzen::Result<T>`. Any error implementing `HttpError` — a route-parameter rejection, a `Json` rejection, a `KvError`, your own `#[skyzen::error]` enum — converts into it with `?` **and keeps its status**:
+
+```rust
+use skyzen::{routing::Params, Result};
+use skyzen_services::Kv;
+
+async fn read_profile(params: Params, kv: Kv) -> Result<String> {
+    let id = params.get("id")?;              // 400 if the parameter is missing
+    let raw = kv.get_text(id).await?;        // 500 if the store is unreachable
+    raw.ok_or_else(|| skyzen::Error::msg("no such profile").set_status(skyzen::StatusCode::NOT_FOUND))
+}
+```
+
+Errors with no HTTP meaning of their own do not convert implicitly — that is deliberate, since guessing a status is how a client error becomes a 500. State one instead:
+
+```rust
+use skyzen::{Context, Result, ResultExt, StatusCode};
+
+async fn read_config(path: &str) -> Result<String> {
+    // `.status(...)` states the status; `.context(...)` adds a breadcrumb and keeps it.
+    std::fs::read_to_string(path)
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .context("loading the application config")
+}
+```
+
+`ResultExt::status_msg` and `Option::status`/`status_msg` cover the same ground when the failure has no error value at all.
+
 ### Error Security & Behavior
 
 - **4xx Errors**: Return the formatted message to the client in a JSON payload: `404 {"error":"item with id 42 was not found"}`.
-- **5xx Errors**: Mask the response body with `"Internal server error"` to prevent internal system or database details from leaking to clients, while preserving the full error message in server logs.
+- **5xx Errors**: Mask the response body with `"Internal server error"` to prevent internal system or database details from leaking to clients, while preserving the full error message — and its whole `source()` chain — in the server log.
 
 ---
 

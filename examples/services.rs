@@ -34,20 +34,14 @@ struct UploadRequest {
 
 /// List all file metadata keys stored in KV.
 async fn list_files(kv: Kv) -> SkyResult<Json<Vec<String>>> {
-    let keys = kv
-        .list(Some("file:"))
-        .await
-        .map_err(|e| skyzen::Error::msg(e.to_string()))?;
+    let keys = kv.list(Some("file:")).await?;
     Ok(Json(keys))
 }
 
 /// Get metadata for a single file from KV.
 async fn get_file(kv: Kv, params: Params) -> SkyResult<Json<Option<FileMetadata>>> {
     let name = params.get("name")?;
-    let meta = kv
-        .get_json::<FileMetadata>(&format!("file:{name}"))
-        .await
-        .map_err(|e| skyzen::Error::msg(e.to_string()))?;
+    let meta = kv.get_json::<FileMetadata>(&format!("file:{name}")).await?;
     Ok(Json(meta))
 }
 
@@ -64,15 +58,10 @@ async fn upload_file(
     };
 
     // Store file bytes in object storage
-    storage
-        .put(&body.name, data)
-        .await
-        .map_err(|e| skyzen::Error::msg(e.to_string()))?;
+    storage.put(&body.name, data).await?;
 
     // Store metadata in KV
-    kv.put_json(&format!("file:{}", body.name), &meta)
-        .await
-        .map_err(|e| skyzen::Error::msg(e.to_string()))?;
+    kv.put_json(&format!("file:{}", body.name), &meta).await?;
 
     Ok("uploaded")
 }

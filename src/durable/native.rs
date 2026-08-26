@@ -730,7 +730,7 @@ mod tests {
     use super::*;
     use crate::{
         routing::{CreateRouteNode, Route},
-        Error, Result,
+        Result,
     };
     use serde::{Deserialize, Serialize};
     use skyzen_services::durable::DurableDb;
@@ -761,14 +761,12 @@ mod tests {
     async fn increment(db: DurableDb) -> Result<String> {
         db.query("CREATE TABLE IF NOT EXISTS counter (value INTEGER NOT NULL)")
             .execute()
-            .await
-            .map_err(to_error)?;
+            .await?;
 
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
             .fetch_optional::<CounterRow>()
-            .await
-            .map_err(to_error)?
+            .await?
             .map_or(0, |row| row.value);
         let next = current + 1;
 
@@ -776,14 +774,12 @@ mod tests {
             db.query("INSERT INTO counter (value) VALUES (?)")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         } else {
             db.query("UPDATE counter SET value = ?")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         }
 
         Ok(next.to_string())
@@ -794,14 +790,12 @@ mod tests {
     async fn slow_increment(db: DurableDb) -> Result<String> {
         db.query("CREATE TABLE IF NOT EXISTS counter (value INTEGER NOT NULL)")
             .execute()
-            .await
-            .map_err(to_error)?;
+            .await?;
 
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
             .fetch_optional::<CounterRow>()
-            .await
-            .map_err(to_error)?
+            .await?
             .map_or(0, |row| row.value);
 
         async_io::Timer::after(std::time::Duration::from_millis(50)).await;
@@ -811,38 +805,31 @@ mod tests {
             db.query("INSERT INTO counter (value) VALUES (?)")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         } else {
             db.query("UPDATE counter SET value = ?")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         }
 
         Ok(next.to_string())
     }
 
     async fn schedule_alarm(alarm: skyzen_services::durable::Alarm) -> Result<&'static str> {
-        alarm
-            .set_alarm(super::current_unix_ms() + 50)
-            .await
-            .map_err(to_error)?;
+        alarm.set_alarm(super::current_unix_ms() + 50).await?;
         Ok("scheduled")
     }
 
     async fn value(db: DurableDb) -> Result<String> {
         db.query("CREATE TABLE IF NOT EXISTS counter (value INTEGER NOT NULL)")
             .execute()
-            .await
-            .map_err(to_error)?;
+            .await?;
 
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
             .fetch_optional::<CounterRow>()
-            .await
-            .map_err(to_error)?
+            .await?
             .map_or(0, |row| row.value);
         Ok(current.to_string())
     }
@@ -850,14 +837,12 @@ mod tests {
     async fn run_alarm(db: DurableDb) -> Result<&'static str> {
         db.query("CREATE TABLE IF NOT EXISTS alarm_runs (value INTEGER NOT NULL)")
             .execute()
-            .await
-            .map_err(to_error)?;
+            .await?;
 
         let current = db
             .query("SELECT value FROM alarm_runs LIMIT 1")
             .fetch_optional::<CounterRow>()
-            .await
-            .map_err(to_error)?
+            .await?
             .map_or(0, |row| row.value);
         let next = current + 1;
 
@@ -865,14 +850,12 @@ mod tests {
             db.query("INSERT INTO alarm_runs (value) VALUES (?)")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         } else {
             db.query("UPDATE alarm_runs SET value = ?")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         }
 
         Ok("ok")
@@ -881,20 +864,14 @@ mod tests {
     async fn alarm_count(db: DurableDb) -> Result<String> {
         db.query("CREATE TABLE IF NOT EXISTS alarm_runs (value INTEGER NOT NULL)")
             .execute()
-            .await
-            .map_err(to_error)?;
+            .await?;
 
         let current = db
             .query("SELECT value FROM alarm_runs LIMIT 1")
             .fetch_optional::<CounterRow>()
-            .await
-            .map_err(to_error)?
+            .await?
             .map_or(0, |row| row.value);
         Ok(current.to_string())
-    }
-
-    fn to_error(error: impl std::fmt::Display) -> Error {
-        Error::msg(error.to_string())
     }
 
     fn request(method: Method, path: &str) -> Request {
