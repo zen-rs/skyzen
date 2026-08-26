@@ -76,6 +76,13 @@ pub use http_kit;
 pub use http_kit::{
     header, Body, BodyError, Endpoint, HttpError, Method, Request, Response, StatusCode, Uri,
 };
+
+/// RFC-typed headers, for use with [`TypedHeader`](crate::extract::TypedHeader).
+///
+/// This is the [`headers`](https://docs.rs/headers) crate; `skyzen::header` beside it is the raw
+/// `HeaderName`/`HeaderValue` vocabulary from `http`.
+#[cfg(feature = "typed-header")]
+pub use headers;
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use js_sys;
