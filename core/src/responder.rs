@@ -23,9 +23,12 @@ use crate::Error;
 ///
 /// Responders compose: a tuple applies each element left to right, so `(StatusCode::CREATED,
 /// Json(article))` sets the status and then the body.
-// The `note` lines below render under the trait-bound error at the `.at(handler)` call site, e.g.
-//   error[E0277]: `MyType` cannot be returned from a handler: it is not a `Responder`
-//      = note: return `String`, `&'static str`, `Bytes`, `Json<T>`, `StatusCode`, `Redirect`, ...
+// Verified rendering wherever a `Responder` bound is unsatisfied:
+//   error[E0277]: `NotAResponder` cannot be returned from a handler: it is not a `Responder`
+//      = note: return `String`, `&'static str`, `Bytes`, `Json<T>`, `StatusCode`, `Redirect`, a
+//              `Response`, or a tuple of responders such as `(StatusCode, Json<T>)`
+//      = note: to send a value as JSON, wrap it in `skyzen::utils::Json`
+//      = note: `Result<T, E>` is a responder when `T: Responder` and `E: HttpError`
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be returned from a handler: it is not a `Responder`",
     label = "not a `Responder`",
