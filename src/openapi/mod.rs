@@ -1,7 +1,6 @@
 //! OpenAPI helpers powered by `utoipa` schemas.
 
 use std::collections::BTreeMap;
-#[cfg(feature = "openapi")]
 use std::marker::PhantomData;
 use std::{
     fmt::{self, Debug},

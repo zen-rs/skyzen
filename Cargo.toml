@@ -155,7 +155,7 @@ multipart = ["dep:multer", "dep:pin-project-lite"]
 sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
 # The static file server emits and honours `ETag`, `Last-Modified` and `Range`, which it parses
 # and renders with the `headers` crate rather than by hand.
-static-files = ["dep:headers"]
+static-files = ["dep:headers", "dep:sha1", "dep:base64"]
 # `TypedHeader<H>` plus the `skyzen::headers` re-export.
 typed-header = ["dep:headers"]
 runtime-async-std-native-tls = ["skyzen-services/runtime-async-std-native-tls"]
