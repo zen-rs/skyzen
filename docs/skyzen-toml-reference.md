@@ -24,8 +24,45 @@ type = "queue"
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `name` | string | **Required.** Logical service name used in wiring sections |
+| `name` | string | **Required.** Logical service name used in wiring sections, and the name of the generated extractor type |
 | `type` | string | **Required.** `kv`, `storage`, or `queue` |
+
+### Multiple Instances of One Type
+
+Declare as many services of a type as you need — multiple KV namespaces and multiple R2 buckets
+are routine in a single Worker, and so are multiple caches and buckets on AWS:
+
+```toml
+[[service]]
+name = "cache"
+type = "kv"
+
+[[service]]
+name = "sessions"
+type = "kv"
+```
+
+Each entry generates its own extractor type, named after the entry, wrapping the portable service:
+`cache` generates `pub struct Cache(Kv)` with `Deref<Target = Kv>`, so every `Kv` method is
+reachable through it. A handler names the ones it wants:
+
+```rust
+async fn handler(cache: Cache, sessions: Sessions) -> Result<&'static str> {
+    cache.put("greeting", b"hello").await?;
+    sessions.put_if_absent("sid", b"{}").await?;
+    Ok("ok")
+}
+```
+
+**How a bare `Kv` / `Storage` / `Queue` resolves.** Services reach handlers through request
+extensions, which are keyed by type, so a bare wrapper can only ever name one instance.
+`#[skyzen::main]` injects it only when the manifest declares **exactly one** service of that type.
+With the two KV entries above, only `Cache` and `Sessions` are injected, and a handler asking for a
+bare `Kv` gets its `KvNotConfigured` error (HTTP 500) rather than one of the two chosen
+arbitrarily — name the binding you mean.
+
+The same rule applies to `Db`, except that `[[database]]` picks its bare instance explicitly with
+`default = true`.
 
 ### Native Service Wiring
 

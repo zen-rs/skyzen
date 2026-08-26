@@ -3,7 +3,7 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::PathBuf,
 };
@@ -141,10 +141,34 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// Import datasource declarations from `Skyzen.toml` and generate strong-typed extractors.
+/// Import declarations from `Skyzen.toml` and generate strongly typed extractors.
 ///
 /// This macro has no runtime side effects. It only generates types, initialization methods,
 /// middleware implementations, and extractors.
+///
+/// # Named bindings
+///
+/// Every `[[service]]` and `[[database]]` entry generates a newtype around the portable wrapper,
+/// named after the entry: `[[service]] name = "cache" type = "kv"` generates `pub struct
+/// Cache(Kv)` with `Deref<Target = Kv>`, its own `CacheNotConfigured` error, and its own
+/// `Extractor` and `Middleware`. Multiple instances of one type are therefore ordinary:
+///
+/// ```ignore
+/// async fn handler(cache: Cache, sessions: Sessions) -> Result<&'static str> {
+///     cache.put("greeting", b"hello").await?;      // Deref reaches every `Kv` method
+///     sessions.put_if_absent("sid", b"{}").await?;
+///     Ok("ok")
+/// }
+/// ```
+///
+/// # How a bare `Kv`, `Storage`, `Queue` or `Db` resolves
+///
+/// Services are injected into request extensions keyed by type, so a bare wrapper can only name
+/// one instance. `#[skyzen::main]` therefore injects it **only when the manifest declares exactly
+/// one service of that type** (or, for `Db`, the database marked `default = true`). With two KV
+/// namespaces declared, only `Cache` and `Sessions` are injected and a handler asking for a bare
+/// `Kv` gets its `KvNotConfigured` error (HTTP 500) rather than one namespace chosen arbitrarily.
+/// Name the binding you mean.
 #[proc_macro]
 pub fn import_config(input: TokenStream) -> TokenStream {
     if !input.is_empty() {
@@ -1919,6 +1943,15 @@ impl ServiceType {
             Self::Queue => "queue",
         }
     }
+
+    /// The portable wrapper this service type is bound to.
+    fn wrapper_path(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Kv => quote! { ::skyzen_services::Kv },
+            Self::Storage => quote! { ::skyzen_services::Storage },
+            Self::Queue => quote! { ::skyzen_services::Queue },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1944,12 +1977,18 @@ impl DatabaseType {
 #[allow(clippy::too_many_lines)]
 fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
     let datasources = load_datasources()?;
-    let databases = if let Some(value) = load_manifest_value()? {
-        load_databases_from_value(&value)?
-    } else {
-        Vec::new()
+    let (services, databases) = match load_manifest_value()? {
+        Some(value) => (
+            load_services_from_value(&value)?,
+            load_databases_from_value(&value)?,
+        ),
+        None => (Vec::new(), Vec::new()),
     };
-    let mut generated_items = Vec::with_capacity(datasources.len());
+    let mut generated_items =
+        Vec::with_capacity(datasources.len() + services.len() + databases.len());
+    // Datasources, services and databases all land in the same module, so one set catches a
+    // collision between kinds — a service named `main-db` and a database named `main` both
+    // normalize to `MainDb`.
     let mut seen_idents = HashSet::new();
 
     for datasource in datasources {
@@ -2105,89 +2144,43 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
         });
     }
 
-    let mut seen_database_idents = HashSet::new();
-    for database in databases {
+    for service in &services {
+        let ident = service_ident_from_name(&service.name)?;
+        if !seen_idents.insert(ident.to_string()) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!("duplicate service type name after normalization: `{ident}`"),
+            ));
+        }
+
+        generated_items.push(named_binding_tokens(
+            &ident,
+            &service.service_type.wrapper_path(),
+            &format!(
+                "{} `{}` not configured. Ensure Skyzen.toml service wiring is installed.",
+                service.service_type.as_str(),
+                service.name
+            ),
+        ));
+    }
+
+    for database in &databases {
         let ident = database_ident_from_name(&database.name)?;
-        if !seen_database_idents.insert(ident.to_string()) {
+        if !seen_idents.insert(ident.to_string()) {
             return Err(Error::new(
                 proc_macro2::Span::call_site(),
                 format!("duplicate database type name after normalization: `{ident}`"),
             ));
         }
 
-        let missing_ident = format_ident!("{ident}NotConfigured");
-        let display_name = database.name.clone();
-        let display_message = LitStr::new(
+        generated_items.push(named_binding_tokens(
+            &ident,
+            &quote! { ::skyzen_services::Db },
             &format!(
-                "database `{display_name}` not configured. Ensure Skyzen.toml database wiring is installed."
+                "database `{}` not configured. Ensure Skyzen.toml database wiring is installed.",
+                database.name
             ),
-            proc_macro2::Span::call_site(),
-        );
-
-        generated_items.push(quote! {
-            #[derive(Debug, Clone)]
-            pub struct #ident(::skyzen_services::Db);
-
-            impl #ident {
-                #[must_use]
-                pub const fn new(db: ::skyzen_services::Db) -> Self {
-                    Self(db)
-                }
-
-                #[must_use]
-                pub const fn inner(&self) -> &::skyzen_services::Db {
-                    &self.0
-                }
-
-                #[must_use]
-                pub fn into_inner(self) -> ::skyzen_services::Db {
-                    self.0
-                }
-            }
-
-            impl ::std::ops::Deref for #ident {
-                type Target = ::skyzen_services::Db;
-
-                fn deref(&self) -> &Self::Target {
-                    &self.0
-                }
-            }
-
-            ::skyzen::http_kit::http_error!(
-                pub #missing_ident,
-                ::skyzen::StatusCode::INTERNAL_SERVER_ERROR,
-                #display_message
-            );
-
-            impl ::skyzen::extract::Extractor for #ident {
-                type Error = #missing_ident;
-
-                async fn extract(
-                    request: &mut ::skyzen::Request,
-                ) -> ::std::result::Result<Self, Self::Error> {
-                    request
-                        .extensions()
-                        .get::<Self>()
-                        .cloned()
-                        .ok_or_else(#missing_ident::new)
-                }
-            }
-
-            impl ::skyzen::middleware::Middleware for #ident {
-                async fn handle(
-                    &self,
-                    request: &mut ::skyzen::Request,
-                    next: ::skyzen::middleware::Next<'_>,
-                ) -> ::std::result::Result<::skyzen::Response, ::skyzen::Error> {
-                    request.extensions_mut().insert(self.clone());
-                    next.run(request).await
-                }
-
-                fn provisions(&self) -> ::std::vec::Vec<::std::any::TypeId> {
-                    ::std::vec![::std::any::TypeId::of::<Self>()]
-                }
-            }
-        });
+        ));
     }
 
     let manifest_tracking = manifest_tracking_tokens();
@@ -2202,6 +2195,89 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
 
         pub use __skyzen_config::*;
     })
+}
+
+/// Generate the named newtype for one `[[service]]` or `[[database]]` entry.
+///
+/// Injection is keyed by the extension's type, so a bare `Kv` or `Db` can only ever name one
+/// instance. Every manifest entry therefore gets its own type wrapping the portable wrapper, with
+/// `Deref` to it, its own `*NotConfigured` error, and its own `Extractor`/`Middleware` pair — which
+/// is what lets `async fn h(cache: Cache, sessions: Sessions)` name two KV namespaces.
+///
+/// Services and databases produce byte-identical plumbing, so it is written once here rather than
+/// twice; only the wrapped type and the not-configured message differ.
+fn named_binding_tokens(
+    ident: &proc_macro2::Ident,
+    wrapper: &proc_macro2::TokenStream,
+    missing_message: &str,
+) -> proc_macro2::TokenStream {
+    let missing_ident = format_ident!("{ident}NotConfigured");
+    let missing_message = LitStr::new(missing_message, proc_macro2::Span::call_site());
+
+    quote! {
+        #[derive(Debug, Clone)]
+        pub struct #ident(#wrapper);
+
+        impl #ident {
+            #[must_use]
+            pub const fn new(service: #wrapper) -> Self {
+                Self(service)
+            }
+
+            #[must_use]
+            pub const fn inner(&self) -> &#wrapper {
+                &self.0
+            }
+
+            #[must_use]
+            pub fn into_inner(self) -> #wrapper {
+                self.0
+            }
+        }
+
+        impl ::std::ops::Deref for #ident {
+            type Target = #wrapper;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        ::skyzen::http_kit::http_error!(
+            pub #missing_ident,
+            ::skyzen::StatusCode::INTERNAL_SERVER_ERROR,
+            #missing_message
+        );
+
+        impl ::skyzen::extract::Extractor for #ident {
+            type Error = #missing_ident;
+
+            async fn extract(
+                request: &mut ::skyzen::Request,
+            ) -> ::std::result::Result<Self, Self::Error> {
+                request
+                    .extensions()
+                    .get::<Self>()
+                    .cloned()
+                    .ok_or_else(#missing_ident::new)
+            }
+        }
+
+        impl ::skyzen::middleware::Middleware for #ident {
+            async fn handle(
+                &self,
+                request: &mut ::skyzen::Request,
+                next: ::skyzen::middleware::Next<'_>,
+            ) -> ::std::result::Result<::skyzen::Response, ::skyzen::Error> {
+                request.extensions_mut().insert(self.clone());
+                next.run(request).await
+            }
+
+            fn provisions(&self) -> ::std::vec::Vec<::std::any::TypeId> {
+                ::std::vec![::std::any::TypeId::of::<Self>()]
+            }
+        }
+    }
 }
 
 /// Emit a `const _: &str = include_str!(...)` referencing `Skyzen.toml` (when it exists) so
@@ -2267,38 +2343,27 @@ fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>>
     let default_database = default_database_index(&databases)?;
 
     let mut steps = Vec::with_capacity(services.len() + databases.len() + 1);
-    let mut seen_service_types = HashSet::new();
+    let service_type_counts = service_type_counts(&services);
 
     // On wasm, `__skyzen_wasm_env` is bound by the factory closure parameter generated in
     // `#[skyzen::main]`; the environment is threaded explicitly rather than read from a
     // thread-local that concurrent invocations could race.
 
     for service in &services {
-        if !seen_service_types.insert(service.service_type) {
-            return Err(Error::new(
-                proc_macro2::Span::call_site(),
-                format!(
-                    "duplicate portable service type `{}` detected; Skyzen currently supports only one default `{}` capability",
-                    service.service_type.as_str(),
-                    service.service_type.as_str()
-                ),
-            ));
-        }
-
+        let ident = service_ident_from_name(&service.name)?;
         let native_init = generate_native_service_init(service, &value)?;
         let cloudflare_init = generate_cloudflare_service_init(service, &value)?;
+        // The bare `Kv`/`Storage`/`Queue` extractor names whichever service of that type is the
+        // only one, so it is injected exactly when the type is unambiguous.
+        let inject_bare = service_type_counts[&service.service_type] == 1;
+        let native = named_injection_tokens(&ident, &native_init, inject_bare);
+        let cloudflare = named_injection_tokens(&ident, &cloudflare_init, inject_bare);
         steps.push(quote! {
             let endpoint = {
                 #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let __svc = #native_init;
-                    ::skyzen::__private::with_middleware(endpoint, __svc)
-                }
+                { #native }
                 #[cfg(target_arch = "wasm32")]
-                {
-                    let __svc = #cloudflare_init;
-                    ::skyzen::__private::with_middleware(endpoint, __svc)
-                }
+                { #cloudflare }
             };
         });
     }
@@ -2307,34 +2372,59 @@ fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>>
         let ident = database_ident_from_name(&database.name)?;
         let native_init = generate_native_database_init(database, &value)?;
         let cloudflare_init = generate_cloudflare_database_init(database, &value)?;
-        let inject_default = default_database == Some(index);
+        let inject_bare = default_database == Some(index);
+        let native = named_injection_tokens(&ident, &native_init, inject_bare);
+        let cloudflare = named_injection_tokens(&ident, &cloudflare_init, inject_bare);
         steps.push(quote! {
             let endpoint = {
                 #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let __db = #native_init;
-                    let endpoint = ::skyzen::__private::with_middleware(endpoint, #ident::new(__db.clone()));
-                    if #inject_default {
-                        ::skyzen::__private::with_middleware(endpoint, __db)
-                    } else {
-                        endpoint
-                    }
-                }
+                { #native }
                 #[cfg(target_arch = "wasm32")]
-                {
-                    let __db = #cloudflare_init;
-                    let endpoint = ::skyzen::__private::with_middleware(endpoint, #ident::new(__db.clone()));
-                    if #inject_default {
-                        ::skyzen::__private::with_middleware(endpoint, __db)
-                    } else {
-                        endpoint
-                    }
-                }
+                { #cloudflare }
             };
         });
     }
 
     Ok(steps)
+}
+
+/// How many `[[service]]` entries each service type has.
+///
+/// A type with exactly one entry is unambiguous, so the bare `Kv`/`Storage`/`Queue` extractor can
+/// be injected alongside the named newtype; with two or more, only the newtypes are injected.
+fn service_type_counts(services: &[ServiceConfig]) -> HashMap<ServiceType, usize> {
+    let mut counts = HashMap::new();
+    for service in services {
+        *counts.entry(service.service_type).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Wrap the router with one manifest entry's middleware.
+///
+/// The named newtype is always installed. `inject_bare` additionally installs the portable wrapper
+/// itself, which is what makes `async fn h(kv: Kv)` work when the manifest declares exactly one
+/// service of that type (or the default database).
+fn named_injection_tokens(
+    ident: &proc_macro2::Ident,
+    init: &proc_macro2::TokenStream,
+    inject_bare: bool,
+) -> proc_macro2::TokenStream {
+    if inject_bare {
+        quote! {
+            let __service = #init;
+            let endpoint = ::skyzen::__private::with_middleware(
+                endpoint,
+                #ident::new(::std::clone::Clone::clone(&__service)),
+            );
+            ::skyzen::__private::with_middleware(endpoint, __service)
+        }
+    } else {
+        quote! {
+            let __service = #init;
+            ::skyzen::__private::with_middleware(endpoint, #ident::new(__service))
+        }
+    }
 }
 
 fn load_datasources() -> syn::Result<Vec<DatasourceConfig>> {
@@ -2871,8 +2961,12 @@ fn ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
     Ok(format_ident!("{normalized}"))
 }
 
-fn database_ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
-    let mut normalized = String::with_capacity(name.len() + 2);
+/// Turn a manifest entry's name into a type name: `main-db` becomes `MainDb`.
+///
+/// `suffix` is appended after the conversion, so a database keeps its `Db` marker while a service
+/// binding uses its name verbatim (`cache` becomes `Cache`).
+fn pascal_ident_from_name(name: &str, suffix: &str, kind: &str) -> syn::Result<proc_macro2::Ident> {
+    let mut normalized = String::with_capacity(name.len() + suffix.len());
     let mut uppercase_next = true;
 
     for ch in name.chars() {
@@ -2891,12 +2985,28 @@ fn database_ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
     if normalized.is_empty() {
         return Err(Error::new(
             proc_macro2::Span::call_site(),
-            "database name must contain at least one alphanumeric character",
+            format!("{kind} name must contain at least one alphanumeric character"),
         ));
     }
 
-    normalized.push_str("Db");
+    if normalized
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_digit())
+    {
+        normalized.insert(0, '_');
+    }
+
+    normalized.push_str(suffix);
     Ok(format_ident!("{normalized}"))
+}
+
+fn database_ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
+    pascal_ident_from_name(name, "Db", "database")
+}
+
+fn service_ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
+    pascal_ident_from_name(name, "", "service")
 }
 
 fn default_database_index(databases: &[DatabaseConfig]) -> syn::Result<Option<usize>> {
@@ -3611,6 +3721,98 @@ binding = "DB"
                 .to_string()
                 .contains("cannot mark more than one database as `default = true`")
         );
+    }
+
+    #[test]
+    fn a_service_binding_becomes_a_type_name_without_a_suffix() {
+        use super::service_ident_from_name;
+
+        assert_eq!(
+            service_ident_from_name("cache").unwrap().to_string(),
+            "Cache"
+        );
+        assert_eq!(
+            service_ident_from_name("session-store")
+                .unwrap()
+                .to_string(),
+            "SessionStore"
+        );
+        assert_eq!(
+            service_ident_from_name("user_uploads").unwrap().to_string(),
+            "UserUploads"
+        );
+        // A leading digit cannot start an identifier, so it is prefixed rather than dropped.
+        assert_eq!(
+            service_ident_from_name("9lives").unwrap().to_string(),
+            "_9lives"
+        );
+        assert!(service_ident_from_name("---").is_err());
+    }
+
+    #[test]
+    fn the_bare_wrapper_is_injected_only_for_an_unambiguous_service_type() {
+        use super::service_type_counts;
+
+        let value: toml::Value = toml::from_str(
+            r#"[[service]]
+name = "cache"
+type = "kv"
+
+[[service]]
+name = "sessions"
+type = "kv"
+
+[[service]]
+name = "uploads"
+type = "storage"
+"#,
+        )
+        .expect("valid toml");
+        let services = load_services_from_value(&value).expect("services");
+        let counts = service_type_counts(&services);
+
+        // Two KV namespaces: only `Cache` and `Sessions` are injected, never a bare `Kv`.
+        assert_eq!(counts[&ServiceType::Kv], 2);
+        // One bucket: `Uploads` and the bare `Storage` both are.
+        assert_eq!(counts[&ServiceType::Storage], 1);
+        assert!(!counts.contains_key(&ServiceType::Queue));
+    }
+
+    #[test]
+    fn a_named_binding_derefs_to_its_portable_wrapper() {
+        use super::named_binding_tokens;
+        use quote::{format_ident, quote};
+
+        let generated = named_binding_tokens(
+            &format_ident!("Cache"),
+            &quote! { ::skyzen_services::Kv },
+            "kv `cache` not configured.",
+        )
+        .to_string();
+
+        assert!(generated.contains("pub struct Cache (:: skyzen_services :: Kv)"));
+        assert!(generated.contains("impl :: std :: ops :: Deref for Cache"));
+        assert!(generated.contains("impl :: skyzen :: extract :: Extractor for Cache"));
+        assert!(generated.contains("impl :: skyzen :: middleware :: Middleware for Cache"));
+        assert!(generated.contains("fn provisions"));
+        assert!(generated.contains("pub CacheNotConfigured"));
+    }
+
+    #[test]
+    fn injection_installs_the_newtype_and_only_then_the_bare_wrapper() {
+        use super::named_injection_tokens;
+        use quote::{format_ident, quote};
+
+        let init = quote! { ::skyzen_services::Kv::new(backend) };
+
+        let unambiguous = named_injection_tokens(&format_ident!("Cache"), &init, true).to_string();
+        assert!(unambiguous.contains("Cache :: new"));
+        // Both the newtype and the bare wrapper are layered on.
+        assert_eq!(unambiguous.matches("with_middleware").count(), 2);
+
+        let ambiguous = named_injection_tokens(&format_ident!("Cache"), &init, false).to_string();
+        assert!(ambiguous.contains("Cache :: new"));
+        assert_eq!(ambiguous.matches("with_middleware").count(), 1);
     }
 
     #[test]
