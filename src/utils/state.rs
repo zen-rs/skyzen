@@ -1,6 +1,7 @@
 //! State utilities module.
 //! It provides a middleware and extractor for application state sharing.
 
+use core::future::{ready, Future};
 use std::{
     any::TypeId,
     ops::{Deref, DerefMut},
@@ -60,12 +61,16 @@ impl http_kit::HttpError for StateNotExist {
 
 impl<T: Send + Sync + Clone + 'static> Extractor for State<T> {
     type Error = StateNotExist;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or_else(StateNotExist::new::<T>)
+    // Reading the state back out of the extensions is a synchronous clone, so the future is ready
+    // on creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(
+            request
+                .extensions()
+                .get::<Self>()
+                .cloned()
+                .ok_or_else(StateNotExist::new::<T>),
+        )
     }
 
     fn requirements() -> Vec<Requirement> {

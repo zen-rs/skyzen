@@ -1,5 +1,6 @@
 //! In-memory message queue for testing.
 
+use core::future::{ready, Future};
 use std::{
     collections::VecDeque,
     sync::{Arc, RwLock},
@@ -187,94 +188,116 @@ impl Default for InMemoryQueue {
     }
 }
 
+// A `VecDeque` behind a lock answers every call synchronously, so each future is ready on creation
+// rather than an `async` block with nothing to await.
 impl MessageQueue for InMemoryQueue {
-    async fn send(&self, message: &[u8]) -> Result<(), QueueError> {
-        self.take_injected_failure()?;
-        self.push(message, None);
-        Ok(())
+    fn send(&self, message: &[u8]) -> impl Future<Output = Result<(), QueueError>> + Send {
+        ready(
+            self.take_injected_failure()
+                .map(|()| self.push(message, None)),
+        )
     }
 
-    async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<(), QueueError> {
-        self.take_injected_failure()?;
-        for message in messages {
-            self.push(message, None);
-        }
-        Ok(())
-    }
-
-    async fn send_with(&self, message: &[u8], options: SendOptions) -> Result<(), QueueError> {
-        self.take_injected_failure()?;
-        self.push(message, options.delay);
-        Ok(())
-    }
-
-    async fn receive(&self, options: ReceiveOptions) -> Result<Vec<ReceivedMessage>, QueueError> {
-        self.take_injected_failure()?;
-        let now = Instant::now();
-        let visibility = options
-            .visibility_timeout
-            .unwrap_or(DEFAULT_VISIBILITY_TIMEOUT);
-        let lease_until = now.checked_add(visibility).unwrap_or(now);
-
-        let mut state = self.state.write().expect("InMemoryQueue lock poisoned");
-        let mut received = Vec::new();
-
-        for index in 0..state.messages.len() {
-            if received.len() >= options.max_messages {
-                break;
+    fn send_batch(
+        &self,
+        messages: &[Vec<u8>],
+    ) -> impl Future<Output = Result<(), QueueError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            for message in messages {
+                self.push(message, None);
             }
-            if !state.messages[index].is_visible(now) {
-                continue;
+        }))
+    }
+
+    fn send_with(
+        &self,
+        message: &[u8],
+        options: SendOptions,
+    ) -> impl Future<Output = Result<(), QueueError>> + Send {
+        ready(
+            self.take_injected_failure()
+                .map(|()| self.push(message, options.delay)),
+        )
+    }
+
+    fn receive(
+        &self,
+        options: ReceiveOptions,
+    ) -> impl Future<Output = Result<Vec<ReceivedMessage>, QueueError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let now = Instant::now();
+            let visibility = options
+                .visibility_timeout
+                .unwrap_or(DEFAULT_VISIBILITY_TIMEOUT);
+            let lease_until = now.checked_add(visibility).unwrap_or(now);
+
+            let mut state = self.state.write().expect("InMemoryQueue lock poisoned");
+            let mut received = Vec::new();
+
+            for index in 0..state.messages.len() {
+                if received.len() >= options.max_messages {
+                    break;
+                }
+                if !state.messages[index].is_visible(now) {
+                    continue;
+                }
+
+                let token = state.take_token();
+                let message = &mut state.messages[index];
+                message.attempts += 1;
+                message.receipt = Some(token);
+                message.visible_at = lease_until;
+
+                received.push(ReceivedMessage {
+                    id: Some(message.id.to_string()),
+                    body: message.body.clone(),
+                    receipt: MessageReceipt::new(token.to_string()),
+                    attempts: Some(message.attempts),
+                });
             }
 
-            let token = state.take_token();
+            drop(state);
+            received
+        }))
+    }
+
+    fn ack(&self, receipt: &MessageReceipt) -> impl Future<Output = Result<(), QueueError>> + Send {
+        ready(self.take_injected_failure().and_then(|()| {
+            let mut state = self.state.write().expect("InMemoryQueue lock poisoned");
+            let Some(index) = state.position_of(receipt) else {
+                // An unknown receipt means the lease already lapsed and the message went back to
+                // the queue, which is exactly the case a consumer must not treat as a successful
+                // delete.
+                return Err(QueueError::Conflict);
+            };
+            state.messages.remove(index);
+            drop(state);
+            Ok(())
+        }))
+    }
+
+    fn nack(
+        &self,
+        receipt: &MessageReceipt,
+        retry: QueueRetry,
+    ) -> impl Future<Output = Result<(), QueueError>> + Send {
+        ready(self.take_injected_failure().and_then(|()| {
+            let now = Instant::now();
+            let visible_at = retry
+                .delay_seconds
+                .and_then(|delay| now.checked_add(Duration::from_secs(u64::from(delay))))
+                .unwrap_or(now);
+
+            let mut state = self.state.write().expect("InMemoryQueue lock poisoned");
+            let Some(index) = state.position_of(receipt) else {
+                return Err(QueueError::Conflict);
+            };
             let message = &mut state.messages[index];
-            message.attempts += 1;
-            message.receipt = Some(token);
-            message.visible_at = lease_until;
-
-            received.push(ReceivedMessage {
-                id: Some(message.id.to_string()),
-                body: message.body.clone(),
-                receipt: MessageReceipt::new(token.to_string()),
-                attempts: Some(message.attempts),
-            });
-        }
-
-        drop(state);
-        Ok(received)
-    }
-
-    async fn ack(&self, receipt: &MessageReceipt) -> Result<(), QueueError> {
-        self.take_injected_failure()?;
-        let mut state = self.state.write().expect("InMemoryQueue lock poisoned");
-        let Some(index) = state.position_of(receipt) else {
-            // An unknown receipt means the lease already lapsed and the message went back to the
-            // queue, which is exactly the case a consumer must not treat as a successful delete.
-            return Err(QueueError::Conflict);
-        };
-        state.messages.remove(index);
-        drop(state);
-        Ok(())
-    }
-
-    async fn nack(&self, receipt: &MessageReceipt, retry: QueueRetry) -> Result<(), QueueError> {
-        self.take_injected_failure()?;
-        let now = Instant::now();
-        let visible_at = retry
-            .delay_seconds
-            .and_then(|delay| now.checked_add(Duration::from_secs(u64::from(delay))))
-            .unwrap_or(now);
-
-        let mut state = self.state.write().expect("InMemoryQueue lock poisoned");
-        let Some(index) = state.position_of(receipt) else {
-            return Err(QueueError::Conflict);
-        };
-        let message = &mut state.messages[index];
-        message.receipt = None;
-        message.visible_at = visible_at;
-        drop(state);
-        Ok(())
+            message.receipt = None;
+            message.visible_at = visible_at;
+            drop(state);
+            Ok(())
+        }))
     }
 }
 

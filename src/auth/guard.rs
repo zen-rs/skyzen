@@ -25,6 +25,7 @@
 //! }
 //! ```
 
+use core::future::{ready, Future};
 use http::StatusCode;
 
 use crate::{extract::Extractor, middleware::auth::AuthUser, Request};
@@ -102,19 +103,23 @@ where
 {
     type Error = AuthorizationError;
 
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let user = request
-            .extensions()
-            .get::<AuthUser<U>>()
-            .ok_or(AuthorizationError::NotAuthenticated)?
-            .0
-            .clone();
-
-        if user.has_role(Self::ROLE) {
-            Ok(Self(user))
-        } else {
-            Err(AuthorizationError::Forbidden)
-        }
+    // The authenticated user is already in the extensions, so the future is ready on creation
+    // rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(
+            request
+                .extensions()
+                .get::<AuthUser<U>>()
+                .ok_or(AuthorizationError::NotAuthenticated)
+                .and_then(|user| {
+                    let user = user.0.clone();
+                    if user.has_role(Self::ROLE) {
+                        Ok(Self(user))
+                    } else {
+                        Err(AuthorizationError::Forbidden)
+                    }
+                }),
+        )
     }
 
     fn requirements() -> Vec<Requirement> {

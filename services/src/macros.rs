@@ -165,14 +165,20 @@ macro_rules! service_extractor {
 
         impl ::skyzen_core::Extractor for $wrapper {
             type Error = $not_configured;
-            async fn extract(
+            // Reading the wrapper back out of the extensions is a synchronous clone, so the
+            // future is ready on creation rather than an `async` block with nothing to await.
+            fn extract(
                 request: &mut ::http_kit::Request,
-            ) -> ::core::result::Result<Self, Self::Error> {
-                request
-                    .extensions()
-                    .get::<Self>()
-                    .cloned()
-                    .ok_or($not_configured::new())
+            ) -> impl ::core::future::Future<
+                Output = ::core::result::Result<Self, Self::Error>,
+            > + ::core::marker::Send {
+                ::core::future::ready(
+                    request
+                        .extensions()
+                        .get::<Self>()
+                        .cloned()
+                        .ok_or($not_configured::new()),
+                )
             }
         }
 

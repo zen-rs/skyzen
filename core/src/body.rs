@@ -14,6 +14,7 @@ use core::any::type_name;
 use core::convert::Infallible;
 use core::error::Error as StdError;
 use core::fmt::{self, Debug, Display};
+use core::future::Future;
 use core::mem;
 use core::pin::pin;
 
@@ -79,8 +80,8 @@ impl Default for RequestBodyLimit {
 /// Reads the limit in force for the current request, so a handler can size its own reads.
 impl Extractor for RequestBodyLimit {
     type Error = Infallible;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(Self::of(request))
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(Ok(Self::of(request)))
     }
 }
 

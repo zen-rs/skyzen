@@ -170,29 +170,32 @@ impl QuerySource for &DurableDb {
 mod tests {
     use super::{DurableDb, DurableDbBackend, DurableDbError};
     use crate::sql::{DbExecResult, DbValue};
+    use core::future::{ready, Future};
 
     #[derive(Debug, Clone, Default)]
     struct RecordingBackend;
 
+    // Every answer is a constant, so the futures are ready on creation rather than `async` blocks
+    // with nothing to await.
     impl DurableDbBackend for RecordingBackend {
-        async fn query(
+        fn query(
             &self,
             _query: &str,
             _params: &[DbValue],
-        ) -> Result<DbExecResult, DurableDbError> {
-            Ok(DbExecResult::default())
+        ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+            ready(Ok(DbExecResult::default()))
         }
 
-        async fn execute(
+        fn execute(
             &self,
             _query: &str,
             _params: &[DbValue],
-        ) -> Result<DbExecResult, DurableDbError> {
-            Ok(DbExecResult::default())
+        ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+            ready(Ok(DbExecResult::default()))
         }
 
-        async fn database_size(&self) -> Result<u64, DurableDbError> {
-            Ok(0)
+        fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
+            ready(Ok(0))
         }
     }
 

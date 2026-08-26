@@ -11,7 +11,7 @@
 
 use std::{
     any::TypeId,
-    future::Future,
+    future::{ready, Future},
     ops::{Deref, DerefMut},
 };
 
@@ -62,12 +62,16 @@ http_kit::http_error!(
 impl<U: Send + Sync + Clone + 'static> Extractor for AuthUser<U> {
     type Error = NotAuthenticated;
 
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or_else(NotAuthenticated::new)
+    // Reading the user back out of the extensions is a synchronous clone, so the future is ready
+    // on creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(
+            request
+                .extensions()
+                .get::<Self>()
+                .cloned()
+                .ok_or_else(NotAuthenticated::new),
+        )
     }
 
     fn requirements() -> Vec<Requirement> {
@@ -128,6 +132,7 @@ mod tests {
         Arc,
     };
 
+    use core::future::{ready, Future};
     use http_kit::{http_error, HttpError};
 
     use super::{AuthMiddleware, AuthUser, Authenticator};
@@ -176,14 +181,14 @@ mod tests {
         type User = TestUser;
         type Error = TestAuthError;
 
-        async fn authenticate(
+        fn authenticate(
             &self,
             _req: &Request,
-        ) -> std::result::Result<Self::User, Self::Error> {
-            match &self.outcome {
+        ) -> impl Future<Output = std::result::Result<Self::User, Self::Error>> + Send {
+            ready(match &self.outcome {
                 AuthOutcome::Allow(user) => Ok(user.clone()),
                 AuthOutcome::Deny => Err(TestAuthError::new()),
-            }
+            })
         }
     }
 

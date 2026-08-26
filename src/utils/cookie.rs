@@ -1,5 +1,6 @@
 //! HTTP cookies
 pub use cookie::Cookie;
+use core::future::{ready, Future};
 use http::StatusCode;
 
 use std::{
@@ -50,22 +51,29 @@ http_error!(
 
 impl Extractor for CookieJar {
     type Error = CookieParseError;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        // HTTP/2 allows the Cookie header to be split into several field lines,
-        // so join every occurrence with "; " before parsing.
-        let mut combined = String::new();
-        for value in request.headers().get_all(header::COOKIE) {
-            let value =
-                core::str::from_utf8(value.as_bytes()).map_err(|_| CookieParseError::new())?;
-            if !combined.is_empty() {
-                combined.push_str("; ");
-            }
-            combined.push_str(value);
-        }
-        combined
-            .parse::<Self>()
-            .map_err(|_| CookieParseError::new())
+    // The header is already on the request, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(parse_jar(request))
     }
+}
+
+/// Join every `Cookie` field line and parse the result.
+///
+/// HTTP/2 allows the header to be split into several field lines, so they are joined with "; "
+/// before parsing.
+fn parse_jar(request: &Request) -> Result<CookieJar, CookieParseError> {
+    let mut combined = String::new();
+    for value in request.headers().get_all(header::COOKIE) {
+        let value = core::str::from_utf8(value.as_bytes()).map_err(|_| CookieParseError::new())?;
+        if !combined.is_empty() {
+            combined.push_str("; ");
+        }
+        combined.push_str(value);
+    }
+    combined
+        .parse::<CookieJar>()
+        .map_err(|_| CookieParseError::new())
 }
 
 http_error!(

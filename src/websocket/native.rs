@@ -33,6 +33,7 @@ use async_tungstenite::{
     WebSocketReceiver as AsyncWebSocketReceiver, WebSocketSender as AsyncWebSocketSender,
     WebSocketStream,
 };
+use core::future::{ready, Future};
 use executor_core::{AnyExecutor, Executor};
 use futures_core::Stream;
 use futures_util::Sink;
@@ -721,14 +722,16 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
 
 impl Extractor for WebSocketUpgrade {
     type Error = WebSocketUpgradeError;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+    // The handshake is validated from the request's own headers, so the future is ready on
+    // creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
         let result = upgrade(request);
 
         if let Err(ref error) = result {
             error!("WebSocket upgrade failed: {error}");
         }
 
-        result
+        ready(result)
     }
 }
 

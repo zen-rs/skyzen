@@ -663,12 +663,13 @@ mod tests {
         MessageQueue, MessageReceipt, Queue, QueueBatch, QueueError, QueueMessage, QueueRetry,
         ReceiveOptions, ReceivedMessage, SendOptions,
     };
+    use core::future::{ready, Future};
     use http_kit::{Body, Endpoint, HttpError, Response};
     use serde::{Deserialize, Serialize};
     use skyzen_core::Extractor;
     use std::{
         convert::Infallible,
-        sync::{Arc, RwLock},
+        sync::{Arc, RwLock, RwLockWriteGuard},
     };
 
     #[derive(Clone, Default)]
@@ -676,21 +677,30 @@ mod tests {
         messages: Arc<RwLock<Vec<Vec<u8>>>>,
     }
 
-    impl MessageQueue for InMemoryMessageQueue {
-        async fn send(&self, message: &[u8]) -> Result<(), QueueError> {
+    impl InMemoryMessageQueue {
+        fn write(&self) -> Result<RwLockWriteGuard<'_, Vec<Vec<u8>>>, QueueError> {
             self.messages
                 .write()
-                .map_err(|_| QueueError::backend("lock poisoned"))?
-                .push(message.to_vec());
-            Ok(())
+                .map_err(|_| QueueError::backend("lock poisoned"))
+        }
+    }
+
+    // Pushing onto a `Vec` behind a lock is synchronous, so the futures are ready on creation
+    // rather than `async` blocks with nothing to await.
+    impl MessageQueue for InMemoryMessageQueue {
+        fn send(&self, message: &[u8]) -> impl Future<Output = Result<(), QueueError>> + Send {
+            ready(self.write().map(|mut messages| {
+                messages.push(message.to_vec());
+            }))
         }
 
-        async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<(), QueueError> {
-            self.messages
-                .write()
-                .map_err(|_| QueueError::backend("lock poisoned"))?
-                .extend(messages.iter().cloned());
-            Ok(())
+        fn send_batch(
+            &self,
+            messages: &[Vec<u8>],
+        ) -> impl Future<Output = Result<(), QueueError>> + Send {
+            ready(self.write().map(|mut queued| {
+                queued.extend(messages.iter().cloned());
+            }))
         }
     }
 

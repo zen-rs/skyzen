@@ -516,12 +516,13 @@ impl Kv {
 #[cfg(test)]
 mod tests {
     use super::{KeyValueStore, Kv, KvError, KvListOptions, KvListResult};
+    use core::future::{ready, Future};
     use http_kit::HttpError;
     use serde::Deserialize;
     use skyzen_core::Extractor;
     use std::{
         collections::HashMap,
-        sync::{Arc, RwLock},
+        sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
     };
 
     #[derive(Clone, Default)]
@@ -529,37 +530,22 @@ mod tests {
         data: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     }
 
-    impl KeyValueStore for InMemoryKeyValueStore {
-        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
-            let data = self
-                .data
+    impl InMemoryKeyValueStore {
+        fn read(&self) -> Result<RwLockReadGuard<'_, HashMap<String, Vec<u8>>>, KvError> {
+            self.data
                 .read()
-                .map_err(|_| KvError::backend("lock poisoned"))?;
-            Ok(data.get(key).cloned())
+                .map_err(|_| KvError::backend("lock poisoned"))
         }
 
-        async fn put(&self, key: &str, value: &[u8]) -> Result<(), KvError> {
+        fn write(&self) -> Result<RwLockWriteGuard<'_, HashMap<String, Vec<u8>>>, KvError> {
             self.data
                 .write()
-                .map_err(|_| KvError::backend("lock poisoned"))?
-                .insert(key.to_owned(), value.to_vec());
-            Ok(())
+                .map_err(|_| KvError::backend("lock poisoned"))
         }
 
-        async fn delete(&self, key: &str) -> Result<(), KvError> {
-            self.data
-                .write()
-                .map_err(|_| KvError::backend("lock poisoned"))?
-                .remove(key);
-            Ok(())
-        }
-
-        async fn list(&self, options: KvListOptions) -> Result<KvListResult, KvError> {
+        fn list_page(&self, options: &KvListOptions) -> Result<KvListResult, KvError> {
             let mut keys: Vec<String> = {
-                let data = self
-                    .data
-                    .read()
-                    .map_err(|_| KvError::backend("lock poisoned"))?;
+                let data = self.read()?;
                 data.keys()
                     .filter(|key| {
                         options
@@ -585,6 +571,33 @@ mod tests {
             }
 
             Ok(KvListResult { keys, cursor })
+        }
+    }
+
+    // A `HashMap` behind a lock answers every call synchronously, so the futures are ready on
+    // creation rather than `async` blocks with nothing to await.
+    impl KeyValueStore for InMemoryKeyValueStore {
+        fn get(&self, key: &str) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + Send {
+            ready(self.read().map(|data| data.get(key).cloned()))
+        }
+
+        fn put(&self, key: &str, value: &[u8]) -> impl Future<Output = Result<(), KvError>> + Send {
+            ready(self.write().map(|mut data| {
+                data.insert(key.to_owned(), value.to_vec());
+            }))
+        }
+
+        fn delete(&self, key: &str) -> impl Future<Output = Result<(), KvError>> + Send {
+            ready(self.write().map(|mut data| {
+                data.remove(key);
+            }))
+        }
+
+        fn list(
+            &self,
+            options: KvListOptions,
+        ) -> impl Future<Output = Result<KvListResult, KvError>> + Send {
+            ready(self.list_page(&options))
         }
     }
 
@@ -644,20 +657,30 @@ mod tests {
         struct StuckCursorStore;
 
         impl KeyValueStore for StuckCursorStore {
-            async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, KvError> {
-                Ok(None)
+            fn get(
+                &self,
+                _key: &str,
+            ) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + Send {
+                ready(Ok(None))
             }
-            async fn put(&self, _key: &str, _value: &[u8]) -> Result<(), KvError> {
-                Ok(())
+            fn put(
+                &self,
+                _key: &str,
+                _value: &[u8],
+            ) -> impl Future<Output = Result<(), KvError>> + Send {
+                ready(Ok(()))
             }
-            async fn delete(&self, _key: &str) -> Result<(), KvError> {
-                Ok(())
+            fn delete(&self, _key: &str) -> impl Future<Output = Result<(), KvError>> + Send {
+                ready(Ok(()))
             }
-            async fn list(&self, _options: KvListOptions) -> Result<KvListResult, KvError> {
-                Ok(KvListResult {
+            fn list(
+                &self,
+                _options: KvListOptions,
+            ) -> impl Future<Output = Result<KvListResult, KvError>> + Send {
+                ready(Ok(KvListResult {
                     keys: vec!["stuck".to_owned()],
                     cursor: Some("same".to_owned()),
-                })
+                }))
             }
         }
 

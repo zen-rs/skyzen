@@ -1,5 +1,6 @@
 //! In-memory key-value store for testing.
 
+use core::future::{ready, Future};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock, RwLockWriteGuard},
@@ -143,45 +144,55 @@ fn counter_value(entry: Option<&Entry>) -> Result<i64, KvError> {
         .map_err(|error| KvError::Decode(format!("counter {text:?} is not an integer: {error}")))
 }
 
+// A `HashMap` behind a lock answers every call synchronously, so each future is ready on creation
+// rather than an `async` block with nothing to await.
 impl KeyValueStore for InMemoryKv {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
-        self.take_injected_failure()?;
-        let now = Instant::now();
-        let data = self.data.read().expect("InMemoryKv lock poisoned");
-        Ok(data
-            .get(key)
-            .filter(|entry| !entry.is_expired(now))
-            .map(|entry| entry.value.clone()))
+    fn get(&self, key: &str) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let now = Instant::now();
+            let data = self.data.read().expect("InMemoryKv lock poisoned");
+            data.get(key)
+                .filter(|entry| !entry.is_expired(now))
+                .map(|entry| entry.value.clone())
+        }))
     }
 
-    async fn put(&self, key: &str, value: &[u8]) -> Result<(), KvError> {
-        self.take_injected_failure()?;
-        self.write_purged().insert(
-            key.to_owned(),
-            Entry {
-                value: value.to_vec(),
-                expires_at: None,
-            },
-        );
-        Ok(())
+    fn put(&self, key: &str, value: &[u8]) -> impl Future<Output = Result<(), KvError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            self.write_purged().insert(
+                key.to_owned(),
+                Entry {
+                    value: value.to_vec(),
+                    expires_at: None,
+                },
+            );
+        }))
     }
 
-    async fn put_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<(), KvError> {
-        self.take_injected_failure()?;
-        let expires_at = self.expiry_for(ttl);
-        self.write_purged().insert(
-            key.to_owned(),
-            Entry {
-                value: value.to_vec(),
-                expires_at,
-            },
-        );
-        Ok(())
+    fn put_with_ttl(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: Duration,
+    ) -> impl Future<Output = Result<(), KvError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let expires_at = self.expiry_for(ttl);
+            self.write_purged().insert(
+                key.to_owned(),
+                Entry {
+                    value: value.to_vec(),
+                    expires_at,
+                },
+            );
+        }))
     }
 
-    async fn put_if_absent(&self, key: &str, value: &[u8]) -> Result<bool, KvError> {
-        self.take_injected_failure()?;
-        let written = {
+    fn put_if_absent(
+        &self,
+        key: &str,
+        value: &[u8],
+    ) -> impl Future<Output = Result<bool, KvError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
             let mut data = self.write_purged();
             !data.contains_key(key)
                 && data
@@ -193,18 +204,16 @@ impl KeyValueStore for InMemoryKv {
                         },
                     )
                     .is_none()
-        };
-        Ok(written)
+        }))
     }
 
-    async fn compare_and_swap(
+    fn compare_and_swap(
         &self,
         key: &str,
         expected: Option<&[u8]>,
         new: &[u8],
-    ) -> Result<bool, KvError> {
-        self.take_injected_failure()?;
-        let swapped = {
+    ) -> impl Future<Output = Result<bool, KvError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
             let mut data = self.write_purged();
             data.get(key).map(|entry| entry.value.as_slice()) == expected && {
                 data.insert(
@@ -217,86 +226,98 @@ impl KeyValueStore for InMemoryKv {
                 );
                 true
             }
-        };
-        Ok(swapped)
+        }))
     }
 
-    async fn increment(&self, key: &str, delta: i64) -> Result<i64, KvError> {
-        self.take_injected_failure()?;
-        let mut data = self.write_purged();
-        let updated = counter_value(data.get(key))?
-            .checked_add(delta)
-            .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
-        // Keep whatever expiry the counter already had, so an incremented rate-limit
-        // window still closes on schedule.
-        let expires_at = data.get(key).and_then(|entry| entry.expires_at);
-        data.insert(
-            key.to_owned(),
-            Entry {
-                value: updated.to_string().into_bytes(),
-                expires_at,
-            },
-        );
-        drop(data);
-        Ok(updated)
+    fn increment(
+        &self,
+        key: &str,
+        delta: i64,
+    ) -> impl Future<Output = Result<i64, KvError>> + Send {
+        ready(self.take_injected_failure().and_then(|()| {
+            let mut data = self.write_purged();
+            let updated = counter_value(data.get(key))?
+                .checked_add(delta)
+                .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
+            // Keep whatever expiry the counter already had, so an incremented rate-limit
+            // window still closes on schedule.
+            let expires_at = data.get(key).and_then(|entry| entry.expires_at);
+            data.insert(
+                key.to_owned(),
+                Entry {
+                    value: updated.to_string().into_bytes(),
+                    expires_at,
+                },
+            );
+            drop(data);
+            Ok(updated)
+        }))
     }
 
-    async fn expire(&self, key: &str, ttl: Duration) -> Result<bool, KvError> {
-        self.take_injected_failure()?;
-        let expires_at = self.expiry_for(ttl);
-        let re_armed = {
+    fn expire(
+        &self,
+        key: &str,
+        ttl: Duration,
+    ) -> impl Future<Output = Result<bool, KvError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let expires_at = self.expiry_for(ttl);
             let mut data = self.write_purged();
             data.get_mut(key).is_some_and(|entry| {
                 entry.expires_at = expires_at;
                 true
             })
-        };
-        Ok(re_armed)
+        }))
     }
 
-    async fn exists(&self, key: &str) -> Result<bool, KvError> {
-        self.take_injected_failure()?;
-        let now = Instant::now();
-        let data = self.data.read().expect("InMemoryKv lock poisoned");
-        Ok(data.get(key).is_some_and(|entry| !entry.is_expired(now)))
+    fn exists(&self, key: &str) -> impl Future<Output = Result<bool, KvError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let now = Instant::now();
+            let data = self.data.read().expect("InMemoryKv lock poisoned");
+            data.get(key).is_some_and(|entry| !entry.is_expired(now))
+        }))
     }
 
-    async fn delete(&self, key: &str) -> Result<(), KvError> {
-        self.take_injected_failure()?;
-        self.write_purged().remove(key);
-        Ok(())
+    fn delete(&self, key: &str) -> impl Future<Output = Result<(), KvError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            self.write_purged().remove(key);
+        }))
     }
 
-    async fn list(&self, options: KvListOptions) -> Result<KvListResult, KvError> {
-        self.take_injected_failure()?;
-        let mut keys: Vec<String> = {
-            let data = self.write_purged();
-            data.keys()
-                .filter(|key| {
-                    options
-                        .prefix
-                        .as_ref()
-                        .is_none_or(|prefix| key.starts_with(prefix))
-                        // The cursor is the last key of the previous page; resume strictly after it.
-                        && options
-                            .cursor
+    fn list(
+        &self,
+        options: KvListOptions,
+    ) -> impl Future<Output = Result<KvListResult, KvError>> + Send {
+        ready(self.take_injected_failure().map(|()| {
+            let mut keys: Vec<String> = {
+                let data = self.write_purged();
+                data.keys()
+                    .filter(|key| {
+                        options
+                            .prefix
                             .as_ref()
-                            .is_none_or(|cursor| key.as_str() > cursor.as_str())
-                })
-                .cloned()
-                .collect()
-        };
-        keys.sort_unstable();
+                            .is_none_or(|prefix| key.starts_with(prefix))
+                            // The cursor is the last key of the previous page; resume strictly
+                            // after it.
+                            && options
+                                .cursor
+                                .as_ref()
+                                .is_none_or(|cursor| key.as_str() > cursor.as_str())
+                    })
+                    .cloned()
+                    .collect()
+            };
+            keys.sort_unstable();
 
-        let mut cursor = None;
-        if let Some(limit) = options.limit {
-            if keys.len() > limit {
-                keys.truncate(limit);
-                cursor = keys.last().cloned();
+            let mut cursor = None;
+            if let Some(limit) = options.limit {
+                if keys.len() > limit {
+                    keys.truncate(limit);
+                    cursor = keys.last().cloned();
+                }
             }
-        }
 
-        Ok(KvListResult { keys, cursor })
+            KvListResult { keys, cursor }
+        }))
     }
 }
 
