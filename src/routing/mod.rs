@@ -144,6 +144,9 @@ pub use param::{MissingParam, Params};
 mod router;
 pub use router::{build, AllowedMethods, NotFound, RouteBuildError, Router};
 
+mod nest;
+pub use nest::{NestedPathError, NestedRouter};
+
 /// Which requests an endpoint node answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MethodFilter {
@@ -225,6 +228,13 @@ pub enum RouteNodeType {
         /// Middleware wrapping this endpoint, outermost first.
         middleware: Vec<BoxMiddleware>,
     },
+    /// An already-built [`Router`] mounted under the node's path.
+    Nested {
+        /// The mounted router, which sees paths with the mount prefix removed.
+        router: Router,
+        /// Middleware wrapping the mounted router, outermost first.
+        middleware: Vec<BoxMiddleware>,
+    },
 }
 
 impl fmt::Debug for RouteNodeType {
@@ -236,6 +246,11 @@ impl fmt::Debug for RouteNodeType {
             } => f
                 .debug_struct("Endpoint")
                 .field("method", method)
+                .field("middleware", &middleware.len())
+                .finish(),
+            Self::Nested { router, middleware } => f
+                .debug_struct("Nested")
+                .field("router", router)
                 .field("middleware", &middleware.len())
                 .finish(),
         }
@@ -502,10 +517,25 @@ impl RouteNode {
         }
     }
 
+    /// Construct a node mounting an already-built router under `path`.
+    #[must_use]
+    pub(crate) fn new_nested(path: impl Into<String>, router: Router) -> Self {
+        Self {
+            path: path.into(),
+            node_type: RouteNodeType::Nested {
+                router,
+                middleware: Vec::new(),
+            },
+        }
+    }
+
     fn apply_middleware(&mut self, middleware: &BoxMiddleware) {
         match &mut self.node_type {
             RouteNodeType::Route(route) => route.apply_middleware(middleware),
             RouteNodeType::Endpoint {
+                middleware: stack, ..
+            }
+            | RouteNodeType::Nested {
                 middleware: stack, ..
             } => stack.insert(0, Arc::clone(middleware)),
         }
@@ -701,14 +731,24 @@ impl RouteNode {
         self.extend_with_nodes(vec![endpoint])
     }
 
+    /// Mount an already-built [`Router`] under the current path.
+    ///
+    /// See [`CreateRouteNode::nest`] for what the mounted router sees.
+    #[must_use]
+    pub fn nest(self, router: Router) -> Self {
+        self.extend_with_nodes(vec![Self::new_nested("", router)])
+    }
+
     fn extend_with_nodes(self, mut additional: Vec<Self>) -> Self {
         let path = self.path;
         let mut nodes = match self.node_type {
             RouteNodeType::Route(route) => route.into_mounted_nodes(),
-            endpoint @ RouteNodeType::Endpoint { .. } => vec![Self {
-                path: String::new(),
-                node_type: endpoint,
-            }],
+            terminal @ (RouteNodeType::Endpoint { .. } | RouteNodeType::Nested { .. }) => {
+                vec![Self {
+                    path: String::new(),
+                    node_type: terminal,
+                }]
+            }
         };
 
         nodes.append(&mut additional);
@@ -868,8 +908,27 @@ fn collect_openapi_entries(
                     buf.push(RouteOpenApiEntry::new(path, method.clone(), *openapi));
                 }
             }
+            RouteNodeType::Nested { router, .. } => {
+                buf.extend(prefixed_openapi_entries(&path, router));
+            }
         }
     }
+}
+
+/// A mounted router's operations, re-pathed under the prefix it is mounted at.
+#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+pub(crate) fn prefixed_openapi_entries(prefix: &str, router: &Router) -> Vec<RouteOpenApiEntry> {
+    router
+        .openapi_entries()
+        .iter()
+        .map(|entry| {
+            RouteOpenApiEntry::new(
+                join_path(prefix, &entry.path),
+                entry.method.clone(),
+                entry.handler,
+            )
+        })
+        .collect()
 }
 
 /// Builder extension that turns a path literal into convenient routing nodes.
@@ -958,6 +1017,27 @@ pub trait CreateRouteNode: Sized {
 
     /// Mount nested routes under the current path segment.
     fn route(self, routes: impl Routes) -> RouteNode;
+
+    /// Mount an already-built [`Router`] under the current path segment.
+    ///
+    /// The mounted router matches as if it sat at the root: the prefix is stripped before it sees
+    /// the request, and put back afterwards. It keeps its own `404` fallback and `405`, so a path
+    /// under the prefix that it does not know is answered by *it* rather than by the outer router.
+    /// Its `OpenAPI` operations are re-exported under the prefix.
+    ///
+    /// ```rust
+    /// use skyzen::{routing::{CreateRouteNode, Route}, Result};
+    ///
+    /// // A library exports a built router...
+    /// let admin = Route::new(("/users".at(|| async { Result::Ok("users") }),)).build();
+    ///
+    /// // ...and an application hangs it wherever it likes.
+    /// let router = Route::new(("/admin".nest(admin),)).build();
+    /// ```
+    ///
+    /// Use [`route`](Self::route) instead to compose an unbuilt [`Route`]: nesting exists for the
+    /// case where the router is already built and its internals are no longer reachable.
+    fn nest(self, router: Router) -> RouteNode;
 
     /// Attach an endpoint at the specified method and path.
     ///
@@ -1091,5 +1171,9 @@ where
 
     fn route(self, routes: impl Routes) -> RouteNode {
         RouteNode::new_route(self.into(), Route::new(routes))
+    }
+
+    fn nest(self, router: Router) -> RouteNode {
+        RouteNode::new_nested(self.into(), router)
     }
 }
