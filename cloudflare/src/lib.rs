@@ -105,7 +105,8 @@ pub use database_error::CfDatabaseError;
 pub use durable::{
     invoke_alarm, invoke_websocket_close, invoke_websocket_error, invoke_websocket_message,
     CfAlarm, CfDurableConnections, CfDurableDb, CfDurableKv, CfDurableNamespace,
-    CfDurableObjectStub, CfDurableState, CfWebSocketConnection, DurableObjectRuntime,
+    CfDurableObjectStub, CfDurableState, CfJurisdiction, CfWebSocketConnection,
+    DurableObjectRuntime,
 };
 #[cfg(target_arch = "wasm32")]
 pub use events::{
