@@ -6,7 +6,8 @@ use std::{
 };
 
 use super::{
-    join_path, BoxEndpoint, EndpointFactory, MethodFilter, Params, Route, RouteNode, RouteNodeType,
+    join_path, BoxEndpoint, EndpointFactory, MethodFilter, NestedRouter, Params, Route, RouteNode,
+    RouteNodeType,
 };
 #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 use crate::openapi::RouteOpenApiEntry;
@@ -344,6 +345,12 @@ impl Router {
         }
     }
 
+    /// The `OpenAPI` entries this router was built from, for re-export by a router that mounts it.
+    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+    pub(crate) fn openapi_entries(&self) -> &[RouteOpenApiEntry] {
+        &self.openapi_entries
+    }
+
     /// Create a fresh alarm endpoint, if one was registered via [`Route::on_alarm`].
     #[must_use]
     pub fn alarm_endpoint(&self) -> Option<BoxEndpoint> {
@@ -451,6 +458,11 @@ pub enum RouteBuildError {
         /// The path as the route tree assembled it.
         path: String,
     },
+    /// A router was mounted under a prefix containing a pattern segment.
+    NestedPatternPrefix {
+        /// The mount prefix that cannot be stripped.
+        path: String,
+    },
     /// An endpoint needs a value that no middleware on its ancestor chain provides.
     MissingProvision {
         /// Path of the endpoint whose wiring is incomplete.
@@ -479,6 +491,11 @@ impl std::fmt::Display for RouteBuildError {
                 f,
                 "route path `{path}` cannot match any request: every mount prefix must start \
                  with `/`"
+            ),
+            Self::NestedPatternPrefix { path } => write!(
+                f,
+                "a router cannot be mounted at `{path}`: the prefix is removed from the request \
+                 path literally, so it must not contain a `{{name}}` segment"
             ),
             Self::MissingProvision {
                 path,
@@ -570,6 +587,32 @@ fn flatten(
                     middleware,
                     requirements,
                 });
+            }
+            RouteNodeType::Nested { router, middleware } => {
+                if !path.starts_with('/') {
+                    return Err(RouteBuildError::InvalidPath { path });
+                }
+                // The prefix is removed from the raw request path by string comparison, so a
+                // pattern segment in it would leave no stable prefix to remove.
+                if path.contains('{') {
+                    return Err(RouteBuildError::NestedPatternPrefix { path });
+                }
+
+                #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+                openapi_entries.extend(super::prefixed_openapi_entries(&path, &router));
+
+                let nested = NestedRouter::new(&path, router);
+                // The mount point itself and everything beneath it, for every method: the inner
+                // router decides which of them it answers, including its own 404 and 405.
+                for mounted in [path.clone(), join_path(&path, "/{*skyzen_nested}")] {
+                    let endpoint = nested.clone();
+                    buf.entry(mounted).or_default().push(FlatEndpoint {
+                        method: MethodFilter::Any,
+                        factory: Arc::new(move || BoxEndpoint::new(endpoint.clone())),
+                        middleware: middleware.clone(),
+                        requirements: Vec::new(),
+                    });
+                }
             }
         }
     }
@@ -1495,6 +1538,113 @@ mod tests {
             operation["requestBody"].is_null(),
             "a GET with query/path params must not declare a request body"
         );
+    }
+
+    #[tokio::test]
+    async fn a_mounted_router_sees_paths_without_its_prefix() {
+        async fn list(uri: crate::Uri) -> Result<String> {
+            Ok(format!("inner saw {}", uri.path()))
+        }
+
+        let inner = build(Route::new((
+            "/users".at(list),
+            "/".at(|| async { Result::Ok("inner root") }),
+        )))
+        .unwrap();
+        let router = build(Route::new((
+            "/api".nest(inner),
+            "/health".at(|| async { Result::Ok("ok") }),
+        )))
+        .unwrap();
+
+        let response = router.clone().go(get_request("/api/users")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "inner saw /users");
+
+        // The mount point itself reaches the inner router's root.
+        let response = router.clone().go(get_request("/api")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "inner root");
+
+        // Sibling routes are untouched.
+        let response = router.clone().go(get_request("/health")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "ok");
+    }
+
+    #[tokio::test]
+    async fn a_mounted_router_keeps_its_own_fallback_and_405() {
+        let inner = build(
+            Route::new(("/users".at(|| async { Result::Ok("users") }),))
+                .fallback(|| async { Result::Ok("inner fallback") }),
+        )
+        .unwrap();
+        let router = build(
+            Route::new(("/api".nest(inner),)).fallback(|| async { Result::Ok("outer fallback") }),
+        )
+        .unwrap();
+
+        // Unknown path *under* the prefix: the inner router answers.
+        let response = router.clone().go(get_request("/api/nope")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "inner fallback");
+
+        // Unknown path outside it: the outer router answers.
+        let response = router.clone().go(get_request("/nope")).await.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "outer fallback");
+
+        // The inner router still decides which methods it answers.
+        let response = router
+            .clone()
+            .go(request_with_method("/api/users", Method::DELETE))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn a_mounted_router_keeps_the_query_string() {
+        async fn echo(
+            query: crate::extract::Query<std::collections::BTreeMap<String, String>>,
+            uri: crate::Uri,
+        ) -> Result<String> {
+            let seen: Vec<String> = query
+                .0
+                .iter()
+                .map(|(key, value)| [key.as_str(), value.as_str()].join("="))
+                .collect();
+            Ok([uri.path(), &seen.join(",")].join(" "))
+        }
+
+        let inner = build(Route::new(("/search".at(echo),))).unwrap();
+        let router = build(Route::new(("/api".nest(inner),))).unwrap();
+
+        let response = router
+            .clone()
+            .go(get_request("/api/search?q=rust"))
+            .await
+            .unwrap();
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "/search q=rust");
+    }
+
+    #[test]
+    fn a_router_cannot_be_mounted_under_a_pattern_prefix() {
+        let inner = build(Route::new(("/x".at(|| async { Result::Ok("x") }),))).unwrap();
+        let error = build(Route::new(("/tenants/{tenant}".nest(inner),))).unwrap_err();
+        assert!(matches!(error, RouteBuildError::NestedPatternPrefix { .. }));
+    }
+
+    #[test]
+    fn a_mounted_router_re_exports_its_operations_under_the_prefix() {
+        let inner = build(Route::new(("/widgets".post(create_widget),))).unwrap();
+        let openapi = Route::new(("/api".nest(inner),)).build().openapi();
+
+        assert!(openapi
+            .operations()
+            .iter()
+            .any(|operation| operation.path == "/api/widgets" && operation.method == Method::POST));
     }
 
     #[derive(Debug, Deserialize, ToSchema)]
