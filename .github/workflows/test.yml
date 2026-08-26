@@ -119,6 +119,9 @@ jobs:
         run: |
           curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/health | grep OK
           curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/hello/Skyzen | grep "Hello, Skyzen!"
+          # Exercises `WorkerContext::wait_until` against the real runtime: the handler hands a
+          # future to `ctx.waitUntil`, which throws if the execution context was not threaded in.
+          curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/track | grep accepted
 
       - name: Shutdown wrangler
         if: always()
