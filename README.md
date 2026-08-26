@@ -3,194 +3,579 @@
 [![crates.io](https://img.shields.io/crates/v/skyzen.svg)](https://crates.io/crates/skyzen)
 [![doc.rs](https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square)](https://docs.rs/skyzen)
 [![License](https://img.shields.io/crates/l/skyzen.svg)](#license)
-[![Coverage](https://img.shields.io/codecov/c/github/zen-rs/skyzen?logo=codecov)](https://app.codecov.io/gh/zen-rs/skyzen)
 
-An HTTP framework for Rust that compiles to a native Tokio server or to a
-WinterCG `fetch` handler for Cloudflare Workers, from the same source.
+Skyzen is an HTTP framework for Rust that compiles to a native Tokio/Hyper server or to a WebAssembly edge handler (such as Cloudflare Workers) from the same codebase.
 
-Most Rust web frameworks assume a long-lived process with a thread pool. Most
-edge SDKs assume a single-threaded WASM sandbox and hand you provider types
-directly. Skyzen targets both: handlers are written against portable traits
-(`Kv`, `Storage`, `Queue`, `Db`), `Send` bounds are applied conditionally per
-target, and `#[skyzen::main]` expands to either a `fn main()` or a `fetch`
-export depending on `target_arch`. When you need something a portable trait
-can't express — D1's raw SQL, Durable Objects, alarms — the provider types are
-still there.
+Write handlers against portable service wrappers (`Kv`, `Storage`, `Queue`, `Db`), compose routing trees declaratively, and switch between native servers and serverless edge runtimes without rewriting application logic.
 
-## Quick start
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Routing](#routing)
+- [Handlers, Extractors & Responders](#handlers-extractors--responders)
+- [Error Handling](#error-handling)
+- [Middleware & State](#middleware--state)
+- [Portable Services](#portable-services)
+- [WebSockets](#websockets)
+- [Static Files & SPA Support](#static-files--spa-support)
+- [OpenAPI & Documentation](#openapi--documentation)
+- [Testing](#testing)
+- [Running on the Edge (Cloudflare Workers)](#running-on-the-edge-cloudflare-workers)
+- [Skyzen CLI](#skyzen-cli)
+- [Crates Overview](#crates-overview)
+- [Guides & Examples](#guides--examples)
+- [License](#license)
+
+---
+
+## Quick Start
+
+Add `skyzen` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 skyzen = "0.1"
+serde = { version = "1.0", features = ["derive"] }
 ```
+
+Write your entry point in `src/main.rs`:
+
+```rust
+use serde::{Deserialize, Serialize};
+use skyzen::{
+    extract::Query,
+    routing::{CreateRouteNode, Params, Route, Router},
+    utils::Json,
+    Result,
+};
+
+#[derive(Serialize)]
+struct MessageResponse {
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct GreetingQuery {
+    prefix: Option<String>,
+}
+
+async fn health() -> &'static str {
+    "OK"
+}
+
+async fn greet_user(
+    params: Params,
+    Query(query): Query<GreetingQuery>,
+) -> Result<Json<MessageResponse>> {
+    let name = params.get("name")?;
+    let prefix = query.prefix.as_deref().unwrap_or("Hello");
+    Ok(Json(MessageResponse {
+        message: format!("{prefix}, {name}!"),
+    }))
+}
+
+fn app() -> Router {
+    Route::new((
+        "/health".at(health),
+        "/greet/{name}".get(greet_user),
+    ))
+    .build()
+}
+
+#[skyzen::main]
+fn main() -> Router {
+    app()
+}
+```
+
+Run locally:
+
+```sh
+# Start the server (defaults to an open localhost port or reads PORT / SKYZEN_ADDRESS)
+cargo run
+
+# Bind a specific port
+cargo run -- --port 8080
+```
+
+---
+
+## Routing
+
+Skyzen builds routing trees directly from string path literals using the `CreateRouteNode` trait. Route matching uses a radix tree powered by [`matchit`](https://crates.io/crates/matchit).
+
+### Method Builders
+
+Path literals support HTTP method shorthands:
 
 ```rust
 use skyzen::routing::{CreateRouteNode, Route, Router};
 
-#[skyzen::main]
-fn main() -> Router {
-    Route::new((
-        "/".at(|| async { "Hello, World!" }),
-        "/health".at(|| async { "OK" }),
-    ))
-    .build()
-}
-```
-
-`cargo run` starts the server and logs its address. `cargo run -- --port 8787`
-pins the port.
-
-## Routing
-
-Routes are built from path literals. `CreateRouteNode` adds `.at()`, `.get()`,
-`.post()`, `.put()`, `.delete()`, `.ws()`, and `.route()` to `&str`, so a route
-tree is just a tuple of them:
-
-```rust
-use skyzen::routing::{CreateRouteNode, Params, Route, Router};
-
 fn router() -> Router {
     Route::new((
-        "/".at(home),
-        "/users/{id}".at(|params: Params| async move {
-            let id = params.get("id")?;
-            Ok(format!("User: {id}"))
-        }),
-        "/posts".get(list_posts),
-        "/posts".post(create_post),
-        "/posts/{id}".put(update_post),
-        "/posts/{id}".delete(delete_post),
-        "/admin".route((
-            "/stats".at(stats),
-            "/flush".post(flush),
-        )),
+        "/".at(home),                     // GET shorthand
+        "/posts".get(list_posts),         // Explicit GET
+        "/posts".post(create_post),       // POST
+        "/posts/{id}".put(update_post),   // PUT
+        "/posts/{id}".patch(patch_post),  // PATCH
+        "/posts/{id}".delete(delete_post),// DELETE
+        "/ws".ws(chat_websocket),         // WebSocket upgrade
     ))
     .build()
 }
 ```
 
-Matching is done by [`matchit`](https://crates.io/crates/matchit)'s radix
-tree, so a request is resolved by walking its own path rather than by testing
-routes one at a time.
+### Path Parameters and Wildcards
 
-## Handlers
-
-A handler is an async function. Its arguments are extractors, its return type
-is a responder — nothing needs to be registered, and tuples of either compose
-automatically.
+- `{name}` matches a single path segment.
+- `{*path}` matches the remainder of the path (wildcard).
 
 ```rust
-use skyzen::{extract::Query, routing::Params, utils::Json, Result};
+use skyzen::routing::{CreateRouteNode, Params, Route};
+use skyzen::Result;
 
-async fn create_user(Json(body): Json<CreateUser>) -> Result<Json<User>> {
-    Ok(Json(User::insert(body).await?))
+async fn get_user_post(params: Params) -> Result<String> {
+    let user_id = params.get("user_id")?;
+    let post_id = params.get("post_id")?;
+    Ok(format!("User {user_id}, Post {post_id}"))
 }
 
-async fn search(Query(query): Query<SearchQuery>, params: Params) -> Json<Page> {
-    // ...
+async fn serve_asset(params: Params) -> Result<String> {
+    let filepath = params.get("path")?;
+    Ok(format!("Serving asset: {filepath}"))
+}
+
+let routes = Route::new((
+    "/users/{user_id}/posts/{post_id}".get(get_user_post),
+    "/assets/{*path}".get(serve_asset),
+));
+```
+
+### Nested Route Trees
+
+Group sub-paths using `.route(...)`:
+
+```rust
+let api_routes = Route::new((
+    "/v1".route((
+        "/users".get(list_users).post(create_user),
+        "/users/{id}".get(get_user).delete(delete_user),
+    )),
+    "/v2".route((
+        "/users".get(list_users_v2),
+    )),
+));
+```
+
+---
+
+## Handlers, Extractors & Responders
+
+A handler is an `async fn` whose arguments implement `Extractor` and whose return type implements `Responder`. Handlers do not require macro decoration or manual registration.
+
+```rust
+use skyzen::{
+    extract::{BearerToken, ClientIp, Query},
+    routing::Params,
+    utils::{Json, State},
+    Result, StatusCode,
+};
+
+async fn update_profile(
+    params: Params,
+    token: BearerToken,
+    ip: ClientIp,
+    State(db): State<DatabasePool>,
+    Json(payload): Json<ProfileUpdate>,
+) -> Result<(StatusCode, Json<UserProfile>)> {
+    let user_id = params.get("id")?;
+    let profile = db.update_user(user_id, payload).await?;
+    Ok((StatusCode::OK, Json(profile)))
 }
 ```
 
-`Json`, `Form`, `Query`, `Params`, `Multipart`, `State`, `BearerToken`, and
-`ClientIp` are extractors out of the box. `String`, `&str`, `Json<T>`,
-`Response`, and `Result<T>` are responders. Implement `Extractor` or
-`Responder` for your own types.
+### Built-in Extractors
 
-## Errors
+| Extractor | Type | Description |
+|---|---|---|
+| `Json<T>` | `skyzen::utils::Json` | Deserializes a JSON request body (`T: DeserializeOwned`) |
+| `Query<T>` | `skyzen::extract::Query` | Deserializes URL query parameters |
+| `Form<T>` | `skyzen::utils::Form` | Deserializes `application/x-www-form-urlencoded` form bodies |
+| `Params` | `skyzen::routing::Params` | Accesses path parameters (`params.get("id")?`) |
+| `Multipart` | `skyzen::utils::Multipart` | Streams multipart form data and file uploads |
+| `State<T>` | `skyzen::utils::State` | Extracts shared state attached to the route via `.with(State(...))` |
+| `BearerToken` | `skyzen::extract::BearerToken` | Extracts the bearer token from the `Authorization` header |
+| `ClientIp` | `skyzen::extract::ClientIp` | Resolves the client IP (supporting `X-Forwarded-For` and `CF-Connecting-IP`) |
+| `Kv`, `Storage`, `Queue`, `Db` | `skyzen_services::*` | Portable cloud services injected into the request context |
+| `Body`, `Bytes`, `ByteStr` | `skyzen::http_kit::*` | Raw request body representations |
+| `HeaderMap`, `Uri`, `Method` | `skyzen::http_kit::*` | HTTP request metadata |
 
-`#[skyzen::error]` writes the `Display`, `Error`, and `HttpError` impls, and
-maps each variant to a status code. Messages interpolate fields the same way
-`thiserror` does:
+### Built-in Responders
+
+| Responder | Description |
+|---|---|
+| `&'static str`, `String`, `Bytes` | Plain text or raw byte payload |
+| `Json<T>` / `PrettyJson<T>` | Serializes `T` to `application/json` |
+| `StatusCode` | Returns an empty response with the given status code |
+| `(StatusCode, T)` | Pairs an explicit HTTP status code with any responder `T` |
+| `(HeaderMap, T)` | Sets custom response headers alongside a responder `T` |
+| `Result<T, E>` | Returns `T` on `Ok`, or maps `E: HttpError` to an HTTP error response |
+| `Redirect` | Returns an HTTP 301, 302, 303, 307, or 308 redirect response |
+| `Sse` | Streams Server-Sent Events |
+
+---
+
+## Error Handling
+
+Define typed application errors with `#[skyzen::error]`. This macro implements `std::error::Error`, `Display`, and `HttpError`, mapping each variant to an HTTP status code with message formatting:
 
 ```rust
+use skyzen::{error, StatusCode};
+
 #[skyzen::error(message = "internal server error")]
-enum ApiError {
-    #[error("no user with id {0}", status = NOT_FOUND)]
-    UserNotFound(u64),
-    #[error("field {field} is invalid: {reason}", status = BAD_REQUEST)]
-    Invalid { field: String, reason: String },
-    #[error("upstream {service} timed out", status = GATEWAY_TIMEOUT)]
-    Timeout { service: &'static str },
+pub enum AppError {
+    #[error("item with id {0} was not found", status = NOT_FOUND)]
+    NotFound(u64),
+
+    #[error("validation error on field '{field}': {reason}", status = BAD_REQUEST)]
+    Validation {
+        field: &'static str,
+        reason: String,
+    },
+
+    #[error("unauthorized access", status = StatusCode::UNAUTHORIZED)]
+    Unauthorized,
+
+    #[error("upstream service timeout", status = GATEWAY_TIMEOUT)]
+    Timeout,
 }
 ```
 
-Returning `Err(ApiError::UserNotFound(7))` from a handler produces
-`404 {"error":"no user with id 7"}`. Note that 5xx responses replace the
-message with a generic `"Internal server error"` — a `Display` impl is for
-your logs, and shouldn't leak into a client's error body by accident.
+### Error Security & Behavior
 
-## Portable services
+- **4xx Errors**: Return the formatted message to the client in a JSON payload: `404 {"error":"item with id 42 was not found"}`.
+- **5xx Errors**: Mask the response body with `"Internal server error"` to prevent internal system or database details from leaking to clients, while preserving the full error message in server logs.
 
-`skyzen-services` exposes four capability wrappers — `Kv`, `Storage`, `Queue`,
-and `Db`. Handlers take them as extractors and never name a provider type:
+---
+
+## Middleware & State
+
+Attach shared state or middleware to any route branch using `.with(...)`:
 
 ```rust
+use std::sync::Arc;
+use skyzen::{
+    routing::{CreateRouteNode, Route, Router},
+    utils::State,
+};
+
+#[derive(Clone)]
+struct AppConfig {
+    api_key: String,
+}
+
+async fn handler(State(config): State<Arc<AppConfig>>) -> String {
+    format!("Config loaded with key length {}", config.api_key.len())
+}
+
+fn router() -> Router {
+    let config = Arc::new(AppConfig {
+        api_key: "secret".into(),
+    });
+
+    Route::new((
+        "/info".at(handler),
+    ))
+    .with(State(config))
+    .build()
+}
+```
+
+---
+
+## Portable Services
+
+The `skyzen-services` crate provides four capability wrappers: `Kv`, `Storage`, `Queue`, and `Db`. Handlers accept these wrappers directly as extractors, keeping business logic decoupled from concrete infrastructure providers.
+
+```rust
+use skyzen::{routing::Params, utils::Json, Result};
 use skyzen_services::{Db, Kv, Storage};
 
-async fn handler(kv: Kv, storage: Storage, db: Db) -> Result<Json<Data>> {
-    let cached = kv.get_json::<Data>("cache:key").await?;
-    let logo = storage.get("assets/logo.png").await?;
-    let users = db.query("SELECT id, name FROM users").fetch_all::<User>().await?;
-    Ok(Json(cached.unwrap_or_default()))
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FileMetadata {
+    filename: String,
+    size: usize,
+}
+
+async fn save_file(
+    kv: Kv,
+    storage: Storage,
+    db: Db,
+    Json(meta): Json<FileMetadata>,
+) -> Result<&'static str> {
+    // Write metadata to Key-Value store
+    kv.put_json(&format!("meta:{}", meta.filename), &meta).await?;
+
+    // Record entry in relational database
+    db.query("INSERT INTO files (name, size) VALUES (?, ?)")
+        .bind(&meta.filename)
+        .bind(meta.size as i64)
+        .execute()
+        .await?;
+
+    Ok("saved")
 }
 ```
 
-The backend is chosen once, at wiring time:
+### Provider Compatibility Matrix
+
+| Capability | Native Server | Cloudflare Workers | AWS | Azure | In-Memory (Tests) |
+|---|---|---|---|---|---|
+| **Key-Value** (`Kv`) | [`skyzen-redis`](redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
+| **Object Storage** (`Storage`) | [`skyzen-s3`](s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
+| **Message Queue** (`Queue`) | — | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
+| **SQL Database** (`Db`) | `Db` via SQLx (Postgres/MySQL/SQLite) | `Db` via D1 | Planned | Planned | `InMemoryDb` (SQLite) |
+
+### Wiring Backends
+
+Backends can be configured declaratively via [`Skyzen.toml`](docs/skyzen-toml-reference.md) or wired manually in code:
 
 ```rust
-// Native
-let kv = Kv::new(Redis::connect("redis://localhost:6379").await?);
+// Native (Redis + S3)
+let kv = Kv::new(Redis::connect("redis://127.0.0.1:6379").await?);
 let storage = Storage::new(S3Storage::from_env("my-bucket"));
 
-// Cloudflare
-let kv = Kv::new(CfKv::from_env(&env, "CACHE")?);
-let storage = Storage::new(CfR2::from_env(&env, "UPLOADS")?);
+// Cloudflare Workers (KV + R2 bindings)
+let kv = Kv::new(CfKv::from_env(&env, "KV_BINDING")?);
+let storage = Storage::new(CfR2::from_env(&env, "R2_BINDING")?);
 
-// Tests
+// Unit & Integration Tests (No external dependencies)
 let kv = Kv::new(InMemoryKv::new());
 let storage = Storage::new(InMemoryStorage::new());
 ```
 
-| Capability | Native | Cloudflare | AWS | Azure | Test |
-|---|---|---|---|---|---|
-| Key-value | [`skyzen-redis`](redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
-| Object storage | [`skyzen-s3`](s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
-| Message queue | — | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
-| SQL | `Db` via sqlx | `Db` via D1 | — | — | — |
+See the [Services Guide](docs/services-guide.md) and [Durable Object + SQL Guide](docs/durable-sql-guide.md) for deeper coverage.
 
-Native and Cloudflare are wired automatically from `Skyzen.toml`. The AWS and
-Azure crates are usable as backends, but you construct and inject them
-yourself; there is no automatic wiring for them yet.
+---
 
-The provider-specific types (`CfD1`, `DurableKv`, `DurableDb`, `Alarm`) are
-public and can be mixed into the same app. See the
-[services guide](docs/services-guide.md) and the
-[Durable Object + SQL guide](docs/durable-sql-guide.md).
+## WebSockets
 
-## Running on the edge
+Skyzen provides a unified WebSocket API that compiles to `async-tungstenite` on native runtimes and `WebSocketPair` on WebAssembly edge runtimes.
 
-The same router runs on Cloudflare Workers. Build a `cdylib` instead of a
-binary:
+```rust
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use skyzen::routing::{CreateRouteNode, Route, Router};
+use skyzen::websocket::WebSocketMessage;
+
+#[derive(Serialize, Deserialize)]
+struct ChatPayload {
+    user: String,
+    text: String,
+}
+
+fn router() -> Router {
+    Route::new((
+        // Shorthand WebSocket endpoint
+        "/ws".ws(|mut socket| async move {
+            while let Some(Ok(message)) = socket.next().await {
+                if let Some(text) = message.into_text() {
+                    let _ = socket.send_text(format!("Echo: {text}")).await;
+                }
+            }
+        }),
+        // Strongly typed JSON messages
+        "/ws/json".ws(|mut socket| async move {
+            while let Some(Ok(chat)) = socket.recv_json::<ChatPayload>().await {
+                let reply = ChatPayload {
+                    user: "server".into(),
+                    text: format!("Hello, {}", chat.user),
+                };
+                let _ = socket.send(&reply).await;
+            }
+        }),
+    ))
+    .build()
+}
+```
+
+*Note: WASM WebSockets enforce a 1 MiB maximum message size and do not support manual ping/pong frame control.*
+
+---
+
+## Static Files & SPA Support
+
+Serve directories from the filesystem or embed them directly into the binary at compile time.
+
+```rust
+use skyzen::routing::Route;
+use skyzen::static_files::{EmbeddedStaticDir, StaticDir};
+
+// 1. Serve from disk (Native only) with SPA fallback:
+let disk_routes = Route::new((
+    StaticDir::new("/assets", "./public")
+        .index_file("index.html")
+        .spa(), // Extensionless paths fall back to index.html
+));
+
+// 2. Embed files at compile time (Works on both Native and WebAssembly):
+static ASSETS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/dist");
+
+let embedded_routes = Route::new((
+    EmbeddedStaticDir::new("/", &ASSETS)
+        .index_file("index.html")
+        .spa(),
+));
+```
+
+---
+
+## OpenAPI & Documentation
+
+Annotate handlers with `#[skyzen::openapi]` to generate an OpenAPI specification at compile time. Doc comments automatically become endpoint descriptions:
+
+```rust
+use serde::{Deserialize, Serialize};
+use skyzen::{
+    routing::{CreateRouteNode, Route, Router},
+    utils::Json,
+    OpenApi, Result, ToSchema,
+};
+
+#[derive(Serialize, ToSchema)]
+struct Item {
+    id: u64,
+    title: String,
+}
+
+/// Retrieve an item by unique identifier.
+#[skyzen::openapi]
+async fn get_item(params: skyzen::routing::Params) -> Result<Json<Item>> {
+    let id: u64 = params.get("id")?.parse().unwrap_or(0);
+    Ok(Json(Item {
+        id,
+        title: format!("Item #{id}"),
+    }))
+}
+
+fn router() -> Router {
+    let routes = Route::new((
+        "/items/{id}".get(get_item),
+    ));
+
+    // Mount interactive ReDoc documentation at GET /docs
+    let redoc_endpoint = routes.openapi().redoc();
+
+    Route::new((
+        routes,
+        "/docs".get(redoc_endpoint),
+    ))
+    .build()
+}
+```
+
+*OpenAPI schema generation is gated to debug builds and native targets, keeping production release binaries and edge WASM bundles lightweight.*
+
+---
+
+## Testing
+
+The `skyzen-test` crate allows testing endpoints and services in-memory without binding TCP sockets or running background servers.
+
+```toml
+[dev-dependencies]
+skyzen-test = { version = "0.1" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+```rust
+use serde_json::json;
+use skyzen::{
+    routing::{CreateRouteNode, Route, Router},
+    utils::Json,
+    Result,
+};
+use skyzen_services::Kv;
+use skyzen_test::{mock::InMemoryKv, TestContext};
+
+async fn get_name(kv: Kv) -> Result<Json<serde_json::Value>> {
+    let name = kv.get_text("user:name").await?.unwrap_or_else(|| "Anonymous".into());
+    Ok(Json(json!({ "name": name })))
+}
+
+fn app(kv: Kv) -> Router {
+    Route::new(("/user".get(get_name),))
+        .with(kv)
+        .build()
+}
+
+#[tokio::test]
+async fn test_user_endpoint() {
+    // 1. Initialize mock service
+    let mock_kv = Kv::new(InMemoryKv::new());
+    mock_kv.put("user:name", b"Alice").await.unwrap();
+
+    // 2. Create in-memory test client
+    let ctx = TestContext::new();
+    let client = ctx.client(app(mock_kv));
+
+    // 3. Send request and assert response
+    let response = client.get("/user").send().await;
+    response.assert_status_success();
+    response.assert_json_path("name", &json!("Alice"));
+}
+```
+
+See the [Testing Guide](docs/testing-guide.md) for more details on assertion helpers and snapshot testing.
+
+---
+
+## Running on the Edge (Cloudflare Workers)
+
+Skyzen compiles to WebAssembly without changing routing or handler definitions.
+
+### Project Setup
+
+Configure your crate as a `cdylib` in `Cargo.toml`:
 
 ```toml
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+skyzen = { version = "0.1", default-features = false, features = ["json"] }
 ```
 
+In `src/lib.rs`:
+
 ```rust
-#[skyzen::main]
+use skyzen::routing::{CreateRouteNode, Route, Router};
+
 fn app() -> Router {
-    router()
+    Route::new((
+        "/".at(|| async { "Hello from Cloudflare Workers!" }),
+    ))
+    .build()
+}
+
+#[skyzen::main]
+fn worker() -> Router {
+    app()
 }
 ```
 
-On `wasm32`, `#[skyzen::main]` emits a WinterCG `fetch` export instead of a
-`main`. Workers' queue and cron entrypoints have their own macros:
+On `wasm32-unknown-unknown`, `#[skyzen::main]` automatically generates the WinterCG `fetch` export.
+
+### Serverless Queue and Cron Handlers
+
+Export Queue batch consumers and Cron triggers with dedicated attributes:
 
 ```rust
 #[cfg(target_arch = "wasm32")]
 #[skyzen::queue]
-async fn queue(
+async fn queue_handler(
     batch: skyzen_cloudflare::CfQueueBatch,
     env: skyzen::runtime::wasm::Env,
     ctx: skyzen_cloudflare::CfQueueContext,
@@ -201,7 +586,7 @@ async fn queue(
 
 #[cfg(target_arch = "wasm32")]
 #[skyzen::scheduled]
-async fn scheduled(
+async fn cron_handler(
     event: skyzen_cloudflare::CfScheduledEvent,
     env: skyzen::runtime::wasm::Env,
     ctx: skyzen_cloudflare::CfScheduleContext,
@@ -210,124 +595,107 @@ async fn scheduled(
 }
 ```
 
-Stateful workloads use `#[skyzen::durable_object]` with the `DurableObject`
-trait. Full setup is in the [deployment guide](docs/deployment-guide.md).
+### Durable Objects & Object-Scoped SQL
 
-## WebSocket
-
-```rust
-Route::new((
-    "/ws".ws(|mut socket| async move {
-        while let Some(Ok(message)) = socket.next().await {
-            if let Some(text) = message.into_text() {
-                let _ = socket.send_text(text).await;
-            }
-        }
-    }),
-))
-```
-
-Native uses `async-tungstenite`; WASM uses `WebSocketPair`. Two differences
-worth knowing: WASM caps messages at 1 MiB, and it gives no control over
-ping/pong frames.
-
-## OpenAPI
-
-Annotated handlers register themselves at compile time through `linkme`, so
-the spec is assembled from the same signatures the router uses:
+Use `#[skyzen::durable_object]` and `DurableDb` for stateful edge computing backed by SQLite:
 
 ```rust
-/// Fetch a user by id.
-#[skyzen::openapi]
-async fn get_user(params: Params) -> Result<Json<User>> {
-    // ...
-}
+use skyzen::durable::DurableObject;
+use skyzen::routing::{CreateRouteNode, Route};
+use skyzen::Result;
+use skyzen_services::durable::DurableDb;
 
-fn router() -> Router {
-    Route::new(("/users/{id}".at(get_user),))
-        .enable_api_doc() // served at /api-docs
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[skyzen::durable_object]
+struct ChatRoom;
+
+impl DurableObject for ChatRoom {
+    fn fetch(&mut self) -> impl skyzen::Endpoint + 'static {
+        Route::new((
+            "/messages".get(get_messages),
+        ))
         .build()
+    }
+}
+
+async fn get_messages(db: DurableDb) -> Result<skyzen::utils::Json<Vec<String>>> {
+    let rows = db.query("SELECT message FROM messages")
+        .fetch_all::<String>()
+        .await?;
+    Ok(skyzen::utils::Json(rows))
 }
 ```
 
-Doc comments become descriptions. Generation is gated on `debug_assertions`
-and native targets, so neither release builds nor Workers bundles carry the
-schema.
+*Skyzen provides `NativeDurableNamespace` on native targets to simulate Durable Objects and SQLite state during local testing.*
 
-## `#[skyzen::main]`
+See the [Deployment Guide](docs/deployment-guide.md) and [Durable SQL Guide](docs/durable-sql-guide.md).
 
-On native targets the macro sets up a Tokio runtime and Hyper server, installs
-a `tracing` subscriber that respects `RUST_LOG`, parses `--host` / `--port` /
-`--listen`, and shuts down gracefully on `Ctrl+C`. To install your own
-subscriber:
+---
 
-```rust
-#[skyzen::main(default_logger = false)]
-async fn main() -> Router {
-    tracing_subscriber::fmt().init();
-    router()
-}
-```
+## Skyzen CLI
 
-If you need to drive the server yourself — embedding Skyzen in a larger
-process, or using a non-Tokio executor — `skyzen-hyper` implements the `Server`
-trait directly:
-
-```rust
-use skyzen_hyper::Hyper;
-
-Hyper.serve(
-    my_executor,
-    |error| tracing::error!(%error, "connection failed"),
-    my_tcp_listener(),
-    router().build(),
-).await;
-```
-
-## CLI
+The `skyzen` CLI automates scaffolding, local emulation, and deployment:
 
 ```sh
-skyzen new my-app --template api
-skyzen new jobs-app --template serverless-events
-skyzen new room-app --template durable-realtime
-skyzen doctor                          # check toolchain
-skyzen dev                             # native watch + restart
-skyzen dev --provider cloudflare       # wrangler-driven dev
+# Install CLI
+cargo install skyzen-cli
+
+# Create a project from a template
+skyzen new my-api --template api
+skyzen new my-events --template serverless-events
+skyzen new my-room --template durable-realtime
+
+# Verify installed platform prerequisites (wrangler, wasm target, etc.)
+skyzen doctor
+
+# Run local development with file watching
+skyzen dev
+
+# Run local development against Cloudflare Workers emulator
+skyzen dev --provider cloudflare
+
+# Deploy to Cloudflare Workers
 skyzen deploy --provider cloudflare
 ```
 
-Bindings, queues, and databases are declared in
-[`Skyzen.toml`](docs/skyzen-toml-reference.md). For Cloudflare the CLI
-generates `.skyzen/gen/wrangler.toml` — don't hand-edit `wrangler.toml`.
+---
 
-## Crates
+## Crates Overview
 
-| Crate | What it is |
-|---|---|
-| [`skyzen`](.) | Routing, extractors, responders, middleware, runtime |
-| [`skyzen-core`](core/) | `Extractor`, `Responder`, `Server` traits; `no_std`-capable |
-| [`skyzen-hyper`](hyper/) | Hyper backend for the `Server` trait |
-| [`skyzen-macros`](macros/) | `#[skyzen::main]`, `#[skyzen::openapi]`, `#[skyzen::error]`, and friends |
-| [`skyzen-services`](services/) | `Kv`, `Storage`, `Queue`, `Db` and the traits behind them |
-| [`skyzen-test`](test/) | In-memory services, `TestClient`, assertions |
-| [`skyzen-redis`](redis/) | Redis `KeyValueStore` |
-| [`skyzen-s3`](s3/) | S3-compatible `ObjectStorage` |
-| [`skyzen-cloudflare`](cloudflare/) | Workers KV, R2, Queues, D1, Durable Objects (wasm32 only) |
-| [`skyzen-aws`](aws/) | DynamoDB, SQS, S3 backends |
-| [`skyzen-azure`](azure/) | Cosmos DB, Blob Storage, Service Bus backends |
-| [`skyzen-cli`](cli/) | `skyzen new` / `dev` / `deploy` / `doctor` |
+| Crate | Path | Description |
+|---|---|---|
+| [`skyzen`](.) | Root | Core framework: routing, extractors, responders, middleware, and runtime |
+| [`skyzen-core`](core/) | `core/` | Foundational traits (`Extractor`, `Responder`, `Server`), `no_std` compatible |
+| [`skyzen-hyper`](hyper/) | `hyper/` | Hyper backend implementing `Server` for native runtimes |
+| [`skyzen-macros`](macros/) | `macros/` | Procedural macros (`#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, etc.) |
+| [`skyzen-services`](services/) | `services/` | Portable service abstractions (`Kv`, `Storage`, `Queue`, `Db`) |
+| [`skyzen-test`](test/) | `test/` | In-memory mocks (`InMemoryKv`, `InMemoryStorage`), test client, and assertion tools |
+| [`skyzen-redis`](redis/) | `redis/` | Redis implementation of `KeyValueStore` |
+| [`skyzen-s3`](s3/) | `s3/` | S3-compatible implementation of `ObjectStorage` |
+| [`skyzen-cloudflare`](cloudflare/) | `cloudflare/` | Cloudflare Workers bindings: KV, R2, Queues, D1, Durable Objects (*wasm32 only*) |
+| [`skyzen-aws`](aws/) | `aws/` | AWS implementations: DynamoDB, S3, SQS |
+| [`skyzen-azure`](azure/) | `azure/` | Azure implementations: Cosmos DB, Blob Storage, Service Bus |
+| [`skyzen-cli`](cli/) | `cli/` | Command-line tool for project creation, local emulation, and deployments |
 
-## Guides
+---
 
-- [Portable services](docs/services-guide.md)
-- [Testing](docs/testing-guide.md)
-- [Deployment](docs/deployment-guide.md)
-- [`Skyzen.toml` reference](docs/skyzen-toml-reference.md)
-- [Durable Objects + SQL](docs/durable-sql-guide.md)
+## Guides & Examples
 
-Runnable examples live in [`examples/`](examples/).
+- [Using Portable Services](docs/services-guide.md)
+- [Testing Guide](docs/testing-guide.md)
+- [Deployment Guide](docs/deployment-guide.md)
+- [Durable Objects & SQL Guide](docs/durable-sql-guide.md)
+- [Skyzen.toml Reference](docs/skyzen-toml-reference.md)
+- [Runnable Code Examples](examples/)
+
+---
 
 ## License
 
-Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT),
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
 at your option.
+
