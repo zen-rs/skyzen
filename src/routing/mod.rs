@@ -762,6 +762,23 @@ impl RouteNode {
 
 // Trait for building routes
 /// Trait implemented by types that can be converted into route nodes.
+// Verified rendering at `Route::new`:
+//   error[E0277]: `&str` is not a route tree
+//     --> src/main.rs:10:24
+//      |
+//   10 |     let _ = Route::new("/c");
+//      |             ---------- ^^^^ not `Routes`
+//      = note: pass a tuple of route nodes — note the trailing comma for a single node:
+//              `Route::new(("/ping".at(ping),))`
+//      = note: a tuple holds at most 15 nodes; ...
+//      = note: a built `Router` is mounted with `"/prefix".nest(router)` rather than passed here
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a route tree",
+    label = "not `Routes`",
+    note = "pass a tuple of route nodes — note the trailing comma for a single node: `Route::new((\"/ping\".at(ping),))`",
+    note = "a tuple holds at most 15 nodes; beyond that use `vec![..]` of route nodes, or group them into nested `Route`s",
+    note = "a built `Router` is mounted with `\"/prefix\".nest(router)` rather than passed here"
+)]
 pub trait Routes {
     /// Consume the type and produce the corresponding route nodes.
     fn into_route_nodes(self) -> Vec<RouteNode>;
