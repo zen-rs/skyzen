@@ -24,7 +24,7 @@ Extractor (handler arg)     ← Pulled from request extensions automatically
 |-------|---------|------------|
 | `KeyValueStore` | `Kv` | `get`, `put`, `put_with_ttl`, `delete`, `exists`, `list` + the atomics below + `get_json`, `get_text`, `put_json`, `list_all` |
 | `ObjectStorage` | `Storage` | `get`, `put`, `put_with`, `delete`, `list`, `head` |
-| `MessageQueue` | `Queue` | `send`, `send_batch` + `send_json`, `send_json_batch` |
+| `MessageQueue` | `Queue` | `send`, `send_batch`, `send_with`, `receive`, `ack`, `nack` + `send_json`, `send_json_batch`, `receive_json` |
 | `DbBackend` | `Db` | `query(...).bind(...).fetch_*`, `execute` |
 
 Cloudflare-specific primitives such as `CfD1`, `DurableDb`, and Durable Objects are provider extensions, not part of the portable core.
@@ -64,6 +64,37 @@ for key in page.keys { /* ... */ }
 
 `Kv::list_all(prefix)` drains every page for you. It is documented as potentially expensive: it
 holds the whole key set in memory and, on `DynamoDB`, is a full table scan.
+
+### Producing and Consuming Queue Messages
+
+Producers get `send`, `send_batch`, and `send_with(message, SendOptions::new().with_delay(d))` for
+scheduled work (SQS `DelaySeconds`, Cloudflare Queues `delaySeconds`).
+
+Consumption comes in two shapes, and `MessageQueue` covers both:
+
+- **Push** — the platform invokes your worker with a batch. Cloudflare Queues works this way;
+  Skyzen surfaces it through `#[skyzen::queue]`, `QueueBatch` and `QueueBatchDisposition`.
+- **Pull** — the consumer asks for messages and settles them itself. SQS and Azure Service Bus work
+  this way:
+
+```rust
+let messages = queue
+    .receive_json::<Job>(ReceiveOptions::new().with_max_messages(10))
+    .await?;
+
+for message in messages {
+    match run(&message.body).await {
+        Ok(()) => queue.ack(&message.receipt).await?,
+        Err(_) => queue.nack(&message.receipt, QueueRetry::new().with_delay_seconds(30)).await?,
+    }
+}
+```
+
+`ReceivedMessage::receipt` is the provider's own settle token (an SQS receipt handle, a Service Bus
+lock token) wrapped in an opaque `MessageReceipt`; `attempts` counts deliveries, so a value above
+1 means an earlier delivery was never acknowledged. A message left unsettled returns to the queue
+when its visibility timeout lapses. A push-only backend leaves `receive`/`ack`/`nack` at their
+`QueueError::Unsupported` defaults rather than returning a silent empty batch.
 
 ## Writing a Handler
 
