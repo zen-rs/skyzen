@@ -461,7 +461,7 @@ service_obj! {
 ///
 /// Transactions are the one service that `service_obj!` cannot generate: their methods take
 /// `&mut self`, `commit`/`rollback` consume the backend through `self: Box<Self>`, and there is no
-/// `clone_box` because a transaction is not clonable.
+/// `clone_box` because a transaction is not cloneable.
 trait DbTransactionBackendObj: Send {
     fn dialect(&self) -> DbDialect;
     fn query<'a>(

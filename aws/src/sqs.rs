@@ -361,7 +361,7 @@ fn encode_message(data: &[u8]) -> EncodedMessage {
 /// Reverse [`encode_message`] for one received message.
 ///
 /// An untagged body is the bytes SQS delivered. A body tagged with an encoding this client never
-/// writes is refused rather than handed back mis-decoded, because guessing would corrupt it
+/// writes is refused rather than handed back wrongly decoded, because guessing would corrupt it
 /// silently.
 fn decode_message(message: &Message) -> Result<Vec<u8>, QueueError> {
     let body = message.body().unwrap_or_default();
