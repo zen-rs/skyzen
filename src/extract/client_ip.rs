@@ -1,5 +1,6 @@
 //! Look up the IP address of client.
 
+use core::future::{ready, Future};
 use std::{
     net::{AddrParseError, IpAddr, Ipv6Addr},
     str::{FromStr, Utf8Error},
@@ -30,36 +31,42 @@ impl_deref!(ClientIp, IpAddr);
 
 impl Extractor for ClientIp {
     type Error = ClientIpError;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        if let Some(v) = request.headers().get(header::FORWARDED) {
-            if let Some(addr) = parse_forwarded(v.as_bytes())? {
-                return Ok(Self(addr));
-            }
-        }
-
-        if let Some(v) = request
-            .headers()
-            .get(HeaderName::from_static("x-forwarded-for"))
-        {
-            if let Some(addr) = parse_x_forwarded_for(v.as_bytes())? {
-                return Ok(Self(addr));
-            }
-        }
-
-        Ok(Self(
-            request
-                .extensions()
-                .get::<PeerAddr>()
-                .ok_or(ClientIpError::MissingRemoteAddr)?
-                .0
-                .ip(),
-        ))
-
-        // It's unnecessary to consume the extension.
+    // Every source is already on the request, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(client_ip(request))
     }
 
     // The client IP is derived server-side from connection metadata and proxy headers, so it is
     // not a client-supplied request parameter and contributes no OpenAPI schema.
+}
+
+/// Resolve the client address from the proxy headers, falling back to the connection's peer.
+fn client_ip(request: &Request) -> Result<ClientIp, ClientIpError> {
+    if let Some(v) = request.headers().get(header::FORWARDED) {
+        if let Some(addr) = parse_forwarded(v.as_bytes())? {
+            return Ok(ClientIp(addr));
+        }
+    }
+
+    if let Some(v) = request
+        .headers()
+        .get(HeaderName::from_static("x-forwarded-for"))
+    {
+        if let Some(addr) = parse_x_forwarded_for(v.as_bytes())? {
+            return Ok(ClientIp(addr));
+        }
+    }
+
+    // It's unnecessary to consume the extension.
+    Ok(ClientIp(
+        request
+            .extensions()
+            .get::<PeerAddr>()
+            .ok_or(ClientIpError::MissingRemoteAddr)?
+            .0
+            .ip(),
+    ))
 }
 
 /// An error occurred while extracting the client's IP.

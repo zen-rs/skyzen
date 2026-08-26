@@ -10,6 +10,7 @@
 //! server sends `Last-Modified`; an embedded file has no modification time, so it validates by
 //! `ETag` alone.
 
+use core::future::{ready, Future};
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -691,8 +692,13 @@ impl Endpoint for StaticDirEndpoint {
 
 impl Endpoint for EmbeddedStaticDirEndpoint {
     type Error = StaticDirError;
-    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        self.serve(request)
+    // The assets are compiled into the binary, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn respond(
+        &mut self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ready(self.serve(request))
     }
 }
 

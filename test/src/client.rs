@@ -233,6 +233,7 @@ impl<E: Endpoint> RequestBuilder<E> {
 
 #[cfg(test)]
 mod tests {
+    use core::future::{ready, Future};
     use http_kit::{Body, Endpoint, Request, Response, StatusCode};
 
     use crate::context::TestContext;
@@ -257,8 +258,11 @@ mod tests {
     impl Endpoint for ServerErrorEndpoint {
         type Error = BackendBroken;
 
-        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-            Err(BackendBroken::new())
+        fn respond(
+            &mut self,
+            _request: &mut Request,
+        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+            ready(Err(BackendBroken::new()))
         }
     }
 
@@ -268,8 +272,11 @@ mod tests {
     impl Endpoint for ClientErrorEndpoint {
         type Error = BadInput;
 
-        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-            Err(BadInput::new())
+        fn respond(
+            &mut self,
+            _request: &mut Request,
+        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+            ready(Err(BadInput::new()))
         }
     }
 
@@ -364,8 +371,11 @@ mod tests {
     impl Endpoint for MethodEchoEndpoint {
         type Error = std::convert::Infallible;
 
-        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-            Ok(Response::new(Body::from(request.method().to_string())))
+        fn respond(
+            &mut self,
+            request: &mut Request,
+        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+            ready(Ok(Response::new(Body::from(request.method().to_string()))))
         }
     }
 

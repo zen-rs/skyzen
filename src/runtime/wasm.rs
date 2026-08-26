@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     error::Error as StdError,
     fmt,
-    future::Future,
+    future::{ready, Future},
     pin::Pin,
     task::{Context as TaskContext, Poll},
 };
@@ -92,12 +92,18 @@ http_error!(
 impl Extractor for WasmEnv {
     type Error = WasmEnvNotConfigured;
 
-    async fn extract(request: &mut crate::Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or(WasmEnvNotConfigured::new())
+    // Reading the environment back out of the extensions is a synchronous clone, so the future is
+    // ready on creation rather than an `async` block with nothing to await.
+    fn extract(
+        request: &mut crate::Request,
+    ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(
+            request
+                .extensions()
+                .get::<Self>()
+                .cloned()
+                .ok_or(WasmEnvNotConfigured::new()),
+        )
     }
 }
 

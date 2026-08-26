@@ -487,6 +487,7 @@ impl CompressionLevel {
 mod tests {
     use super::*;
     use crate::middleware::apply;
+    use core::future::{ready, Future};
     use flate2::read::{GzDecoder, ZlibDecoder};
     use http::{header::CONTENT_ENCODING, HeaderValue};
     use http_kit::Endpoint;
@@ -522,12 +523,15 @@ mod tests {
 
     impl Endpoint for StaticEndpoint {
         type Error = Infallible;
-        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
+        fn respond(
+            &mut self,
+            _request: &mut Request,
+        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
             let mut response = Response::new(self.response_body());
             if let Some(value) = self.vary.clone() {
                 response.headers_mut().insert(VARY, value);
             }
-            Ok(response)
+            ready(Ok(response))
         }
     }
 
@@ -650,8 +654,11 @@ mod tests {
         F: Fn() -> Response + Clone + Send + Sync + 'static,
     {
         type Error = Infallible;
-        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-            Ok((self.0)())
+        fn respond(
+            &mut self,
+            _request: &mut Request,
+        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+            ready(Ok((self.0)()))
         }
     }
 

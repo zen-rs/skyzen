@@ -1,5 +1,6 @@
 //! Bearer token extraction from Authorization header.
 
+use core::future::{ready, Future};
 use http::StatusCode;
 
 use crate::{extract::Extractor, header, Request};
@@ -74,8 +75,10 @@ pub(crate) fn parse_bearer(request: &Request) -> Result<&str, BearerTokenError> 
 impl Extractor for BearerToken {
     type Error = BearerTokenError;
 
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        parse_bearer(request).map(|token| Self(token.to_owned()))
+    // The header is already on the request, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(parse_bearer(request).map(|token| Self(token.to_owned())))
     }
 
     #[cfg(feature = "openapi")]

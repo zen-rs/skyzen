@@ -804,12 +804,13 @@ mod tests {
         ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, Storage, StorageError,
         StorageObject, StorageStream,
     };
+    use core::future::{ready, Future};
     use http_kit::{Body, Endpoint, HttpError, Response};
     use skyzen_core::Extractor;
     use std::{
         collections::HashMap,
         convert::Infallible,
-        sync::{Arc, RwLock},
+        sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
     };
 
     #[derive(Clone, Default)]
@@ -831,40 +832,22 @@ mod tests {
         }
     }
 
-    impl ObjectStorage for InMemoryObjectStorage {
-        async fn get(&self, key: &str) -> Result<Option<StorageObject>, StorageError> {
-            let data = self
-                .data
+    impl InMemoryObjectStorage {
+        fn read(&self) -> Result<RwLockReadGuard<'_, HashMap<String, Vec<u8>>>, StorageError> {
+            self.data
                 .read()
-                .map_err(|_| StorageError::backend("lock poisoned"))?;
-            Ok(data.get(key).map(|body| StorageObject {
-                body: body.clone(),
-                metadata: Self::metadata_for(key, body),
-            }))
+                .map_err(|_| StorageError::backend("lock poisoned"))
         }
 
-        async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), StorageError> {
+        fn write(&self) -> Result<RwLockWriteGuard<'_, HashMap<String, Vec<u8>>>, StorageError> {
             self.data
                 .write()
-                .map_err(|_| StorageError::backend("lock poisoned"))?
-                .insert(key.to_owned(), body);
-            Ok(())
+                .map_err(|_| StorageError::backend("lock poisoned"))
         }
 
-        async fn delete(&self, key: &str) -> Result<(), StorageError> {
-            self.data
-                .write()
-                .map_err(|_| StorageError::backend("lock poisoned"))?
-                .remove(key);
-            Ok(())
-        }
-
-        async fn list(&self, options: ListOptions) -> Result<ListResult, StorageError> {
+        fn list_page(&self, options: &ListOptions) -> Result<ListResult, StorageError> {
             let mut objects: Vec<ObjectMetadata> = {
-                let data = self
-                    .data
-                    .read()
-                    .map_err(|_| StorageError::backend("lock poisoned"))?;
+                let data = self.read()?;
                 data.iter()
                     .filter(|(key, _)| {
                         options
@@ -885,13 +868,54 @@ mod tests {
                 cursor: None,
             })
         }
+    }
 
-        async fn head(&self, key: &str) -> Result<Option<ObjectMetadata>, StorageError> {
-            let data = self
-                .data
-                .read()
-                .map_err(|_| StorageError::backend("lock poisoned"))?;
-            Ok(data.get(key).map(|body| Self::metadata_for(key, body)))
+    // A `HashMap` behind a lock answers every call synchronously, so the futures are ready on
+    // creation rather than `async` blocks with nothing to await.
+    impl ObjectStorage for InMemoryObjectStorage {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl Future<Output = Result<Option<StorageObject>, StorageError>> + Send {
+            ready(self.read().map(|data| {
+                data.get(key).map(|body| StorageObject {
+                    body: body.clone(),
+                    metadata: Self::metadata_for(key, body),
+                })
+            }))
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            body: Vec<u8>,
+        ) -> impl Future<Output = Result<(), StorageError>> + Send {
+            ready(self.write().map(|mut data| {
+                data.insert(key.to_owned(), body);
+            }))
+        }
+
+        fn delete(&self, key: &str) -> impl Future<Output = Result<(), StorageError>> + Send {
+            ready(self.write().map(|mut data| {
+                data.remove(key);
+            }))
+        }
+
+        fn list(
+            &self,
+            options: ListOptions,
+        ) -> impl Future<Output = Result<ListResult, StorageError>> + Send {
+            ready(self.list_page(&options))
+        }
+
+        fn head(
+            &self,
+            key: &str,
+        ) -> impl Future<Output = Result<Option<ObjectMetadata>, StorageError>> + Send {
+            ready(
+                self.read()
+                    .map(|data| data.get(key).map(|body| Self::metadata_for(key, body))),
+            )
         }
     }
 

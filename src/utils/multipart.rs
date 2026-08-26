@@ -1,6 +1,7 @@
 //! Multipart form data utilities module.
 //! It provides an extractor for `multipart/form-data` requests.
 
+use core::future::{ready, Future};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -76,12 +77,18 @@ pub struct MultipartBoundaryError(String);
 /// `413 Payload Too Large` from [`Multipart::next_field`].
 impl Extractor for Multipart {
     type Error = MultipartRejection;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let boundary =
-            boundary_from_headers(request.headers()).map_err(MultipartRejection::Parse)?;
-        let limit = RequestBodyLimit::of(request);
-        let body = take_body_stream::<Self>(request)?;
-        Ok(Self::from_parts(boundary, body, limit))
+    // Taking the body stream is synchronous — nothing is read here — so the future is ready on
+    // creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(
+            boundary_from_headers(request.headers())
+                .map_err(MultipartRejection::Parse)
+                .and_then(|boundary| {
+                    let limit = RequestBodyLimit::of(request);
+                    let body = take_body_stream::<Self>(request)?;
+                    Ok(Self::from_parts(boundary, body, limit))
+                }),
+        )
     }
 
     #[cfg(feature = "openapi")]

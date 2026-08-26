@@ -1,6 +1,7 @@
 //! RFC-typed request and response headers, backed by the [`headers`] crate.
 
 use core::convert::Infallible;
+use core::future::{ready, Future};
 
 use headers::{Header, HeaderMapExt};
 
@@ -39,17 +40,20 @@ pub enum TypedHeaderError {
 
 impl<H: Header + Send + Sync + 'static> Extractor for TypedHeader<H> {
     type Error = TypedHeaderError;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+    // The header is already on the request, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
         let name = H::name();
         let all = request.headers().get_all(name);
         // `Header::decode` cannot tell "absent" from "malformed" — it reports the same error for
         // both — so absence is checked first, and the two get distinct messages.
-        if all.iter().next().is_none() {
-            return Err(TypedHeaderError::Missing(name.to_string()));
-        }
-        H::decode(&mut all.iter())
-            .map(Self)
-            .map_err(|_| TypedHeaderError::Invalid(name.to_string()))
+        ready(if all.iter().next().is_none() {
+            Err(TypedHeaderError::Missing(name.to_string()))
+        } else {
+            H::decode(&mut all.iter())
+                .map(Self)
+                .map_err(|_| TypedHeaderError::Invalid(name.to_string()))
+        })
     }
 
     #[cfg(feature = "openapi")]
