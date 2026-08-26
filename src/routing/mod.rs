@@ -3,9 +3,10 @@
 //! Routes are defined by combining nodes produced by the [`CreateRouteNode`] extension. Path
 //! literals gain builder methods such as `.at(handler)` (GET), `.post(handler)`, `.put(handler)`,
 //! `.patch(handler)`, `.delete(handler)`, `.head(handler)`, `.options(handler)`,
-//! `.trace(handler)`, `.on(method, handler)`, `.any(handler)`, `.ws(handler)`, and `.route(children)`
-//! so you can describe the full tree declaratively. Once a tree is assembled, call [`Route::build`]
-//! to obtain a [`Router`] that can be mounted on a server or invoked directly from tests.
+//! `.trace(handler)`, `.on(method, handler)`, `.any(handler)`, `.ws(handler)`, `.route(children)`
+//! and `.nest(router)` so you can describe the full tree declaratively. Once a tree is assembled,
+//! call [`Route::build`] to obtain a [`Router`] that can be mounted on a server or invoked
+//! directly from tests.
 //!
 //! ## Building routes
 //! ```no_run
@@ -37,7 +38,8 @@
 //!
 //! ## Named parameters and wildcards
 //! Use `{name}` to capture a single path segment and `{*path}` to capture the rest of the path.
-//! Extract the captured values with [`Params`]:
+//! [`Path<T>`](crate::extract::Path) deserializes the captures into a struct, a tuple or a single
+//! primitive; [`Params`] reads them by name when the names are only known at runtime:
 //! ```no_run
 //! use skyzen::{
 //!     routing::{CreateRouteNode, Params, Route},
@@ -90,6 +92,11 @@
 //! }))
 //! .build();
 //! ```
+//!
+//! ## Mounting a built router
+//! [`CreateRouteNode::nest`] hangs an already-built [`Router`] — one a library exported, say —
+//! under a path prefix. The mounted router matches as if it sat at the root and keeps its own
+//! fallback and `405`.
 //!
 //! ## Replacing the 404 and 405 responses
 //! [`Route::fallback`] and [`Route::method_not_allowed`] take ordinary handlers. The

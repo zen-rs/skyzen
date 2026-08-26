@@ -5,7 +5,7 @@
 use http::Method;
 use serde::{Deserialize, Serialize};
 use skyzen::{
-    extract::Query,
+    extract::{Path, Query},
     routing::{CreateRouteNode, Route, Router},
     utils::Json,
     OpenApi, StatusCode, ToSchema,
@@ -70,14 +70,11 @@ async fn hello(Json(query): Json<HelloQuery>) -> skyzen::Result<Json<HelloRespon
 /// Creates a task under a project, demonstrating multiple extractors with `OpenAPI` metadata.
 #[skyzen::openapi]
 async fn create_task(
-    params: skyzen::routing::Params,
+    Path(project_id): Path<String>,
     Query(filter): Query<TaskFilter>,
     Json(draft): Json<TaskDraft>,
 ) -> skyzen::Result<Json<Task>> {
     // In a real handler we would persist the task; here we just echo the request back.
-    let project_id = params
-        .get("project_id")
-        .map_or_else(|_| "unknown".to_string(), ToString::to_string);
     let task = Task {
         id: "task-123".into(),
         project_id,
