@@ -29,6 +29,15 @@ extern "C" {
         options: &JsValue,
     ) -> Result<Promise, JsValue>;
 
+    /// Get a value together with the metadata stored alongside it. Returns a promise resolving to
+    /// `{ value, metadata }`, where `value` is null when the key is absent.
+    #[wasm_bindgen(method, catch, js_name = getWithMetadata)]
+    pub fn get_with_metadata(
+        this: &KvNamespace,
+        key: &str,
+        options: &JsValue,
+    ) -> Result<Promise, JsValue>;
+
     /// Delete a key. Returns a promise.
     #[wasm_bindgen(method, catch)]
     pub fn delete(this: &KvNamespace, key: &str) -> Result<Promise, JsValue>;
