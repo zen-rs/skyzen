@@ -157,7 +157,7 @@ async fn serve<E>(
     mut endpoint: E,
     request: Request,
     env: Env,
-    _ctx: ExecutionContext,
+    ctx: ExecutionContext,
 ) -> Result<Response, JsValue>
 where
     E: Endpoint + Clone + 'static,
@@ -165,6 +165,11 @@ where
     let mut sky_request = convert_request(&request)?;
     // Make WinterCG env available via request extensions
     sky_request.extensions_mut().insert(WasmEnv::new(env));
+    // The execution context is what keeps post-response work alive: a future not awaited before
+    // the response is returned is cancelled with the isolate unless it goes through `waitUntil`.
+    sky_request
+        .extensions_mut()
+        .insert(super::WorkerContext::new(ctx));
 
     // Capture the request identity before `respond` takes the request mutably, so the error log
     // can name the call that failed the way the native backends do.
@@ -212,7 +217,20 @@ fn convert_request(request: &Request) -> Result<crate::Request, JsValue> {
     let http_request = builder
         .body(request_body(request))
         .map_err(|error| JsValue::from_str(&format!("Failed to build request: {error}")))?;
-    Ok(crate::Request::from(http_request))
+    let mut sky_request = crate::Request::from(http_request);
+
+    // `cf` is Cloudflare's, not WinterCG's, so it is simply absent on other hosts — which is not
+    // an error, just a request with no edge metadata to extract.
+    if let Some(properties) = super::CfProperties::read(request)? {
+        if let Err(error) = &properties {
+            tracing::error!(error, "failed to decode `request.cf`");
+        }
+        sky_request
+            .extensions_mut()
+            .insert(super::CfPropertiesSlot(properties));
+    }
+
+    Ok(sky_request)
 }
 
 fn convert_response(response: crate::Response) -> Result<Response, JsValue> {
