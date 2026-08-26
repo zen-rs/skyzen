@@ -139,3 +139,51 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{layer, Middleware, Next};
+    use crate::{
+        routing::{CreateRouteNode, Route},
+        Body, Endpoint, Error, Request, Response, Result,
+    };
+    use http_kit::header::{HeaderName, HeaderValue};
+
+    /// Stands in for the service injectors `#[skyzen::main]` wraps a built router with.
+    #[derive(Debug)]
+    struct Stamp(&'static str);
+
+    impl Middleware for Stamp {
+        async fn handle(
+            &self,
+            request: &mut Request,
+            next: Next<'_>,
+        ) -> std::result::Result<Response, Error> {
+            let mut response = next.run(request).await?;
+            response.headers_mut().append(
+                HeaderName::from_static("x-stamp"),
+                HeaderValue::from_static(self.0),
+            );
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn layering_an_endpoint_applies_the_last_wrapper_outermost() {
+        let router = Route::new(("/ping".at(|| async { Result::Ok("pong") }),)).build();
+        let mut endpoint = layer(layer(router, Stamp("inner")), Stamp("outer"));
+
+        let mut request = Request::new(Body::empty());
+        *request.uri_mut() = "/ping".parse().expect("valid path");
+        let response = endpoint.respond(&mut request).await.unwrap();
+
+        // Both wrappers ran; the outer one appended last because it saw the response last.
+        let stamps: Vec<&str> = response
+            .headers()
+            .get_all("x-stamp")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(stamps, ["inner", "outer"]);
+    }
+}

@@ -22,7 +22,7 @@ use skyzen_core::{
 /// The middleware only publishes the limit. Enforcement lives in the body extractors
 /// (`Bytes`, `ByteStr`, `Json`, `Form`, `Multipart`), which read it back with
 /// [`RequestBodyLimit::of`] and reject an oversized payload with `413 Payload Too Large`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BodyLimit(RequestBodyLimit);
 
 impl BodyLimit {
@@ -42,12 +42,6 @@ impl BodyLimit {
     #[must_use]
     pub const fn limit(self) -> RequestBodyLimit {
         self.0
-    }
-}
-
-impl Default for BodyLimit {
-    fn default() -> Self {
-        Self(RequestBodyLimit::default())
     }
 }
 
