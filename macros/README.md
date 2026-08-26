@@ -75,7 +75,7 @@ async fn email(
     env: skyzen::runtime::wasm::Env,
     ctx: skyzen_cloudflare::CfEventContext,
 ) -> Result<(), skyzen_cloudflare::CfEventError> {
-    message.forward("archive@example.invalid").await
+    message.forward("archive@lexo.cool").await
 }
 ```
 
