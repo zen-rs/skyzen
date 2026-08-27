@@ -6,7 +6,7 @@
 //! in a consumer.
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
 /// A parsed `Skyzen.toml` document.
 ///
@@ -109,6 +109,70 @@ pub struct NativeSection {
     /// `[native.database.<name>]`, keyed by the `[[database]]` name.
     #[serde(default)]
     pub database: BTreeMap<String, NativeDatabaseSection>,
+    /// `[[native.queue_consumer]]` — queues this application consumes natively.
+    ///
+    /// The Cloudflare counterpart is `[[cloudflare.queues.consumers]]`: there the platform pushes
+    /// batches into the Worker, whereas natively Skyzen runs the polling loop itself. Both drive
+    /// the same `#[skyzen::queue]` handler.
+    #[serde(default)]
+    pub queue_consumer: Vec<NativeQueueConsumer>,
+}
+
+/// One `[[native.queue_consumer]]` entry — a polling loop over one portable queue.
+///
+/// Durations are humantime strings (`"20s"`, `"1m 30s"`, `"500ms"`) and are parsed here, so a
+/// malformed one fails the manifest parse rather than surfacing as a runtime surprise inside the
+/// consumer loop.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeQueueConsumer {
+    /// The `[[service]]` name to consume from. It must name an entry of `type = "queue"`.
+    pub service: String,
+    /// How many polling loops run against this queue at once.
+    ///
+    /// Each loop receives, invokes the handler and settles independently, so this is the
+    /// application's own concurrency limit for the queue — the native counterpart of Cloudflare's
+    /// `max_concurrency`.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: NonZeroUsize,
+    /// Most messages to take in one receive. Backends cap this at their own batch size (SQS
+    /// allows 10, Azure Storage 32), so a larger value is not an error, just a smaller batch.
+    #[serde(default = "default_batch_size")]
+    pub batch_size: NonZeroUsize,
+    /// How long a receive may wait for a message before returning empty (long polling).
+    ///
+    /// This is also the loop's idle pace: a backend that answers an empty receive sooner than
+    /// this leaves the loop idle for the remainder rather than spinning on it.
+    #[serde(default = "default_poll_wait", with = "humantime_serde")]
+    pub poll_wait: Duration,
+    /// How long a received batch stays invisible to other consumers. Unset uses the queue's own
+    /// configured default.
+    #[serde(default, with = "humantime_serde")]
+    pub visibility_timeout: Option<Duration>,
+    /// How long a retried message is held before redelivery, when the handler asks for a retry
+    /// without naming its own delay.
+    #[serde(default = "default_retry_delay", with = "humantime_serde")]
+    pub retry_delay: Duration,
+}
+
+/// One polling loop per queue, which is the only concurrency an application has not asked for.
+const fn default_concurrency() -> NonZeroUsize {
+    NonZeroUsize::new(1).expect("1 is not zero")
+}
+
+/// Ten messages per receive — SQS's maximum, and at or under every other backend's.
+const fn default_batch_size() -> NonZeroUsize {
+    NonZeroUsize::new(10).expect("10 is not zero")
+}
+
+/// Twenty seconds of long polling, which is SQS's maximum `WaitTimeSeconds`.
+const fn default_poll_wait() -> Duration {
+    Duration::from_secs(20)
+}
+
+/// Thirty seconds before a retried message comes back, matching SQS's default visibility timeout.
+const fn default_retry_delay() -> Duration {
+    Duration::from_secs(30)
 }
 
 /// `[native.service.<name>]`.

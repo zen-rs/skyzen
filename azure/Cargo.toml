@@ -29,6 +29,8 @@ url = { version = "2", optional = true }
 # Azure Storage queues, and the credential types Cosmos and the queues share.
 azure_storage_queue = { version = "1.0", optional = true }
 azure_core = { version = "1.0", optional = true }
+# Storage queues have no long polling of their own, so `receive` emulates one with a timer.
+async-io = { workspace = true, optional = true }
 
 # Blob Storage: OpenDAL moves the bytes, and the listing, tiering and presigning REST calls go out
 # on the same reqwest/reqsign stack OpenDAL's own azblob service is built on.
@@ -62,7 +64,7 @@ servicebus = [
     "dep:time",
     "dep:url",
 ]
-storage-queue = ["dep:azure_storage_queue", "dep:azure_core"]
+storage-queue = ["dep:azure_storage_queue", "dep:azure_core", "dep:async-io"]
 
 [lints]
 workspace = true

@@ -9,10 +9,14 @@ use std::{
 
 use crate::{
     extract::PeerAddr,
-    runtime::{context::ShutdownGuard, WorkerContext},
+    runtime::{
+        consumer::{ConsumerFatal, ConsumerSet},
+        context::ShutdownGuard,
+        WorkerContext,
+    },
     Endpoint,
 };
-use async_channel::{bounded, Receiver};
+use async_channel::{bounded, Receiver, Sender};
 use async_net::TcpListener;
 use core::convert::Infallible;
 use executor_core::{
@@ -322,35 +326,83 @@ fn shutdown_signal() -> Receiver<()> {
     rx
 }
 
-/// How long outstanding connections are given to finish after the accept loop stops.
+/// How long outstanding work is given to finish after the accept loop stops.
 ///
-/// A request still streaming a response when the deadline elapses is severed; the runtime says
-/// so in its final log line rather than claiming a graceful shutdown.
+/// A request still streaming a response — or a queue consumer still settling the batch it is
+/// holding — when the deadline elapses is severed; the runtime says so in its final log line
+/// rather than claiming a graceful shutdown.
 pub const SHUTDOWN_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What the accept loop had left to clean up when it stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shutdown {
-    /// Connections still in flight when the grace period elapsed, and therefore cut off.
+    /// Connections and consumer batches still in flight when the grace period elapsed, and
+    /// therefore cut off.
     pub severed: usize,
 }
 
-/// Build the executor and serve the provided endpoint over Hyper.
+/// Why the runtime stopped before it could shut down on its own terms.
+#[derive(Debug)]
+enum RuntimeFailure {
+    /// The listener could not be bound, or the accept loop failed.
+    Listener(std::io::Error),
+    /// A declared queue consumer cannot run at all against the backend it was pointed at.
+    QueueConsumer(ConsumerFatal),
+}
+
+impl From<std::io::Error> for RuntimeFailure {
+    fn from(error: std::io::Error) -> Self {
+        Self::Listener(error)
+    }
+}
+
+impl std::fmt::Display for RuntimeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Listener(error) => write!(f, "the listener failed: {error}"),
+            Self::QueueConsumer(ConsumerFatal { queue, reason }) => {
+                write!(f, "the queue consumer for `{queue}` cannot run: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuntimeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Listener(error) => Some(error),
+            Self::QueueConsumer(_) => None,
+        }
+    }
+}
+
+/// Build the executor, serve the provided endpoint over Hyper, and run the declared queue
+/// consumers beside it.
 ///
-/// After `Ctrl+C` the listener stops accepting, outstanding connections are awaited for up to
+/// `factory` produces the endpoint together with its [`ConsumerSet`] — `()` for an application
+/// that declares no `[[native.queue_consumer]]` — so both are built from the same service
+/// instances rather than from two independent connections to one backend.
+///
+/// After `Ctrl+C` the listener stops accepting and the consumers stop initiating receives;
+/// outstanding connections and in-flight batches are awaited for up to
 /// [`SHUTDOWN_GRACE_PERIOD`], and only then does `on_shutdown` run — so a cleanup hook observes a
-/// server with no requests still in flight.
+/// server with no requests and no batches still in flight.
+///
+/// A consumer that can never receive at all, and a listener that cannot be bound, both end the
+/// process with a non-zero status once `on_shutdown` has run: a misconfigured deployment should
+/// be restarted by its supervisor, not left running half-alive.
 ///
 /// # Panics
 ///
 /// Panics if the global executor fails to initialize.
-pub fn launch<Fut, E, Hook, HookFut>(
+pub fn launch<Fut, E, C, Hook, HookFut>(
     addr: Option<SocketAddr>,
     factory: impl FnOnce() -> Fut,
     on_shutdown: Hook,
 ) where
-    Fut: Future<Output = E> + Send + 'static,
+    Fut: Future<Output = (E, C)> + Send + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
+    C: ConsumerSet,
     Hook: FnOnce() -> HookFut,
     HookFut: Future<Output = ()>,
 {
@@ -359,23 +411,38 @@ pub fn launch<Fut, E, Hook, HookFut>(
         debug!("Global executor already initialized; reusing existing instance");
     }
 
-    smol::block_on(async move {
+    let failed = smol::block_on(async move {
         tracing::info!("Skyzen application starting up");
 
-        let endpoint = factory().await;
+        let (endpoint, consumers) = factory().await;
         let addr = addr.unwrap_or_else(server_addr);
-        match run_server(executor, endpoint, addr).await {
-            Ok(Shutdown { severed: 0 }) => info!("Skyzen server shut down gracefully"),
-            Ok(Shutdown { severed }) => warn!(
-                connections = severed,
-                grace_period_secs = SHUTDOWN_GRACE_PERIOD.as_secs(),
-                "Shutdown deadline elapsed with connections still in flight; they were severed"
-            ),
-            Err(error) => error!("Skyzen server terminated: {error}"),
-        }
+        let outcome = run_server(executor, endpoint, consumers, addr).await;
+        let failed = match outcome {
+            Ok(Shutdown { severed: 0 }) => {
+                info!("Skyzen server shut down gracefully");
+                false
+            }
+            Ok(Shutdown { severed }) => {
+                warn!(
+                    in_flight = severed,
+                    grace_period_secs = SHUTDOWN_GRACE_PERIOD.as_secs(),
+                    "Shutdown deadline elapsed with work still in flight; it was severed"
+                );
+                false
+            }
+            Err(error) => {
+                error!("Skyzen server terminated: {error}");
+                true
+            }
+        };
 
         on_shutdown().await;
+        failed
     });
+
+    if failed {
+        std::process::exit(1);
+    }
 }
 
 /// Wait for every connection task to finish, or for the grace period to elapse.
@@ -396,14 +463,51 @@ async fn drain_connections(
     }
 }
 
-async fn run_server<Exec, E>(
+/// The channels tying the accept loop to the queue consumers it started.
+///
+/// Dropping the whole thing is what tells every consumer slot to stop initiating receives, so the
+/// shutdown path cannot forget one of the two halves.
+#[derive(Debug)]
+struct ConsumerChannels {
+    /// Watched by every consumer slot; closing it stops them.
+    _stop: Sender<Infallible>,
+    /// Where a consumer that can never receive reports itself.
+    fatal_rx: Receiver<ConsumerFatal>,
+    /// The accept loop's own sender, kept alive so [`Self::fatal_rx`] stays open: a closed
+    /// channel would resolve immediately and read as a failure for an application that declares
+    /// no consumers at all.
+    _fatal_tx: Sender<ConsumerFatal>,
+}
+
+impl ConsumerChannels {
+    /// Start `consumers` on `executor`, each slot holding a clone of the drain `guard`.
+    fn start<Exec: CoreExecutor + 'static, C: ConsumerSet>(
+        consumers: C,
+        executor: &Exec,
+        guard: &Sender<Infallible>,
+    ) -> Self {
+        let (stop, consumers_stop) = bounded::<Infallible>(1);
+        let (fatal_tx, fatal_rx) = bounded::<ConsumerFatal>(1);
+        consumers.start(executor, &consumers_stop, guard, &fatal_tx);
+
+        Self {
+            _stop: stop,
+            fatal_rx,
+            _fatal_tx: fatal_tx,
+        }
+    }
+}
+
+async fn run_server<Exec, E, C>(
     executor: Exec,
     endpoint: E,
+    consumers: C,
     addr: SocketAddr,
-) -> std::io::Result<Shutdown>
+) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
+    C: ConsumerSet,
 {
     const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -419,16 +523,30 @@ where
     // tells the accept loop every connection task has finished.
     let (connection_guard, connections) = bounded::<Infallible>(1);
 
+    let queue_consumers = ConsumerChannels::start(consumers, executor.as_ref(), &connection_guard);
+
     let mut incoming = listener.incoming();
     let shutdown_rx = shutdown_signal();
     let shutdown = shutdown_rx.recv().fuse();
     futures_util::pin_mut!(shutdown);
+    let mut fatal = None;
 
     loop {
         futures_util::select! {
             _ = shutdown => {
                 info!("Ctrl+C received, stopping accept loop");
                 break;
+            }
+            report = queue_consumers.fatal_rx.recv().fuse() => {
+                if let Ok(report) = report {
+                    error!(
+                        queue = report.queue.as_str(),
+                        reason = report.reason,
+                        "A declared queue consumer cannot run; stopping"
+                    );
+                    fatal = Some(report);
+                    break;
+                }
             }
             connection = incoming.next().fuse() => {
                 match connection {
@@ -502,10 +620,15 @@ where
         }
     }
 
-    // Release the accept loop's own handle so only live connections keep the channel open.
+    // Tell the consumers to stop polling, then release the accept loop's own handle so only live
+    // connections and in-flight batches keep the drain channel open.
+    drop(queue_consumers);
     drop(connection_guard);
     let severed = drain_connections(&connections, SHUTDOWN_GRACE_PERIOD).await;
-    Ok(Shutdown { severed })
+
+    fatal.map_or(Ok(Shutdown { severed }), |report| {
+        Err(RuntimeFailure::QueueConsumer(report))
+    })
 }
 
 fn server_addr() -> SocketAddr {
