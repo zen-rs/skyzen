@@ -41,7 +41,15 @@ pub fn prepare(action: &Action, manifest: &Manifest) -> Result<ProviderPlan> {
     // Read the manifest's `url_env` / `bucket_env` declarations *before* starting the child, so a
     // variable the application would have panicked on at its first request is a startup error
     // naming the manifest key that asked for it.
-    let child_env = prepare_child_environment(manifest)?;
+    //
+    // Only for `dev`, which actually runs the application: a `build` needs nothing from the
+    // runtime environment, and gating compilation on a connection string set only in production
+    // would break every CI box.
+    let child_env = if matches!(action, Action::Dev { .. }) {
+        prepare_child_environment(manifest)?
+    } else {
+        Vec::new()
+    };
 
     Ok(ProviderPlan {
         commands: vec![CommandPlan {
@@ -109,6 +117,10 @@ mod tests {
             "[[service]]\nname = \"cache\"\ntype = \"kv\"\n\n\
              [native.service.cache]\nbackend = \"redis\"\nurl_env = \"SKYZEN_NEVER_SET_URL\"\n",
         );
+        // A build needs nothing from the runtime environment, so it must not be gated on a
+        // connection string that only production sets.
+        prepare(&Action::Build { release: true }, &manifest).expect("a build needs no env");
+
         let error = prepare(
             &Action::Dev {
                 runner_args: Vec::new(),

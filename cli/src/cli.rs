@@ -251,6 +251,39 @@ mod tests {
     }
 
     #[test]
+    fn a_global_flag_after_a_var_arg_subcommand_is_still_a_global_flag() {
+        // `skyzen dev --provider cloudflare` is written throughout the docs; a var-arg that
+        // swallowed it would silently run the native path instead.
+        for (args, expected) in [
+            (
+                vec!["skyzen", "dev", "--provider", "cloudflare"],
+                Provider::Cloudflare,
+            ),
+            (
+                vec!["skyzen", "logs", "--provider", "cloudflare"],
+                Provider::Cloudflare,
+            ),
+        ] {
+            let parsed = parse(&args);
+            assert_eq!(parsed.provider, Some(expected), "{args:?}");
+        }
+
+        let parsed = parse(&[
+            "skyzen",
+            "dev",
+            "--provider",
+            "cloudflare",
+            "--env",
+            "staging",
+        ]);
+        let Command::Dev { runner_args } = parsed.command else {
+            panic!("expected `dev`");
+        };
+        assert!(runner_args.is_empty(), "{runner_args:?}");
+        assert_eq!(parsed.env.as_deref(), Some("staging"));
+    }
+
+    #[test]
     fn logs_forwards_trailing_arguments_to_wrangler() {
         let parsed = parse(&["skyzen", "logs", "--format", "json"]);
         let Command::Logs { wrangler_args } = parsed.command else {
