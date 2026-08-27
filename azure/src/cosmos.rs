@@ -353,30 +353,43 @@ impl CosmosKv {
         Self::builder(container).build().await
     }
 
-    /// Read a document's value and entity tag.
-    async fn read(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, KvError> {
+    /// Read a document's value, and the entity tag a conditional write would guard on.
+    ///
+    /// The tag is optional here so a plain [`KeyValueStore::get`] never depends on it; the
+    /// conditional paths ask for it through [`read_for_swap`](Self::read_for_swap).
+    async fn read(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>, KvError> {
         match self
             .container
             .read_item(self.layout.partition_value(key).to_owned(), key, None)
             .await
         {
             Ok(response) => {
-                let etag = response
-                    .headers()
-                    .etag()
-                    .map(ToString::to_string)
-                    .ok_or_else(|| {
-                        KvError::backend(
-                            "Cosmos returned a document with no ETag, which no conditional write \
-                             can be built on",
-                        )
-                    })?;
+                let etag = response.headers().etag().map(ToString::to_string);
                 let document: StoredValue = response.into_model().map_err(cosmos_error)?;
                 Ok(Some((decode_value(&document.value)?, etag)))
             }
             Err(error) if is_absent(&error) => Ok(None),
             Err(error) => Err(cosmos_error(error)),
         }
+    }
+
+    /// Read a document for a conditional write, which needs its entity tag.
+    ///
+    /// A document Cosmos returned without an `_etag` cannot be swapped safely, and reporting that
+    /// is the difference between refusing the write and applying one that guards nothing.
+    async fn read_for_swap(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, KvError> {
+        let Some((value, etag)) = self.read(key).await? else {
+            return Ok(None);
+        };
+
+        let etag = etag.ok_or_else(|| {
+            KvError::backend(format!(
+                "Cosmos returned the document under {key:?} with no ETag, so no conditional write \
+                 can be guarded on it"
+            ))
+        })?;
+
+        Ok(Some((value, etag)))
     }
 
     /// Create a document, reporting whether it was created or already existed.
@@ -593,7 +606,7 @@ impl KeyValueStore for CosmosKv {
             return self.create(key, value, None).await;
         };
 
-        let Some((stored, etag)) = self.read(key).await? else {
+        let Some((stored, etag)) = self.read_for_swap(key).await? else {
             return Ok(false);
         };
 
@@ -611,7 +624,7 @@ impl KeyValueStore for CosmosKv {
     /// [`INCREMENT_ATTEMPTS`] rounds reports [`KvError::Conflict`] rather than spinning.
     async fn increment(&self, key: &str, delta: i64) -> Result<i64, KvError> {
         for _ in 0..INCREMENT_ATTEMPTS {
-            let applied = match self.read(key).await? {
+            let applied = match self.read_for_swap(key).await? {
                 None => {
                     // An absent key counts as zero, and creating it is what makes the first
                     // increment safe against a second caller doing the same.
@@ -697,6 +710,15 @@ impl KeyValueStore for CosmosKv {
     /// cursor never skips keys. The last page may hand back a cursor whose own page turns out
     /// empty, as every token-based pager does.
     async fn list(&self, options: KvListOptions) -> Result<KvListResult, KvError> {
+        // A zero limit yields an empty page, consistent with the other backends; the incoming
+        // cursor is echoed back so no listing progress is lost.
+        if options.limit == Some(0) {
+            return Ok(KvListResult {
+                keys: Vec::new(),
+                cursor: options.cursor,
+            });
+        }
+
         // Parameterize the prefix instead of interpolating it into the query text, so no prefix
         // content can alter the query (Cosmos SQL string escaping uses backslashes, which naive
         // quoting mishandles).

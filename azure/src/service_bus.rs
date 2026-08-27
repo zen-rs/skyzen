@@ -43,9 +43,6 @@ const CONNECTION_STRING_ENV: &str = "SERVICEBUS_CONNECTION_STRING";
 /// a leaked token useless rather than granting queue access for an hour.
 const SETTLE_TOKEN_TTL: Duration = Duration::from_secs(300);
 
-/// The longest server-side wait the Service Bus REST peek-lock accepts.
-const MAX_PEEK_LOCK_WAIT: Duration = Duration::from_secs(55);
-
 /// An Azure Service Bus-backed message queue.
 ///
 /// # Wire format
@@ -561,26 +558,6 @@ fn received_message(response: &PeekLockResponse) -> Result<ReceivedMessage, Queu
     })
 }
 
-/// The peek-lock wait to ask the service for on the `index`-th fetch of one receive.
-///
-/// Only the first fetch waits: the caller asked to wait up to `wait` for *a* message, not up to
-/// `wait` for each of them, so every later fetch takes what is already there and stops at the first
-/// empty answer.
-fn peek_lock_wait(index: usize, wait: Option<Duration>) -> Result<Option<Duration>, QueueError> {
-    if index > 0 {
-        return Ok(Some(Duration::ZERO));
-    }
-
-    match wait {
-        Some(wait) if wait > MAX_PEEK_LOCK_WAIT => Err(QueueError::backend(format!(
-            "Service Bus caps a peek-lock wait at {} seconds; {} was requested",
-            MAX_PEEK_LOCK_WAIT.as_secs(),
-            wait.as_secs()
-        ))),
-        wait => Ok(wait),
-    }
-}
-
 /// Whether a peek-lock answered with a message, and refuse anything but a message or an empty queue.
 fn peeked(status: StatusCode) -> Result<bool, QueueError> {
     match status {
@@ -704,12 +681,21 @@ impl MessageQueue for ServiceBusQueue {
 
     /// Take up to [`ReceiveOptions::max_messages`] messages, leasing each one.
     ///
-    /// Service Bus locks one message per peek-lock request, so a batch is that many requests; the
-    /// first may wait up to [`ReceiveOptions::wait`] for a message to arrive and the rest take only
-    /// what is already there, stopping at the first empty answer.
+    /// Service Bus locks one message per peek-lock request, so a batch of `n` is `n` requests that
+    /// stop at the first empty answer. Only that last request waits — every earlier one is answered
+    /// at once by a message that is already there — so a batch costs one [`ReceiveOptions::wait`]
+    /// in total rather than one per message.
     ///
-    /// [`ReceiveOptions::visibility_timeout`] is refused: the lease lasts the queue's configured
-    /// `LockDuration`, and the REST API has no way to override it for one delivery.
+    /// # Platform notes
+    ///
+    /// - A peek-lock always waits for a message: the REST API has no non-blocking form, so `wait`
+    ///   bounds the wait and `None` leaves the bound to the service's own default. A consumer that
+    ///   must not sit on an empty queue should set an explicit `wait`.
+    /// - [`ReceiveOptions::visibility_timeout`] is refused: the lease lasts the queue's configured
+    ///   `LockDuration`, and the REST API has no way to override it for one delivery.
+    /// - A request that fails part-way through a batch fails the whole call. The messages already
+    ///   locked by it are never handed back, so they return to the queue when their locks lapse —
+    ///   at-least-once delivery, as peek-lock consumption is everywhere.
     async fn receive(&self, options: ReceiveOptions) -> Result<Vec<ReceivedMessage>, QueueError> {
         if options.max_messages == 0 {
             return Err(QueueError::backend(
@@ -726,10 +712,10 @@ impl MessageQueue for ServiceBusQueue {
         }
 
         let mut messages = Vec::with_capacity(options.max_messages);
-        for index in 0..options.max_messages {
+        for _ in 0..options.max_messages {
             let response = self
                 .client
-                .peek_lock_message2(peek_lock_wait(index, options.wait)?)
+                .peek_lock_message2(options.wait)
                 .await
                 .map_err(sdk_error)?;
 
@@ -767,8 +753,8 @@ impl MessageQueue for ServiceBusQueue {
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_failure_code, decode_message, encode_message, peek_lock_wait, peeked, queue_url,
-        settled, ConnectionString, ServiceBusQueue, ServiceBusReceipt, MAX_PEEK_LOCK_WAIT,
+        batch_failure_code, decode_message, encode_message, peeked, queue_url, settled,
+        ConnectionString, ServiceBusQueue, ServiceBusReceipt,
     };
     use azure_core_legacy::{
         error::{Error as AzureError, ErrorKind},
@@ -984,21 +970,6 @@ mod tests {
         assert!(token.ends_with("&skn=RootManageSharedAccessKey"));
         // The resource is the percent-encoded URL, as the SAS specification requires.
         assert!(token.contains("https%3A%2F%2Fskyzen-test.servicebus.windows.net%2Fjobs"));
-    }
-
-    #[test]
-    fn only_the_first_fetch_of_a_receive_waits() {
-        let wait = Some(Duration::from_secs(20));
-        assert_eq!(peek_lock_wait(0, wait).unwrap(), wait);
-        assert_eq!(peek_lock_wait(1, wait).unwrap(), Some(Duration::ZERO));
-        assert_eq!(peek_lock_wait(0, None).unwrap(), None);
-    }
-
-    #[test]
-    fn a_wait_beyond_the_platform_cap_is_refused() {
-        let error = peek_lock_wait(0, Some(MAX_PEEK_LOCK_WAIT + Duration::from_secs(1)))
-            .expect_err("an oversized wait should be refused");
-        assert!(error.to_string().contains("55"));
     }
 
     #[test]
