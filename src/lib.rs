@@ -1,23 +1,48 @@
-//! Skyzen — a fast, ergonomic HTTP framework for Rust that works everywhere.
+//! Skyzen — an HTTP framework for Rust whose infrastructure is portable, not just its handlers.
 //!
-//! Skyzen targets both native servers (Tokio + Hyper) and WebAssembly edge platforms
-//! (Cloudflare Workers, Deno Deploy). Write your handlers once, deploy anywhere.
+//! A handler asks for [`Kv`], [`Storage`], [`Queue`] or [`Db`] and gets a *capability*, not a
+//! vendor SDK. The same function body runs against Redis and Postgres on a server, Cloudflare KV
+//! and D1 at the edge, `DynamoDB` and SQS on AWS, Cosmos DB and Blob Storage on Azure — and against
+//! in-process fakes from `skyzen-test` in a plain `cargo test`, with no sockets and no emulator.
+//! Those types live in [`skyzen_services`](https://docs.rs/skyzen-services).
+//!
+//! The HTTP layer is portable in the same way: one `#[skyzen::main]` serves a native Tokio/Hyper
+//! server, an AWS Lambda, an Azure Functions custom handler, and a Cloudflare Worker, chosen by
+//! what the process finds in its environment rather than by anything in the application.
+//!
+//! [`Kv`]: https://docs.rs/skyzen-services/latest/skyzen_services/struct.Kv.html
+//! [`Storage`]: https://docs.rs/skyzen-services/latest/skyzen_services/struct.Storage.html
+//! [`Queue`]: https://docs.rs/skyzen-services/latest/skyzen_services/struct.Queue.html
+//! [`Db`]: https://docs.rs/skyzen-services/latest/skyzen_services/struct.Db.html
 //!
 //! # Key Modules
 //!
-//! - [`routing`] — Tree-based routing with path parameters, HTTP method matching, and `nest`ing
-//!   of an already-built [`Router`](routing::Router)
+//! - [`routing`] — Tree-based routing with path parameters, HTTP method matching, custom 404/405
+//!   handlers, and `nest`ing of an already-built [`Router`](routing::Router)
 //! - [`extract`] — Extract typed data from requests: [`Json<T>`](utils::Json),
-//!   [`Query<T>`](extract::Query), [`Path<T>`](extract::Path), [`HeaderMap`](header::HeaderMap),
-//!   and the body as `Bytes` or `String`
+//!   [`Query<T>`](extract::Query), [`Path<T>`](extract::Path),
+//!   [`TypedHeader<H>`](extract::TypedHeader), [`HeaderMap`](header::HeaderMap), and the body as
+//!   `Bytes` or `String`
 //! - [`responder`] — Convert types into HTTP responses: [`Json<T>`](utils::Json), `String`,
-//!   [`StatusCode`], and tuples such as `(StatusCode, Json<T>)`
+//!   [`StatusCode`], [`Sse`](responder::Sse), and tuples such as `(StatusCode, Json<T>)`
 //! - [`handler`] — Async functions with extractors as arguments become endpoints automatically
+//! - [`middleware`] — `&self` middleware, [`from_fn`](middleware::from_fn), and the shipped
+//!   [`Cors`](middleware::Cors), [`BodyLimit`](middleware::BodyLimit) and compression layers
 //! - [`utils`] — Common utilities including [`Json<T>`](utils::Json),
 //!   [`Redirect`](utils::Redirect), [`Html<T>`](utils::Html) and [`CookieJar`](utils::CookieJar)
 //! - [`mod@openapi`] — Automatic `OpenAPI` documentation from annotated handlers
-//! - [`runtime`] — Runtime primitives for `#[skyzen::main]`
+//! - [`runtime`] — Runtime primitives for `#[skyzen::main]`, including the platform detection above
+//! - [`static_files`] — Streamed file serving with `ETag`, `Range` and SPA fallback (requires
+//!   `static-files`)
 //! - [`websocket`] — Unified WebSocket API across native and WASM (requires `ws` feature)
+//!
+//! # Safe by default
+//!
+//! - A `5xx` response body is redacted to `"Internal server error"`; the real message and its whole
+//!   `source()` chain go to the log. A `4xx` message is returned verbatim, because it is about the
+//!   caller's request.
+//! - Request bodies are capped at [`RequestBodyLimit::DEFAULT`] (2 MiB) with no configuration,
+//!   enforced from `Content-Length` *and* mid-stream.
 //!
 //! # Getting Started
 //!

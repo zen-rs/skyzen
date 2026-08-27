@@ -17,6 +17,11 @@ this crate rather than through parsers of their own. Every struct carries
 `#[serde(deny_unknown_fields)]`, and discriminants such as `type` and `backend` are enums, so a
 typo or an unsupported value fails at parse time instead of being silently dropped.
 
+The same argument covers migrations, so the `migrations` module lives here too: it is the one
+reader of a `<version>_<name>.sql` directory, used by `skyzen::embed_migrations!` at compile time
+and by `skyzen migrate` at deploy time. If those two disagreed about which files count or how a
+checksum is computed, a deployment would look clean while running different SQL from the binary.
+
 ```rust
 use skyzen_manifest::Manifest;
 

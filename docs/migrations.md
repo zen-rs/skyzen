@@ -175,11 +175,12 @@ test suite answers rather than the first deployment.
 ## From the CLI
 
 ```sh
-skyzen migrate --provider native     # apply through [native.database.<name>].url_env
-skyzen migrate status                # what is applied, what is pending
-skyzen migrate --dry-run             # validate the directory and print the plan; never connects
-skyzen migrate                       # Cloudflare D1, via `wrangler d1 migrations apply`
-skyzen migrate --local               # the D1 emulator's database, for `skyzen dev`
+skyzen migrate                          # Cloudflare D1, via `wrangler d1 migrations apply`
+skyzen migrate --local                  # the D1 emulator's database, for `skyzen dev`
+skyzen migrate status                   # D1's own record, via `wrangler d1 migrations list`
+skyzen migrate --provider native        # apply through [native.database.<name>].url_env
+skyzen migrate status --provider native # read `_skyzen_migrations` through that connection
+skyzen migrate --dry-run                # validate the directory and print the plan; never connects
 ```
 
 The CLI cannot see inside a crate it has not compiled, so it reads the **same directory** the macro
@@ -192,10 +193,14 @@ one after another, matching the Cloudflare path's one-`wrangler`-call-per-databa
 Databases without native wiring are skipped with a warning.
 
 `--dry-run` reads and validates the directories and prints what would run. It never opens a
-connection, so it needs no connection string.
+connection, so it needs no connection string. It applies to the native path; the Cloudflare path
+prints the `wrangler` invocations it would run instead.
 
-`skyzen migrate status` reads the database through the native connection, so it needs that wiring.
-For a D1-only project, `wrangler d1 migrations list` is the equivalent.
+`status` takes the same branch as applying, so it always reports on the database `skyzen migrate`
+would write to: `wrangler d1 migrations list` under the default `--provider cloudflare`, and the
+`_skyzen_migrations` table through `[native.database.<name>].url_env` under `--provider native`. A
+project with both wirings therefore never gets D1's answer from SQLite's bookkeeping, or the
+reverse.
 
 ## Configuration
 

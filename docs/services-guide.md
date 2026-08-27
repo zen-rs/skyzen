@@ -1,6 +1,10 @@
 # Using Portable Services
 
-Skyzen's portable capability layer lets you write business logic against `Kv`, `Storage`, `Queue`, and `Db` instead of provider SDK types. Native and Cloudflare automatic wiring are built in today; provider-specific extensions remain available when you intentionally need more than the portable minimum.
+Skyzen's portable capability layer lets you write business logic against `Kv`, `Storage`, `Queue`,
+and `Db` instead of provider SDK types. Every backend can be constructed in Rust from any runtime;
+`Skyzen.toml` additionally generates the wiring for you on the native and Cloudflare paths. Nothing
+stops you from reaching past the portable surface to a provider's own API when you want more than
+the common minimum — that is a deliberate drop-down, not a fallback.
 
 ## Mental Model
 
@@ -44,8 +48,13 @@ conditionally, so `KeyValueStore` also carries:
 `compare_and_swap` reports a lost race as `Ok(false)`, not as an error — losing an optimistic
 update is an ordinary outcome, and `KvError::Conflict` is reserved for conflicts a backend raises
 on its own. Each of these has a `KvError::Unsupported` default, so a backend without the primitive
-(Cloudflare KV has no conditional write) fails loudly instead of degrading to a racy
-read-modify-write.
+fails loudly instead of degrading to a racy read-modify-write. `Redis`, `DynamoKv`, `CosmosKv` and
+`InMemoryKv` implement all four; **`CfKv` implements none of them** — Cloudflare KV is eventually
+consistent and has no conditional write, so a lock or a counter on the edge belongs in a Durable
+Object, not in KV.
+
+`exists` is different: it has a working default (`get(..).is_some()`), so every backend answers it,
+and a backend overrides it only when the platform has something cheaper than fetching the value.
 
 ### Listing
 
@@ -88,9 +97,12 @@ and `Suffix(n)` — and `ByteRange::resolve(total)` clamps one against a known o
 in `body` while `metadata.size` still reports the whole object, which is exactly the pair a
 `Content-Range` header needs.
 
-All five have `StorageError::Unsupported` defaults this wave; provider crates implement them
-natively as each platform's wave lands. `InMemoryStorage` implements all of them, presigning a
-deterministic `memory://` URL that is documented as **not fetchable**.
+`S3Storage`, `AzureBlob` and `InMemoryStorage` implement all five. `CfR2` implements streaming and
+ranges but keeps the presign defaults: R2 presigns only through its S3-compatible endpoint with an
+account access key, which a Worker's bucket binding does not carry and should not — point
+`skyzen-s3` at the R2 S3 endpoint when you need one. Anything a backend genuinely lacks returns
+`StorageError::Unsupported` rather than silently buffering the whole object. `InMemoryStorage`
+presigns a deterministic `memory://` URL that is documented as **not fetchable**.
 
 ### Producing and Consuming Queue Messages
 
@@ -122,6 +134,20 @@ lock token) wrapped in an opaque `MessageReceipt`; `attempts` counts deliveries,
 1 means an earlier delivery was never acknowledged. A message left unsettled returns to the queue
 when its visibility timeout lapses. A push-only backend leaves `receive`/`ack`/`nack` at their
 `QueueError::Unsupported` defaults rather than returning a silent empty batch.
+
+#### Message Bodies That Are Not Text
+
+A `Queue` body is `Vec<u8>`, but some transports carry only text and offer no property channel to
+tag an encoding with — Azure Storage queues hold a message as character data inside an XML
+document. `skyzen_services::queue::envelope` owns the in-band format that solves it: XML-safe text
+travels verbatim (so `send_json` output arrives as readable JSON for any other consumer), anything
+else travels behind `skyzen-b64:`, and text that would itself look like an envelope travels behind
+`skyzen-utf8:`. The mapping is injective, so `receive` returns exactly the bytes `send` was given.
+
+It lives in `skyzen-services` because two independent parties speak it and neither may depend on
+the other: `AzureStorageQueue` writes it, and the framework's Azure Functions integration reverses
+it for a message the *host* delivered. `SqsQueue` solves the same problem differently, with a
+`skyzen-content-encoding` message attribute, because SQS has a property channel to put it in.
 
 ### Consuming a Queue Natively
 
@@ -214,7 +240,7 @@ use skyzen_services::{Kv, Storage};
 async fn main() -> Router {
     // Create concrete backends
     let redis = Redis::connect("redis://127.0.0.1:6379").await.unwrap();
-    let s3 = S3Storage::from_env("my-bucket");
+    let s3 = S3Storage::from_env("my-bucket").await;
 
     // Wrap in type-erased service wrappers
     let kv = Kv::new(redis);
@@ -270,6 +296,28 @@ binding = "DB"
 
 `#[skyzen::main]` reads these declarations and injects the portable wrappers automatically. Provider SDK types stay in generated wiring; handlers keep using `Kv`, `Storage`, and `Db`.
 
+### One Extractor Per Declared Instance
+
+Every entry also generates a newtype named after it: `[[service]] name = "cache"` generates
+`pub struct Cache(Kv)` with `Deref<Target = Kv>`, and `[[database]] name = "journal"` generates
+`JournalDb`. Two KV namespaces in one Worker are therefore ordinary — each handler names the one it
+means:
+
+```rust
+async fn handler(cache: Cache, sessions: Sessions, journal: JournalDb) -> Result<&'static str> {
+    cache.put("greeting", b"hello").await?;      // Deref reaches every `Kv` method
+    sessions.put_if_absent("sid", b"{}").await?;
+    journal.query("INSERT INTO audit (event) VALUES (?)").bind("greeted").execute().await?;
+    Ok("ok")
+}
+```
+
+A **bare** `Kv` / `Storage` / `Queue` is injected only when the manifest declares exactly one
+service of that type, because request extensions are keyed by type and a bare wrapper can only name
+one instance. With two KV entries, a handler asking for a bare `Kv` gets `KvNotConfigured` (HTTP
+500) rather than one of the two chosen arbitrarily. `Db` follows the same rule, except that
+`[[database]]` picks its bare instance explicitly with `default = true`.
+
 ## Platform Switching
 
 The same handler code runs against the same wrapper types. Only the wiring changes:
@@ -278,7 +326,7 @@ The same handler code runs against the same wrapper types. Only the wiring chang
 
 ```rust
 let kv = Kv::new(Redis::connect("redis://localhost:6379").await?);
-let storage = Storage::new(S3Storage::from_env("my-bucket"));
+let storage = Storage::new(S3Storage::from_env("my-bucket").await);
 ```
 
 ### Cloudflare Workers (KV + R2)
@@ -299,21 +347,45 @@ let storage = Storage::new(InMemoryStorage::new());
 
 Notice the handler function (`upload`) never changes. Only the one-line construction of each backend differs.
 
-Provider crates for AWS and Azure are still available, but they are infrastructure-layer backends today. Runtime parity for those targets is not yet part of the portable core.
+### AWS and Azure
+
+```rust
+// AWS
+let kv = Kv::new(DynamoKv::from_env("sessions").await);
+let queue = Queue::new(SqsQueue::from_env("jobs").await?);
+let db = Db::new(RdsDataDb::from_env().await?);
+
+// Azure
+let kv = Kv::new(CosmosKv::from_env("appdb", "sessions").await?);
+let storage = Storage::new(AzureBlob::from_env("uploads")?);
+let queue = Queue::new(AzureStorageQueue::from_sas_url(&sas_url)?);
+```
+
+These are plain HTTP clients, so they are reachable from every runtime — a native server, a Lambda,
+an Azure Functions custom handler. The application code above them is the same in all three.
 
 ## Platform Implementations
 
 | Service | Native | Cloudflare | AWS | Azure | Test |
 |---------|--------|------------|-----|-------|------|
-| Key-Value | [`skyzen-redis`](../redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
-| Object Storage | [`skyzen-s3`](../s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
-| Message Queue | [`SqsQueue`](../aws/) | `CfQueue` | `SqsQueue` | `ServiceBusQueue` | `InMemoryQueue` |
-| Portable SQL | `Db` via sqlx | `Db` via D1 | planned wiring | planned wiring | — |
+| Key-Value | [`Redis`](../redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
+| Object Storage | [`S3Storage`](../s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
+| Message Queue | [`SqsQueue`](../aws/) | `CfQueue` | `SqsQueue` | `ServiceBusQueue`, `AzureStorageQueue` | `InMemoryQueue` |
+| Portable SQL | `Db` via sqlx (Postgres, MySQL, SQLite) | `CfD1` | `RdsDataDb` (Aurora Data API) | — | `InMemoryDb` |
+| SQL transactions | yes | no — `execute_batch` is D1's atomic unit | yes | — | yes |
 
 The **Native** column names what a native deployment can wire, not a separate implementation.
 Runtime and provider are independent axes, so a backend that is a plain HTTP client — `SqsQueue`,
-`DynamoKv`, `S3Storage` — is reachable from a native server too; `SqsQueue` appears twice for that
-reason, and `[native.service.*]` wiring with `backend = "sqs"` builds exactly it.
+`DynamoKv`, `S3Storage`, `AzureBlob`, `CosmosKv` — is reachable from a native server too;
+`SqsQueue` appears twice for that reason.
+
+What `[native.service.*]` / `[native.database.*]` wiring can build *for* you is narrower than what
+you can build by hand: `redis`, `s3`, `sqs` and `memory` for services, `postgres`, `mysql` and
+`sqlite` for databases. Everything else is one constructor call in `#[skyzen::main]`'s body.
+
+Azure has no portable `Db`: Cosmos DB is wired here as a key-value store, not as SQL. An
+application on Azure Functions reaches SQL through a native `[[database]]` — Azure Database for
+PostgreSQL or MySQL over sqlx.
 
 ## Service Futures Are `Send`, Including On WASM
 

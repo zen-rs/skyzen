@@ -16,8 +16,9 @@ The wasm-bindgen generator and the binaryen optimizer are linked into the binary
 `cargo install skyzen-cli` is the whole toolchain install — there is no `wasm-bindgen` or
 `wasm-opt` to install separately, and no version of either to keep in step by hand.
 
-AWS and Azure have service implementations (`skyzen-aws`, `skyzen-azure`) that a native binary can
-use, but no deployment adapter yet: `--provider` accepts `native` and `cloudflare`.
+`--provider` accepts `native`, `cloudflare`, `aws` and `azure`. AWS deploys through `cargo lambda`
+and Azure through the Functions Core Tools; both serve the same application binary, which decides
+what it is at startup from its environment.
 
 ## Installation
 
@@ -47,7 +48,7 @@ skyzen new .                                   # scaffold into the current direc
 
 | Template | What it demonstrates |
 |----------|----------------------|
-| `api` | A portable `[[service]]` KV wired for native *and* Cloudflare, with a handler that uses the generated extractor |
+| `api` | A portable `[[service]]` KV and a `[[database]]` wired for native *and* Cloudflare, a handler using both generated extractors, and a `migrations/` directory `skyzen migrate` can apply on the first run |
 | `minimal` | Two routes and nothing else |
 | `serverless-events` | A queue consumer and a cron trigger |
 | `durable-realtime` | A WebSocket-serving Durable Object |
@@ -100,12 +101,20 @@ skyzen dev -- --port 3000
 
 ### `skyzen migrate`
 
-Apply SQL migrations from `migrations/` to every declared D1 database:
+Apply the SQL migrations in `migrations/` to every declared database:
 
 ```sh
-skyzen migrate --local
+skyzen migrate                            # D1, via `wrangler d1 migrations apply`
+skyzen migrate --local                    # the emulator's database, for `skyzen dev`
 skyzen migrate --env staging
+skyzen migrate status                     # via `wrangler d1 migrations list`
+skyzen migrate --provider native          # through [native.database.<name>].url_env
+skyzen migrate status --provider native   # reads the `_skyzen_migrations` table
+skyzen migrate --dry-run                  # validate the directory; never connects
 ```
+
+`status` follows the same `--provider` as applying, so it always reports on the database
+`skyzen migrate` would write to. See the [Migrations Guide](../docs/migrations.md).
 
 ### `skyzen build`
 
@@ -156,7 +165,7 @@ skyzen completions zsh > "${fpath[1]}/_skyzen"
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--provider <name>` | `-p` | Target platform: `native`, `cloudflare` |
+| `--provider <name>` | `-p` | Target platform: `native`, `cloudflare`, `aws`, `azure` |
 | `--manifest <path>` | `-m` | Path to `Skyzen.toml` (default: `Skyzen.toml` in the current directory) |
 | `--env <name>` | `-e` | Select a `[cloudflare.env.<name>]` overlay and forward it to wrangler |
 | `--dry-run` | | Print what would happen instead of doing it |
@@ -172,6 +181,8 @@ Global flags are accepted before or after the subcommand.
 |----------|-------|----------|-----------------|
 | Native | `cargo run` with Skyzen watch/restart | — | none |
 | Cloudflare | wasm build + `wrangler dev --local`, rebuilt on change | `wrangler deploy` | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` |
+| AWS | — (run it as a server with `skyzen dev`) | `cargo lambda build` then `cargo lambda deploy`, with the flags derived from `[aws]` | none |
+| Azure | — (`func start` over a built bundle) | `func azure functionapp publish` | `.skyzen/gen/azure/{host.json, local.settings.json, <function>/function.json}` plus the staged binary |
 
 ## Skyzen.toml
 
