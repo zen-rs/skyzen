@@ -159,6 +159,32 @@ pub use router::{build, AllowedMethods, NotFound, RouteBuildError, Router};
 mod nest;
 pub use nest::{NestedPathError, NestedRouter};
 
+/// An endpoint that can say which routes it serves.
+///
+/// The built-in runtime is entitled to know this: a platform integration that has to mount a route
+/// of its own — the Azure Functions queue trigger, which arrives as a `POST` to the function's name
+/// — must be able to tell whether doing so would shadow one of the application's, and refusing to
+/// start beats discovering it from a request that went to the wrong place.
+///
+/// [`Router`] implements it, and so does every wrapper the framework puts around one, so an
+/// application built the ordinary way never implements it by hand.
+pub trait ServedRoutes {
+    /// Every `(method, path)` pair this endpoint answers, in `matchit` path syntax.
+    fn served_routes(&self) -> &[(MethodFilter, String)];
+}
+
+impl ServedRoutes for Router {
+    fn served_routes(&self) -> &[(MethodFilter, String)] {
+        self.routes()
+    }
+}
+
+impl<E: ServedRoutes> ServedRoutes for crate::middleware::Layered<E> {
+    fn served_routes(&self) -> &[(MethodFilter, String)] {
+        self.endpoint().served_routes()
+    }
+}
+
 /// Which requests an endpoint node answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MethodFilter {

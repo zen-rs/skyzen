@@ -3,6 +3,8 @@
 //! Each provider builds a [`ProviderPlan`]; `main` executes it. Adding a provider means adding a
 //! module and one arm here — nothing else in the CLI knows how many there are.
 
+pub mod aws;
+pub mod azure;
 pub mod cloudflare;
 mod native;
 
@@ -13,9 +15,9 @@ use crate::{
     project::{Project, WASM_TARGET},
 };
 use anyhow::{Context, Result};
-use cloudflare::build::BuildPlan;
 use skyzen_manifest::Manifest;
 use std::{
+    fmt::Debug,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -96,6 +98,25 @@ impl CommandPlan {
     }
 }
 
+/// The artifact build one provider performs before its commands run.
+///
+/// Each provider's build is a different pipeline — wasm-bindgen glue for Cloudflare, a Linux
+/// cross-compile staged into a bundle for Azure — and only the provider knows what its own
+/// pipeline is, so the plan carries one of these rather than one provider's build plan standing in
+/// for all of them. A provider whose build is just a command (AWS runs `cargo lambda build`) uses
+/// a [`CommandPlan`] instead, where `--dry-run` can print it verbatim.
+pub trait ArtifactBuild: Debug + Send {
+    /// A one-line description for progress output and `--dry-run`.
+    fn describe(&self) -> String;
+
+    /// Produce the artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the compiler, a tool it drives, or the filesystem does.
+    fn run(&self) -> Result<()>;
+}
+
 /// A file the CLI generates before running anything.
 #[derive(Debug, Clone)]
 pub struct GeneratedFile {
@@ -119,14 +140,14 @@ pub enum RunMode {
 }
 
 /// What one provider decided to do.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct ProviderPlan {
     /// External processes to run, in order.
     pub commands: Vec<CommandPlan>,
     /// Files to write first.
     pub generated_files: Vec<GeneratedFile>,
     /// The artifact build to perform, when the action needs artifacts.
-    pub build: Option<BuildPlan>,
+    pub build: Option<Box<dyn ArtifactBuild>>,
     /// How to supervise the commands.
     pub run_mode: RunMode,
     /// Environment to hand the supervised process, never applied to the CLI's own environment.
@@ -170,6 +191,8 @@ pub fn prepare(
         Provider::Cloudflare => {
             cloudflare::prepare(action, &manifest, &project, environment, dry_run)
         }
+        Provider::Aws => aws::prepare(action, &manifest, &project),
+        Provider::Azure => azure::prepare(action, &manifest, &project),
     }
 }
 
@@ -213,6 +236,20 @@ pub fn provision(
         Provider::Native => {
             anyhow::bail!("`skyzen provision` needs a cloud provider; pass --provider cloudflare")
         }
+        // Provisioning is Cloudflare-only because wrangler is the only one of the three CLIs that
+        // creates a resource *and* hands back an id the manifest has to record. `cargo lambda
+        // deploy` creates the function itself, and a Function App is created by `az functionapp
+        // create` before anything is published to it.
+        Provider::Aws => anyhow::bail!(
+            "`skyzen provision` has no AWS implementation: `skyzen deploy --provider aws` creates \
+             the function, and its queues and buckets are created by Terraform, CloudFormation or \
+             the AWS console"
+        ),
+        Provider::Azure => anyhow::bail!(
+            "`skyzen provision` has no Azure implementation: create the Function App with `az \
+             functionapp create` (stack: .NET / Custom Handler), then run `skyzen deploy \
+             --provider azure`"
+        ),
         Provider::Cloudflare => {
             let manifest = Manifest::load(manifest_path)?;
             let config = manifest
@@ -248,16 +285,23 @@ pub fn doctor(
     provider: Option<Provider>,
     environment: Option<&str>,
 ) -> Result<()> {
+    // Checking every provider by default would fail a Cloudflare project for not having the Azure
+    // tools installed, so an unqualified `skyzen doctor` checks the two that need no account.
     let providers =
         provider.map_or_else(|| vec![Provider::Native, Provider::Cloudflare], |p| vec![p]);
     let mut failures = 0_usize;
 
     for provider in &providers {
-        for binary in required_binaries(*provider) {
-            if binary_exists(binary) {
-                output::ok(format!("{}: found `{binary}`", provider.as_str()));
+        for tool in required_tools(*provider) {
+            if tool.is_present() {
+                output::ok(format!("{}: found `{}`", provider.as_str(), tool.label()));
             } else {
-                output::failed(format!("{}: `{binary}` not found", provider.as_str()));
+                output::failed(format!(
+                    "{}: `{}` not found; install it with {}",
+                    provider.as_str(),
+                    tool.label(),
+                    tool.remedy
+                ));
                 failures += 1;
             }
         }
@@ -266,6 +310,10 @@ pub fn doctor(
     if providers.contains(&Provider::Cloudflare) {
         failures += check_wasm_target();
         failures += check_wrangler_auth();
+    }
+
+    if providers.contains(&Provider::Azure) {
+        failures += azure::check_linux_target(manifest_path);
     }
 
     failures += check_manifest(manifest_path, &providers, environment);
@@ -277,10 +325,76 @@ pub fn doctor(
     }
 }
 
-const fn required_binaries(provider: Provider) -> &'static [&'static str] {
+/// An external tool a provider's pipeline shells out to.
+///
+/// A cargo subcommand cannot be probed by running its own binary — `cargo lambda` is `cargo` with
+/// an argument — so a check is a program *and* the arguments that make it answer.
+#[derive(Debug, Clone, Copy)]
+pub struct Tool {
+    /// The program to run.
+    program: &'static str,
+    /// The arguments that make it print its version and exit zero.
+    args: &'static [&'static str],
+    /// How to install it, named in the failure so a first run is not a search.
+    remedy: &'static str,
+}
+
+impl Tool {
+    /// How the tool is spelled in a report.
+    fn label(self) -> String {
+        if self.args.len() > 1 {
+            format!("{} {}", self.program, self.args[0])
+        } else {
+            self.program.to_owned()
+        }
+    }
+
+    /// Whether the tool is installed and runnable.
+    fn is_present(self) -> bool {
+        Command::new(self.program)
+            .args(self.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+/// The tool `cargo` itself is, which every provider needs.
+const CARGO: Tool = Tool {
+    program: "cargo",
+    args: &["--version"],
+    remedy: "https://rustup.rs",
+};
+
+const fn required_tools(provider: Provider) -> &'static [Tool] {
     match provider {
-        Provider::Native => &["cargo"],
-        Provider::Cloudflare => &["cargo", "wrangler"],
+        Provider::Native => &[CARGO],
+        Provider::Cloudflare => &[
+            CARGO,
+            Tool {
+                program: "wrangler",
+                args: &["--version"],
+                remedy: "`npm install -g wrangler`",
+            },
+        ],
+        Provider::Aws => &[
+            CARGO,
+            Tool {
+                program: "cargo",
+                args: &["lambda", "--version"],
+                remedy: "`cargo install cargo-lambda` (or `brew install cargo-lambda`)",
+            },
+        ],
+        Provider::Azure => &[
+            CARGO,
+            Tool {
+                program: "func",
+                args: &["--version"],
+                remedy: "`npm install -g azure-functions-core-tools@4 --unsafe-perm true`",
+            },
+        ],
     }
 }
 
@@ -353,6 +467,15 @@ fn check_manifest(
             "no {} to check; services can be wired in Rust instead",
             manifest_path.display()
         ));
+        // Every other provider can deploy from defaults; Azure cannot, because nothing can infer
+        // which Function App to publish to. Reported here so a missing file and a missing section
+        // fail the same way rather than one of them passing.
+        if providers.contains(&Provider::Azure) {
+            output::failed(
+                "azure: there is no Skyzen.toml, so nothing names the Function App to publish to",
+            );
+            return 1;
+        }
         return 0;
     }
 
@@ -370,6 +493,12 @@ fn check_manifest(
     let mut failures = 0;
     if providers.contains(&Provider::Cloudflare) {
         failures += check_cloudflare_manifest(&manifest, environment);
+    }
+    if providers.contains(&Provider::Aws) {
+        failures += aws::check_manifest(&manifest);
+    }
+    if providers.contains(&Provider::Azure) {
+        failures += azure::check_manifest(&manifest);
     }
     failures
 }
@@ -416,16 +545,6 @@ fn check_cloudflare_manifest(manifest: &Manifest, environment: Option<&str>) -> 
     }
 
     failures
-}
-
-fn binary_exists(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 /// Load the project's `.env` files and check every variable the manifest declares is available.

@@ -43,12 +43,14 @@ mod schema;
 
 pub use merge::deep_merge;
 pub use schema::{
-    CfAssets, CfAssetsNotFoundHandling, CfD1Database, CfDurableBinding, CfDurableMigration,
-    CfDurableObjects, CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer,
-    CfQueueProducer, CfQueues, CfR2Bucket, CfSecretsStoreSecret, CfServiceBinding, CfTriggers,
-    CloudflareDatabaseSection, CloudflareSection, CloudflareServiceSection, DatabaseEntry,
-    DatabaseType, NativeDatabaseBackend, NativeDatabaseSection, NativeQueueConsumer, NativeSection,
-    NativeServiceBackend, NativeServiceSection, ServiceEntry, ServiceType, SkyzenManifest,
+    AwsSection, AzureHttpMode, AzureQueueTrigger, AzureSection, CfAssets, CfAssetsNotFoundHandling,
+    CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableObjects, CfDurableRenamedClass,
+    CfHandlers, CfKvNamespace, CfQueueConsumer, CfQueueProducer, CfQueues, CfR2Bucket,
+    CfSecretsStoreSecret, CfServiceBinding, CfTriggers, CloudflareDatabaseSection,
+    CloudflareSection, CloudflareServiceSection, DatabaseEntry, DatabaseType, LambdaArchitecture,
+    NativeDatabaseBackend, NativeDatabaseSection, NativeQueueConsumer, NativeSection,
+    NativeServiceBackend, NativeServiceSection, QueueTriggerError, ServiceEntry, ServiceType,
+    SkyzenManifest, HTTP_FUNCTION_NAME,
 };
 
 use std::{
@@ -96,6 +98,14 @@ pub enum ManifestError {
         path: PathBuf,
         /// The offending key, always `env`.
         key: &'static str,
+    },
+    /// An `[[azure.queue_triggers]]` entry names a function that cannot be used.
+    #[error("{path}: [[azure.queue_triggers]] {source}")]
+    QueueTrigger {
+        /// The manifest path.
+        path: PathBuf,
+        /// What is wrong with the entry.
+        source: schema::QueueTriggerError,
     },
     /// A named environment was requested that the manifest does not declare.
     #[error(
@@ -193,6 +203,18 @@ impl Manifest {
                     section: "the manifest".to_owned(),
                     source: Box::new(source),
                 })?;
+
+        // Checked here rather than by each consumer: a Functions name is a directory the CLI
+        // writes into and a URL path the runtime mounts, so a malformed one has to be caught once,
+        // before either of them acts on it.
+        if let Some(azure) = &data.azure {
+            azure
+                .validate_queue_triggers()
+                .map_err(|source| ManifestError::QueueTrigger {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
 
         let base_cloudflare = document
             .get("cloudflare")
@@ -397,6 +419,138 @@ mod tests {
             error.to_string().contains("concurrency"),
             "error should name the rejected key: {error}"
         );
+    }
+
+    #[test]
+    fn the_aws_section_defaults_to_arm64_with_a_function_url() {
+        let manifest = parse("[aws]\nfunction_name = \"api\"\n").expect("manifest parses");
+
+        let aws = manifest.data().aws.as_ref().expect("aws section");
+        assert_eq!(aws.function_name.as_deref(), Some("api"));
+        assert_eq!(aws.architecture, super::LambdaArchitecture::Arm64);
+        assert_eq!(
+            aws.architecture.target_triple(),
+            "aarch64-unknown-linux-gnu"
+        );
+        assert!(aws.url, "an HTTP application is unreachable without one");
+        assert_eq!(aws.memory_mb, None);
+        assert_eq!(aws.timeout, None);
+        assert!(aws.env.is_empty());
+    }
+
+    #[test]
+    fn the_aws_section_parses_its_sizing_and_environment() {
+        let manifest = parse(
+            "[aws]\nmemory_mb = 512\ntimeout = \"30s\"\narchitecture = \"x86_64\"\nurl = false\n\n\
+             [aws.env]\nRUST_LOG = \"info\"\n",
+        )
+        .expect("manifest parses");
+
+        let aws = manifest.data().aws.as_ref().expect("aws section");
+        assert_eq!(aws.memory_mb.map(std::num::NonZeroU32::get), Some(512));
+        assert_eq!(aws.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(aws.architecture.target_triple(), "x86_64-unknown-linux-gnu");
+        assert!(!aws.url);
+        assert_eq!(aws.env["RUST_LOG"], "info");
+    }
+
+    #[test]
+    fn rejects_a_zero_lambda_memory_size_and_an_unknown_architecture() {
+        let zero = parse("[aws]\nmemory_mb = 0\n").expect_err("zero memory");
+        assert!(zero.to_string().contains("memory_mb"), "{zero}");
+
+        let architecture =
+            parse("[aws]\narchitecture = \"riscv\"\n").expect_err("unknown architecture");
+        assert!(architecture.to_string().contains("riscv"), "{architecture}");
+    }
+
+    #[test]
+    fn the_azure_section_parses_its_queue_triggers() {
+        let manifest = parse(
+            "[azure]\napp_name = \"skyzen-demo\"\ntarget = \"x86_64-unknown-linux-musl\"\n\
+             http_mode = \"proxy\"\n\n\
+             [[azure.queue_triggers]]\nfunction = \"process\"\nqueue = \"jobs\"\n\
+             connection_env = \"AzureWebJobsStorage\"\n",
+        )
+        .expect("manifest parses");
+
+        let azure = manifest.data().azure.as_ref().expect("azure section");
+        assert_eq!(azure.app_name.as_deref(), Some("skyzen-demo"));
+        assert_eq!(azure.target.as_deref(), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(azure.http_mode.host_json_key(), "enableProxyingHttpRequest");
+        assert_eq!(azure.queue_triggers[0].function, "process");
+        assert_eq!(azure.queue_triggers[0].queue, "jobs");
+        assert_eq!(
+            azure.queue_triggers[0].connection_env,
+            "AzureWebJobsStorage"
+        );
+    }
+
+    #[test]
+    fn the_azure_section_forwards_http_by_default() {
+        let manifest = parse("[azure]\n").expect("manifest parses");
+
+        let azure = manifest.data().azure.as_ref().expect("azure section");
+        assert_eq!(
+            azure.http_mode.host_json_key(),
+            "enableForwardingHttpRequest"
+        );
+        assert!(azure.queue_triggers.is_empty());
+    }
+
+    fn trigger(function: &str) -> Result<Manifest, ManifestError> {
+        parse(&format!(
+            "[[azure.queue_triggers]]\nfunction = \"{function}\"\nqueue = \"jobs\"\n\
+             connection_env = \"AzureWebJobsStorage\"\n"
+        ))
+    }
+
+    #[test]
+    fn a_queue_trigger_cannot_take_the_catch_all_http_functions_name() {
+        // It would replace the one function that serves every route, and the deployment would come
+        // up answering nothing.
+        for name in ["http", "HTTP", "Http"] {
+            let error = trigger(name).expect_err("the name is reserved");
+            assert!(error.to_string().contains("catch-all"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_queue_trigger_name_that_is_a_path_is_refused() {
+        // `function` becomes a directory the CLI writes into, so a traversal must never reach it.
+        for name in ["../escape", "a/b", "", "9lives", "with space"] {
+            let error = trigger(name).expect_err("not a Functions name");
+            assert!(
+                error.to_string().contains("valid Functions name"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_queue_trigger_name_is_accepted() {
+        for name in ["process", "process-jobs", "process_jobs", "p9"] {
+            trigger(name).unwrap_or_else(|error| panic!("{name} should parse: {error}"));
+        }
+    }
+
+    #[test]
+    fn two_queue_triggers_cannot_share_a_name() {
+        let error = parse(
+            "[[azure.queue_triggers]]\nfunction = \"process\"\nqueue = \"a\"\n\
+             connection_env = \"AzureWebJobsStorage\"\n\n\
+             [[azure.queue_triggers]]\nfunction = \"Process\"\nqueue = \"b\"\n\
+             connection_env = \"AzureWebJobsStorage\"\n",
+        )
+        .expect_err("one name, one directory, one URL path");
+        assert!(error.to_string().contains("twice"), "{error}");
+    }
+
+    #[test]
+    fn a_queue_trigger_must_name_its_connection_setting() {
+        let error = parse("[[azure.queue_triggers]]\nfunction = \"process\"\nqueue = \"jobs\"\n")
+            .expect_err("no connection_env");
+        assert!(error.to_string().contains("connection_env"), "{error}");
     }
 
     #[test]

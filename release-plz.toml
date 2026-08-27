@@ -20,6 +20,10 @@ name = "skyzen-hyper"
 git_tag_name = "hyper-v{{ version }}"
 
 [[package]]
+name = "skyzen-lambda"
+git_tag_name = "lambda-v{{ version }}"
+
+[[package]]
 name = "skyzen-macros"
 git_tag_name = "macros-v{{ version }}"
 

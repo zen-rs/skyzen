@@ -3,8 +3,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use skyzen_manifest::{
-    DatabaseEntry, DatabaseType, Manifest, NativeDatabaseBackend, NativeQueueConsumer,
-    NativeServiceBackend, ServiceEntry, ServiceType, SkyzenManifest,
+    AzureQueueTrigger, DatabaseEntry, DatabaseType, Manifest, NativeDatabaseBackend,
+    NativeQueueConsumer, NativeServiceBackend, ServiceEntry, ServiceType, SkyzenManifest,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -52,6 +52,10 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(error) => return error.to_compile_error().into(),
     };
     let PortableWiring { steps, consumers } = wiring;
+    let azure_queue_triggers = match azure_queue_trigger_tokens() {
+        Ok(triggers) => triggers,
+        Err(error) => return error.to_compile_error().into(),
+    };
     // Natively the factory yields the endpoint *and* the queue consumers, both built from the one
     // set of service instances; on wasm the platform owns event delivery, so it yields only the
     // endpoint and this whole arm is stripped.
@@ -100,10 +104,11 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(clippy::redundant_clone)]
         fn main() {
             #init_logging
-            let __skyzen_listen_addr =
-                ::skyzen::runtime::native::apply_cli_overrides(::std::env::args());
             ::skyzen::runtime::native::launch(
-                __skyzen_listen_addr,
+                ::skyzen::runtime::native::LaunchOptions {
+                    listen: ::skyzen::runtime::native::apply_cli_overrides(::std::env::args()),
+                    azure_queue_triggers: #azure_queue_triggers,
+                },
                 || #native_factory,
                 #shutdown_hook,
             );
@@ -2491,6 +2496,40 @@ fn load_manifest_document() -> syn::Result<Option<Manifest>> {
 }
 
 /// The `[[native.queue_consumer]]` entries the manifest declares.
+/// The `[[azure.queue_triggers]]` entries, as the runtime's own static table.
+///
+/// Read at compile time for the usual reason: the set of function names this binary answers is
+/// fixed by the manifest, so the runtime should not have to re-read a file to learn it. The names
+/// themselves were validated when the manifest was parsed, which is what turns a malformed or
+/// reserved one into a compile error rather than a bad bundle.
+fn azure_queue_trigger_tokens() -> syn::Result<proc_macro2::TokenStream> {
+    Ok(load_manifest()?.map_or_else(
+        || quote! { &[] },
+        |manifest| azure_trigger_table(azure_queue_triggers(&manifest)),
+    ))
+}
+
+/// Render the trigger table the runtime is launched with.
+fn azure_trigger_table(triggers: &[AzureQueueTrigger]) -> proc_macro2::TokenStream {
+    let entries = triggers.iter().map(|trigger| {
+        let function = &trigger.function;
+        let queue = &trigger.queue;
+        quote! {
+            ::skyzen::runtime::azure::QueueTrigger { function: #function, queue: #queue }
+        }
+    });
+
+    quote! { &[#(#entries),*] }
+}
+
+/// The `[[azure.queue_triggers]]` entries this manifest declares.
+fn azure_queue_triggers(manifest: &SkyzenManifest) -> &[AzureQueueTrigger] {
+    manifest
+        .azure
+        .as_ref()
+        .map_or(&[], |azure| azure.queue_triggers.as_slice())
+}
+
 fn native_queue_consumers(manifest: &SkyzenManifest) -> &[NativeQueueConsumer] {
     manifest
         .native
@@ -2504,7 +2543,9 @@ fn native_queue_consumers(manifest: &SkyzenManifest) -> &[NativeQueueConsumer] {
 /// environment is consulted rather than only the base document — otherwise a Worker that consumes
 /// `jobs` in staging only would be told its handler is unreachable.
 fn queue_handler_is_consumed(manifest: &Manifest) -> bool {
-    if !native_queue_consumers(manifest.data()).is_empty() {
+    if !native_queue_consumers(manifest.data()).is_empty()
+        || !azure_queue_triggers(manifest.data()).is_empty()
+    {
         return true;
     }
 
@@ -3861,6 +3902,39 @@ type = "queue"
             .expect("no consumers is not an error")
             .to_string();
         assert_eq!(tokens, "()");
+    }
+
+    #[test]
+    fn azure_queue_triggers_become_the_runtimes_static_table() {
+        use super::{azure_queue_triggers, azure_trigger_table};
+
+        let declared = manifest(
+            r#"[[azure.queue_triggers]]
+function = "process"
+queue = "jobs"
+connection_env = "AzureWebJobsStorage"
+
+[[azure.queue_triggers]]
+function = "reindex"
+queue = "search"
+connection_env = "SEARCH_STORAGE"
+"#,
+        );
+
+        let tokens = azure_trigger_table(azure_queue_triggers(&declared)).to_string();
+        // The connection is the CLI's business — it goes in `function.json`, not into the binary.
+        assert!(tokens.contains("function : \"process\""), "{tokens}");
+        assert!(tokens.contains("queue : \"jobs\""), "{tokens}");
+        assert!(tokens.contains("function : \"reindex\""), "{tokens}");
+        assert!(!tokens.contains("AzureWebJobsStorage"), "{tokens}");
+    }
+
+    #[test]
+    fn an_application_with_no_azure_triggers_launches_with_an_empty_table() {
+        use super::{azure_queue_triggers, azure_trigger_table};
+
+        let tokens = azure_trigger_table(azure_queue_triggers(&manifest(""))).to_string();
+        assert_eq!(tokens, "& []");
     }
 
     #[test]

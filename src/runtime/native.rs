@@ -9,7 +9,9 @@ use std::{
 
 use crate::{
     extract::PeerAddr,
+    routing::ServedRoutes,
     runtime::{
+        azure,
         consumer::{ConsumerFatal, ConsumerSet},
         context::ShutdownGuard,
         WorkerContext,
@@ -231,13 +233,26 @@ pub fn init_logging() {
     });
 }
 
+/// A listener address a command-line flag asked for.
+///
+/// Which flag it came from matters: a serverless host that dictates the port (Azure Functions
+/// does) outranks the defaults and outranks `--host`/`--port`, which only adjust them — but not an
+/// explicit `--listen`, where the operator named the whole socket and meant it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenOverride {
+    /// The address to bind.
+    pub addr: SocketAddr,
+    /// Whether `--listen`/`--addr` named this socket outright.
+    pub explicit: bool,
+}
+
 /// Parse CLI overrides such as `--addr`/`--port` and return the resulting listen address.
 ///
 /// Returns `None` when no valid override was supplied; the caller then falls back to the
 /// `SKYZEN_ADDRESS` environment variable or the built-in default (see [`server_addr`]). Invalid
 /// values are logged and ignored rather than mutating any global state.
 #[must_use]
-pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<SocketAddr> {
+pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<ListenOverride> {
     let mut args = args.into_iter();
     let _ = args.next(); // binary name
     let mut listen = None;
@@ -279,7 +294,10 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<Soc
         return match addr.parse::<SocketAddr>() {
             Ok(socket) => {
                 info!("Configured listener address via CLI: {socket}");
-                Some(socket)
+                Some(ListenOverride {
+                    addr: socket,
+                    explicit: true,
+                })
             }
             Err(error) => {
                 warn!("Ignoring invalid --listen address `{addr}`: {error}");
@@ -313,7 +331,10 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<Soc
     }
 
     info!("Configured listener address via CLI: {candidate}");
-    Some(candidate)
+    Some(ListenOverride {
+        addr: candidate,
+        explicit: false,
+    })
 }
 
 fn shutdown_signal() -> Receiver<()> {
@@ -348,6 +369,8 @@ enum RuntimeFailure {
     Listener(std::io::Error),
     /// A declared queue consumer cannot run at all against the backend it was pointed at.
     QueueConsumer(ConsumerFatal),
+    /// The Azure Functions triggers cannot be mounted over this application.
+    Mount(azure::MountError),
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -363,6 +386,7 @@ impl std::fmt::Display for RuntimeFailure {
             Self::QueueConsumer(ConsumerFatal { queue, reason }) => {
                 write!(f, "the queue consumer for `{queue}` cannot run: {reason}")
             }
+            Self::Mount(error) => write!(f, "{error}"),
         }
     }
 }
@@ -371,10 +395,105 @@ impl std::error::Error for RuntimeFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Listener(error) => Some(error),
+            Self::Mount(error) => Some(error),
             Self::QueueConsumer(_) => None,
         }
     }
 }
+
+/// Everything `#[skyzen::main]` settles before the runtime starts.
+///
+/// A struct rather than a widening argument list: what the runtime needs to know grows with every
+/// platform it learns to serve, and each of those is a compile-time fact read out of `Skyzen.toml`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchOptions {
+    /// The address a command-line flag asked for, if any.
+    pub listen: Option<ListenOverride>,
+    /// The `[[azure.queue_triggers]]` entries this application declares.
+    ///
+    /// Empty for everything that is not an Azure Functions app, which is the only case where they
+    /// mean anything.
+    pub azure_queue_triggers: &'static [azure::QueueTrigger],
+}
+
+/// Where this process is running, as told by the environment its host set up.
+///
+/// Detected rather than declared: the same binary is a server, a Lambda function and a Functions
+/// custom handler, and nothing in the source says which — so the runtime asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    /// An ordinary server, binding a listener of its own.
+    Server,
+    /// AWS Lambda, which hands out invocations over the runtime API.
+    Lambda,
+    /// The Azure Functions host, which expects a web server on the port it chose.
+    AzureFunctions {
+        /// The port the host is waiting on.
+        port: u16,
+    },
+}
+
+/// Set by the AWS Lambda execution environment, and by nothing else.
+const LAMBDA_RUNTIME_API_ENV: &str = "AWS_LAMBDA_RUNTIME_API";
+
+impl Platform {
+    /// Read the environment to see what is hosting this process.
+    ///
+    /// A malformed `FUNCTIONS_CUSTOMHANDLER_PORT` is not a reason to fall back to a port of our
+    /// own choosing: the host would then wait forever on the port it picked, so the value is
+    /// reported and the process refuses to pretend.
+    fn detect() -> Result<Self, StartupError> {
+        if std::env::var_os(LAMBDA_RUNTIME_API_ENV).is_some() {
+            return Ok(Self::Lambda);
+        }
+
+        std::env::var(azure::CUSTOM_HANDLER_PORT_ENV).map_or(Ok(Self::Server), |port| {
+            port.trim()
+                .parse::<u16>()
+                .map(|port| Self::AzureFunctions { port })
+                .map_err(|_| StartupError::CustomHandlerPort { value: port })
+        })
+    }
+}
+
+/// A reason the runtime refused to start at all.
+#[derive(Debug)]
+enum StartupError {
+    /// The process is inside Lambda but was not built with the adapter that speaks to it.
+    #[cfg(not(feature = "lambda"))]
+    LambdaFeatureMissing,
+    /// The Functions host named a port that is not a port.
+    CustomHandlerPort {
+        /// What it said instead.
+        value: String,
+    },
+    /// The Lambda adapter stopped.
+    #[cfg(feature = "lambda")]
+    Lambda(String),
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(not(feature = "lambda"))]
+            Self::LambdaFeatureMissing => write!(
+                f,
+                "this process is running inside AWS Lambda ({LAMBDA_RUNTIME_API_ENV} is set), but \
+                 it was built without Skyzen's Lambda adapter. Add `features = [\"lambda\"]` to \
+                 the skyzen dependency and redeploy"
+            ),
+            Self::CustomHandlerPort { value } => write!(
+                f,
+                "the Azure Functions host set {} to {value:?}, which is not a port number",
+                azure::CUSTOM_HANDLER_PORT_ENV
+            ),
+            #[cfg(feature = "lambda")]
+            Self::Lambda(error) => write!(f, "the AWS Lambda runtime stopped: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StartupError {}
 
 /// Build the executor, serve the provided endpoint over Hyper, and run the declared queue
 /// consumers beside it.
@@ -382,6 +501,25 @@ impl std::error::Error for RuntimeFailure {
 /// `factory` produces the endpoint together with its [`ConsumerSet`] — `()` for an application
 /// that declares no `[[native.queue_consumer]]` — so both are built from the same service
 /// instances rather than from two independent connections to one backend.
+///
+/// # Where this ends up running
+///
+/// The environment decides, because the same binary serves all three:
+///
+/// - **AWS Lambda** (`AWS_LAMBDA_RUNTIME_API` is set) hands over to `skyzen-lambda` before any
+///   listener is bound. Without the `lambda` feature the process refuses to start rather than
+///   binding a TCP port nothing inside Lambda can reach.
+/// - **Azure Functions** (`FUNCTIONS_CUSTOMHANDLER_PORT` is set) binds the port the host chose and
+///   mounts the declared queue triggers ahead of the application's routes.
+/// - Anything else binds the address the flags, `SKYZEN_ADDRESS` or the default asked for.
+///
+/// Under either serverless host the declared `[[native.queue_consumer]]` polling loops do *not*
+/// run: the platform owns delivery there, and a loop polling a queue inside a function that scales
+/// to zero would take messages nothing is waiting to process.
+///
+/// `on_shutdown` does not run on the Lambda path either. Lambda freezes and later discards an
+/// execution environment without telling the process, so there is no moment at which a cleanup
+/// hook could be called and be believed.
 ///
 /// After `Ctrl+C` the listener stops accepting and the consumers stop initiating receives;
 /// outstanding connections and in-flight batches are awaited for up to
@@ -396,16 +534,34 @@ impl std::error::Error for RuntimeFailure {
 ///
 /// Panics if the global executor fails to initialize.
 pub fn launch<Fut, E, C, Hook, HookFut>(
-    addr: Option<SocketAddr>,
+    options: LaunchOptions,
     factory: impl FnOnce() -> Fut,
     on_shutdown: Hook,
 ) where
     Fut: Future<Output = (E, C)> + Send + 'static,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
     C: ConsumerSet,
     Hook: FnOnce() -> HookFut,
     HookFut: Future<Output = ()>,
 {
+    let platform = match Platform::detect() {
+        Ok(platform) => platform,
+        Err(error) => {
+            error!("Skyzen cannot start: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    if platform == Platform::Lambda {
+        // Lambda's runtime is Tokio's and the adapter owns it, so this path never touches the
+        // executor, the listener or the shutdown drain below.
+        // `run_on_lambda` never returns `Ok`: it either hands over for the life of the process
+        // or explains why it could not.
+        let Err(error) = run_on_lambda(options, factory);
+        error!("Skyzen cannot start: {error}");
+        std::process::exit(1);
+    }
+
     let executor = SmolGlobal;
     if try_init_global_executor(executor).is_err() {
         debug!("Global executor already initialized; reusing existing instance");
@@ -415,8 +571,18 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
         tracing::info!("Skyzen application starting up");
 
         let (endpoint, consumers) = factory().await;
-        let addr = addr.unwrap_or_else(server_addr);
-        let outcome = run_server(executor, endpoint, consumers, addr).await;
+        let outcome = match platform {
+            Platform::Lambda => unreachable!("handed over before the executor was built"),
+            Platform::Server => {
+                let addr = options
+                    .listen
+                    .map_or_else(server_addr, |listen| listen.addr);
+                run_server(executor, endpoint, consumers, addr).await
+            }
+            Platform::AzureFunctions { port } => {
+                serve_functions_host(executor, endpoint, consumers, &options, port).await
+            }
+        };
         let failed = match outcome {
             Ok(Shutdown { severed: 0 }) => {
                 info!("Skyzen server shut down gracefully");
@@ -631,6 +797,118 @@ where
     })
 }
 
+/// Hand this process over to the AWS Lambda adapter.
+///
+/// Without the `lambda` feature there is nothing to hand over to, and the honest answer is to
+/// refuse: a Skyzen server that binds a socket inside Lambda is a function that times out on every
+/// invocation with nothing in its logs to explain why.
+#[cfg(feature = "lambda")]
+fn run_on_lambda<Fut, E, C>(
+    _options: LaunchOptions,
+    factory: impl FnOnce() -> Fut,
+) -> Result<core::convert::Infallible, StartupError>
+where
+    Fut: Future<Output = (E, C)> + Send + 'static,
+    E: Endpoint + Clone + Send + Sync + 'static,
+    C: ConsumerSet,
+{
+    skyzen_lambda::run(|| async move {
+        let (endpoint, consumers) = factory().await;
+        (endpoint, LambdaConsumers(consumers))
+    })
+    .map_err(|error| StartupError::Lambda(error.to_string()))?;
+
+    // `skyzen_lambda::run` returns only when the runtime API stops answering, which is the
+    // environment shutting down under us rather than an orderly exit.
+    Err(StartupError::Lambda(
+        "the Lambda runtime API stopped answering".to_owned(),
+    ))
+}
+
+#[cfg(not(feature = "lambda"))]
+#[allow(clippy::needless_pass_by_value)]
+fn run_on_lambda<Fut, E, C>(
+    _options: LaunchOptions,
+    _factory: impl FnOnce() -> Fut,
+) -> Result<core::convert::Infallible, StartupError>
+where
+    Fut: Future<Output = (E, C)> + Send + 'static,
+    E: Endpoint + Clone + Send + Sync + 'static,
+    C: ConsumerSet,
+{
+    Err(StartupError::LambdaFeatureMissing)
+}
+
+/// The application's consumer set, seen through the Lambda adapter's own trait.
+///
+/// A local newtype because both the trait and `ConsumerSet`'s implementors would otherwise be
+/// foreign to one another; it carries nothing of its own.
+#[cfg(feature = "lambda")]
+struct LambdaConsumers<C>(C);
+
+#[cfg(feature = "lambda")]
+impl<C: ConsumerSet> skyzen_lambda::QueueDispatch for LambdaConsumers<C> {
+    const DECLARED: bool = C::DECLARES_HANDLER;
+
+    fn dispatch(
+        &self,
+        batch: skyzen_services::queue::QueueBatch<Vec<u8>>,
+    ) -> impl Future<
+        Output = Result<skyzen_services::queue::QueueBatchDisposition, skyzen_services::BoxError>,
+    > + Send {
+        self.0.dispatch(batch)
+    }
+}
+
+/// Serve the Azure Functions host on the port it chose, with the queue triggers mounted.
+///
+/// The host is the only caller, and it is waiting on a port it picked, so that port wins over the
+/// default and over `--host`/`--port`. An explicit `--listen` still wins over the host — that is
+/// someone running the binary by hand, and silently ignoring what they typed would be worse than
+/// serving somewhere the host is not listening.
+async fn serve_functions_host<Exec, E, C>(
+    executor: Exec,
+    endpoint: E,
+    consumers: C,
+    options: &LaunchOptions,
+    port: u16,
+) -> Result<Shutdown, RuntimeFailure>
+where
+    Exec: CoreExecutor + 'static,
+    E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
+    C: ConsumerSet,
+{
+    let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let addr = match options.listen {
+        Some(ListenOverride {
+            addr,
+            explicit: true,
+        }) if addr != host_addr => {
+            warn!(
+                requested = %addr,
+                functions_host = %host_addr,
+                "--listen overrides the port the Azure Functions host is waiting on; the host \
+                 will not reach this process"
+            );
+            addr
+        }
+        _ => host_addr,
+    };
+
+    info!(
+        port,
+        triggers = options.azure_queue_triggers.len(),
+        "Serving the Azure Functions host as a custom handler"
+    );
+
+    let endpoint = azure::mount(endpoint, consumers, options.azure_queue_triggers)
+        .map_err(RuntimeFailure::Mount)?;
+
+    // The consumer set moved into the mounted endpoint: under the Functions host the platform
+    // pushes every message, so nothing here polls.
+    run_server(executor, endpoint, (), addr).await
+}
+
 fn server_addr() -> SocketAddr {
     std::env::var("SKYZEN_ADDRESS").map_or_else(
         |_| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -787,7 +1065,11 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_cli_overrides, drain_connections, server_addr, sniff_protocol, Prefixed};
+    use super::{
+        apply_cli_overrides, drain_connections, server_addr, sniff_protocol, ListenOverride,
+        Platform, Prefixed, StartupError, LAMBDA_RUNTIME_API_ENV,
+    };
+    use crate::runtime::azure::CUSTOM_HANDLER_PORT_ENV;
     use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use serial_test::serial;
     use std::{
@@ -799,31 +1081,45 @@ mod tests {
 
     const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+    /// One environment variable, restored to whatever it was when the guard is dropped.
+    ///
+    /// Platform detection reads the environment, so the tests that exercise it have to write it;
+    /// every one of them is `#[serial]`, and this puts the variable back either way.
     struct EnvGuard {
+        name: &'static str,
         original: Option<String>,
     }
 
     impl EnvGuard {
-        fn capture() -> Self {
+        fn capture(name: &'static str) -> Self {
             Self {
-                original: std::env::var("SKYZEN_ADDRESS").ok(),
+                name,
+                original: std::env::var(name).ok(),
             }
+        }
+
+        fn clear_var(name: &'static str) -> Self {
+            let guard = Self::capture(name);
+            unsafe {
+                std::env::remove_var(name);
+            }
+            guard
+        }
+
+        fn set_var(name: &'static str, value: &str) -> Self {
+            let guard = Self::capture(name);
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            guard
         }
 
         fn clear() -> Self {
-            let guard = Self::capture();
-            unsafe {
-                std::env::remove_var("SKYZEN_ADDRESS");
-            }
-            guard
+            Self::clear_var("SKYZEN_ADDRESS")
         }
 
         fn set(value: &str) -> Self {
-            let guard = Self::capture();
-            unsafe {
-                std::env::set_var("SKYZEN_ADDRESS", value);
-            }
-            guard
+            Self::set_var("SKYZEN_ADDRESS", value)
         }
     }
 
@@ -831,10 +1127,10 @@ mod tests {
         fn drop(&mut self) {
             match &self.original {
                 Some(value) => unsafe {
-                    std::env::set_var("SKYZEN_ADDRESS", value);
+                    std::env::set_var(self.name, value);
                 },
                 None => unsafe {
-                    std::env::remove_var("SKYZEN_ADDRESS");
+                    std::env::remove_var(self.name);
                 },
             }
         }
@@ -927,18 +1223,94 @@ mod tests {
 
     #[test]
     #[serial]
+    fn a_plain_process_is_detected_as_an_ordinary_server() {
+        let _lambda = EnvGuard::clear_var(LAMBDA_RUNTIME_API_ENV);
+        let _functions = EnvGuard::clear_var(CUSTOM_HANDLER_PORT_ENV);
+
+        assert_eq!(
+            Platform::detect().expect("no host to misread"),
+            Platform::Server
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn the_lambda_runtime_api_is_detected_before_anything_binds_a_listener() {
+        let _lambda = EnvGuard::set_var(LAMBDA_RUNTIME_API_ENV, "127.0.0.1:9001");
+        let _functions = EnvGuard::clear_var(CUSTOM_HANDLER_PORT_ENV);
+
+        assert_eq!(
+            Platform::detect().expect("a well-formed environment"),
+            Platform::Lambda
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lambda_outranks_the_functions_port_when_somehow_both_are_set() {
+        // Nothing sets both in practice; this pins the order so a future reader does not have to
+        // guess which branch wins.
+        let _lambda = EnvGuard::set_var(LAMBDA_RUNTIME_API_ENV, "127.0.0.1:9001");
+        let _functions = EnvGuard::set_var(CUSTOM_HANDLER_PORT_ENV, "7071");
+
+        assert_eq!(
+            Platform::detect().expect("a well-formed environment"),
+            Platform::Lambda
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn the_functions_custom_handler_port_is_detected_and_parsed() {
+        let _lambda = EnvGuard::clear_var(LAMBDA_RUNTIME_API_ENV);
+        let _functions = EnvGuard::set_var(CUSTOM_HANDLER_PORT_ENV, "7071");
+
+        assert_eq!(
+            Platform::detect().expect("a well-formed environment"),
+            Platform::AzureFunctions { port: 7071 }
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_functions_port_that_is_not_a_port_stops_the_process_rather_than_guessing() {
+        let _lambda = EnvGuard::clear_var(LAMBDA_RUNTIME_API_ENV);
+        let _functions = EnvGuard::set_var(CUSTOM_HANDLER_PORT_ENV, "not-a-port");
+
+        let error = Platform::detect().expect_err("there is no sensible port to fall back to");
+
+        assert!(matches!(error, StartupError::CustomHandlerPort { .. }));
+        assert!(error.to_string().contains("not-a-port"), "{error}");
+    }
+
+    #[test]
+    #[cfg(not(feature = "lambda"))]
+    fn a_lambda_without_the_feature_names_the_feature_it_needs() {
+        let error = StartupError::LambdaFeatureMissing.to_string();
+
+        assert!(error.contains("features = [\"lambda\"]"), "{error}");
+        assert!(error.contains(LAMBDA_RUNTIME_API_ENV), "{error}");
+    }
+
+    #[test]
+    #[serial]
     fn apply_cli_overrides_accepts_listen_aliases_and_split_flags() {
         let _guard = EnvGuard::clear();
 
+        // `--addr`/`--listen` name the whole socket, so they outrank a platform-supplied port.
         assert_eq!(
             apply_cli_overrides([
                 "skyzen".to_owned(),
                 "--addr".to_owned(),
                 "127.0.0.1:5050".to_owned(),
             ]),
-            Some("127.0.0.1:5050".parse().unwrap())
+            Some(ListenOverride {
+                addr: "127.0.0.1:5050".parse().unwrap(),
+                explicit: true,
+            })
         );
 
+        // `--host`/`--port` only adjust the default, and lose to one.
         assert_eq!(
             apply_cli_overrides([
                 "skyzen".to_owned(),
@@ -947,7 +1319,10 @@ mod tests {
                 "-p".to_owned(),
                 "6060".to_owned(),
             ]),
-            Some("127.0.0.1:6060".parse().unwrap())
+            Some(ListenOverride {
+                addr: "127.0.0.1:6060".parse().unwrap(),
+                explicit: false,
+            })
         );
     }
 
@@ -986,7 +1361,10 @@ mod tests {
         // A valid override is combined with the env-configured base address.
         assert_eq!(
             apply_cli_overrides(["skyzen".to_owned(), "--port=8080".to_owned()]),
-            Some("127.0.0.1:8080".parse().unwrap())
+            Some(ListenOverride {
+                addr: "127.0.0.1:8080".parse().unwrap(),
+                explicit: false,
+            })
         );
     }
 

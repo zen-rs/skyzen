@@ -4,11 +4,13 @@ The typed model of `Skyzen.toml`, shared by the [Skyzen](https://github.com/zen-
 procedural macros and the `skyzen` CLI.
 
 `Skyzen.toml` declares portable capabilities (`[[service]]`, `[[database]]`) once and wires them
-per target (`[native.*]`, `[cloudflare.*]`). Two very different consumers read it:
+per target (`[native.*]`, `[cloudflare.*]`, `[aws]`, `[azure]`). Two very different consumers read
+it:
 
-- `#[skyzen::main]` reads it at compile time and generates the backend construction and the
-  typed extractors.
-- `skyzen dev` / `skyzen deploy` read it to render `wrangler.toml` and drive the build.
+- `#[skyzen::main]` reads it at compile time and generates the backend construction, the typed
+  extractors, and the Azure queue triggers the runtime mounts.
+- `skyzen dev` / `skyzen deploy` read it to render provider configuration (`wrangler.toml`, the
+  Azure Functions bundle, the `cargo lambda` flags) and drive the build.
 
 They must never disagree about what a section means, so both deserialize through the schema in
 this crate rather than through parsers of their own. Every struct carries

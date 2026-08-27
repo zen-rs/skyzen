@@ -48,6 +48,7 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 - **`skyzen-macros`** (`macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::scheduled]`, `#[skyzen::email]`, `#[skyzen::tail]`, `#[skyzen::durable_object]`, `#[derive(HttpError)]`.
 - **`skyzen-manifest`** (`manifest/`) - The one typed `Skyzen.toml` schema, consumed by **both** `skyzen-macros` (at compile time) and `skyzen-cli` (at deploy time), so a section can never be accepted by one and rejected by the other. Every struct carries `deny_unknown_fields` and the `type`/`backend` discriminants are enums, so a typo or an unsupported value fails at parse time.
 - **`skyzen-hyper`** (`hyper/`) - Hyper server adapter implementing the `Server` trait from `skyzen-core`.
+- **`skyzen-lambda`** (`lambda/`) - AWS Lambda adapter: HTTP invocations and SQS batches, driven by its own Tokio runtime. Reached through the root crate's optional `lambda` feature, never named by an application.
 
 **Services Abstraction & Testing:**
 - **`skyzen-services`** (`services/`) - Platform-agnostic service traits (`KeyValueStore`, `ObjectStorage`, `MessageQueue`, `DbBackend`) and type-erased extractors (`Kv`, `Storage`, `Queue`, `Db`, `DurableDb`, `DurableKv`).
