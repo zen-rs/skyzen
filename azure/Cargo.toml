@@ -47,9 +47,13 @@ bytes = { version = "1", optional = true }
 # makes Azure SQL reachable at all; `deadpool-tiberius` is the pool in front of it, chosen over
 # `bb8-tiberius` because deadpool's `Object::take` can detach a connection from the pool, which is
 # what keeps a transaction that was dropped without a commit from handing back a dirty connection.
-# `rustls` rather than `native-tls`: tiberius's native-tls path pulls `async-native-tls` with the
-# async-std runtime, and everything else here is on Tokio.
-deadpool-tiberius = { version = "0.1.9", default-features = false, features = ["rustls", "tds73", "chrono"], optional = true }
+# `native-tls` rather than `rustls`: tiberius's rustls feature pins rustls 0.21, whose
+# rustls-webpki 0.101 carries three RustSec vulnerabilities (2026-0098/0099/0104) with no
+# compatible fix. The platform TLS path costs an unmaintained `async-native-tls` wrapper and an
+# async-std transitive (already in the tree via sqlx-macros) — warnings, not vulnerabilities —
+# and puts SChannel/SecureTransport/OpenSSL under the handshake instead. Revisit when a tiberius
+# release moves to rustls >= 0.23.
+deadpool-tiberius = { version = "0.1.9", default-features = false, features = ["native-tls", "tds73", "chrono"], optional = true }
 # tiberius's own ADO.NET parser, named directly so the encryption and authentication policy applied
 # to a connection string reads exactly the string tiberius will read.
 connection-string = { version = "0.2", optional = true }
