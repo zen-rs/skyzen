@@ -94,6 +94,12 @@ const SERVICE_BUS: &[CrateRequirement] = &[
     plain("skyzen-services"),
     only("skyzen-azure", &["servicebus"]),
 ];
+const STORAGE_QUEUE: &[CrateRequirement] = &[
+    plain("skyzen-services"),
+    only("skyzen-azure", &["storage-queue"]),
+];
+const RDS_DATA: &[CrateRequirement] =
+    &[plain("skyzen-services"), only("skyzen-aws", &["rds-data"])];
 const CLOUDFLARE: &[CrateRequirement] = &[plain("skyzen-services"), plain("skyzen-cloudflare")];
 const POSTGRES: &[CrateRequirement] = &[CrateRequirement {
     name: "skyzen-services",
@@ -155,23 +161,28 @@ pub const CATALOGUE: &[Capability] = &[
     },
     Capability {
         name: "dynamodb",
-        summary: "a DynamoDB-backed KV store",
+        summary: "a DynamoDB-backed KV store (`backend = \"dynamodb\"`)",
         crates: DYNAMODB,
     },
     Capability {
         name: "cosmos",
-        summary: "a Cosmos DB-backed KV store",
+        summary: "a Cosmos DB-backed KV store (`backend = \"cosmos\"`)",
         crates: COSMOS,
     },
     Capability {
         name: "azure-blob",
-        summary: "Azure Blob object storage",
+        summary: "Azure Blob object storage (`backend = \"blob\"`)",
         crates: AZURE_BLOB,
     },
     Capability {
         name: "servicebus",
-        summary: "an Azure Service Bus queue",
+        summary: "an Azure Service Bus queue (`backend = \"servicebus\"`)",
         crates: SERVICE_BUS,
+    },
+    Capability {
+        name: "storage-queue",
+        summary: "an Azure Storage queue (`backend = \"storage-queue\"`)",
+        crates: STORAGE_QUEUE,
     },
     Capability {
         name: "cloudflare",
@@ -192,6 +203,11 @@ pub const CATALOGUE: &[Capability] = &[
         name: "sqlite",
         summary: "the SQLite driver (`backend = \"sqlite\"`)",
         crates: SQLITE,
+    },
+    Capability {
+        name: "rds-data",
+        summary: "Aurora through the RDS Data API (`backend = \"rds-data\"`)",
+        crates: RDS_DATA,
     },
 ];
 
@@ -226,11 +242,20 @@ const fn service_capability(service_type: ServiceType) -> &'static str {
 }
 
 /// The capability a native service backend needs.
+///
+/// A capability name is what a user types, so it is not always the manifest spelling: Azure Blob
+/// Storage is `backend = "blob"` in a wiring and `skyzen add azure-blob` on the command line,
+/// where a bare `blob` would say nothing about whose.
 const fn native_service_capability(backend: NativeServiceBackend) -> &'static str {
     match backend {
         NativeServiceBackend::Redis => "redis",
+        NativeServiceBackend::DynamoDb => "dynamodb",
+        NativeServiceBackend::Cosmos => "cosmos",
         NativeServiceBackend::S3 => "s3",
+        NativeServiceBackend::Blob => "azure-blob",
         NativeServiceBackend::Sqs => "sqs",
+        NativeServiceBackend::ServiceBus => "servicebus",
+        NativeServiceBackend::StorageQueue => "storage-queue",
         NativeServiceBackend::Memory => "memory",
     }
 }
@@ -241,6 +266,7 @@ const fn native_database_capability(backend: NativeDatabaseBackend) -> &'static 
         NativeDatabaseBackend::Postgres => "postgres",
         NativeDatabaseBackend::Mysql => "mysql",
         NativeDatabaseBackend::Sqlite => "sqlite",
+        NativeDatabaseBackend::RdsData => "rds-data",
     }
 }
 
@@ -261,10 +287,10 @@ pub fn required(manifest: &SkyzenManifest) -> Vec<&'static Capability> {
 
     if let Some(native) = &manifest.native {
         for service in native.service.values() {
-            names.insert(native_service_capability(service.backend));
+            names.insert(native_service_capability(service.backend()));
         }
         for database in native.database.values() {
-            names.insert(native_database_capability(database.backend));
+            names.insert(native_database_capability(database.backend()));
         }
     }
 
@@ -366,8 +392,10 @@ pub fn add(root: &Path, names: &[String], list_only: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lookup, required, CATALOGUE};
-    use skyzen_manifest::Manifest;
+    use super::{
+        lookup, native_database_capability, native_service_capability, required, CATALOGUE,
+    };
+    use skyzen_manifest::{Manifest, NativeDatabaseBackend, NativeServiceBackend};
 
     fn manifest(source: &str) -> skyzen_manifest::SkyzenManifest {
         Manifest::parse(source, "Skyzen.toml", ".")
@@ -426,15 +454,72 @@ mod tests {
 
     #[test]
     fn feature_restricted_crates_render_the_flags_cargo_add_needs() {
-        let sqs = lookup("sqs").expect("sqs");
-        let aws = sqs
-            .crates
-            .iter()
-            .find(|requirement| requirement.name == "skyzen-aws")
-            .expect("skyzen-aws");
-        assert_eq!(
-            aws.cargo_add_command(),
-            "cargo add skyzen-aws --no-default-features --features sqs"
+        for (capability, crate_name, expected) in [
+            (
+                "sqs",
+                "skyzen-aws",
+                "cargo add skyzen-aws --no-default-features --features sqs",
+            ),
+            (
+                "rds-data",
+                "skyzen-aws",
+                "cargo add skyzen-aws --no-default-features --features rds-data",
+            ),
+            (
+                "storage-queue",
+                "skyzen-azure",
+                "cargo add skyzen-azure --no-default-features --features storage-queue",
+            ),
+            (
+                "azure-blob",
+                "skyzen-azure",
+                "cargo add skyzen-azure --no-default-features --features blob",
+            ),
+        ] {
+            let requirement = lookup(capability)
+                .unwrap_or_else(|error| panic!("{capability}: {error}"))
+                .crates
+                .iter()
+                .find(|requirement| requirement.name == crate_name)
+                .unwrap_or_else(|| panic!("{capability} should need {crate_name}"));
+            assert_eq!(requirement.cargo_add_command(), expected);
+        }
+    }
+
+    #[test]
+    fn every_native_backend_a_manifest_can_declare_has_a_capability_to_install() {
+        // The failure this catches is a backend added to the schema and not to the catalogue,
+        // which would leave `skyzen dev` reporting a missing crate with no command to fix it.
+        for backend in NativeServiceBackend::ALL {
+            let capability = native_service_capability(backend);
+            lookup(capability)
+                .unwrap_or_else(|error| panic!("backend `{}`: {error}", backend.as_str()));
+        }
+        for backend in NativeDatabaseBackend::ALL {
+            let capability = native_database_capability(backend);
+            lookup(capability)
+                .unwrap_or_else(|error| panic!("backend `{}`: {error}", backend.as_str()));
+        }
+    }
+
+    #[test]
+    fn a_cloud_backend_declared_natively_implies_its_provider_crate() {
+        let manifest = manifest(
+            "[[service]]\nname = \"sessions\"\ntype = \"kv\"\n\n\
+             [[service]]\nname = \"jobs\"\ntype = \"queue\"\n\n\
+             [[database]]\nname = \"main\"\ntype = \"sql\"\n\n\
+             [native.service.sessions]\nbackend = \"cosmos\"\n\
+             database = \"appdb\"\ncontainer = \"sessions\"\n\n\
+             [native.service.jobs]\nbackend = \"storage-queue\"\nsas_url_env = \"JOBS_SAS_URL\"\n\n\
+             [native.database.main]\nbackend = \"rds-data\"\n",
         );
+
+        let names: Vec<_> = required(&manifest)
+            .into_iter()
+            .map(|capability| capability.name)
+            .collect();
+        assert!(names.contains(&"cosmos"), "{names:?}");
+        assert!(names.contains(&"storage-queue"), "{names:?}");
+        assert!(names.contains(&"rds-data"), "{names:?}");
     }
 }

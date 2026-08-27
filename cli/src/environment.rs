@@ -1,15 +1,19 @@
-//! Environment variables the manifest names, and the `.env` files that supply them.
+//! Environment variables the manifest's native wiring reads, and the `.env` files that supply them.
 //!
-//! `[native.service.*].url_env` / `bucket_env` and `[native.database.*].url_env` were parsed and
-//! then discarded: only the proc-macro read them, at compile time, so declaring
+//! The variables a wiring names — `url_env`, `bucket_env`, `connection_env`, `sas_url_env` — were
+//! parsed and then discarded: only the proc-macro read them, at compile time, so declaring
 //! `url_env = "CACHE_URL"` and forgetting to export it produced a panic at the first request
 //! rather than a message at startup. `skyzen dev` now loads the `.env` files, checks the declared
 //! variables are present, and hands the result to the child process — never to the CLI's own
 //! environment, so nothing global is mutated.
+//!
+//! A backend whose constructor fixes its own variable names (Cosmos DB, the RDS Data API) is
+//! covered too: the section reports those names, so they reach this check and `.env.example` the
+//! same way a key-named one does.
 
 use anyhow::{Context, Result};
 use askama::Template;
-use skyzen_manifest::SkyzenManifest;
+use skyzen_manifest::{SkyzenManifest, WiringEnvVar};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -29,7 +33,7 @@ pub struct RequiredVariable {
     pub declared_by: String,
 }
 
-/// Every environment variable the manifest's native wiring names.
+/// Every environment variable the manifest's native wiring reads at startup.
 pub fn required_variables(manifest: &SkyzenManifest) -> Vec<RequiredVariable> {
     let mut variables = Vec::new();
     let Some(native) = &manifest.native else {
@@ -37,29 +41,44 @@ pub fn required_variables(manifest: &SkyzenManifest) -> Vec<RequiredVariable> {
     };
 
     for (name, service) in &native.service {
-        if let Some(url_env) = &service.url_env {
-            variables.push(RequiredVariable {
-                name: url_env.clone(),
-                declared_by: format!("[native.service.{name}].url_env"),
-            });
-        }
-        if let Some(bucket_env) = &service.bucket_env {
-            variables.push(RequiredVariable {
-                name: bucket_env.clone(),
-                declared_by: format!("[native.service.{name}].bucket_env"),
-            });
-        }
+        collect(
+            &mut variables,
+            &format!("[native.service.{name}]"),
+            service.backend().as_str(),
+            service.env_vars(),
+        );
     }
     for (name, database) in &native.database {
-        variables.push(RequiredVariable {
-            name: database.url_env.clone(),
-            declared_by: format!("[native.database.{name}].url_env"),
-        });
+        collect(
+            &mut variables,
+            &format!("[native.database.{name}]"),
+            database.backend().as_str(),
+            database.env_vars(),
+        );
     }
 
     variables.sort();
     variables.dedup();
     variables
+}
+
+/// Record one wiring's variables, saying where each name came from.
+///
+/// A backend that fixes its own variable names — Cosmos DB's account endpoint and key, the four
+/// the RDS Data API reads — is named instead of a key, because there is no key to correct.
+fn collect(
+    variables: &mut Vec<RequiredVariable>,
+    section: &str,
+    backend: &str,
+    named: Vec<WiringEnvVar<'_>>,
+) {
+    variables.extend(named.into_iter().map(|variable| RequiredVariable {
+        name: variable.name.to_owned(),
+        declared_by: variable.key.map_or_else(
+            || format!("{section} backend = \"{backend}\""),
+            |key| format!("{section}.{key}"),
+        ),
+    }));
 }
 
 /// The variables loaded from the project's `.env` files.
@@ -173,6 +192,63 @@ mod tests {
         let names: Vec<_> = variables.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, ["CACHE_URL", "DATABASE_URL", "UPLOADS_BUCKET"]);
         assert!(variables[0].declared_by.contains("[native.service.cache]"));
+    }
+
+    #[test]
+    fn a_backend_that_fixes_its_own_variables_names_the_backend_rather_than_a_key() {
+        let variables = required_variables(&manifest(
+            "[[service]]\nname = \"sessions\"\ntype = \"kv\"\n\n\
+             [native.service.sessions]\nbackend = \"cosmos\"\n\
+             database = \"appdb\"\ncontainer = \"sessions\"\n\n\
+             [[database]]\nname = \"main\"\ntype = \"sql\"\n\n\
+             [native.database.main]\nbackend = \"rds-data\"\n",
+        ));
+
+        let names: Vec<_> = variables.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "AZURE_COSMOS_ENDPOINT",
+                "AZURE_COSMOS_KEY",
+                "RDS_DATABASE",
+                "RDS_ENGINE",
+                "RDS_RESOURCE_ARN",
+                "RDS_SECRET_ARN",
+            ]
+        );
+        assert_eq!(
+            variables[0].declared_by,
+            "[native.service.sessions] backend = \"cosmos\""
+        );
+        assert_eq!(
+            variables[2].declared_by,
+            "[native.database.main] backend = \"rds-data\""
+        );
+    }
+
+    #[test]
+    fn a_backend_whose_variable_the_manifest_names_reports_the_key() {
+        let variables = required_variables(&manifest(
+            "[[service]]\nname = \"jobs\"\ntype = \"queue\"\n\n\
+             [native.service.jobs]\nbackend = \"storage-queue\"\nsas_url_env = \"JOBS_SAS_URL\"\n",
+        ));
+
+        assert_eq!(variables[0].name, "JOBS_SAS_URL");
+        assert_eq!(
+            variables[0].declared_by,
+            "[native.service.jobs].sas_url_env"
+        );
+    }
+
+    #[test]
+    fn a_backend_reached_through_an_ambient_credential_chain_declares_nothing() {
+        // DynamoDB's credentials and region come from the AWS chain, which has its own sources —
+        // naming one of them would refuse to start on a machine using another.
+        let variables = required_variables(&manifest(
+            "[[service]]\nname = \"sessions\"\ntype = \"kv\"\n\n\
+             [native.service.sessions]\nbackend = \"dynamodb\"\ntable = \"skyzen-sessions\"\n",
+        ));
+        assert!(variables.is_empty(), "{variables:?}");
     }
 
     #[test]
