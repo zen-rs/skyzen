@@ -2871,7 +2871,7 @@ fn native_kv_tokens(name: &str, wiring: &NativeServiceSection) -> Option<proc_ma
         }
         NativeServiceSection::Cosmos(cosmos) => {
             // `CosmosKv::from_env` reads the container's definition before it returns, so a
-            // container whose partition key or time-to-life this backend cannot work with fails
+            // container whose partition key or time-to-live this backend cannot work with fails
             // here, at startup, rather than on the first write.
             let database = LitStr::new(&cosmos.database, proc_macro2::Span::call_site());
             let container = LitStr::new(&cosmos.container, proc_macro2::Span::call_site());
