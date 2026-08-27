@@ -4,7 +4,8 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use skyzen_manifest::{
     AzureQueueTrigger, DatabaseEntry, DatabaseType, Manifest, NativeDatabaseSection,
-    NativeQueueConsumer, NativeServiceSection, ServiceEntry, ServiceType, SkyzenManifest,
+    NativeQueueConsumer, NativeServiceSection, RdsEngine, ServiceEntry, ServiceType,
+    SkyzenManifest,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -3079,17 +3080,22 @@ fn generate_native_database_init(
                 ::skyzen_services::Db::new(backend)
             }};
         }
-        (DatabaseType::Sql, NativeDatabaseSection::RdsData(_)) => {
-            let failure = LitStr::new(
-                &format!(
-                    "portable database `{name}` failed to reach Aurora through the RDS Data API"
-                ),
-                proc_macro2::Span::call_site(),
-            );
+        (DatabaseType::Sql, NativeDatabaseSection::RdsData(rds)) => {
+            // Either the wiring names all four values a Data API call is addressed by, and they
+            // are handed straight to `from_parts`, or it names none and `from_env` reads them.
+            // A half-written wiring never reaches here — the manifest parse rejects it — and is
+            // reported rather than assumed, so the rule has one implementation.
+            let parts = match rds.parts() {
+                Ok(parts) => parts,
+                Err(error) => {
+                    return compile_error_block(&format!("[native.database.{name}] {error}"));
+                }
+            };
+
+            let build = parts.map_or_else(|| rds_from_env_tokens(name), rds_from_parts_tokens);
+
             return quote! {{
-                let backend = ::skyzen_aws::RdsDataDb::from_env()
-                    .await
-                    .unwrap_or_else(|error| panic!("{}: {error}", #failure));
+                let backend = #build;
                 ::skyzen_services::Db::new(backend)
             }};
         }
@@ -3106,6 +3112,44 @@ fn generate_native_database_init(
             .await
             .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
     }}
+}
+
+/// The RDS Data API backend built from the four values a wiring names.
+///
+/// Infallible: nothing is read and nothing is parsed here, so there is no failure to report — the
+/// ARNs are first exercised by the first statement, like every other Data API call.
+fn rds_from_parts_tokens(parts: skyzen_manifest::RdsDataParts<'_>) -> proc_macro2::TokenStream {
+    let resource_arn = LitStr::new(parts.resource_arn, proc_macro2::Span::call_site());
+    let secret_arn = LitStr::new(parts.secret_arn, proc_macro2::Span::call_site());
+    let database = LitStr::new(parts.database, proc_macro2::Span::call_site());
+    let engine = rds_engine_tokens(parts.engine);
+    quote! {
+        ::skyzen_aws::RdsDataDb::from_parts(#resource_arn, #secret_arn, #database, #engine).await
+    }
+}
+
+/// The RDS Data API backend built from the four variables its own constructor reads.
+fn rds_from_env_tokens(name: &str) -> proc_macro2::TokenStream {
+    let failure = LitStr::new(
+        &format!("portable database `{name}` failed to reach Aurora through the RDS Data API"),
+        proc_macro2::Span::call_site(),
+    );
+    quote! {
+        ::skyzen_aws::RdsDataDb::from_env()
+            .await
+            .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+    }
+}
+
+/// The `RdsEngine` variant a manifest's `engine` names.
+///
+/// The manifest models the engine as its own enum so a typo is a parse error; this maps that enum
+/// onto the one `skyzen-aws` takes, which is the only place the two spellings meet.
+fn rds_engine_tokens(engine: RdsEngine) -> proc_macro2::TokenStream {
+    match engine {
+        RdsEngine::AuroraPostgres => quote! { ::skyzen_aws::RdsEngine::AuroraPostgres },
+        RdsEngine::AuroraMysql => quote! { ::skyzen_aws::RdsEngine::AuroraMysql },
+    }
 }
 
 fn generate_cloudflare_database_init(
@@ -4057,6 +4101,34 @@ type = "sql"
         );
         assert!(generated.contains(". await"), "{generated}");
         // It reads its four variables itself, so the expansion reads none.
+        assert!(!generated.contains("env :: var"), "{generated}");
+    }
+
+    #[test]
+    fn an_rds_data_wiring_that_names_its_four_values_is_built_from_them_instead() {
+        let generated = database_init(
+            "backend = \"rds-data\"\n\
+             resource_arn = \"arn:aws:rds:us-east-1:111122223333:cluster:skyzen\"\n\
+             secret_arn = \"arn:aws:secretsmanager:us-east-1:111122223333:secret:skyzen-Ab12Cd\"\n\
+             database = \"appdb\"\nengine = \"aurora-mysql\"",
+        );
+
+        assert!(
+            generated.contains("skyzen_aws :: RdsDataDb :: from_parts"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("skyzen_aws :: RdsEngine :: AuroraMysql"),
+            "{generated}"
+        );
+        assert!(generated.contains("appdb"), "{generated}");
+        assert!(
+            generated.contains("skyzen_services :: Db :: new"),
+            "{generated}"
+        );
+        assert!(generated.contains(". await"), "{generated}");
+        // The values are in the manifest, so neither constructor reads a variable.
+        assert!(!generated.contains("from_env"), "{generated}");
         assert!(!generated.contains("env :: var"), "{generated}");
     }
 
