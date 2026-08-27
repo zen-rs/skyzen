@@ -23,16 +23,41 @@ fn main() -> Router {
 }
 ```
 
-**On native targets**: Sets up Tokio + Hyper, `tracing` logging, graceful shutdown, and CLI argument parsing (`--port`, `--host`, `--listen`).
+**On native targets**: reads the environment before binding anything. `AWS_LAMBDA_RUNTIME_API` hands
+over to the Lambda adapter (which needs the root crate's `lambda` feature, and says so rather than
+binding a port nothing in Lambda can reach); `FUNCTIONS_CUSTOMHANDLER_PORT` serves the Azure
+Functions host on the port it chose, with the manifest's `[[azure.queue_triggers]]` mounted in front
+of the router; neither means an ordinary server, with Tokio + Hyper, `tracing` logging, graceful
+shutdown and CLI argument parsing (`--port`, `--host`, `--listen`).
 
 **On WASM targets**: Exports a WinterCG-compatible `fetch` handler.
+
+It also expands `import_config!()` and, when `Skyzen.toml` declares `[[native.queue_consumer]]`,
+starts the polling loops that drive `#[skyzen::queue]` beside the HTTP server.
 
 Options:
 - `default_logger = false` — Disable the built-in tracing subscriber
 
 ### `#[skyzen::queue]`
 
-Exports a Cloudflare queue-consumer entrypoint on wasm targets while leaving the original async function available for normal Rust use:
+Marks the function that consumes a queue batch. **It is dual-target**: the same handler is invoked
+by Skyzen's own polling loop natively (`[[native.queue_consumer]]`), by the platform's push on
+Cloudflare Workers and on AWS Lambda (an SQS event source), and by the Azure Functions host
+(`[[azure.queue_triggers]]`). The portable shape takes a `QueueBatch<T>` and returns `()`,
+`Result<(), _>` or a `QueueBatchDisposition`:
+
+```rust
+#[skyzen::queue]
+async fn queue(batch: QueueBatch<Job>) -> QueueBatchDisposition {
+    QueueBatchDisposition::ack_all()
+}
+```
+
+A handler that nothing consumes — no `[[native.queue_consumer]]` and no
+`[[cloudflare.queues.consumers]]` — is a compile error rather than dead code.
+
+The wasm-specific form below takes Cloudflare's own types instead, and exports the Worker's `queue`
+entrypoint while leaving the original async function available for normal Rust use:
 
 ```rust
 #[cfg(target_arch = "wasm32")]
@@ -118,15 +143,39 @@ Extracts request/response schemas from the function signature and registers the 
 
 ### `#[skyzen::test]`
 
-Runs an async test on Skyzen's native test runtime and injects test helpers such as `TestContext`, `Kv`, `Storage`, `Queue`, and `Db` using in-memory implementations.
+Runs an async test on Skyzen's native test runtime and injects test helpers — `TestContext`, `Kv`,
+`Storage`, `Queue`, `Db`, `DurableKv`, `DurableDb`, `Alarm`, and the named extractors the manifest
+declares — using in-memory implementations. `migrations = <path to a Migrations static>` applies a
+migration set to the injected database first, through the production runner:
+
+```rust
+#[skyzen::test(migrations = MIGRATIONS)]
+async fn a_user_can_be_inserted(db: Db, ctx: TestContext) { /* ... */ }
+```
 
 ### `#[skyzen::error]`
 
-Defines custom HTTP error types with status codes.
+Defines custom HTTP error types with status codes. On a struct, `message = "..."` is the `Display`
+format; on an enum, every variant carries its own `#[error("...", status = ...)]` and an
+enum-level `message` is **rejected with a compile error** rather than silently ignored.
 
 ### `#[derive(HttpError)]`
 
 Derive macro for enums to implement HTTP error responses.
+
+### `embed_migrations!("migrations")`
+
+Reads a `<version>_<name>.sql` directory relative to `CARGO_MANIFEST_DIR` at compile time,
+validates it, checksums each file and emits `include_str!` for the contents, producing a
+`skyzen_services::Migrations`:
+
+```rust
+static MIGRATIONS: Migrations = skyzen::embed_migrations!("migrations");
+```
+
+A malformed file name or a repeated version is a compile error pointing at the path literal. It
+reads through the same `skyzen-manifest` module the `skyzen migrate` CLI uses, so the binary and
+the CLI can never disagree about which files count or how a checksum is computed.
 
 ### `import_config!()`
 

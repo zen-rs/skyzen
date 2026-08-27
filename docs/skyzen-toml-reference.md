@@ -48,7 +48,9 @@ type = "kv"
 
 Each entry generates its own extractor type, named after the entry, wrapping the portable service:
 `cache` generates `pub struct Cache(Kv)` with `Deref<Target = Kv>`, so every `Kv` method is
-reachable through it. A handler names the ones it wants:
+reachable through it. A `[[database]]` entry gets a `Db` suffix — `journal` generates `JournalDb` —
+because a bare `Journal` reads as a domain type rather than a connection. A handler names the ones
+it wants:
 
 ```rust
 async fn handler(cache: Cache, sessions: Sessions) -> Result<&'static str> {
@@ -158,7 +160,7 @@ type = "sql"
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `name` | string | **Required.** Logical database name used in wiring sections |
+| `name` | string | **Required.** Logical database name used in wiring sections, and the stem of the generated extractor (`main` generates `MainDb`) |
 | `type` | string | **Required.** Currently only `sql` |
 | `default` | bool | Whether a bare `Db` extractor resolves to this entry. Required (on exactly one entry) when more than one database is declared |
 | `migrations_dir` | string | Directory of `<version>_<name>.sql` migrations, relative to the project root. Defaults to `migrations` |
@@ -313,6 +315,21 @@ retry_delay = 60
 | `retry_delay` | integer | Seconds to hold a retried message before redelivering it |
 
 Declaring a consumer makes the generated Worker shim export a `queue` member, which requires a Rust handler annotated `#[skyzen::queue]`.
+
+### Cron Triggers
+
+```toml
+[cloudflare.triggers]
+crons = ["0 * * * *", "*/15 * * * *"]
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `crons` | string[] | Cron expressions, in Cloudflare's own syntax, that invoke the `scheduled` handler |
+
+Declaring any cron makes the generated Worker shim export a `scheduled` member, which requires a
+Rust handler annotated `#[skyzen::scheduled]`. `skyzen dev --provider cloudflare -- --test-scheduled`
+fires it on demand rather than waiting for the schedule.
 
 ### Service Bindings
 

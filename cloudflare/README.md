@@ -17,11 +17,20 @@ Cloudflare Workers service implementations for the Skyzen framework.
 | Type | Implements | Cloudflare API |
 |------|-----------|----------------|
 | `CfKv` | `KeyValueStore` | [Workers KV](https://developers.cloudflare.com/kv/) |
-| `CfR2` | `ObjectStorage` | [R2](https://developers.cloudflare.com/r2/) |
+| `CfR2` | `ObjectStorage` | [R2](https://developers.cloudflare.com/r2/), including multipart, ranges and streaming |
 | `CfQueue` | `MessageQueue` | [Queues](https://developers.cloudflare.com/queues/) |
-| `CfD1` | `DbBackend` + raw D1 API | [D1](https://developers.cloudflare.com/d1/) |
+| `CfD1` | `DbBackend` + raw D1 API | [D1](https://developers.cloudflare.com/d1/), with `execute_batch` as its atomic unit |
 | `CfCache` | raw Cache API | [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) |
-| `CfDurableDb` | `DurableDbBackend` | [Durable Objects SQLite](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
+| `CfDurableDb`, `CfDurableKv`, `CfAlarm` | the `durable` backends | [Durable Objects storage](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
+| `CfSecretStore` | — | [Secrets Store](https://developers.cloudflare.com/secrets-store/) bindings |
+| `CfService`, `CfAssets` | — | [Service bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/) and the static-assets binding |
+| `CfFetch` | — | Outbound `fetch` with Cloudflare's own request options |
+
+The Worker events Cloudflare documents are covered too: `fetch` from `#[skyzen::main]`, `queue`,
+`scheduled`, `email` and `tail` from their attributes (`CfQueueBatch`, `CfScheduledEvent`,
+`CfEmailMessage`, `TailTraceItem`), and the Durable Object `alarm` from `Route::on_alarm`.
+`CfProperties` (`skyzen::runtime`) carries the `request.cf` metadata, and `WorkerContext` carries
+`waitUntil`.
 
 ## Usage
 
@@ -126,11 +135,16 @@ bind parameters and row deserialization:
 use skyzen_services::durable::DurableDb;
 
 let db = DurableDb::new(CfDurableDb::from_state(&state)?);
-db.execute(
-    "CREATE TABLE IF NOT EXISTS counter (id TEXT PRIMARY KEY, value INTEGER)",
-    &[],
-)
-.await?;
+db.query("CREATE TABLE IF NOT EXISTS counter (id TEXT PRIMARY KEY, value INTEGER)")
+    .execute()
+    .await?;
+
+// Rows arrive as JSON objects keyed by column name, so a row type is a struct with a field per
+// selected column.
+#[derive(serde::Deserialize)]
+struct Counter { id: String, value: i64 }
+
+let counters: Vec<Counter> = db.query("SELECT id, value FROM counter").fetch_all().await?;
 ```
 
 ## D1 vs Durable Object SQLite
