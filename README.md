@@ -75,9 +75,9 @@ and a set of convenience methods on top.
 | **`Storage`** | `InMemoryStorage` | `S3Storage` | `CfR2` | `S3Storage` | `AzureBlob` |
 | **`Queue`** (produce) | `InMemoryQueue` | `SqsQueue` | `CfQueue` | `SqsQueue` | `ServiceBusQueue`, `AzureStorageQueue` |
 | **`Queue`** (consume) | driven by the test | Skyzen polls — `[[native.queue_consumer]]` | the platform pushes | SQS event source mapping | Functions queue trigger |
-| **`Db`** | `InMemoryDb` (SQLite) | sqlx — Postgres, MySQL, SQLite | `CfD1` | `RdsDataDb` (Aurora Data API) | — |
-| `Db::begin` (transactions) | yes | yes | no — use `execute_batch` | yes | — |
-| `Db::migrate` / `skyzen migrate` | yes | yes | yes (`wrangler d1 migrations`) | in-app runner only | — |
+| **`Db`** | `InMemoryDb` (SQLite) | sqlx — Postgres, MySQL, SQLite | `CfD1` | `RdsDataDb` (Aurora Data API) | `AzureSqlDb` (Azure SQL, dialect `Mssql`) |
+| `Db::begin` (transactions) | yes | yes | no — use `execute_batch` | yes | yes |
+| `Db::migrate` / `skyzen migrate` | yes | yes | yes (`wrangler d1 migrations`) | in-app runner only | in-app runner only |
 
 Read the columns honestly:
 
@@ -87,9 +87,11 @@ Read the columns honestly:
   declared in [`Skyzen.toml`](docs/skyzen-toml-reference.md)'s `[native.service.*]` /
   `[native.database.*]` wiring rather than constructed by hand. The column names the one this
   table's row is *about*, not the limit of what a native binary can reach.
-- **Azure has no portable `Db`.** Cosmos DB is wired as a key–value store, not as SQL. A Skyzen
-  application deployed to Azure Functions reaches SQL through a native `[[database]]` (Azure
-  Database for PostgreSQL/MySQL over sqlx), not through a portable Azure binding.
+- **Which `Db` you want on Azure depends on which database it is.** Azure Database for PostgreSQL
+  and for MySQL speak the wire protocols sqlx already speaks, so they are an ordinary native
+  `[[database]]` and need nothing from `skyzen-azure`. **Azure SQL** speaks T-SQL over TDS, which
+  sqlx has no driver for, and is what `AzureSqlDb` exists for — real transactions included. Cosmos
+  DB is not SQL here at all: it is wired as a key–value store.
 - **Cloudflare has no interactive transactions**, because D1 has none. `Db::begin` returns
   `DbError::TransactionsUnsupported` there; `Db::execute_batch` is D1's atomic unit and is
   supported everywhere.
@@ -107,6 +109,8 @@ use skyzen_services::{Db, Kv, Storage};
 let kv = Kv::new(skyzen_redis::Redis::connect("redis://127.0.0.1:6379").await?);
 let storage = Storage::new(skyzen_s3::S3Storage::from_env("my-bucket").await);
 let db = Db::connect_postgres("postgres://localhost/app").await?;
+// Azure SQL speaks T-SQL over TDS, which sqlx has no driver for, so it has a backend of its own.
+let db = Db::new(skyzen_azure::AzureSqlDb::from_env()?);
 
 // AWS / Azure — plain HTTP clients, so these work from any runtime
 let kv = Kv::new(skyzen_aws::DynamoKv::from_env("sessions").await);
@@ -140,9 +144,9 @@ binding = "CACHE"
 ```
 
 Any backend goes in that `backend = …` — `dynamodb`, `cosmos`, `blob`, `servicebus`,
-`storage-queue`, `rds-data` and the rest — each with its own keys, and unknown ones rejected where
-they are written. `skyzen add <backend>` installs the crate it needs, and `skyzen dev` refuses to
-start when a variable one of them reads is set nowhere.
+`storage-queue`, `rds-data`, `azure-sql` and the rest — each with its own keys, and unknown ones
+rejected where they are written. `skyzen add <backend>` installs the crate it needs, and
+`skyzen dev` refuses to start when a variable one of them reads is set nowhere.
 
 ```rust
 // `[[service]] name = "cache"` generates `pub struct Cache(Kv)` with `Deref<Target = Kv>`;
@@ -826,7 +830,7 @@ running it, and `--manifest` points at a `Skyzen.toml` elsewhere.
 | [`skyzen-cloudflare`](cloudflare/) | `cloudflare/` | Workers KV, R2, Queues, D1, Durable Objects, secrets store, `request.cf` (*wasm32 only*) |
 | [`skyzen-cloudflare-admin`](cloudflare-admin/) | `cloudflare-admin/` | Cloudflare REST client, used by `skyzen provision` |
 | [`skyzen-aws`](aws/) | `aws/` | `DynamoKv`, `SqsQueue`, `RdsDataDb`, and `S3Storage` re-exported |
-| [`skyzen-azure`](azure/) | `azure/` | `CosmosKv`, `AzureBlob`, `ServiceBusQueue`, `AzureStorageQueue` |
+| [`skyzen-azure`](azure/) | `azure/` | `CosmosKv`, `AzureBlob`, `ServiceBusQueue`, `AzureStorageQueue`, `AzureSqlDb` |
 | [`skyzen-cli`](cli/) | `cli/` | The `skyzen` binary: scaffolding, local emulation, provisioning, migrations, deployment |
 
 ---

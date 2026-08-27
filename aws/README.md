@@ -188,6 +188,23 @@ async fn main() {
 }
 ```
 
+A caller that already knows the four values names them instead, and reads no variables:
+
+```rust
+use skyzen_aws::{RdsDataDb, RdsEngine};
+use skyzen_services::Db;
+
+let db = Db::new(
+    RdsDataDb::from_parts(resource_arn, secret_arn, "appdb", RdsEngine::AuroraPostgres).await,
+);
+```
+
+That is also what a `[native.database.<name>]` wiring expands to when it names `resource_arn`,
+`secret_arn`, `database` and `engine` — all four or none, so half a wiring is a compile error
+rather than a lookup of variables nobody declared. See the
+[Skyzen.toml reference](../docs/skyzen-toml-reference.md#native-database-wiring), and
+`skyzen add rds-data` for the dependency.
+
 ## Related Crates
 
 - `skyzen-core`: Foundational traits
