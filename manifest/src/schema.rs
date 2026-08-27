@@ -4,6 +4,13 @@
 //! than a silently dropped binding. String-valued discriminants (`type`, `backend`) are modelled
 //! as enums so an unsupported value is rejected by the parser instead of by a `match` arm buried
 //! in a consumer.
+//!
+//! `[native.service.<name>]` and `[native.database.<name>]` go one step further: they are
+//! internally tagged unions, where `backend` selects the variant and the rest of the table is that
+//! backend's own payload struct — which carries the `deny_unknown_fields` (serde has no such
+//! attribute for a variant). A key that belongs to another backend, or to none, is therefore
+//! rejected where it is written rather than ignored: `backend = "memory"` with a stray `url_env`
+//! is a parse error, and a required key is missing at parse time rather than at macro expansion.
 
 use serde::Deserialize;
 use std::{
@@ -203,70 +210,416 @@ const fn default_retry_delay() -> Duration {
     Duration::from_secs(30)
 }
 
-/// `[native.service.<name>]`.
+/// One environment variable a native wiring reads when the application starts.
+///
+/// `key` is the manifest key that named it, and is `None` when the backend's own constructor fixes
+/// the name — a wiring cannot move `AZURE_COSMOS_ENDPOINT`, so the CLI reports it as coming from
+/// the backend rather than from a key the user could have mistyped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WiringEnvVar<'a> {
+    /// The variable's name.
+    pub name: &'a str,
+    /// The manifest key that named it, when the wiring chooses the name.
+    pub key: Option<&'static str>,
+}
+
+impl<'a> WiringEnvVar<'a> {
+    /// A variable the manifest names through `key`.
+    const fn declared(key: &'static str, name: &'a str) -> Self {
+        Self {
+            name,
+            key: Some(key),
+        }
+    }
+
+    /// A variable the backend's constructor fixes the name of.
+    const fn fixed(name: &'static str) -> Self {
+        Self { name, key: None }
+    }
+}
+
+/// The account endpoint `CosmosKv::from_env` reads. Fixed by that constructor, which is the only
+/// public one that authenticates with an account key.
+const COSMOS_ENDPOINT_ENV: &str = "AZURE_COSMOS_ENDPOINT";
+
+/// The account key `CosmosKv::from_env` reads.
+const COSMOS_KEY_ENV: &str = "AZURE_COSMOS_KEY";
+
+/// The four variables `RdsDataDb::from_env` reads. It is the only public constructor that builds
+/// its own client, so a manifest wiring cannot move or replace any of them.
+const RDS_ENV_VARS: [&str; 4] = [
+    "RDS_RESOURCE_ARN",
+    "RDS_SECRET_ARN",
+    "RDS_DATABASE",
+    "RDS_ENGINE",
+];
+
+/// `[native.service.<name>]` — how one portable service is backed on native targets.
+///
+/// `backend` selects the variant; every other key in the table belongs to that backend alone.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "backend")]
+pub enum NativeServiceSection {
+    /// `skyzen-redis` — a KV store backed by Redis.
+    #[serde(rename = "redis")]
+    Redis(RedisWiring),
+    /// `skyzen-aws` (`dynamodb` feature) — a KV store backed by Amazon `DynamoDB`.
+    #[serde(rename = "dynamodb")]
+    DynamoDb(DynamoDbWiring),
+    /// `skyzen-azure` (`cosmos` feature) — a KV store backed by Azure Cosmos DB.
+    #[serde(rename = "cosmos")]
+    Cosmos(CosmosWiring),
+    /// `skyzen-s3` — object storage backed by an S3-compatible endpoint.
+    #[serde(rename = "s3")]
+    S3(S3Wiring),
+    /// `skyzen-azure` (`blob` feature) — object storage backed by Azure Blob Storage.
+    #[serde(rename = "blob")]
+    Blob(BlobWiring),
+    /// `skyzen-aws` (`sqs` feature) — a queue backed by Amazon SQS.
+    #[serde(rename = "sqs")]
+    Sqs(SqsWiring),
+    /// `skyzen-azure` (`servicebus` feature) — a queue backed by Azure Service Bus.
+    #[serde(rename = "servicebus")]
+    ServiceBus(ServiceBusWiring),
+    /// `skyzen-azure` (`storage-queue` feature) — a queue backed by an Azure Storage queue.
+    #[serde(rename = "storage-queue")]
+    StorageQueue(StorageQueueWiring),
+    /// `skyzen-test` — an in-process mock, for local development and tests.
+    #[serde(rename = "memory")]
+    Memory(MemoryWiring),
+}
+
+impl NativeServiceSection {
+    /// Which backend this wiring names.
+    #[must_use]
+    pub const fn backend(&self) -> NativeServiceBackend {
+        match self {
+            Self::Redis(_) => NativeServiceBackend::Redis,
+            Self::DynamoDb(_) => NativeServiceBackend::DynamoDb,
+            Self::Cosmos(_) => NativeServiceBackend::Cosmos,
+            Self::S3(_) => NativeServiceBackend::S3,
+            Self::Blob(_) => NativeServiceBackend::Blob,
+            Self::Sqs(_) => NativeServiceBackend::Sqs,
+            Self::ServiceBus(_) => NativeServiceBackend::ServiceBus,
+            Self::StorageQueue(_) => NativeServiceBackend::StorageQueue,
+            Self::Memory(_) => NativeServiceBackend::Memory,
+        }
+    }
+
+    /// Every environment variable this wiring reads when the application starts.
+    ///
+    /// A backend that authenticates through an ambient credential chain (`DynamoDB` through the
+    /// AWS one, and SQS's own credentials) names nothing here: the chain has its own sources, and
+    /// listing one of them would make `skyzen dev` refuse to start on a machine using another.
+    #[must_use]
+    pub fn env_vars(&self) -> Vec<WiringEnvVar<'_>> {
+        match self {
+            Self::Redis(wiring) => vec![WiringEnvVar::declared("url_env", &wiring.url_env)],
+            Self::Sqs(wiring) => vec![WiringEnvVar::declared("url_env", &wiring.url_env)],
+            Self::S3(wiring) => vec![WiringEnvVar::declared("bucket_env", &wiring.bucket_env)],
+            Self::Blob(wiring) => vec![WiringEnvVar::declared(
+                "connection_env",
+                &wiring.connection_env,
+            )],
+            Self::ServiceBus(wiring) => vec![WiringEnvVar::declared(
+                "connection_env",
+                &wiring.connection_env,
+            )],
+            Self::StorageQueue(wiring) => {
+                vec![WiringEnvVar::declared("sas_url_env", &wiring.sas_url_env)]
+            }
+            Self::Cosmos(_) => vec![
+                WiringEnvVar::fixed(COSMOS_ENDPOINT_ENV),
+                WiringEnvVar::fixed(COSMOS_KEY_ENV),
+            ],
+            Self::DynamoDb(_) | Self::Memory(_) => Vec::new(),
+        }
+    }
+}
+
+/// `backend = "redis"`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NativeServiceSection {
-    /// Which backend crate provides the service natively.
-    pub backend: NativeServiceBackend,
-    /// Environment variable holding the connection URL (Redis, SQS).
+pub struct RedisWiring {
+    /// Environment variable holding the connection URL (`redis://host:port`).
+    pub url_env: String,
+}
+
+/// `backend = "dynamodb"`.
+///
+/// The table is named here; the credentials and the region come from the ambient AWS chain, the
+/// way `DynamoKv::from_env` loads them. The partition key attribute is that constructor's `"pk"`;
+/// a table keyed on anything else is wired in code with `DynamoKv::new`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DynamoDbWiring {
+    /// The `DynamoDB` table backing the store. It must already exist.
+    pub table: String,
+    /// The attribute expiry timestamps are written to. Unset uses `DynamoKv`'s own `expires_at`.
     #[serde(default)]
-    pub url_env: Option<String>,
-    /// Environment variable holding the bucket name (S3).
+    pub ttl_attribute: Option<String>,
+    /// Whether reads ask for `ConsistentRead`. Unset leaves `DynamoDB`'s eventually consistent
+    /// default, at half the read capacity.
     #[serde(default)]
-    pub bucket_env: Option<String>,
+    pub consistent_reads: Option<bool>,
+}
+
+/// `backend = "cosmos"`.
+///
+/// The account endpoint and key come from `AZURE_COSMOS_ENDPOINT` and `AZURE_COSMOS_KEY`, which
+/// `CosmosKv::from_env` fixes the names of; this wiring names the container inside that account.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CosmosWiring {
+    /// The Cosmos DB database holding the container.
+    pub database: String,
+    /// The container backing the store. It must already exist, and it is read once at startup.
+    pub container: String,
+}
+
+/// `backend = "s3"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3Wiring {
+    /// Environment variable holding the bucket name.
+    pub bucket_env: String,
+}
+
+/// `backend = "blob"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobWiring {
+    /// The blob container backing the store.
+    pub container: String,
+    /// Environment variable holding the storage account connection string.
+    #[serde(default = "default_azure_storage_connection_env")]
+    pub connection_env: String,
+}
+
+/// The variable `AzureBlob::from_env` reads, and this wiring's default.
+fn default_azure_storage_connection_env() -> String {
+    "AZURE_STORAGE_CONNECTION_STRING".to_owned()
+}
+
+/// `backend = "sqs"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqsWiring {
+    /// Environment variable holding the queue URL. It must name a standard queue: a FIFO queue
+    /// needs a message group on every send, and is wired in code with `SqsQueue::fifo`.
+    pub url_env: String,
+}
+
+/// `backend = "servicebus"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceBusWiring {
+    /// The Service Bus queue to send to and receive from.
+    pub queue: String,
+    /// Environment variable holding the namespace's connection string.
+    #[serde(default = "default_servicebus_connection_env")]
+    pub connection_env: String,
+}
+
+/// The variable `ServiceBusQueue::from_env` reads, and this wiring's default.
+fn default_servicebus_connection_env() -> String {
+    "SERVICEBUS_CONNECTION_STRING".to_owned()
+}
+
+/// `backend = "storage-queue"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageQueueWiring {
+    /// Environment variable holding the queue URL with its shared access signature attached.
+    ///
+    /// The whole URL is the credential, which is why it is read from the environment rather than
+    /// split into a queue name and a secret.
+    pub sas_url_env: String,
+}
+
+pub use fieldless::{MemoryWiring, RdsDataWiring};
+
+/// The wirings whose whole table is `backend`, and which therefore accept no other key.
+///
+/// They live in their own module for one reason: serde spells the field matcher of a fieldless
+/// `deny_unknown_fields` struct as an empty enum, inside a `const` block that an `allow` on the
+/// struct itself does not reach.
+#[allow(clippy::empty_enums)]
+mod fieldless {
+    use serde::Deserialize;
+
+    /// `backend = "memory"`. The mock takes no configuration.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct MemoryWiring {}
+
+    /// `backend = "rds-data"`.
+    ///
+    /// `RdsDataDb::from_env` is the one public constructor that builds its own client, and it reads
+    /// the cluster ARN, the secret ARN, the database and the engine from `RDS_RESOURCE_ARN`,
+    /// `RDS_SECRET_ARN`, `RDS_DATABASE` and `RDS_ENGINE`. Naming any of them here would be a key
+    /// the wiring could not honour.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RdsDataWiring {}
 }
 
 /// The native backends a portable service can be wired to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// The discriminant of [`NativeServiceSection`], for the consumers that only need to name the
+/// backend. [`as_str`](Self::as_str) is the manifest spelling, and it is the same string the
+/// section's `#[serde(rename)]` parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NativeServiceBackend {
     /// `skyzen-redis` — a KV store backed by Redis.
     Redis,
+    /// `skyzen-aws` (`dynamodb` feature) — a KV store backed by Amazon `DynamoDB`.
+    DynamoDb,
+    /// `skyzen-azure` (`cosmos` feature) — a KV store backed by Azure Cosmos DB.
+    Cosmos,
     /// `skyzen-s3` — object storage backed by an S3-compatible endpoint.
     S3,
+    /// `skyzen-azure` (`blob` feature) — object storage backed by Azure Blob Storage.
+    Blob,
     /// `skyzen-aws` (`sqs` feature) — a queue backed by Amazon SQS.
     Sqs,
+    /// `skyzen-azure` (`servicebus` feature) — a queue backed by Azure Service Bus.
+    ServiceBus,
+    /// `skyzen-azure` (`storage-queue` feature) — a queue backed by an Azure Storage queue.
+    StorageQueue,
     /// `skyzen-test` — an in-process mock, for local development and tests.
     Memory,
 }
 
 impl NativeServiceBackend {
+    /// Every backend, in the order the documentation lists them.
+    pub const ALL: [Self; 9] = [
+        Self::Redis,
+        Self::DynamoDb,
+        Self::Cosmos,
+        Self::S3,
+        Self::Blob,
+        Self::Sqs,
+        Self::ServiceBus,
+        Self::StorageQueue,
+        Self::Memory,
+    ];
+
     /// The manifest spelling of this backend.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Redis => "redis",
+            Self::DynamoDb => "dynamodb",
+            Self::Cosmos => "cosmos",
             Self::S3 => "s3",
+            Self::Blob => "blob",
             Self::Sqs => "sqs",
+            Self::ServiceBus => "servicebus",
+            Self::StorageQueue => "storage-queue",
             Self::Memory => "memory",
+        }
+    }
+
+    /// The portable service type this backend implements, or `None` when it implements every one.
+    #[must_use]
+    pub const fn service_type(self) -> Option<ServiceType> {
+        match self {
+            Self::Redis | Self::DynamoDb | Self::Cosmos => Some(ServiceType::Kv),
+            Self::S3 | Self::Blob => Some(ServiceType::Storage),
+            Self::Sqs | Self::ServiceBus | Self::StorageQueue => Some(ServiceType::Queue),
+            Self::Memory => None,
         }
     }
 }
 
-/// `[native.database.<name>]`.
+/// `[native.database.<name>]` — how one portable database is backed on native targets.
+///
+/// `backend` selects the variant; every other key in the table belongs to that backend alone.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "backend")]
+pub enum NativeDatabaseSection {
+    /// `PostgreSQL`, through `skyzen-services`' `postgres` feature.
+    #[serde(rename = "postgres")]
+    Postgres(SqlUrlWiring),
+    /// `MySQL`, through `skyzen-services`' `mysql` feature.
+    #[serde(rename = "mysql")]
+    Mysql(SqlUrlWiring),
+    /// SQLite, through `skyzen-services`' `sqlite` feature.
+    #[serde(rename = "sqlite")]
+    Sqlite(SqlUrlWiring),
+    /// Aurora through the RDS Data API, from `skyzen-aws`' `rds-data` feature.
+    #[serde(rename = "rds-data")]
+    RdsData(RdsDataWiring),
+}
+
+impl NativeDatabaseSection {
+    /// Which backend this wiring names.
+    #[must_use]
+    pub const fn backend(&self) -> NativeDatabaseBackend {
+        match self {
+            Self::Postgres(_) => NativeDatabaseBackend::Postgres,
+            Self::Mysql(_) => NativeDatabaseBackend::Mysql,
+            Self::Sqlite(_) => NativeDatabaseBackend::Sqlite,
+            Self::RdsData(_) => NativeDatabaseBackend::RdsData,
+        }
+    }
+
+    /// The variable holding this database's connection URL, for the drivers that connect to one.
+    ///
+    /// `None` for the RDS Data API, which is an HTTP service reached by ARN rather than a server
+    /// reached by URL — and therefore the one backend `skyzen migrate --provider native` cannot
+    /// open a connection to.
+    #[must_use]
+    pub fn url_env(&self) -> Option<&str> {
+        match self {
+            Self::Postgres(wiring) | Self::Mysql(wiring) | Self::Sqlite(wiring) => {
+                Some(&wiring.url_env)
+            }
+            Self::RdsData(_) => None,
+        }
+    }
+
+    /// Every environment variable this wiring reads when the application starts.
+    #[must_use]
+    pub fn env_vars(&self) -> Vec<WiringEnvVar<'_>> {
+        match self {
+            Self::Postgres(wiring) | Self::Mysql(wiring) | Self::Sqlite(wiring) => {
+                vec![WiringEnvVar::declared("url_env", &wiring.url_env)]
+            }
+            Self::RdsData(_) => RDS_ENV_VARS.map(WiringEnvVar::fixed).to_vec(),
+        }
+    }
+}
+
+/// A SQL database reached through a connection URL: `backend = "postgres"`, `"mysql"`, `"sqlite"`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NativeDatabaseSection {
-    /// Which SQL driver backs the database natively.
-    pub backend: NativeDatabaseBackend,
+pub struct SqlUrlWiring {
     /// Environment variable holding the connection URL.
     pub url_env: String,
 }
 
-/// The native SQL drivers a portable database can be wired to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// The native backends a portable database can be wired to.
+///
+/// The discriminant of [`NativeDatabaseSection`]; see [`NativeServiceBackend`] for why it is
+/// separate from the section itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NativeDatabaseBackend {
-    /// PostgreSQL, through `skyzen-services`' `postgres` feature.
+    /// `PostgreSQL`, through `skyzen-services`' `postgres` feature.
     Postgres,
-    /// MySQL, through `skyzen-services`' `mysql` feature.
+    /// `MySQL`, through `skyzen-services`' `mysql` feature.
     Mysql,
     /// SQLite, through `skyzen-services`' `sqlite` feature.
     Sqlite,
+    /// Aurora through the RDS Data API, from `skyzen-aws`' `rds-data` feature.
+    RdsData,
 }
 
 impl NativeDatabaseBackend {
+    /// Every backend, in the order the documentation lists them.
+    pub const ALL: [Self; 4] = [Self::Postgres, Self::Mysql, Self::Sqlite, Self::RdsData];
+
     /// The manifest spelling of this backend.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -274,6 +627,7 @@ impl NativeDatabaseBackend {
             Self::Postgres => "postgres",
             Self::Mysql => "mysql",
             Self::Sqlite => "sqlite",
+            Self::RdsData => "rds-data",
         }
     }
 }

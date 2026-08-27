@@ -45,14 +45,16 @@ mod schema;
 pub use merge::deep_merge;
 pub use migrations::{MigrationFile, MigrationsError, DEFAULT_MIGRATIONS_DIR};
 pub use schema::{
-    AwsSection, AzureHttpMode, AzureQueueTrigger, AzureSection, CfAssets, CfAssetsNotFoundHandling,
-    CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableObjects, CfDurableRenamedClass,
-    CfHandlers, CfKvNamespace, CfQueueConsumer, CfQueueProducer, CfQueues, CfR2Bucket,
-    CfSecretsStoreSecret, CfServiceBinding, CfTriggers, CloudflareDatabaseSection,
-    CloudflareSection, CloudflareServiceSection, DatabaseEntry, DatabaseType, LambdaArchitecture,
-    NativeDatabaseBackend, NativeDatabaseSection, NativeQueueConsumer, NativeSection,
-    NativeServiceBackend, NativeServiceSection, QueueTriggerError, ServiceEntry, ServiceType,
-    SkyzenManifest, HTTP_FUNCTION_NAME,
+    AwsSection, AzureHttpMode, AzureQueueTrigger, AzureSection, BlobWiring, CfAssets,
+    CfAssetsNotFoundHandling, CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableObjects,
+    CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer, CfQueueProducer, CfQueues,
+    CfR2Bucket, CfSecretsStoreSecret, CfServiceBinding, CfTriggers, CloudflareDatabaseSection,
+    CloudflareSection, CloudflareServiceSection, CosmosWiring, DatabaseEntry, DatabaseType,
+    DynamoDbWiring, LambdaArchitecture, MemoryWiring, NativeDatabaseBackend, NativeDatabaseSection,
+    NativeQueueConsumer, NativeSection, NativeServiceBackend, NativeServiceSection,
+    QueueTriggerError, RdsDataWiring, RedisWiring, S3Wiring, ServiceBusWiring, ServiceEntry,
+    ServiceType, SkyzenManifest, SqlUrlWiring, SqsWiring, StorageQueueWiring, WiringEnvVar,
+    HTTP_FUNCTION_NAME,
 };
 
 use std::{
@@ -331,11 +333,40 @@ fn take_environment_overlays(
 
 #[cfg(test)]
 mod tests {
-    use super::{Manifest, ManifestError, NativeServiceBackend, ServiceType};
+    use super::{
+        Manifest, ManifestError, NativeDatabaseBackend, NativeDatabaseSection,
+        NativeServiceBackend, NativeServiceSection, ServiceType,
+    };
     use std::time::Duration;
 
     fn parse(content: &str) -> Result<Manifest, ManifestError> {
         Manifest::parse(content, "Skyzen.toml", ".")
+    }
+
+    /// The `[native.service.cache]` a manifest wiring `cache` with `body` produces.
+    fn service_wiring(body: &str) -> Result<NativeServiceSection, ManifestError> {
+        Ok(parse(&format!(
+            "[[service]]\nname = \"cache\"\ntype = \"kv\"\n\n[native.service.cache]\n{body}"
+        ))?
+        .data()
+        .native
+        .as_ref()
+        .expect("native")
+        .service["cache"]
+            .clone())
+    }
+
+    /// The `[native.database.main]` a manifest wiring `main` with `body` produces.
+    fn database_wiring(body: &str) -> Result<NativeDatabaseSection, ManifestError> {
+        Ok(parse(&format!(
+            "[[database]]\nname = \"main\"\ntype = \"sql\"\n\n[native.database.main]\n{body}"
+        ))?
+        .data()
+        .native
+        .as_ref()
+        .expect("native")
+        .database["main"]
+            .clone())
     }
 
     #[test]
@@ -350,10 +381,240 @@ mod tests {
         let data = manifest.data();
         assert_eq!(data.service[0].service_type, ServiceType::Kv);
         assert_eq!(
-            data.native.as_ref().expect("native").service["cache"].backend,
+            data.native.as_ref().expect("native").service["cache"].backend(),
             NativeServiceBackend::Memory
         );
         assert!(data.database[0].default);
+    }
+
+    #[test]
+    fn a_redis_wiring_names_the_variable_holding_its_url() {
+        let NativeServiceSection::Redis(wiring) =
+            service_wiring("backend = \"redis\"\nurl_env = \"CACHE_URL\"\n").expect("parses")
+        else {
+            panic!("expected the redis variant");
+        };
+        assert_eq!(wiring.url_env, "CACHE_URL");
+    }
+
+    #[test]
+    fn a_dynamodb_wiring_names_its_table_and_leaves_the_rest_to_the_backend() {
+        let NativeServiceSection::DynamoDb(wiring) =
+            service_wiring("backend = \"dynamodb\"\ntable = \"skyzen-sessions\"\n")
+                .expect("parses")
+        else {
+            panic!("expected the dynamodb variant");
+        };
+        assert_eq!(wiring.table, "skyzen-sessions");
+        assert_eq!(wiring.ttl_attribute, None);
+        assert_eq!(wiring.consistent_reads, None);
+    }
+
+    #[test]
+    fn a_dynamodb_wiring_carries_the_two_options_the_builder_takes() {
+        let NativeServiceSection::DynamoDb(wiring) = service_wiring(
+            "backend = \"dynamodb\"\ntable = \"skyzen-sessions\"\n\
+             ttl_attribute = \"ttl\"\nconsistent_reads = true\n",
+        )
+        .expect("parses") else {
+            panic!("expected the dynamodb variant");
+        };
+        assert_eq!(wiring.ttl_attribute.as_deref(), Some("ttl"));
+        assert_eq!(wiring.consistent_reads, Some(true));
+    }
+
+    #[test]
+    fn a_cosmos_wiring_names_its_container_and_reads_the_sdks_own_variables() {
+        let wiring = service_wiring(
+            "backend = \"cosmos\"\ndatabase = \"appdb\"\ncontainer = \"sessions\"\n",
+        )
+        .expect("parses");
+        let NativeServiceSection::Cosmos(cosmos) = &wiring else {
+            panic!("expected the cosmos variant");
+        };
+        assert_eq!(cosmos.database, "appdb");
+        assert_eq!(cosmos.container, "sessions");
+
+        // The endpoint and the key are fixed by `CosmosKv::from_env`, so they are reported as
+        // coming from the backend rather than from a key the manifest could have named.
+        let names: Vec<_> = wiring.env_vars().iter().map(|var| var.name).collect();
+        assert_eq!(names, ["AZURE_COSMOS_ENDPOINT", "AZURE_COSMOS_KEY"]);
+        assert!(wiring.env_vars().iter().all(|var| var.key.is_none()));
+    }
+
+    #[test]
+    fn a_blob_wiring_defaults_to_the_variable_the_azure_sdk_documents() {
+        let NativeServiceSection::Blob(wiring) =
+            service_wiring("backend = \"blob\"\ncontainer = \"uploads\"\n").expect("parses")
+        else {
+            panic!("expected the blob variant");
+        };
+        assert_eq!(wiring.container, "uploads");
+        assert_eq!(wiring.connection_env, "AZURE_STORAGE_CONNECTION_STRING");
+
+        let NativeServiceSection::Blob(overridden) = service_wiring(
+            "backend = \"blob\"\ncontainer = \"uploads\"\nconnection_env = \"UPLOADS_ACCOUNT\"\n",
+        )
+        .expect("parses") else {
+            panic!("expected the blob variant");
+        };
+        assert_eq!(overridden.connection_env, "UPLOADS_ACCOUNT");
+    }
+
+    #[test]
+    fn a_service_bus_wiring_defaults_to_the_variable_the_azure_sdk_documents() {
+        let NativeServiceSection::ServiceBus(wiring) =
+            service_wiring("backend = \"servicebus\"\nqueue = \"jobs\"\n").expect("parses")
+        else {
+            panic!("expected the servicebus variant");
+        };
+        assert_eq!(wiring.queue, "jobs");
+        assert_eq!(wiring.connection_env, "SERVICEBUS_CONNECTION_STRING");
+    }
+
+    #[test]
+    fn a_storage_queue_wiring_names_the_variable_holding_its_signed_url() {
+        let wiring =
+            service_wiring("backend = \"storage-queue\"\nsas_url_env = \"JOBS_SAS_URL\"\n")
+                .expect("parses");
+        let NativeServiceSection::StorageQueue(storage_queue) = &wiring else {
+            panic!("expected the storage-queue variant");
+        };
+        assert_eq!(storage_queue.sas_url_env, "JOBS_SAS_URL");
+        assert_eq!(wiring.env_vars()[0].key, Some("sas_url_env"));
+    }
+
+    #[test]
+    fn an_rds_data_wiring_declares_the_four_variables_its_constructor_reads() {
+        let wiring = database_wiring("backend = \"rds-data\"\n").expect("parses");
+        assert_eq!(wiring.backend(), NativeDatabaseBackend::RdsData);
+        assert_eq!(wiring.url_env(), None);
+
+        let names: Vec<_> = wiring.env_vars().iter().map(|var| var.name).collect();
+        assert_eq!(
+            names,
+            [
+                "RDS_RESOURCE_ARN",
+                "RDS_SECRET_ARN",
+                "RDS_DATABASE",
+                "RDS_ENGINE"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_backend_spelling_parses_back_to_its_own_discriminant() {
+        // `as_str` is what the CLI and the docs print, and the `#[serde(rename)]` on the section is
+        // what the parser accepts. A test rather than a comment, because the two are written twice.
+        let body = |backend: NativeServiceBackend| match backend {
+            NativeServiceBackend::Redis | NativeServiceBackend::Sqs => "url_env = \"X\"".to_owned(),
+            NativeServiceBackend::S3 => "bucket_env = \"X\"".to_owned(),
+            NativeServiceBackend::DynamoDb => "table = \"x\"".to_owned(),
+            NativeServiceBackend::Cosmos => "database = \"a\"\ncontainer = \"b\"".to_owned(),
+            NativeServiceBackend::Blob => "container = \"b\"".to_owned(),
+            NativeServiceBackend::ServiceBus => "queue = \"q\"".to_owned(),
+            NativeServiceBackend::StorageQueue => "sas_url_env = \"X\"".to_owned(),
+            NativeServiceBackend::Memory => String::new(),
+        };
+
+        for backend in NativeServiceBackend::ALL {
+            let wiring = service_wiring(&format!(
+                "backend = \"{}\"\n{}\n",
+                backend.as_str(),
+                body(backend)
+            ))
+            .unwrap_or_else(|error| panic!("{} should parse: {error}", backend.as_str()));
+            assert_eq!(wiring.backend(), backend);
+        }
+
+        for backend in NativeDatabaseBackend::ALL {
+            let body = if backend == NativeDatabaseBackend::RdsData {
+                String::new()
+            } else {
+                "url_env = \"DATABASE_URL\"".to_owned()
+            };
+            let wiring = database_wiring(&format!("backend = \"{}\"\n{body}\n", backend.as_str()))
+                .unwrap_or_else(|error| panic!("{} should parse: {error}", backend.as_str()));
+            assert_eq!(wiring.backend(), backend);
+        }
+    }
+
+    #[test]
+    fn a_key_that_belongs_to_another_backend_is_rejected_where_it_is_written() {
+        // One per variant: the whole point of the tagged shape is that `url_env` under a backend
+        // that reads no URL is a mistake the parser catches, not a key silently ignored.
+        for (body, unknown) in [
+            (
+                "backend = \"redis\"\nbucket_env = \"B\"\nurl_env = \"U\"",
+                "bucket_env",
+            ),
+            (
+                "backend = \"dynamodb\"\ntable = \"t\"\nurl_env = \"U\"",
+                "url_env",
+            ),
+            (
+                "backend = \"cosmos\"\ndatabase = \"a\"\ncontainer = \"b\"\nendpoint_env = \"E\"",
+                "endpoint_env",
+            ),
+            (
+                "backend = \"s3\"\nbucket_env = \"B\"\nurl_env = \"U\"",
+                "url_env",
+            ),
+            (
+                "backend = \"blob\"\ncontainer = \"c\"\nbucket_env = \"B\"",
+                "bucket_env",
+            ),
+            ("backend = \"sqs\"\nurl_env = \"U\"\nqueue = \"q\"", "queue"),
+            (
+                "backend = \"servicebus\"\nqueue = \"q\"\nurl_env = \"U\"",
+                "url_env",
+            ),
+            (
+                "backend = \"storage-queue\"\nsas_url_env = \"U\"\nqueue = \"q\"",
+                "queue",
+            ),
+            ("backend = \"memory\"\nurl_env = \"U\"", "url_env"),
+        ] {
+            let error = service_wiring(&format!("{body}\n"))
+                .expect_err("a key from another backend should be rejected")
+                .to_string();
+            assert!(error.contains(unknown), "{body}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_missing_required_key_fails_the_parse_rather_than_the_build() {
+        for (body, key) in [
+            ("backend = \"redis\"", "url_env"),
+            ("backend = \"dynamodb\"", "table"),
+            ("backend = \"cosmos\"\ndatabase = \"a\"", "container"),
+            ("backend = \"s3\"", "bucket_env"),
+            ("backend = \"blob\"", "container"),
+            ("backend = \"sqs\"", "url_env"),
+            ("backend = \"servicebus\"", "queue"),
+            ("backend = \"storage-queue\"", "sas_url_env"),
+        ] {
+            let error = service_wiring(&format!("{body}\n"))
+                .expect_err("a required key is missing")
+                .to_string();
+            assert!(error.contains(key), "{body}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_rds_data_wiring_rejects_the_keys_its_constructor_cannot_honour() {
+        for key in ["database", "engine", "resource_arn_env", "url_env"] {
+            let error = database_wiring(&format!("backend = \"rds-data\"\n{key} = \"x\"\n"))
+                .expect_err("the RDS Data API reads its own variables")
+                .to_string();
+            assert!(error.contains(key), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_backend_names_the_value_it_rejected() {
+        let error = service_wiring("backend = \"kafka\"\n").expect_err("not a backend");
+        assert!(error.to_string().contains("kafka"), "{error}");
     }
 
     #[test]
