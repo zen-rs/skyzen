@@ -4,7 +4,7 @@
 
 use skyzen::{HttpError, StatusCode};
 
-#[skyzen::error(message = "artifact error")]
+#[skyzen::error]
 enum SampleError {
     #[error("bad request", status = BAD_REQUEST)]
     BadRequest,
@@ -136,4 +136,86 @@ fn display_messages_match_error_attributes() {
     assert_eq!(ApiError::NotFound.to_string(), "not found");
     assert_eq!(ApiError::Upstream.to_string(), "upstream failed");
     assert_eq!(PlainError::Boom.to_string(), "boom");
+}
+
+/// A wrapped cause, so `source()` has something concrete to hand back.
+#[derive(Debug)]
+struct Cause(&'static str);
+
+impl std::fmt::Display for Cause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Cause {}
+
+/// `#[from]` and `#[source]` both surface the wrapped error as the cause.
+#[skyzen::error]
+enum WrappingError {
+    /// Converts from `Cause` and reports it as the cause.
+    #[error("upstream call failed", status = BAD_GATEWAY)]
+    Upstream(#[from] Cause),
+
+    /// Reports the cause without generating a conversion.
+    #[error("writing {key} failed")]
+    Write {
+        key: &'static str,
+        #[source]
+        cause: Cause,
+    },
+
+    /// Carries no cause at all.
+    #[error("nothing to report", status = NOT_FOUND)]
+    Bare,
+}
+
+/// `#[from]` on a struct error generates the conversion and the cause.
+#[skyzen::error(message = "shim failed", status = BAD_GATEWAY)]
+struct ShimError(#[from] Cause);
+
+#[test]
+fn from_variant_reports_the_wrapped_error_as_source() {
+    let error = WrappingError::from(Cause("socket closed"));
+    assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(error.to_string(), "upstream call failed");
+    assert_eq!(
+        std::error::Error::source(&error)
+            .expect("#[from] field is the source")
+            .to_string(),
+        "socket closed"
+    );
+}
+
+#[test]
+fn source_marked_field_reports_the_wrapped_error_as_source() {
+    let error = WrappingError::Write {
+        key: "meta:1",
+        cause: Cause("disk full"),
+    };
+    assert_eq!(error.to_string(), "writing meta:1 failed");
+    assert_eq!(
+        std::error::Error::source(&error)
+            .expect("#[source] field is the source")
+            .to_string(),
+        "disk full"
+    );
+}
+
+#[test]
+fn variant_without_a_marked_field_has_no_source() {
+    assert!(std::error::Error::source(&WrappingError::Bare).is_none());
+}
+
+#[test]
+fn struct_error_reports_its_from_field_as_source() {
+    let error = ShimError::from(Cause("handshake rejected"));
+    assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(error.to_string(), "shim failed");
+    assert_eq!(
+        std::error::Error::source(&error)
+            .expect("#[from] field is the source")
+            .to_string(),
+        "handshake rejected"
+    );
 }

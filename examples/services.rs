@@ -4,8 +4,9 @@
 //! production backends, replace `InMemoryKv`/`InMemoryStorage` with:
 //!
 //! - `Redis::connect("redis://localhost:6379").await.unwrap()` (skyzen-redis)
-//! - `S3Storage::from_env("my-bucket")` (skyzen-s3)
+//! - `S3Storage::from_env("my-bucket").await` (skyzen-s3)
 //! - `DynamoKv::from_env("my-table").await` (skyzen-aws)
+//! - `CosmosKv::from_env("appdb", "files").await.unwrap()` (skyzen-azure)
 //!
 //! The handler code stays exactly the same.
 //!
@@ -13,7 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 use skyzen::{
-    routing::{CreateRouteNode, Params, Route, Router},
+    extract::Path,
+    routing::{CreateRouteNode, Route, Router},
     utils::Json,
     Result as SkyResult,
 };
@@ -33,21 +35,18 @@ struct UploadRequest {
 }
 
 /// List all file metadata keys stored in KV.
+///
+/// `list_all` drains the backend's list cursor, which suits a demo namespace; a real listing
+/// endpoint should page with `kv.list(KvListOptions::new().with_prefix("file:").with_limit(n))`
+/// and hand the returned cursor back to the client.
 async fn list_files(kv: Kv) -> SkyResult<Json<Vec<String>>> {
-    let keys = kv
-        .list(Some("file:"))
-        .await
-        .map_err(|e| skyzen::Error::msg(e.to_string()))?;
+    let keys = kv.list_all(Some("file:")).await?;
     Ok(Json(keys))
 }
 
 /// Get metadata for a single file from KV.
-async fn get_file(kv: Kv, params: Params) -> SkyResult<Json<Option<FileMetadata>>> {
-    let name = params.get("name")?;
-    let meta = kv
-        .get_json::<FileMetadata>(&format!("file:{name}"))
-        .await
-        .map_err(|e| skyzen::Error::msg(e.to_string()))?;
+async fn get_file(kv: Kv, Path(name): Path<String>) -> SkyResult<Json<Option<FileMetadata>>> {
+    let meta = kv.get_json::<FileMetadata>(&format!("file:{name}")).await?;
     Ok(Json(meta))
 }
 
@@ -64,15 +63,10 @@ async fn upload_file(
     };
 
     // Store file bytes in object storage
-    storage
-        .put(&body.name, data)
-        .await
-        .map_err(|e| skyzen::Error::msg(e.to_string()))?;
+    storage.put(&body.name, data).await?;
 
     // Store metadata in KV
-    kv.put_json(&format!("file:{}", body.name), &meta)
-        .await
-        .map_err(|e| skyzen::Error::msg(e.to_string()))?;
+    kv.put_json(&format!("file:{}", body.name), &meta).await?;
 
     Ok("uploaded")
 }
@@ -94,10 +88,10 @@ fn main() -> Router {
     let kv = Kv::new(InMemoryKv::new());
     let storage = Storage::new(InMemoryStorage::new());
 
-    // For production with Redis + S3, swap to:
+    // For production with Redis + S3, make this `async fn main` and swap to:
     //   let redis = Redis::connect("redis://127.0.0.1:6379").await.unwrap();
     //   let kv = Kv::new(redis);
-    //   let storage = Storage::new(S3Storage::from_env("my-bucket"));
+    //   let storage = Storage::new(S3Storage::from_env("my-bucket").await);
 
     build_router(kv, storage)
 }

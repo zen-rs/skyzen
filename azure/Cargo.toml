@@ -11,19 +11,90 @@ categories = ["web-programming::http-server", "database"]
 
 [dependencies]
 skyzen-services = { path = "../services", version = "0.1.0" }
-azure_data_cosmos = { version = "0.36", optional = true }
-azure_messaging_servicebus = { version = "0.21", optional = true }
-opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "http-transport-reqwest-rustls", "services-azblob"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"
 base64 = "0.22"
+tracing.workspace = true
+
+# Cosmos DB.
+azure_data_cosmos = { version = "0.37.1", features = ["key_auth"], optional = true }
+
+# Service Bus. The legacy client is the only published one; `azure_core` 0.21 is the HTTP stack it
+# already links, and the settlement calls this crate issues go out on that same client.
+azure_messaging_servicebus = { version = "0.21", optional = true }
+azure_core_legacy = { package = "azure_core", version = "0.21", optional = true }
+time = { version = "0.3", optional = true }
+url = { version = "2", optional = true }
+
+# Azure Storage queues, and the credential types Cosmos and the queues share.
+azure_storage_queue = { version = "1.0", optional = true }
+azure_core = { version = "1.0", optional = true }
+# Storage queues have no long polling of their own, so `receive` emulates one with a timer.
+async-io = { workspace = true, optional = true }
+
+# Blob Storage: OpenDAL moves the bytes, and the listing, tiering and presigning REST calls go out
+# on the same reqwest/reqsign stack OpenDAL's own azblob service is built on.
+opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "http-transport-reqwest-rustls", "services-azblob"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+reqsign-azure-storage = { version = "3.1", optional = true }
+reqsign-core = { version = "3.1", optional = true }
+quick-xml = { version = "0.41", features = ["serialize"], optional = true }
+http = { version = "1.4", optional = true }
+bytes = { version = "1", optional = true }
+
+# Azure SQL. `tiberius` is the only maintained TDS driver for Rust and sqlx has none, so it is what
+# makes Azure SQL reachable at all; `deadpool-tiberius` is the pool in front of it, chosen over
+# `bb8-tiberius` because deadpool's `Object::take` can detach a connection from the pool, which is
+# what keeps a transaction that was dropped without a commit from handing back a dirty connection.
+# `native-tls` rather than `rustls`: tiberius's rustls feature pins rustls 0.21, whose
+# rustls-webpki 0.101 carries three RustSec vulnerabilities (2026-0098/0099/0104) with no
+# compatible fix. The platform TLS path costs an unmaintained `async-native-tls` wrapper and an
+# async-std transitive (already in the tree via sqlx-macros) — warnings, not vulnerabilities —
+# and puts SChannel/SecureTransport/OpenSSL under the handshake instead. Revisit when a tiberius
+# release moves to rustls >= 0.23.
+deadpool-tiberius = { version = "0.1.9", default-features = false, features = ["native-tls", "tds73", "chrono"], optional = true }
+# tiberius's own ADO.NET parser, named directly so the encryption and authentication policy applied
+# to a connection string reads exactly the string tiberius will read.
+connection-string = { version = "0.2", optional = true }
+# The parameter types `DbValue` carries, at the versions `skyzen-services` names, so a bound value
+# is the same type on both sides of the crate boundary. `uuid` needs no entry: tiberius re-exports
+# the one it was compiled against, which cargo has already unified with the one `DbValue` carries.
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+bigdecimal = { version = "0.4", optional = true }
+
+[dev-dependencies]
+# `AzureStorageQueue::from_sas_env` is tested against a variable this crate sets and removes, and
+# the environment is process-wide: the tests that touch it run one at a time.
+serial_test = "3.2"
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [features]
-default = ["cosmos", "blob", "servicebus"]
-cosmos = ["dep:azure_data_cosmos"]
-blob = ["dep:opendal"]
-servicebus = ["dep:azure_messaging_servicebus"]
+default = ["cosmos", "blob", "servicebus", "storage-queue", "sql"]
+cosmos = ["dep:azure_data_cosmos", "dep:azure_core"]
+blob = [
+    "dep:opendal",
+    "dep:url",
+    "dep:reqwest",
+    "dep:reqsign-azure-storage",
+    "dep:reqsign-core",
+    "dep:quick-xml",
+    "dep:http",
+    "dep:bytes",
+]
+servicebus = [
+    "dep:azure_messaging_servicebus",
+    "dep:azure_core_legacy",
+    "dep:time",
+    "dep:url",
+]
+storage-queue = ["dep:azure_storage_queue", "dep:azure_core", "dep:async-io"]
+sql = [
+    "dep:deadpool-tiberius",
+    "dep:connection-string",
+    "dep:chrono",
+    "dep:bigdecimal",
+]
 
 [lints]
 workspace = true

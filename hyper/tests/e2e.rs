@@ -1,6 +1,7 @@
 //! End-to-end tests: drive [`skyzen_hyper::Hyper`] over a localhost listener with a raw
 //! HTTP/1.1 client and assert on the bytes that actually go over the wire.
 
+use core::future::Future;
 use executor_core::smol::SmolGlobal;
 use http_kit::error::BoxHttpError;
 use http_kit::{http_error, Body, Request, Response, StatusCode};
@@ -30,12 +31,15 @@ struct TestEndpoint;
 impl Endpoint for TestEndpoint {
     type Error = BoxHttpError;
 
-    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        match request.uri().path() {
+    fn respond(
+        &mut self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        core::future::ready(match request.uri().path() {
             "/hello" => Ok(Response::new(Body::from_bytes("hello world"))),
-            "/teapot" => Err(Box::new(TeapotError::new())),
-            _ => Err(Box::new(SecretDbError::new())),
-        }
+            "/teapot" => Err(Box::new(TeapotError::new()) as Self::Error),
+            _ => Err(Box::new(SecretDbError::new()) as Self::Error),
+        })
     }
 }
 

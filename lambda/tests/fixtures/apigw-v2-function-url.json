@@ -1,0 +1,35 @@
+{
+  "version": "2.0",
+  "routeKey": "$default",
+  "rawPath": "/greet/ada",
+  "rawQueryString": "loud=true",
+  "headers": {
+    "content-type": "application/json",
+    "host": "abcdefghij.lambda-url.us-east-2.on.aws",
+    "user-agent": "curl/8.7.1",
+    "x-forwarded-for": "203.0.113.42"
+  },
+  "queryStringParameters": {
+    "loud": "true"
+  },
+  "requestContext": {
+    "accountId": "anonymous",
+    "apiId": "abcdefghij",
+    "domainName": "abcdefghij.lambda-url.us-east-2.on.aws",
+    "domainPrefix": "abcdefghij",
+    "http": {
+      "method": "POST",
+      "path": "/greet/ada",
+      "protocol": "HTTP/1.1",
+      "sourceIp": "203.0.113.42",
+      "userAgent": "curl/8.7.1"
+    },
+    "requestId": "e1506fd0-9a5a-4f4a-9d1e-2b1f9a0e0f11",
+    "routeKey": "$default",
+    "stage": "$default",
+    "time": "18/Dec/2018:19:37:29 +0000",
+    "timeEpoch": 1545162449183
+  },
+  "body": "{\"greeting\":\"hello\"}",
+  "isBase64Encoded": false
+}

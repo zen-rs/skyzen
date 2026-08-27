@@ -1,7 +1,7 @@
 //! OpenAPI helpers powered by `utoipa` schemas.
 
+use core::future::{ready, Future};
 use std::collections::BTreeMap;
-#[cfg(feature = "openapi")]
 use std::marker::PhantomData;
 use std::{
     fmt::{self, Debug},
@@ -11,7 +11,7 @@ use std::{
 use crate::{
     extract::Extractor,
     responder::Responder,
-    routing::{IntoRouteNode, RouteNode},
+    routing::{IntoRouteNode, MethodFilter, RouteNode},
     Body, Endpoint, Request, Response, Route,
 };
 use http_kit::{header, http_error, Method, StatusCode};
@@ -47,6 +47,8 @@ pub enum ParameterLocation {
     Query,
     /// Read from a request header.
     Header,
+    /// Read from the route's captured `{name}` path segments.
+    Path,
 }
 
 #[cfg(not(feature = "openapi"))]
@@ -257,16 +259,39 @@ where
     }
 }
 
-#[cfg(feature = "openapi")]
-struct SchemaProbe<T>(PhantomData<T>);
+/// Asks "does `T` describe itself?" without requiring that it does.
+///
+/// The answer is decided by method resolution: [`SchemaProbe::maybe_schema`] is an *inherent*
+/// method that only exists when `T: ToSchema`, and inherent methods win over the trait method of
+/// the same name on `&SchemaProbe<T>`, so a self-describing type takes the first and everything
+/// else falls through to the second.
+///
+/// The choice is made where the call is written, so it only discriminates when `T` is concrete
+/// there. Calling it from a function generic over `T` always yields the fallback — which is why
+/// `#[skyzen::openapi]` emits the probe at the handler's own call site, where the extractor's
+/// payload type is spelled out.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct SchemaProbe<T>(PhantomData<T>);
 
-#[cfg(feature = "openapi")]
-trait MaybeSchemaProbe {
+impl<T> SchemaProbe<T> {
+    /// Build a probe for `T`.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+/// The fallback half of [`SchemaProbe`]: any type at all, describing nothing.
+#[doc(hidden)]
+pub trait MaybeSchemaProbe {
+    /// No schema, because `T` does not implement `ToSchema`.
     fn maybe_schema(self) -> Option<SchemaRef>;
+    /// Nothing to register, for the same reason.
     fn maybe_register(self, defs: &mut BTreeMap<String, SchemaRef>);
 }
 
-#[cfg(feature = "openapi")]
 impl<T> MaybeSchemaProbe for &SchemaProbe<T> {
     fn maybe_schema(self) -> Option<SchemaRef> {
         None
@@ -275,33 +300,53 @@ impl<T> MaybeSchemaProbe for &SchemaProbe<T> {
     fn maybe_register(self, _defs: &mut BTreeMap<String, SchemaRef>) {}
 }
 
-#[cfg(feature = "openapi")]
-impl<T> MaybeSchemaProbe for &&SchemaProbe<T>
+/// The specialized half of [`SchemaProbe`], reached only when `T` really does describe itself.
+impl<T> SchemaProbe<T>
 where
     T: crate::PartialSchema + crate::ToSchema,
 {
-    fn maybe_schema(self) -> Option<SchemaRef> {
+    /// The schema `T` declares.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn maybe_schema(&self) -> Option<SchemaRef> {
         Some(<T as crate::PartialSchema>::schema())
     }
 
-    fn maybe_register(self, defs: &mut BTreeMap<String, SchemaRef>) {
+    /// Register `T` and its dependencies into the components map.
+    #[doc(hidden)]
+    #[cfg(feature = "openapi")]
+    pub fn maybe_register(&self, defs: &mut BTreeMap<String, SchemaRef>) {
         register_type::<T>(defs);
+    }
+
+    /// Registering is a no-op without the `openapi` feature: nothing ever reads the components
+    /// map, so the probe keeps its signature and does nothing.
+    ///
+    /// This is a separate `const` definition rather than one body holding a `#[cfg]`ed statement
+    /// so the feature-off form is genuinely const, which is what `clippy::missing_const_for_fn`
+    /// asks for on the wasm builds that turn `openapi` off.
+    #[doc(hidden)]
+    #[cfg(not(feature = "openapi"))]
+    pub const fn maybe_register(&self, defs: &mut BTreeMap<String, SchemaRef>) {
+        let _ = defs;
     }
 }
 
 /// Return the schema for `T` when it implements `ToSchema`; otherwise return `None`.
+///
+/// `T` is generic here, so this always takes the fallback; it exists for extractors whose own
+/// payload type is generic and therefore cannot be probed. `#[skyzen::openapi]` probes at the
+/// handler's call site instead, which is what puts real types in the generated document.
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn maybe_schema_of<T>() -> Option<SchemaRef> {
-    let probe = SchemaProbe::<T>(PhantomData);
-    (&probe).maybe_schema()
+    SchemaProbe::<T>::new().maybe_schema()
 }
 
 /// Register the schema for `T` when it implements `ToSchema`; otherwise do nothing.
 #[cfg(feature = "openapi")]
 pub fn maybe_register_schema_for<T>(defs: &mut BTreeMap<String, SchemaRef>) {
-    let probe = SchemaProbe::<T>(PhantomData);
-    (&probe).maybe_register(defs);
+    SchemaProbe::<T>::new().maybe_register(defs);
 }
 
 /// Register a schema and its dependencies when `OpenAPI` is enabled.
@@ -649,8 +694,13 @@ http_error!(
 
 impl Endpoint for OpenApiRedocEndpoint {
     type Error = OpenApiRedocDisabledError;
-    async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-        self.html.as_ref().map_or_else(
+    // The document is rendered at build time, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn respond(
+        &mut self,
+        _request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ready(self.html.as_ref().map_or_else(
             || Err(OpenApiRedocDisabledError::new()),
             |html| {
                 let mut response = Response::new(Body::from(html.as_bytes().to_vec()));
@@ -660,15 +710,27 @@ impl Endpoint for OpenApiRedocEndpoint {
                 );
                 Ok(response)
             },
-        )
+        ))
     }
 }
 
 fn redoc_route(endpoint: OpenApiRedocEndpoint, mount_path: String) -> RouteNode {
     let wildcard_suffix = "/{*path}";
     let route = Route::new((
-        RouteNode::new_endpoint("", Method::GET, endpoint.clone(), None),
-        RouteNode::new_endpoint(wildcard_suffix, Method::GET, endpoint, None),
+        RouteNode::new_endpoint(
+            "",
+            MethodFilter::Exact(Method::GET),
+            endpoint.clone(),
+            None,
+            Vec::new(),
+        ),
+        RouteNode::new_endpoint(
+            wildcard_suffix,
+            MethodFilter::Exact(Method::GET),
+            endpoint,
+            None,
+            Vec::new(),
+        ),
     ));
 
     RouteNode::new_route(mount_path, route)
@@ -760,13 +822,18 @@ fn path_parameter_names(path: &str) -> Vec<String> {
 fn build_parameters(op: &OpenApiOperation) -> Vec<Parameter> {
     let mut parameters = Vec::new();
 
-    for name in path_parameter_names(&op.path) {
+    // The route pattern is what names the path parameters; a `Path<T>` extractor only supplies
+    // their types, so the two are merged rather than both emitted.
+    let names = path_parameter_names(&op.path);
+    let typed = typed_path_schemas(op, &names);
+    for name in names {
+        let schema = typed.get(&name).cloned();
         parameters.push(
             ParameterBuilder::new()
                 .name(name)
                 .parameter_in(ParameterIn::Path)
                 .required(Required::True)
-                .schema(Some(string_param_schema()))
+                .schema(Some(schema.unwrap_or_else(string_param_schema)))
                 .build(),
         );
     }
@@ -788,11 +855,43 @@ fn build_parameters(op: &OpenApiOperation) -> Vec<Parameter> {
                     ))
                     .build(),
             ),
-            ParameterLocation::Body => {}
+            // Path parameters were emitted above, merged with the route pattern's names; body
+            // extractors are handled by `build_request_body`.
+            ParameterLocation::Path | ParameterLocation::Body => {}
         }
     }
 
     parameters
+}
+
+/// The schemas a `Path<T>` extractor contributes, keyed by path parameter name.
+///
+/// A struct or map payload names its own fields; a tuple or a bare primitive does not, so its
+/// schema is matched positionally against the route pattern — which for the single-parameter case
+/// is exactly what `Path<u64>` means.
+fn typed_path_schemas(op: &OpenApiOperation, names: &[String]) -> BTreeMap<String, RefOr<Schema>> {
+    let mut typed = BTreeMap::new();
+    for named in &op.parameters {
+        if named.schema.location != ParameterLocation::Path {
+            continue;
+        }
+        let Some(schema) = &named.schema.schema else {
+            continue;
+        };
+        match schema {
+            RefOr::T(Schema::Object(object)) if !object.properties.is_empty() => {
+                for (field, field_schema) in &object.properties {
+                    typed.insert(field.clone(), field_schema.clone());
+                }
+            }
+            _ => {
+                if let [only] = names {
+                    typed.insert(only.clone(), schema.clone());
+                }
+            }
+        }
+    }
+    typed
 }
 
 /// Append query parameters for a `Query<T>` extractor. When the schema is an inline object its

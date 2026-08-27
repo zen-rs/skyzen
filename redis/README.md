@@ -34,6 +34,14 @@ use skyzen_redis::Redis;
 let redis = Redis::connect("redis://127.0.0.1:6379").await.unwrap();
 ```
 
+Or from `REDIS_URL`, the way every other Skyzen backend reads its configuration:
+
+```rust
+use skyzen_redis::Redis;
+
+let redis = Redis::from_env().await.unwrap();
+```
+
 Or from an existing connection manager:
 
 ```rust
@@ -43,12 +51,27 @@ let conn = ConnectionManager::new(client).await?;
 let redis = Redis::from_connection_manager(conn);
 ```
 
+### Atomic primitives
+
+Beyond get/put/delete/list, this backend implements the whole `KeyValueStore` surface on Redis'
+own commands: `put_if_absent` (`SET NX`) for distributed locks and idempotency keys,
+`compare_and_swap` (a Lua script, since Redis has no compare-and-swap command and a GET/SET pair is
+not atomic), `increment` (`INCRBY`) for rate-limit counters, `expire` (`PEXPIRE`) for sliding
+sessions, and `exists` (`EXISTS`).
+
+Redis Cluster and Sentinel are out of scope: this type speaks to a single endpoint, so a key that
+hashes to another slot comes back as a `MOVED` error rather than being followed.
+
 ### Wiring into a Skyzen App
 
 Wrap the `Redis` instance in `Kv` and inject it as middleware:
 
 ```rust
-use skyzen::routing::{CreateRouteNode, Route, Router};
+use skyzen::{
+    extract::Path,
+    routing::{CreateRouteNode, Route, Router},
+    Result,
+};
 use skyzen_redis::Redis;
 use skyzen_services::Kv;
 
@@ -64,12 +87,10 @@ async fn main() -> Router {
     .build()
 }
 
-async fn get_cached(kv: Kv, params: skyzen::routing::Params) -> Result<String> {
-    let key = params.get("key")?;
-    let value = kv.get_text(key).await.map_err(|e| {
-        skyzen_core::error::Error::internal(e.to_string())
-    })?;
-    Ok(value.unwrap_or_default())
+// `KvError` implements `HttpError`, so a bare `?` carries it — and its status — into the response.
+// There is no `map_err` to write.
+async fn get_cached(kv: Kv, Path(key): Path<String>) -> Result<String> {
+    Ok(kv.get_text(&key).await?.unwrap_or_default())
 }
 ```
 

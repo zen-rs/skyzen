@@ -15,7 +15,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use skyzen_core::{error_response, BodyError, Endpoint, HttpError, PeerAddr};
+use skyzen_core::{error_response, log_endpoint_error, BodyError, Endpoint, PeerAddr};
 
 type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
 type Bytes = http_kit::utils::Bytes;
@@ -133,24 +133,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                     response
                 }
                 Err(error) => {
-                    let status = error.status();
-                    if status.is_server_error() {
-                        tracing::error!(
-                            method = method.as_str(),
-                            path = path.as_str(),
-                            status = status.as_u16(),
-                            error = %error,
-                            "internal server error"
-                        );
-                    } else {
-                        tracing::warn!(
-                            method = method.as_str(),
-                            path = path.as_str(),
-                            status = status.as_u16(),
-                            error = %error,
-                            "client error"
-                        );
-                    }
+                    log_endpoint_error(&error, &method, path.as_str());
                     error_response(&error)
                 }
             };

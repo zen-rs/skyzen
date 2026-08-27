@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 
 use skyzen::durable::{DurableObject, DurableObjectError, WebSocketConnection, WebSocketEvent};
-use skyzen::{Body, Endpoint, HttpError, Method, Request, Response, StatusCode, Uri};
+use skyzen::{Body, Endpoint, Method, Request, Response, StatusCode, Uri};
 use skyzen_services::durable::DurableKv;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -52,6 +52,11 @@ where
             .inject_request_extensions(&mut request)
             .map_err(to_js)?;
 
+        // Capture the request identity before `respond` takes the request mutably, so the error
+        // log can name the call that failed the way the HTTP backends do.
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+
         // State is persisted only when the handler succeeds, matching the
         // websocket and alarm paths.
         let (response, succeeded) = {
@@ -59,7 +64,12 @@ where
                 skyzen::runtime::wasm::with_current_env(env, || loaded.object.fetch());
             match endpoint.respond(&mut request).await {
                 Ok(response) => (response, true),
-                Err(error) => (error_to_response(&error), false),
+                Err(error) => {
+                    // Log and render through the shared helpers so every backend emits the same
+                    // fields and applies the same 4xx/5xx redaction policy.
+                    skyzen::log_endpoint_error(&error, &method, path.as_str());
+                    (skyzen::error_response(&error), false)
+                }
             }
         };
 
@@ -303,6 +313,15 @@ async fn load_state<T>(state: &worker_sys::DurableObjectState) -> Result<LoadedO
 where
     T: DurableObject,
 {
+    // An object that keeps its state in storage itself has no blob to restore, so the read and the
+    // parse are skipped rather than performed and discarded.
+    if !T::PERSIST {
+        return Ok(LoadedObject {
+            object: T::default(),
+            snapshot: None,
+        });
+    }
+
     let kv = DurableKv::new(CfDurableKv::from_state(state).map_err(|error| {
         JsValue::from_str(&format!(
             "failed to initialize durable kv for state load: {error}"
@@ -328,7 +347,8 @@ where
 
 /// Persist the object's serialized state, skipping the storage write when the
 /// bytes are identical to what [`load_state`] read (read-only events would
-/// otherwise write on every invocation).
+/// otherwise write on every invocation), and skipping it entirely for an object
+/// that opted out with `PERSIST = false`.
 async fn save_state<T>(
     state: &worker_sys::DurableObjectState,
     loaded: &LoadedObject<T>,
@@ -336,6 +356,10 @@ async fn save_state<T>(
 where
     T: DurableObject,
 {
+    if !T::PERSIST {
+        return Ok(());
+    }
+
     let bytes = serde_json::to_vec(&loaded.object).map_err(|error| {
         JsValue::from_str(&format!(
             "failed to serialize durable state '{SKYZEN_STATE_KEY}': {error}"
@@ -420,6 +444,13 @@ async fn convert_request(request: web_sys::Request) -> Result<Request, JsValue> 
         sky_request.headers_mut().insert(name, value);
     }
 
+    // A Durable Object's requests carry the same `cf` the main fetch handler sees — they are the
+    // edge request, forwarded — so a handler that reads [`CfProperties`] must not go blind just
+    // because it runs inside an object.
+    if let Some(slot) = skyzen::runtime::CfPropertiesSlot::read(&request)? {
+        sky_request.extensions_mut().insert(slot);
+    }
+
     Ok(sky_request)
 }
 
@@ -459,27 +490,6 @@ async fn convert_response(mut response: Response) -> Result<web_sys::Response, J
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let body = js_sys::Uint8Array::from(bytes.as_ref());
     web_sys::Response::new_with_opt_buffer_source_and_init(Some(&body), &init)
-}
-
-fn error_to_response(error: &impl HttpError) -> Response {
-    let status = error.status();
-    let message = error.to_string();
-
-    let body = if status.is_server_error() {
-        tracing::error!(status = status.as_u16(), error = %message, "durable fetch internal error");
-        serde_json::json!({ "error": "Internal server error" }).to_string()
-    } else {
-        tracing::warn!(status = status.as_u16(), error = %message, "durable fetch client error");
-        serde_json::json!({ "error": message }).to_string()
-    };
-
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        skyzen::header::CONTENT_TYPE,
-        skyzen::header::HeaderValue::from_static("application/json"),
-    );
-    response
 }
 
 async fn read_body_bytes(request: &web_sys::Request) -> Result<Vec<u8>, JsValue> {

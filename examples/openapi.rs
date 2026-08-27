@@ -5,7 +5,7 @@
 use http::Method;
 use serde::{Deserialize, Serialize};
 use skyzen::{
-    extract::Query,
+    extract::{Path, Query},
     routing::{CreateRouteNode, Route, Router},
     utils::Json,
     OpenApi, StatusCode, ToSchema,
@@ -70,14 +70,11 @@ async fn hello(Json(query): Json<HelloQuery>) -> skyzen::Result<Json<HelloRespon
 /// Creates a task under a project, demonstrating multiple extractors with `OpenAPI` metadata.
 #[skyzen::openapi]
 async fn create_task(
-    params: skyzen::routing::Params,
+    Path(project_id): Path<String>,
     Query(filter): Query<TaskFilter>,
     Json(draft): Json<TaskDraft>,
 ) -> skyzen::Result<Json<Task>> {
     // In a real handler we would persist the task; here we just echo the request back.
-    let project_id = params
-        .get("project_id")
-        .map_or_else(|_| "unknown".to_string(), ToString::to_string);
     let task = Task {
         id: "task-123".into(),
         project_id,
@@ -96,12 +93,12 @@ fn schema_to_string<T: Serialize>(schema: &T) -> String {
 
 fn log_openapi(spec: &OpenApi) {
     if !spec.is_enabled() {
-        println!("OpenAPI support is disabled for this build.");
+        tracing::warn!("OpenAPI support is disabled for this build");
         return;
     }
 
     for op in spec.operations() {
-        println!(
+        tracing::info!(
             "{} {} handled by {}",
             op.method.as_str(),
             op.path,
@@ -109,7 +106,7 @@ fn log_openapi(spec: &OpenApi) {
         );
 
         if let Some(docs) = op.docs {
-            println!("  docs: {docs}");
+            tracing::info!("  docs: {docs}");
         }
 
         for param in &op.parameters {
@@ -119,11 +116,11 @@ fn log_openapi(spec: &OpenApi) {
                 .as_ref()
                 .map_or_else(|| "<undocumented>".to_string(), schema_to_string);
             let content_type = param.schema.content_type.unwrap_or("<unknown>");
-            println!("  param {} ({}): {}", param.name, content_type, schema);
+            tracing::info!("  param {} ({}): {}", param.name, content_type, schema);
         }
 
         if op.responses.is_empty() {
-            println!("  response: <ignored>");
+            tracing::info!("  response: <ignored>");
         } else {
             for response in &op.responses {
                 let status = response.status.unwrap_or(StatusCode::OK);
@@ -132,7 +129,7 @@ fn log_openapi(spec: &OpenApi) {
                     .schema
                     .as_ref()
                     .map_or_else(|| "<undocumented>".to_string(), schema_to_string);
-                println!(
+                tracing::info!(
                     "  response {} ({}): {}",
                     status.as_u16(),
                     content_type,
@@ -142,9 +139,27 @@ fn log_openapi(spec: &OpenApi) {
         }
     }
 
+    write_openapi_document(spec);
+}
+
+/// Write the generated document to stdout, as a document rather than as a log record.
+///
+/// This one is not a `tracing` event on purpose. The lines above describe what the router holds
+/// and belong in the log; this is the artifact itself — the thing a reader redirects into a file
+/// or pipes into `jq` — and a subscriber would prefix every line of it with a level and a target,
+/// which is exactly what makes such a pipe useless.
+fn write_openapi_document(spec: &OpenApi) {
+    use std::io::Write as _;
+
     let json = serde_json::to_string_pretty(&spec.to_utoipa_spec())
         .unwrap_or_else(|err| format!("<failed to serialize spec: {err}>"));
-    println!("\nFull OpenAPI document:\n{json}");
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    if let Err(error) = writeln!(stdout, "{json}") {
+        // A closed pipe (`| head`) is the ordinary case, and is not worth a panic.
+        tracing::warn!("failed to write the OpenAPI document to stdout: {error}");
+    }
 }
 
 #[skyzen::main]
@@ -158,8 +173,8 @@ fn main() -> Router {
     ))
     .build();
     let openapi = router.openapi();
-    println!("OpenAPI enabled: {}", openapi.is_enabled());
-    println!("ReDoc endpoint mounted at GET /docs");
+    tracing::info!("OpenAPI enabled: {}", openapi.is_enabled());
+    tracing::info!("ReDoc endpoint mounted at GET /docs");
     log_openapi(&openapi);
     router
 }
