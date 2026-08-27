@@ -245,14 +245,21 @@ const COSMOS_ENDPOINT_ENV: &str = "AZURE_COSMOS_ENDPOINT";
 /// The account key `CosmosKv::from_env` reads.
 const COSMOS_KEY_ENV: &str = "AZURE_COSMOS_KEY";
 
-/// The four variables `RdsDataDb::from_env` reads. It is the only public constructor that builds
-/// its own client, so a manifest wiring cannot move or replace any of them.
+/// The four variables `RdsDataDb::from_env` reads, in the order that constructor reads them.
+///
+/// Read only by the wiring that names none of the four values itself; one that names all four is
+/// built through `RdsDataDb::from_parts` and reads nothing. Their names are fixed by the
+/// constructor, so a wiring can replace them wholesale but cannot rename them.
 const RDS_ENV_VARS: [&str; 4] = [
     "RDS_RESOURCE_ARN",
     "RDS_SECRET_ARN",
     "RDS_DATABASE",
     "RDS_ENGINE",
 ];
+
+/// The manifest keys an [`RdsDataWiring`] names its four values with, in the order they are
+/// reported. Written once because the parse check, the error message and the docs all name them.
+const RDS_DATA_KEYS: [&str; 4] = ["resource_arn", "secret_arn", "database", "engine"];
 
 /// `[native.service.<name>]` — how one portable service is backed on native targets.
 ///
@@ -437,7 +444,7 @@ pub struct StorageQueueWiring {
     pub sas_url_env: String,
 }
 
-pub use fieldless::{MemoryWiring, RdsDataWiring};
+pub use fieldless::MemoryWiring;
 
 /// The wirings whose whole table is `backend`, and which therefore accept no other key.
 ///
@@ -452,16 +459,149 @@ mod fieldless {
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct MemoryWiring {}
+}
 
-    /// `backend = "rds-data"`.
+/// `backend = "rds-data"`.
+///
+/// A Data API call is addressed by four values: the Aurora cluster's ARN, the Secrets Manager
+/// secret holding its credentials, the database, and the engine. This wiring either names **all
+/// four** — and is built with `RdsDataDb::from_parts`, reading nothing from the environment — or
+/// names **none** of them, and is built with `RdsDataDb::from_env`, which reads
+/// `RDS_RESOURCE_ARN`, `RDS_SECRET_ARN`, `RDS_DATABASE` and `RDS_ENGINE`.
+///
+/// Naming only some is rejected when the manifest is parsed, by [`parts`](Self::parts): a wiring
+/// that took its ARN from the file and its database from a variable would be half-declared, and
+/// the half nobody wrote down is the half `skyzen dev` cannot check.
+///
+/// The credentials and the region come from the ambient AWS chain either way, as with `dynamodb`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RdsDataWiring {
+    /// The Aurora cluster's ARN, when the wiring names it rather than leaving it to
+    /// `RDS_RESOURCE_ARN`.
+    #[serde(default)]
+    pub resource_arn: Option<String>,
+    /// The Secrets Manager secret holding the cluster's credentials, when the wiring names it
+    /// rather than leaving it to `RDS_SECRET_ARN`.
+    #[serde(default)]
+    pub secret_arn: Option<String>,
+    /// The database statements run against, when the wiring names it rather than leaving it to
+    /// `RDS_DATABASE`.
+    #[serde(default)]
+    pub database: Option<String>,
+    /// Which Aurora engine the endpoint fronts, when the wiring names it rather than leaving it to
+    /// `RDS_ENGINE`. It decides the dialect placeholders are rewritten into.
+    #[serde(default)]
+    pub engine: Option<RdsEngine>,
+}
+
+/// The four values an [`RdsDataWiring`] names, once it is known to name all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RdsDataParts<'a> {
+    /// The Aurora cluster's ARN.
+    pub resource_arn: &'a str,
+    /// The Secrets Manager secret holding its credentials.
+    pub secret_arn: &'a str,
+    /// The database statements run against.
+    pub database: &'a str,
+    /// The engine the endpoint fronts.
+    pub engine: RdsEngine,
+}
+
+/// An `rds-data` wiring that names some of its four values but not the rest.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "`backend = \"rds-data\"` names {named} but not {missing}; a Data API call is addressed by all \
+     four of `resource_arn`, `secret_arn`, `database` and `engine`, so write all of them here, or \
+     none of them and let `RdsDataDb::from_env` read RDS_RESOURCE_ARN, RDS_SECRET_ARN, \
+     RDS_DATABASE and RDS_ENGINE"
+)]
+pub struct PartialRdsDataWiring {
+    /// The keys this wiring does name.
+    pub named: String,
+    /// The keys it leaves out — the ones to add.
+    pub missing: String,
+}
+
+impl RdsDataWiring {
+    /// The four values this wiring names, or `None` when it names none of them.
     ///
-    /// `RdsDataDb::from_env` is the one public constructor that builds its own client, and it reads
-    /// the cluster ARN, the secret ARN, the database and the engine from `RDS_RESOURCE_ARN`,
-    /// `RDS_SECRET_ARN`, `RDS_DATABASE` and `RDS_ENGINE`. Naming any of them here would be a key
-    /// the wiring could not honour.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct RdsDataWiring {}
+    /// # Errors
+    ///
+    /// [`PartialRdsDataWiring`] when it names some but not all four. [`Manifest::parse`] calls
+    /// this when the manifest is read, so a wiring that reached a consumer has already been
+    /// checked — consumers call it again only to read the values.
+    ///
+    /// [`Manifest::parse`]: crate::Manifest::parse
+    pub fn parts(&self) -> Result<Option<RdsDataParts<'_>>, PartialRdsDataWiring> {
+        let named = [
+            self.resource_arn.as_deref(),
+            self.secret_arn.as_deref(),
+            self.database.as_deref(),
+            self.engine.map(RdsEngine::as_str),
+        ];
+
+        match (
+            self.resource_arn.as_deref(),
+            self.secret_arn.as_deref(),
+            self.database.as_deref(),
+            self.engine,
+        ) {
+            (Some(resource_arn), Some(secret_arn), Some(database), Some(engine)) => {
+                Ok(Some(RdsDataParts {
+                    resource_arn,
+                    secret_arn,
+                    database,
+                    engine,
+                }))
+            }
+            _ if named.iter().all(Option::is_none) => Ok(None),
+            _ => {
+                let (named, missing) = named_and_missing_keys(&named);
+                Err(PartialRdsDataWiring { named, missing })
+            }
+        }
+    }
+}
+
+/// The `rds-data` keys a wiring names, and the ones it leaves out, as readable lists.
+fn named_and_missing_keys(values: &[Option<&str>; 4]) -> (String, String) {
+    let list = |present: bool| {
+        RDS_DATA_KEYS
+            .iter()
+            .zip(values)
+            .filter(|(_, value)| value.is_some() == present)
+            .map(|(key, _)| format!("`{key}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    (list(true), list(false))
+}
+
+/// Which Aurora engine an RDS Data API endpoint fronts.
+///
+/// The two identifiers RDS itself uses, modelled as an enum so a typo is rejected by the parser
+/// rather than by `RdsEngine::from_str` at startup — where it would surface as a failure to build
+/// the database, long after the manifest was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+pub enum RdsEngine {
+    /// Aurora `PostgreSQL`, which takes `$1`-style placeholders.
+    #[serde(rename = "aurora-postgresql")]
+    AuroraPostgres,
+    /// Aurora `MySQL`, which takes `?` placeholders.
+    #[serde(rename = "aurora-mysql")]
+    AuroraMysql,
+}
+
+impl RdsEngine {
+    /// The manifest spelling of this engine, which is RDS's own identifier for it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuroraPostgres => "aurora-postgresql",
+            Self::AuroraMysql => "aurora-mysql",
+        }
+    }
 }
 
 /// The native backends a portable service can be wired to.
@@ -588,6 +728,9 @@ impl NativeDatabaseSection {
     }
 
     /// Every environment variable this wiring reads when the application starts.
+    ///
+    /// An `rds-data` wiring that names its four values reads none of them: reporting the variables
+    /// anyway would have `skyzen dev` refuse to start over four names the wiring has replaced.
     #[must_use]
     pub fn env_vars(&self) -> Vec<WiringEnvVar<'_>> {
         match self {
@@ -597,6 +740,10 @@ impl NativeDatabaseSection {
             | Self::AzureSql(wiring) => {
                 vec![WiringEnvVar::declared("url_env", &wiring.url_env)]
             }
+            // A partial wiring cannot reach here — the manifest parse rejects one — and if it
+            // somehow did, naming the variables is the answer that fails loudly rather than
+            // starting an application with half its configuration missing.
+            Self::RdsData(wiring) if matches!(wiring.parts(), Ok(Some(_))) => Vec::new(),
             Self::RdsData(_) => RDS_ENV_VARS.map(WiringEnvVar::fixed).to_vec(),
         }
     }
