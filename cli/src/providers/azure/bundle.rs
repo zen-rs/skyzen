@@ -380,7 +380,8 @@ mod tests {
             .iter()
             .find(|(path, _)| path.ends_with("process/function.json"))
             .expect("the trigger has a directory of its own");
-        assert!(path.to_string_lossy().contains(".skyzen/gen/azure/process"));
+        // Component-wise so the platform separator on Windows matches too.
+        assert!(path.ends_with(".skyzen/gen/azure/process/function.json"));
 
         let queue = document(&files, "process/function.json");
         let binding = &queue["bindings"][0];
