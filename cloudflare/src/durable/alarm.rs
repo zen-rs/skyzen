@@ -58,12 +58,12 @@ impl AlarmScheduler for CfAlarm {
         }
 
         let timestamp = value.as_f64().ok_or_else(|| {
-            AlarmError::Backend(format!(
+            AlarmError::backend(format!(
                 "DurableObjectStorage.getAlarm returned non-number: {value:?}"
             ))
         })?;
         if !timestamp.is_finite() || timestamp.fract() != 0.0 {
-            return Err(AlarmError::Backend(format!(
+            return Err(AlarmError::backend(format!(
                 "DurableObjectStorage.getAlarm returned invalid timestamp: {timestamp}"
             )));
         }
@@ -91,5 +91,5 @@ impl AlarmScheduler for CfAlarm {
 
 #[allow(clippy::needless_pass_by_value)]
 fn js_err(error: JsValue) -> AlarmError {
-    AlarmError::Backend(format!("{error:?}"))
+    AlarmError::backend(format!("{error:?}"))
 }

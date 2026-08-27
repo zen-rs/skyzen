@@ -60,6 +60,12 @@ impl fmt::Display for WebSocketError {
 
 impl std::error::Error for WebSocketError {}
 
+// A failed frame is the connection's problem, not the client request's: nothing the peer sent
+// makes a transport failure its fault, so the default `500` is the honest status. Implementing
+// `HttpError` is also what lets a websocket failure travel through `?` — both into a handler's
+// [`skyzen::Result`](crate::Result) and into the session outcome a `.ws` handler returns.
+impl http_kit::HttpError for WebSocketError {}
+
 #[cfg(feature = "json")]
 impl From<serde_json::Error> for WebSocketError {
     fn from(error: serde_json::Error) -> Self {

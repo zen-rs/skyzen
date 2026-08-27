@@ -34,6 +34,9 @@
 //! smol = "2.0"
 //! async-net = "2.0"
 //! futures-lite = "2.0"
+//! # Without `rt` nothing installs a log subscriber, so this application installs its own.
+//! tracing = "0.1"
+//! tracing-subscriber = "0.3"
 //! ```
 //!
 //! Run with: `cargo run --example embed_hyper`
@@ -81,6 +84,11 @@ fn build_router() -> Router {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `#[skyzen::main]` installs a tracing subscriber; this example does not use it, so it
+    // installs one itself. Without this, every `tracing` event below — and every one the
+    // framework emits — is dropped.
+    tracing_subscriber::fmt().init();
+
     // Use smol's global executor
     smol::block_on(async {
         // Build the Skyzen router
@@ -89,13 +97,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bind to a TCP listener using async-net (smol-compatible)
         let addr = "127.0.0.1:3000";
         let listener = TcpListener::bind(addr).await?;
-        println!("Embedded Skyzen server listening on http://{addr}");
-        println!("Using smol runtime to demonstrate multi-runtime support");
-        println!();
-        println!("Try these endpoints:");
-        println!("  curl http://{addr}/health");
-        println!("  curl http://{addr}/status");
-        println!("  curl http://{addr}/hello");
+        tracing::info!("embedded Skyzen server listening on http://{addr}");
+        tracing::info!("using the smol runtime, to demonstrate multi-runtime support");
+        tracing::info!("try: curl http://{addr}/health");
+        tracing::info!("try: curl http://{addr}/status");
+        tracing::info!("try: curl http://{addr}/hello");
 
         // Convert TcpListener to an owned Stream of connections
         let connections = Box::pin(stream::unfold(listener, |listener| async move {
@@ -107,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Hyper
             .serve(
                 SmolGlobal,
-                |err| eprintln!("Connection error: {err}"),
+                |error| tracing::error!("connection error: {error}"),
                 connections,
                 router,
             )

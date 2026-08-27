@@ -1,0 +1,24 @@
+[package]
+name = "skyzen-example-queue-consumer"
+version = "0.0.0"
+edition = "2021"
+description = "Runnable example of a native Skyzen queue consumer driven by Skyzen.toml"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A member of its own rather than a file in `examples/`: the macros read the `Skyzen.toml` next to
+# the *crate* being compiled, so a manifest for this example would otherwise be the whole
+# framework's manifest and would wire services into every other example and test.
+
+[dependencies]
+skyzen = { path = "../.." }
+skyzen-services = { path = "../../services" }
+# The `backend = "memory"` wiring in Skyzen.toml expands to `skyzen_test`'s in-process mock.
+skyzen-test = { path = "../../test" }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[package.metadata.cargo-machete]
+# Consumed by the code `#[skyzen::main]` GENERATES for `backend = "memory"`, which
+# cargo-machete cannot see in the source text.
+ignored = ["skyzen-test"]

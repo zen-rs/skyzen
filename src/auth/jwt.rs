@@ -21,6 +21,7 @@
 //! let middleware = AuthMiddleware::new(authenticator);
 //! ```
 
+use core::future::{ready, Future};
 use std::marker::PhantomData;
 
 use http::StatusCode;
@@ -289,10 +290,17 @@ where
     type User = C;
     type Error = JwtError;
 
-    async fn authenticate(&self, req: &Request) -> Result<Self::User, Self::Error> {
-        let token = parse_bearer(req)?;
-        let token_data = self.config.decode::<C>(token)?;
-        Ok(token_data.claims)
+    // Decoding a JWT is pure computation over the request's own header, so the future is ready
+    // on creation rather than an `async` block with nothing to await.
+    fn authenticate(
+        &self,
+        req: &Request,
+    ) -> impl Future<Output = Result<Self::User, Self::Error>> + Send {
+        ready(
+            parse_bearer(req)
+                .map_err(Self::Error::from)
+                .and_then(|token| Ok(self.config.decode::<C>(token)?.claims)),
+        )
     }
 }
 

@@ -1,607 +1,500 @@
+//! `skyzen new`: generating a project.
+//!
+//! Templates carry no dependency versions. They used to hardcode `skyzen = "0.1"`, so a CLI
+//! released alongside skyzen 0.3 still scaffolded a project pinned to 0.1; the versions are now
+//! resolved by `cargo add`, which is the only thing that actually knows what the registry has.
+//! The one exception is `wasm-bindgen`, which is pinned to the version this binary's bindings
+//! generator was built from — that is a correctness constraint, not a freshness one.
+
+use crate::{
+    cli::Template, environment, output, providers::cloudflare::build::embedded_wasm_bindgen_version,
+};
+use anyhow::{Context, Result};
+use askama::Template as _;
+use skyzen_manifest::Manifest;
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
-
-use anyhow::{Context, Result};
 use time::{macros::format_description, OffsetDateTime};
 
-use crate::args::{CliOptions, Template};
+/// The values every scaffold template substitutes.
+#[derive(Debug)]
+pub struct ScaffoldContext {
+    /// The cargo package name, taken from the target directory.
+    pub package_name: String,
+    /// The Worker name, which cannot contain underscores.
+    pub worker_name: String,
+    /// Today, as the Workers compatibility date.
+    pub compatibility_date: String,
+    /// The wasm-bindgen version this binary's generator was built from.
+    pub wasm_bindgen_version: String,
+}
 
-const API_CARGO_TOML: &str = include_str!("../templates/api/Cargo.toml.tmpl");
-const API_SKYZEN_TOML: &str = include_str!("../templates/api/Skyzen.toml.tmpl");
-const API_GITIGNORE: &str = include_str!("../templates/api/gitignore.tmpl");
-const API_APP_RS: &str = include_str!("../templates/api/src/app.rs.tmpl");
-const API_LIB_RS: &str = include_str!("../templates/api/src/lib.rs.tmpl");
-const API_MAIN_RS: &str = include_str!("../templates/api/src/main.rs.tmpl");
-const EVENTS_CARGO_TOML: &str = include_str!("../templates/serverless-events/Cargo.toml.tmpl");
-const EVENTS_SKYZEN_TOML: &str = include_str!("../templates/serverless-events/Skyzen.toml.tmpl");
-const EVENTS_GITIGNORE: &str = include_str!("../templates/serverless-events/gitignore.tmpl");
-const EVENTS_APP_RS: &str = include_str!("../templates/serverless-events/src/app.rs.tmpl");
-const EVENTS_LIB_RS: &str = include_str!("../templates/serverless-events/src/lib.rs.tmpl");
-const EVENTS_MAIN_RS: &str = include_str!("../templates/serverless-events/src/main.rs.tmpl");
-const DURABLE_CARGO_TOML: &str = include_str!("../templates/durable-realtime/Cargo.toml.tmpl");
-const DURABLE_SKYZEN_TOML: &str = include_str!("../templates/durable-realtime/Skyzen.toml.tmpl");
-const DURABLE_GITIGNORE: &str = include_str!("../templates/durable-realtime/gitignore.tmpl");
-const DURABLE_APP_RS: &str = include_str!("../templates/durable-realtime/src/app.rs.tmpl");
-const DURABLE_LIB_RS: &str = include_str!("../templates/durable-realtime/src/lib.rs.tmpl");
-const DURABLE_MAIN_RS: &str = include_str!("../templates/durable-realtime/src/main.rs.tmpl");
-const DURABLE_OBJECT_RS: &str =
-    include_str!("../templates/durable-realtime/src/durable_object.rs.tmpl");
+/// One crate `skyzen new` asks cargo to add to the generated project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencySpec {
+    /// The crate name.
+    pub name: &'static str,
+    /// Features to enable.
+    pub features: &'static [&'static str],
+}
 
-pub fn create_project(options: &CliOptions) -> Result<()> {
-    let path = options
-        .path
-        .as_ref()
-        .context("project path is required for `skyzen new`")?;
-    let package_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .context("project path must end with a valid directory name")?;
-
-    ensure_target_dir(path, options.force)?;
-
-    let compatibility_date = OffsetDateTime::now_utc()
-        .format(&format_description!("[year]-[month]-[day]"))
-        .context("failed to format compatibility date")?;
-    let worker_name = package_name.replace('_', "-");
-
-    let files = match options.template {
-        Template::Api => api_template_files(path, package_name, &worker_name, &compatibility_date),
-        Template::ServerlessEvents => {
-            serverless_events_template_files(path, package_name, &worker_name, &compatibility_date)
+impl DependencySpec {
+    /// The `cargo add` arguments for this dependency.
+    pub fn cargo_add_args(&self) -> Vec<String> {
+        let mut args = vec!["add".to_owned(), self.name.to_owned()];
+        if !self.features.is_empty() {
+            args.push("--features".to_owned());
+            args.push(self.features.join(","));
         }
-        Template::DurableRealtime => {
-            durable_realtime_template_files(path, package_name, &worker_name, &compatibility_date)
+        args
+    }
+}
+
+/// Declare one template's files, generating the askama struct for each.
+macro_rules! template_set {
+    ($fn_name:ident, [$(($struct:ident, $path:literal, $output:literal)),* $(,)?]) => {
+        $(
+            // Every template takes the context so the file list stays uniform, even the few
+            // (`.gitignore`, `lib.rs`, `main.rs`) that substitute nothing today.
+            #[derive(askama::Template)]
+            #[template(path = $path, escape = "none")]
+            #[allow(dead_code)]
+            struct $struct<'a> {
+                ctx: &'a ScaffoldContext,
+            }
+        )*
+
+        fn $fn_name(root: &Path, ctx: &ScaffoldContext) -> Result<Vec<(PathBuf, String)>> {
+            Ok(vec![
+                $((
+                    root.join($output),
+                    $struct { ctx }
+                        .render()
+                        .with_context(|| format!("failed to render {}", $path))?,
+                ),)*
+            ])
         }
     };
+}
 
-    if options.dry_run {
-        for (path, contents) in files {
-            println!("[dry-run] write {}", path.display());
+template_set!(
+    minimal_files,
+    [
+        (MinimalCargoToml, "minimal/Cargo.toml.tmpl", "Cargo.toml"),
+        (MinimalSkyzenToml, "minimal/Skyzen.toml.tmpl", "Skyzen.toml"),
+        (MinimalGitignore, "minimal/gitignore.tmpl", ".gitignore"),
+        (MinimalApp, "minimal/src/app.rs.tmpl", "src/app.rs"),
+        (MinimalLib, "minimal/src/lib.rs.tmpl", "src/lib.rs"),
+        (MinimalMain, "minimal/src/main.rs.tmpl", "src/main.rs"),
+    ]
+);
+
+template_set!(
+    api_files,
+    [
+        (ApiCargoToml, "api/Cargo.toml.tmpl", "Cargo.toml"),
+        (ApiSkyzenToml, "api/Skyzen.toml.tmpl", "Skyzen.toml"),
+        (ApiGitignore, "api/gitignore.tmpl", ".gitignore"),
+        (ApiApp, "api/src/app.rs.tmpl", "src/app.rs"),
+        (ApiLib, "api/src/lib.rs.tmpl", "src/lib.rs"),
+        (ApiMain, "api/src/main.rs.tmpl", "src/main.rs"),
+        (
+            ApiMigration,
+            "api/migrations/0001_create_greetings.sql.tmpl",
+            "migrations/0001_create_greetings.sql"
+        ),
+    ]
+);
+
+template_set!(
+    serverless_events_files,
+    [
+        (
+            EventsCargoToml,
+            "serverless-events/Cargo.toml.tmpl",
+            "Cargo.toml"
+        ),
+        (
+            EventsSkyzenToml,
+            "serverless-events/Skyzen.toml.tmpl",
+            "Skyzen.toml"
+        ),
+        (
+            EventsGitignore,
+            "serverless-events/gitignore.tmpl",
+            ".gitignore"
+        ),
+        (EventsApp, "serverless-events/src/app.rs.tmpl", "src/app.rs"),
+        (EventsLib, "serverless-events/src/lib.rs.tmpl", "src/lib.rs"),
+        (
+            EventsMain,
+            "serverless-events/src/main.rs.tmpl",
+            "src/main.rs"
+        ),
+    ]
+);
+
+template_set!(
+    durable_realtime_files,
+    [
+        (
+            DurableCargoToml,
+            "durable-realtime/Cargo.toml.tmpl",
+            "Cargo.toml"
+        ),
+        (
+            DurableSkyzenToml,
+            "durable-realtime/Skyzen.toml.tmpl",
+            "Skyzen.toml"
+        ),
+        (
+            DurableGitignore,
+            "durable-realtime/gitignore.tmpl",
+            ".gitignore"
+        ),
+        (DurableApp, "durable-realtime/src/app.rs.tmpl", "src/app.rs"),
+        (
+            DurableObject,
+            "durable-realtime/src/durable_object.rs.tmpl",
+            "src/durable_object.rs"
+        ),
+        (DurableLib, "durable-realtime/src/lib.rs.tmpl", "src/lib.rs"),
+        (
+            DurableMain,
+            "durable-realtime/src/main.rs.tmpl",
+            "src/main.rs"
+        ),
+    ]
+);
+
+/// The crates each template's code needs.
+pub const fn dependencies(template: Template) -> &'static [DependencySpec] {
+    const SKYZEN: DependencySpec = DependencySpec {
+        name: "skyzen",
+        features: &[],
+    };
+    const SKYZEN_WS: DependencySpec = DependencySpec {
+        name: "skyzen",
+        features: &["ws"],
+    };
+    const SERVICES: DependencySpec = DependencySpec {
+        name: "skyzen-services",
+        features: &[],
+    };
+    const TEST: DependencySpec = DependencySpec {
+        name: "skyzen-test",
+        features: &[],
+    };
+    const CLOUDFLARE: DependencySpec = DependencySpec {
+        name: "skyzen-cloudflare",
+        features: &[],
+    };
+    const SERDE: DependencySpec = DependencySpec {
+        name: "serde",
+        features: &["derive"],
+    };
+    const TRACING: DependencySpec = DependencySpec {
+        name: "tracing",
+        features: &[],
+    };
+    const FUTURES: DependencySpec = DependencySpec {
+        name: "futures-util",
+        features: &[],
+    };
+
+    match template {
+        Template::Minimal => &[SKYZEN],
+        // The api template declares a portable KV service, so it needs the wrappers, the
+        // in-process backend `[native.service.cache]` names, and the Cloudflare one.
+        Template::Api => &[SKYZEN, SERVICES, TEST, CLOUDFLARE, SERDE],
+        Template::ServerlessEvents => &[SKYZEN, SERVICES, CLOUDFLARE, SERDE, TRACING],
+        Template::DurableRealtime => &[SKYZEN_WS, CLOUDFLARE, SERDE, FUTURES],
+    }
+}
+
+fn template_files(
+    template: Template,
+    root: &Path,
+    ctx: &ScaffoldContext,
+) -> Result<Vec<(PathBuf, String)>> {
+    match template {
+        Template::Minimal => minimal_files(root, ctx),
+        Template::Api => api_files(root, ctx),
+        Template::ServerlessEvents => serverless_events_files(root, ctx),
+        Template::DurableRealtime => durable_realtime_files(root, ctx),
+    }
+}
+
+/// What to do about files already in the target directory.
+///
+/// `--force` used to mean "replace whatever is there", which is not what "reuse an existing
+/// target directory" suggests and not what `cargo new` does. It now keeps what it finds, and
+/// replacing is a separate, louder flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExistingFiles {
+    /// Refuse to scaffold into a non-empty directory.
+    #[default]
+    Refuse,
+    /// Reuse the directory, keeping every file that is already there (`--force`).
+    Keep,
+    /// Reuse the directory, replacing files that are already there (`--overwrite`).
+    Replace,
+}
+
+/// What `skyzen new` was asked to do.
+#[derive(Debug)]
+pub struct ScaffoldRequest<'a> {
+    /// The directory to scaffold into.
+    pub path: &'a Path,
+    /// Which starting point to generate.
+    pub template: Template,
+    /// How to treat files that are already there.
+    pub existing: ExistingFiles,
+    /// Print what would be written instead of writing it.
+    pub dry_run: bool,
+    /// Run `cargo add` in the generated project.
+    ///
+    /// The scaffold compile tests turn this off: they must not touch the network, and they wire
+    /// the workspace's own crates in by path instead.
+    pub install_dependencies: bool,
+}
+
+/// Generate a project.
+///
+/// # Errors
+///
+/// Fails when the target directory is unusable, when the package name is not a valid cargo name,
+/// when a template cannot render, or when a file cannot be written.
+pub fn create_project(request: &ScaffoldRequest<'_>) -> Result<()> {
+    let root = resolve_root(request.path)?;
+    let package_name = package_name(&root)?;
+    validate_package_name(&package_name)?;
+    ensure_target_dir(&root, request)?;
+
+    let ctx = ScaffoldContext {
+        worker_name: package_name.replace('_', "-"),
+        package_name,
+        compatibility_date: OffsetDateTime::now_utc()
+            .format(&format_description!("[year]-[month]-[day]"))
+            .context("failed to format the Workers compatibility date")?,
+        wasm_bindgen_version: embedded_wasm_bindgen_version(),
+    };
+
+    let mut files = template_files(request.template, &root, &ctx)?;
+    files.push(env_example(&root, &files)?);
+
+    if request.dry_run {
+        for (path, contents) in &files {
+            output::dry_run(format!("write {}", path.display()));
             println!("{contents}");
+        }
+        for dependency in dependencies(request.template) {
+            output::dry_run(format!("cargo {}", dependency.cargo_add_args().join(" ")));
         }
         return Ok(());
     }
 
-    for (path, contents) in files {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(&path, contents)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        println!("[skyzen] wrote {}", path.display());
+    for (path, contents) in &files {
+        write_file(path, contents, request.existing)?;
+    }
+
+    if request.install_dependencies {
+        install_dependencies(&root, request.template)?;
     }
 
     Ok(())
 }
 
-fn ensure_target_dir(path: &Path, force: bool) -> Result<()> {
-    if !path.exists() {
-        fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+/// Render the `.env.example` from the manifest the template just produced.
+///
+/// Deriving it rather than shipping a static file keeps it honest: a template that adds a
+/// `url_env` gets the variable listed without anyone remembering to update a second file.
+fn env_example(root: &Path, files: &[(PathBuf, String)]) -> Result<(PathBuf, String)> {
+    let manifest_path = root.join("Skyzen.toml");
+    let source = files
+        .iter()
+        .find(|(path, _)| *path == manifest_path)
+        .map(|(_, contents)| contents.as_str())
+        .context("the template produced no Skyzen.toml")?;
+    let manifest = Manifest::parse(source, &manifest_path, root)?;
+    Ok((
+        root.join(".env.example"),
+        environment::render_example(manifest.data())?,
+    ))
+}
+
+fn write_file(path: &Path, contents: &str, existing: ExistingFiles) -> Result<()> {
+    if path.exists() && existing != ExistingFiles::Replace {
+        output::step(format!("kept existing {}", path.display()));
         return Ok(());
     }
-
-    if force {
-        return Ok(());
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    output::step(format!("wrote {}", path.display()));
+    Ok(())
+}
 
-    let mut entries =
-        fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if entries.next().is_some() {
+/// Resolve the target directory, so `skyzen new .` works.
+fn resolve_root(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", path.display()));
+    }
+    // A path that does not exist yet cannot be canonicalized, but its parent can, which is what
+    // turns `./demo` and `../demo` into something with a usable final component.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let name = path
+        .file_name()
+        .context("the project path must end with a directory name")?;
+    match parent {
+        Some(parent) if parent.exists() => Ok(parent
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", parent.display()))?
+            .join(name)),
+        _ => Ok(path.to_path_buf()),
+    }
+}
+
+fn package_name(root: &Path) -> Result<String> {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .with_context(|| {
+            format!(
+                "cannot derive a package name from {}; the path must end with a directory name",
+                root.display()
+            )
+        })
+}
+
+/// Reject a name cargo would reject, before any file is written.
+///
+/// The old scaffolder took the directory name with only an emptiness check, so `skyzen new "my
+/// app"` wrote `name = "my app"` into `Cargo.toml` and failed later, inside cargo, with a
+/// generated project already on disk.
+fn validate_package_name(name: &str) -> Result<()> {
+    /// Keywords cargo refuses outright, because a crate name has to be a usable identifier.
+    const RESERVED: &[&str] = &[
+        "crate", "self", "super", "extern", "as", "async", "await", "break", "const", "continue",
+        "dyn", "else", "enum", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match",
+        "mod", "move", "mut", "pub", "ref", "return", "static", "struct", "trait", "true", "type",
+        "unsafe", "use", "where", "while", "test",
+    ];
+
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        anyhow::bail!("the package name cannot be empty");
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
         anyhow::bail!(
-            "target directory `{}` already exists and is not empty; pass --force to reuse it",
-            path.display()
+            "`{name}` cannot be used as a package name: it must start with a letter or underscore"
+        );
+    }
+    if let Some(invalid) = name.chars().find(|character| {
+        !character.is_ascii_alphanumeric() && *character != '-' && *character != '_'
+    }) {
+        anyhow::bail!(
+            "`{name}` cannot be used as a package name: `{invalid}` is not allowed; use letters, \
+             digits, `-` and `_`"
+        );
+    }
+    if RESERVED.contains(&name) {
+        anyhow::bail!("`{name}` cannot be used as a package name: it is a Rust keyword");
+    }
+    Ok(())
+}
+
+fn ensure_target_dir(root: &Path, request: &ScaffoldRequest<'_>) -> Result<()> {
+    if !root.exists() {
+        if request.dry_run {
+            return Ok(());
+        }
+        return fs::create_dir_all(root)
+            .with_context(|| format!("failed to create {}", root.display()));
+    }
+
+    if request.existing == ExistingFiles::Refuse {
+        let mut entries =
+            fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))?;
+        if entries.next().is_some() {
+            anyhow::bail!(
+                "target directory `{}` already exists and is not empty; pass --force to keep the \
+                 files that are already there, or --overwrite to replace them",
+                root.display()
+            );
+        }
+        return Ok(());
+    }
+
+    // Overwriting inside a dirty worktree destroys work that is not recoverable from git.
+    if request.existing == ExistingFiles::Replace && is_dirty_git_worktree(root) {
+        anyhow::bail!(
+            "`{}` is a git worktree with uncommitted changes; commit or stash them before \
+             scaffolding with --overwrite",
+            root.display()
         );
     }
 
     Ok(())
 }
 
-fn api_template_files(
-    root: &Path,
-    package_name: &str,
-    worker_name: &str,
-    compatibility_date: &str,
-) -> Vec<(PathBuf, String)> {
-    vec![
-        (
-            root.join("Cargo.toml"),
-            render(
-                API_CARGO_TOML,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join("Skyzen.toml"),
-            render(
-                API_SKYZEN_TOML,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join(".gitignore"),
-            render(API_GITIGNORE, package_name, worker_name, compatibility_date),
-        ),
-        (
-            root.join("src/app.rs"),
-            render(API_APP_RS, package_name, worker_name, compatibility_date),
-        ),
-        (
-            root.join("src/lib.rs"),
-            render(API_LIB_RS, package_name, worker_name, compatibility_date),
-        ),
-        (
-            root.join("src/main.rs"),
-            render(API_MAIN_RS, package_name, worker_name, compatibility_date),
-        ),
-    ]
+fn is_dirty_git_worktree(root: &Path) -> bool {
+    Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
 }
 
-fn serverless_events_template_files(
-    root: &Path,
-    package_name: &str,
-    worker_name: &str,
-    compatibility_date: &str,
-) -> Vec<(PathBuf, String)> {
-    vec![
-        (
-            root.join("Cargo.toml"),
-            render(
-                EVENTS_CARGO_TOML,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join("Skyzen.toml"),
-            render(
-                EVENTS_SKYZEN_TOML,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join(".gitignore"),
-            render(
-                EVENTS_GITIGNORE,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join("src/app.rs"),
-            render(EVENTS_APP_RS, package_name, worker_name, compatibility_date),
-        ),
-        (
-            root.join("src/lib.rs"),
-            render(EVENTS_LIB_RS, package_name, worker_name, compatibility_date),
-        ),
-        (
-            root.join("src/main.rs"),
-            render(
-                EVENTS_MAIN_RS,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-    ]
-}
+/// Let cargo resolve the dependency versions, in the project that was just generated.
+fn install_dependencies(root: &Path, template: Template) -> Result<()> {
+    let specs = dependencies(template);
+    for spec in specs {
+        let args = spec.cargo_add_args();
+        output::step(format!("cargo {}", args.join(" ")));
+        let status = Command::new("cargo")
+            .args(&args)
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
 
-fn durable_realtime_template_files(
-    root: &Path,
-    package_name: &str,
-    worker_name: &str,
-    compatibility_date: &str,
-) -> Vec<(PathBuf, String)> {
-    vec![
-        (
-            root.join("Cargo.toml"),
-            render(
-                DURABLE_CARGO_TOML,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join("Skyzen.toml"),
-            render(
-                DURABLE_SKYZEN_TOML,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join(".gitignore"),
-            render(
-                DURABLE_GITIGNORE,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join("src/app.rs"),
-            render(
-                DURABLE_APP_RS,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join("src/durable_object.rs"),
-            render(
-                DURABLE_OBJECT_RS,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join("src/lib.rs"),
-            render(
-                DURABLE_LIB_RS,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-        (
-            root.join("src/main.rs"),
-            render(
-                DURABLE_MAIN_RS,
-                package_name,
-                worker_name,
-                compatibility_date,
-            ),
-        ),
-    ]
-}
-
-fn render(
-    template: &str,
-    package_name: &str,
-    worker_name: &str,
-    compatibility_date: &str,
-) -> String {
-    template
-        .replace("{{PACKAGE_NAME}}", package_name)
-        .replace("{{WORKER_NAME}}", worker_name)
-        .replace("{{COMPATIBILITY_DATE}}", compatibility_date)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::args::{Action, CliOptions, Template};
-    use std::process::Command;
-
-    fn temp_dir() -> tempfile::TempDir {
-        tempfile::tempdir().expect("create temp dir")
-    }
-
-    #[test]
-    fn creates_api_template() {
-        let dir = temp_dir();
-        let path = dir.path().to_path_buf();
-        let options = CliOptions {
-            action: Action::New,
-            provider: None,
-            manifest: PathBuf::from("Skyzen.toml"),
-            dry_run: false,
-            template: Template::Api,
-            path: Some(path.clone()),
-            force: false,
+        let failed = match status {
+            Ok(status) => !status.success(),
+            Err(error) => {
+                output::warn(format!("failed to launch cargo: {error}"));
+                true
+            }
         };
 
-        create_project(&options).expect("scaffold should succeed");
-
-        let cargo_toml = fs::read_to_string(path.join("Cargo.toml")).expect("Cargo.toml");
-        let manifest = fs::read_to_string(path.join("Skyzen.toml")).expect("Skyzen.toml");
-        let app = fs::read_to_string(path.join("src/app.rs")).expect("app.rs");
-        assert!(cargo_toml.contains("[lib]"));
-        assert!(manifest.contains("[cloudflare]"));
-        assert!(!app.contains("{{PACKAGE_NAME}}"));
-    }
-
-    #[test]
-    fn creates_serverless_events_template() {
-        let dir = temp_dir();
-        let path = dir.path().to_path_buf();
-        let options = CliOptions {
-            action: Action::New,
-            provider: None,
-            manifest: PathBuf::from("Skyzen.toml"),
-            dry_run: false,
-            template: Template::ServerlessEvents,
-            path: Some(path.clone()),
-            force: false,
-        };
-
-        create_project(&options).expect("scaffold should succeed");
-
-        let cargo_toml = fs::read_to_string(path.join("Cargo.toml")).expect("Cargo.toml");
-        let manifest = fs::read_to_string(path.join("Skyzen.toml")).expect("Skyzen.toml");
-        let lib_rs = fs::read_to_string(path.join("src/lib.rs")).expect("lib.rs");
-        assert!(cargo_toml.contains("skyzen-cloudflare"));
-        assert!(manifest.contains("[[cloudflare.queues.consumers]]"));
-        assert!(manifest.contains("[cloudflare.triggers]"));
-        assert!(lib_rs.contains("#[skyzen::queue]"));
-        assert!(lib_rs.contains("#[skyzen::scheduled]"));
-    }
-
-    #[test]
-    fn creates_durable_realtime_template() {
-        let dir = temp_dir();
-        let path = dir.path().to_path_buf();
-        let options = CliOptions {
-            action: Action::New,
-            provider: None,
-            manifest: PathBuf::from("Skyzen.toml"),
-            dry_run: false,
-            template: Template::DurableRealtime,
-            path: Some(path.clone()),
-            force: false,
-        };
-
-        create_project(&options).expect("scaffold should succeed");
-
-        let manifest = fs::read_to_string(path.join("Skyzen.toml")).expect("Skyzen.toml");
-        let durable =
-            fs::read_to_string(path.join("src/durable_object.rs")).expect("durable_object.rs");
-        assert!(manifest.contains("[[cloudflare.durable_objects.bindings]]"));
-        assert!(manifest.contains("[[cloudflare.durable_objects.migrations]]"));
-        assert!(durable.contains("#[skyzen::durable_object]"));
-    }
-
-    fn all_template_files() -> Vec<(&'static str, Vec<(PathBuf, String)>)> {
-        let root = Path::new("proj");
-        vec![
-            (
-                "api",
-                api_template_files(root, "proj", "proj", "2026-01-01"),
-            ),
-            (
-                "serverless-events",
-                serverless_events_template_files(root, "proj", "proj", "2026-01-01"),
-            ),
-            (
-                "durable-realtime",
-                durable_realtime_template_files(root, "proj", "proj", "2026-01-01"),
-            ),
-        ]
-    }
-
-    fn template_manifest(files: &[(PathBuf, String)], template: &str) -> String {
-        files
-            .iter()
-            .find(|(path, _)| path.ends_with("Skyzen.toml"))
-            .unwrap_or_else(|| panic!("template `{template}` has no Skyzen.toml"))
-            .1
-            .clone()
-    }
-
-    /// `source` declares `struct <name>` as a whole identifier (so `Room`
-    /// does not match `RoomObject`).
-    fn declares_struct(source: &str, name: &str) -> bool {
-        source
-            .match_indices(&format!("struct {name}"))
-            .any(|(index, matched)| {
-                !matches!(
-                    source[index + matched.len()..].chars().next(),
-                    Some(c) if c.is_alphanumeric() || c == '_'
-                )
-            })
-    }
-
-    #[test]
-    fn every_template_manifest_parses() {
-        let dir = temp_dir();
-        for (template, files) in all_template_files() {
-            let contents = template_manifest(&files, template);
-            let manifest_path = dir.path().join(format!("{template}-Skyzen.toml"));
-            fs::write(&manifest_path, contents).expect("write Skyzen.toml");
-
-            let loaded =
-                crate::manifest::LoadedManifest::load(&manifest_path).unwrap_or_else(|error| {
-                    panic!("template `{template}` Skyzen.toml failed to parse: {error:#}")
-                });
-            assert!(
-                loaded.data.cloudflare.is_some(),
-                "template `{template}` Skyzen.toml is missing the [cloudflare] section"
+        if failed {
+            let commands = specs
+                .iter()
+                .map(|spec| format!("  cargo {}", spec.cargo_add_args().join(" ")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "the project was generated, but its dependencies could not be added (offline?). \
+                 Run these in {}:\n{commands}",
+                root.display()
             );
         }
     }
-
-    #[test]
-    fn template_durable_class_names_match_rust_structs() {
-        use crate::providers::cloudflare::collect_local_durable_exports;
-
-        for (template, files) in all_template_files() {
-            let manifest: crate::manifest::SkyzenManifest =
-                toml::from_str(&template_manifest(&files, template)).unwrap_or_else(|error| {
-                    panic!("template `{template}` Skyzen.toml failed to parse: {error}")
-                });
-            let Some(cloudflare) = manifest.cloudflare else {
-                continue;
-            };
-
-            let rust_sources: String = files
-                .iter()
-                .filter(|(path, _)| path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
-                .map(|(_, contents)| contents.as_str())
-                .collect();
-
-            for export in collect_local_durable_exports(&cloudflare) {
-                // `class_name` must be the Rust struct name: the macro exports
-                // `{Struct}Object` and the worker shim re-exports it under the
-                // struct name, which is what wrangler references.
-                assert!(
-                    declares_struct(&rust_sources, &export.public_name),
-                    "template `{template}` declares durable class `{}` but no Rust source \
-                     defines `struct {}`",
-                    export.public_name,
-                    export.public_name
-                );
-                assert_eq!(
-                    export.bindings_export_name,
-                    format!("{}Object", export.public_name),
-                    "shim export name must match the `{{Struct}}Object` wasm export"
-                );
-            }
-
-            for migration in &cloudflare.durable_objects.migrations {
-                for class in migration
-                    .new_classes
-                    .iter()
-                    .chain(&migration.new_sqlite_classes)
-                {
-                    assert!(
-                        cloudflare
-                            .durable_objects
-                            .bindings
-                            .iter()
-                            .any(|binding| binding.class_name == *class),
-                        "template `{template}` migration references `{class}` which has no \
-                         matching durable object binding"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn scaffolded_templates_compile() {
-        let dir = temp_dir();
-        let root = dir.path().to_path_buf();
-        let shared_target_dir = root.join("target-cache");
-
-        compile_template(
-            &root.join("api-app"),
-            Template::Api,
-            &shared_target_dir,
-            true,
-        );
-        compile_template(
-            &root.join("events-app"),
-            Template::ServerlessEvents,
-            &shared_target_dir,
-            true,
-        );
-        compile_template(
-            &root.join("durable-app"),
-            Template::DurableRealtime,
-            &shared_target_dir,
-            true,
-        );
-    }
-
-    fn compile_template(
-        path: &Path,
-        template: Template,
-        shared_target_dir: &Path,
-        check_wasm: bool,
-    ) {
-        let options = CliOptions {
-            action: Action::New,
-            provider: None,
-            manifest: PathBuf::from("Skyzen.toml"),
-            dry_run: false,
-            template,
-            path: Some(path.to_path_buf()),
-            force: false,
-        };
-
-        create_project(&options).expect("template generation should succeed");
-        patch_local_crates(path);
-        run_cargo_check(path, shared_target_dir, false);
-        if check_wasm {
-            run_cargo_check(path, shared_target_dir, true);
-        }
-    }
-
-    fn patch_local_crates(path: &Path) {
-        use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
-
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("cli crate should have a workspace parent")
-            .to_path_buf();
-
-        let cargo_toml_path = path.join("Cargo.toml");
-        let existing = fs::read_to_string(&cargo_toml_path).expect("template Cargo.toml");
-        let mut doc = existing
-            .parse::<DocumentMut>()
-            .expect("template Cargo.toml is valid TOML");
-
-        // Build `[patch.crates-io]` via toml_edit so paths are escaped correctly — a hand-formatted
-        // string would emit invalid TOML for Windows paths (e.g. `D:\a\skyzen` has `\a`/`\s`).
-        let mut crates_io = Table::new();
-        for (name, dir) in [
-            ("skyzen", workspace_root.clone()),
-            ("skyzen-cloudflare", workspace_root.join("cloudflare")),
-            ("skyzen-services", workspace_root.join("services")),
-        ] {
-            let mut dep = InlineTable::new();
-            dep.insert("path", Value::from(dir.display().to_string()));
-            crates_io.insert(name, Item::Value(Value::InlineTable(dep)));
-        }
-
-        let mut patch_table = Table::new();
-        patch_table.set_implicit(true);
-        patch_table.insert("crates-io", Item::Table(crates_io));
-        doc.insert("patch", Item::Table(patch_table));
-
-        fs::write(&cargo_toml_path, doc.to_string()).expect("patched Cargo.toml");
-    }
-
-    fn run_cargo_check(path: &Path, shared_target_dir: &Path, wasm: bool) {
-        // Nested wasm checks are already covered by the normal test run. Under cargo-llvm-cov,
-        // rustc injects coverage instrumentation that the wasm target in this environment cannot
-        // link because `profiler_builtins` is unavailable.
-        if wasm && cfg!(coverage) {
-            return;
-        }
-
-        let mut command = Command::new("cargo");
-        // Don't pass `--offline`: the generated projects (especially the wasm Cloudflare templates)
-        // pull deps such as `gloo-timers` that the workspace's native build never caches, so an
-        // offline check fails on CI even though the template is correct. Let cargo fetch as needed.
-        command.arg("check").arg("--quiet");
-        if wasm {
-            command.arg("--target").arg("wasm32-unknown-unknown");
-        }
-        let output = command
-            .current_dir(path)
-            .env("CARGO_TARGET_DIR", shared_target_dir)
-            .env("RUSTFLAGS", "")
-            .env("CARGO_ENCODED_RUSTFLAGS", "")
-            .env("RUSTDOCFLAGS", "")
-            .env("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS", "")
-            .env_remove("LLVM_PROFILE_FILE")
-            .output()
-            .expect("cargo check should launch");
-
-        assert!(
-            output.status.success(),
-            "cargo check failed for {} (wasm={}):\nstdout:\n{}\nstderr:\n{}",
-            path.display(),
-            wasm,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    Ok(())
 }
+
+#[cfg(test)]
+mod tests;

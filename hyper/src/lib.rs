@@ -62,8 +62,11 @@ const SNIFF_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hyper's HTTP/1 header read timeout (30s by default) and HTTP/2 keep-alive
 /// are silently disabled unless a timer is configured on the connection
 /// builders, so we always install this one.
+///
+/// Exported so the built-in `#[skyzen::main]` runtime installs the same timer on its own
+/// connection builders instead of carrying a second copy of it.
 #[derive(Debug, Default, Clone, Copy)]
-struct AsyncIoTimer;
+pub struct AsyncIoTimer;
 
 struct AsyncIoSleep(async_io::Timer);
 

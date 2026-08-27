@@ -1,7 +1,25 @@
 //! Cloudflare D1 database wrapper.
+//!
+//! # Transactions
+//!
+//! D1 runs every statement in auto-commit and offers no interactive transaction: there is no
+//! connection for a Worker to hold open across `BEGIN` … `COMMIT`. [`CfD1::batch`] — surfaced
+//! portably as [`Db::execute_batch`](skyzen_services::Db::execute_batch) — is D1's transaction
+//! primitive, and the whole sequence rolls back if any statement in it fails.
+//! [`DbBackend::begin`] therefore keeps its
+//! [`TransactionsUnsupported`](DbError::TransactionsUnsupported) default rather than faking one
+//! with `exec("BEGIN")`, which Cloudflare documents as unsafe outside maintenance.
+//!
+//! # Sessions API
+//!
+//! D1's read replication (`withSession`) is not wrapped. Using it correctly means threading a
+//! *bookmark* — the token naming how far a replica must have caught up — out of every response and
+//! back into the next request, which is a cross-request contract rather than a method call: it has
+//! to be modelled in the framework's request/response types before a wrapper here would be more
+//! than a footgun that silently serves stale reads.
 
 use serde::de::DeserializeOwned;
-use skyzen_services::{DbBackend, DbError, DbExecResult, DbValue};
+use skyzen_services::{BatchStatement, DbBackend, DbError, DbExecResult, DbValue};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -65,6 +83,29 @@ impl CfD1 {
     pub fn prepare(&self, query: &str) -> Result<CfD1Statement, CfDatabaseError> {
         let stmt = self.db.prepare(query).map_err(js_err)?;
         Ok(CfD1Statement { stmt })
+    }
+
+    /// Run a sequence of prepared statements as one transaction.
+    ///
+    /// This is D1's only atomicity primitive: the statements run in order, and if one fails the
+    /// whole sequence is rolled back. The returned values are the raw `D1Result` objects, one per
+    /// statement, in the same order — the same shape [`CfD1Statement::all`] hands back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfDatabaseError`] when the runtime rejects the batch or a statement fails.
+    pub async fn batch(
+        &self,
+        statements: &[CfD1Statement],
+    ) -> Result<Vec<JsValue>, CfDatabaseError> {
+        let array = js_sys::Array::new();
+        for statement in statements {
+            array.push(statement.stmt.as_ref());
+        }
+
+        let promise = self.db.batch(array).map_err(js_err)?;
+        let results = JsFuture::from(promise).into_send().await.map_err(js_err)?;
+        Ok(js_sys::Array::from(&results).iter().collect())
     }
 }
 
@@ -193,27 +234,60 @@ impl DbBackend for CfD1 {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DbError> {
         let statement = self
             .prepare(query)
-            .map_err(|error| DbError::Backend(error.to_string()))?
+            .map_err(|error| DbError::backend(error.to_string()))?
             .bind(params)
-            .map_err(|error| DbError::Backend(error.to_string()))?;
+            .map_err(|error| DbError::backend(error.to_string()))?;
         let value = statement
             .all()
             .await
-            .map_err(|error| DbError::Backend(error.to_string()))?;
+            .map_err(|error| DbError::backend(error.to_string()))?;
         d1_result_to_exec_result(value)
     }
 
     async fn execute(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DbError> {
         let statement = self
             .prepare(query)
-            .map_err(|error| DbError::Backend(error.to_string()))?
+            .map_err(|error| DbError::backend(error.to_string()))?
             .bind(params)
-            .map_err(|error| DbError::Backend(error.to_string()))?;
+            .map_err(|error| DbError::backend(error.to_string()))?;
         let value = statement
             .run()
             .await
-            .map_err(|error| DbError::Backend(error.to_string()))?;
+            .map_err(|error| DbError::backend(error.to_string()))?;
         d1_result_to_exec_result(value)
+    }
+
+    /// Run the batch through D1's `batch()`, which is a transaction.
+    ///
+    /// Nothing here has to unwind on failure the way the native sqlx backend does: D1 rolls the
+    /// whole sequence back itself and reports the statement that failed.
+    async fn execute_batch(
+        &self,
+        statements: Vec<BatchStatement>,
+    ) -> Result<Vec<DbExecResult>, DbError> {
+        let prepared = statements
+            .iter()
+            .map(|statement| {
+                self.prepare(&statement.sql)
+                    .and_then(|prepared| prepared.bind(&statement.params))
+                    .map_err(|error| DbError::backend(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+
+        let results = self
+            .batch(&prepared)
+            .await
+            .map_err(|error| DbError::backend(error.to_string()))?;
+
+        if results.len() != prepared.len() {
+            return Err(DbError::backend(format!(
+                "D1 batch returned {} results for {} statements",
+                results.len(),
+                prepared.len()
+            )));
+        }
+
+        results.into_iter().map(d1_result_to_exec_result).collect()
     }
 }
 
@@ -228,23 +302,23 @@ fn d1_result_to_exec_result(value: JsValue) -> Result<DbExecResult, DbError> {
     let result: D1Result = value.unchecked_into();
     let success = result
         .success()
-        .map_err(|error| DbError::Backend(format!("{error:?}")))?;
+        .map_err(|error| DbError::backend(format!("{error:?}")))?;
     if !success {
         let message = result
             .error()
-            .map_err(|error| DbError::Backend(format!("{error:?}")))?
+            .map_err(|error| DbError::backend(format!("{error:?}")))?
             .unwrap_or_else(|| "unknown D1 error".to_owned());
-        return Err(DbError::Backend(message));
+        return Err(DbError::backend(message));
     }
 
     let rows = result
         .results()
-        .map_err(|error| DbError::Backend(format!("{error:?}")))?
+        .map_err(|error| DbError::backend(format!("{error:?}")))?
         .map(|rows| {
             rows.iter()
                 .map(|row| {
                     serde_wasm_bindgen::from_value(row)
-                        .map_err(|error| DbError::Backend(error.to_string()))
+                        .map_err(|error| DbError::backend(error.to_string()))
                 })
                 .collect::<Result<Vec<serde_json::Value>, DbError>>()
         })
@@ -253,10 +327,10 @@ fn d1_result_to_exec_result(value: JsValue) -> Result<DbExecResult, DbError> {
 
     let meta = result
         .meta()
-        .map_err(|error| DbError::Backend(format!("{error:?}")))
+        .map_err(|error| DbError::backend(format!("{error:?}")))
         .and_then(|meta| {
             serde_wasm_bindgen::from_value::<D1Meta>(meta.into())
-                .map_err(|error| DbError::Backend(error.to_string()))
+                .map_err(|error| DbError::backend(error.to_string()))
         })
         .unwrap_or_default();
 
@@ -267,6 +341,13 @@ fn d1_result_to_exec_result(value: JsValue) -> Result<DbExecResult, DbError> {
     })
 }
 
+/// Convert a bound parameter to the JS value D1 accepts.
+///
+/// D1's binding API takes only `null`, numbers, strings and `ArrayBuffer`s, so the richer
+/// [`DbValue`] variants are rendered in the textual form `SQLite` compares and stores them as:
+/// RFC 3339 for a timestamp, the hyphenated form for a UUID, the exact decimal rendering for a
+/// decimal, and compact JSON for a document — the last of which `SQLite`'s JSON functions read
+/// directly.
 fn db_value_to_js(value: &DbValue) -> Result<JsValue, CfDatabaseError> {
     match value {
         DbValue::Null => Ok(JsValue::NULL),
@@ -275,6 +356,10 @@ fn db_value_to_js(value: &DbValue) -> Result<JsValue, CfDatabaseError> {
         DbValue::Real(value) => Ok(JsValue::from_f64(*value)),
         DbValue::Text(value) => Ok(JsValue::from_str(value)),
         DbValue::Blob(value) => Ok(js_sys::Uint8Array::from(value.as_slice()).into()),
+        DbValue::Timestamp(value) => Ok(JsValue::from_str(&value.to_rfc3339())),
+        DbValue::Uuid(value) => Ok(JsValue::from_str(&value.to_string())),
+        DbValue::Decimal(value) => Ok(JsValue::from_str(&value.to_string())),
+        DbValue::Json(value) => Ok(JsValue::from_str(&value.to_string())),
     }
 }
 
