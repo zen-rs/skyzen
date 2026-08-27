@@ -34,10 +34,10 @@ base64 = { version = "0.22", optional = true }
 # a FIFO `MessageDeduplicationId`.
 sha2 = { version = "0.10", optional = true }
 serde_json = { version = "1", optional = true }
-# The same tokenizer `skyzen-services` rewrites placeholders with, so the RDS Data API's second
-# rewriting pass sees exactly the same string literals and comments the first one did.
-sqlparser = { version = "0.58", optional = true }
 tracing = { workspace = true, optional = true }
+# Note: no direct `sqlparser` dependency. The RDS Data API's second rewriting pass uses the
+# tokenizer `skyzen-services` re-exports, so the two passes cannot end up on different versions of
+# it and disagree about what a string literal is.
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
@@ -54,7 +54,6 @@ rds-data = [
     "dep:aws-sdk-rdsdata",
     "dep:aws-smithy-types",
     "dep:serde_json",
-    "dep:sqlparser",
     "dep:tracing",
 ]
 s3 = ["dep:skyzen-s3"]
