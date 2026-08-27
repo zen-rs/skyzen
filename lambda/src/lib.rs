@@ -544,7 +544,11 @@ mod tests {
         let response =
             block_on(handle_sqs(&dispatch, sqs_event())).expect("the batch is dispatchable");
 
-        assert!(response.batch_item_failures.is_empty());
+        assert!(
+            response.batch_item_failures.is_empty(),
+            "{:?}",
+            response.batch_item_failures
+        );
     }
 
     #[test]

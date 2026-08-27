@@ -571,7 +571,7 @@ mod tests {
             get.url,
             "memory://in-memory-storage/report.pdf?expires_in=900"
         );
-        assert!(get.headers.is_empty());
+        assert!(get.headers.is_empty(), "{:?}", get.headers);
         assert_eq!(
             storage
                 .presign_get("report.pdf", Duration::from_mins(15))

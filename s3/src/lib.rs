@@ -1076,14 +1076,14 @@ mod tests {
 
         // An exhausted stream comes back empty, which is what marks the end for the part loop.
         let (third, exhausted) = take_chunk(&mut stream, 4).await.unwrap();
-        assert!(third.is_empty());
+        assert!(third.is_empty(), "{third:?}");
         assert!(exhausted);
     }
 
     #[tokio::test]
     async fn take_chunk_reports_an_empty_stream_as_exhausted_immediately() {
         let (buffer, exhausted) = take_chunk(&mut stream_of(&[]), 16).await.unwrap();
-        assert!(buffer.is_empty());
+        assert!(buffer.is_empty(), "{buffer:?}");
         assert!(exhausted);
     }
 
