@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/zen-rs/skyzen/compare/hyper-v0.1.1...hyper-v0.2.0) - 2026-08-27
+
+### Added
+
+- *(runtime)* [**breaking**] drain connections on Ctrl+C, install hyper's timer, add on_shutdown
+
+### Fixed
+
+- *(hyper)* sound reads, real timeouts, and Content-Length responses
+
+### Other
+
+- drop unused async from await-free trait impls
+- [**breaking**] render and log endpoint errors through one shared pair of helpers
+- cover error_response redaction and add hyper end-to-end tests
+
 ## [0.1.1](https://github.com/zen-rs/skyzen/compare/hyper-v0.1.0...hyper-v0.1.1) - 2025-12-10
 
 ### Other
