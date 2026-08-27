@@ -3044,9 +3044,10 @@ fn generate_native_database_init(
     let name = database.name.as_str();
 
     // Every sqlx driver takes the same shape — read one env var, hand the URL to a `Db::connect_*`
-    // — so those arms differ only in which constructor they name. The RDS Data API is not a
-    // connection at all: it is an HTTP service reached by ARN, and its own constructor reads every
-    // parameter it needs from the environment.
+    // — so those arms differ only in which constructor they name. The other two are not a
+    // `Db::connect_*` at all, and each returns its own expression: the RDS Data API is an HTTP
+    // service reached by ARN whose constructor reads what it needs from the environment, and Azure
+    // SQL is reached through a synchronous constructor taking a config rather than a URL.
     let (connect, url_env) = match (database.database_type, wiring) {
         (DatabaseType::Sql, NativeDatabaseSection::Postgres(sql)) => {
             (quote! { connect_postgres }, &sql.url_env)
@@ -3056,6 +3057,27 @@ fn generate_native_database_init(
         }
         (DatabaseType::Sql, NativeDatabaseSection::Sqlite(sql)) => {
             (quote! { connect_sqlite }, &sql.url_env)
+        }
+        (DatabaseType::Sql, NativeDatabaseSection::AzureSql(sql)) => {
+            // `AzureSqlDb::new` is synchronous and takes an `AzureSqlConfig`, not a URL: what the
+            // variable holds is an ADO.NET connection string, which the config parses. Nothing is
+            // dialled, so a wrong password surfaces on the first query — but a connection string
+            // this backend cannot use fails right here, at startup.
+            let connection = env_value_expr("database", name, &sql.url_env);
+            let failure = LitStr::new(
+                &format!(
+                    "portable database `{name}` failed to reach Azure SQL using `{}`",
+                    sql.url_env
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            return quote! {{
+                let backend = ::skyzen_azure::AzureSqlDb::new(
+                    ::skyzen_azure::AzureSqlConfig::new(#connection)
+                )
+                .unwrap_or_else(|error| panic!("{}: {error}", #failure));
+                ::skyzen_services::Db::new(backend)
+            }};
         }
         (DatabaseType::Sql, NativeDatabaseSection::RdsData(_)) => {
             let failure = LitStr::new(
@@ -4036,6 +4058,32 @@ type = "sql"
         assert!(generated.contains(". await"), "{generated}");
         // It reads its four variables itself, so the expansion reads none.
         assert!(!generated.contains("env :: var"), "{generated}");
+    }
+
+    #[test]
+    fn azure_sql_is_built_from_a_config_holding_the_named_variables_connection_string() {
+        let generated =
+            database_init("backend = \"azure-sql\"\nurl_env = \"AZURE_SQL_CONNECTION_STRING\"");
+        assert!(
+            generated.contains("skyzen_azure :: AzureSqlDb :: new"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("skyzen_azure :: AzureSqlConfig :: new"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("skyzen_services :: Db :: new"),
+            "{generated}"
+        );
+        // The connection string comes from the variable the wiring names, not from the backend's
+        // own `from_env`, which would ignore it.
+        assert!(
+            generated.contains("AZURE_SQL_CONNECTION_STRING"),
+            "{generated}"
+        );
+        // The constructor is synchronous; awaiting it would not compile in the user's crate.
+        assert!(!generated.contains(". await"), "{generated}");
     }
 
     #[test]

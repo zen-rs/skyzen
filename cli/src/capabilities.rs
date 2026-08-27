@@ -100,6 +100,7 @@ const STORAGE_QUEUE: &[CrateRequirement] = &[
 ];
 const RDS_DATA: &[CrateRequirement] =
     &[plain("skyzen-services"), only("skyzen-aws", &["rds-data"])];
+const AZURE_SQL: &[CrateRequirement] = &[plain("skyzen-services"), only("skyzen-azure", &["sql"])];
 const CLOUDFLARE: &[CrateRequirement] = &[plain("skyzen-services"), plain("skyzen-cloudflare")];
 const POSTGRES: &[CrateRequirement] = &[CrateRequirement {
     name: "skyzen-services",
@@ -209,6 +210,11 @@ pub const CATALOGUE: &[Capability] = &[
         summary: "Aurora through the RDS Data API (`backend = \"rds-data\"`)",
         crates: RDS_DATA,
     },
+    Capability {
+        name: "azure-sql",
+        summary: "Azure SQL over TDS (`backend = \"azure-sql\"`)",
+        crates: AZURE_SQL,
+    },
 ];
 
 /// Look one capability up by the name the user typed.
@@ -266,6 +272,7 @@ const fn native_database_capability(backend: NativeDatabaseBackend) -> &'static 
         NativeDatabaseBackend::Postgres => "postgres",
         NativeDatabaseBackend::Mysql => "mysql",
         NativeDatabaseBackend::Sqlite => "sqlite",
+        NativeDatabaseBackend::AzureSql => "azure-sql",
         NativeDatabaseBackend::RdsData => "rds-data",
     }
 }
@@ -475,6 +482,11 @@ mod tests {
                 "skyzen-azure",
                 "cargo add skyzen-azure --no-default-features --features blob",
             ),
+            (
+                "azure-sql",
+                "skyzen-azure",
+                "cargo add skyzen-azure --no-default-features --features sql",
+            ),
         ] {
             let requirement = lookup(capability)
                 .unwrap_or_else(|error| panic!("{capability}: {error}"))
@@ -521,5 +533,21 @@ mod tests {
         assert!(names.contains(&"cosmos"), "{names:?}");
         assert!(names.contains(&"storage-queue"), "{names:?}");
         assert!(names.contains(&"rds-data"), "{names:?}");
+    }
+
+    #[test]
+    fn an_azure_sql_database_implies_the_azure_crate() {
+        let manifest = manifest(
+            "[[database]]\nname = \"main\"\ntype = \"sql\"\n\n\
+             [native.database.main]\nbackend = \"azure-sql\"\n\
+             url_env = \"AZURE_SQL_CONNECTION_STRING\"\n",
+        );
+
+        let names: Vec<_> = required(&manifest)
+            .into_iter()
+            .map(|capability| capability.name)
+            .collect();
+        assert!(names.contains(&"db"), "{names:?}");
+        assert!(names.contains(&"azure-sql"), "{names:?}");
     }
 }

@@ -485,6 +485,41 @@ mod tests {
     }
 
     #[test]
+    fn an_azure_sql_wiring_names_the_variable_holding_its_connection_string() {
+        let wiring =
+            database_wiring("backend = \"azure-sql\"\nurl_env = \"AZURE_SQL_CONNECTION_STRING\"\n")
+                .expect("parses");
+        assert_eq!(wiring.backend(), NativeDatabaseBackend::AzureSql);
+
+        // An ADO.NET connection string is not a URL sqlx can dial, so the native migrate runner is
+        // told there is no connection here for it to open …
+        assert_eq!(wiring.url_env(), None);
+        // … while the variable itself is still declared, so `skyzen dev` and `.env.example` cover
+        // it the way they cover every other named one.
+        assert_eq!(wiring.env_vars()[0].name, "AZURE_SQL_CONNECTION_STRING");
+        assert_eq!(wiring.env_vars()[0].key, Some("url_env"));
+    }
+
+    #[test]
+    fn an_azure_sql_wiring_rejects_a_key_that_belongs_to_another_backend() {
+        for (body, unknown) in [
+            (
+                "backend = \"azure-sql\"\nurl_env = \"C\"\ncontainer = \"uploads\"",
+                "container",
+            ),
+            (
+                "backend = \"azure-sql\"\nconnection_env = \"AZURE_SQL_CONNECTION_STRING\"",
+                "connection_env",
+            ),
+        ] {
+            let error = database_wiring(&format!("{body}\n"))
+                .expect_err("a key azure-sql does not take should be rejected")
+                .to_string();
+            assert!(error.contains(unknown), "{body}: {error}");
+        }
+    }
+
+    #[test]
     fn an_rds_data_wiring_declares_the_four_variables_its_constructor_reads() {
         let wiring = database_wiring("backend = \"rds-data\"\n").expect("parses");
         assert_eq!(wiring.backend(), NativeDatabaseBackend::RdsData);
