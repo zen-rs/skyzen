@@ -648,7 +648,7 @@ mod tests {
         backend: InMemoryQueue,
         handler: Recorder,
         config: ConsumerConfig,
-        until: impl Fn(&Recorder) -> bool,
+        until: impl Fn(&Recorder) -> bool + Send + Sync,
     ) -> Vec<ConsumerFatal> {
         let (stop_tx, stop_rx) = async_channel::bounded::<Infallible>(1);
         let (fatal_tx, fatal_rx) = async_channel::bounded::<ConsumerFatal>(1);
