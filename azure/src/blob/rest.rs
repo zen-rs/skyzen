@@ -476,6 +476,7 @@ mod tests {
             "uploads",
             Credential::SasToken {
                 token: "sv=2020-12-06&sig=signature".to_owned(),
+                expires_at: None,
             },
         )
         .expect("the endpoint should parse");

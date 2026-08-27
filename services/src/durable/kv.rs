@@ -470,11 +470,8 @@ mod tests {
         assert!(kv.delete("alpha").await.unwrap());
         assert_eq!(kv.delete_multiple(&["beta", "missing"]).await.unwrap(), 1);
         kv.delete_all().await.unwrap();
-        assert!(kv
-            .list(DurableListOptions::default())
-            .await
-            .unwrap()
-            .is_empty());
+        let remaining = kv.list(DurableListOptions::default()).await.unwrap();
+        assert!(remaining.is_empty(), "{remaining:?}");
     }
 
     #[tokio::test]

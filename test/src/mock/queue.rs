@@ -354,11 +354,8 @@ mod tests {
         assert_eq!(received[0].attempts, Some(1));
 
         // The leased message is invisible to the next consumer.
-        assert!(queue
-            .receive(ReceiveOptions::new())
-            .await
-            .unwrap()
-            .is_empty());
+        let leased = queue.receive(ReceiveOptions::new()).await.unwrap();
+        assert!(leased.is_empty(), "{leased:?}");
         assert_eq!(queue.len(), 1);
 
         queue.ack(&received[0].receipt).await.unwrap();
@@ -417,11 +414,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(queue
-            .receive(ReceiveOptions::new())
-            .await
-            .unwrap()
-            .is_empty());
+        let held_back = queue.receive(ReceiveOptions::new()).await.unwrap();
+        assert!(held_back.is_empty(), "{held_back:?}");
         assert_eq!(queue.len(), 1);
     }
 
