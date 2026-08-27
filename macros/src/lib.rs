@@ -2800,11 +2800,18 @@ fn generate_native_service_init(
 
     let wrapper = service_wrapper_path(service.service_type);
     let Some(backend) = native_backend_tokens(service, wiring) else {
+        // Naming what the backend *does* provide is what turns this from "no" into a correction:
+        // the mistake is almost always a queue backend under a `type = "kv"` entry, or the reverse.
+        let backend = wiring.backend();
+        let provides = backend.service_type().map_or_else(
+            || "every portable service".to_owned(),
+            |service_type| format!("the `{}` service", service_type.as_str()),
+        );
         return compile_error_block(&format!(
-            "unsupported native backend `{}` for portable service `{}` of type `{}`",
-            wiring.backend().as_str(),
+            "portable service `{}` is declared as `{}`, but `backend = \"{}\"` provides {provides}",
             service.name,
-            service.service_type.as_str()
+            service.service_type.as_str(),
+            backend.as_str(),
         ));
     };
 
