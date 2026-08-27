@@ -259,6 +259,12 @@ async fn connect(target: &Target, url: &str) -> Result<Db> {
              than a connection this runner can open",
             target.name
         ),
+        NativeDatabaseBackend::AzureSql => anyhow::bail!(
+            "database `{}` is an Azure SQL database, which speaks TDS; this runner links sqlx, \
+             which has no T-SQL driver. Apply its migrations from the application with \
+             `Db::migrate`",
+            target.name
+        ),
     };
 
     db.with_context(|| {
