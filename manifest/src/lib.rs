@@ -47,7 +47,7 @@ pub use schema::{
     CfDurableObjects, CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer,
     CfQueueProducer, CfQueues, CfR2Bucket, CfSecretsStoreSecret, CfServiceBinding, CfTriggers,
     CloudflareDatabaseSection, CloudflareSection, CloudflareServiceSection, DatabaseEntry,
-    DatabaseType, NativeDatabaseBackend, NativeDatabaseSection, NativeSection,
+    DatabaseType, NativeDatabaseBackend, NativeDatabaseSection, NativeQueueConsumer, NativeSection,
     NativeServiceBackend, NativeServiceSection, ServiceEntry, ServiceType, SkyzenManifest,
 };
 
@@ -308,6 +308,7 @@ fn take_environment_overlays(
 #[cfg(test)]
 mod tests {
     use super::{Manifest, ManifestError, NativeServiceBackend, ServiceType};
+    use std::time::Duration;
 
     fn parse(content: &str) -> Result<Manifest, ManifestError> {
         Manifest::parse(content, "Skyzen.toml", ".")
@@ -329,6 +330,73 @@ mod tests {
             NativeServiceBackend::Memory
         );
         assert!(data.database[0].default);
+    }
+
+    #[test]
+    fn a_queue_consumer_entry_fills_in_the_polling_defaults() {
+        let manifest = parse(
+            "[[service]]\nname = \"jobs\"\ntype = \"queue\"\n\n\
+             [native.service.jobs]\nbackend = \"memory\"\n\n\
+             [[native.queue_consumer]]\nservice = \"jobs\"\n",
+        )
+        .expect("manifest parses");
+
+        let consumer = &manifest
+            .data()
+            .native
+            .as_ref()
+            .expect("native")
+            .queue_consumer[0];
+        assert_eq!(consumer.service, "jobs");
+        assert_eq!(consumer.concurrency.get(), 1);
+        assert_eq!(consumer.batch_size.get(), 10);
+        assert_eq!(consumer.poll_wait, Duration::from_secs(20));
+        assert_eq!(consumer.visibility_timeout, None);
+        assert_eq!(consumer.retry_delay, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_queue_consumer_entry_parses_its_humantime_durations() {
+        let manifest = parse(
+            "[[service]]\nname = \"jobs\"\ntype = \"queue\"\n\n\
+             [[native.queue_consumer]]\nservice = \"jobs\"\nconcurrency = 4\nbatch_size = 5\n\
+             poll_wait = \"1s\"\nvisibility_timeout = \"1m 30s\"\nretry_delay = \"250ms\"\n",
+        )
+        .expect("manifest parses");
+
+        let consumer = &manifest
+            .data()
+            .native
+            .as_ref()
+            .expect("native")
+            .queue_consumer[0];
+        assert_eq!(consumer.concurrency.get(), 4);
+        assert_eq!(consumer.batch_size.get(), 5);
+        assert_eq!(consumer.poll_wait, Duration::from_secs(1));
+        assert_eq!(consumer.visibility_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(consumer.retry_delay, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn rejects_a_malformed_consumer_duration_at_parse_time() {
+        let error = parse(
+            "[[native.queue_consumer]]\nservice = \"jobs\"\npoll_wait = \"twenty seconds\"\n",
+        )
+        .expect_err("bad duration");
+        assert!(
+            error.to_string().contains("poll_wait"),
+            "error should name the rejected key: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_consumer_concurrency() {
+        let error = parse("[[native.queue_consumer]]\nservice = \"jobs\"\nconcurrency = 0\n")
+            .expect_err("zero concurrency");
+        assert!(
+            error.to_string().contains("concurrency"),
+            "error should name the rejected key: {error}"
+        );
     }
 
     #[test]

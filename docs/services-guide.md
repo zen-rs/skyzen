@@ -123,6 +123,62 @@ lock token) wrapped in an opaque `MessageReceipt`; `attempts` counts deliveries,
 when its visibility timeout lapses. A push-only backend leaves `receive`/`ack`/`nack` at their
 `QueueError::Unsupported` defaults rather than returning a silent empty batch.
 
+### Consuming a Queue Natively
+
+Writing that pull loop by hand is not the point, though — `#[skyzen::queue]` is dual-target, and
+declaring a consumer in `Skyzen.toml` is what makes Skyzen run the loop for you:
+
+```toml
+[[service]]
+name = "jobs"
+type = "queue"
+
+[native.service.jobs]
+backend = "sqs"
+url_env = "JOBS_QUEUE_URL"
+
+[[native.queue_consumer]]
+service = "jobs"
+concurrency = 4
+batch_size = 10
+poll_wait = "20s"
+retry_delay = "30s"
+```
+
+```rust
+#[skyzen::queue]
+async fn queue(batch: QueueBatch<Job>) -> QueueBatchDisposition {
+    // Exactly the handler a Cloudflare Worker runs, invoked here by Skyzen's own consumer loop.
+    QueueBatchDisposition::ack_all()
+}
+```
+
+`#[skyzen::main]` starts one loop per `concurrency` slot beside the HTTP server, on the same
+executor and the same service instance the `Jobs` extractor injects into handlers. Each loop
+receives a batch, hands it to the annotated function, and settles every message with what the
+function returned: `()` and `Ok(())` acknowledge the batch, an `Err` or a panic retries it, and a
+`QueueBatchDisposition` settles message by message. A retry with no delay of its own uses the
+manifest's `retry_delay`. `cargo run -p skyzen-example-queue-consumer` is a working one.
+
+What to expect of it:
+
+- **At-least-once.** A batch is settled only after the handler returns, so a process that dies
+  mid-batch leaves its messages leased and the visibility timeout redelivers them. Handlers must
+  be idempotent.
+- **Ordering is not preserved**, least of all across concurrency slots.
+- **Backends cap the batch** (SQS at 10, Azure Storage at 32) and the loop always long-polls for
+  `poll_wait` — which is why Service Bus, whose receive requires an explicit wait, just works, and
+  why Azure Storage queues emulate one by re-polling for the same interval. A backend that answers
+  an empty receive early leaves the loop idle for the remainder instead of spinning.
+- **A backend that cannot pull at all** — a Cloudflare queue, say — ends the process at startup
+  with an error naming it, rather than idling forever against a queue it can never read.
+- **Ctrl+C stops new receives**, then the in-flight batch finishes and settles within the
+  shutdown grace period.
+- `QueueMessage::timestamp_ms` is the moment the batch was *received*: the portable
+  `ReceivedMessage` carries no enqueue time on the pull path, so unlike Cloudflare's pushed batch
+  it is not an enqueue timestamp. Redelivery counts are logged by the consumer rather than carried
+  on the message.
+
 ## Writing a Handler
 
 Handlers declare service wrappers as arguments — Skyzen extracts them from request extensions:

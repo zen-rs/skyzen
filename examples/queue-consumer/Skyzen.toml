@@ -1,0 +1,18 @@
+[[service]]
+name = "jobs"
+type = "queue"
+
+# The in-process mock, so the example runs with nothing installed. Point this at
+# `backend = "sqs"` with a `url_env` and the same binary consumes a real queue.
+[native.service.jobs]
+backend = "memory"
+
+# What makes `#[skyzen::queue]` run natively: Skyzen polls `jobs` itself, hands each batch to the
+# annotated handler, and settles it with whatever the handler decided.
+[[native.queue_consumer]]
+service = "jobs"
+concurrency = 2
+batch_size = 5
+poll_wait = "500ms"
+visibility_timeout = "10s"
+retry_delay = "2s"

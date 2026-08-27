@@ -22,3 +22,8 @@ git_tag_name = "hyper-v{{ version }}"
 [[package]]
 name = "skyzen-macros"
 git_tag_name = "macros-v{{ version }}"
+
+# A runnable example, not a published crate: it must not get a version bump, a tag or a changelog.
+[[package]]
+name = "skyzen-example-queue-consumer"
+release = false

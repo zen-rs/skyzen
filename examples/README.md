@@ -2,6 +2,8 @@
 
 The `examples` directory demonstrates how to target both native and WASM runtimes with the same Skyzen APIs. Run them from the repository root.
 
+Most are single-file `--example` targets of the root crate. `queue-consumer/` is a crate of its own, because the macros read the `Skyzen.toml` sitting next to the crate they compile: a manifest for a single-file example would be the whole framework's manifest.
+
 ## `native.rs`
 
 Features:
@@ -109,4 +111,18 @@ Features:
 
 ```sh
 cargo run --example services
+```
+
+## `queue-consumer/`
+
+Features:
+
+- Runs a `#[skyzen::queue]` handler natively: `[[native.queue_consumer]]` in `Skyzen.toml` makes Skyzen poll the queue, invoke the handler and settle each batch, beside the HTTP server.
+- The same handler a Cloudflare Worker would run for pushed batches, unchanged.
+- Shows the enqueue side and the consume side sharing one queue instance, and a retry picking up the manifest's `retry_delay`.
+
+```sh
+cargo run -p skyzen-example-queue-consumer -- --port 3000
+curl -X POST localhost:3000/jobs -H 'content-type: application/json' -d '{"id":"1","action":"ship"}'
+curl -X POST localhost:3000/jobs -H 'content-type: application/json' -d '{"id":"2","action":"retry"}'
 ```

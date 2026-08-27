@@ -70,8 +70,12 @@ const MAX_VISIBILITY_TIMEOUT_SECONDS: i32 = 604_800;
 /// A message is capped at 64 KB of encoded text — base64 costs a third more than the bytes it
 /// encodes — and a send above it is refused here rather than at the service. One `receive` takes at
 /// most 32 messages, and a larger request is capped rather than split, so a consumer that wants
-/// more polls again. There is no long polling: [`ReceiveOptions::wait`] is refused rather than
-/// ignored.
+/// more polls again.
+///
+/// The service has no long polling of its own, so [`ReceiveOptions::wait`] is *emulated*: the
+/// queue is polled at [`POLL_INTERVAL`] until a message arrives or the wait elapses. Emulating it
+/// here rather than in each consumer is what lets one portable consumer loop drive this backend
+/// and a genuinely long-polling one (SQS, Service Bus) with the same options.
 ///
 /// Cloning is cheap — the client is behind an `Arc`.
 #[derive(Clone)]
@@ -167,6 +171,73 @@ impl AzureStorageQueue {
             )
             .await?;
         Ok(())
+    }
+
+    /// One trip to the service for whatever is visible right now.
+    async fn receive_once(
+        &self,
+        options: ReceiveOptions,
+    ) -> Result<Vec<ReceivedMessage>, QueueError> {
+        let visibility_timeout = options
+            .visibility_timeout
+            .map(|timeout| duration_seconds(timeout, "a visibility timeout"))
+            .transpose()
+            .map_err(azure_error)?;
+
+        let response = self
+            .client
+            .receive_messages(Some(QueueClientReceiveMessagesOptions {
+                number_of_messages: Some(receive_batch_size(options.max_messages)?),
+                visibility_timeout,
+                ..QueueClientReceiveMessagesOptions::default()
+            }))
+            .await
+            .map_err(azure_error)?;
+
+        response
+            .into_model()
+            .map_err(azure_error)?
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(received_message)
+            .collect()
+    }
+}
+
+/// How often an emulated long poll asks the service again.
+///
+/// A second is short enough that a message is picked up promptly and long enough that waiting out
+/// a twenty-second poll costs twenty requests rather than thousands.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Turn a series of immediate receives into one that waits.
+///
+/// Returns as soon as `receive_once` yields anything, and empty once `wait` has elapsed — the
+/// contract a long-polling backend offers natively. A failure is returned rather than retried: the
+/// caller's own backoff is the right place to decide what a broken queue means.
+async fn long_poll<Poll, Fut>(
+    wait: Duration,
+    mut receive_once: Poll,
+) -> Result<Vec<ReceivedMessage>, QueueError>
+where
+    Poll: FnMut() -> Fut,
+    Fut: core::future::Future<Output = Result<Vec<ReceivedMessage>, QueueError>>,
+{
+    let deadline = std::time::Instant::now() + wait;
+
+    loop {
+        let messages = receive_once().await?;
+        if !messages.is_empty() {
+            return Ok(messages);
+        }
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(Vec::new());
+        }
+
+        async_io::Timer::after(POLL_INTERVAL.min(remaining)).await;
     }
 }
 
@@ -498,40 +569,16 @@ impl MessageQueue for AzureStorageQueue {
 
     /// Take up to [`ReceiveOptions::max_messages`] messages, leasing each one.
     ///
-    /// [`ReceiveOptions::wait`] is refused: Azure Storage queues answer immediately with whatever
-    /// is there, and there is no long poll to map it onto.
+    /// [`ReceiveOptions::wait`] is emulated rather than refused: the service answers immediately
+    /// with whatever is there, so a wait re-polls at [`POLL_INTERVAL`] until a message arrives or
+    /// the wait elapses. Callers therefore get what they asked for — a receive that does not
+    /// report an empty queue before it has waited — without every consumer having to grow a
+    /// polling loop of its own.
     async fn receive(&self, options: ReceiveOptions) -> Result<Vec<ReceivedMessage>, QueueError> {
-        if options.wait.is_some() {
-            return Err(QueueError::Unsupported(
-                "Azure Storage queues have no long polling; a consumer polls `receive` on its own \
-                 schedule, or uses Service Bus, which does",
-            ));
+        match options.wait {
+            None => self.receive_once(options).await,
+            Some(wait) => long_poll(wait, || self.receive_once(options)).await,
         }
-
-        let visibility_timeout = options
-            .visibility_timeout
-            .map(|timeout| duration_seconds(timeout, "a visibility timeout"))
-            .transpose()
-            .map_err(azure_error)?;
-
-        let response = self
-            .client
-            .receive_messages(Some(QueueClientReceiveMessagesOptions {
-                number_of_messages: Some(receive_batch_size(options.max_messages)?),
-                visibility_timeout,
-                ..QueueClientReceiveMessagesOptions::default()
-            }))
-            .await
-            .map_err(azure_error)?;
-
-        response
-            .into_model()
-            .map_err(azure_error)?
-            .items
-            .unwrap_or_default()
-            .into_iter()
-            .map(received_message)
-            .collect()
     }
 
     /// Delete a leased message, which is how Azure Storage queues acknowledge one.
@@ -572,11 +619,11 @@ impl MessageQueue for AzureStorageQueue {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_message, encode_message, is_queue_name, queue_url, receive_batch_size,
-        retry_visibility_seconds, AzureStorageQueue, StorageQueueReceipt, BASE64_PREFIX,
+        decode_message, encode_message, is_queue_name, long_poll, queue_url, receive_batch_size,
+        retry_visibility_seconds, AzureStorageQueue, Duration, StorageQueueReceipt, BASE64_PREFIX,
         MAX_MESSAGE_BYTES, MAX_RECEIVE_MESSAGES, UTF8_PREFIX,
     };
-    use skyzen_services::queue::{MessageQueue, MessageReceipt, QueueError, QueueRetry};
+    use skyzen_services::queue::{MessageReceipt, QueueError, QueueRetry, ReceivedMessage};
 
     /// The round trip the wire format promises: what `send` encodes, `receive` decodes.
     fn round_trip(payload: &[u8]) -> Vec<u8> {
@@ -723,20 +770,64 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn long_polling_is_refused_rather_than_silently_returning_empty() {
-        let queue = AzureStorageQueue::from_sas_url(
-            "https://skyzentest.queue.core.windows.net/jobs?sv=2020-12-06&sig=signature",
-        )
-        .expect("should build");
+    /// A message shaped like whatever the service would have returned.
+    fn delivered() -> ReceivedMessage {
+        ReceivedMessage {
+            id: Some("1".to_owned()),
+            body: b"job".to_vec(),
+            receipt: MessageReceipt::new("receipt"),
+            attempts: Some(1),
+        }
+    }
 
-        let error = queue
-            .receive(
-                skyzen_services::queue::ReceiveOptions::new()
-                    .with_wait(core::time::Duration::from_secs(20)),
-            )
-            .await
-            .expect_err("a long poll should be refused");
-        assert!(matches!(error, QueueError::Unsupported(_)));
+    #[tokio::test]
+    async fn an_emulated_long_poll_returns_as_soon_as_a_message_arrives() {
+        let polls = std::cell::Cell::new(0);
+
+        let messages = long_poll(Duration::from_secs(30), || {
+            let taken = polls.get();
+            polls.set(taken + 1);
+            async move {
+                Ok(if taken < 2 {
+                    Vec::new()
+                } else {
+                    vec![delivered()]
+                })
+            }
+        })
+        .await
+        .expect("the poll should succeed");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(polls.get(), 3, "it stopped as soon as it had a message");
+    }
+
+    #[tokio::test]
+    async fn an_emulated_long_poll_gives_up_empty_once_the_wait_elapses() {
+        let polls = std::cell::Cell::new(0);
+        let started = std::time::Instant::now();
+        let wait = Duration::from_millis(30);
+
+        let messages = long_poll(wait, || {
+            polls.set(polls.get() + 1);
+            async { Ok(Vec::new()) }
+        })
+        .await
+        .expect("an empty queue is not an error");
+
+        assert_eq!(messages.len(), 0, "an elapsed wait returns nothing");
+        assert!(polls.get() >= 2, "it polled again before giving up");
+        assert!(started.elapsed() >= wait, "it waited out the whole poll");
+    }
+
+    #[tokio::test]
+    async fn an_emulated_long_poll_surfaces_a_failure_instead_of_retrying_it() {
+        let error = long_poll(Duration::from_secs(30), || async {
+            Err(QueueError::backend("the queue is gone"))
+        })
+        .await
+        .expect_err("the failure should reach the caller");
+
+        assert!(error.to_string().contains("the queue is gone"));
     }
 }

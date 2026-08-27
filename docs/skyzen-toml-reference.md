@@ -94,6 +94,39 @@ Supported native backends:
 | `storage` | `s3`, `memory` | `bucket_env` for `s3` |
 | `queue` | `sqs`, `memory` | `url_env` for `sqs` |
 
+### Native Queue Consumers
+
+Cloudflare pushes queue batches into a Worker. Natively nobody does, so declaring a consumer is
+what makes Skyzen run the polling loop itself — receive, call the `#[skyzen::queue]` handler,
+settle — beside the HTTP server:
+
+```toml
+[[native.queue_consumer]]
+service = "jobs"
+concurrency = 4
+batch_size = 10
+poll_wait = "20s"
+visibility_timeout = "60s"
+retry_delay = "30s"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `service` | string | **Required.** | The `[[service]]` to consume. It must be `type = "queue"` |
+| `concurrency` | integer | `1` | Polling loops run against this queue at once. Must be at least 1 |
+| `batch_size` | integer | `10` | Most messages per receive. Backends cap it further (SQS 10, Azure Storage 32) |
+| `poll_wait` | duration | `"20s"` | How long a receive waits for a message, and the loop's idle pace |
+| `visibility_timeout` | duration | queue default | How long a received batch stays invisible to other consumers |
+| `retry_delay` | duration | `"30s"` | Redelivery delay for a retry the handler did not delay itself. Whole seconds only |
+
+Durations are humantime strings (`"20s"`, `"1m 30s"`, `"500ms"`) and are parsed when the manifest
+is read, so a malformed one fails the build rather than the consumer.
+
+Declaring a consumer requires a `#[skyzen::queue]` handler in the same module as
+`#[skyzen::main]`, taking exactly one `QueueBatch<T>` argument; a handler that nothing consumes —
+no `[[native.queue_consumer]]` and no `[[cloudflare.queues.consumers]]` — is a compile error
+rather than dead code. See the [services guide](services-guide.md) for the delivery semantics.
+
 ### Cloudflare Service Wiring
 
 Wire each declared service for Cloudflare/WASM targets:
