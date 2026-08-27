@@ -23,8 +23,13 @@ pub enum AzureStatus {
     /// `412 Precondition Failed`: the `If-Match` / `If-None-Match` the request carried no longer
     /// holds, which is what a lost optimistic-concurrency race looks like.
     PreconditionFailed,
-    /// `404 Not Found` or `410 Gone`: the resource is not there — for a lease-settling call, that
-    /// the lease has already lapsed or been settled.
+    /// `404 Not Found`: the resource is not there — for a lease-settling call, that the lease has
+    /// already lapsed or been settled.
+    ///
+    /// `410 Gone` is deliberately **not** here: Azure services use it for a resource that never
+    /// existed rather than one that just went away (Service Bus answers a call against a queue that
+    /// does not exist with it), and reading that as a lapsed lease would hide a misconfiguration
+    /// behind a retry.
     Absent,
     /// Anything else, which stays a backend error carrying the service's own message.
     Other,
@@ -34,7 +39,7 @@ pub enum AzureStatus {
 pub const fn classify(status: u16) -> AzureStatus {
     match status {
         401 | 403 => AzureStatus::Unauthorized,
-        404 | 410 => AzureStatus::Absent,
+        404 => AzureStatus::Absent,
         409 => AzureStatus::Conflict,
         412 => AzureStatus::PreconditionFailed,
         429 => AzureStatus::Throttled,
@@ -68,12 +73,13 @@ mod tests {
         assert_eq!(classify(409), AzureStatus::Conflict);
         assert_eq!(classify(412), AzureStatus::PreconditionFailed);
         assert_eq!(classify(404), AzureStatus::Absent);
-        assert_eq!(classify(410), AzureStatus::Absent);
     }
 
     #[test]
     fn an_ordinary_failure_stays_a_backend_error() {
         assert_eq!(classify(400), AzureStatus::Other);
+        // A queue that does not exist is a misconfiguration, not a lease that lapsed.
+        assert_eq!(classify(410), AzureStatus::Other);
         assert_eq!(classify(500), AzureStatus::Other);
         assert_eq!(classify(503), AzureStatus::Other);
     }
