@@ -1,7 +1,8 @@
 //! Edge example demonstrating how the `#[skyzen::main]` macro maps to
 //! Cloudflare Workers (or any `WinterCG` runtime) without extra glue.
 
-use skyzen::routing::{CreateRouteNode, Params, Route, Router};
+use skyzen::extract::Path;
+use skyzen::routing::{CreateRouteNode, Route, Router};
 #[cfg(target_arch = "wasm32")]
 use skyzen::runtime::CfProperties;
 use skyzen::runtime::WorkerContext;
@@ -15,9 +16,8 @@ async fn root() -> &'static str {
     "Hello from Skyzen running at the edge!"
 }
 
-async fn greet(params: Params) -> SkyResult<String> {
-    let name = params.get("name")?;
-    Ok(format!("Hello, {name}!"))
+async fn greet(Path(name): Path<String>) -> String {
+    format!("Hello, {name}!")
 }
 
 /// Hand work to the runtime that outlives the response.

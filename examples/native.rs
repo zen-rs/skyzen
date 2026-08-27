@@ -3,10 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 use skyzen::{
-    extract::Query,
-    routing::{CreateRouteNode, Params, Route, Router},
+    extract::{Path, Query},
+    routing::{CreateRouteNode, Route, Router},
     utils::Json,
-    Result as SkyResult,
 };
 
 #[derive(Debug, Serialize)]
@@ -24,11 +23,13 @@ async fn home() -> &'static str {
     "Visit /hello?name=Skyzen or /hello/Skyzen for a personalized greeting."
 }
 
-async fn greet_from_path(params: Params) -> SkyResult<Json<Greeting>> {
-    let name = params.get("name")?;
-    Ok(Json(Greeting {
+/// `Path<T>` deserializes the captured segment, so a handler never parses a string itself. Here
+/// `T` is `String`, but `Path<u64>` or `Path<(String, u64)>` works the same way and answers a
+/// malformed segment with a `400` naming it.
+async fn greet_from_path(Path(name): Path<String>) -> Json<Greeting> {
+    Json(Greeting {
         message: format!("Hello, {name}!"),
-    }))
+    })
 }
 
 async fn greet_from_query(Query(query): Query<GreetingQuery>) -> Json<Greeting> {
