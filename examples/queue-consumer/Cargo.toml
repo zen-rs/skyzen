@@ -17,3 +17,8 @@ skyzen-services = { path = "../../services" }
 skyzen-test = { path = "../../test" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
+
+[package.metadata.cargo-machete]
+# Consumed by the code `#[skyzen::main]` GENERATES for `backend = "memory"`, which
+# cargo-machete cannot see in the source text.
+ignored = ["skyzen-test"]

@@ -26,6 +26,7 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 const POLL: Duration = Duration::from_millis(250);
 
 /// How long a child gets to exit after `SIGINT` before it is killed.
+#[cfg(unix)]
 const GRACE: Duration = Duration::from_secs(2);
 
 enum Signal {
