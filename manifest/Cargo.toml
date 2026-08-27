@@ -22,3 +22,8 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# humantime-serde is used through `#[serde(with = "humantime_serde")]` string paths,
+# which cargo-machete cannot see.
+ignored = ["humantime-serde"]
