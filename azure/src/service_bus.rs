@@ -208,9 +208,14 @@ impl ServiceBusQueue {
     /// Build a settlement request against `receipt`'s lock, signed for [`SETTLE_TOKEN_TTL`].
     ///
     /// The URL is the one the Service Bus REST API documents for settling a peek-locked message,
-    /// `…/{queue}/messages/{messageId}/{lockToken}`: `DELETE` completes it, `PUT` unlocks it. The
-    /// SDK reaches it only through the response object a receive returns, which cannot outlive the
-    /// call, so a receipt that a caller may settle minutes later has to name it directly.
+    /// `…/{queue}/messages/{messageId|sequenceNumber}/{lockToken}`: `DELETE` completes it, `PUT`
+    /// unlocks it. The SDK reaches it only through the response object a receive returns, which
+    /// cannot outlive the call, so a receipt that a caller may settle minutes later has to name it
+    /// directly.
+    ///
+    /// The sequence number is what names the message here, which is what the service puts in the
+    /// `Location` header of the peek-lock it answered: it is a number the broker assigned, while a
+    /// message id is whatever the sender chose to set.
     fn settle_request(
         &self,
         method: Method,
@@ -219,7 +224,11 @@ impl ServiceBusQueue {
         let mut url = self.queue_url.clone();
         url.path_segments_mut()
             .map_err(|()| QueueError::backend("the Service Bus queue URL cannot carry a path"))?
-            .extend(["messages", &receipt.message_id, &receipt.lock_token]);
+            .extend([
+                "messages",
+                &receipt.sequence_number.to_string(),
+                &receipt.lock_token,
+            ]);
 
         let mut request = Request::new(url.clone(), method);
         request.insert_header(
@@ -477,12 +486,13 @@ impl From<Headers> for ContentEncodingProperty {
 
 /// The lease this backend hands back, and takes back to settle a message.
 ///
-/// Service Bus settles a peek-locked message by naming both its id and its lock token in the
+/// Service Bus settles a peek-locked message by naming both the message and its lock token in the
 /// request URL, so a receipt has to carry both.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct ServiceBusReceipt {
-    /// The `MessageId` broker property.
-    message_id: String,
+    /// The `SequenceNumber` broker property, which is how the service's own `Location` header
+    /// names the locked message.
+    sequence_number: i64,
     /// The `LockToken` broker property, which names this delivery's lock.
     lock_token: String,
 }
@@ -536,7 +546,7 @@ fn received_message(response: &PeekLockResponse) -> Result<ReceivedMessage, Queu
     };
 
     let receipt = ServiceBusReceipt {
-        message_id: broker_properties.message_id.clone(),
+        sequence_number: broker_properties.sequence_number,
         lock_token: broker_properties.lock_token.clone(),
     };
 
@@ -569,6 +579,9 @@ fn peeked(status: StatusCode) -> Result<bool, QueueError> {
 }
 
 /// Read the outcome of a settlement request off its status.
+///
+/// Service Bus answers a settle it cannot match with `404` and a settle against a queue that does
+/// not exist with `410`, so only the first is the message state changing underneath the call.
 fn settled(status: StatusCode, retry_after_header: Option<&str>) -> Result<(), QueueError> {
     if status.is_success() {
         return Ok(());
@@ -833,7 +846,7 @@ mod tests {
     #[test]
     fn receipts_round_trip_through_their_opaque_token() {
         let receipt = ServiceBusReceipt {
-            message_id: "1c9b4a1e-0b6d-4b39-9c1c-6d8f0c3b7f21".to_owned(),
+            sequence_number: 42,
             lock_token: "0f6a9d16-9a3d-4c53-9f3a-1c31f2b0f9e2".to_owned(),
         };
 
@@ -941,17 +954,19 @@ mod tests {
         let queue = ServiceBusQueue::from_connection_string(CONNECTION_STRING, "jobs")
             .expect("should build");
         let receipt = ServiceBusReceipt {
-            message_id: "message-1".to_owned(),
-            lock_token: "lock-1".to_owned(),
+            sequence_number: 2,
+            lock_token: "7da9cfd5-40d5-4bb1-8d64-ec5a52e1c547".to_owned(),
         };
 
         let request = queue
             .settle_request(azure_core_legacy::Method::Delete, &receipt)
             .expect("should build a settle request");
 
+        // The shape the service itself hands back in the `Location` header of a peek-lock.
         assert_eq!(
             request.url().as_str(),
-            "https://skyzen-test.servicebus.windows.net/jobs/messages/message-1/lock-1"
+            "https://skyzen-test.servicebus.windows.net/jobs/messages/2/\
+             7da9cfd5-40d5-4bb1-8d64-ec5a52e1c547"
         );
         assert_eq!(*request.method(), azure_core_legacy::Method::Delete);
     }
@@ -990,12 +1005,14 @@ mod tests {
     fn a_lapsed_lease_settles_as_a_conflict() {
         assert!(settled(StatusCode::Ok, None).is_ok());
         assert!(matches!(
-            settled(StatusCode::Gone, None),
-            Err(QueueError::Conflict)
-        ));
-        assert!(matches!(
             settled(StatusCode::NotFound, None),
             Err(QueueError::Conflict)
+        ));
+        // A queue that does not exist is not a lease that lapsed: it stays a backend error naming
+        // the status, so a misconfiguration is not retried forever as a lost race.
+        assert!(matches!(
+            settled(StatusCode::Gone, None),
+            Err(QueueError::Backend { .. })
         ));
         assert!(matches!(
             settled(StatusCode::TooManyRequests, Some("7")),
