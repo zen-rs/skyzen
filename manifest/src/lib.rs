@@ -146,7 +146,10 @@ impl Manifest {
                 })?
                 .join(path)
         };
-        let root_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let root_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         let content = fs::read_to_string(&path).map_err(|source| ManifestError::Read {
             path: path.clone(),
             source,
@@ -404,8 +407,10 @@ mod tests {
 
     #[test]
     fn selecting_an_undeclared_environment_is_an_error_not_a_fall_back() {
-        let manifest = parse("[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
-             [cloudflare.env.staging]\nname = \"app-staging\"\n")
+        let manifest = parse(
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+             [cloudflare.env.staging]\nname = \"app-staging\"\n",
+        )
         .expect("manifest parses");
 
         let error = manifest

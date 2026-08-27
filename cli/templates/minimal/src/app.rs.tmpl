@@ -1,7 +1,7 @@
 use skyzen::routing::{CreateRouteNode, Route, Router};
 
 async fn root() -> &'static str {
-    "Hello from {{ ctx.package_name }} durable worker!"
+    "Hello from {{ ctx.package_name }}!"
 }
 
 async fn health() -> &'static str {
@@ -15,4 +15,3 @@ pub fn router() -> Router {
     ))
     .build()
 }
-

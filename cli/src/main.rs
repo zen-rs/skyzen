@@ -1,18 +1,22 @@
 //! Skyzen unified CLI for local emulation and deployment.
 
-mod args;
-mod deps;
+mod capabilities;
+mod cli;
 mod dev;
-mod manifest;
+mod environment;
+mod output;
+mod project;
 mod providers;
 mod scaffold;
 
 use anyhow::{Context, Result};
-use args::{Action, CliOptions};
-use providers::{prepare, run_internal_step, PreparedRun, RunMode};
+use clap::{CommandFactory, Parser};
+use cli::{Cli, Command};
+use providers::{Action, ProviderPlan, RunMode};
 use std::{
     fs,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Command as Process, Stdio},
 };
 
 fn main() {
@@ -23,18 +27,97 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let options = CliOptions::parse(std::env::args())?;
-    if options.action == Action::New {
-        return scaffold::create_project(&options);
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Command::Completions { shell } => {
+            clap_complete::generate(
+                *shell,
+                &mut Cli::command(),
+                "skyzen",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
+        Command::New {
+            path,
+            template,
+            force,
+            overwrite,
+        } => scaffold::create_project(&scaffold::ScaffoldRequest {
+            path,
+            template: *template,
+            existing: match (*force, *overwrite) {
+                (_, true) => scaffold::ExistingFiles::Replace,
+                (true, false) => scaffold::ExistingFiles::Keep,
+                (false, false) => scaffold::ExistingFiles::Refuse,
+            },
+            dry_run: cli.dry_run,
+            install_dependencies: true,
+        }),
+        Command::Add {
+            capabilities: names,
+            list,
+        } => capabilities::add(&project_root(&cli.manifest)?, names, *list || cli.dry_run),
+        Command::Provision => {
+            providers::provision(&cli.manifest, cli.provider, cli.env.as_deref(), cli.dry_run)
+        }
+        Command::Doctor => providers::doctor(&cli.manifest, cli.provider, cli.env.as_deref()),
+        command => {
+            let action = action_for(command);
+            let plan = providers::prepare(
+                &action,
+                &cli.manifest,
+                cli.provider,
+                cli.env.as_deref(),
+                cli.dry_run,
+            )?;
+            execute(&plan, cli.dry_run)
+        }
     }
-    let prepared = prepare(&options)?;
-    execute(&prepared, options.dry_run)
 }
 
-fn execute(prepared: &PreparedRun, dry_run: bool) -> Result<()> {
-    for file in &prepared.generated_files {
-        if dry_run {
-            println!("[dry-run] write {}", file.path.display());
+/// The directory `cargo add` should run in.
+fn project_root(manifest_path: &Path) -> Result<PathBuf> {
+    let absolute = if manifest_path.is_absolute() {
+        manifest_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to read the current directory")?
+            .join(manifest_path)
+    };
+    Ok(absolute
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf))
+}
+
+fn action_for(command: &Command) -> Action {
+    match command {
+        Command::Build { release } => Action::Build { release: *release },
+        Command::Dev => Action::Dev,
+        Command::Deploy => Action::Deploy,
+        Command::Logs { wrangler_args } => Action::Logs {
+            wrangler_args: wrangler_args.clone(),
+        },
+        Command::Secret { command } => Action::Secret(command.clone()),
+        Command::New { .. }
+        | Command::Add { .. }
+        | Command::Provision
+        | Command::Doctor
+        | Command::Completions { .. } => {
+            unreachable!("handled before dispatch")
+        }
+    }
+}
+
+fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
+    // `deploy --dry-run` is the exception: it maps onto `wrangler deploy --dry-run`, which
+    // validates the real bundle, so the plan runs for real and only the upload is skipped.
+    let simulate = dry_run && !plan.execute_despite_dry_run;
+
+    for file in &plan.generated_files {
+        if simulate {
+            output::dry_run(format!("write {}", file.path.display()));
             println!("{}", file.contents);
             continue;
         }
@@ -44,48 +127,59 @@ fn execute(prepared: &PreparedRun, dry_run: bool) -> Result<()> {
         }
         fs::write(&file.path, &file.contents)
             .with_context(|| format!("failed to write {}", file.path.display()))?;
-        println!("[skyzen] wrote {}", file.path.display());
+        output::step(format!("wrote {}", file.path.display()));
     }
 
-    for step in &prepared.internal_steps {
-        let display = step.display();
-        if dry_run {
-            println!("[dry-run] {display}");
-            continue;
-        }
-
-        println!("[skyzen] {display}");
-        run_internal_step(step)?;
-    }
-
-    if prepared.commands.is_empty() {
-        match prepared.action {
-            Action::Doctor => {}
-            Action::New => unreachable!("new is handled before prepare"),
-            Action::Dev | Action::Deploy => {
-                anyhow::bail!("no command prepared");
-            }
+    if let Some(build) = &plan.build {
+        if simulate {
+            output::dry_run(build.describe());
+        } else {
+            output::step(build.describe());
+            providers::cloudflare::build::run(build)?;
         }
     }
 
-    if prepared.run_mode == RunMode::Watch {
-        let Some(command) = prepared.commands.first() else {
-            anyhow::bail!("watch mode requires at least one command");
-        };
-        return dev::run_native_watch(command, dry_run);
+    if plan.run_mode == RunMode::Once {
+        return run_commands(&plan.commands, simulate, &plan.child_env);
     }
 
-    for command in &prepared.commands {
+    let Some(command) = plan.commands.first() else {
+        anyhow::bail!("a supervised run needs at least one command");
+    };
+    if simulate {
+        output::dry_run(format!("supervise {}", command.display()));
+        return Ok(());
+    }
+    let watch_root = plan
+        .watch_root
+        .as_deref()
+        .context("a supervised run needs a directory to watch")?;
+    dev::supervise(&dev::Supervision {
+        command,
+        build: plan.build.as_ref(),
+        mode: plan.run_mode,
+        child_env: &plan.child_env,
+        watch_root,
+    })
+}
+
+fn run_commands(
+    commands: &[providers::CommandPlan],
+    simulate: bool,
+    child_env: &[(String, String)],
+) -> Result<()> {
+    for command in commands {
         let display = command.display();
-        if dry_run {
-            println!("[dry-run] {display}");
+        if simulate {
+            output::dry_run(display);
             continue;
         }
 
-        println!("[skyzen] {display}");
-        let mut process = Command::new(&command.program);
+        output::step(&display);
+        let mut process = Process::new(&command.program);
         process
             .args(&command.args)
+            .envs(child_env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -97,11 +191,7 @@ fn execute(prepared: &PreparedRun, dry_run: bool) -> Result<()> {
             .status()
             .with_context(|| format!("failed to launch {}", command.program))?;
         if !status.success() {
-            anyhow::bail!(
-                "command failed with status {}: {}",
-                status,
-                command.display()
-            );
+            anyhow::bail!("command failed with status {status}: {display}");
         }
     }
 
