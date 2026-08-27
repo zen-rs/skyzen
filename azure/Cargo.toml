@@ -11,19 +11,57 @@ categories = ["web-programming::http-server", "database"]
 
 [dependencies]
 skyzen-services = { path = "../services", version = "0.1.0" }
-azure_data_cosmos = { version = "0.36", optional = true }
-azure_messaging_servicebus = { version = "0.21", optional = true }
-opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "http-transport-reqwest-rustls", "services-azblob"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"
 base64 = "0.22"
 
+# Cosmos DB.
+azure_data_cosmos = { version = "0.37.1", features = ["key_auth"], optional = true }
+
+# Service Bus. The legacy client is the only published one; `azure_core` 0.21 is the HTTP stack it
+# already links, and the settlement calls this crate issues go out on that same client.
+azure_messaging_servicebus = { version = "0.21", optional = true }
+azure_core_legacy = { package = "azure_core", version = "0.21", optional = true }
+time = { version = "0.3", optional = true }
+url = { version = "2", optional = true }
+
+# Azure Storage queues, and the credential types Cosmos and the queues share.
+azure_storage_queue = { version = "1.0", optional = true }
+azure_core = { version = "1.0", optional = true }
+
+# Blob Storage: OpenDAL moves the bytes, and the listing, tiering and presigning REST calls go out
+# on the same reqwest/reqsign stack OpenDAL's own azblob service is built on.
+opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "http-transport-reqwest-rustls", "services-azblob"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+reqsign-azure-storage = { version = "3.1", optional = true }
+reqsign-core = { version = "3.1", optional = true }
+quick-xml = { version = "0.41", features = ["serialize"], optional = true }
+http = { version = "1.4", optional = true }
+bytes = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
 [features]
-default = ["cosmos", "blob", "servicebus"]
-cosmos = ["dep:azure_data_cosmos"]
-blob = ["dep:opendal"]
-servicebus = ["dep:azure_messaging_servicebus"]
+default = ["cosmos", "blob", "servicebus", "storage-queue"]
+cosmos = ["dep:azure_data_cosmos", "dep:azure_core"]
+blob = [
+    "dep:opendal",
+    "dep:reqwest",
+    "dep:reqsign-azure-storage",
+    "dep:reqsign-core",
+    "dep:quick-xml",
+    "dep:http",
+    "dep:bytes",
+]
+servicebus = [
+    "dep:azure_messaging_servicebus",
+    "dep:azure_core_legacy",
+    "dep:time",
+    "dep:url",
+]
+storage-queue = ["dep:azure_storage_queue", "dep:azure_core"]
 
 [lints]
 workspace = true
