@@ -137,6 +137,33 @@ impl AzureStorageQueue {
         Ok(Self::new(client))
     }
 
+    /// Create a queue client from the signed queue URL held in an environment variable.
+    ///
+    /// The counterpart of the `from_env` every other backend in this workspace has. There is no
+    /// fixed variable name to default to, because the whole URL — account, queue and signature —
+    /// is the credential: a deployment holding two queues holds two unrelated URLs, so the caller
+    /// (or a `[native.service.<name>]` wiring's `sas_url_env`) names the one it means.
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError::Backend`] naming `variable` when it is unset, and when its value is not a
+    /// signed queue URL — see [`from_sas_url`](Self::from_sas_url).
+    pub fn from_sas_env(variable: &str) -> Result<Self, QueueError> {
+        let url = std::env::var(variable).map_err(|error| {
+            QueueError::backend_with(
+                format!("{variable} is not set to a signed Azure Storage queue URL"),
+                error,
+            )
+        })?;
+
+        Self::from_sas_url(&url).map_err(|error| {
+            QueueError::backend_with(
+                format!("{variable} does not hold a usable Azure Storage queue URL"),
+                error,
+            )
+        })
+    }
+
     /// Send one message, holding it invisible for `delay` when there is one.
     async fn send_message(&self, message: &[u8], options: SendOptions) -> Result<(), AzureError> {
         let body: RequestContent<QueueMessage, _> = QueueMessage {
@@ -573,6 +600,7 @@ mod tests {
         retry_visibility_seconds, AzureStorageQueue, Duration, StorageQueueReceipt,
         MAX_MESSAGE_BYTES, MAX_RECEIVE_MESSAGES,
     };
+    use serial_test::serial;
     use skyzen_services::queue::{
         envelope::BASE64_PREFIX, MessageReceipt, QueueError, QueueRetry, ReceivedMessage,
     };
@@ -655,6 +683,48 @@ mod tests {
             AzureStorageQueue::from_sas_url("https://skyzentest.queue.core.windows.net/jobs")
                 .expect_err("an unsigned URL should be refused");
         assert!(error.to_string().contains("shared access signature"));
+    }
+
+    /// The variable this test owns. `set_var` and `remove_var` are process-wide, so the tests that
+    /// touch the environment are serialized against each other.
+    const SAS_URL_VARIABLE: &str = "SKYZEN_TEST_STORAGE_QUEUE_SAS_URL";
+
+    #[test]
+    #[serial]
+    fn a_signed_url_read_from_the_environment_builds_a_client() {
+        std::env::set_var(
+            SAS_URL_VARIABLE,
+            "https://skyzentest.queue.core.windows.net/jobs?sv=2024-11-04&sig=signature",
+        );
+        let queue = AzureStorageQueue::from_sas_env(SAS_URL_VARIABLE);
+        std::env::remove_var(SAS_URL_VARIABLE);
+
+        let queue = queue.expect("a signed URL should build a client");
+        assert!(
+            format!("{queue:?}").contains("skyzentest.queue.core.windows.net/jobs"),
+            "{queue:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_unset_variable_is_reported_by_name_rather_than_as_a_missing_url() {
+        std::env::remove_var(SAS_URL_VARIABLE);
+
+        let error = AzureStorageQueue::from_sas_env(SAS_URL_VARIABLE)
+            .expect_err("an unset variable should be refused");
+        assert!(error.to_string().contains(SAS_URL_VARIABLE), "{error}");
+    }
+
+    #[test]
+    #[serial]
+    fn a_variable_holding_something_that_is_not_a_queue_url_names_the_variable() {
+        std::env::set_var(SAS_URL_VARIABLE, "not a url");
+        let error = AzureStorageQueue::from_sas_env(SAS_URL_VARIABLE);
+        std::env::remove_var(SAS_URL_VARIABLE);
+
+        let error = error.expect_err("a malformed URL should be refused");
+        assert!(error.to_string().contains(SAS_URL_VARIABLE), "{error}");
     }
 
     #[test]
