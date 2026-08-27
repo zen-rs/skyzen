@@ -15,7 +15,14 @@
 //! - [`CfAssets`] — Cloudflare Static Assets binding
 //! - [`CfSecretStore`] — Cloudflare Secrets Store bindings
 //! - [`CfCache`] — Cloudflare Cache API
-//! - [`CfDurableDb`] — Durable Object `SQLite` (`state.storage.sql`)
+//! - [`CfFetch`] — outbound `fetch` with Cloudflare's own request options
+//! - [`CfDurableDb`], [`CfDurableKv`], [`CfAlarm`] — Durable Object storage (`state.storage.sql`,
+//!   the key-value API, and alarms), plus [`CfDurableNamespace`] and [`CfDurableObjectStub`] for
+//!   addressing one
+//!
+//! The Worker event payloads live here too — [`CfQueueBatch`], [`CfScheduledEvent`],
+//! [`CfEmailMessage`] and [`TailTraceItem`] — behind `#[skyzen::queue]`, `#[skyzen::scheduled]`,
+//! `#[skyzen::email]` and `#[skyzen::tail]`.
 //!
 //! **This crate only works on `wasm32` targets.** On native targets it compiles
 //! as an empty crate.
