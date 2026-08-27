@@ -251,6 +251,14 @@ async fn connect(target: &Target, url: &str) -> Result<Db> {
         NativeDatabaseBackend::Postgres => Db::connect_postgres(url).await,
         NativeDatabaseBackend::Mysql => Db::connect_mysql(url).await,
         NativeDatabaseBackend::Sqlite => Db::connect_sqlite(url).await,
+        // Never reached: a database with no connection URL is refused by `resolve_targets`, which
+        // is where the explanation belongs. Reported rather than unreachable so that adding a
+        // backend to the schema cannot turn into a panic here.
+        NativeDatabaseBackend::RdsData => anyhow::bail!(
+            "database `{}` is reached through the RDS Data API, which is an HTTP service rather \
+             than a connection this runner can open",
+            target.name
+        ),
     };
 
     db.with_context(|| {
@@ -299,8 +307,14 @@ fn resolve_targets(manifest: &Manifest) -> Result<Vec<Target>> {
 
     let mut targets = Vec::new();
     let mut unwired = Vec::new();
+    let mut unreachable = Vec::new();
     for database in databases {
         match native.and_then(|wiring| wiring.get(&database.name)) {
+            // A backend with no connection URL is one this runner cannot open: it links sqlx and
+            // its drivers, and the RDS Data API is an HTTP service reached by ARN.
+            Some(section) if section.url_env().is_none() => {
+                unreachable.push((database.name.clone(), section.backend().as_str()));
+            }
             Some(section) => targets.push(target_for(manifest, database, section)?),
             None => unwired.push(database.name.clone()),
         }
@@ -308,13 +322,20 @@ fn resolve_targets(manifest: &Manifest) -> Result<Vec<Target>> {
 
     if targets.is_empty() {
         anyhow::bail!(
-            "no [[database]] in {} has a [native.database.<name>] wiring, so there is no \
-             connection to migrate through (declared: {}). Add one, or migrate through the \
-             provider that hosts the database — for Cloudflare D1 that is \
-             `skyzen migrate --provider cloudflare`, which is also where \
+            "no [[database]] in {} has a [native.database.<name>] wiring this runner can open a \
+             connection through (no wiring: {}; wired to a backend that is not a connection: {}). \
+             Add one, apply the migrations from the application itself with `Db::migrate` (see \
+             docs/migrations.md), or migrate through the provider that hosts the database — for \
+             Cloudflare D1 that is `skyzen migrate --provider cloudflare`, which is also where \
              `skyzen migrate status` reports from.",
             manifest.path().display(),
-            unwired.join(", ")
+            list(&unwired),
+            list(
+                &unreachable
+                    .iter()
+                    .map(|(name, backend)| format!("{name} ({backend})"))
+                    .collect::<Vec<_>>()
+            ),
         );
     }
     for name in unwired {
@@ -322,8 +343,23 @@ fn resolve_targets(manifest: &Manifest) -> Result<Vec<Target>> {
             "database `{name}` has no [native.database.{name}] wiring; skipping it"
         ));
     }
+    for (name, backend) in unreachable {
+        output::warn(format!(
+            "database `{name}` is wired to `{backend}`, which this runner cannot open a connection \
+             to; skipping it. Apply its migrations from the application with `Db::migrate`."
+        ));
+    }
 
     Ok(targets)
+}
+
+/// A comma-separated list, or `none` when there is nothing to list.
+fn list(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
 }
 
 /// Read one database's migrations directory.
@@ -342,8 +378,11 @@ fn target_for(
 
     Ok(Target {
         name: database.name.clone(),
-        backend: section.backend,
-        url_env: section.url_env.clone(),
+        backend: section.backend(),
+        url_env: section
+            .url_env()
+            .context("a database with no connection URL is not resolved into a target")?
+            .to_owned(),
         directory,
         files,
     })
@@ -477,6 +516,44 @@ mod tests {
             rendered.contains("skyzen migrate --provider cloudflare"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn a_database_that_is_not_a_connection_is_skipped_with_the_reason() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest_path = dir.path().join("Skyzen.toml");
+        fs::write(
+            &manifest_path,
+            "[[database]]\nname = \"main\"\ntype = \"sql\"\ndefault = true\n\n\
+             [native.database.main]\nbackend = \"rds-data\"\n",
+        )
+        .expect("write manifest");
+
+        // The RDS Data API is wired, so the message must not claim the database has no wiring —
+        // it must say the runner cannot open a connection to it, and where the migrations can run.
+        let error = resolve_targets(&load(&manifest_path)).expect_err("nothing to connect through");
+        let rendered = error.to_string();
+        assert!(rendered.contains("main (rds-data)"), "{rendered}");
+        assert!(rendered.contains("Db::migrate"), "{rendered}");
+    }
+
+    #[test]
+    fn a_database_the_runner_can_open_is_still_migrated_beside_one_it_cannot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest_path = project(dir.path(), "SKYZEN_TEST_DB_URL", None);
+        let source = fs::read_to_string(&manifest_path).expect("read manifest");
+        fs::write(
+            &manifest_path,
+            format!(
+                "{source}\n[[database]]\nname = \"reports\"\ntype = \"sql\"\n\n\
+                 [native.database.reports]\nbackend = \"rds-data\"\n"
+            ),
+        )
+        .expect("write manifest");
+
+        let targets = resolve_targets(&load(&manifest_path)).expect("one openable database");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "main");
     }
 
     #[test]

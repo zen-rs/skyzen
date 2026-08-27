@@ -494,6 +494,9 @@ fn check_manifest(
     };
 
     let mut failures = 0;
+    if providers.contains(&Provider::Native) {
+        report_native_wiring(&manifest);
+    }
     if providers.contains(&Provider::Cloudflare) {
         failures += check_cloudflare_manifest(&manifest, environment);
     }
@@ -504,6 +507,48 @@ fn check_manifest(
         failures += azure::check_manifest(&manifest);
     }
     failures
+}
+
+/// Report the native wiring: which backend each portable capability resolves to, and which of the
+/// variables it reads are actually available.
+///
+/// A warning rather than a failure, and it counts none: `doctor` is not a run, and the machine a
+/// project is diagnosed on is routinely not the one holding the production connection strings.
+/// `skyzen dev` is where an unset variable is an error, because that is where it would panic.
+fn report_native_wiring(manifest: &Manifest) {
+    let Some(native) = manifest.data().native.as_ref() else {
+        return;
+    };
+    if native.service.is_empty() && native.database.is_empty() {
+        return;
+    }
+
+    for (name, service) in &native.service {
+        output::ok(format!(
+            "native: service `{name}` is backed by `{}`",
+            service.backend().as_str()
+        ));
+    }
+    for (name, database) in &native.database {
+        output::ok(format!(
+            "native: database `{name}` is backed by `{}`",
+            database.backend().as_str()
+        ));
+    }
+
+    let dotenv = environment::load_dotenv_files(manifest.root_dir()).unwrap_or_else(|error| {
+        output::warn(format!("native: {error:#}"));
+        std::collections::BTreeMap::new()
+    });
+    for variable in environment::required_variables(manifest.data()) {
+        if dotenv.contains_key(&variable.name) || std::env::var_os(&variable.name).is_some() {
+            continue;
+        }
+        output::warn(format!(
+            "native: {} is set nowhere (declared by {}); `skyzen dev` will refuse to start",
+            variable.name, variable.declared_by
+        ));
+    }
 }
 
 fn check_cloudflare_manifest(manifest: &Manifest, environment: Option<&str>) -> usize {
