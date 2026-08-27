@@ -106,12 +106,12 @@
 //! # Errors
 //!
 //! Service error codes are classified before they become a [`DbError`], so a handler never has to
-//! match on message text: throttling becomes [`DbError::Throttled`], and a permission rejection
-//! (`ForbiddenException`, `AccessDeniedException`) becomes a [`DbError::Backend`] whose message
-//! says so — [`DbError`] has no `Unauthorized` variant to carry it. Everything else, including
-//! `BadRequestException` (which is how a SQL error arrives), `StatementTimeoutException` and the
-//! transient `DatabaseResumingException`, stays a [`DbError::Backend`] with the SDK's error as its
-//! source.
+//! match on message text: throttling becomes [`DbError::Throttled`] and a permission rejection
+//! (`ForbiddenException`, `AccessDeniedException`) becomes [`DbError::Unauthorized`], matching how
+//! [`KvError`](skyzen_services::KvError) and [`QueueError`](skyzen_services::QueueError) report the
+//! same rejection from `DynamoDB` and SQS. Everything else, including `BadRequestException` (which
+//! is how a SQL error arrives), `StatementTimeoutException` and the transient
+//! `DatabaseResumingException`, stays a [`DbError::Backend`] with the SDK's error as its source.
 
 use std::str::FromStr;
 
@@ -127,12 +127,21 @@ use aws_sdk_rdsdata::Client;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use serde_json::{Map, Number, Value};
-use skyzen_services::sql::{
-    BatchStatement, DbBackend, DbDialect, DbError, DbExecResult, DbTransaction,
-    DbTransactionBackend, DbValue,
+// The tokenizer, the location-to-byte mapper and the `DbError::SqlParse` mapping all come from
+// `skyzen-services`: this backend rewrites a statement that crate has already rewritten once, so
+// re-deriving any of it here would be two copies of the same forward scan drifting apart. The
+// sqlparser types come through the same re-export, which is what guarantees the two crates are
+// talking about one `Dialect`.
+use skyzen_services::{
+    sql::{
+        tokenize_with_dialect, BatchStatement, DbBackend, DbDialect, DbError, DbExecResult,
+        DbTransaction, DbTransactionBackend, DbValue, LocationMapper,
+    },
+    sqlparser::{
+        dialect::{MySqlDialect, PostgreSqlDialect},
+        tokenizer::{Token, TokenWithSpan},
+    },
 };
-use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect};
-use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
 use crate::errors::{categorize, AwsErrorCategory};
 
@@ -823,67 +832,14 @@ fn placeholder_index(placeholder: &str, position: usize, params: usize) -> Resul
 }
 
 /// Tokenize with the engine's own dialect, so its quoting rules apply.
+///
+/// The tokenizing itself — and the mapping of a tokenizer failure onto [`DbError::SqlParse`] —
+/// comes from `skyzen-services`, which does the first rewriting pass over the same statement. Only
+/// the engine-to-dialect choice is this crate's.
 fn tokenize(sql: &str, engine: RdsEngine) -> Result<Vec<TokenWithSpan>, DbError> {
     match engine {
-        RdsEngine::AuroraPostgres => tokenize_with(sql, &PostgreSqlDialect {}),
-        RdsEngine::AuroraMysql => tokenize_with(sql, &MySqlDialect {}),
-    }
-}
-
-/// Tokenize `sql`, turning a tokenizer failure into a [`DbError::SqlParse`].
-fn tokenize_with(sql: &str, dialect: &dyn Dialect) -> Result<Vec<TokenWithSpan>, DbError> {
-    Tokenizer::new(dialect, sql)
-        .tokenize_with_location()
-        .map_err(|error| DbError::SqlParse(error.to_string()))
-}
-
-/// Maps the 1-based line/column [`Location`]s sqlparser reports to byte indices, in a single
-/// forward pass over the statement.
-///
-/// Token locations arrive in source order, so the mapper only ever advances and mapping every
-/// placeholder costs `O(n)` in the statement's length rather than `O(n²)`. `skyzen-services` needs
-/// exactly the same mapping for its own rewriting pass and keeps it private; this crate cannot
-/// reach it, and a platform crate may not reach into the services crate's internals either way.
-struct LocationMapper<'a> {
-    chars: core::iter::Peekable<core::str::CharIndices<'a>>,
-    len: usize,
-    line: u64,
-    column: u64,
-}
-
-impl<'a> LocationMapper<'a> {
-    fn new(sql: &'a str) -> Self {
-        Self {
-            chars: sql.char_indices().peekable(),
-            len: sql.len(),
-            line: 1,
-            column: 1,
-        }
-    }
-
-    /// Byte index of `target`, saturating to the end of the statement.
-    ///
-    /// Targets must be requested in non-decreasing source order.
-    fn byte_index(&mut self, target: Location) -> usize {
-        if target.line == 0 && target.column == 0 {
-            return 0;
-        }
-
-        while let Some(&(index, character)) = self.chars.peek() {
-            if (self.line, self.column) >= (target.line, target.column) {
-                return index;
-            }
-
-            self.chars.next();
-            if character == '\n' {
-                self.line += 1;
-                self.column = 1;
-            } else {
-                self.column += 1;
-            }
-        }
-
-        self.len
+        RdsEngine::AuroraPostgres => tokenize_with_dialect(sql, &PostgreSqlDialect {}),
+        RdsEngine::AuroraMysql => tokenize_with_dialect(sql, &MySqlDialect {}),
     }
 }
 
@@ -893,22 +849,24 @@ impl<'a> LocationMapper<'a> {
 /// [`DisplayErrorContext`] walks the whole source chain, so the service's error code appears in the
 /// message instead of a bare "service error".
 ///
-/// A rejected caller becomes a [`DbError::Backend`] whose message says the request was
-/// unauthorized: [`DbError`] has no `Unauthorized` variant, unlike the key-value and queue errors,
-/// and inventing one here would mean editing the services crate.
+/// A rejected caller becomes [`DbError::Unauthorized`], the same unit variant `DynamoDB` and SQS
+/// map their `AccessDeniedException` to. The message is dropped along with the source, which is
+/// deliberate and matches the other services: "not authorized" is the whole diagnosis, and the
+/// remedy is an IAM policy or a Secrets Manager secret, never the statement.
 fn sdk_error<E>(action: &str, error: E) -> DbError
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     match classify(&error) {
         AwsErrorCategory::Throttled => DbError::Throttled { retry_after: None },
-        AwsErrorCategory::Unauthorized => DbError::backend_with(
-            format!(
-                "not authorized to {action} through the RDS Data API: {}",
-                DisplayErrorContext(&error)
-            ),
-            error,
-        ),
+        AwsErrorCategory::Unauthorized => {
+            tracing::warn!(
+                action,
+                error = %DisplayErrorContext(&error),
+                "the RDS Data API rejected the request as unauthorized",
+            );
+            DbError::Unauthorized
+        }
         AwsErrorCategory::Backend => DbError::backend_with(
             format!("failed to {action}: {}", DisplayErrorContext(&error)),
             error,
@@ -1497,8 +1455,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unauthorized_call_says_so_in_its_message() {
-        let error = sdk_error("begin a transaction", Coded::new("ForbiddenException"));
-        assert!(error.to_string().contains("not authorized"), "{error}");
+    fn an_unauthorized_call_becomes_the_unauthorized_error() {
+        // The same variant `DynamoDB` and SQS map their `AccessDeniedException` to, so a handler
+        // matching on "the credentials were refused" sees one shape across all three services.
+        for code in ["ForbiddenException", "AccessDeniedException"] {
+            let error = sdk_error("begin a transaction", Coded::new(code));
+            assert!(matches!(error, DbError::Unauthorized), "{code}: {error:?}");
+            assert!(error.to_string().contains("not authorized"), "{error}");
+        }
     }
 }

@@ -49,13 +49,24 @@ pub(crate) type BoxFuture<'a, T> = futures_core::future::BoxFuture<'a, T>;
 pub mod durable;
 pub mod events;
 pub mod kv;
+pub mod migrate;
 pub mod queue;
 pub mod sql;
 pub mod storage;
 
+/// The SQL tokenizer every Skyzen backend rewrites statements with.
+///
+/// Re-exported because [`sql::tokenize_with_dialect`] and [`sql::LocationMapper`] speak in
+/// sqlparser's own types: a platform crate doing a second rewriting pass (the Aurora Data API
+/// turns Skyzen's placeholders into its named form) has to name the *same* `Dialect` and `Token`
+/// types, and depending on sqlparser separately only works for as long as the two versions happen
+/// to agree.
+pub use sqlparser;
+
 pub use durable::{DurableDb, DurableDbBackend, DurableDbError, DurableDbQuery};
 pub use events::ScheduledTick;
 pub use kv::{KeyValueStore, Kv, KvError, KvListOptions, KvListResult};
+pub use migrate::{AppliedMigration, Migration, MigrationReport, MigrationStatus, Migrations};
 pub use queue::{
     BatchSendFailure, MessageQueue, MessageReceipt, Queue, QueueBatch, QueueBatchDisposition,
     QueueError, QueueMessage, QueueMessageDisposition, QueueRetry, ReceiveOptions, ReceivedMessage,
@@ -63,7 +74,7 @@ pub use queue::{
 };
 pub use sql::{
     BatchStatement, Db, DbBackend, DbDialect, DbError, DbExecResult, DbQuery, DbTransaction,
-    DbTransactionBackend, DbTransactionQuery, DbValue, QuerySource, SqlQuery,
+    DbTransactionBackend, DbTransactionQuery, DbValue, LocationMapper, QuerySource, SqlQuery,
 };
 pub use storage::{
     ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest, PutOption,
@@ -195,7 +206,36 @@ mod http_status_tests {
                 &DbError::Throttled { retry_after: None },
                 StatusCode::TOO_MANY_REQUESTS,
             ),
+            // A rejected credential is a deployment fault, so it renders as a 500 exactly like the
+            // key-value, storage and queue errors do — never as a 401 aimed at the HTTP caller.
+            (&DbError::Unauthorized, StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                &DbError::MigrationChanged {
+                    version: 1,
+                    name: "create_users".to_owned(),
+                    recorded: "aa".repeat(32),
+                    embedded: "bb".repeat(32),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ]);
+    }
+
+    #[test]
+    fn an_edited_migration_names_the_file_and_both_checksums() {
+        let error = DbError::MigrationChanged {
+            version: 7,
+            name: "add_index".to_owned(),
+            recorded: "aa".repeat(32),
+            embedded: "bb".repeat(32),
+        };
+        let rendered = error.to_string();
+        for fragment in ["add_index", "version 7", &"aa".repeat(32), &"bb".repeat(32)] {
+            assert!(
+                rendered.contains(fragment),
+                "{fragment} missing: {rendered}"
+            );
+        }
     }
 
     #[test]

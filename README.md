@@ -852,6 +852,7 @@ skyzen deploy --provider azure
 ## Guides & Examples
 
 - [Using Portable Services](docs/services-guide.md)
+- [SQL Migrations](docs/migrations.md)
 - [Testing Guide](docs/testing-guide.md)
 - [Deployment Guide](docs/deployment-guide.md)
 - [Durable Objects & SQL Guide](docs/durable-sql-guide.md)

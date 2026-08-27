@@ -161,6 +161,12 @@ type = "sql"
 | `name` | string | **Required.** Logical database name used in wiring sections |
 | `type` | string | **Required.** Currently only `sql` |
 | `default` | bool | Whether a bare `Db` extractor resolves to this entry. Required (on exactly one entry) when more than one database is declared |
+| `migrations_dir` | string | Directory of `<version>_<name>.sql` migrations, relative to the project root. Defaults to `migrations` |
+
+`migrations_dir` defaults to `migrations/`, which is also `wrangler d1 migrations apply`'s default,
+so a database deployed to D1 and one run natively read the same files with nothing configured.
+Changing it moves only the native path — wrangler needs its own `migrations_dir` under
+`[cloudflare.raw]`. See the [Migrations Guide](migrations.md).
 
 ### Native Database Wiring
 

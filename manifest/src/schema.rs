@@ -89,6 +89,24 @@ pub struct DatabaseEntry {
     /// Whether a bare `Db` extractor resolves to this entry. At most one entry may set it.
     #[serde(default)]
     pub default: bool,
+    /// Directory holding this database's `NNNN_name.sql` migrations, relative to the project root.
+    ///
+    /// Unset means [`DEFAULT_MIGRATIONS_DIR`](crate::DEFAULT_MIGRATIONS_DIR) — the same `migrations/`
+    /// that `wrangler d1 migrations apply` defaults to, so a database deployed to D1 and one run
+    /// natively read the same files. Setting it to anything else moves only the native path;
+    /// wrangler needs its own `migrations_dir`, set through `[cloudflare.raw]`.
+    #[serde(default)]
+    pub migrations_dir: Option<String>,
+}
+
+impl DatabaseEntry {
+    /// The migrations directory this entry reads, relative to the project root.
+    #[must_use]
+    pub fn migrations_dir(&self) -> &str {
+        self.migrations_dir
+            .as_deref()
+            .unwrap_or(crate::DEFAULT_MIGRATIONS_DIR)
+    }
 }
 
 /// The portable database kinds a `[[database]]` entry can declare.

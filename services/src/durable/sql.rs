@@ -66,7 +66,9 @@ impl From<DbError> for DurableDbError {
             error @ (DbError::TransactionsUnsupported
             | DbError::BatchesUnsupported
             | DbError::Conflict
-            | DbError::Throttled { .. }) => Self::backend_with(error.to_string(), error),
+            | DbError::Throttled { .. }
+            | DbError::MigrationChanged { .. }
+            | DbError::Unauthorized) => Self::backend_with(error.to_string(), error),
         }
     }
 }

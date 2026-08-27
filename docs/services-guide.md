@@ -374,4 +374,23 @@ skyzen-services = { version = "0.1", features = ["runtime-tokio-rustls", "postgr
 
 Portable SQL is intentionally the minimum common surface. When you need provider-specific features such as Durable Object local SQLite or D1-specific metadata, drop down to the provider APIs explicitly.
 
+### Schema Changes
+
+Schema is managed with plain `.sql` files, embedded at compile time and applied by a runner that
+works on every backend `Db` works on:
+
+```rust
+use skyzen::embed_migrations;
+use skyzen_services::Migrations;
+
+static MIGRATIONS: Migrations = embed_migrations!("migrations");
+
+db.migrate(&MIGRATIONS).await?;
+```
+
+The same files are what `skyzen migrate` applies from the CLI, and what
+`#[skyzen::test(migrations = MIGRATIONS)]` applies to a test's database. See the
+[Migrations Guide](migrations.md) for the file-naming rules, per-backend atomicity, the checksum
+policy that detects an edited migration, and the CLI and testing workflows.
+
 For object-scoped SQL that runs on both native and Cloudflare, continue with the [Durable Object + SQL Guide](durable-sql-guide.md).
