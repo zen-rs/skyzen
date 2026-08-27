@@ -88,13 +88,134 @@ backend = "sqs"
 url_env = "JOBS_QUEUE_URL"
 ```
 
-Supported native backends:
+`backend` selects which keys the rest of the table may hold, and unknown keys are rejected: a
+`url_env` under a backend that reads no URL fails the parse rather than being ignored, and a
+required key that is missing fails there too rather than at compile time.
 
-| Service Type | Backends | Required Keys |
-|--------------|----------|---------------|
-| `kv` | `redis`, `memory` | `url_env` for `redis` |
-| `storage` | `s3`, `memory` | `bucket_env` for `s3` |
-| `queue` | `sqs`, `memory` | `url_env` for `sqs` |
+| Service Type | Backends |
+|--------------|----------|
+| `kv` | `redis`, `dynamodb`, `cosmos`, `memory` |
+| `storage` | `s3`, `blob`, `memory` |
+| `queue` | `sqs`, `servicebus`, `storage-queue`, `memory` |
+
+Every backend below is reachable from any runtime, native or serverless: they are HTTP clients, not
+platform bindings. Each one needs its crate — see [Dependencies](#dependencies).
+
+#### `backend = "redis"` (kv)
+
+```toml
+[native.service.cache]
+backend = "redis"
+url_env = "CACHE_URL"      # required: redis://127.0.0.1:6379
+```
+
+#### `backend = "dynamodb"` (kv)
+
+```toml
+[native.service.sessions]
+backend = "dynamodb"
+table = "skyzen-sessions"  # required: the table, which must already exist
+ttl_attribute = "ttl"      # optional: default "expires_at"
+consistent_reads = true    # optional: default false, DynamoDB's own
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `table` | string | **Required.** | The `DynamoDB` table. Its partition key attribute must be `pk` |
+| `ttl_attribute` | string | `expires_at` | Attribute expiry timestamps are written to. Enable the table's TTL feature on it |
+| `consistent_reads` | bool | `false` | Read with `ConsistentRead`, at twice the read capacity |
+
+No environment variable: the credentials and the region come from the ambient AWS chain
+(`AWS_PROFILE`, an instance role, SSO — whatever the SDK finds), exactly as `DynamoKv::from_env`
+loads them. A table keyed on an attribute other than `pk` is wired in code with `DynamoKv::new`.
+
+#### `backend = "cosmos"` (kv)
+
+```toml
+[native.service.sessions]
+backend = "cosmos"
+database = "appdb"         # required
+container = "sessions"     # required, and read once at startup
+```
+
+The account endpoint and key come from `AZURE_COSMOS_ENDPOINT` and `AZURE_COSMOS_KEY`, whose names
+`CosmosKv::from_env` fixes — so the wiring names no variable, and `skyzen dev` checks those two by
+name. The container is read when the application starts, so a partition key path or a time-to-live
+setting this backend cannot work with fails at startup rather than on the first write. An account
+reached with an Entra ID credential is wired in code with `CosmosKv::with_credential`.
+
+#### `backend = "s3"` (storage)
+
+```toml
+[native.service.uploads]
+backend = "s3"
+bucket_env = "UPLOADS_BUCKET"   # required: the bucket name, not a URL
+```
+
+#### `backend = "blob"` (storage)
+
+```toml
+[native.service.uploads]
+backend = "blob"
+container = "uploads"                          # required
+connection_env = "AZURE_STORAGE_CONNECTION_STRING"   # optional: this is the default
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `container` | string | **Required.** | The blob container |
+| `connection_env` | string | `AZURE_STORAGE_CONNECTION_STRING` | Variable holding the storage account connection string |
+
+Both forms the portal hands out are read: an account key and a shared access signature. An Azurite
+connection string works too, because its `BlobEndpoint` wins over the public-cloud host.
+
+#### `backend = "sqs"` (queue)
+
+```toml
+[native.service.jobs]
+backend = "sqs"
+url_env = "JOBS_QUEUE_URL"   # required: https://sqs.us-east-1.amazonaws.com/123456789012/jobs
+```
+
+The URL must name a *standard* queue. A FIFO queue needs a message group id on every send and is
+wired in code with `SqsQueue::fifo`, so this backend refuses a `.fifo` URL rather than sending
+messages that would be rejected one at a time.
+
+#### `backend = "servicebus"` (queue)
+
+```toml
+[native.service.jobs]
+backend = "servicebus"
+queue = "jobs"                                  # required
+connection_env = "SERVICEBUS_CONNECTION_STRING" # optional: this is the default
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `queue` | string | **Required.** | The Service Bus queue |
+| `connection_env` | string | `SERVICEBUS_CONNECTION_STRING` | Variable holding the namespace's connection string (`Endpoint=sb://…;SharedAccessKeyName=…;SharedAccessKey=…`) |
+
+#### `backend = "storage-queue"` (queue)
+
+```toml
+[native.service.jobs]
+backend = "storage-queue"
+sas_url_env = "JOBS_SAS_URL"   # required
+```
+
+The variable holds the whole signed queue URL, as the portal's "Generate SAS" hands it out:
+`https://myaccount.queue.core.windows.net/jobs?sv=2024-11-04&sig=…`. There is no default name,
+because the URL *is* the credential: two queues are two unrelated URLs. A queue reached with an
+Entra ID credential is wired in code with `AzureStorageQueue::with_credential`.
+
+#### `backend = "memory"` (any type)
+
+```toml
+[native.service.cache]
+backend = "memory"
+```
+
+The in-process mock from `skyzen-test`, for local development and tests. It takes no other key.
 
 ### Native Queue Consumers
 
@@ -180,10 +301,37 @@ url_env = "DATABASE_URL"
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `backend` | string | **Required.** `postgres`, `mysql` or `sqlite` |
-| `url_env` | string | **Required.** Environment variable containing the connection URL |
+| `backend` | string | **Required.** `postgres`, `mysql`, `sqlite` or `rds-data` |
+| `url_env` | string | **Required** for `postgres`, `mysql` and `sqlite`. Environment variable containing the connection URL |
 
-`skyzen dev` loads `.env` and then `.env.local` into the process it starts, and refuses to start when a `url_env` / `bucket_env` the manifest names is set nowhere. `skyzen new` writes a `.env.example` listing exactly these variables.
+#### `backend = "rds-data"`
+
+```toml
+[native.database.main]
+backend = "rds-data"
+```
+
+Aurora reached through the RDS Data API — an HTTP service addressed by ARN rather than a server
+addressed by URL, which is what lets a Lambda talk to Aurora Serverless with no connection pool.
+The table holds only `backend`, because `RdsDataDb::from_env` builds its own client and reads
+everything it needs from four variables whose names it fixes:
+
+| Variable | Holds |
+|----------|-------|
+| `RDS_RESOURCE_ARN` | The Aurora cluster's ARN |
+| `RDS_SECRET_ARN` | The Secrets Manager secret holding its credentials |
+| `RDS_DATABASE` | The database statements run against |
+| `RDS_ENGINE` | `aurora-postgresql` or `aurora-mysql` — it decides how placeholders are rewritten |
+
+`skyzen dev` checks all four by name, and `skyzen new` lists them in `.env.example`. The
+credentials and the region come from the ambient AWS chain, as with `dynamodb`.
+
+`skyzen migrate --provider native` cannot migrate this database: the runner links sqlx and its
+drivers, and there is no connection to open. It says so and migrates the others; apply these
+migrations from the application itself with `Db::migrate` (see the
+[Migrations Guide](migrations.md)).
+
+`skyzen dev` loads `.env` and then `.env.local` into the process it starts, and refuses to start when a variable the manifest names — through a key, or through a backend that fixes the name — is set nowhere. `skyzen new` writes a `.env.example` listing exactly these variables, and `skyzen doctor` warns about the ones that are set nowhere.
 
 ### Cloudflare Database Wiring
 
@@ -648,5 +796,23 @@ skyzen add redis        # backend = "redis"
 skyzen add cloudflare   # any [cloudflare.service.*] / [cloudflare.database.*] wiring
 skyzen add --list kv    # print the `cargo add` invocations without running them
 ```
+
+One capability per backend, plus one per portable extractor:
+
+| Backend | `skyzen add` | Crate |
+|---------|--------------|-------|
+| `redis` | `redis` | `skyzen-redis` |
+| `dynamodb` | `dynamodb` | `skyzen-aws` (`dynamodb`) |
+| `cosmos` | `cosmos` | `skyzen-azure` (`cosmos`) |
+| `s3` | `s3` | `skyzen-s3` |
+| `blob` | `azure-blob` | `skyzen-azure` (`blob`) |
+| `sqs` | `sqs` | `skyzen-aws` (`sqs`) |
+| `servicebus` | `servicebus` | `skyzen-azure` (`servicebus`) |
+| `storage-queue` | `storage-queue` | `skyzen-azure` (`storage-queue`) |
+| `postgres` / `mysql` / `sqlite` | same name | `skyzen-services` (that feature) |
+| `rds-data` | `rds-data` | `skyzen-aws` (`rds-data`) |
+| `memory` | `memory` | `skyzen-test` |
+
+`skyzen add --list` prints them all.
 
 `skyzen add` shells out to `cargo add`, so the versions are whatever the registry actually has.
