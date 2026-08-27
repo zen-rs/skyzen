@@ -7,6 +7,15 @@
 //! - [`AzureBlob`] — Azure Blob Storage (implements [`ObjectStorage`])
 //! - [`ServiceBusQueue`] — Azure Service Bus (implements [`MessageQueue`])
 //! - [`AzureStorageQueue`] — Azure Storage queues (implements [`MessageQueue`])
+//! - [`AzureSqlDb`] — Azure SQL (implements [`DbBackend`])
+//!
+//! # Choosing a SQL database
+//!
+//! Azure Database for `PostgreSQL` and Azure Database for `MySQL` need nothing from this crate:
+//! they speak the wire protocols sqlx already speaks, so `Db::connect_postgres` and
+//! `Db::connect_mysql` reach them directly. [`AzureSqlDb`] is for **Azure SQL**, which speaks TDS —
+//! a protocol sqlx has no driver for — and is therefore the one Azure database Skyzen could not
+//! otherwise reach.
 //!
 //! # Choosing a queue
 //!
@@ -31,6 +40,7 @@
 //! [`KeyValueStore`]: skyzen_services::kv::KeyValueStore
 //! [`ObjectStorage`]: skyzen_services::storage::ObjectStorage
 //! [`MessageQueue`]: skyzen_services::queue::MessageQueue
+//! [`DbBackend`]: skyzen_services::sql::DbBackend
 
 #[cfg(feature = "blob")]
 pub mod blob;
@@ -38,6 +48,8 @@ pub mod blob;
 pub mod cosmos;
 #[cfg(feature = "servicebus")]
 pub mod service_bus;
+#[cfg(feature = "sql")]
+pub mod sql;
 #[cfg(any(
     feature = "blob",
     feature = "cosmos",
@@ -54,5 +66,7 @@ pub use blob::{AzureBlob, AzureBlobAuth, AzureBlobConfig};
 pub use cosmos::{CosmosKv, CosmosKvBuilder, PartitionStrategy};
 #[cfg(feature = "servicebus")]
 pub use service_bus::ServiceBusQueue;
+#[cfg(feature = "sql")]
+pub use sql::{AzureSqlConfig, AzureSqlDb, AzureSqlTransaction};
 #[cfg(feature = "storage-queue")]
 pub use storage_queue::AzureStorageQueue;

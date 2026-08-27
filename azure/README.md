@@ -16,6 +16,11 @@ Azure service implementations for the Skyzen framework.
 | `AzureBlob` | `ObjectStorage` | [Azure Blob Storage](https://learn.microsoft.com/azure/storage/blobs/) |
 | `ServiceBusQueue` | `MessageQueue` | [Azure Service Bus](https://learn.microsoft.com/azure/service-bus-messaging/) |
 | `AzureStorageQueue` | `MessageQueue` | [Azure Storage queues](https://learn.microsoft.com/azure/storage/queues/) |
+| `AzureSqlDb` | `DbBackend` | [Azure SQL](https://learn.microsoft.com/azure/azure-sql/) |
+
+`AzureSqlDb` is only for **Azure SQL**, which speaks T-SQL over TDS. Azure Database for PostgreSQL
+and Azure Database for MySQL speak the wire protocols sqlx already speaks, so they need nothing from
+this crate — `Db::connect_postgres` and `Db::connect_mysql` reach them directly.
 
 ## Installation
 
@@ -32,6 +37,7 @@ skyzen-azure = "0.1"
 | `blob` | Yes | Blob Storage `ObjectStorage` via Apache OpenDAL, plus the REST calls OpenDAL does not cover |
 | `servicebus` | Yes | Service Bus `MessageQueue` via `azure_messaging_servicebus` |
 | `storage-queue` | Yes | Azure Storage queue `MessageQueue` via `azure_storage_queue` |
+| `sql` | Yes | Azure SQL `DbBackend` via `tiberius` behind a `deadpool` pool |
 
 Disable unused features to reduce compile times:
 
@@ -150,6 +156,101 @@ long polling of its own, so `ReceiveOptions::wait` is **emulated** — the queue
 `POLL_INTERVAL` until a message arrives or the wait elapses, which is what lets one portable
 consumer loop drive this backend and a genuinely long-polling one with the same options.
 
+### AzureSqlDb
+
+The portable `Db` API over Azure SQL. Handlers write `?` placeholders and plain `SELECT`s, exactly
+as they do against Postgres or D1.
+
+```rust
+use skyzen_azure::{AzureSqlConfig, AzureSqlDb};
+use skyzen_services::Db;
+
+// AZURE_SQL_CONNECTION_STRING holds the portal's ADO.NET connection string.
+let db = Db::new(AzureSqlDb::from_env()?);
+
+let user: User = db
+    .query("SELECT [id], [name] FROM [users] WHERE [id] = ?")
+    .bind(7_i64)
+    .fetch_one()
+    .await?;
+
+// Or configure it explicitly, capping the pool:
+let db = Db::new(AzureSqlDb::new(
+    AzureSqlConfig::new(connection_string).with_max_pool_size(4),
+)?);
+```
+
+**Dialect.** `dialect()` is `DbDialect::Mssql`. Skyzen rewrites each `?` into `@P1`, `@P2`, … before
+execution, and bounds `fetch_one`/`fetch_optional` with `TOP (1)` rather than `LIMIT 1` — T-SQL has
+no `LIMIT`. Writing `@P1` yourself collides with the generated name, the same way a hand-written
+`$1` does on Postgres; bind with `?`.
+
+Because `TOP` bounds the query it sits inside rather than the whole statement, the rewrite steps
+aside for a `WITH` query and for `UNION` / `EXCEPT` / `INTERSECT`, which cost the optimization and
+never correctness.
+
+**Connection string.** The ADO.NET form the portal hands out is what `from_env` and `AzureSqlConfig`
+take. Two things are read out of it before tiberius sees it:
+
+- if it does not mention `Encrypt`, encryption is set to **required** — tiberius would otherwise
+  default it off and Azure SQL would refuse the login with a handshake error naming nothing;
+- `Authentication=` is **refused** unless it says `SqlPassword`. tiberius supports SQL Server
+  authentication only, and its parser ignores the keyword, so a Microsoft Entra ID value would
+  silently fall through to an empty username and fail as `Login failed for user ''`.
+
+Nothing dials at construction: the pool connects lazily, so a wrong password surfaces on the first
+query rather than at `from_env()`.
+
+**Transactions.** `begin()` is a real interactive transaction. It takes one connection out of the
+pool and keeps it — `BEGIN TRANSACTION` is session state, so a transaction whose statements landed
+on different pooled connections would commit nothing. A clean commit or rollback returns the
+connection; a commit or rollback that *fails*, or a transaction dropped without either, closes it
+instead of handing back a connection that may still be inside a transaction (the drop case logs an
+error — call `commit()` or `rollback()`). The rollback is `IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION`,
+because SQL Server rolls a deadlock victim back itself and a bare `ROLLBACK` would then fail with
+"no corresponding BEGIN TRANSACTION" and hide the deadlock. `execute_batch` runs its statements in
+one such transaction, rolling back on the first failure.
+
+**Types.** `DbValue::Timestamp` binds as `datetimeoffset` at `+00:00`, `Uuid` as
+`uniqueidentifier`, `Decimal` as `numeric`, and `Json` as `nvarchar` — SQL Server has no JSON column
+type in the versions this targets, and `JSON_VALUE` / `OPENJSON` / `ISJSON` all read `nvarchar`
+anyway. A decimal needing more than T-SQL's 38 digits of precision (or a scale above 37) is
+**refused** rather than rounded.
+
+Rows come back in the same JSON shape as every other backend: `numeric` as an exact string, blobs as
+arrays of byte values, UUIDs and dates as strings. Which form a timestamp takes is decided by the
+column: a `datetimeoffset` column renders as RFC 3339 and a `chrono::DateTime<Utc>` field
+round-trips, while `datetime2` / `datetime` render in chrono's zoneless textual form and need a
+`chrono::NaiveDateTime` field — the zone is not guessed at, because guessing wrong would silently
+shift every value in the column. Declare timestamp columns `datetimeoffset`.
+
+One difference from the sqlx backends: a column with **no name** is an error rather than an empty
+key, so give `COUNT(*)` an `AS` alias.
+
+**Errors.** A refused login, a disabled account, a firewall rejection or a missing `GRANT` becomes
+`DbError::Unauthorized`; a resource-governance limit becomes `DbError::Throttled`, carrying Azure's
+own retry delay when the message states one; a deadlock victim (`1205`) becomes `DbError::Conflict`.
+Error `40613` — the database is resuming from a serverless pause — is deliberately *not* throttling:
+it is transient, but telling a caller to back off would be the wrong diagnosis.
+
+**Runtime.** tiberius is Tokio-based, like the rest of this crate, so the backend must be built and
+used inside a Tokio runtime (`#[skyzen::main]` and `skyzen-lambda` both provide one). TLS is
+`rustls`. The pool validates a connection before handing it out, which costs one extra round trip
+per checkout and is what keeps Azure's idle-connection reaping from surfacing as a failed query.
+There is no wait timeout: a request that arrives while every connection is checked out waits for one
+rather than failing fast, so bound request time with Skyzen's `Timeout` middleware and size
+`with_max_pool_size` against the concurrency you expect.
+
+A `DbValue::Null` has to declare *some* type — TDS has no untyped null — and goes out as a null
+`nvarchar`, which is what ADO.NET does with an unspecified `DBNull`. SQL Server converts a null of
+one type to a null of another wherever the column needs it.
+
+**Not covered offline.** The unit tests here exercise everything reachable without a server —
+connection-string policy, the `DbValue` → TDS mapping, row conversion, the error taxonomy. What
+needs a live database: the TLS handshake against a real Azure SQL endpoint, the transaction
+semantics through tiberius's `sp_executesql` path, Azure's exact throttling message text, a null
+`nvarchar` parameter against a non-string column, and the type round-trips end to end.
+
 ## Wiring
 
 Inject a backend the way any other Skyzen service is injected, and the handlers never mention Azure:
@@ -159,6 +260,7 @@ Route::new(("/files".at(list_files),))
     .with(Kv::new(cosmos))
     .with(Storage::new(blob))
     .with(Queue::new(jobs))
+    .with(Db::new(sql))
     .build()
 ```
 
