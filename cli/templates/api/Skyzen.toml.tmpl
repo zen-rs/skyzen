@@ -1,6 +1,48 @@
+# One declaration, wired per target below. `#[skyzen::main]` reads it to generate the `Cache`
+# extractor and construct the backend; `skyzen deploy` reads it to render the Cloudflare binding
+# the edge build resolves against. Handler code never mentions either backend.
+[[service]]
+name = "cache"
+type = "kv"
+
+# The same declaration for SQL. `migrations_dir` is left at its default, `migrations/`, which is
+# also `wrangler d1 migrations apply`'s default — so `skyzen migrate` and `skyzen migrate
+# --provider native` read the one directory this project ships.
+[[database]]
+name = "journal"
+type = "sql"
+default = true
+
+# Local runs use the in-process mock, so `skyzen dev` needs nothing installed. Swap in
+# `backend = "redis"` with `url_env = "CACHE_URL"` (and `skyzen add redis`) for a real one.
+[native.service.cache]
+backend = "memory"
+
+# SQLite keeps the native side dependency-free too. `skyzen new` lists JOURNAL_URL in
+# `.env.example`; `skyzen dev` refuses to start until it is set somewhere.
+[native.database.journal]
+backend = "sqlite"
+url_env = "JOURNAL_URL"
+
 [cloudflare]
-name = "{{WORKER_NAME}}"
+name = "{{ ctx.worker_name }}"
 main = "dist/worker.js"
-compatibility_date = "{{COMPATIBILITY_DATE}}"
+compatibility_date = "{{ ctx.compatibility_date }}"
 workers_dev = true
 
+[cloudflare.service.cache]
+binding = "CACHE"
+
+[cloudflare.database.journal]
+binding = "JOURNAL"
+
+# `id` is filled in by `skyzen provision --provider cloudflare`. Until then `skyzen dev` binds a
+# local namespace and `skyzen deploy` refuses to run.
+[[cloudflare.kv_namespaces]]
+binding = "CACHE"
+
+# Likewise for D1: `skyzen provision` creates the database and writes `database_id` back here,
+# after which `skyzen migrate` applies `migrations/` to it.
+[[cloudflare.d1_databases]]
+binding = "JOURNAL"
+database_name = "{{ ctx.worker_name }}-journal"

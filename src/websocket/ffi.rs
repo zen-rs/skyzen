@@ -46,8 +46,14 @@ extern "C" {
     pub fn send(this: &WebSocket, data: &JsValue) -> Result<(), JsValue>;
 
     /// Close the WebSocket connection.
-    #[wasm_bindgen(method)]
-    pub fn close(this: &WebSocket, code: Option<u16>, reason: Option<&str>);
+    ///
+    /// Fallible on purpose: the WebSocket standard has `close` throw `InvalidAccessError` for a
+    /// code outside `1000` and `3000..=4999`, which covers `1011` — the code the framework itself
+    /// sends for a failed session. Workers accepts it on a server-side socket, but a binding that
+    /// could not report a rejection would turn the one host that does not into an unhandled
+    /// promise rejection inside a spawned task.
+    #[wasm_bindgen(method, catch)]
+    pub fn close(this: &WebSocket, code: Option<u16>, reason: Option<&str>) -> Result<(), JsValue>;
 
     /// Add an event listener to the WebSocket.
     #[wasm_bindgen(method, js_name = addEventListener)]

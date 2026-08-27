@@ -1,5 +1,6 @@
 //! Durable Object WebSocket connection management.
 
+use core::future::{ready, Future};
 use http_kit::http_error;
 use serde::Serialize;
 use skyzen_core::{Extractor, StatusCode};
@@ -154,12 +155,18 @@ http_error!(
 impl Extractor for DurableConnections {
     type Error = DurableConnectionsNotConfigured;
 
-    async fn extract(request: &mut http_kit::Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .cloned()
-            .ok_or(DurableConnectionsNotConfigured::new())
+    // Reading the handle back out of the extensions is a synchronous clone, so the future is ready
+    // on creation rather than an `async` block with nothing to await.
+    fn extract(
+        request: &mut http_kit::Request,
+    ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(
+            request
+                .extensions()
+                .get::<Self>()
+                .cloned()
+                .ok_or(DurableConnectionsNotConfigured::new()),
+        )
     }
 }
 

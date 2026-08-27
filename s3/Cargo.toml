@@ -20,7 +20,17 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
 ] }
 aws-config = { version = "1" }
-aws-smithy-types = { version = "1" }
+# `byte-stream-poll-next` exposes `ByteStream::poll_next`, which is what lets `get_stream` wrap a
+# response body in a `futures_core::Stream` newtype instead of buffering the whole object.
+aws-smithy-types = { version = "1", features = ["byte-stream-poll-next"] }
+base64 = "0.22"
+bytes = "1"
+futures-core = "0.3"
+http-kit.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

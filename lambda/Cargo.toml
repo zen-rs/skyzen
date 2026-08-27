@@ -1,0 +1,28 @@
+[package]
+name = "skyzen-lambda"
+version = "0.1.0"
+edition = "2021"
+description = "AWS Lambda runtime adapter for the Skyzen HTTP framework"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "README.md"
+keywords = ["skyzen", "lambda", "aws", "serverless"]
+categories = ["web-programming::http-server"]
+
+[dependencies]
+aws_lambda_events = { version = "1.2", default-features = false, features = ["sqs"] }
+base64 = "0.22"
+futures-util = "0.3.32"
+http = "1.4"
+http-kit.workspace = true
+lambda_http = "1.3"
+lambda_runtime = "1.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+skyzen-core.workspace = true
+skyzen-services.workspace = true
+tokio = { version = "1.49", features = ["rt", "net", "time"] }
+tracing.workspace = true
+
+[lints]
+workspace = true

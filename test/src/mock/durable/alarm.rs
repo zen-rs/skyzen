@@ -1,5 +1,6 @@
 //! In-memory alarm scheduler for testing.
 
+use core::future::{ready, Future};
 use std::sync::{Arc, RwLock};
 
 use skyzen_services::durable::alarm::{AlarmError, AlarmScheduler};
@@ -28,29 +29,35 @@ impl InMemoryAlarm {
     }
 }
 
+impl InMemoryAlarm {
+    fn store(&self, scheduled_time_ms: Option<i64>) -> Result<(), AlarmError> {
+        self.scheduled
+            .write()
+            .map_err(|_| AlarmError::backend("lock poisoned"))
+            .map(|mut scheduled| *scheduled = scheduled_time_ms)
+    }
+}
+
+// A single `Option` behind a lock answers every call synchronously, so each future is ready on
+// creation rather than an `async` block with nothing to await.
 impl AlarmScheduler for InMemoryAlarm {
-    async fn get_alarm(&self) -> Result<Option<i64>, AlarmError> {
-        let scheduled = self
-            .scheduled
-            .read()
-            .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))?;
-        Ok(*scheduled)
+    fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, AlarmError>> + Send {
+        ready(
+            self.scheduled
+                .read()
+                .map_err(|_| AlarmError::backend("lock poisoned"))
+                .map(|scheduled| *scheduled),
+        )
     }
 
-    async fn set_alarm(&self, scheduled_time_ms: i64) -> Result<(), AlarmError> {
-        *self
-            .scheduled
-            .write()
-            .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? =
-            Some(scheduled_time_ms);
-        Ok(())
+    fn set_alarm(
+        &self,
+        scheduled_time_ms: i64,
+    ) -> impl Future<Output = Result<(), AlarmError>> + Send {
+        ready(self.store(Some(scheduled_time_ms)))
     }
 
-    async fn delete_alarm(&self) -> Result<(), AlarmError> {
-        *self
-            .scheduled
-            .write()
-            .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? = None;
-        Ok(())
+    fn delete_alarm(&self) -> impl Future<Output = Result<(), AlarmError>> + Send {
+        ready(self.store(None))
     }
 }

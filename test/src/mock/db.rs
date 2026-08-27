@@ -2,7 +2,7 @@
 //!
 //! This utility creates a [`skyzen_services::Db`] backed by in-memory `SQLite`.
 
-use skyzen_services::{Db, DbError};
+use skyzen_services::{Db, DbError, MigrationReport, Migrations};
 
 /// A test helper that owns an in-memory SQLite-backed [`Db`].
 ///
@@ -38,6 +38,34 @@ impl InMemoryDb {
         }
 
         Ok(db)
+    }
+
+    /// Create a new in-memory `SQLite` database and apply `migrations` to it.
+    ///
+    /// This runs the application's real migration set through the real runner
+    /// ([`Db::migrate`]), so a test's schema is the schema a deploy would produce — including the
+    /// `_skyzen_migrations` bookkeeping, which is what makes "does this migration apply cleanly?"
+    /// a question the test suite answers rather than the first deployment.
+    ///
+    /// Use [`with_schema`](Self::with_schema) instead when a test wants a table and does not care
+    /// about migrations at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection fails or a migration does not apply.
+    pub async fn with_migrations(migrations: &Migrations) -> Result<Self, DbError> {
+        let db = Self::new().await?;
+        db.migrate(migrations).await?;
+        Ok(db)
+    }
+
+    /// Apply `migrations` to an already-created database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a migration does not apply.
+    pub async fn migrate(&self, migrations: &Migrations) -> Result<MigrationReport, DbError> {
+        self.db.migrate(migrations).await
     }
 
     /// Borrow the inner [`Db`] wrapper.

@@ -1,0 +1,10 @@
+# A stand-in application for the provider tests: `cargo metadata` reads it to answer "which binary
+# does this project deploy?", so it needs a name and a `src/main.rs` and nothing else.
+#
+# The empty `[workspace]` table keeps it out of the Skyzen workspace, so it is never built.
+[workspace]
+
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"

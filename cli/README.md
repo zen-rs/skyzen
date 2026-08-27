@@ -3,11 +3,22 @@
 [![crates.io](https://img.shields.io/crates/v/skyzen-cli.svg)](https://crates.io/crates/skyzen-cli)
 [![License](https://img.shields.io/crates/l/skyzen-cli.svg)](../LICENSE)
 
-Project scaffolding, local development, and deployment CLI for Skyzen apps.
+Project scaffolding, local development, provisioning and deployment CLI for Skyzen apps.
 
 ## Overview
 
-The `skyzen` CLI provides a single interface for creating projects, running native local development, and deploying Skyzen applications. For Cloudflare Workers it reads `Skyzen.toml`, builds the wasm target, generates Worker artifacts, writes `.skyzen/gen/wrangler.toml`, and then delegates to Wrangler. AWS and Azure integration are currently deployment-tooling hooks, not runtime-parity features.
+The `skyzen` CLI is a single interface for creating projects, running them locally, creating the
+cloud resources they declare, and deploying them. For Cloudflare Workers it reads `Skyzen.toml`,
+builds the wasm target, generates the Worker artifacts, writes `.skyzen/gen/wrangler.toml`, and
+then delegates to Wrangler.
+
+The wasm-bindgen generator and the binaryen optimizer are linked into the binary, so
+`cargo install skyzen-cli` is the whole toolchain install — there is no `wasm-bindgen` or
+`wasm-opt` to install separately, and no version of either to keep in step by hand.
+
+`--provider` accepts `native`, `cloudflare`, `aws` and `azure`. AWS deploys through `cargo lambda`
+and Azure through the Functions Core Tools; both serve the same application binary, which decides
+what it is at startup from its environment.
 
 ## Installation
 
@@ -25,62 +36,159 @@ cargo run -p skyzen-cli -- <command>
 
 ### `skyzen new`
 
-Create a new project from a built-in template:
+Create a project from a built-in template:
 
 ```sh
-skyzen new my-app --template api
+skyzen new my-app                              # the `api` template
+skyzen new my-app --template minimal
 skyzen new jobs-app --template serverless-events
 skyzen new room-app --template durable-realtime
+skyzen new .                                   # scaffold into the current directory
 ```
+
+| Template | What it demonstrates |
+|----------|----------------------|
+| `api` | A portable `[[service]]` KV and a `[[database]]` wired for native *and* Cloudflare, a handler using both generated extractors, and a `migrations/` directory `skyzen migrate` can apply on the first run |
+| `minimal` | Two routes and nothing else |
+| `serverless-events` | A queue consumer and a cron trigger |
+| `durable-realtime` | A WebSocket-serving Durable Object |
+
+The generated `Cargo.toml` carries no Skyzen version numbers: `skyzen new` runs `cargo add` in the
+new project, so the versions are whatever the registry actually has. The one pinned dependency is
+`wasm-bindgen`, which must match the generator this binary embeds.
+
+`skyzen new` also writes a `.env.example` derived from the template's own manifest.
+
+### `skyzen add`
+
+Add the crates a capability needs, through `cargo add`:
+
+```sh
+skyzen add kv redis
+skyzen add cloudflare
+skyzen add --list postgres     # print the invocations without running them
+```
+
+`dev` and `deploy` never edit your `Cargo.toml`. When the manifest declares a capability whose
+crate is missing, they fail and name the exact command.
 
 ### `skyzen doctor`
 
-Check that required provider tools are installed:
+Check the toolchain *and* the manifest:
 
 ```sh
 skyzen doctor
+skyzen doctor --provider cloudflare
 ```
 
 ### `skyzen dev`
 
-Start local development:
-
 ```sh
-skyzen dev                         # native watch + restart
-skyzen dev --provider cloudflare
+skyzen dev                         # native: cargo run, restarted on change
+skyzen dev --provider cloudflare   # wasm build + wrangler dev, rebuilt on change
 ```
 
-Native mode is supervised by Skyzen and automatically restarts on source changes. Cloudflare mode uses Wrangler directly after Skyzen prepares the Worker artifacts.
+Native mode restarts the binary on debounced source changes, after loading `.env` / `.env.local`
+into it. Cloudflare mode re-runs the wasm build while `wrangler dev` keeps running, so local state
+and the bound port survive an edit.
+
+Trailing arguments reach the runner:
+
+```sh
+skyzen dev --provider cloudflare -- --test-scheduled
+skyzen dev -- --port 3000
+```
+
+### `skyzen migrate`
+
+Apply the SQL migrations in `migrations/` to every declared database:
+
+```sh
+skyzen migrate                            # D1, via `wrangler d1 migrations apply`
+skyzen migrate --local                    # the emulator's database, for `skyzen dev`
+skyzen migrate --env staging
+skyzen migrate status                     # via `wrangler d1 migrations list`
+skyzen migrate --provider native          # through [native.database.<name>].url_env
+skyzen migrate status --provider native   # reads the `_skyzen_migrations` table
+skyzen migrate --dry-run                  # validate the directory; never connects
+```
+
+`status` follows the same `--provider` as applying, so it always reports on the database
+`skyzen migrate` would write to. See the [Migrations Guide](../docs/migrations.md).
+
+### `skyzen build`
+
+Produce the artifacts without running or deploying:
+
+```sh
+skyzen build --provider cloudflare --release
+```
+
+Every build prints the final `.wasm` size, raw and gzipped; release builds run through `wasm-opt -Os`.
+
+### `skyzen provision`
+
+Create the KV namespaces, R2 buckets, D1 databases and queues the manifest declares but has no id
+for, and write the ids back into `Skyzen.toml`:
+
+```sh
+skyzen provision --provider cloudflare --dry-run
+skyzen provision --provider cloudflare
+```
+
+Idempotent: anything that already has an id is skipped.
 
 ### `skyzen deploy`
 
-Deploy the application to the target platform:
-
 ```sh
 skyzen deploy --provider cloudflare
+skyzen deploy --provider cloudflare --env staging
+skyzen deploy --provider cloudflare --dry-run   # real build, `wrangler deploy --dry-run`
+```
+
+### `skyzen logs` / `skyzen secret`
+
+```sh
+skyzen logs
+skyzen logs -- --format json     # forwarded to `wrangler tail`
+skyzen secret set API_KEY        # value read from stdin
+skyzen secret list
+```
+
+### `skyzen completions`
+
+```sh
+skyzen completions zsh > "${fpath[1]}/_skyzen"
 ```
 
 ## Options
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--provider <name>` | `-p` | Target platform: `native`, `cloudflare` |
-| `--template <name>` | `-t` | Project template for `skyzen new`: `api`, `serverless-events`, `durable-realtime` |
-| `--manifest <path>` | `-m` | Path to `Skyzen.toml` (default: `Skyzen.toml` in current directory) |
-| `--force` | `-f` | Reuse an existing target directory when scaffolding |
-| `--dry-run` | | Preview generated config without writing files |
-| `--help` | `-h` | Print usage information |
+| `--provider <name>` | `-p` | Target platform: `native`, `cloudflare`, `aws`, `azure` |
+| `--manifest <path>` | `-m` | Path to `Skyzen.toml` (default: `Skyzen.toml` in the current directory) |
+| `--env <name>` | `-e` | Select a `[cloudflare.env.<name>]` overlay and forward it to wrangler |
+| `--dry-run` | | Print what would happen instead of doing it |
+| `--template <name>` | `-t` | `skyzen new`: `api`, `minimal`, `serverless-events`, `durable-realtime` |
+| `--force` | `-f` | `skyzen new`: reuse a non-empty directory, **keeping** files that already exist |
+| `--overwrite` | | `skyzen new`: reuse a non-empty directory, **replacing** files that already exist |
+
+Global flags are accepted before or after the subcommand.
 
 ## Provider Mapping
 
 | Provider | `dev` | `deploy` | Generated Config |
 |----------|-------|----------|-----------------|
 | Native | `cargo run` with Skyzen watch/restart | — | none |
-| Cloudflare | `wrangler dev` | `wrangler deploy` | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` |
+| Cloudflare | wasm build + `wrangler dev --local`, rebuilt on change | `wrangler deploy` | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` |
+| AWS | — (run it as a server with `skyzen dev`) | `cargo lambda build` then `cargo lambda deploy`, with the flags derived from `[aws]` | none |
+| Azure | — (`func start` over a built bundle) | `func azure functionapp publish` | `.skyzen/gen/azure/{host.json, local.settings.json, <function>/function.json}` plus the staged binary |
 
 ## Skyzen.toml
 
-See the [Skyzen.toml Reference](../docs/skyzen-toml-reference.md) for the full configuration format. Users edit `Skyzen.toml`; generated provider files such as `.skyzen/gen/wrangler.toml` and Cloudflare Worker artifacts under `dist/` are derived artifacts and are overwritten automatically.
+See the [Skyzen.toml Reference](../docs/skyzen-toml-reference.md) for the full configuration
+format. Users edit `Skyzen.toml`; generated provider files such as `.skyzen/gen/wrangler.toml` and
+the Cloudflare Worker artifacts under `dist/` are derived and are overwritten automatically.
 
 Example:
 

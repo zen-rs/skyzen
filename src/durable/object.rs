@@ -17,6 +17,7 @@ use crate::routing::Router;
 ///   On first creation, `Default::default()` produces the initial state.
 ///   On subsequent activations, the struct is deserialized from storage.
 ///   After each event, it is re-serialized.
+///   See [`PERSIST`](Self::PERSIST) for where that model stops scaling and how to opt out.
 ///
 /// - **`&mut self` everywhere**: Durable Objects have single-threaded serial execution.
 ///   No locks needed.
@@ -50,6 +51,42 @@ use crate::routing::Router;
 /// }
 /// ```
 pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'static {
+    /// Whether the framework loads and stores `Self` around every event.
+    ///
+    /// # What `true` costs
+    ///
+    /// With the default, the whole object is read from one storage value and JSON-parsed before
+    /// **every** event — each fetch, each alarm, each websocket message — and serialized again
+    /// afterwards. For a counter that is nothing. For a chat room holding a message history it is
+    /// a full parse and a full serialize per websocket frame, and the object lives in a single
+    /// storage value, so it is bounded by the per-value limit rather than by the storage size.
+    ///
+    /// # Setting it to `false`
+    ///
+    /// An object that keeps its state in storage directly — through the
+    /// [`DurableKv`](skyzen_services::durable::DurableKv) or
+    /// [`DurableDb`](skyzen_services::durable::DurableDb) extractors — has nothing for the
+    /// framework to serialize, and setting `PERSIST = false` skips the load/parse/serialize/save
+    /// round trip entirely. The struct then holds only per-activation scratch, and
+    /// `Default::default()` produces it on every event.
+    ///
+    /// This is the path to take for anything that grows: `DurableDb` is backed by the `SQLite`
+    /// storage Cloudflare now provisions for new Durable Object classes, so rows are read and
+    /// written individually instead of the whole object being rewritten to change one field.
+    ///
+    /// ```ignore
+    /// #[derive(Serialize, Deserialize, Default)]
+    /// struct Room;
+    ///
+    /// impl DurableObject for Room {
+    ///     // Messages live in SQLite via `DurableDb`; there is no blob to round-trip.
+    ///     const PERSIST: bool = false;
+    ///
+    ///     fn fetch(&mut self) -> Router { /* … */ }
+    /// }
+    /// ```
+    const PERSIST: bool = true;
+
     /// Build the [`Router`] handling HTTP requests (and, via [`Route::on_alarm`](crate::routing::Route::on_alarm),
     /// alarm events).
     ///

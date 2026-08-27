@@ -1,20 +1,22 @@
 //! Durable Object database abstraction.
 
 use core::future::Future;
+use std::borrow::Cow;
 
-use serde::de::DeserializeOwned;
-
-use crate::{
-    maybe_send::{BoxFuture, MaybeSend},
-    sql::{prepare_query_sql, DbDialect, DbError, DbExecResult, DbValue},
-};
+use crate::sql::{DbDialect, DbError, DbExecResult, DbValue, QuerySource, SqlQuery};
 
 /// Errors from Durable Object database operations.
 #[derive(Debug, thiserror::Error)]
 pub enum DurableDbError {
     /// The underlying storage backend returned an error.
-    #[error("durable database error: {0}")]
-    Backend(String),
+    #[error("durable database error: {message}")]
+    Backend {
+        /// A human-readable description of what the backend was asked to do.
+        message: String,
+        /// The backend's own error, when it hands one back.
+        #[source]
+        source: Option<crate::BoxError>,
+    },
 
     /// Serialization or deserialization failed.
     #[error("durable database serialization error: {0}")]
@@ -41,19 +43,32 @@ pub enum DurableDbError {
     RowNotFound,
 }
 
+backend_error!(DurableDbError);
+
+service_http_error!(DurableDbError {
+    Self::Backend { .. } => INTERNAL_SERVER_ERROR,
+    Self::Serialization(_) => INTERNAL_SERVER_ERROR,
+    Self::ParameterCountMismatch { .. } => INTERNAL_SERVER_ERROR,
+    Self::SqlParse(_) => INTERNAL_SERVER_ERROR,
+    Self::RowNotFound => NOT_FOUND,
+});
+
 impl From<DbError> for DurableDbError {
     fn from(error: DbError) -> Self {
         match error {
-            DbError::Backend(message) => Self::Backend(message),
+            DbError::Backend { message, source } => Self::Backend { message, source },
             DbError::Serialization(error) => Self::Serialization(error),
             DbError::ParameterCountMismatch { expected, actual } => {
                 Self::ParameterCountMismatch { expected, actual }
             }
             DbError::SqlParse(message) => Self::SqlParse(message),
             DbError::RowNotFound => Self::RowNotFound,
-            DbError::TransactionsUnsupported => {
-                Self::Backend(DbError::TransactionsUnsupported.to_string())
-            }
+            error @ (DbError::TransactionsUnsupported
+            | DbError::BatchesUnsupported
+            | DbError::Conflict
+            | DbError::Throttled { .. }
+            | DbError::MigrationChanged { .. }
+            | DbError::Unauthorized) => Self::backend_with(error.to_string(), error),
         }
     }
 }
@@ -65,58 +80,32 @@ pub trait DurableDbBackend: Send + Sync + Clone + 'static {
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send;
 
     /// Execute a statement that does not return rows.
     fn execute(
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send;
 
     /// Get the on-disk database size in bytes.
-    fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + MaybeSend;
+    fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send;
 }
 
-trait DurableDbBackendObj: Send + Sync {
-    fn query<'a>(
+service_obj! {
+    DurableDbBackendObj: DurableDbBackend;
+    async fn query<'a>(
         &'a self,
         query: &'a str,
         params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DurableDbError>>;
-    fn execute<'a>(
+    ) -> Result<DbExecResult, DurableDbError>;
+    async fn execute<'a>(
         &'a self,
         query: &'a str,
         params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DurableDbError>>;
-    fn database_size(&self) -> BoxFuture<'_, Result<u64, DurableDbError>>;
-    fn clone_box(&self) -> Box<dyn DurableDbBackendObj>;
-}
-
-impl<T: DurableDbBackend> DurableDbBackendObj for T {
-    fn query<'a>(
-        &'a self,
-        query: &'a str,
-        params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DurableDbError>> {
-        Box::pin(DurableDbBackend::query(self, query, params))
-    }
-
-    fn execute<'a>(
-        &'a self,
-        query: &'a str,
-        params: &'a [DbValue],
-    ) -> BoxFuture<'a, Result<DbExecResult, DurableDbError>> {
-        Box::pin(DurableDbBackend::execute(self, query, params))
-    }
-
-    fn database_size(&self) -> BoxFuture<'_, Result<u64, DurableDbError>> {
-        Box::pin(DurableDbBackend::database_size(self))
-    }
-
-    fn clone_box(&self) -> Box<dyn DurableDbBackendObj> {
-        Box::new(self.clone())
-    }
+    ) -> Result<DbExecResult, DurableDbError>;
+    async fn database_size(&'_ self) -> Result<u64, DurableDbError>;
 }
 
 /// Type-erased Durable Object database extractor.
@@ -140,11 +129,7 @@ impl DurableDb {
     /// supported and will fail the placeholder/parameter count check.
     #[must_use]
     pub const fn query<'a>(&'a self, sql: &'a str) -> DurableDbQuery<'a> {
-        DurableDbQuery {
-            db: self,
-            sql,
-            params: Vec::new(),
-        }
+        SqlQuery::new(self, Cow::Borrowed(sql))
     }
 
     /// Get the on-disk database size in bytes.
@@ -157,87 +142,29 @@ impl DurableDb {
     }
 }
 
-/// Query builder for [`DurableDb`].
-#[derive(Debug)]
-pub struct DurableDbQuery<'a> {
-    db: &'a DurableDb,
-    sql: &'a str,
-    params: Vec<DbValue>,
-}
+/// The query builder returned by [`DurableDb::query`].
+///
+/// Durable Object SQL is `SQLite`, so it shares [`SqlQuery`] — and with it the `?`-placeholder
+/// rewriting and the `LIMIT 1` that `fetch_one`/`fetch_optional` append — with [`Db`](crate::Db).
+pub type DurableDbQuery<'a> = SqlQuery<'a, &'a DurableDb>;
 
-impl DurableDbQuery<'_> {
-    /// Bind a parameter value to the query.
-    #[must_use]
-    pub fn bind<T>(mut self, value: T) -> Self
-    where
-        T: Into<DbValue>,
-    {
-        self.params.push(value.into());
-        self
+impl QuerySource for &DurableDb {
+    type Error = DurableDbError;
+
+    fn dialect(&self) -> DbDialect {
+        DbDialect::Sqlite
     }
 
-    /// Execute a statement that does not return rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if placeholder validation, backend execution, or
-    /// result conversion fails.
-    pub async fn execute(self) -> Result<DbExecResult, DurableDbError> {
-        let sql = prepare_query_sql(self.sql, self.params.len(), DbDialect::Sqlite)?;
-        self.db.0.execute(&sql, &self.params).await
+    async fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<DbExecResult, Self::Error> {
+        self.0.query(sql, params).await
     }
 
-    /// Execute a query and deserialize all rows into `T`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if placeholder validation, backend execution, or row
-    /// deserialization fails.
-    pub async fn fetch_all<T>(self) -> Result<Vec<T>, DurableDbError>
-    where
-        T: DeserializeOwned,
-    {
-        let sql = prepare_query_sql(self.sql, self.params.len(), DbDialect::Sqlite)?;
-        let result = self.db.0.query(&sql, &self.params).await?;
-        result
-            .rows
-            .into_iter()
-            .map(|row| serde_json::from_value(row).map_err(Into::into))
-            .collect()
-    }
-
-    /// Execute a query and deserialize the first row into `T`, if present.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if placeholder validation, backend execution, or row
-    /// deserialization fails.
-    pub async fn fetch_optional<T>(self) -> Result<Option<T>, DurableDbError>
-    where
-        T: DeserializeOwned,
-    {
-        let sql = prepare_query_sql(self.sql, self.params.len(), DbDialect::Sqlite)?;
-        let result = self.db.0.query(&sql, &self.params).await?;
-        result
-            .rows
-            .into_iter()
-            .next()
-            .map(|row| serde_json::from_value(row).map_err(Into::into))
-            .transpose()
-    }
-
-    /// Execute a query and deserialize exactly one row into `T`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if execution fails or the query returns no rows.
-    pub async fn fetch_one<T>(self) -> Result<T, DurableDbError>
-    where
-        T: DeserializeOwned,
-    {
-        self.fetch_optional()
-            .await?
-            .ok_or(DurableDbError::RowNotFound)
+    async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, Self::Error> {
+        self.0.execute(sql, params).await
     }
 }
 
@@ -245,29 +172,32 @@ impl DurableDbQuery<'_> {
 mod tests {
     use super::{DurableDb, DurableDbBackend, DurableDbError};
     use crate::sql::{DbExecResult, DbValue};
+    use core::future::{ready, Future};
 
     #[derive(Debug, Clone, Default)]
     struct RecordingBackend;
 
+    // Every answer is a constant, so the futures are ready on creation rather than `async` blocks
+    // with nothing to await.
     impl DurableDbBackend for RecordingBackend {
-        async fn query(
+        fn query(
             &self,
             _query: &str,
             _params: &[DbValue],
-        ) -> Result<DbExecResult, DurableDbError> {
-            Ok(DbExecResult::default())
+        ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+            ready(Ok(DbExecResult::default()))
         }
 
-        async fn execute(
+        fn execute(
             &self,
             _query: &str,
             _params: &[DbValue],
-        ) -> Result<DbExecResult, DurableDbError> {
-            Ok(DbExecResult::default())
+        ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+            ready(Ok(DbExecResult::default()))
         }
 
-        async fn database_size(&self) -> Result<u64, DurableDbError> {
-            Ok(0)
+        fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
+            ready(Ok(0))
         }
     }
 

@@ -1,7 +1,7 @@
 [cloudflare]
-name = "{{WORKER_NAME}}"
+name = "{{ ctx.worker_name }}"
 main = "dist/worker.js"
-compatibility_date = "{{COMPATIBILITY_DATE}}"
+compatibility_date = "{{ ctx.compatibility_date }}"
 workers_dev = true
 
 [[cloudflare.durable_objects.bindings]]
