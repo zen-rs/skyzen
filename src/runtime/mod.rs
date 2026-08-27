@@ -7,7 +7,7 @@
 mod cf;
 mod context;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 pub use cf::{CfBotManagement, CfProperties, CfPropertiesSlot, CfPropertiesUnavailable};
 pub use context::{WorkerContext, WorkerContextError, WorkerContextNotConfigured};
 
