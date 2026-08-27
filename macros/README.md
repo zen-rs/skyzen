@@ -130,13 +130,17 @@ Derive macro for enums to implement HTTP error responses.
 
 ### `import_config!()`
 
-Generates typed datasource code from `Skyzen.toml` declarations:
+Generates typed service and database extractors from `Skyzen.toml` declarations:
 
 ```rust
 skyzen::import_config!();
 ```
 
-Reads `[[datasource]]` entries from `Skyzen.toml` and generates types, `init()` functions, and middleware for each datasource. Automatically expanded by `#[skyzen::main]`.
+Reads the `[[service]]` and `[[database]]` entries — through the shared
+[`skyzen-manifest`](../manifest) schema, the same one the `skyzen` CLI parses with — and generates
+a named newtype, a `*NotConfigured` error, an `Extractor` and a `Middleware` for each. Automatically
+expanded by `#[skyzen::main]`, which also generates the backend construction from the matching
+`[native.*]` / `[cloudflare.*]` wiring.
 
 ## License
 
