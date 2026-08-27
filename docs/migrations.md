@@ -188,9 +188,12 @@ embeds, through the **same** reader — versions, names and checksums are comput
 both paths. A migration applied by `skyzen migrate` is therefore one the application accepts as
 already applied, rather than reporting as edited history.
 
-The native path applies to **every** `[[database]]` that has a `[native.database.<name>]` wiring,
-one after another, matching the Cloudflare path's one-`wrangler`-call-per-database behaviour.
-Databases without native wiring are skipped with a warning.
+The native path applies to **every** `[[database]]` that has a `[native.database.<name>]` wiring it
+can open a connection to, one after another, matching the Cloudflare path's
+one-`wrangler`-call-per-database behaviour. Databases without native wiring are skipped with a
+warning, and so is `backend = "rds-data"`: the CLI links sqlx and its drivers, and the RDS Data API
+is an HTTP service reached by ARN rather than a connection. Its migrations run from the application
+itself, through the same embedded set — `db.migrate(MIGRATIONS).await?` at startup.
 
 `--dry-run` reads and validates the directories and prints what would run. It never opens a
 connection, so it needs no connection string. It applies to the native path; the Cloudflare path
@@ -212,8 +215,8 @@ default = true
 migrations_dir = "db/changes"   # optional; defaults to "migrations"
 
 [native.database.main]
-backend = "postgres"            # postgres | mysql | sqlite
-url_env = "DATABASE_URL"
+backend = "postgres"            # postgres | mysql | sqlite | rds-data
+url_env = "DATABASE_URL"        # not used by rds-data, which reads RDS_* itself
 ```
 
 `migrations_dir` defaults to `migrations/`, which is also `wrangler d1 migrations apply`'s default,
