@@ -73,26 +73,17 @@ pub enum Dispatch {
 /// other than what was asked.
 ///
 /// `migrate` is the one action with two genuinely different implementations rather than two
-/// renderings of one plan, so the choice is made here rather than inside a provider plan.
+/// renderings of one plan, so the choice is made here rather than inside a provider plan. Applying
+/// and reporting take the same branch: `--provider native` runs in process, anything else is the
+/// provider's own tooling (`wrangler d1 migrations apply` / `... list` for D1), so `status` reports
+/// on whichever database `migrate` would have written to.
 ///
 /// # Errors
 ///
-/// Fails when `--local` is combined with the native path (there is no emulator to select), and
-/// when `status` is asked of a cloud provider — the bookkeeping table is only reachable through
-/// the native connection, and answering from *that* database would report on something the caller
-/// did not ask about.
-pub fn dispatch(provider: Option<Provider>, status: bool, local: bool) -> Result<Dispatch> {
-    let native = provider == Some(Provider::Native);
-
-    if status && provider == Some(Provider::Cloudflare) {
-        anyhow::bail!(
-            "`skyzen migrate status` reads the bookkeeping table through the native connection \
-             ([native.database.<name>].url_env), so it cannot report on a Cloudflare D1 database. \
-             Use `wrangler d1 migrations list`, or drop `--provider cloudflare` to report on the \
-             native database."
-        );
-    }
-    if !native && !status {
+/// Fails when `--local` is combined with the native path: `--local` selects a provider's emulator,
+/// and the native runner has none to select.
+pub fn dispatch(provider: Option<Provider>, local: bool) -> Result<Dispatch> {
+    if provider != Some(Provider::Native) {
         return Ok(Dispatch::Provider);
     }
     if local {
@@ -320,8 +311,8 @@ fn resolve_targets(manifest: &Manifest) -> Result<Vec<Target>> {
             "no [[database]] in {} has a [native.database.<name>] wiring, so there is no \
              connection to migrate through (declared: {}). Add one, or migrate through the \
              provider that hosts the database — for Cloudflare D1 that is \
-             `skyzen migrate --provider cloudflare`, and `wrangler d1 migrations list` is D1's \
-             equivalent of `skyzen migrate status`.",
+             `skyzen migrate --provider cloudflare`, which is also where \
+             `skyzen migrate status` reports from.",
             manifest.path().display(),
             unwired.join(", ")
         );
@@ -447,46 +438,24 @@ mod tests {
     fn a_plain_migrate_still_goes_to_the_provider_and_native_is_opt_in() {
         // The default has to stay `wrangler d1 migrations apply`: a Worker project that types
         // `skyzen migrate` is asking about D1.
+        assert_eq!(dispatch(None, false).expect("default"), Dispatch::Provider);
         assert_eq!(
-            dispatch(None, false, false).expect("default"),
+            dispatch(Some(Provider::Cloudflare), false).expect("explicit cloud"),
             Dispatch::Provider
         );
         assert_eq!(
-            dispatch(Some(Provider::Cloudflare), false, false).expect("explicit cloud"),
+            dispatch(Some(Provider::Cloudflare), true).expect("the emulator"),
             Dispatch::Provider
         );
         assert_eq!(
-            dispatch(Some(Provider::Cloudflare), false, true).expect("the emulator"),
-            Dispatch::Provider
-        );
-        assert_eq!(
-            dispatch(Some(Provider::Native), false, false).expect("opt in"),
+            dispatch(Some(Provider::Native), false).expect("opt in"),
             Dispatch::Native
         );
-    }
-
-    #[test]
-    fn status_is_native_by_default_but_refused_when_the_cloud_was_asked_for() {
-        assert_eq!(
-            dispatch(None, true, false).expect("status reads natively"),
-            Dispatch::Native
-        );
-
-        // A project with both wirings would otherwise be told its D1 database is up to date on the
-        // strength of the *native* database's bookkeeping table.
-        let error = dispatch(Some(Provider::Cloudflare), true, false)
-            .expect_err("status cannot speak for D1");
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains("wrangler d1 migrations list"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("native connection"), "{rendered}");
     }
 
     #[test]
     fn local_has_no_meaning_on_the_native_path() {
-        let error = dispatch(Some(Provider::Native), false, true).expect_err("no emulator");
+        let error = dispatch(Some(Provider::Native), true).expect_err("no emulator");
         assert!(error.to_string().contains("--local"), "{error}");
     }
 
@@ -505,7 +474,7 @@ mod tests {
         assert!(rendered.contains("[native.database."), "{rendered}");
         // The D1 alternative has to be named, because that is where such a project's database is.
         assert!(
-            rendered.contains("wrangler d1 migrations list"),
+            rendered.contains("skyzen migrate --provider cloudflare"),
             "{rendered}"
         );
     }

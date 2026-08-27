@@ -88,8 +88,9 @@ pub enum Command {
     /// Apply pending SQL migrations to every declared database.
     ///
     /// With no subcommand, pending migrations are applied. `--provider cloudflare` (the default)
-    /// hands the work to `wrangler d1 migrations apply`; `--provider native` connects through the
-    /// `[native.database.<name>].url_env` connection string and applies them itself.
+    /// hands the work to `wrangler d1 migrations`; `--provider native` connects through the
+    /// `[native.database.<name>].url_env` connection string and does it itself. `status` takes the
+    /// same branch as applying, so it always reports on the database `migrate` would write to.
     Migrate {
         /// What to do. Applying pending migrations is the default.
         #[command(subcommand)]
@@ -129,10 +130,10 @@ pub enum Command {
 pub enum MigrateCommand {
     /// List which migrations have been applied and which are still pending.
     ///
-    /// This reads the database through the native connection string, so it needs a
-    /// `[native.database.<name>]` wiring. It creates the `_skyzen_migrations` bookkeeping table if
+    /// On Cloudflare this is `wrangler d1 migrations list`. On `--provider native` it reads the
+    /// `_skyzen_migrations` bookkeeping table through the connection string, creating that table if
     /// the database has never been migrated — otherwise there would be nothing to report on — but
-    /// applies nothing.
+    /// applying nothing.
     Status,
 }
 

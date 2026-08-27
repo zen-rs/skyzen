@@ -69,12 +69,16 @@ fn run() -> Result<()> {
         // everything else, while the native path opens a connection and applies the files itself.
         // `migrate::dispatch` picks between them, and refuses the combinations that would answer a
         // different question than the one typed.
-        Command::Migrate { command, local } => {
-            match migrate::dispatch(cli.provider, command.is_some(), *local)? {
-                migrate::Dispatch::Native => migrate::run(&cli.manifest, *command, cli.dry_run),
-                migrate::Dispatch::Provider => run_plan(&cli, &Action::Migrate { local: *local }),
-            }
-        }
+        Command::Migrate { command, local } => match migrate::dispatch(cli.provider, *local)? {
+            migrate::Dispatch::Native => migrate::run(&cli.manifest, *command, cli.dry_run),
+            migrate::Dispatch::Provider => run_plan(
+                &cli,
+                &Action::Migrate {
+                    local: *local,
+                    status: command.is_some(),
+                },
+            ),
+        },
         command => run_plan(&cli, &action_for(command)),
     }
 }
