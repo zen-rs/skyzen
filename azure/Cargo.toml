@@ -48,6 +48,7 @@ default = ["cosmos", "blob", "servicebus", "storage-queue"]
 cosmos = ["dep:azure_data_cosmos", "dep:azure_core"]
 blob = [
     "dep:opendal",
+    "dep:url",
     "dep:reqwest",
     "dep:reqsign-azure-storage",
     "dep:reqsign-core",
