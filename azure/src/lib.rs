@@ -51,7 +51,7 @@ pub mod storage_queue;
 #[cfg(feature = "blob")]
 pub use blob::AzureBlob;
 #[cfg(feature = "cosmos")]
-pub use cosmos::CosmosKv;
+pub use cosmos::{CosmosKv, CosmosKvBuilder, PartitionStrategy};
 #[cfg(feature = "servicebus")]
 pub use service_bus::ServiceBusQueue;
 #[cfg(feature = "storage-queue")]
