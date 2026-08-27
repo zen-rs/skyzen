@@ -1,6 +1,25 @@
+# One declaration, wired per target below. `#[skyzen::main]` reads it to generate the `Cache`
+# extractor and construct the backend; `skyzen deploy` reads it to render the Cloudflare binding
+# the edge build resolves against. Handler code never mentions either backend.
+[[service]]
+name = "cache"
+type = "kv"
+
+# Local runs use the in-process mock, so `skyzen dev` needs nothing installed. Swap in
+# `backend = "redis"` with `url_env = "CACHE_URL"` (and `skyzen add redis`) for a real one.
+[native.service.cache]
+backend = "memory"
+
 [cloudflare]
-name = "{{WORKER_NAME}}"
+name = "{{ ctx.worker_name }}"
 main = "dist/worker.js"
-compatibility_date = "{{COMPATIBILITY_DATE}}"
+compatibility_date = "{{ ctx.compatibility_date }}"
 workers_dev = true
 
+[cloudflare.service.cache]
+binding = "CACHE"
+
+# `id` is filled in by `skyzen provision --provider cloudflare`. Until then `skyzen dev` binds a
+# local namespace and `skyzen deploy` refuses to run.
+[[cloudflare.kv_namespaces]]
+binding = "CACHE"
