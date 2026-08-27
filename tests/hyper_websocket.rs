@@ -404,3 +404,73 @@ async fn websocket_binary_convenience_methods() {
     handle.abort();
     let _ = handle.await;
 }
+
+#[tokio::test]
+async fn websocket_session_failure_closes_with_internal_error() {
+    let (mut client, _, handle) = spawn_router(
+        Route::new(("/boom".ws(|mut socket| async move {
+            // Take one message so the client is certainly connected, then fail the session the way
+            // a handler would when a downstream call it depends on gives up.
+            let _ = socket.next().await;
+            Err::<(), _>(skyzen::Error::msg("the session gave up"))
+        }),)),
+        "ws://localhost/boom",
+    )
+    .await;
+
+    client
+        .send(Message::text("hello"))
+        .await
+        .expect("send message");
+
+    let frame = client
+        .next()
+        .await
+        .expect("the server closed without a frame")
+        .expect("websocket frame");
+
+    match frame {
+        Message::Close(Some(frame)) => assert_eq!(
+            u16::from(frame.code),
+            skyzen::websocket::INTERNAL_ERROR,
+            "a failed session must close with 1011, not {frame:?}"
+        ),
+        other => panic!("expected a close frame after a failed session, got {other:?}"),
+    }
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn websocket_session_success_leaves_the_connection_alone() {
+    let (mut client, _, handle) = spawn_router(
+        Route::new(("/done".ws(|mut socket| async move {
+            socket.send_text("bye").await?;
+            Ok::<_, skyzen::Error>(())
+        }),)),
+        "ws://localhost/done",
+    )
+    .await;
+
+    let first = client
+        .next()
+        .await
+        .expect("missing first frame")
+        .expect("websocket frame");
+    assert_eq!(first.into_text().unwrap(), "bye");
+
+    // A session that ended cleanly gets no close frame from the framework: the socket is dropped
+    // and the connection ends, exactly as it did before sessions could report failure. What
+    // matters here is the negative — the client must never see the `1011` the failure path sends.
+    if let Some(Ok(Message::Close(Some(frame)))) = client.next().await {
+        assert_ne!(
+            u16::from(frame.code),
+            skyzen::websocket::INTERNAL_ERROR,
+            "a successful session must not be closed as an internal error"
+        );
+    }
+
+    handle.abort();
+    let _ = handle.await;
+}

@@ -12,6 +12,7 @@ use crate::{
     header,
     websocket::{
         ffi,
+        session::{internal_error_frame, IntoWebSocketOutcome},
         types::{WebSocketCloseFrame, WebSocketError, WebSocketResult},
     },
     Method, Request, Response, StatusCode,
@@ -23,7 +24,7 @@ use futures_core::Stream;
 use http_kit::utils::ByteStr;
 use http_kit::ws::{WebSocketConfig, WebSocketMessage};
 use serde::Serialize;
-use skyzen_core::{Extractor, Responder};
+use skyzen_core::{error::ErrorChain, Extractor, Responder};
 use std::{
     cell::RefCell,
     future::{ready, Future},
@@ -42,6 +43,17 @@ const fn ensure_within_limit(config: &WebSocketConfig, len: usize) -> WebSocketR
         }
     }
     Ok(())
+}
+
+/// Ask the host runtime to close a socket, reporting a rejection instead of dropping it.
+fn close_socket(
+    socket: &ffi::WebSocket,
+    close_frame: Option<WebSocketCloseFrame>,
+) -> WebSocketResult<()> {
+    let (code, reason) = close_frame.map_or((None, None), |frame| (Some(frame.code), Some(frame)));
+    socket
+        .close(code, reason.as_ref().map(|frame| frame.reason.as_str()))
+        .map_err(|error| WebSocketError::Protocol(format!("{error:?}")))
 }
 
 /// WebSocket connection for WASM targets.
@@ -292,17 +304,13 @@ impl WebSocket {
     ///
     /// # Errors
     ///
-    /// Currently never fails on WASM; the `Result` mirrors the native API.
+    /// Returns [`WebSocketError::Protocol`] if the host runtime rejects the close — most often a
+    /// close code it does not allow the caller to send.
     pub fn close(
         &mut self,
         close_frame: Option<WebSocketCloseFrame>,
     ) -> impl Future<Output = WebSocketResult<()>> {
-        if let Some(frame) = close_frame {
-            self.inner.close(Some(frame.code), Some(&frame.reason));
-        } else {
-            self.inner.close(None, None);
-        }
-        ready(Ok(()))
+        ready(close_socket(&self.inner, close_frame))
     }
 
     /// Split the websocket into independent sender and receiver halves.
@@ -461,17 +469,13 @@ impl WebSocketSender {
     ///
     /// # Errors
     ///
-    /// Currently never fails on WASM; the `Result` mirrors the native API.
+    /// Returns [`WebSocketError::Protocol`] if the host runtime rejects the close — most often a
+    /// close code it does not allow the caller to send.
     pub fn close(
         &mut self,
         close_frame: Option<WebSocketCloseFrame>,
     ) -> impl Future<Output = WebSocketResult<()>> {
-        if let Some(frame) = close_frame {
-            self.inner.close(Some(frame.code), Some(&frame.reason));
-        } else {
-            self.inner.close(None, None);
-        }
-        ready(Ok(()))
+        ready(close_socket(&self.inner, close_frame))
     }
 
     /// Access the underlying websocket configuration.
@@ -633,10 +637,18 @@ impl WebSocketUpgrade {
     }
 
     /// Finalize the handshake and start handling the upgraded socket with `callback`.
-    pub fn on_upgrade<F, Fut>(self, callback: F) -> WebSocketUpgradeResponder
+    ///
+    /// The callback owns the connection until it returns. What it returns says how the session
+    /// ended: `()` says nothing beyond "it ended", while a `Result<(), E>` — for any `E` that
+    /// converts into [`Error`](skyzen_core::error::Error), which includes [`WebSocketError`] —
+    /// lets the handler use `?` and report what stopped it. An error is logged with its whole
+    /// `source()` chain, and the framework then closes the connection with
+    /// [`INTERNAL_ERROR`](super::INTERNAL_ERROR).
+    pub fn on_upgrade<F, Fut, R>(self, callback: F) -> WebSocketUpgradeResponder
     where
         F: FnOnce(WebSocket) -> Fut + 'static,
-        Fut: std::future::Future<Output = ()> + 'static,
+        Fut: std::future::Future<Output = R> + 'static,
+        R: IntoWebSocketOutcome + 'static,
     {
         let pair = self.pair.0;
         let server = pair.server();
@@ -645,12 +657,23 @@ impl WebSocketUpgrade {
         // Accept the connection
         server.accept();
 
+        // A JS websocket is a handle, so the framework keeps one of its own to close with. The
+        // native backend has to work harder for the same thing: see `SessionStream` there.
+        let closer = server.clone();
+
         // Create our WebSocket wrapper
         let socket = WebSocket::from_ffi_socket(server, self.config);
 
         // Spawn the callback to handle messages
         wasm_bindgen_futures::spawn_local(async move {
-            callback(socket).await;
+            if let Err(error) = callback(socket).await.into_outcome() {
+                tracing::error!(error = %ErrorChain(&error), "websocket session handler failed");
+                // Best-effort, exactly as on the native backend: the session already failed, and a
+                // runtime that refuses the close leaves nothing further to do but say so.
+                if let Err(error) = close_socket(&closer, Some(internal_error_frame())) {
+                    tracing::debug!("failed to close a failed websocket session: {error}");
+                }
+            }
         });
 
         WebSocketUpgradeResponder {

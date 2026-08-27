@@ -122,6 +122,16 @@ jobs:
           # Exercises `WorkerContext::wait_until` against the real runtime: the handler hands a
           # future to `ctx.waitUntil`, which throws if the execution context was not threaded in.
           curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/track | grep accepted
+          # Exercises the `CfProperties` extractor against a real `request.cf`. Miniflare — what
+          # `wrangler dev --local` runs — documents the `cf` option as supplying "an object with
+          # default placeholder values" when it is left unset, so the object is there and the
+          # route must answer 200; a 500 is what an absent or undecodable `cf` looks like, since
+          # the extractor refuses to invent edge metadata. The placeholder's individual field
+          # values are the one thing the docs do not pin down, so the assertion stops at the
+          # shape and the body is echoed for whoever reads the log.
+          cf=$(curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/where-am-i)
+          echo "request.cf decoded as: $cf"
+          echo "$cf" | grep -q '^colo='
 
       - name: Shutdown wrangler
         if: always()
