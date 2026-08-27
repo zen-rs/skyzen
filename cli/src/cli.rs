@@ -130,8 +130,8 @@ pub enum SecretCommand {
 
 /// The platforms a project can target.
 ///
-/// AWS and Azure have service implementations (`skyzen-aws`, `skyzen-azure`) but no deployment
-/// adapter yet, so they are deliberately absent rather than accepted and then rejected.
+/// Every one of these deploys the *same* application: the runtime detects where it is running, so
+/// picking a provider chooses a deployment pipeline rather than a way of writing the code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum Provider {
@@ -139,6 +139,10 @@ pub enum Provider {
     Native,
     /// A Cloudflare Worker.
     Cloudflare,
+    /// An AWS Lambda function, deployed with `cargo lambda`.
+    Aws,
+    /// An Azure Functions custom handler, deployed with `func`.
+    Azure,
 }
 
 impl Provider {
@@ -147,6 +151,8 @@ impl Provider {
         match self {
             Self::Native => "native",
             Self::Cloudflare => "cloudflare",
+            Self::Aws => "aws",
+            Self::Azure => "azure",
         }
     }
 }
@@ -231,12 +237,25 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_provider_is_rejected_by_the_parser() {
-        let error = Cli::try_parse_from(["skyzen", "--provider=aws", "deploy"])
-            .expect_err("aws has no deployment adapter yet");
+    fn every_provider_with_a_deployment_adapter_is_reachable() {
+        for (spelling, expected) in [
+            ("native", Provider::Native),
+            ("cloudflare", Provider::Cloudflare),
+            ("aws", Provider::Aws),
+            ("azure", Provider::Azure),
+        ] {
+            let parsed = parse(&["skyzen", &format!("--provider={spelling}"), "deploy"]);
+            assert_eq!(parsed.provider, Some(expected), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_platform_with_no_adapter_is_rejected_by_the_parser() {
+        let error = Cli::try_parse_from(["skyzen", "--provider=fly", "deploy"])
+            .expect_err("there is no fly.io adapter");
         let rendered = error.to_string();
         assert!(
-            rendered.contains("native") && rendered.contains("cloudflare"),
+            rendered.contains("cloudflare") && rendered.contains("aws"),
             "the error should list the providers that do work: {rendered}"
         );
     }

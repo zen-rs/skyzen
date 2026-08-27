@@ -12,6 +12,23 @@ use serde::Serialize;
 
 use crate::{error::ErrorChain, Extractor};
 
+/// The message a panicking task carried, when it carried a printable one.
+///
+/// Every backend that runs application code behind a catch — the native queue-consumer driver and
+/// the Lambda adapter both do, so that one poisonous message cannot take a whole runtime down —
+/// needs this, and the standard library offers no way to ask a panic payload for its text.
+#[must_use]
+pub fn panic_message(panic: &(dyn core::any::Any + Send)) -> &str {
+    panic.downcast_ref::<&'static str>().map_or_else(
+        || {
+            panic
+                .downcast_ref::<alloc::string::String>()
+                .map_or("<non-string panic payload>", alloc::string::String::as_str)
+        },
+        |message| *message,
+    )
+}
+
 http_error!(
     /// Raised when the connection metadata does not expose the remote address.
     pub MissingRemoteAddr,

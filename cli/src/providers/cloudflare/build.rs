@@ -117,13 +117,18 @@ pub struct BuildPlan {
     pub optimize: bool,
 }
 
-impl BuildPlan {
+impl crate::providers::ArtifactBuild for BuildPlan {
     /// A one-line description for progress output and `--dry-run`.
-    pub fn describe(&self) -> String {
+    fn describe(&self) -> String {
         format!(
             "build Cloudflare worker artifacts into {}",
             self.output_dir.display()
         )
+    }
+
+    /// Compile the wasm module and generate the Worker's JavaScript around it.
+    fn run(&self) -> Result<()> {
+        run(self)
     }
 }
 

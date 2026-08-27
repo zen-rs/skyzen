@@ -191,7 +191,22 @@ impl<H: QueueConsumer> QueueConsumers<H> {
 ///
 /// Implemented by `()` for an application that declares none and by [`QueueConsumers`] for one
 /// that does, so the runtime has a single launch path and no "no consumer" placeholder handler.
-pub trait ConsumerSet: Send + 'static {
+///
+/// # Polling and being pushed
+///
+/// [`start`](Self::start) is the pull side: it owns the receive loops, and only a plain server
+/// runs them. [`dispatch`](Self::dispatch) is the push side, for a platform that invokes the
+/// application with a batch it already holds — AWS Lambda through an SQS event source, and the
+/// Azure Functions host through a queue trigger. Both sides drive the same `#[skyzen::queue]`
+/// handler; a serverless deployment uses only the second, because a polling loop inside a
+/// function that scales to zero would consume messages nobody is paying attention to.
+pub trait ConsumerSet: Send + Sync + 'static {
+    /// Whether a `#[skyzen::queue]` handler exists at all.
+    ///
+    /// A const, so a platform integration can refuse a queue trigger *at startup* rather than on
+    /// the first message that arrives with nothing to handle it.
+    const DECLARES_HANDLER: bool;
+
     /// Spawn every declared consumer loop.
     ///
     /// `stop` is closed when the process begins shutting down and `guard` is a drain token: each
@@ -204,9 +219,24 @@ pub trait ConsumerSet: Send + 'static {
         guard: &Sender<Infallible>,
         fatal: &Sender<ConsumerFatal>,
     );
+
+    /// Hand a batch the platform pushed to the declared handler.
+    ///
+    /// Settling is the platform's job here — it holds the lease — so this only reports what the
+    /// handler decided.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handler's own error, or a decode failure, whichever came first.
+    fn dispatch(
+        &self,
+        batch: QueueBatch<Vec<u8>>,
+    ) -> impl Future<Output = Result<QueueBatchDisposition, BoxError>> + Send;
 }
 
 impl ConsumerSet for () {
+    const DECLARES_HANDLER: bool = false;
+
     fn start<Exec: CoreExecutor + 'static>(
         self,
         _executor: &Exec,
@@ -215,9 +245,29 @@ impl ConsumerSet for () {
         _fatal: &Sender<ConsumerFatal>,
     ) {
     }
+
+    fn dispatch(
+        &self,
+        _batch: QueueBatch<Vec<u8>>,
+    ) -> impl Future<Output = Result<QueueBatchDisposition, BoxError>> + Send {
+        // Callers check `DECLARES_HANDLER` first and refuse the trigger by name, so this is the
+        // backstop for a hand-written integration that forgot to.
+        core::future::ready(Err(BoxError::from(
+            "this application declares no #[skyzen::queue] handler",
+        )))
+    }
 }
 
 impl<H: QueueConsumer> ConsumerSet for QueueConsumers<H> {
+    const DECLARES_HANDLER: bool = true;
+
+    fn dispatch(
+        &self,
+        batch: QueueBatch<Vec<u8>>,
+    ) -> impl Future<Output = Result<QueueBatchDisposition, BoxError>> + Send {
+        self.handler.handle(batch)
+    }
+
     fn start<Exec: CoreExecutor + 'static>(
         self,
         executor: &Exec,

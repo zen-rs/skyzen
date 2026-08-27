@@ -7,7 +7,7 @@
 
 use crate::{
     environment, output,
-    providers::{cloudflare::build, cloudflare::build::BuildPlan, CommandPlan, RunMode},
+    providers::{ArtifactBuild, CommandPlan, RunMode},
 };
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -39,7 +39,7 @@ pub struct Supervision<'a> {
     /// The process to run.
     pub command: &'a CommandPlan,
     /// The build to re-run under [`RunMode::Rebuild`].
-    pub build: Option<&'a BuildPlan>,
+    pub build: Option<&'a dyn ArtifactBuild>,
     /// Whether a change restarts the child or re-runs the build.
     pub mode: RunMode,
     /// Environment for the child, from the project's `.env` files.
@@ -169,7 +169,7 @@ fn on_change(supervision: &Supervision<'_>, child: &mut SupervisedChild) -> Resu
             output::step("change detected, rebuilding worker artifacts");
             // A rebuild failure is a compile error the user is about to fix, not a reason to stop
             // supervising: wrangler keeps serving the previous bundle until the next success.
-            if let Err(error) = build::run(plan) {
+            if let Err(error) = plan.run() {
                 output::warn(format!("rebuild failed: {error:#}"));
             }
         }
