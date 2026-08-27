@@ -2,17 +2,27 @@
 
 use core::future::Future;
 
-use crate::maybe_send::{BoxFuture, MaybeSend};
-
 // ── Error type ──
 
 /// Errors from Durable Object alarm operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AlarmError {
     /// The underlying storage backend returned an error.
-    #[error("alarm error: {0}")]
-    Backend(String),
+    #[error("alarm error: {message}")]
+    Backend {
+        /// A human-readable description of what the backend was asked to do.
+        message: String,
+        /// The backend's own error, when it hands one back.
+        #[source]
+        source: Option<crate::BoxError>,
+    },
 }
+
+backend_error!(AlarmError);
+
+service_http_error!(AlarmError {
+    Self::Backend { .. } => INTERNAL_SERVER_ERROR,
+});
 
 // ── Layer 1: Public trait ──
 
@@ -22,42 +32,25 @@ pub enum AlarmError {
 /// that will trigger the Durable Object's alarm handler.
 pub trait AlarmScheduler: Send + Sync + Clone + 'static {
     /// Get the currently scheduled alarm time (ms since epoch), if any.
-    fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, AlarmError>> + MaybeSend;
+    fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, AlarmError>> + Send;
 
     /// Schedule an alarm at the given time (ms since epoch).
     fn set_alarm(
         &self,
         scheduled_time_ms: i64,
-    ) -> impl Future<Output = Result<(), AlarmError>> + MaybeSend;
+    ) -> impl Future<Output = Result<(), AlarmError>> + Send;
 
     /// Delete the currently scheduled alarm.
-    fn delete_alarm(&self) -> impl Future<Output = Result<(), AlarmError>> + MaybeSend;
+    fn delete_alarm(&self) -> impl Future<Output = Result<(), AlarmError>> + Send;
 }
 
-// ── Layer 2: Private object-safe trait ──
+// ── Layer 2: Generated object-safe trait ──
 
-trait AlarmSchedulerObj: Send + Sync {
-    fn get_alarm(&self) -> BoxFuture<'_, Result<Option<i64>, AlarmError>>;
-    fn set_alarm(&self, scheduled_time_ms: i64) -> BoxFuture<'_, Result<(), AlarmError>>;
-    fn delete_alarm(&self) -> BoxFuture<'_, Result<(), AlarmError>>;
-    fn clone_box(&self) -> Box<dyn AlarmSchedulerObj>;
-}
-
-// ── Bridge ──
-
-impl<T: AlarmScheduler> AlarmSchedulerObj for T {
-    fn get_alarm(&self) -> BoxFuture<'_, Result<Option<i64>, AlarmError>> {
-        Box::pin(AlarmScheduler::get_alarm(self))
-    }
-    fn set_alarm(&self, scheduled_time_ms: i64) -> BoxFuture<'_, Result<(), AlarmError>> {
-        Box::pin(AlarmScheduler::set_alarm(self, scheduled_time_ms))
-    }
-    fn delete_alarm(&self) -> BoxFuture<'_, Result<(), AlarmError>> {
-        Box::pin(AlarmScheduler::delete_alarm(self))
-    }
-    fn clone_box(&self) -> Box<dyn AlarmSchedulerObj> {
-        Box::new(self.clone())
-    }
+service_obj! {
+    AlarmSchedulerObj: AlarmScheduler;
+    async fn get_alarm(&'_ self) -> Result<Option<i64>, AlarmError>;
+    async fn set_alarm(&'_ self, scheduled_time_ms: i64) -> Result<(), AlarmError>;
+    async fn delete_alarm(&'_ self) -> Result<(), AlarmError>;
 }
 
 // ── User-facing wrapper ──
@@ -110,7 +103,8 @@ impl Alarm {
 #[cfg(test)]
 mod tests {
     use super::{Alarm, AlarmError, AlarmNotConfigured, AlarmScheduler};
-    use http_kit::{Body, Endpoint, HttpError, Middleware, Response};
+    use core::future::{ready, Future};
+    use http_kit::{Body, Endpoint, HttpError, Response};
     use skyzen_core::Extractor;
     use std::{
         convert::Infallible,
@@ -122,34 +116,40 @@ mod tests {
         scheduled: Arc<RwLock<Option<i64>>>,
     }
 
-    impl AlarmScheduler for InMemoryAlarmScheduler {
-        async fn get_alarm(&self) -> Result<Option<i64>, AlarmError> {
-            let scheduled = self
-                .scheduled
-                .read()
-                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))?;
-            Ok(*scheduled)
-        }
-
-        async fn set_alarm(&self, scheduled_time_ms: i64) -> Result<(), AlarmError> {
-            *self
-                .scheduled
+    impl InMemoryAlarmScheduler {
+        fn store(&self, scheduled_time_ms: Option<i64>) -> Result<(), AlarmError> {
+            self.scheduled
                 .write()
-                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? =
-                Some(scheduled_time_ms);
-            Ok(())
-        }
-
-        async fn delete_alarm(&self) -> Result<(), AlarmError> {
-            *self
-                .scheduled
-                .write()
-                .map_err(|_| AlarmError::Backend("lock poisoned".to_owned()))? = None;
-            Ok(())
+                .map_err(|_| AlarmError::backend("lock poisoned"))
+                .map(|mut scheduled| *scheduled = scheduled_time_ms)
         }
     }
 
-    #[derive(Debug)]
+    // A single `Option` behind a lock answers every call synchronously, so the futures are ready
+    // on creation rather than `async` blocks with nothing to await.
+    impl AlarmScheduler for InMemoryAlarmScheduler {
+        fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, AlarmError>> + Send {
+            ready(
+                self.scheduled
+                    .read()
+                    .map_err(|_| AlarmError::backend("lock poisoned"))
+                    .map(|scheduled| *scheduled),
+            )
+        }
+
+        fn set_alarm(
+            &self,
+            scheduled_time_ms: i64,
+        ) -> impl Future<Output = Result<(), AlarmError>> + Send {
+            ready(self.store(Some(scheduled_time_ms)))
+        }
+
+        fn delete_alarm(&self) -> impl Future<Output = Result<(), AlarmError>> + Send {
+            ready(self.store(None))
+        }
+    }
+
+    #[derive(Debug, Clone)]
     struct ReadAlarmEndpoint;
 
     impl Endpoint for ReadAlarmEndpoint {
@@ -186,10 +186,12 @@ mod tests {
     async fn middleware_injects_alarm_for_downstream_endpoint_and_extractor() {
         let scheduler = InMemoryAlarmScheduler::default();
         scheduler.set_alarm(1337).await.unwrap();
-        let mut alarm = Alarm::new(scheduler);
+        let alarm = Alarm::new(scheduler);
         let mut request = http_kit::Request::new(Body::empty());
 
-        let response = alarm.handle(&mut request, ReadAlarmEndpoint).await.unwrap();
+        let response = ::skyzen_core::middleware::apply(&alarm, &mut request, ReadAlarmEndpoint)
+            .await
+            .unwrap();
         let body = response.into_body().into_string().await.unwrap();
         assert_eq!(body, "1337");
 

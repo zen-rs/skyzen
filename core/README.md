@@ -10,11 +10,14 @@ Foundational traits for the Skyzen HTTP framework.
 
 `skyzen-core` defines the core abstractions that all Skyzen components build upon:
 
-- **`Extractor`** — Types that can be extracted from an HTTP request (e.g. path params, JSON body, headers)
-- **`Responder`** — Types that can be converted into an HTTP response (e.g. `String`, `Json<T>`, `StatusCode`)
+- **`Extractor`** — Types that extract themselves from a `&mut Request` (a JSON body, a header, the raw bytes). Tuples of extractors are extractors, up to arity 15.
+- **`Responder`** — Types that write themselves into a `&mut Response` (`String`, `StatusCode`, `HeaderMap`, tuples of the above)
+- **`Middleware`** — Skyzen's own middleware trait, taking **`&self`** so a middleware value is stored once and shared across requests, with `Next::run` continuing the chain. It lives here rather than in `skyzen` so `skyzen-services` can implement it without depending on the framework.
 - **`Server`** — Trait for HTTP server backends (implemented by `skyzen-hyper`)
+- **The error vocabulary** — `Error`, `HttpError`, `Result`, `ResultExt` and `Context`, including the policy that redacts a 5xx body while keeping the whole `source()` chain in the log.
+- **The body rules** — `RequestBodyLimit` (2 MiB by default, enforced from `Content-Length` and mid-stream) and `BodyConsumed`, which makes a second body-consuming extractor a loud error rather than a silent empty body.
 
-This crate also re-exports foundational HTTP types from `http-kit`: `Request`, `Response`, `Body`, `Endpoint`, `Middleware`, `StatusCode`, and more.
+This crate also re-exports foundational HTTP types from `http-kit`: `Request`, `Response`, `Body`, `Endpoint`, `StatusCode`, and more.
 
 ## `no_std` Support
 

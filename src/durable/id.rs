@@ -4,7 +4,7 @@
 ///
 /// This is an opaque wrapper around the platform-specific ID.
 /// On Cloudflare, it wraps `DurableObjectId` from `worker-sys`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DurableObjectId {
     /// The hex string representation of the ID.
     id: String,

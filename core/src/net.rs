@@ -4,12 +4,30 @@
 //! `skyzen-hyper` adapter) so that peer-address handling and error-to-response conversion are
 //! defined exactly once.
 
+use core::future::Future;
 use std::net::SocketAddr;
 
-use http_kit::{header, http_error, Body, HttpError, Request, Response, StatusCode};
+use http_kit::{header, http_error, Body, HttpError, Method, Request, Response, StatusCode};
 use serde::Serialize;
 
-use crate::Extractor;
+use crate::{error::ErrorChain, Extractor};
+
+/// The message a panicking task carried, when it carried a printable one.
+///
+/// Every backend that runs application code behind a catch — the native queue-consumer driver and
+/// the Lambda adapter both do, so that one poisonous message cannot take a whole runtime down —
+/// needs this, and the standard library offers no way to ask a panic payload for its text.
+#[must_use]
+pub fn panic_message(panic: &(dyn core::any::Any + Send)) -> &str {
+    panic.downcast_ref::<&'static str>().map_or_else(
+        || {
+            panic
+                .downcast_ref::<alloc::string::String>()
+                .map_or("<non-string panic payload>", alloc::string::String::as_str)
+        },
+        |message| *message,
+    )
+}
 
 http_error!(
     /// Raised when the connection metadata does not expose the remote address.
@@ -43,18 +61,50 @@ impl core::ops::Deref for PeerAddr {
 
 impl Extractor for PeerAddr {
     type Error = MissingRemoteAddr;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        request
-            .extensions()
-            .get::<Self>()
-            .copied()
-            .ok_or(MissingRemoteAddr::new())
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(
+            request
+                .extensions()
+                .get::<Self>()
+                .copied()
+                .ok_or(MissingRemoteAddr::new()),
+        )
     }
 }
 
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
+}
+
+/// Emit the endpoint-error log line that every Skyzen backend shares.
+///
+/// Server (5xx) errors log at `error`, everything else at `warn`, and both carry the request's
+/// method and path plus the error's full `source()` chain — the chain is the only place the
+/// detail survives for a 5xx, whose response body is redacted.
+///
+/// Backends call this immediately before [`error_response`] so the operator-facing record and the
+/// client-facing body are produced by the same policy in every runtime.
+pub fn log_endpoint_error(error: &dyn HttpError, method: &Method, path: &str) {
+    let status = error.status();
+    let chain = ErrorChain(error);
+    if status.is_server_error() {
+        tracing::error!(
+            method = method.as_str(),
+            path,
+            status = status.as_u16(),
+            error = %chain,
+            "internal server error"
+        );
+    } else {
+        tracing::warn!(
+            method = method.as_str(),
+            path,
+            status = status.as_u16(),
+            error = %chain,
+            "client error"
+        );
+    }
 }
 
 /// Convert an endpoint error into an HTTP response carrying a JSON body.
@@ -84,4 +134,62 @@ pub fn error_response(error: &dyn HttpError) -> Response {
         header::HeaderValue::from_static("application/json"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_response;
+    use http_kit::{header, http_error, StatusCode};
+
+    http_error!(
+        /// Client error carrying a user-facing message.
+        TeapotError,
+        StatusCode::IM_A_TEAPOT,
+        "the teapot is busy"
+    );
+
+    http_error!(
+        /// Server error carrying an internal detail that must not leak.
+        SecretDbError,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "db password is hunter2"
+    );
+
+    fn body_json(response: crate::Response) -> serde_json::Value {
+        let bytes =
+            futures_lite::future::block_on(response.into_body().into_bytes()).expect("read body");
+        serde_json::from_slice(&bytes).expect("body is valid JSON")
+    }
+
+    #[test]
+    fn client_error_keeps_message() {
+        let response = error_response(&TeapotError::new());
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(
+            body_json(response),
+            serde_json::json!({ "error": "the teapot is busy" })
+        );
+    }
+
+    #[test]
+    fn server_error_is_redacted() {
+        let response = error_response(&SecretDbError::new());
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body_json(response),
+            serde_json::json!({ "error": "Internal server error" })
+        );
+    }
+
+    #[test]
+    fn error_response_sets_json_content_type() {
+        let response = error_response(&TeapotError::new());
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+    }
 }

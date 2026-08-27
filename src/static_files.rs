@@ -1,18 +1,39 @@
+//! Serving files: from disk, or embedded into the binary.
+//!
+//! Both servers stream rather than buffer, and both speak the caching half of HTTP: they emit an
+//! `ETag`, answer `If-None-Match` and `If-Modified-Since` with `304 Not Modified`, and serve a
+//! single `Range` as `206 Partial Content` so media can be scrubbed.
+//!
+//! Two deliberate limits: a multi-range request is answered with the whole file and `200`, because
+//! `multipart/byteranges` is rarely worth its complexity, and `If-Range` is not consulted — an
+//! `If-None-Match` on the same request already covers the case it guards. Only the filesystem
+//! server sends `Last-Modified`; an embedded file has no modification time, so it validates by
+//! `ETag` alone.
+
+use core::future::{ready, Future};
+use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::SystemTime;
 use std::{
     io,
     path::{Component, Path, PathBuf},
 };
 
+use base64::Engine;
+use headers::{
+    AcceptRanges, ContentRange, ETag, HeaderMapExt, IfModifiedSince, IfNoneMatch, LastModified,
+    Range as RangeHeader,
+};
 use include_dir::{Dir, File};
+use sha1::{Digest, Sha1};
 
 use crate::{
-    header::{self, HeaderValue},
-    routing::{IntoRouteNode, Params, Route, RouteNode},
-    Endpoint, Method, Request, Response, StatusCode,
+    header::{self, HeaderMap, HeaderValue},
+    routing::{IntoRouteNode, MethodFilter, Params, Route, RouteNode},
+    Body, Endpoint, Method, Request, Response, StatusCode,
 };
-use skyzen_core::Extractor;
 
 /// Mount a directory tree into the router.
 ///
@@ -32,6 +53,7 @@ pub struct StaticDir {
     directory: Arc<PathBuf>,
     index_file: String,
     spa: bool,
+    cache_control: Option<HeaderValue>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -47,6 +69,7 @@ impl StaticDir {
             directory: Arc::new(directory.into()),
             index_file: "index.html".to_owned(),
             spa: false,
+            cache_control: None,
         }
     }
 
@@ -54,6 +77,26 @@ impl StaticDir {
     #[must_use]
     pub fn index_file(mut self, index_file: impl Into<String>) -> Self {
         self.index_file = index_file.into();
+        self
+    }
+
+    /// Send `value` as the `Cache-Control` header on every file served.
+    ///
+    /// Nothing is sent by default, which leaves caching to the validators (`ETag` and
+    /// `Last-Modified`): correct, but it costs a conditional request per asset. Fingerprinted
+    /// assets should say `public, max-age=31536000, immutable` instead.
+    ///
+    /// ```rust
+    /// # #[cfg(not(target_arch = "wasm32"))] {
+    /// use skyzen::{header::HeaderValue, static_files::StaticDir};
+    ///
+    /// let assets = StaticDir::new("/assets", "./dist")
+    ///     .cache_control(HeaderValue::from_static("public, max-age=31536000, immutable"));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn cache_control(mut self, value: HeaderValue) -> Self {
+        self.cache_control = Some(value);
         self
     }
 
@@ -82,6 +125,7 @@ pub struct EmbeddedStaticDir {
     directory: &'static Dir<'static>,
     index_file: String,
     spa: bool,
+    cache_control: Option<HeaderValue>,
 }
 
 impl EmbeddedStaticDir {
@@ -94,6 +138,7 @@ impl EmbeddedStaticDir {
             directory,
             index_file: "index.html".to_owned(),
             spa: false,
+            cache_control: None,
         }
     }
 
@@ -101,6 +146,16 @@ impl EmbeddedStaticDir {
     #[must_use]
     pub fn index_file(mut self, index_file: impl Into<String>) -> Self {
         self.index_file = index_file.into();
+        self
+    }
+
+    /// Send `value` as the `Cache-Control` header on every file served.
+    ///
+    /// See [`StaticDir::cache_control`]; embedded assets are usually built into a versioned
+    /// binary, so a long `max-age` is the common choice.
+    #[must_use]
+    pub fn cache_control(mut self, value: HeaderValue) -> Self {
+        self.cache_control = Some(value);
         self
     }
 
@@ -116,12 +171,6 @@ impl EmbeddedStaticDir {
     }
 }
 
-impl IntoRouteNode for Route {
-    fn into_route_node(self) -> RouteNode {
-        RouteNode::new_route("", self)
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 impl IntoRouteNode for StaticDir {
     fn into_route_node(self) -> RouteNode {
@@ -129,6 +178,7 @@ impl IntoRouteNode for StaticDir {
             directory: self.directory.clone(),
             index_file: Arc::new(self.index_file.clone()),
             spa: self.spa,
+            cache_control: self.cache_control,
         };
         route_node_for_static(self.mount_path, endpoint)
     }
@@ -140,6 +190,10 @@ impl IntoRouteNode for EmbeddedStaticDir {
             directory: self.directory,
             index_file: self.index_file,
             spa: self.spa,
+            cache_control: self.cache_control,
+            // Shared, because the endpoint is cloned into two registrations (the mount point and
+            // the wildcard below it) and both must consult the same memo.
+            etags: EtagCache::default(),
         };
         route_node_for_static(self.mount_path, endpoint)
     }
@@ -158,11 +212,200 @@ where
         "/{*path}"
     };
     let route = Route::new((
-        RouteNode::new_endpoint("", Method::GET, endpoint.clone(), None),
-        RouteNode::new_endpoint(wildcard_suffix, Method::GET, endpoint, None),
+        RouteNode::new_endpoint(
+            "",
+            MethodFilter::Exact(Method::GET),
+            endpoint.clone(),
+            None,
+            Vec::new(),
+        ),
+        RouteNode::new_endpoint(
+            wildcard_suffix,
+            MethodFilter::Exact(Method::GET),
+            endpoint,
+            None,
+            Vec::new(),
+        ),
     ));
 
     RouteNode::new_route(mount_path, route)
+}
+
+/// What the request's conditional and range headers ask for.
+#[derive(Debug, PartialEq, Eq)]
+enum Disposition {
+    /// The client's copy is still good.
+    NotModified,
+    /// A `Range` was asked for that this file cannot satisfy.
+    Unsatisfiable,
+    /// One byte range, inclusive at both ends.
+    Partial { start: u64, end: u64 },
+    /// The whole file.
+    Full,
+}
+
+/// Decide what to send, from the request's validators and range.
+///
+/// Validators win over the range: a client whose cached copy is current gets `304` and no body,
+/// whatever byte range it asked for.
+fn negotiate(
+    headers: &HeaderMap,
+    etag: Option<&ETag>,
+    last_modified: Option<SystemTime>,
+    len: u64,
+) -> Disposition {
+    if let (Some(if_none_match), Some(etag)) = (headers.typed_get::<IfNoneMatch>(), etag) {
+        if !if_none_match.precondition_passes(etag) {
+            return Disposition::NotModified;
+        }
+    } else if let (Some(if_modified_since), Some(modified)) =
+        (headers.typed_get::<IfModifiedSince>(), last_modified)
+    {
+        // `If-Modified-Since` is only consulted when the stronger validator did not settle it,
+        // which is what RFC 9110 prescribes.
+        if !if_modified_since.is_modified(modified) {
+            return Disposition::NotModified;
+        }
+    }
+
+    let Some(range) = headers.typed_get::<RangeHeader>() else {
+        return Disposition::Full;
+    };
+
+    let mut satisfiable = range.satisfiable_ranges(len);
+    let Some(first) = satisfiable.next() else {
+        return Disposition::Unsatisfiable;
+    };
+    if satisfiable.next().is_some() {
+        // Multi-range: answered in full, as documented on the module.
+        return Disposition::Full;
+    }
+
+    let start = match first.0 {
+        std::ops::Bound::Included(start) => start,
+        std::ops::Bound::Excluded(start) => start.saturating_add(1),
+        std::ops::Bound::Unbounded => 0,
+    };
+    let end = match first.1 {
+        std::ops::Bound::Included(end) => end.min(len.saturating_sub(1)),
+        std::ops::Bound::Excluded(end) => end.saturating_sub(1).min(len.saturating_sub(1)),
+        std::ops::Bound::Unbounded => len.saturating_sub(1),
+    };
+
+    if len == 0 || start > end || start >= len {
+        return Disposition::Unsatisfiable;
+    }
+    Disposition::Partial { start, end }
+}
+
+/// Everything the response needs that does not depend on where the bytes come from.
+struct ServedFile {
+    len: u64,
+    etag: Option<ETag>,
+    last_modified: Option<SystemTime>,
+    content_type: Option<HeaderValue>,
+}
+
+impl ServedFile {
+    /// Build the response head — status, validators and caching headers — for `disposition`.
+    fn head(&self, disposition: &Disposition, cache_control: Option<&HeaderValue>) -> Response {
+        let mut response = Response::new(Body::empty());
+        let status = match disposition {
+            Disposition::NotModified => StatusCode::NOT_MODIFIED,
+            Disposition::Unsatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+            Disposition::Partial { .. } => StatusCode::PARTIAL_CONTENT,
+            Disposition::Full => StatusCode::OK,
+        };
+        *response.status_mut() = status;
+
+        let headers = response.headers_mut();
+        if let Some(etag) = &self.etag {
+            headers.typed_insert(etag.clone());
+        }
+        if let Some(modified) = self.last_modified {
+            headers.typed_insert(LastModified::from(modified));
+        }
+        if let Some(value) = cache_control {
+            headers.insert(header::CACHE_CONTROL, value.clone());
+        }
+
+        match disposition {
+            // A 304 repeats the validators and nothing else; a 416 describes the file's size and
+            // carries no content type of its own.
+            Disposition::NotModified => {}
+            Disposition::Unsatisfiable => {
+                headers.typed_insert(ContentRange::unsatisfied_bytes(self.len));
+            }
+            Disposition::Partial { start, end } => {
+                headers.typed_insert(AcceptRanges::bytes());
+                if let Ok(content_range) = ContentRange::bytes(*start..=*end, self.len) {
+                    headers.typed_insert(content_range);
+                }
+                self.set_content_type(headers);
+            }
+            Disposition::Full => {
+                headers.typed_insert(AcceptRanges::bytes());
+                self.set_content_type(headers);
+            }
+        }
+
+        response
+    }
+
+    fn set_content_type(&self, headers: &mut HeaderMap) {
+        if let Some(value) = &self.content_type {
+            headers.insert(header::CONTENT_TYPE, value.clone());
+        }
+    }
+}
+
+/// The `ETag` for a byte slice: a SHA-1 of the content, which is what an embedded file has
+/// instead of a modification time.
+fn content_etag(contents: &[u8]) -> Option<ETag> {
+    let digest = Sha1::digest(contents);
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    ["\"", &encoded, "\""].concat().parse().ok()
+}
+
+/// The `ETag` for a filesystem entry: its size and modification time, which change together
+/// whenever the content does and cost no read to obtain.
+#[cfg(not(target_arch = "wasm32"))]
+fn metadata_etag(len: u64, modified: Option<SystemTime>) -> Option<ETag> {
+    let modified = modified?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    format!("\"{len:x}-{modified:x}\"").parse().ok()
+}
+
+/// Lazily hashed `ETag`s for an embedded directory, computed once for the whole tree.
+///
+/// An embedded file's bytes never change, so the map is built on the first request and shared by
+/// every clone of the endpoint from then on.
+#[derive(Debug, Default, Clone)]
+struct EtagCache(std::sync::Arc<OnceLock<HashMap<&'static Path, Option<ETag>>>>);
+
+impl EtagCache {
+    fn get(&self, directory: &'static Dir<'static>, file: &File<'static>) -> Option<ETag> {
+        self.0
+            .get_or_init(|| {
+                let mut map = HashMap::new();
+                collect_etags(directory, &mut map);
+                map
+            })
+            .get(file.path())
+            .cloned()
+            .flatten()
+    }
+}
+
+fn collect_etags(directory: &'static Dir<'static>, map: &mut HashMap<&'static Path, Option<ETag>>) {
+    for file in directory.files() {
+        map.insert(file.path(), content_etag(file.contents()));
+    }
+    for nested in directory.dirs() {
+        collect_etags(nested, map);
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -170,26 +413,68 @@ async fn serve_static(
     directory: &Path,
     index_file: &str,
     spa: bool,
-    params: &Params,
+    cache_control: Option<&HeaderValue>,
+    request: &Request,
 ) -> Result<Response, StaticDirError> {
+    let params = request
+        .extensions()
+        .get::<Params>()
+        .cloned()
+        .unwrap_or_else(|| Params::new(Vec::new()));
     let requested_path = params.get("path").unwrap_or("");
     let sanitized = sanitize_relative_path(requested_path).ok_or(StaticDirError::InvalidPath)?;
     let file_path = resolve_target_path(directory, &sanitized, index_file, spa)
+        .await
         .ok_or(StaticDirError::FileNotFound)?;
 
-    let data = read_file(&file_path).await?;
-    let mut response = Response::new(http_kit::Body::from(data));
+    let metadata = async_fs::metadata(&file_path)
+        .await
+        .map_err(StaticDirError::IoError)?;
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
 
-    if let Some(value) = guess_content_type(&file_path) {
-        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    let served = ServedFile {
+        len,
+        etag: metadata_etag(len, modified),
+        last_modified: modified,
+        content_type: guess_content_type(&file_path),
+    };
+
+    let disposition = negotiate(request.headers(), served.etag.as_ref(), modified, len);
+    let mut response = served.head(&disposition, cache_control);
+
+    match disposition {
+        Disposition::NotModified | Disposition::Unsatisfiable => {}
+        Disposition::Partial { start, end } => {
+            let length = end - start + 1;
+            *response.body_mut() = file_body(&file_path, start, length).await?;
+        }
+        Disposition::Full => {
+            *response.body_mut() = file_body(&file_path, 0, len).await?;
+        }
     }
 
     Ok(response)
 }
 
+/// Stream `length` bytes of `path` starting at `start`, without buffering the file.
 #[cfg(not(target_arch = "wasm32"))]
-async fn read_file(path: &Path) -> Result<Vec<u8>, StaticDirError> {
-    async_fs::read(path).await.map_err(StaticDirError::IoError)
+async fn file_body(path: &Path, start: u64, length: u64) -> Result<Body, StaticDirError> {
+    use http_kit::utils::io::{AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
+
+    let mut file = async_fs::File::open(path)
+        .await
+        .map_err(StaticDirError::IoError)?;
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))
+            .await
+            .map_err(StaticDirError::IoError)?;
+    }
+    let reader = BufReader::new(file.take(length));
+    Ok(Body::from_reader(
+        reader,
+        usize::try_from(length).unwrap_or(usize::MAX),
+    ))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -200,7 +485,7 @@ fn guess_content_type(path: &Path) -> Option<HeaderValue> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_target_path(
+async fn resolve_target_path(
     base: &Path,
     relative: &Path,
     index_file: &str,
@@ -212,13 +497,16 @@ fn resolve_target_path(
         base.join(relative)
     };
 
-    if let Ok(metadata) = std::fs::metadata(&target) {
+    if let Ok(metadata) = async_fs::metadata(&target).await {
         let resolved = if metadata.is_dir() {
             target.join(index_file)
         } else {
             target
         };
-        if std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()) {
+        if async_fs::metadata(&resolved)
+            .await
+            .is_ok_and(|m| m.is_file())
+        {
             return Some(resolved);
         }
     }
@@ -226,7 +514,10 @@ fn resolve_target_path(
     // SPA fallback: only for extensionless paths
     if spa && relative.extension().is_none() {
         let fallback = base.join(index_file);
-        if std::fs::metadata(&fallback).is_ok_and(|m| m.is_file()) {
+        if async_fs::metadata(&fallback)
+            .await
+            .is_ok_and(|m| m.is_file())
+        {
             return Some(fallback);
         }
     }
@@ -263,38 +554,71 @@ fn normalize_mount_path(mount_path: &str) -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct StaticDirEndpoint {
     directory: Arc<PathBuf>,
     index_file: Arc<String>,
     spa: bool,
+    cache_control: Option<HeaderValue>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct EmbeddedStaticDirEndpoint {
     directory: &'static Dir<'static>,
     index_file: String,
     spa: bool,
+    cache_control: Option<HeaderValue>,
+    etags: EtagCache,
 }
 
-fn serve_embedded_static(
-    directory: &'static Dir<'static>,
-    index_file: &str,
-    spa: bool,
-    params: &Params,
-) -> Result<Response, StaticDirError> {
-    let requested_path = params.get("path").unwrap_or("");
-    let sanitized = sanitize_relative_path(requested_path).ok_or(StaticDirError::InvalidPath)?;
+impl EmbeddedStaticDirEndpoint {
+    fn serve(&self, request: &Request) -> Result<Response, StaticDirError> {
+        let params = request
+            .extensions()
+            .get::<Params>()
+            .cloned()
+            .unwrap_or_else(|| Params::new(Vec::new()));
+        let requested_path = params.get("path").unwrap_or("");
+        let sanitized =
+            sanitize_relative_path(requested_path).ok_or(StaticDirError::InvalidPath)?;
 
-    let embedded_file = resolve_embedded_file(directory, &sanitized, index_file, spa)
-        .ok_or(StaticDirError::FileNotFound)?;
+        let file = resolve_embedded_file(self.directory, &sanitized, &self.index_file, self.spa)
+            .ok_or(StaticDirError::FileNotFound)?;
 
-    let mut response = Response::new(http_kit::Body::from(embedded_file.contents().to_vec()));
-    if let Some(value) = guess_embedded_content_type(embedded_file) {
-        response.headers_mut().insert(header::CONTENT_TYPE, value);
+        let contents = file.contents();
+        let len = contents.len() as u64;
+        let served = ServedFile {
+            len,
+            etag: self.etags.get(self.directory, file),
+            // An embedded file has no modification time; its ETag is the validator.
+            last_modified: None,
+            content_type: guess_embedded_content_type(file),
+        };
+
+        let disposition = negotiate(request.headers(), served.etag.as_ref(), None, len);
+        let mut response = served.head(&disposition, self.cache_control.as_ref());
+
+        match disposition {
+            Disposition::NotModified | Disposition::Unsatisfiable => {}
+            Disposition::Partial { start, end } => {
+                let slice = &contents[usize_range(start, end, contents.len())];
+                *response.body_mut() = Body::from_bytes(http_kit::utils::Bytes::from_static(slice));
+            }
+            Disposition::Full => {
+                *response.body_mut() =
+                    Body::from_bytes(http_kit::utils::Bytes::from_static(contents));
+            }
+        }
+
+        Ok(response)
     }
+}
 
-    Ok(response)
+/// Clamp an inclusive byte range to a slice's bounds.
+fn usize_range(start: u64, end: u64, len: usize) -> std::ops::Range<usize> {
+    let start = usize::try_from(start).unwrap_or(usize::MAX).min(len);
+    let end = usize::try_from(end).unwrap_or(usize::MAX).min(len - 1);
+    start..end + 1
 }
 
 fn resolve_embedded_file<'a>(
@@ -355,12 +679,12 @@ pub enum StaticDirError {
 impl Endpoint for StaticDirEndpoint {
     type Error = StaticDirError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let params = Params::extract(request).await.unwrap(); // Params extractor never fails, so unwrap is safe
         serve_static(
             self.directory.as_ref(),
             self.index_file.as_ref(),
             self.spa,
-            &params,
+            self.cache_control.as_ref(),
+            request,
         )
         .await
     }
@@ -368,17 +692,21 @@ impl Endpoint for StaticDirEndpoint {
 
 impl Endpoint for EmbeddedStaticDirEndpoint {
     type Error = StaticDirError;
-    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let params = Params::extract(request).await.unwrap(); // Params extractor never fails, so unwrap is safe
-        serve_embedded_static(self.directory, &self.index_file, self.spa, &params)
+    // The assets are compiled into the binary, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn respond(
+        &mut self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ready(self.serve(request))
     }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::{normalize_mount_path, sanitize_relative_path};
+    use super::{negotiate, normalize_mount_path, sanitize_relative_path, Disposition};
     use crate::{
-        header,
+        header::{self, HeaderValue},
         routing::{build, Route},
         static_files::StaticDir,
         Body, Method, StatusCode,
@@ -402,6 +730,23 @@ mod tests {
     fn keeps_valid_relative_segments() {
         let path = sanitize_relative_path("styles/main.css").unwrap();
         assert_eq!(path, std::path::Path::new("styles").join("main.css"));
+    }
+
+    #[test]
+    fn an_unsatisfiable_range_is_recognised() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=100-200"));
+        assert_eq!(
+            negotiate(&headers, None, None, 10),
+            Disposition::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn a_multi_range_request_is_answered_in_full() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-1,4-5"));
+        assert_eq!(negotiate(&headers, None, None, 10), Disposition::Full);
     }
 
     fn get_request(path: &str) -> http_kit::Request {
@@ -429,8 +774,104 @@ mod tests {
             .get(header::CONTENT_TYPE)
             .expect("missing content type");
         assert_eq!(header_value.to_str().unwrap(), "text/css");
+        assert!(response.headers().contains_key(header::ETAG));
+        assert!(response.headers().contains_key(header::LAST_MODIFIED));
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
         let body = response.into_body().into_bytes().await.unwrap();
         assert_eq!(body.as_ref(), b"body { color: #fff; }");
+    }
+
+    #[tokio::test]
+    async fn a_matching_etag_answers_304_without_a_body() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.js"), b"console.log(1)").unwrap();
+        let router = build(Route::new((StaticDir::new("/s", dir.path()),))).unwrap();
+
+        let first = router.clone().go(get_request("/s/app.js")).await.unwrap();
+        let etag = first.headers().get(header::ETAG).unwrap().clone();
+
+        let mut request = get_request("/s/app.js");
+        request.headers_mut().insert(header::IF_NONE_MATCH, etag);
+        let response = router.clone().go(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        let body = response.into_body().into_bytes().await.unwrap();
+        assert!(body.is_empty(), "a 304 carries no body");
+    }
+
+    #[tokio::test]
+    async fn a_not_modified_since_request_answers_304() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.js"), b"console.log(1)").unwrap();
+        let router = build(Route::new((StaticDir::new("/s", dir.path()),))).unwrap();
+
+        let first = router.clone().go(get_request("/s/app.js")).await.unwrap();
+        let modified = first.headers().get(header::LAST_MODIFIED).unwrap().clone();
+
+        let mut request = get_request("/s/app.js");
+        request
+            .headers_mut()
+            .insert(header::IF_MODIFIED_SINCE, modified);
+        let response = router.clone().go(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn a_single_range_answers_206_with_just_those_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.bin"), b"0123456789").unwrap();
+        let router = build(Route::new((StaticDir::new("/s", dir.path()),))).unwrap();
+
+        let mut request = get_request("/s/data.bin");
+        request
+            .headers_mut()
+            .insert(header::RANGE, HeaderValue::from_static("bytes=2-5"));
+        let response = router.clone().go(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 2-5/10"
+        );
+        let body = response.into_body().into_bytes().await.unwrap();
+        assert_eq!(body.as_ref(), b"2345");
+    }
+
+    #[tokio::test]
+    async fn a_range_past_the_end_answers_416() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.bin"), b"0123456789").unwrap();
+        let router = build(Route::new((StaticDir::new("/s", dir.path()),))).unwrap();
+
+        let mut request = get_request("/s/data.bin");
+        request
+            .headers_mut()
+            .insert(header::RANGE, HeaderValue::from_static("bytes=50-60"));
+        let response = router.clone().go(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes */10"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_cache_control_reaches_the_response() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.js"), b"console.log(1)").unwrap();
+        let router = build(Route::new((StaticDir::new("/s", dir.path())
+            .cache_control(HeaderValue::from_static("public, max-age=60")),)))
+        .unwrap();
+
+        let response = router.clone().go(get_request("/s/app.js")).await.unwrap();
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=60"
+        );
     }
 
     #[tokio::test]

@@ -15,4 +15,4 @@ pub mod sql;
 pub use crate::sql::{DbExecResult, DbValue};
 pub use alarm::{Alarm, AlarmError, AlarmScheduler};
 pub use kv::{DurableKv, DurableKvError, DurableKvStore, DurableListOptions};
-pub use sql::{DurableDb, DurableDbBackend, DurableDbError};
+pub use sql::{DurableDb, DurableDbBackend, DurableDbError, DurableDbQuery};

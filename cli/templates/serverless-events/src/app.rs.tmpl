@@ -1,7 +1,7 @@
 use skyzen::routing::{CreateRouteNode, Route, Router};
 
 async fn root() -> &'static str {
-    "Hello from {{PACKAGE_NAME}} events worker!"
+    "Hello from {{ ctx.package_name }} events worker!"
 }
 
 async fn health() -> &'static str {

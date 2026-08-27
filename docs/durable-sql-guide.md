@@ -33,7 +33,7 @@ Your object code is the same on native and Cloudflare. The runtime changes, not 
 ```rust
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
-use skyzen::routing::{CreateRouteNode, Route};
+use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::Result;
 use skyzen_services::durable::DurableDb;
 
@@ -42,7 +42,7 @@ use skyzen_services::durable::DurableDb;
 struct Room;
 
 impl DurableObject for Room {
-    fn fetch(&mut self) -> impl skyzen::Endpoint + 'static {
+    fn fetch(&mut self) -> Router {
         Route::new((
             "/join".post(join_room),
             "/members".get(list_members),
@@ -105,7 +105,15 @@ async fn compact_room(db: DurableDb) -> Result<&'static str> {
 
 Example:
 
+A row arrives as a JSON object keyed by column name, so a query's row type is a struct with one
+field per selected column — name the aggregate in SQL and the field will find it:
+
 ```rust
+#[derive(serde::Deserialize)]
+struct CountRow {
+    count: i64,
+}
+
 let count = db
     .query("SELECT COUNT(*) AS count FROM members WHERE name = ?")
     .bind("alice")

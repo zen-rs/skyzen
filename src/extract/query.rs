@@ -1,27 +1,38 @@
 use crate::{extract::Extractor, Request, StatusCode};
 
-use http_kit::http_error;
+use core::future::{ready, Future};
 use serde::de::DeserializeOwned;
-use serde_urlencoded::from_str;
+use serde_html_form::from_str;
 
 /// Parse query from Uri.
+///
+/// Repeated keys collect into a sequence, so `?tags=a&tags=b` deserializes into a
+/// `tags: Vec<String>` field.
 #[derive(Debug, Clone)]
 pub struct Query<T>(pub T);
 
 impl_deref!(Query);
 
-http_error!(
-    /// An error occurred while parsing the query string.
-    pub QueryError, StatusCode::BAD_REQUEST, "Failed to parse query string");
+/// An error occurred while parsing the query string.
+///
+/// Carries the deserializer's own message so the 4xx response tells the caller which parameter
+/// was wrong, rather than only saying that something was.
+#[skyzen::error(
+    message = "Failed to parse query string: {0}",
+    status = StatusCode::BAD_REQUEST
+)]
+pub struct QueryError(String);
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
     type Error = QueryError;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+    // The query string is already on the request, so the future is ready on creation rather than
+    // an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
         let data = request.uri().query().unwrap_or_default();
-        Ok(Self(from_str(data).map_err(|error| {
+        ready(from_str(data).map(Self).map_err(|error| {
             tracing::debug!(%error, "failed to parse query string");
-            QueryError::new()
-        })?))
+            QueryError(error.to_string())
+        }))
     }
 
     #[cfg(feature = "openapi")]
@@ -55,6 +66,28 @@ mod tests {
         page: u8,
     }
 
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Filter {
+        tags: Option<Vec<String>>,
+    }
+
+    #[tokio::test]
+    async fn collects_repeated_keys_into_a_sequence() {
+        let mut request = request("http://localhost/search?tags=a&tags=b");
+        let Query(filter) = Query::<Filter>::extract(&mut request).await.unwrap();
+        assert_eq!(
+            filter.tags.as_deref(),
+            Some(["a".to_owned(), "b".to_owned()].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_sequence_stays_none() {
+        let mut request = request("http://localhost/search");
+        let Query(filter) = Query::<Filter>::extract(&mut request).await.unwrap();
+        assert_eq!(filter.tags, None);
+    }
+
     #[tokio::test]
     async fn parses_struct_from_query_string() {
         let mut request = request("http://localhost/search?q=rust&page=2");
@@ -73,6 +106,15 @@ mod tests {
         let mut request = request("http://localhost/search?q=rust&page=two");
         let error = Query::<Search>::extract(&mut request).await.unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let message = error.to_string();
+        assert!(
+            message.starts_with("Failed to parse query string: "),
+            "rejection should keep its prefix, got {message}"
+        );
+        assert!(
+            message.contains("invalid digit"),
+            "rejection should carry the deserializer detail, got {message}"
+        );
     }
     fn request(uri: &str) -> http_kit::Request {
         let mut request = http_kit::Request::new(Body::empty());

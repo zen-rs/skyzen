@@ -1,16 +1,64 @@
 use executor_core::AnyExecutor;
-use futures_util::{stream::MapOk, TryStreamExt};
-use http_body_util::{BodyDataStream, StreamBody};
+use futures_util::{Stream, TryStreamExt};
+use http_body::SizeHint;
+use http_body_util::BodyDataStream;
 use hyper::{
     body::{Frame, Incoming},
     service::Service,
 };
-use std::{convert::Infallible, future::Future, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{
+    convert::Infallible,
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use skyzen_core::{error_response, BodyError, Endpoint, HttpError, PeerAddr};
+use skyzen_core::{error_response, log_endpoint_error, BodyError, Endpoint, PeerAddr};
 
 type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
 type Bytes = http_kit::utils::Bytes;
+
+/// Response body adapter bridging a skyzen [`Body`](skyzen_core::Body) to hyper.
+///
+/// Unlike a plain stream wrapper, this adapter reports an exact
+/// [`size_hint`](http_body::Body::size_hint) whenever the underlying body knows its length, so
+/// fixed-size responses are sent with a `Content-Length` header instead of
+/// `Transfer-Encoding: chunked`.
+#[derive(Debug)]
+pub struct SkyzenBody(skyzen_core::Body);
+
+impl SkyzenBody {
+    const fn new(body: skyzen_core::Body) -> Self {
+        Self(body)
+    }
+}
+
+impl http_body::Body for SkyzenBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|option| option.map(|result| result.map(Frame::data)))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_empty() == Some(true)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.0
+            .len()
+            .and_then(|len| u64::try_from(len).ok())
+            .map_or_else(SizeHint::default, SizeHint::with_exact)
+    }
+}
 
 /// Hyper service adapter for skyzen endpoints.
 ///
@@ -48,8 +96,7 @@ impl<E: Endpoint + Clone> IntoService<E> {
 impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
     for IntoService<E>
 {
-    type Response =
-        hyper::Response<StreamBody<MapOk<skyzen_core::Body, fn(Bytes) -> Frame<Bytes>>>>;
+    type Response = hyper::Response<SkyzenBody>;
     // Handler errors are converted into HTTP responses, so the service itself never fails.
     type Error = Infallible;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
@@ -86,34 +133,12 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                     response
                 }
                 Err(error) => {
-                    let status = error.status();
-                    if status.is_server_error() {
-                        tracing::error!(
-                            method = method.as_str(),
-                            path = path.as_str(),
-                            status = status.as_u16(),
-                            error = %error,
-                            "internal server error"
-                        );
-                    } else {
-                        tracing::warn!(
-                            method = method.as_str(),
-                            path = path.as_str(),
-                            status = status.as_u16(),
-                            error = %error,
-                            "client error"
-                        );
-                    }
+                    log_endpoint_error(&error, &method, path.as_str());
                     error_response(&error)
                 }
             };
 
-            Ok(response.map(|body| {
-                let body: MapOk<skyzen_core::Body, fn(Bytes) -> Frame<Bytes>> =
-                    body.map_ok(Frame::data);
-
-                StreamBody::new(body)
-            }))
+            Ok(response.map(SkyzenBody::new))
         };
 
         Box::pin(fut)

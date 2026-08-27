@@ -17,6 +17,13 @@ pub mod state;
 pub use state::State;
 
 pub mod cookie;
+pub use cookie::{Cookie, CookieJar};
+
+pub mod html;
+pub use html::Html;
+
+pub mod redirect;
+pub use redirect::{InvalidRedirectLocation, Redirect};
 
 /// Error types
 pub mod error {
@@ -26,6 +33,7 @@ pub mod error {
     pub use super::json::JsonContentTypeError;
     #[cfg(feature = "multipart")]
     pub use super::multipart::MultipartBoundaryError;
+    pub use super::redirect::InvalidRedirectLocation;
     pub use super::state::StateNotExist;
 }
 

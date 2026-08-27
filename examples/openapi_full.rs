@@ -15,8 +15,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use skyzen::{
-    extract::Query,
-    routing::{CreateRouteNode, Params, Route, Router},
+    extract::{Path, Query},
+    routing::{CreateRouteNode, Route, Router},
     utils::{Json, State},
     StatusCode, ToSchema,
 };
@@ -146,11 +146,10 @@ async fn create_article(
 /// Uses path params and custom errors to demonstrate error mapping in `OpenAPI`.
 #[skyzen::openapi]
 async fn get_article(
-    params: Params,
+    Path(id): Path<String>,
     State(store): State<SharedStore>,
 ) -> Result<Json<Article>, ApiError> {
-    let id = params.get("id").map_err(|_| ApiError::NotFound)?;
-    store.get(id).map(Json).ok_or(ApiError::NotFound)
+    store.get(&id).map(Json).ok_or(ApiError::NotFound)
 }
 
 /// Deprecated health check for compatibility with legacy clients.
@@ -170,7 +169,7 @@ fn main() -> Router {
         "/articles"
             .at(list_articles)
             .post(create_article)
-            .route(("/articles/{id}".at(get_article),)),
+            .route(("/{id}".at(get_article),)),
         "/legacy/ping".at(legacy_ping),
     ));
 

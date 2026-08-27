@@ -1,5 +1,6 @@
 //! HTTP cookies
 pub use cookie::Cookie;
+use core::future::{ready, Future};
 use http::StatusCode;
 
 use std::{
@@ -50,22 +51,34 @@ http_error!(
 
 impl Extractor for CookieJar {
     type Error = CookieParseError;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let cookie = request
-            .headers()
-            .get(header::COOKIE)
-            .map_or(&[] as &[u8], |v| v.as_bytes());
-        let cookies = core::str::from_utf8(cookie)
-            .map_err(|_| CookieParseError::new())?
-            .parse::<Self>()
-            .map_err(|_| CookieParseError::new())?;
-        Ok(cookies)
+    // The header is already on the request, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(parse_jar(request))
     }
+}
+
+/// Join every `Cookie` field line and parse the result.
+///
+/// HTTP/2 allows the header to be split into several field lines, so they are joined with "; "
+/// before parsing.
+fn parse_jar(request: &Request) -> Result<CookieJar, CookieParseError> {
+    let mut combined = String::new();
+    for value in request.headers().get_all(header::COOKIE) {
+        let value = core::str::from_utf8(value.as_bytes()).map_err(|_| CookieParseError::new())?;
+        if !combined.is_empty() {
+            combined.push_str("; ");
+        }
+        combined.push_str(value);
+    }
+    combined
+        .parse::<CookieJar>()
+        .map_err(|_| CookieParseError::new())
 }
 
 http_error!(
     /// Error occurs when setting cookies to response headers.
-    pub CookieSetError, StatusCode::SERVICE_UNAVAILABLE, "Failed to set cookies"
+    pub CookieSetError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to set cookies"
 );
 
 impl Responder for CookieJar {
@@ -104,6 +117,22 @@ mod tests {
         let jar = CookieJar::extract(&mut request).await.unwrap();
 
         assert_eq!(jar.get("session").unwrap().value(), "abc 123");
+        assert_eq!(jar.get("theme").unwrap().value(), "dark");
+    }
+
+    #[tokio::test]
+    async fn joins_multiple_cookie_headers() {
+        let mut request = Request::new(Body::empty());
+        request
+            .headers_mut()
+            .append(COOKIE, HeaderValue::from_static("session=abc"));
+        request
+            .headers_mut()
+            .append(COOKIE, HeaderValue::from_static("theme=dark"));
+
+        let jar = CookieJar::extract(&mut request).await.unwrap();
+
+        assert_eq!(jar.get("session").unwrap().value(), "abc");
         assert_eq!(jar.get("theme").unwrap().value(), "dark");
     }
 

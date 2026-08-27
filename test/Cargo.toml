@@ -10,11 +10,18 @@ keywords = ["http", "web", "framework", "testing"]
 categories = ["web-programming::http-server", "development-tools::testing"]
 
 [dependencies]
+skyzen-core.workspace = true
 skyzen-services.workspace = true
 http-kit.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Matches the encoder `skyzen`'s `Form` extractor and responder use, so a payload with a
+# repeated key round-trips through the test client the way it does through the framework.
+serde_html_form = "0.4"
 insta = { version = "1", features = ["json"] }
+
+[dev-dependencies]
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 
 [features]
 # Mirror the database runtime feature flags exposed by `skyzen-services`.
