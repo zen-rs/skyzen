@@ -548,6 +548,9 @@ pub enum NativeDatabaseSection {
     /// SQLite, through `skyzen-services`' `sqlite` feature.
     #[serde(rename = "sqlite")]
     Sqlite(SqlUrlWiring),
+    /// Azure SQL, from `skyzen-azure`' `sql` feature.
+    #[serde(rename = "azure-sql")]
+    AzureSql(SqlUrlWiring),
     /// Aurora through the RDS Data API, from `skyzen-aws`' `rds-data` feature.
     #[serde(rename = "rds-data")]
     RdsData(RdsDataWiring),
@@ -561,22 +564,26 @@ impl NativeDatabaseSection {
             Self::Postgres(_) => NativeDatabaseBackend::Postgres,
             Self::Mysql(_) => NativeDatabaseBackend::Mysql,
             Self::Sqlite(_) => NativeDatabaseBackend::Sqlite,
+            Self::AzureSql(_) => NativeDatabaseBackend::AzureSql,
             Self::RdsData(_) => NativeDatabaseBackend::RdsData,
         }
     }
 
-    /// The variable holding this database's connection URL, for the drivers that connect to one.
+    /// The variable holding a connection URL one of `Db::connect_*` can dial.
     ///
-    /// `None` for the RDS Data API, which is an HTTP service reached by ARN rather than a server
-    /// reached by URL — and therefore the one backend `skyzen migrate --provider native` cannot
-    /// open a connection to.
+    /// `None` for the two backends that are not a URL-addressed server: the RDS Data API is an
+    /// HTTP service reached by ARN, and Azure SQL is reached through an ADO.NET connection string,
+    /// which sqlx has no driver for. Those are exactly the backends
+    /// `skyzen migrate --provider native` cannot open a connection to, which is the question this
+    /// answers — the variable an `azure-sql` wiring names is still reported by
+    /// [`env_vars`](Self::env_vars), so `skyzen dev` and `.env.example` cover it like any other.
     #[must_use]
     pub fn url_env(&self) -> Option<&str> {
         match self {
             Self::Postgres(wiring) | Self::Mysql(wiring) | Self::Sqlite(wiring) => {
                 Some(&wiring.url_env)
             }
-            Self::RdsData(_) => None,
+            Self::AzureSql(_) | Self::RdsData(_) => None,
         }
     }
 
@@ -584,7 +591,10 @@ impl NativeDatabaseSection {
     #[must_use]
     pub fn env_vars(&self) -> Vec<WiringEnvVar<'_>> {
         match self {
-            Self::Postgres(wiring) | Self::Mysql(wiring) | Self::Sqlite(wiring) => {
+            Self::Postgres(wiring)
+            | Self::Mysql(wiring)
+            | Self::Sqlite(wiring)
+            | Self::AzureSql(wiring) => {
                 vec![WiringEnvVar::declared("url_env", &wiring.url_env)]
             }
             Self::RdsData(_) => RDS_ENV_VARS.map(WiringEnvVar::fixed).to_vec(),
@@ -592,11 +602,20 @@ impl NativeDatabaseSection {
     }
 }
 
-/// A SQL database reached through a connection URL: `backend = "postgres"`, `"mysql"`, `"sqlite"`.
+/// A SQL database reached through one variable's worth of connection string.
+///
+/// `backend = "postgres"`, `"mysql"` and `"sqlite"` hold a connection URL there. `"azure-sql"`
+/// holds the ADO.NET connection string the Azure portal hands out — `Server=`, `Database=`,
+/// `User ID=`, `Password=`, `Encrypt=` — which is not a URL but is read from the environment for
+/// the same reason: it carries the password.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqlUrlWiring {
-    /// Environment variable holding the connection URL.
+    /// Environment variable holding the connection string.
+    ///
+    /// A connection URL for `postgres`, `mysql` and `sqlite`; the ADO.NET connection string for
+    /// `azure-sql`, where `AZURE_SQL_CONNECTION_STRING` — the name `AzureSqlConfig::from_env`
+    /// reads — is the conventional choice.
     pub url_env: String,
 }
 
@@ -612,13 +631,21 @@ pub enum NativeDatabaseBackend {
     Mysql,
     /// SQLite, through `skyzen-services`' `sqlite` feature.
     Sqlite,
+    /// Azure SQL, from `skyzen-azure`' `sql` feature.
+    AzureSql,
     /// Aurora through the RDS Data API, from `skyzen-aws`' `rds-data` feature.
     RdsData,
 }
 
 impl NativeDatabaseBackend {
     /// Every backend, in the order the documentation lists them.
-    pub const ALL: [Self; 4] = [Self::Postgres, Self::Mysql, Self::Sqlite, Self::RdsData];
+    pub const ALL: [Self; 5] = [
+        Self::Postgres,
+        Self::Mysql,
+        Self::Sqlite,
+        Self::AzureSql,
+        Self::RdsData,
+    ];
 
     /// The manifest spelling of this backend.
     #[must_use]
@@ -627,6 +654,7 @@ impl NativeDatabaseBackend {
             Self::Postgres => "postgres",
             Self::Mysql => "mysql",
             Self::Sqlite => "sqlite",
+            Self::AzureSql => "azure-sql",
             Self::RdsData => "rds-data",
         }
     }
