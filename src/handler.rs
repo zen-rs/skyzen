@@ -50,6 +50,26 @@ impl<E: Extractor, R: Responder> core::error::Error for HandlerError<E, R> {}
 
 /// An HTTP handler.
 /// This trait is a wrapper trait for `Fn` types. You will rarely use this type directly.
+// Verified rendering at the `.at(handler)` registration site:
+//   error[E0277]: `fn(NotAnExtractor) -> impl Future<Output = &'static str> {bad_arg}` is not a
+//                 Skyzen handler
+//     --> src/main.rs:11:33
+//      |
+//   11 |     let _ = Route::new(("/a".at(bad_arg),));
+//      |                              -- ^^^^^^^ not a handler
+//      = note: a handler is an `async fn` (or closure) whose arguments all implement `Extractor`
+//              and whose return type implements `Responder`
+//      = note: the future a handler returns must be `Send`: ...
+//      = note: a handler takes at most 15 arguments; ...
+//      = note: common fixes: ...
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a Skyzen handler",
+    label = "not a handler",
+    note = "a handler is an `async fn` (or closure) whose arguments all implement `Extractor` and whose return type implements `Responder`",
+    note = "the future a handler returns must be `Send`: do not hold an `Rc` or a `MutexGuard` across an `.await`",
+    note = "a handler takes at most 15 arguments; group the rest into one extractor",
+    note = "common fixes: take path parameters as `Path<T>` or `Params`, take a body as `Json<T>`/`Bytes`/`String`, and return `Json<T>`, `String` or `Result<T>` rather than a bare value"
+)]
 pub trait Handler<T: Extractor, R: Responder>: Send + Sync + Clone + 'static {
     /// Handle the request and make a response.
     fn call_handler(
@@ -97,19 +117,37 @@ where
 }
 
 macro_rules! impl_handler {
-    ($($ty:ident),*) => {
-        #[allow(non_snake_case)]
-
-        impl<F, Fut, Res,$($ty:Extractor,)*> Handler<($($ty,)*) , Res> for F
+    // A handler taking no arguments extracts nothing. Its extractor is `()`, whose error type is
+    // `Infallible`, so the variadic arm's `map_err` would be a call that can never run — which is
+    // what nightly reports as an unreachable call. The arm is written out separately rather than
+    // silenced, the same way `skyzen_core`'s own `()` extractor is.
+    () => {
+        impl<F, Fut, Res> Handler<(), Res> for F
         where
-            F: 'static + Clone + Send + Sync + Fn($($ty,)*) -> Fut,
+            F: 'static + Clone + Send + Sync + Fn() -> Fut,
             Fut: Send + Future<Output = Res>,
             Res: Responder,
         {
-            async fn call_handler(&self, request: &mut Request) -> Result<Response, HandlerError<($($ty,)*), Res>> {
-                let ($($ty,)*) = <($($ty,)*) as Extractor>::extract(request).await.map_err(|e| HandlerError::ExtractorError(e))?;
+            async fn call_handler(&self, request: &mut Request) -> Result<Response, HandlerError<(), Res>> {
                 let mut response = Response::new(http_kit::Body::empty());
-                (self)($($ty,)*).await.respond_to(request,&mut response).map_err(|e| HandlerError::ResponderError(e))?;
+                (self)().await.respond_to(request,&mut response).map_err(|e| HandlerError::ResponderError(e))?;
+                Ok(response)
+            }
+        }
+    };
+    ($($ty:ident),+) => {
+        #[allow(non_snake_case)]
+
+        impl<F, Fut, Res,$($ty:Extractor,)+> Handler<($($ty,)+) , Res> for F
+        where
+            F: 'static + Clone + Send + Sync + Fn($($ty,)+) -> Fut,
+            Fut: Send + Future<Output = Res>,
+            Res: Responder,
+        {
+            async fn call_handler(&self, request: &mut Request) -> Result<Response, HandlerError<($($ty,)+), Res>> {
+                let ($($ty,)+) = <($($ty,)+) as Extractor>::extract(request).await.map_err(|e| HandlerError::ExtractorError(e))?;
+                let mut response = Response::new(http_kit::Body::empty());
+                (self)($($ty,)+).await.respond_to(request,&mut response).map_err(|e| HandlerError::ResponderError(e))?;
                 Ok(response)
             }
         }

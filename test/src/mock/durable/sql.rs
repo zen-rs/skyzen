@@ -1,5 +1,6 @@
 //! In-memory Durable Object SQL store for testing.
 
+use core::future::{ready, Future};
 use std::sync::{Arc, RwLock};
 
 use skyzen_services::{
@@ -7,10 +8,17 @@ use skyzen_services::{
     DbExecResult, DbValue,
 };
 
-/// In-memory implementation of [`DurableDbBackend`] for testing.
+/// Recording stub implementation of [`DurableDbBackend`] for testing.
 ///
-/// This is a minimal stub that records executed queries.
-/// For full SQL testing, consider using `rusqlite` directly.
+/// **This is not a SQL engine.** It executes nothing: every `query` and
+/// `execute` call records the SQL string and returns an empty
+/// [`DbExecResult`], regardless of the statement. `SELECT`s always produce
+/// zero rows, `INSERT`s store nothing, and invalid SQL succeeds.
+///
+/// Its purpose is asserting *which* statements a handler issued, via
+/// [`executed_queries`](Self::executed_queries). For tests that need real SQL
+/// semantics, use `InMemoryDb` (in-memory `SQLite`, requires a runtime
+/// feature) instead.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryDurableDb {
     queries: Arc<RwLock<Vec<String>>>,
@@ -23,7 +31,10 @@ impl InMemoryDurableDb {
         Self::default()
     }
 
-    /// Get all queries that have been executed.
+    /// Get the SQL strings of all statements issued so far, in order.
+    ///
+    /// Both `query` and `execute` calls are recorded. Bound parameter values
+    /// are not captured.
     ///
     /// # Panics
     ///
@@ -34,28 +45,34 @@ impl InMemoryDurableDb {
     }
 }
 
+// Recording a SQL string under a lock is synchronous, so each future is ready on creation rather
+// than an `async` block with nothing to await.
 impl DurableDbBackend for InMemoryDurableDb {
-    async fn query(
+    fn query(
         &self,
         query: &str,
         _params: &[DbValue],
-    ) -> Result<DbExecResult, DurableDbError> {
-        self.queries
-            .write()
-            .map_err(|_| DurableDbError::Backend("lock poisoned".to_owned()))?
-            .push(query.to_owned());
-        Ok(DbExecResult::default())
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+        ready(
+            self.queries
+                .write()
+                .map_err(|_| DurableDbError::backend("lock poisoned"))
+                .map(|mut queries| {
+                    queries.push(query.to_owned());
+                    DbExecResult::default()
+                }),
+        )
     }
 
-    async fn execute(
+    fn execute(
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> Result<DbExecResult, DurableDbError> {
-        self.query(query, params).await
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+        self.query(query, params)
     }
 
-    async fn database_size(&self) -> Result<u64, DurableDbError> {
-        Ok(0)
+    fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
+        ready(Ok(0))
     }
 }

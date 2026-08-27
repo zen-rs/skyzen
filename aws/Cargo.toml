@@ -24,13 +24,40 @@ aws-sdk-sqs = { version = "1", optional = true, default-features = false, featur
     "default-https-client",
     "rt-tokio",
 ] }
+aws-sdk-rdsdata = { version = "1", optional = true, default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-smithy-types = { version = "1", optional = true }
 base64 = { version = "0.22", optional = true }
+# Only for `SqsDeduplication::ContentHash`, which needs a stable digest of a message body to build
+# a FIFO `MessageDeduplicationId`.
+sha2 = { version = "0.10", optional = true }
+serde_json = { version = "1", optional = true }
+tracing = { workspace = true, optional = true }
+# Note: no direct `sqlparser` dependency. The RDS Data API's second rewriting pass uses the
+# tokenizer `skyzen-services` re-exports, so the two passes cannot end up on different versions of
+# it and disagree about what a string literal is.
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+# The parameter types `DbValue` carries, needed to build one of every variant in the mapping tests.
+# Versions match `skyzen-services`, so the types are the same ones its `DbValue` holds.
+bigdecimal = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = "1"
 
 [features]
-default = ["dynamodb", "s3", "sqs"]
-dynamodb = ["dep:aws-sdk-dynamodb"]
+default = ["dynamodb", "rds-data", "s3", "sqs"]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-smithy-types"]
+rds-data = [
+    "dep:aws-sdk-rdsdata",
+    "dep:aws-smithy-types",
+    "dep:serde_json",
+    "dep:tracing",
+]
 s3 = ["dep:skyzen-s3"]
-sqs = ["dep:aws-sdk-sqs", "dep:base64"]
+sqs = ["dep:aws-sdk-sqs", "dep:aws-smithy-types", "dep:base64", "dep:sha2"]
 
 [lints]
 workspace = true

@@ -11,13 +11,18 @@ categories = ["web-programming::http-server", "database"]
 
 [dependencies]
 skyzen-services = { path = "../services", version = "0.1.0" }
-redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "smol-comp"] }
+# `script` is what `compare_and_swap` runs on: Redis has no compare-and-swap command, and a
+# GET/SET pair is not atomic. It brings in `sha1_smol` for the EVALSHA cache key.
+redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "script"], optional = true }
 
 [features]
 default = ["runtime-tokio"]
-# User selects async runtime in their application
-runtime-tokio = ["redis/tokio-comp"]
-runtime-smol = ["redis/smol-comp"]
+# User selects async runtime in their application. The `redis` dependency is
+# only pulled in once a runtime is picked: `redis`'s `aio` support does not
+# compile without one of its `*-comp` features, so with neither runtime
+# selected this crate compiles to an empty shell instead of failing to build.
+runtime-tokio = ["dep:redis", "redis/tokio-comp"]
+runtime-smol = ["dep:redis", "redis/smol-comp"]
 
 [lints]
 workspace = true

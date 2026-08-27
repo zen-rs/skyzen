@@ -1,4 +1,4 @@
-//! FFI bindings for WinterCG WebSocket API.
+//! FFI bindings for `WinterCG` WebSocket API.
 //!
 //! This module provides low-level bindings to the WebSocket API available in
 //! WinterCG-compatible runtimes like Cloudflare Workers.
@@ -10,7 +10,7 @@ use wasm_bindgen::prelude::*;
 /// In WinterCG runtimes, this is used for server-side WebSocket upgrades.
 #[wasm_bindgen]
 extern "C" {
-    /// WebSocketPair type from the WinterCG runtime.
+    /// `WebSocketPair` type from the `WinterCG` runtime.
     pub type WebSocketPair;
 
     /// Creates a new WebSocketPair.
@@ -29,7 +29,7 @@ extern "C" {
 /// WebSocket interface for WinterCG runtimes.
 #[wasm_bindgen]
 extern "C" {
-    /// WebSocket type from the WinterCG runtime.
+    /// WebSocket type from the `WinterCG` runtime.
     #[derive(Clone)]
     pub type WebSocket;
 
@@ -46,8 +46,14 @@ extern "C" {
     pub fn send(this: &WebSocket, data: &JsValue) -> Result<(), JsValue>;
 
     /// Close the WebSocket connection.
-    #[wasm_bindgen(method)]
-    pub fn close(this: &WebSocket, code: Option<u16>, reason: Option<&str>);
+    ///
+    /// Fallible on purpose: the WebSocket standard has `close` throw `InvalidAccessError` for a
+    /// code outside `1000` and `3000..=4999`, which covers `1011` — the code the framework itself
+    /// sends for a failed session. Workers accepts it on a server-side socket, but a binding that
+    /// could not report a rejection would turn the one host that does not into an unhandled
+    /// promise rejection inside a spawned task.
+    #[wasm_bindgen(method, catch)]
+    pub fn close(this: &WebSocket, code: Option<u16>, reason: Option<&str>) -> Result<(), JsValue>;
 
     /// Add an event listener to the WebSocket.
     #[wasm_bindgen(method, js_name = addEventListener)]
@@ -61,7 +67,7 @@ extern "C" {
 /// MessageEvent received from WebSocket.
 #[wasm_bindgen]
 extern "C" {
-    /// MessageEvent type.
+    /// `MessageEvent` type.
     pub type MessageEvent;
 
     /// Get the data from the message event.
@@ -72,7 +78,7 @@ extern "C" {
 /// CloseEvent received when WebSocket closes.
 #[wasm_bindgen]
 extern "C" {
-    /// CloseEvent type.
+    /// `CloseEvent` type.
     pub type CloseEvent;
 
     /// Get the close code.
@@ -91,7 +97,7 @@ extern "C" {
 /// ErrorEvent received on WebSocket error.
 #[wasm_bindgen]
 extern "C" {
-    /// ErrorEvent type.
+    /// `ErrorEvent` type.
     pub type ErrorEvent;
 
     /// Get the error message.
@@ -99,44 +105,20 @@ extern "C" {
     pub fn message(this: &ErrorEvent) -> String;
 }
 
-/// Custom ResponseInit that supports the `webSocket` property for WinterCG runtimes.
-///
-/// This is required because `web_sys::ResponseInit` doesn't include the `webSocket` field
-/// which is a Cloudflare Workers/WinterCG extension to the standard Response API.
-#[wasm_bindgen]
-extern "C" {
-    /// ResponseInit dictionary with WebSocket support.
-    #[wasm_bindgen(extends = js_sys::Object)]
-    #[derive(Clone, Debug)]
-    pub type ResponseInit;
-}
-
-impl ResponseInit {
-    /// Create a new ResponseInit with WebSocket upgrade configuration.
-    pub fn new_websocket(status: u16, websocket: &WebSocket) -> Result<Self, JsValue> {
-        let init = js_sys::Object::new();
-        js_sys::Reflect::set(&init, &"status".into(), &status.into())?;
-        js_sys::Reflect::set(&init, &"webSocket".into(), websocket)?;
-        Ok(init.unchecked_into())
-    }
-}
-
-/// Create a WebSocket upgrade Response for WinterCG runtimes.
-///
-/// This creates a Response with status 101 and the client WebSocket attached,
-/// which is the required format for Cloudflare Workers WebSocket upgrades.
-#[wasm_bindgen]
-extern "C" {
-    /// Create a new Response with options.
-    #[wasm_bindgen(js_namespace = Response, js_name = "new", catch)]
-    fn response_new_with_init(
-        body: JsValue,
-        init: &ResponseInit,
-    ) -> Result<web_sys::Response, JsValue>;
-}
-
 /// Create a WebSocket upgrade response.
+///
+/// This creates a Response with status 101 and the client WebSocket attached via the
+/// non-standard `webSocket` init property (a Cloudflare Workers/WinterCG extension),
+/// which is the required format for WebSocket upgrades on those runtimes.
+///
+/// # Errors
+///
+/// Returns the underlying `JsValue` error if the reflective property set or
+/// the `Response` construction is rejected by the runtime.
 pub fn create_websocket_response(client: &WebSocket) -> Result<web_sys::Response, JsValue> {
-    let init = ResponseInit::new_websocket(101, client)?;
-    response_new_with_init(JsValue::NULL, &init)
+    let init = web_sys::ResponseInit::new();
+    init.set_status(101);
+    // `web_sys::ResponseInit` has no `webSocket` field, so attach it reflectively.
+    js_sys::Reflect::set(init.as_ref(), &"webSocket".into(), client.as_ref())?;
+    web_sys::Response::new_with_opt_buffer_source_and_init(None, &init)
 }

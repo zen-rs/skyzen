@@ -2,6 +2,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use core::future::{ready, Future};
 use std::{
     collections::{BTreeMap, HashMap},
     hash::{Hash, Hasher},
@@ -26,7 +27,7 @@ use super::{
     DurableConnections, DurableConnectionsInner, DurableObject, DurableObjectError,
     DurableObjectId, WebSocketConnection,
 };
-use crate::{Body, Endpoint, HttpError, Method, Request, Response};
+use crate::{Body, Endpoint, Method, Request, Response};
 
 const ALARM_REQUEST_PATH: &str = "/__skyzen_alarm";
 
@@ -50,7 +51,15 @@ impl<T> Clone for NativeDurableNamespace<T> {
 struct NativeDurableNamespaceInner {
     type_name: &'static str,
     next_id: AtomicU64,
-    instances: RwLock<HashMap<String, Arc<Mutex<NativeDurableSlot>>>>,
+    instances: RwLock<HashMap<String, Arc<NativeDurableInstance>>>,
+}
+
+#[derive(Debug)]
+struct NativeDurableInstance {
+    slot: Mutex<NativeDurableSlot>,
+    /// Serializes handler dispatch per object id, upholding the serial-execution promise
+    /// documented on [`DurableObject`].
+    dispatch: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -77,10 +86,20 @@ impl NativeDurableSlot {
         })
     }
 
+    /// Restore the user's object, or produce a fresh one when the type opted out of
+    /// framework-managed persistence.
+    ///
+    /// The simulator honours [`DurableObject::PERSIST`] for the same reason the Cloudflare runtime
+    /// does: an object that stores its own state must behave identically on both, or a bug only
+    /// shows up after deployment.
     fn load_object<T>(&self) -> Result<T, DurableObjectError>
     where
         T: DurableObject,
     {
+        if !T::PERSIST {
+            return Ok(T::default());
+        }
+
         self.state
             .as_deref()
             .map(|bytes| {
@@ -95,6 +114,10 @@ impl NativeDurableSlot {
     where
         T: DurableObject,
     {
+        if !T::PERSIST {
+            return Ok(());
+        }
+
         self.state = Some(
             serde_json::to_vec(object)
                 .map_err(|error| DurableObjectError::Serialization(error.to_string()))?,
@@ -204,8 +227,8 @@ where
     async fn slot_for(
         &self,
         id: &DurableObjectId,
-    ) -> Result<Arc<Mutex<NativeDurableSlot>>, DurableObjectError> {
-        let existing_slot = {
+    ) -> Result<Arc<NativeDurableInstance>, DurableObjectError> {
+        let existing_instance = {
             self.inner
                 .instances
                 .read()
@@ -213,19 +236,72 @@ where
                 .get(id.as_str())
                 .cloned()
         };
-        if let Some(slot) = existing_slot {
-            return Ok(slot);
+        if let Some(instance) = existing_instance {
+            return Ok(instance);
         }
 
-        let slot = Arc::new(Mutex::new(NativeDurableSlot::new().await?));
-        let slot = {
+        let slot = NativeDurableSlot::new().await?;
+        self.install_alarm_timer(&slot.alarm, id);
+        let instance = Arc::new(NativeDurableInstance {
+            slot: Mutex::new(slot),
+            dispatch: Mutex::new(()),
+        });
+        let instance = {
             let mut instances = self.inner.instances.write().map_err(lock_poisoned)?;
             instances
                 .entry(id.as_str().to_owned())
-                .or_insert_with(|| Arc::clone(&slot))
+                .or_insert_with(|| Arc::clone(&instance))
                 .clone()
         };
-        Ok(slot)
+        Ok(instance)
+    }
+
+    /// Wire the per-object alarm scheduler to a background timer that invokes the object's
+    /// alarm handler when the scheduled time is reached, mirroring platform behavior.
+    fn install_alarm_timer(&self, scheduler: &NativeAlarmScheduler, id: &DurableObjectId) {
+        let weak = Arc::downgrade(&self.inner);
+        let object_id = id.clone();
+        let alarm_state = Arc::clone(&scheduler.alarm);
+        let generation = Arc::clone(&scheduler.generation);
+
+        scheduler.install_fire_handler(Box::new(move |scheduled_time_ms, expected_generation| {
+            let weak = weak.clone();
+            let object_id = object_id.clone();
+            let alarm_state = Arc::clone(&alarm_state);
+            let generation = Arc::clone(&generation);
+
+            std::thread::spawn(move || {
+                let now = current_unix_ms();
+                if scheduled_time_ms > now {
+                    let delta = u64::try_from(scheduled_time_ms - now).unwrap_or(0);
+                    std::thread::sleep(std::time::Duration::from_millis(delta));
+                }
+
+                // A newer `set_alarm`/`delete_alarm` supersedes this timer.
+                if generation.load(Ordering::SeqCst) != expected_generation {
+                    return;
+                }
+                // Clear the stored alarm before dispatch (platform semantics: a fired alarm
+                // no longer shows up via `get_alarm`).
+                {
+                    let Ok(mut stored) = alarm_state.write() else {
+                        return;
+                    };
+                    if stored.take().is_none() {
+                        return;
+                    }
+                }
+
+                let Some(inner) = weak.upgrade() else { return };
+                let namespace = Self {
+                    inner,
+                    marker: PhantomData,
+                };
+                if let Err(error) = smol::block_on(namespace.alarm(&object_id)) {
+                    tracing::error!(%error, "native durable alarm handler failed");
+                }
+            });
+        }));
     }
 
     async fn fetch(
@@ -233,36 +309,47 @@ where
         id: &DurableObjectId,
         mut request: Request,
     ) -> Result<Response, DurableObjectError> {
-        let slot = self.slot_for(id).await?;
+        let instance = self.slot_for(id).await?;
 
-        // Load the struct state and clone the (independently synchronized) service handles while
-        // holding the slot lock, then release it before dispatching. Holding the lock across
-        // `respond().await` would deadlock if a handler re-enters the same Durable Object id. The
-        // shared `DurableKv`/`DurableDb` keep their own locks, so cross-request state stays
-        // consistent; struct-field state under concurrent same-id access is last-writer-wins.
+        // Serialize the whole load → dispatch → save sequence per object id, upholding the
+        // serial-execution model documented on `DurableObject`. Note that a handler which
+        // re-enters the same object id through its own stub will deadlock, mirroring the
+        // platform's serial input semantics.
+        let _dispatch = instance.dispatch.lock().await;
+
         let mut object = {
-            let slot = slot.lock().await;
+            let slot = instance.slot.lock().await;
             inject_durable_extensions(&mut request, &slot, id.clone());
             slot.load_object::<T>()?
         };
+
+        // Capture the request identity before `respond` takes the request mutably, so the error
+        // log can name the call that failed the way the HTTP backends do.
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
 
         let response = {
             let mut endpoint = object.fetch();
             match endpoint.respond(&mut request).await {
                 Ok(response) => response,
-                Err(error) => error_to_response(&error),
+                Err(error) => {
+                    skyzen_core::log_endpoint_error(&error, &method, path.as_str());
+                    skyzen_core::error_response(&error)
+                }
             }
         };
 
-        slot.lock().await.save_object(&object)?;
+        instance.slot.lock().await.save_object(&object)?;
         Ok(response)
     }
 
     async fn alarm(&self, id: &DurableObjectId) -> Result<(), DurableObjectError> {
-        let slot = self.slot_for(id).await?;
+        let instance = self.slot_for(id).await?;
 
-        // See `fetch` for why the lock is released before dispatching the alarm handler.
-        let guard = slot.lock().await;
+        // See `fetch`: alarm dispatch participates in the same per-object serialization.
+        let _dispatch = instance.dispatch.lock().await;
+
+        let guard = instance.slot.lock().await;
         let mut object = guard.load_object::<T>()?;
 
         // `fetch()` returns a `Router`, which exposes the alarm handler registered via
@@ -284,7 +371,7 @@ where
             .map_err(|error| DurableObjectError::Runtime(error.to_string()))?;
 
         // Persist any state the alarm handler wrote through the injected services.
-        slot.lock().await.save_object(&object)?;
+        instance.slot.lock().await.save_object(&object)?;
         Ok(())
     }
 }
@@ -373,27 +460,6 @@ fn alarm_request() -> Result<Request, http::Error> {
     Ok(request)
 }
 
-fn error_to_response(error: &dyn HttpError) -> Response {
-    let status = error.status();
-    let message = error.to_string();
-
-    let body = if status.is_server_error() {
-        tracing::error!(status = status.as_u16(), error = %message, "durable fetch internal error");
-        serde_json::json!({ "error": "Internal server error" }).to_string()
-    } else {
-        tracing::warn!(status = status.as_u16(), error = %message, "durable fetch client error");
-        serde_json::json!({ "error": message }).to_string()
-    };
-
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        crate::header::CONTENT_TYPE,
-        crate::header::HeaderValue::from_static("application/json"),
-    );
-    response
-}
-
 fn lock_poisoned<T>(_: T) -> DurableObjectError {
     DurableObjectError::Runtime("native durable simulator lock poisoned".to_owned())
 }
@@ -423,38 +489,81 @@ impl DurableConnectionsInner for NativeDurableConnections {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// Handler invoked when an alarm is scheduled; receives the scheduled unix time (ms) and the
+/// schedule generation that must still be current when the timer elapses.
+type AlarmFireHandler = Box<dyn Fn(i64, u64) + Send + Sync>;
+
+#[derive(Clone, Default)]
 struct NativeAlarmScheduler {
     alarm: Arc<RwLock<Option<i64>>>,
+    /// Monotonic schedule counter; each `set_alarm`/`delete_alarm` bumps it so an in-flight
+    /// timer can detect it has been superseded or cancelled.
+    generation: Arc<AtomicU64>,
+    fire: Arc<std::sync::OnceLock<AlarmFireHandler>>,
 }
 
+impl std::fmt::Debug for NativeAlarmScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeAlarmScheduler")
+            .field("alarm", &self.alarm)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeAlarmScheduler {
+    fn install_fire_handler(&self, handler: AlarmFireHandler) {
+        // Only the first installation wins; the handler is wired once per object slot.
+        let _ = self.fire.set(handler);
+    }
+}
+
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+impl NativeAlarmScheduler {
+    fn store(&self, scheduled_time_ms: Option<i64>) -> Result<(), AlarmError> {
+        self.alarm
+            .write()
+            .map_err(|_| AlarmError::backend("native durable alarm lock poisoned"))
+            .map(|mut alarm| *alarm = scheduled_time_ms)
+    }
+}
+
+// The alarm slot is a lock away, and arming the timer only hands work to a background task, so
+// each future is ready on creation rather than an `async` block with nothing to await.
 impl AlarmScheduler for NativeAlarmScheduler {
-    async fn get_alarm(&self) -> Result<Option<i64>, AlarmError> {
-        let alarm = self
-            .alarm
-            .read()
-            .map_err(|_| AlarmError::Backend("native durable alarm lock poisoned".to_owned()))?;
-        Ok(*alarm)
+    fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, AlarmError>> + Send {
+        ready(
+            self.alarm
+                .read()
+                .map_err(|_| AlarmError::backend("native durable alarm lock poisoned"))
+                .map(|alarm| *alarm),
+        )
     }
 
-    async fn set_alarm(&self, scheduled_time_ms: i64) -> Result<(), AlarmError> {
-        {
-            let mut alarm = self.alarm.write().map_err(|_| {
-                AlarmError::Backend("native durable alarm lock poisoned".to_owned())
-            })?;
-            *alarm = Some(scheduled_time_ms);
-        }
-        Ok(())
+    fn set_alarm(
+        &self,
+        scheduled_time_ms: i64,
+    ) -> impl Future<Output = Result<(), AlarmError>> + Send {
+        ready(self.store(Some(scheduled_time_ms)).map(|()| {
+            let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            // Drive the alarm with a background timer so it actually fires in the simulator.
+            if let Some(fire) = self.fire.get() {
+                fire(scheduled_time_ms, generation);
+            }
+        }))
     }
 
-    async fn delete_alarm(&self) -> Result<(), AlarmError> {
-        {
-            let mut alarm = self.alarm.write().map_err(|_| {
-                AlarmError::Backend("native durable alarm lock poisoned".to_owned())
-            })?;
-            *alarm = None;
-        }
-        Ok(())
+    fn delete_alarm(&self) -> impl Future<Output = Result<(), AlarmError>> + Send {
+        ready(self.store(None).map(|()| {
+            // Invalidate any pending timer.
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }))
     }
 }
 
@@ -463,76 +572,97 @@ struct NativeDurableKvStore {
     data: Arc<RwLock<BTreeMap<String, Vec<u8>>>>,
 }
 
+// A `BTreeMap` behind a lock answers every call synchronously, so each future is ready on
+// creation rather than an `async` block with nothing to await.
 impl DurableKvStore for NativeDurableKvStore {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, DurableKvError> {
-        let data = self.data.read().map_err(kv_lock_err)?;
-        Ok(data.get(key).cloned())
+    fn get(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, DurableKvError>> + Send {
+        ready(
+            self.data
+                .read()
+                .map_err(kv_lock_err)
+                .map(|data| data.get(key).cloned()),
+        )
     }
 
-    async fn get_multiple(&self, keys: &[&str]) -> Result<Vec<(String, Vec<u8>)>, DurableKvError> {
-        let data = self.data.read().map_err(kv_lock_err)?;
-        Ok(keys
-            .iter()
-            .filter_map(|key| {
-                data.get(*key)
-                    .map(|value| ((*key).to_owned(), value.clone()))
-            })
-            .collect())
+    fn get_multiple(
+        &self,
+        keys: &[&str],
+    ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + Send {
+        ready(self.data.read().map_err(kv_lock_err).map(|data| {
+            keys.iter()
+                .filter_map(|key| {
+                    data.get(*key)
+                        .map(|value| ((*key).to_owned(), value.clone()))
+                })
+                .collect()
+        }))
     }
 
-    async fn put(&self, key: &str, value: &[u8]) -> Result<(), DurableKvError> {
-        self.data
-            .write()
-            .map_err(kv_lock_err)?
-            .insert(key.to_owned(), value.to_vec());
-        Ok(())
+    fn put(
+        &self,
+        key: &str,
+        value: &[u8],
+    ) -> impl Future<Output = Result<(), DurableKvError>> + Send {
+        ready(self.data.write().map_err(kv_lock_err).map(|mut guard| {
+            guard.insert(key.to_owned(), value.to_vec());
+        }))
     }
 
-    async fn put_multiple(&self, entries: &[(&str, &[u8])]) -> Result<(), DurableKvError> {
-        {
-            let mut guard = self.data.write().map_err(kv_lock_err)?;
+    fn put_multiple(
+        &self,
+        entries: &[(&str, &[u8])],
+    ) -> impl Future<Output = Result<(), DurableKvError>> + Send {
+        ready(self.data.write().map_err(kv_lock_err).map(|mut guard| {
             for (key, value) in entries {
                 guard.insert((*key).to_owned(), value.to_vec());
             }
-        }
-        Ok(())
+        }))
     }
 
-    async fn delete(&self, key: &str) -> Result<bool, DurableKvError> {
-        Ok(self
-            .data
-            .write()
-            .map_err(kv_lock_err)?
-            .remove(key)
-            .is_some())
+    fn delete(&self, key: &str) -> impl Future<Output = Result<bool, DurableKvError>> + Send {
+        ready(
+            self.data
+                .write()
+                .map_err(kv_lock_err)
+                .map(|mut guard| guard.remove(key).is_some()),
+        )
     }
 
-    async fn delete_multiple(&self, keys: &[&str]) -> Result<usize, DurableKvError> {
-        let mut guard = self.data.write().map_err(kv_lock_err)?;
-        Ok(keys
-            .iter()
-            .filter(|key| guard.remove(**key).is_some())
-            .count())
+    fn delete_multiple(
+        &self,
+        keys: &[&str],
+    ) -> impl Future<Output = Result<usize, DurableKvError>> + Send {
+        ready(self.data.write().map_err(kv_lock_err).map(|mut guard| {
+            keys.iter()
+                .filter(|key| guard.remove(**key).is_some())
+                .count()
+        }))
     }
 
-    async fn delete_all(&self) -> Result<(), DurableKvError> {
-        self.data.write().map_err(kv_lock_err)?.clear();
-        Ok(())
+    fn delete_all(&self) -> impl Future<Output = Result<(), DurableKvError>> + Send {
+        ready(
+            self.data
+                .write()
+                .map_err(kv_lock_err)
+                .map(|mut guard| guard.clear()),
+        )
     }
 
-    async fn list(
+    fn list(
         &self,
         options: DurableListOptions<'_>,
-    ) -> Result<Vec<(String, Vec<u8>)>, DurableKvError> {
-        let data = self.data.read().map_err(kv_lock_err)?;
-        let iter: Box<dyn Iterator<Item = (&String, &Vec<u8>)>> = if options.reverse {
-            Box::new(data.iter().rev())
-        } else {
-            Box::new(data.iter())
-        };
+    ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, DurableKvError>> + Send {
+        ready(self.data.read().map_err(kv_lock_err).map(|data| {
+            let iter: Box<dyn Iterator<Item = (&String, &Vec<u8>)>> = if options.reverse {
+                Box::new(data.iter().rev())
+            } else {
+                Box::new(data.iter())
+            };
 
-        Ok(iter
-            .filter(|(key, _)| {
+            iter.filter(|(key, _)| {
                 if let Some(prefix) = options.prefix {
                     if !key.starts_with(prefix) {
                         return false;
@@ -552,12 +682,13 @@ impl DurableKvStore for NativeDurableKvStore {
             })
             .take(options.limit.unwrap_or(usize::MAX))
             .map(|(key, value)| (key.clone(), value.clone()))
-            .collect())
+            .collect()
+        }))
     }
 }
 
 fn kv_lock_err<T>(_: T) -> DurableKvError {
-    DurableKvError::Backend("native durable KV lock poisoned".to_owned())
+    DurableKvError::backend("native durable KV lock poisoned")
 }
 
 #[derive(Debug, Clone)]
@@ -628,9 +759,9 @@ impl DurableDbBackend for NativeDurableDbStore {
 
         let bytes = page_count
             .checked_mul(page_size)
-            .ok_or_else(|| DurableDbError::Backend("native durable DB size overflow".to_owned()))?;
+            .ok_or_else(|| DurableDbError::backend("native durable DB size overflow"))?;
         u64::try_from(bytes)
-            .map_err(|_| DurableDbError::Backend("native durable DB size was negative".to_owned()))
+            .map_err(|_| DurableDbError::backend("native durable DB size was negative"))
     }
 }
 
@@ -639,7 +770,7 @@ mod tests {
     use super::*;
     use crate::{
         routing::{CreateRouteNode, Route},
-        Error, Result,
+        Result,
     };
     use serde::{Deserialize, Serialize};
     use skyzen_services::durable::DurableDb;
@@ -657,8 +788,10 @@ mod tests {
         fn fetch(&mut self) -> crate::routing::Router {
             Route::new((
                 "/increment".post(increment),
+                "/slow_increment".post(slow_increment),
                 "/value".at(value),
                 "/alarm_count".at(alarm_count),
+                "/schedule_alarm".post(schedule_alarm),
             ))
             .on_alarm(run_alarm)
             .build()
@@ -668,14 +801,12 @@ mod tests {
     async fn increment(db: DurableDb) -> Result<String> {
         db.query("CREATE TABLE IF NOT EXISTS counter (value INTEGER NOT NULL)")
             .execute()
-            .await
-            .map_err(to_error)?;
+            .await?;
 
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
             .fetch_optional::<CounterRow>()
-            .await
-            .map_err(to_error)?
+            .await?
             .map_or(0, |row| row.value);
         let next = current + 1;
 
@@ -683,30 +814,62 @@ mod tests {
             db.query("INSERT INTO counter (value) VALUES (?)")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         } else {
             db.query("UPDATE counter SET value = ?")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         }
 
         Ok(next.to_string())
     }
 
-    async fn value(db: DurableDb) -> Result<String> {
+    /// Read-modify-write with an await gap in the middle: if two same-id requests ran
+    /// concurrently, both would read the same value and one update would be lost.
+    async fn slow_increment(db: DurableDb) -> Result<String> {
         db.query("CREATE TABLE IF NOT EXISTS counter (value INTEGER NOT NULL)")
             .execute()
-            .await
-            .map_err(to_error)?;
+            .await?;
 
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
             .fetch_optional::<CounterRow>()
-            .await
-            .map_err(to_error)?
+            .await?
+            .map_or(0, |row| row.value);
+
+        async_io::Timer::after(std::time::Duration::from_millis(50)).await;
+
+        let next = current + 1;
+        if current == 0 {
+            db.query("INSERT INTO counter (value) VALUES (?)")
+                .bind(next)
+                .execute()
+                .await?;
+        } else {
+            db.query("UPDATE counter SET value = ?")
+                .bind(next)
+                .execute()
+                .await?;
+        }
+
+        Ok(next.to_string())
+    }
+
+    async fn schedule_alarm(alarm: skyzen_services::durable::Alarm) -> Result<&'static str> {
+        alarm.set_alarm(super::current_unix_ms() + 50).await?;
+        Ok("scheduled")
+    }
+
+    async fn value(db: DurableDb) -> Result<String> {
+        db.query("CREATE TABLE IF NOT EXISTS counter (value INTEGER NOT NULL)")
+            .execute()
+            .await?;
+
+        let current = db
+            .query("SELECT value FROM counter LIMIT 1")
+            .fetch_optional::<CounterRow>()
+            .await?
             .map_or(0, |row| row.value);
         Ok(current.to_string())
     }
@@ -714,14 +877,12 @@ mod tests {
     async fn run_alarm(db: DurableDb) -> Result<&'static str> {
         db.query("CREATE TABLE IF NOT EXISTS alarm_runs (value INTEGER NOT NULL)")
             .execute()
-            .await
-            .map_err(to_error)?;
+            .await?;
 
         let current = db
             .query("SELECT value FROM alarm_runs LIMIT 1")
             .fetch_optional::<CounterRow>()
-            .await
-            .map_err(to_error)?
+            .await?
             .map_or(0, |row| row.value);
         let next = current + 1;
 
@@ -729,14 +890,12 @@ mod tests {
             db.query("INSERT INTO alarm_runs (value) VALUES (?)")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         } else {
             db.query("UPDATE alarm_runs SET value = ?")
                 .bind(next)
                 .execute()
-                .await
-                .map_err(to_error)?;
+                .await?;
         }
 
         Ok("ok")
@@ -745,20 +904,46 @@ mod tests {
     async fn alarm_count(db: DurableDb) -> Result<String> {
         db.query("CREATE TABLE IF NOT EXISTS alarm_runs (value INTEGER NOT NULL)")
             .execute()
-            .await
-            .map_err(to_error)?;
+            .await?;
 
         let current = db
             .query("SELECT value FROM alarm_runs LIMIT 1")
             .fetch_optional::<CounterRow>()
-            .await
-            .map_err(to_error)?
+            .await?
             .map_or(0, |row| row.value);
         Ok(current.to_string())
     }
 
-    fn to_error(error: impl std::fmt::Display) -> Error {
-        Error::msg(error.to_string())
+    /// Framework-managed state: the hit count survives between events because the runtime
+    /// serializes the whole object after each one.
+    #[derive(Default, Serialize, Deserialize)]
+    struct BlobCounter {
+        hits: u64,
+    }
+
+    impl DurableObject for BlobCounter {
+        fn fetch(&mut self) -> crate::routing::Router {
+            self.hits += 1;
+            let hits = self.hits;
+            Route::new(("/hits".at(move || async move { hits.to_string() }),)).build()
+        }
+    }
+
+    /// The same shape with `PERSIST = false`: nothing is stored, so every event starts from
+    /// `Default` and the count never climbs past one.
+    #[derive(Default, Serialize, Deserialize)]
+    struct ScratchCounter {
+        hits: u64,
+    }
+
+    impl DurableObject for ScratchCounter {
+        const PERSIST: bool = false;
+
+        fn fetch(&mut self) -> crate::routing::Router {
+            self.hits += 1;
+            let hits = self.hits;
+            Route::new(("/hits".at(move || async move { hits.to_string() }),)).build()
+        }
     }
 
     fn request(method: Method, path: &str) -> Request {
@@ -775,6 +960,30 @@ mod tests {
             .await
             .expect("response body");
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    #[tokio::test]
+    async fn persist_false_skips_the_framework_state_round_trip() {
+        let blob = NativeDurableNamespace::<BlobCounter>::new();
+        let stub = blob.get_by_name("blob").expect("blob object");
+        for expected in ["1", "2", "3"] {
+            let response = stub
+                .fetch(request(Method::GET, "/hits"))
+                .await
+                .expect("blob hit");
+            assert_eq!(response_text(response).await, expected);
+        }
+
+        let scratch = NativeDurableNamespace::<ScratchCounter>::new();
+        let stub = scratch.get_by_name("scratch").expect("scratch object");
+        for _ in 0..3u32 {
+            let response = stub
+                .fetch(request(Method::GET, "/hits"))
+                .await
+                .expect("scratch hit");
+            // Nothing was saved, so the object is rebuilt from `Default` on every event.
+            assert_eq!(response_text(response).await, "1");
+        }
     }
 
     #[tokio::test]
@@ -811,6 +1020,51 @@ mod tests {
 
         assert_eq!(response_text(value_a).await, "2");
         assert_eq!(response_text(value_b).await, "1");
+    }
+
+    #[tokio::test]
+    async fn native_durable_namespace_serializes_same_id_dispatch() {
+        let namespace = NativeDurableNamespace::<CounterObject>::new();
+        let stub = namespace.get_by_name("serial").expect("serial object");
+
+        let (first, second) = tokio::join!(
+            stub.fetch(request(Method::POST, "/slow_increment")),
+            stub.fetch(request(Method::POST, "/slow_increment")),
+        );
+        first.expect("first slow increment");
+        second.expect("second slow increment");
+
+        // Without per-object serialization both requests read 0 and the final value is 1.
+        let value = stub
+            .fetch(request(Method::GET, "/value"))
+            .await
+            .expect("value");
+        assert_eq!(response_text(value).await, "2");
+    }
+
+    #[tokio::test]
+    async fn native_alarm_scheduler_fires_scheduled_alarm() {
+        let namespace = NativeDurableNamespace::<CounterObject>::new();
+        let stub = namespace.get_by_name("timer-alarm").expect("alarm object");
+
+        let response = stub
+            .fetch(request(Method::POST, "/schedule_alarm"))
+            .await
+            .expect("schedule alarm");
+        assert_eq!(response_text(response).await, "scheduled");
+
+        // The background timer should invoke the alarm handler shortly after the deadline.
+        for _ in 0..100u32 {
+            async_io::Timer::after(std::time::Duration::from_millis(50)).await;
+            let response = stub
+                .fetch(request(Method::GET, "/alarm_count"))
+                .await
+                .expect("alarm count");
+            if response_text(response).await == "1" {
+                return;
+            }
+        }
+        panic!("scheduled alarm never fired");
     }
 
     #[tokio::test]

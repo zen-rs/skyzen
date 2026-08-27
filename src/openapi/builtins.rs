@@ -1,4 +1,4 @@
-#[cfg(any(feature = "json", feature = "form"))]
+#[cfg(feature = "json")]
 use serde::Serialize;
 use utoipa::openapi::schema::{ObjectBuilder, Schema, SchemaType, Type};
 use utoipa::openapi::RefOr;

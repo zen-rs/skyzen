@@ -256,6 +256,94 @@ impl Sse {
             ),
         }
     }
+
+    /// Send a comment every `interval` while the stream has nothing to say.
+    ///
+    /// Proxies and load balancers close a connection that has been idle for 30–60 seconds, which
+    /// is exactly what a long-lived event stream looks like between events. A comment is ignored
+    /// by every client but keeps the bytes flowing, so the connection survives.
+    ///
+    /// The countdown restarts whenever a real event goes out, so an active stream sends no
+    /// comments at all.
+    ///
+    /// ```rust
+    /// # #[cfg(not(target_arch = "wasm32"))] {
+    /// use std::time::Duration;
+    /// use skyzen::responder::Sse;
+    ///
+    /// async fn events() -> Sse {
+    ///     let (sender, sse) = Sse::channel();
+    ///     let _ = sender;
+    ///     sse.keep_alive(Duration::from_secs(15))
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// Native targets only: a heartbeat needs a platform timer, and WebAssembly isolates cap a
+    /// response's lifetime themselves, so there is no idle connection to keep alive there.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn keep_alive(self, interval: Duration) -> Self {
+        Self {
+            stream: Body::from_stream(KeepAlive::new(self.stream, interval)),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pin_project! {
+    /// Merges a periodic comment into a stream that has gone quiet.
+    struct KeepAlive {
+        #[pin]
+        inner: Body,
+        // `async_io::Timer` is `Unpin`, so it is driven through `Pin::new` rather than projected —
+        // which is also what lets the interval be restarted when real data flows.
+        timer: async_io::Timer,
+        interval: Duration,
+        finished: bool,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl KeepAlive {
+    fn new(inner: Body, interval: Duration) -> Self {
+        Self {
+            inner,
+            timer: async_io::Timer::interval(interval),
+            interval,
+            finished: false,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Stream for KeepAlive {
+    type Item = <Body as Stream>::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if *this.finished {
+            return Poll::Ready(None);
+        }
+
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(item)) => {
+                // Real traffic is its own keep-alive: push the next heartbeat out a full interval.
+                this.timer.set_interval(*this.interval);
+                return Poll::Ready(Some(item));
+            }
+            Poll::Ready(None) => {
+                *this.finished = true;
+                return Poll::Ready(None);
+            }
+            Poll::Pending => {}
+        }
+
+        match Pin::new(&mut *this.timer).poll_next(cx) {
+            Poll::Ready(_) => Poll::Ready(Some(Ok(Event::comment("").finalize().into()))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 impl Responder for Sse {
@@ -388,5 +476,38 @@ mod tests {
 
         let error = sender.send_data("hello").await.unwrap_err();
         assert_eq!(error.status(), crate::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn keep_alive_sends_a_comment_while_the_stream_is_idle() {
+        use futures_util::StreamExt;
+
+        let (sender, sse) = Sse::channel();
+        let sse = sse.keep_alive(Duration::from_millis(20));
+
+        let mut response = Response::new(Body::empty());
+        sse.respond_to(&Request::new(Body::empty()), &mut response)
+            .unwrap();
+
+        // Nothing has been sent, so the only thing that can arrive is the heartbeat.
+        let mut body = response.into_body();
+        let chunk = body
+            .next()
+            .await
+            .expect("the heartbeat keeps the stream open")
+            .expect("a comment is not an error");
+        assert_eq!(chunk.as_ref(), b":\n\n");
+
+        // A real event still comes through the same stream.
+        sender.send_data("hello").await.unwrap();
+        let mut seen = Vec::new();
+        while let Some(Ok(chunk)) = body.next().await {
+            if chunk.as_ref() == b"data:hello\n\n" {
+                seen.push(chunk);
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 1, "the real event reaches the client");
     }
 }

@@ -17,18 +17,27 @@ Cloudflare Workers service implementations for the Skyzen framework.
 | Type | Implements | Cloudflare API |
 |------|-----------|----------------|
 | `CfKv` | `KeyValueStore` | [Workers KV](https://developers.cloudflare.com/kv/) |
-| `CfR2` | `ObjectStorage` | [R2](https://developers.cloudflare.com/r2/) |
+| `CfR2` | `ObjectStorage` | [R2](https://developers.cloudflare.com/r2/), including multipart, ranges and streaming |
 | `CfQueue` | `MessageQueue` | [Queues](https://developers.cloudflare.com/queues/) |
-| `CfD1` | `DbBackend` + raw D1 API | [D1](https://developers.cloudflare.com/d1/) |
+| `CfD1` | `DbBackend` + raw D1 API | [D1](https://developers.cloudflare.com/d1/), with `execute_batch` as its atomic unit |
 | `CfCache` | raw Cache API | [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) |
-| `CfDurableSqlite` | — (direct SQL API) | [Durable Objects SQLite](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
+| `CfDurableDb`, `CfDurableKv`, `CfAlarm` | the `durable` backends | [Durable Objects storage](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
+| `CfSecretStore` | — | [Secrets Store](https://developers.cloudflare.com/secrets-store/) bindings |
+| `CfService`, `CfAssets` | — | [Service bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/) and the static-assets binding |
+| `CfFetch` | — | Outbound `fetch` with Cloudflare's own request options |
+
+The Worker events Cloudflare documents are covered too: `fetch` from `#[skyzen::main]`, `queue`,
+`scheduled`, `email` and `tail` from their attributes (`CfQueueBatch`, `CfScheduledEvent`,
+`CfEmailMessage`, `TailTraceItem`), and the Durable Object `alarm` from `Route::on_alarm`.
+`CfProperties` (`skyzen::runtime`) carries the `request.cf` metadata, and `WorkerContext` carries
+`waitUntil`.
 
 ## Usage
 
 All types are created from the Workers environment using binding names:
 
 ```rust
-use skyzen_cloudflare::{CfCache, CfD1, CfDurableSqlite, CfKv, CfQueue, CfR2};
+use skyzen_cloudflare::{CfCache, CfD1, CfDurableDb, CfKv, CfQueue, CfR2};
 
 // From a Workers request handler (env is a JsValue):
 let kv = CfKv::from_env(&env, "MY_KV")?;
@@ -119,17 +128,29 @@ helpers are designed to be awaited directly inside Skyzen handlers without leaki
 
 ### Durable Object SQLite
 
-For SQL storage inside Durable Object classes using `state.storage.sql`:
+For SQL storage inside Durable Object classes using `state.storage.sql`, with
+bind parameters and row deserialization:
 
 ```rust
-let sql = CfDurableSqlite::from_state(&state)?;
-let cursor = sql.exec("CREATE TABLE IF NOT EXISTS counter (id TEXT PRIMARY KEY, value INTEGER)")?;
+use skyzen_services::durable::DurableDb;
+
+let db = DurableDb::new(CfDurableDb::from_state(&state)?);
+db.query("CREATE TABLE IF NOT EXISTS counter (id TEXT PRIMARY KEY, value INTEGER)")
+    .execute()
+    .await?;
+
+// Rows arrive as JSON objects keyed by column name, so a row type is a struct with a field per
+// selected column.
+#[derive(serde::Deserialize)]
+struct Counter { id: String, value: i64 }
+
+let counters: Vec<Counter> = db.query("SELECT id, value FROM counter").fetch_all().await?;
 ```
 
 ## D1 vs Durable Object SQLite
 
-| Feature | `CfD1` | `CfDurableSqlite` |
-|---------|--------|-------------------|
+| Feature | `CfD1` | `CfDurableDb` |
+|---------|--------|---------------|
 | Scope | Global (Workers env binding) | Per-object instance |
 | Access | Via `env` in request handler | Via `state` in DO class |
 | Use case | Shared relational data | Per-entity state |

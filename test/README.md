@@ -14,18 +14,21 @@ Testing utilities and mock implementations for the Skyzen HTTP framework.
 
 This crate provides platform-agnostic, in-memory implementations of the `skyzen-services` traits. These mocks allow you to test your handlers and business logic without needing real infrastructure like Redis, S3, or SQS.
 
-- **`InMemoryKv`**: A `DashMap`-based implementation of `KeyValueStore`.
-- **`InMemoryStorage`**: In-memory `ObjectStorage` for file upload/download simulation.
-- **`InMemoryQueue`**: In-memory `MessageQueue` for testing background workers.
-- **`InMemoryDb`**: SQLite in-memory database implementation (requires `runtime-tokio-native-tls` or `runtime-tokio-rustls` feature).
+- **`InMemoryKv`**: A `DashMap`-based implementation of `KeyValueStore`, atomics included.
+- **`InMemoryStorage`**: In-memory `ObjectStorage` for file upload/download simulation, including the streaming, range and presign surface.
+- **`InMemoryQueue`**: In-memory `MessageQueue` for testing background workers, with the full `receive`/`ack`/`nack` lease behaviour.
+- **`InMemoryDb`**: SQLite in-memory database implementation (requires `runtime-tokio-native-tls` or `runtime-tokio-rustls` feature). `InMemoryDb::with_schema` takes raw DDL; `InMemoryDb::with_migrations` runs your real migration set through the production runner, so a migration that would fail on deploy fails in the test suite instead.
+- **`InMemoryDurableKv`, `InMemoryDurableDb`, `InMemoryAlarm`**: the Durable Object surface, so a Workers application is testable on a plain native `cargo test`.
 
 ## HTTP Testing
 
 ### TestContext & TestClient
 
-The `TestContext` is automatically injected into functions annotated with `#[skyzen::test]`. The macro also provides in-memory `Kv`, `Storage`, `Queue`, and `Db` values when those parameter types appear, and `TestContext` forwards those services into every `TestClient` request it creates.
+The `TestContext` is automatically injected into functions annotated with `#[skyzen::test]`. The macro also provides in-memory `Kv`, `Storage`, `Queue`, `Db`, `DurableKv`, `DurableDb` and `Alarm` values when those parameter types appear — and `#[skyzen::test(migrations = MIGRATIONS)]` applies your migration set to the database first. `TestContext` forwards every service it holds into each `TestClient` request it creates.
 
-The `TestClient` executes requests directly against your application's router, bypassing the network stack for maximum performance and easier debugging.
+Built by hand, the same slots are `with_kv`, `with_storage`, `with_queue`, `with_db`, `with_durable_kv`, `with_durable_db` and `with_alarm`.
+
+The `TestClient` executes requests directly against your application's router, bypassing the network stack for maximum performance and easier debugging. `get`, `post`, `put`, `patch`, `delete`, `head` and `options` cover the usual verbs; `request(method, path)` covers anything else.
 
 ```rust
 use skyzen_test::TestContext;
@@ -88,6 +91,7 @@ A complete example demonstrating a handler that uses a KV store, being tested wi
 ```rust
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::utils::Json;
+use skyzen::{Responder, StatusCode};
 use skyzen_services::Kv;
 use skyzen_test::TestContext;
 use serde::{Serialize, Deserialize};

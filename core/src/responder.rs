@@ -11,18 +11,36 @@ use http_kit::header::{HeaderMap, HeaderName, HeaderValue};
 use http_kit::HttpError;
 use http_kit::{
     utils::{AsyncBufRead, ByteStr, Bytes},
-    Body, Request, Response,
+    Body, Request, Response, StatusCode,
 };
 
 #[cfg(feature = "openapi")]
 use crate::openapi::{ResponseSchema, SchemaRef};
 use crate::Error;
 
-/// Transform a object into a part of HTTP response,always is response body,header,etc.
+/// Converts a value into part of an HTTP response, such as the response body or
+/// a set of headers.
+///
+/// Responders compose: a tuple applies each element left to right, so `(StatusCode::CREATED,
+/// Json(article))` sets the status and then the body.
+// Verified rendering wherever a `Responder` bound is unsatisfied:
+//   error[E0277]: `NotAResponder` cannot be returned from a handler: it is not a `Responder`
+//      = note: return `String`, `&'static str`, `Bytes`, `Json<T>`, `StatusCode`, `Redirect`, a
+//              `Response`, or a tuple of responders such as `(StatusCode, Json<T>)`
+//      = note: to send a value as JSON, wrap it in `skyzen::utils::Json`
+//      = note: `Result<T, E>` is a responder when `T: Responder` and `E: HttpError`
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be returned from a handler: it is not a `Responder`",
+    label = "not a `Responder`",
+    note = "return `String`, `&'static str`, `Bytes`, `Json<T>`, `StatusCode`, `Redirect`, a `Response`, or a tuple of responders such as `(StatusCode, Json<T>)`",
+    note = "to send a value as JSON, wrap it in `skyzen::utils::Json`",
+    note = "`Result<T, E>` is a responder when `T: Responder` and `E: HttpError`"
+)]
 pub trait Responder: Sized + Send + Sync + 'static {
     /// Error type returned when responding fails.
     type Error: HttpError;
-    /// Modify the response,sometime also read the request (but the body may have already been consumed).
+    /// Modify the response. Implementations may also inspect the request, but
+    /// its body may have already been consumed by an extractor.
     ///
     /// # Errors
     ///
@@ -46,6 +64,11 @@ macro_rules! impl_tuple_responder {
             const _:() = {
                     // To prevent these macro-generated errors from overwhelming users.
             #[doc(hidden)]
+            // The arity-0 expansion — the responder for `()` — has no variants, which is correct:
+            // a unit responder cannot fail, so its error type is uninhabited. `empty_enums` is
+            // asking for `!` or `Infallible` there, which would need a second hand-written impl
+            // for the one degenerate case.
+            #[allow(clippy::empty_enums)]
             pub enum TupleResponderError<$($ty:Responder),*> {
                 $($ty(<$ty as Responder>::Error),)*
             }
@@ -216,6 +239,25 @@ impl<T: Responder> Responder for core::result::Result<T, Error> {
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
         T::register_openapi_schemas(defs);
+    }
+}
+
+/// Sets the response status, leaving everything else alone.
+///
+/// Because tuple responders apply left to right, `(StatusCode::CREATED, Json(article))` is the
+/// idiomatic way to answer with an explicit status and a body.
+impl Responder for StatusCode {
+    type Error = Infallible;
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
+        *response.status_mut() = self;
+        Ok(())
+    }
+
+    // The status is a runtime value, so there is no single documented status to advertise; the
+    // responder it is paired with contributes the schema.
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<ResponseSchema>> {
+        None
     }
 }
 

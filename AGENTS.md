@@ -1,102 +1,163 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides guidance for AI agents and coding assistants working on the Skyzen codebase.
 
 ## Build and Development Commands
 
 ```sh
-# Format, lint, and test (standard workflow)
+# Format check / fix
 cargo fmt
-cargo clippy --workspace --all-targets --all-features
+
+# Workspace tests
 cargo test --workspace --all-features
 
-# Run a single test
+# Run a specific test
 cargo test --workspace --all-features test_name
 
-# Run examples
-cargo run --example native -- --port 3000
-cargo run --example worker
-cargo run --example openapi
+# Lint across all targets and features
+cargo clippy --workspace --all-targets --all-features
 
-# Build cloudflare crate (wasm32-only, excluded from default workspace members)
+# Build Cloudflare Workers crate (wasm32-only, excluded from default members)
+cargo check -p skyzen-cloudflare --target wasm32-unknown-unknown
 cargo clippy -p skyzen-cloudflare --target wasm32-unknown-unknown
 
 # Build for wasm32 targets
 rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown --release
+
+# Run CLI unit and scaffold integration tests
+cargo test -p skyzen-cli
+
+# Run runnable examples
+cargo run --example native -- --port 3000
+cargo run --example services
+cargo run --example websocket_echo
+cargo run --example openapi
+cargo run --example embed_hyper
 ```
 
 ## Architecture Overview
 
-Skyzen is a router-first HTTP framework targeting both native servers (Tokio + Hyper) and WebAssembly edge platforms. The codebase is a Cargo workspace:
+Skyzen is a router-first HTTP framework targeting both native servers (Tokio + Hyper) and WebAssembly edge platforms (such as Cloudflare Workers). Handlers and services are written against platform-agnostic traits and types, allowing the exact same application code to run natively or compile to edge WebAssembly.
 
 ### Crate Structure
 
-**Framework core:**
-- **`skyzen`** (root) - Main framework crate with routing, middleware, extractors, responders, and runtime helpers
-- **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`) reusable by alternative runtimes. Supports `no_std` when the `std` feature is disabled
-- **`skyzen-macros`** (`macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::openapi]`, `#[skyzen::error]`, `#[derive(HttpError)]`
-- **`skyzen-hyper`** (`hyper/`) - Hyper backend that implements the `Server` trait from `skyzen-core`
+**Framework Core:**
+- **`skyzen`** (`/`) - Main framework crate: routing, extractors, responders, middleware, static files, and runtime helpers.
+- **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`) reusable by alternative runtimes. Supports `no_std` when `std` feature is disabled.
+- **`skyzen-macros`** (`macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::scheduled]`, `#[skyzen::email]`, `#[skyzen::tail]`, `#[skyzen::durable_object]`, `#[skyzen::test]`, `#[derive(HttpError)]`, plus the function-like `import_config!` and `embed_migrations!`.
+- **`skyzen-manifest`** (`manifest/`) - The one typed `Skyzen.toml` schema, consumed by **both** `skyzen-macros` (at compile time) and `skyzen-cli` (at deploy time), so a section can never be accepted by one and rejected by the other. Every struct carries `deny_unknown_fields` and the `type`/`backend` discriminants are enums, so a typo or an unsupported value fails at parse time.
+- **`skyzen-hyper`** (`hyper/`) - Hyper server adapter implementing the `Server` trait from `skyzen-core`.
+- **`skyzen-lambda`** (`lambda/`) - AWS Lambda adapter: HTTP invocations and SQS batches, driven by its own Tokio runtime. Reached through the root crate's optional `lambda` feature, never named by an application.
 
-**Services abstraction:**
-- **`skyzen-services`** (`services/`) - Platform-agnostic service traits (`KeyValueStore`, `ObjectStorage`, `MessageQueue`) and type-erased extractors (`Kv`, `Storage`, `Queue`, `Db`). Re-exports `sea_orm` for database access
-- **`skyzen-test`** (`test/`) - In-memory mock implementations (`InMemoryKv`, `InMemoryStorage`, `InMemoryQueue`) for testing
+**Services Abstraction & Testing:**
+- **`skyzen-services`** (`services/`) - Platform-agnostic service traits (`KeyValueStore`, `ObjectStorage`, `MessageQueue`, `DbBackend`, `DbTransactionBackend`), type-erased extractors (`Kv`, `Storage`, `Queue`, `Db`, `DurableDb`, `DurableKv`), the portable migration runner (`migrate`), and the queue envelope codec (`queue::envelope`) that two independent crates share.
+- **`skyzen-test`** (`test/`) - In-memory mock service implementations (`InMemoryKv`, `InMemoryStorage`, `InMemoryQueue`, `InMemoryDb`), HTTP `TestClient`, `TestContext` with a slot per capability (durable ones included), assertion helpers, and snapshot testing support via `insta`.
 
-**Platform implementations:**
-- **`skyzen-redis`** (`redis/`) - Redis `KeyValueStore` implementation
-- **`skyzen-s3`** (`s3/`) - S3-compatible `ObjectStorage` implementation
-- **`skyzen-cloudflare`** (`cloudflare/`) - Cloudflare Workers implementations (KV, R2, Queues, D1, Durable Object SQLite). **wasm32-only**
-- **`skyzen-aws`** (`aws/`) - AWS implementations (DynamoDB, SQS)
-- **`skyzen-azure`** (`azure/`) - Azure implementations (Cosmos DB, Blob Storage, Service Bus)
+**Platform Implementations:**
+- **`skyzen-redis`** (`redis/`) - Redis implementation of `KeyValueStore`, atomics included.
+- **`skyzen-s3`** (`s3/`) - S3-compatible implementation of `ObjectStorage`, with streaming, ranges, multipart and presigning.
+- **`skyzen-cloudflare`** (`cloudflare/`) - Cloudflare Workers implementations for KV, R2, Queues, D1 SQL, Durable Objects, the secrets store, `WorkerContext`/`CfProperties`, and the email/tail events (**wasm32-only**).
+- **`skyzen-cloudflare-admin`** (`cloudflare-admin/`) - Cloudflare REST API client, used by `skyzen provision`.
+- **`skyzen-aws`** (`aws/`) - AWS implementations: DynamoDB (`DynamoKv`), SQS (`SqsQueue`, FIFO and consume side), the Aurora Data API (`RdsDataDb`, with real transactions), and `S3Storage` re-exported from `skyzen-s3`.
+- **`skyzen-azure`** (`azure/`) - Azure implementations: Cosmos DB (`CosmosKv`), Blob Storage (`AzureBlob`), Service Bus (`ServiceBusQueue`), Azure Storage queues (`AzureStorageQueue`).
 
-### Services Abstraction (Two-Trait Pattern)
+**Tooling:**
+- **`skyzen-cli`** (`cli/`) - Unified CLI binary: `new`, `add`, `doctor`, `dev`, `build`, `provision`, `migrate` (+ `migrate status`), `deploy`, `logs`, `secret`, `completions`, with a global `--provider` / `--env` / `--manifest` / `--dry-run`. It links the wasm-bindgen generator and the binaryen optimizer in rather than shelling out, so `cargo install skyzen-cli` is the whole toolchain install. Templates and the generated Worker shim are askama templates under `cli/templates/`; `wrangler.toml` is a `Serialize` model, never string assembly.
 
-Services use a two-layer design for type erasure:
-- **Public trait** (e.g. `KeyValueStore`) with `impl Future` returns — ergonomic for implementors, NOT object-safe
-- **Private `*Obj` trait** with `BoxFuture` — object-safe for dynamic dispatch via `Box<dyn *Obj>`
-- **Bridge**: blanket impl of `*Obj` for any `T: PublicTrait`
-- **Wrapper** (e.g. `Kv`): holds `Box<dyn *Obj>`, implements `Extractor`, exposes async methods
+---
 
-The `MaybeSend` pattern (`services/src/maybe_send.rs`) conditionally applies `Send` bounds — `Send` on native, no-op on WASM. This allows the same traits to work on both targets.
+## Key Design Patterns & Invariants
 
-Platform crates depend only on `skyzen-services` (traits), NOT on the `skyzen` main crate.
+### 1. Services Abstraction (Two-Trait Pattern)
+Services use a two-layer design for dynamic dispatch and type erasure:
+- **Public Trait** (e.g. `KeyValueStore`): Uses `impl Future` returns for ergonomic implementors. Not object-safe.
+- **Internal Trait** (e.g. `KeyValueStoreObj`): Uses `BoxFuture` returns, making it object-safe for dynamic dispatch via `Box<dyn KeyValueStoreObj>`. It and its blanket bridge are **generated** by the `service_obj!` macro (`services/src/macros.rs`) from the public trait's signatures, so adding a service method is a single-site change. The one exception is `DbTransactionBackendObj`, whose `&mut self` / `self: Box<Self>` shape the macro does not cover.
+- **Wrapper** (e.g. `Kv`): Holds `Box<dyn KeyValueStoreObj>`, implements `Extractor`, and exposes high-level async convenience methods (`get_json`, `put_json`, etc.).
 
-### Key Abstractions
+*Rule:* Platform crates depend **only** on `skyzen-services` (the trait definitions), **never** on the root `skyzen` crate.
 
-1. **Extractor/Responder pattern** (`core/src/extract.rs`, `core/src/responder.rs`): Types that implement `Extractor` can be pulled from requests; types implementing `Responder` can write to responses. Tuples of extractors/responders compose automatically.
+### 2. Service Futures Are `Send` On Every Target
+Service wrappers travel in `http::Extensions`, which requires `Send + Sync` unconditionally — including on wasm32 — so there is no target where a `!Send` service future would help. Every service trait therefore writes a plain `Send` bound, with no alias and no `#[cfg]` split.
 
-2. **Handler system** (`src/handler.rs`): Async functions with extractors as arguments and responders as return types are automatically converted into endpoints.
+WebAssembly backends still work because portability is bought where the JS handles live, not in the trait: `skyzen-cloudflare` wraps each `JsValue` handle in a newtype carrying a contained `unsafe impl Send + Sync`, sound because a Workers isolate is single-threaded and never moves the handle across threads, and drives JS promises through `worker::send::IntoSendFuture`. A new wasm backend follows the same recipe.
 
-3. **Routing** (`src/routing/mod.rs`, `src/routing/router.rs`): Tree-based routing using `Route::new()` and the `CreateRouteNode` trait. Path literals gain builder methods (`.at()`, `.post()`, `.put()`, `.delete()`, `.ws()`, `.route()`).
+The old workspace-wide `MaybeSend` alias is **gone**. The name survives in exactly one place, `src/websocket/session.rs`, where `MaybeSend`/`MaybeSync` are `#[cfg]`-split markers bounding a *user's session closure and future* — not a service future. A WebSocket session on wasm is built from `Rc`s and JS handles that no `Send` future could hold across an `await`, and there is no second thread to send it to; the relaxation stops at the route builder, and what the router actually stores still satisfies `http_kit::Endpoint`'s unconditional `Send` by carrying the session in a cell whose `unsafe impl Send` rests on the same single-threaded argument. Do not reintroduce the pattern anywhere else.
 
-4. **Dual-target runtime** (`src/runtime/`): The `#[skyzen::main]` macro generates either a native `fn main()` (with Tokio/Hyper, logging, CLI overrides) or a wasm `fetch` export for WinterCG platforms.
+### 3. Middleware, Layers & Build-Time Wiring
 
-5. **OpenAPI integration** (`src/openapi/`): Handlers annotated with `#[skyzen::openapi]` contribute to auto-generated OpenAPI documentation. Uses `linkme` distributed slices for compile-time registration.
+- `skyzen_core::middleware::Middleware` takes **`&self`**. The router stores each middleware once
+  as `Arc<dyn MiddlewareObj>` and never clones it per request, so state kept in an atomic or a
+  channel persists. `Next::run(request)` continues the chain and hides the endpoint/middleware
+  error split behind `skyzen::Error`.
+- The trait lives in `skyzen-core`, not `skyzen`: `skyzen-services`' `service_extractor!` macro
+  implements it and only depends on core.
+- Three attachment scopes, narrowest first: `RouteNode::with` (one node), `Route::with` (subtree),
+  `Route::layer` / `Router::layer` (the whole router, **including the 404/405 paths** — this is what
+  makes CORS preflight answerable). Applying middleware pushes it to the front of the endpoint's
+  stack, so the last call is outermost.
+- `Route::build()` validates wiring: an endpoint whose extractors declare `Extractor::requirements()`
+  must have those `TypeId`s in the `provisions()` of middleware on its ancestor chain.
+  **Only declare a requirement when route middleware is the sole supply path** — `State<T>` and
+  `AuthUser<U>` qualify; the service wrappers do not, because `#[skyzen::main]` and
+  `skyzen_test::TestClient` also inject them out of band.
 
-### Feature Flags
+### 4. Handler, Extractor & Responder System
+- **Extractors** (`skyzen_core::Extractor`): Types that extract themselves from a `&mut Request`. Tuples of extractors implement `Extractor` automatically, up to arity 15.
+- **Responders** (`skyzen_core::Responder`): Types that mutate a `&mut Response`. Tuples of responders compose automatically.
+- **Handlers** (`skyzen::handler`): Any async function taking extractors as arguments and returning a responder is automatically converted into an `Endpoint`.
+- **The body is taken once.** `skyzen_core::body::take_body_bytes` enforces two invariants for every
+  buffering extractor: `RequestBodyLimit` (2 MiB unless a `BodyLimit` middleware says otherwise,
+  checked against `Content-Length` *and* mid-stream), and `BodyConsumed`, which poisons the body the
+  moment an extractor takes it — including a *failed* one — so a second body extractor in the same
+  signature is a loud `500` naming both rather than a silent empty body.
 
-Default features: `json`, `form`, `multipart`, `sse`, `rt`, `openapi`, `ws`
+### 5. One Binary, Four Deployments (`#[skyzen::main]`)
 
-- `rt` - Enables Tokio/Hyper runtime (native builds)
-- `openapi` - OpenAPI schema generation (debug builds only)
-- `ws` - Unified WebSocket support; pulls in the right backend per target (native via async-tungstenite, wasm via WebSocketPair)
+Nothing in an application is annotated for a platform. The `wasm32` build is the Worker; the native
+build **reads its environment before it binds anything** and hands over accordingly:
 
-#### WebSocket Platform Support
+| Target | Selected by | What runs |
+|---|---|---|
+| Native server | nothing else matched | Tokio + Hyper, a `tracing` subscriber, `--port`/`--host`/`--listen`, `Ctrl+C` shutdown |
+| AWS Lambda | `AWS_LAMBDA_RUNTIME_API` is set | `skyzen-lambda` (root crate's `lambda` feature). Without the feature the binary **refuses to start** and names it, rather than binding a port nothing in Lambda can reach |
+| Azure Functions | `FUNCTIONS_CUSTOMHANDLER_PORT` is set | `src/runtime/azure.rs` mounts the declared `[[azure.queue_triggers]]` in front of the router; HTTP triggers reach the router untouched |
+| Cloudflare Workers | `target_arch = "wasm32"` | the WinterCG `fetch` export, plus whatever the manifest implies |
 
-The WebSocket implementation provides a unified API across both native and WASM targets:
+Detection is in `src/runtime/mod.rs`; the adapters are `skyzen-lambda` and `src/runtime/azure.rs`.
 
-- **Native (tokio)**: Full WebSocket support via `async-tungstenite`, including custom ping/pong control
-- **WASM (WinterCG)**: WebSocket support via custom FFI bindings to the WebSocketPair API, compatible with Cloudflare Workers and other WinterCG-compliant runtimes
+**Events are dual-target too.** `#[skyzen::queue]` is one handler driven four ways: Skyzen's own
+polling loop (`src/runtime/consumer.rs`) when `[[native.queue_consumer]]` declares one, the
+platform's push on Workers and on Lambda, and the Functions host's `POST /{function}` on Azure. The
+polling loops deliberately do **not** run under either serverless host — the platform owns delivery
+there. `#[skyzen::scheduled]`, `#[skyzen::email]`, `#[skyzen::tail]` and `#[skyzen::durable_object]`
+remain Cloudflare-only, because nothing else has those events.
 
-**Platform differences:**
-- WASM has a 1 MiB message size limit (platform imposed)
-- WASM does not support custom ping/pong frame control
-- Both platforms share the same convenience methods: `send()` for JSON, `send_text()` for text, `send_binary()` for binary, and `recv_json()` for JSON deserialization
+### 5a. Portable SQL and Migrations
+- `Db` is one API over sqlx (Postgres/MySQL/SQLite), Cloudflare D1 and the Aurora Data API. `begin`
+  is a real transaction on sqlx and the Data API; D1 has none, so `execute_batch` is its atomic unit
+  and `begin` returns `DbError::TransactionsUnsupported` there rather than pretending.
+- Migrations are `<version>_<name>.sql` files read by **one** reader, `skyzen-manifest`'s
+  `migrations` module, so `embed_migrations!` (compile time) and `skyzen migrate` (deploy time)
+  cannot disagree about which files count or how a checksum is computed. `Db::migrate` applies each
+  file and its bookkeeping row in one `execute_batch`, and refuses to run when an applied file's
+  checksum no longer matches.
 
-### Workspace Lints
+### 6. Error Handling & Log Security
+- `#[skyzen::error]` generates `Display`, `Error`, and `HttpError` implementations with status code attributes.
+- **4xx errors** return formatted JSON messages to clients.
+- **5xx errors** return generic `"Internal server error"` to prevent leaking internal database/system information to clients while preserving detailed logs on the server.
 
-The workspace enforces strict Clippy lints including `pedantic` and `nursery` groups. All crates require `missing_docs` and `missing_debug_implementations` warnings.
+### 7. WebSockets
+- Native backend uses `async-tungstenite`.
+- WASM backend uses `WebSocketPair` FFI bindings.
+- Both share a unified interface: `socket.next()`, `socket.send_text()`, `socket.send_binary()`, `socket.recv_json::<T>()`, `socket.send(&json)`.
 
-### External Dependency
+---
 
-The framework depends on `http-kit` (git dependency from zen-rs/http-kit) which provides core HTTP types (`Request`, `Response`, `Body`, `Endpoint`, `Middleware`).
+## Coding Conventions & Workspace Lints
+
+- **Strict Clippy Lints**: The workspace enforces `pedantic` and `nursery` lint groups. All crates warn on `missing_docs` and `missing_debug_implementations`.
+- **Dependencies**: Core HTTP primitives (`Request`, `Response`, `Body`, `Endpoint`) come from `http-kit`. The `Middleware` trait is Skyzen's own, in `skyzen-core`.
+- **Formatting**: Run `cargo fmt` before finishing changes.
+

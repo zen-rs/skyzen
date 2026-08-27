@@ -15,8 +15,11 @@ proc-macro = true
 [dependencies]
 proc-macro2 = "1"
 quote = "1"
+# The manifest schema is shared with the CLI so a `Skyzen.toml` section can never be understood
+# one way at compile time and another at deploy time. A proc-macro crate may depend on a plain
+# library crate; only the reverse is restricted.
+skyzen-manifest.workspace = true
 syn = { version = "2", features = ["full"] }
-toml = "1.0"
 
 [dev-dependencies]
 

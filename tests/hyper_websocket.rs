@@ -256,6 +256,62 @@ async fn websocket_uses_custom_max_message_size() {
 }
 
 #[tokio::test]
+async fn websocket_rejects_messages_exceeding_max_message_size() {
+    use skyzen::websocket::WebSocketError;
+
+    let (error_tx, error_rx) = tokio::sync::oneshot::channel::<WebSocketError>();
+    let error_tx = Arc::new(std::sync::Mutex::new(Some(error_tx)));
+
+    let (mut client, _, handle) = spawn_router(
+        Route::new(("/limited".at(move |upgrade: WebSocketUpgrade| {
+            let error_tx = Arc::clone(&error_tx);
+            async move {
+                upgrade
+                    .max_message_size(Some(8))
+                    .on_upgrade(move |mut socket| async move {
+                        while let Some(result) = socket.next().await {
+                            match result {
+                                Ok(_) => {}
+                                Err(error) => {
+                                    let sender = error_tx.lock().unwrap().take();
+                                    if let Some(tx) = sender {
+                                        let _ = tx.send(error);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    })
+            }
+        }),)),
+        "ws://localhost/limited",
+    )
+    .await;
+
+    // Well within the limit: no error is produced.
+    client
+        .send(Message::text("ok"))
+        .await
+        .expect("send small message");
+
+    // Exceeds the configured 8-byte cap: the server-side receive loop must surface an error.
+    client
+        .send(Message::text("x".repeat(64)))
+        .await
+        .expect("send oversized message");
+
+    let error = error_rx.await.expect("server never observed an error");
+    assert!(
+        matches!(error, WebSocketError::Protocol(_)),
+        "expected protocol error for oversized message, got: {error}"
+    );
+
+    let _ = client.close(None).await;
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn websocket_json_convenience_methods() {
     use serde::{Deserialize, Serialize};
 
@@ -345,6 +401,76 @@ async fn websocket_binary_convenience_methods() {
     assert_eq!(&received[1..], &test_data[..]);
 
     let _ = client.close(None).await;
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn websocket_session_failure_closes_with_internal_error() {
+    let (mut client, _, handle) = spawn_router(
+        Route::new(("/boom".ws(|mut socket| async move {
+            // Take one message so the client is certainly connected, then fail the session the way
+            // a handler would when a downstream call it depends on gives up.
+            let _ = socket.next().await;
+            Err::<(), _>(skyzen::Error::msg("the session gave up"))
+        }),)),
+        "ws://localhost/boom",
+    )
+    .await;
+
+    client
+        .send(Message::text("hello"))
+        .await
+        .expect("send message");
+
+    let frame = client
+        .next()
+        .await
+        .expect("the server closed without a frame")
+        .expect("websocket frame");
+
+    match frame {
+        Message::Close(Some(frame)) => assert_eq!(
+            u16::from(frame.code),
+            skyzen::websocket::INTERNAL_ERROR,
+            "a failed session must close with 1011, not {frame:?}"
+        ),
+        other => panic!("expected a close frame after a failed session, got {other:?}"),
+    }
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn websocket_session_success_leaves_the_connection_alone() {
+    let (mut client, _, handle) = spawn_router(
+        Route::new(("/done".ws(|mut socket| async move {
+            socket.send_text("bye").await?;
+            Ok::<_, skyzen::Error>(())
+        }),)),
+        "ws://localhost/done",
+    )
+    .await;
+
+    let first = client
+        .next()
+        .await
+        .expect("missing first frame")
+        .expect("websocket frame");
+    assert_eq!(first.into_text().unwrap(), "bye");
+
+    // A session that ended cleanly gets no close frame from the framework: the socket is dropped
+    // and the connection ends, exactly as it did before sessions could report failure. What
+    // matters here is the negative — the client must never see the `1011` the failure path sends.
+    if let Some(Ok(Message::Close(Some(frame)))) = client.next().await {
+        assert_ne!(
+            u16::from(frame.code),
+            skyzen::websocket::INTERNAL_ERROR,
+            "a successful session must not be closed as an internal error"
+        );
+    }
+
     handle.abort();
     let _ = handle.await;
 }

@@ -1,3 +1,4 @@
+use core::future::{ready, Future};
 use std::convert::Infallible;
 use std::fmt;
 
@@ -15,6 +16,7 @@ pub struct MissingParam {
 }
 
 impl MissingParam {
+    /// Create an error naming the parameter that was missing.
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
@@ -39,6 +41,15 @@ impl Params {
         Self(vec)
     }
 
+    /// The captured parameters, in the order the route pattern declares them.
+    ///
+    /// [`Path<T>`](crate::extract::Path) deserializes from exactly this list; reach for it here
+    /// only when the parameter names are not known until runtime.
+    #[must_use]
+    pub fn pairs(&self) -> &[(String, String)] {
+        &self.0
+    }
+
     pub(crate) const fn empty() -> Self {
         Self(Vec::new())
     }
@@ -58,11 +69,15 @@ impl Params {
 
 impl Extractor for Params {
     type Error = Infallible;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(request
-            .extensions_mut()
-            .remove::<Self>()
-            .unwrap_or(Self::empty()))
+    // Reading the params back out of the extensions is a synchronous clone, so the future is ready
+    // on creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        // Clone rather than remove so the params survive repeated extraction.
+        ready(Ok(request
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .unwrap_or(Self::empty())))
     }
 
     // Individual path parameters are derived from the route's `{name}` segments when the OpenAPI

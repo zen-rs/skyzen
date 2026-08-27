@@ -1,0 +1,35 @@
+import init, * as wasmExports from "./{{ bindings_name }}";
+import wasmUrl from "./{{ wasm_name }}";
+{%- for export in durable_exports %}
+export { {{ export.bindings_export_name }} as {{ export.public_name }} } from "./{{ bindings_name }}";
+{%- endfor %}
+
+let initPromise;
+
+function ensureInitialized() {
+  if (!initPromise) {
+    initPromise = init({ module_or_path: wasmUrl });
+  }
+  return initPromise;
+}
+
+// Durable Object classes are constructed by the runtime before any handler
+// runs, so the wasm module must be ready at module load. Workers ESM supports
+// top-level await; the awaits inside each handler are a safety net.
+await ensureInitialized();
+
+export default {
+  async fetch(request, env, ctx) {
+    await ensureInitialized();
+    return wasmExports.fetch(request, env, ctx);
+  },
+{%- for member in event_members %}
+  async {{ member.name }}({{ member.args }}) {
+    await ensureInitialized();
+    if (typeof wasmExports.{{ member.name }} !== "function") {
+      throw new Error("Skyzen.toml declares a {{ member.name }} handler but the wasm module does not export one; annotate a Rust handler with {{ member.macro_hint }}");
+    }
+    return wasmExports.{{ member.name }}({{ member.args }});
+  },
+{%- endfor %}
+};

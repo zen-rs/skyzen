@@ -1,24 +1,106 @@
-use core::mem;
+use core::any::{type_name, TypeId};
 use core::{convert::Infallible, future::Future};
 
+use crate::body::{take_body_bytes, take_body_stream, BodyAlreadyConsumed, BodyReadError};
 #[cfg(feature = "openapi")]
 use crate::openapi::{ExtractorSchema, ParameterLocation, SchemaRef};
 use alloc::boxed::Box;
 #[cfg(feature = "openapi")]
 use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 use http_kit::error::BoxHttpError;
+use http_kit::header::HeaderMap;
 use http_kit::{
-    http_error,
     utils::{ByteStr, Bytes},
-    Body, HttpError, Method, Request, StatusCode, Uri,
+    Body, HttpError, Method, Request, Uri,
 };
 
-/// Extract a object from request,always is the header,body value,etc.
+/// A value an extractor needs some middleware to have put into the request.
+///
+/// Extractors that read a value back out of the request extensions declare it here so the route
+/// tree can be checked at build time instead of failing with a 500 on the first request that
+/// reaches the endpoint. Report a requirement only when route-attached middleware is the *only*
+/// way the value can arrive; a value that a runtime, a test harness or a generated entrypoint may
+/// also inject cannot be validated this way and must not be declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Requirement {
+    type_id: TypeId,
+    description: &'static str,
+    hint: &'static str,
+}
+
+impl Requirement {
+    /// Declare that `T` must be present in the request extensions, suggesting `hint` as the fix.
+    #[must_use]
+    pub fn of<T: 'static>(hint: &'static str) -> Self {
+        Self {
+            type_id: TypeId::of::<T>(),
+            description: type_name::<T>(),
+            hint,
+        }
+    }
+
+    /// The type that must be present.
+    #[must_use]
+    pub const fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+
+    /// A human-readable name for the missing type.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        self.description
+    }
+
+    /// The call that would satisfy this requirement, quoted for an error message.
+    #[must_use]
+    pub const fn hint(&self) -> &'static str {
+        self.hint
+    }
+}
+
+/// Extracts a typed value from an HTTP request, such as a header, the body, or
+/// other request metadata.
+///
+/// # Reading the body
+///
+/// An extractor that reads the request body *takes* it, and records that it did so, so a second
+/// body-consuming extractor in the same handler signature is rejected with `500` naming both
+/// rather than silently observing an empty body. Buffering extractors also honour the
+/// [`RequestBodyLimit`](crate::RequestBodyLimit) in force and reject an oversized payload with
+/// `413`. Implement a body-reading extractor with [`take_body_bytes`](crate::take_body_bytes) or
+/// [`take_body_stream`](crate::take_body_stream) so it participates in both rules.
+// Verified rendering wherever an `Extractor` bound is unsatisfied:
+//   error[E0277]: `NotAnExtractor` is not an extractor, so it cannot be a handler argument
+//      = note: every handler argument must implement `skyzen::Extractor`: `Json<T>`, `Form<T>`,
+//              `Query<T>`, `Path<T>`, `Params`, `HeaderMap`, `String`, `Bytes`, `State<T>` are
+//              built in
+//      = note: wrap an argument in `Option<T>` or `Result<T, BoxHttpError>` to inspect its
+//              rejection yourself
+//      = note: extractors are owned values: `&str` and other borrows cannot be extracted
+// In a handler position the `Handler` bound fails first and shadows this, which is why that
+// trait's message names both halves.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an extractor, so it cannot be a handler argument",
+    label = "not an `Extractor`",
+    note = "every handler argument must implement `skyzen::Extractor`: `Json<T>`, `Form<T>`, `Query<T>`, `Path<T>`, `Params`, `HeaderMap`, `String`, `Bytes`, `State<T>` are built in",
+    note = "wrap an argument in `Option<T>` or `Result<T, BoxHttpError>` to inspect its rejection yourself",
+    note = "extractors are owned values: `&str` and other borrows cannot be extracted"
+)]
 pub trait Extractor: Sized + Send + Sync + 'static {
     /// Error type returned when extraction fails.
     type Error: HttpError;
     /// Read the request and parse a value.
     fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send;
+
+    /// Values this extractor needs route middleware to provide.
+    ///
+    /// Defaults to nothing. See [`Requirement`] for when declaring one is sound.
+    #[must_use]
+    fn requirements() -> Vec<Requirement> {
+        Vec::new()
+    }
 
     /// Describe the extractor's `OpenAPI` schema, if available.
     #[cfg(feature = "openapi")]
@@ -33,58 +115,69 @@ pub trait Extractor: Sized + Send + Sync + 'static {
 }
 
 macro_rules! impl_tuple_extractor {
-    ($($ty:ident),*) => {
+    // The unit tuple extracts nothing, so its body has nothing to await and no variant to carry an
+    // error. It is written out separately rather than folded into the variadic arm below, which
+    // would generate an `async fn` with no `.await` and an uninhabited error enum with no variants.
+    () => {
+        /// A handler taking no arguments still names an extractor: the empty tuple, which reads
+        /// nothing from the request and cannot fail.
+        impl Extractor for () {
+            type Error = Infallible;
+            fn extract(
+                _request: &mut Request,
+            ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+                core::future::ready(Ok(()))
+            }
+        }
+    };
+    ($($ty:ident),+) => {
         const _:() = {
             // To prevent these macro-generated errors from overwhelming users.
             #[doc(hidden)]
-            pub enum TupleExtractorError<$($ty:Extractor),*> {
-                $($ty(<$ty as Extractor>::Error),)*
+            pub enum TupleExtractorError<$($ty:Extractor),+> {
+                $($ty(<$ty as Extractor>::Error),)+
             }
 
-            impl <$($ty: Extractor),*>core::fmt::Display for TupleExtractorError<$($ty),*> {
-                #[allow(unused_variables)]
+            impl <$($ty: Extractor),+>core::fmt::Display for TupleExtractorError<$($ty),+> {
                 fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                     match self {
-                        $(TupleExtractorError::$ty(e) => write!(f,"{}",e),)*
-                        #[allow(unreachable_patterns)]
-                        _ => unreachable!(),
+                        $(TupleExtractorError::$ty(e) => write!(f,"{}",e),)+
                     }
                 }
             }
 
-            impl <$($ty: Extractor),*>core::fmt::Debug for TupleExtractorError<$($ty),*> {
-                #[allow(unused_variables)]
+            impl <$($ty: Extractor),+>core::fmt::Debug for TupleExtractorError<$($ty),+> {
                 fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                     match self {
-                        $(TupleExtractorError::$ty(e) => write!(f,"{:?}",e),)*
-                        #[allow(unreachable_patterns)]
-                        _ => unreachable!(),
+                        $(TupleExtractorError::$ty(e) => write!(f,"{:?}",e),)+
                     }
                 }
             }
 
-            impl <$($ty: Extractor),*>core::error::Error for TupleExtractorError<$($ty),*> {}
+            impl <$($ty: Extractor),+>core::error::Error for TupleExtractorError<$($ty),+> {}
 
-            impl <$($ty: Extractor),*>http_kit::HttpError for TupleExtractorError<$($ty),*> {
+            impl <$($ty: Extractor),+>http_kit::HttpError for TupleExtractorError<$($ty),+> {
                 fn status(&self) -> http_kit::StatusCode {
                     match self {
-                        $(TupleExtractorError::$ty(e) => e.status(),)*
-                        #[allow(unreachable_patterns)]
-                        _ => unreachable!(),
+                        $(TupleExtractorError::$ty(e) => e.status(),)+
                     }
                 }
             }
 
 
             #[allow(non_snake_case)]
-            #[allow(unused_variables)]
-            #[allow(clippy::unused_unit)]
-            impl<$($ty:Extractor,)*> Extractor for ($($ty,)*) {
-                type Error = TupleExtractorError<$($ty),*>;
+            impl<$($ty:Extractor,)+> Extractor for ($($ty,)+) {
+                type Error = TupleExtractorError<$($ty),+>;
                 async fn extract(request:&mut Request) -> Result<Self,Self::Error>{
                     Ok(($($ty::extract(request).await.map_err(|error|{
                         TupleExtractorError::$ty(error)
-                    })?,)*))
+                    })?,)+))
+                }
+
+                fn requirements() -> alloc::vec::Vec<crate::extract::Requirement> {
+                    let mut requirements = alloc::vec::Vec::new();
+                    $(requirements.extend(<$ty as Extractor>::requirements());)+
+                    requirements
                 }
 
                 // A tuple combines several extractors, but `openapi()` can only describe one, so it
@@ -99,7 +192,7 @@ macro_rules! impl_tuple_extractor {
                 fn register_openapi_schemas(
                     defs: &mut alloc::collections::BTreeMap<String, crate::openapi::SchemaRef>,
                 ) {
-                    $(<$ty as Extractor>::register_openapi_schemas(defs);)*
+                    $(<$ty as Extractor>::register_openapi_schemas(defs);)+
                 }
             }
         };
@@ -108,13 +201,11 @@ macro_rules! impl_tuple_extractor {
 
 tuples!(impl_tuple_extractor);
 
-http_error!(pub InvalidBody, StatusCode::BAD_REQUEST, "Failed to read request body");
-
+/// Buffers the whole request body, up to the [`RequestBodyLimit`](crate::RequestBodyLimit).
 impl Extractor for Bytes {
-    type Error = InvalidBody;
+    type Error = BodyReadError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let body = mem::replace(request.body_mut(), Body::empty());
-        body.into_bytes().await.map_err(|_| InvalidBody::new())
+        take_body_bytes::<Self>(request).await
     }
 
     #[cfg(feature = "openapi")]
@@ -127,11 +218,13 @@ impl Extractor for Bytes {
     }
 }
 
+/// Buffers the whole request body as UTF-8, up to the
+/// [`RequestBodyLimit`](crate::RequestBodyLimit).
 impl Extractor for ByteStr {
-    type Error = InvalidBody;
+    type Error = BodyReadError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let body = mem::replace(request.body_mut(), Body::empty());
-        body.into_string().await.map_err(|_| InvalidBody::new())
+        let bytes = take_body_bytes::<Self>(request).await?;
+        Self::from_utf8(bytes).map_err(|_| crate::body::InvalidBody::new().into())
     }
 
     #[cfg(feature = "openapi")]
@@ -144,10 +237,36 @@ impl Extractor for ByteStr {
     }
 }
 
-impl Extractor for Body {
-    type Error = Infallible;
+/// Buffers the whole request body as UTF-8 through the same path as [`ByteStr`], up to the
+/// [`RequestBodyLimit`](crate::RequestBodyLimit).
+impl Extractor for String {
+    type Error = BodyReadError;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(mem::replace(request.body_mut(), Self::empty()))
+        let bytes = take_body_bytes::<Self>(request).await?;
+        let text = ByteStr::from_utf8(bytes).map_err(|_| crate::body::InvalidBody::new())?;
+        Ok(text.as_str().into())
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<ExtractorSchema> {
+        Some(ExtractorSchema {
+            location: ParameterLocation::Body,
+            content_type: Some("text/plain; charset=utf-8"),
+            schema: None,
+        })
+    }
+}
+
+/// Hands the request body's stream to the handler.
+///
+/// This is the one body extractor that does **not** apply the
+/// [`RequestBodyLimit`](crate::RequestBodyLimit): it buffers nothing, so there is nothing to cap —
+/// whatever the handler reads from the stream is the handler's own budget to enforce. It still
+/// takes the body, so a later body-consuming extractor in the same signature is rejected.
+impl Extractor for Body {
+    type Error = BodyAlreadyConsumed;
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(take_body_stream::<Self>(request))
     }
 
     #[cfg(feature = "openapi")]
@@ -160,20 +279,45 @@ impl Extractor for Body {
     }
 }
 
+/// Clones the request headers, symmetric with the [`Responder`](crate::Responder) impl that
+/// merges a `HeaderMap` into the response.
+impl Extractor for HeaderMap {
+    type Error = Infallible;
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(Ok(request.headers().clone()))
+    }
+}
+
 impl Extractor for Uri {
     type Error = Infallible;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(request.uri().clone())
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(Ok(request.uri().clone()))
     }
 }
 
 impl Extractor for Method {
     type Error = Infallible;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        Ok(request.method().clone())
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        core::future::ready(Ok(request.method().clone()))
     }
 }
 
+/// Turns a failed extraction into `None`.
+///
+/// `Option<T>` erases *why* `T` was unavailable: `Option<Json<Payload>>` is `None` alike for "no
+/// body was sent", "the content type was wrong" and "the body was `{not json`". A handler that
+/// reads `None` as "the client omitted this" therefore accepts malformed input as absence, and the
+/// caller gets a `200` with no hint that their request was wrong. Prefer
+/// [`Result<T, BoxHttpError>`](Extractor#impl-Extractor-for-Result<T,+Box<dyn+HttpError>>), which
+/// keeps the rejection — including its status — and lets the handler decide.
+///
+/// For a body-consuming `T` the body is taken (and so poisoned for any later body extractor) even
+/// when the extraction fails, because the marker is recorded at the moment the body is taken
+/// rather than when parsing succeeds. `Option<Form<T>>` returning `None` has still consumed the
+/// body.
+// `requirements()` is deliberately *not* forwarded here or on `Result<T, BoxHttpError>`: both
+// wrappers exist so the handler can cope with `T` being unavailable, so a missing provision is a
+// case the handler asked to see rather than a wiring mistake to reject at build time.
 impl<T: Extractor> Extractor for Option<T> {
     type Error = Infallible;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
