@@ -2331,7 +2331,8 @@ fn generate_native_service_init(
     let (env_key, build) = match (service.service_type, wiring.backend) {
         (ServiceType::Kv, NativeServiceBackend::Redis) => {
             let key = env_key("url_env", wiring.url_env.as_ref())?;
-            let failure = connect_failure_lit(&service.name, &format!("connect to Redis using `{key}`"));
+            let failure =
+                connect_failure_lit(&service.name, &format!("connect to Redis using `{key}`"));
             (
                 key,
                 quote! {
@@ -2350,8 +2351,10 @@ fn generate_native_service_init(
             // `SqsQueue::from_env` builds a *standard* queue and refuses a `.fifo` URL, which
             // needs a message group id on every send. A FIFO queue is wired in code with
             // `SqsQueue::fifo`, so the manifest path reports the mismatch rather than hiding it.
-            let failure =
-                connect_failure_lit(&service.name, &format!("use the SQS queue named by `{key}`"));
+            let failure = connect_failure_lit(
+                &service.name,
+                &format!("use the SQS queue named by `{key}`"),
+            );
             (
                 key,
                 quote! {

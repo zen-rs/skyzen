@@ -1,5 +1,5 @@
 [package]
-name = "{{PACKAGE_NAME}}"
+name = "{{ ctx.package_name }}"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,8 +7,11 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-skyzen = "0.1"
-skyzen-cloudflare = "0.1"
-skyzen-services = "0.1"
-tracing = "0.1"
+
+# `wasm-bindgen` must be exactly the version the `skyzen` CLI embeds its bindings generator from.
+# The two share a schema version and wasm-bindgen refuses to pair a module with a generator that
+# does not match, so leaving this floating makes the first Cloudflare build fail with an opaque
+# error. `skyzen doctor` re-checks it, and `cargo update -p wasm-bindgen --precise <version>`
+# restores agreement after upgrading the CLI.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "={{ ctx.wasm_bindgen_version }}"

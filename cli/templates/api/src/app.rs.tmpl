@@ -1,18 +1,43 @@
-use skyzen::routing::{CreateRouteNode, Route, Router};
+use crate::Cache;
+use serde::Serialize;
+use skyzen::{
+    routing::{CreateRouteNode, Params, Route, Router},
+    utils::Json,
+    Result,
+};
+
+#[derive(Serialize)]
+struct Greeting {
+    name: String,
+    seen_before: bool,
+}
 
 async fn root() -> &'static str {
-    "Hello from {{PACKAGE_NAME}}!"
+    "Hello from {{ ctx.package_name }}!"
 }
 
 async fn health() -> &'static str {
     "OK"
 }
 
+/// Skyzen.toml declares `[[service]] name = "cache"`, so `#[skyzen::main]` generates a `Cache`
+/// extractor around the portable `Kv` and injects it into every request.
+///
+/// This handler is the whole point of the framework: it runs unchanged against the in-process
+/// mock during `skyzen dev` and against a Cloudflare KV namespace after `skyzen deploy`. Changing
+/// backends is a Skyzen.toml edit, never a code edit.
+async fn greet(cache: Cache, params: Params) -> Result<Json<Greeting>> {
+    let name = params.get("name")?.to_owned();
+    // `Cache` derefs to `Kv`, so every `Kv` method is reachable through it.
+    let seen_before = !cache.put_if_absent(&format!("greeted:{name}"), b"1").await?;
+    Ok(Json(Greeting { name, seen_before }))
+}
+
 pub fn router() -> Router {
     Route::new((
         "/".at(root),
         "/health".at(health),
+        "/greet".route(("/{name}".at(greet),)),
     ))
     .build()
 }
-
