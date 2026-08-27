@@ -113,6 +113,39 @@ db.db()
     .unwrap();
 ```
 
+### Testing Against the Real Schema
+
+`with_schema` is for tests that want a table and nothing more. When the schema is owned by
+migrations, apply the real set instead — it runs through the production runner, so a migration that
+would fail on deploy fails in the test suite rather than in production:
+
+```rust
+use skyzen::embed_migrations;
+use skyzen_services::Migrations;
+use skyzen_test::mock::InMemoryDb;
+
+static MIGRATIONS: Migrations = embed_migrations!("migrations");
+
+let db = InMemoryDb::with_migrations(&MIGRATIONS).await.unwrap();
+```
+
+`#[skyzen::test]` does the same for the database it injects, so the body starts against a migrated
+schema:
+
+```rust
+#[skyzen::test(migrations = MIGRATIONS)]
+async fn a_user_can_be_inserted(db: Db) {
+    db.query("INSERT INTO users (email) VALUES (?)")
+        .bind("ada@example.invalid")
+        .execute()
+        .await
+        .unwrap();
+}
+```
+
+Each test gets its own database, so no migrated state is shared between them. See the
+[Migrations Guide](migrations.md).
+
 ## TestClient
 
 `TestClient` sends HTTP requests directly to an endpoint without network I/O. Create it via `TestContext`:

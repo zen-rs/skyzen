@@ -8,7 +8,7 @@ use skyzen_manifest::{
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use syn::{
     Attribute, Data, DeriveInput, Error, Expr, ExprLit, Fields, FnArg, Item, ItemEnum, ItemFn,
@@ -134,22 +134,67 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Attribute macro that runs an async test with Skyzen's native test runtime and injected mocks.
+///
+/// # Arguments
+///
+/// - `migrations = <path>` — a `skyzen_services::Migrations` value (a `static`
+///   produced by [`embed_migrations!`]) to apply to the test's database before the body runs. The
+///   test must take a database parameter for there to be anything to migrate.
+///
+/// ```ignore
+/// static MIGRATIONS: Migrations = skyzen::embed_migrations!("migrations");
+///
+/// #[skyzen::test(migrations = MIGRATIONS)]
+/// async fn a_user_can_be_inserted(db: Db) {
+///     db.query("INSERT INTO users (email) VALUES (?)")
+///         .bind("a@b.c")
+///         .execute()
+///         .await
+///         .unwrap();
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args =
         parse_macro_input!(attr with Punctuated::<MetaNameValue, Token![,]>::parse_terminated);
-    if !args.is_empty() {
-        return Error::new_spanned(
-            quote! { #args },
-            "#[skyzen::test] does not take arguments; remove them",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let options = match TestOptions::from_args(&args) {
+        Ok(options) => options,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     let function = parse_macro_input!(item as ItemFn);
-    match expand_test(function) {
+    match expand_test(function, &options) {
         Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+/// Read a directory of `<version>_<name>.sql` files and embed them as a
+/// `skyzen_services::Migrations` set.
+///
+/// The path is relative to the crate's `CARGO_MANIFEST_DIR`, so it names the same directory
+/// wherever in the crate the macro is written:
+///
+/// ```ignore
+/// use skyzen_services::Migrations;
+///
+/// static MIGRATIONS: Migrations = skyzen::embed_migrations!("migrations");
+/// ```
+///
+/// The files are read, ordered and checksummed at compile time by the same code `skyzen migrate`
+/// uses at deploy time, so the CLI can never apply a different set from the one the binary
+/// carries. A file whose name is not `<version>_<name>.sql`, or a version claimed twice, is a
+/// compile error pointing at the path literal. The contents reach the binary through
+/// `include_str!`, so editing a migration rebuilds the crate — a `fs::read` inside the macro would
+/// be invisible to cargo, and the stale binary would keep claiming the old checksum.
+///
+/// The expansion is usable anywhere a value is: a `static` item (the usual place, so
+/// `#[skyzen::test(migrations = ...)]` can name it), a `const`, or an expression.
+#[proc_macro]
+pub fn embed_migrations(input: TokenStream) -> TokenStream {
+    let directory = parse_macro_input!(input as LitStr);
+    match expand_embed_migrations(&directory) {
+        Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
 }
@@ -724,6 +769,121 @@ impl TestService {
     }
 }
 
+/// The arguments `#[skyzen::test]` accepts.
+#[derive(Default)]
+struct TestOptions {
+    /// The path named by `migrations = <path>`, applied to the test's default database.
+    migrations: Option<syn::Path>,
+}
+
+/// Written by hand rather than derived: `syn::Path` only implements `Debug` under syn's
+/// `extra-traits` feature, which would be a real compile-time cost across every crate in the build
+/// in exchange for one line of test output.
+impl core::fmt::Debug for TestOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let migrations = self
+            .migrations
+            .as_ref()
+            .map(|path| quote! { #path }.to_string());
+        f.debug_struct("TestOptions")
+            .field("migrations", &migrations)
+            .finish()
+    }
+}
+
+impl TestOptions {
+    fn from_args(args: &Punctuated<MetaNameValue, Token![,]>) -> syn::Result<Self> {
+        let mut options = Self::default();
+
+        for meta in args {
+            if meta.path.is_ident("migrations") {
+                let Expr::Path(path) = &meta.value else {
+                    return Err(Error::new_spanned(
+                        &meta.value,
+                        "expected the path of a `Migrations` value, such as \
+                         `migrations = MIGRATIONS`",
+                    ));
+                };
+                if options.migrations.replace(path.path.clone()).is_some() {
+                    return Err(Error::new_spanned(
+                        &meta.path,
+                        "duplicate `migrations` argument",
+                    ));
+                }
+            } else {
+                return Err(Error::new_spanned(
+                    &meta.path,
+                    "unsupported option, expected `migrations = <path to a Migrations value>`",
+                ));
+            }
+        }
+
+        Ok(options)
+    }
+}
+
+/// Expand `embed_migrations!("dir")` into a `Migrations` built from that directory.
+fn expand_embed_migrations(directory: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
+    let resolved = resolve_migrations_directory(directory)?;
+    embed_migrations_tokens(&resolved, directory.span())
+}
+
+/// Turn the macro's argument into an absolute directory under the calling crate's root.
+fn resolve_migrations_directory(directory: &LitStr) -> syn::Result<PathBuf> {
+    let span = directory.span();
+    let relative = directory.value();
+    if relative.trim().is_empty() {
+        return Err(Error::new(
+            span,
+            "embed_migrations!() needs a directory, such as `embed_migrations!(\"migrations\")`",
+        ));
+    }
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .map_err(|error| Error::new(span, format!("failed to read CARGO_MANIFEST_DIR: {error}")))?;
+    Ok(PathBuf::from(manifest_dir).join(&relative))
+}
+
+/// Read `directory` and render the `Migrations` expression, reporting every failure at `span`.
+fn embed_migrations_tokens(
+    directory: &Path,
+    span: proc_macro2::Span,
+) -> syn::Result<proc_macro2::TokenStream> {
+    // The same reader `skyzen migrate` runs, so a directory the CLI would reject cannot compile
+    // and a directory that compiles is one the CLI will read identically.
+    let files = skyzen_manifest::migrations::load(directory)
+        .map_err(|error| Error::new(span, error.to_string()))?;
+
+    let entries = files.iter().map(|file| {
+        let version = file.version;
+        let name = LitStr::new(&file.name, span);
+        // Absolute, because `include_str!` resolves relative to the *source file* that expands the
+        // macro — a relative path would break the moment the macro is used from a nested module.
+        let path = LitStr::new(&file.path.display().to_string(), span);
+        let checksum = file.checksum;
+        quote! {
+            ::skyzen_services::migrate::Migration::embedded(
+                #version,
+                #name,
+                ::core::include_str!(#path),
+                [#(#checksum),*],
+            )
+        }
+    });
+    let count = files.len();
+
+    // The array is bound to a `static` rather than passed as a literal: `Migration` holds a `Cow`,
+    // so it has drop glue, and a temporary with drop glue cannot be promoted to `'static` inside a
+    // `static` or `const` initializer. Taking a reference to a named `static` always can.
+    Ok(quote! {
+        {
+            static __SKYZEN_EMBEDDED_MIGRATIONS:
+                [::skyzen_services::migrate::Migration; #count] = [#(#entries),*];
+            ::skyzen_services::migrate::Migrations::from_static(&__SKYZEN_EMBEDDED_MIGRATIONS)
+        }
+    })
+}
+
 #[derive(Default)]
 struct TestRequirements {
     test_context: bool,
@@ -742,7 +902,7 @@ struct TestParamBindings {
     statements: Vec<proc_macro2::TokenStream>,
 }
 
-fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
+fn expand_test(mut function: ItemFn, options: &TestOptions) -> syn::Result<TokenStream> {
     if function.sig.asyncness.is_none() {
         return Err(Error::new_spanned(
             function.sig.fn_token,
@@ -773,7 +933,7 @@ fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
         .unwrap_or_default();
     let database_types = test_database_types(&databases)?;
     let bindings = collect_test_param_bindings(inputs, &database_types)?;
-    let setup_statements = test_setup_statements(&bindings.requirements, &databases)?;
+    let setup_statements = test_setup_statements(&bindings.requirements, &databases, options)?;
 
     let mut inner_statements = setup_statements;
     inner_statements.extend(bindings.statements);
@@ -901,12 +1061,48 @@ fn push_test_param_binding(
 fn test_setup_statements(
     requirements: &TestRequirements,
     databases: &[DatabaseEntry],
+    options: &TestOptions,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let mut statements = Vec::new();
     push_test_service_setup(requirements, &mut statements);
     push_test_database_setup(requirements, databases, &mut statements)?;
+    push_test_migrations(requirements, options, &mut statements)?;
     push_test_context_setup(requirements, &mut statements);
     Ok(statements)
+}
+
+/// Apply `migrations = <path>` to the database the test asked for.
+///
+/// Only the default database: a test naming several databases has no one answer to "which one do
+/// these migrations describe", and guessing would silently migrate the wrong one. Naming a set
+/// with no database to apply it to is a mistake rather than a no-op, so it is refused at the
+/// argument.
+fn push_test_migrations(
+    requirements: &TestRequirements,
+    options: &TestOptions,
+    statements: &mut Vec<proc_macro2::TokenStream>,
+) -> syn::Result<()> {
+    let Some(migrations) = &options.migrations else {
+        return Ok(());
+    };
+
+    if !requirements.databases.default_db {
+        return Err(Error::new_spanned(
+            migrations,
+            "`migrations` needs a database to apply to; add a `Db` parameter to the test",
+        ));
+    }
+
+    // The production runner, against the in-memory database — so a migration that would fail on a
+    // real deploy fails here too, rather than being waved through by a test-only shortcut.
+    statements.push(quote! {
+        ::skyzen_services::Db::migrate(&__skyzen_test_default_db, &#migrations)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("failed to apply migrations to the in-memory test database: {error}")
+            });
+    });
+    Ok(())
 }
 
 fn push_test_service_setup(
@@ -3651,6 +3847,7 @@ binding = "DB"
             name: "main".to_owned(),
             database_type: DatabaseType::Sql,
             default: false,
+            migrations_dir: None,
         }];
         assert_eq!(default_database_index(&single).unwrap(), Some(0));
 
@@ -3659,11 +3856,13 @@ binding = "DB"
                 name: "main".to_owned(),
                 database_type: DatabaseType::Sql,
                 default: false,
+                migrations_dir: None,
             },
             DatabaseEntry {
                 name: "analytics".to_owned(),
                 database_type: DatabaseType::Sql,
                 default: false,
+                migrations_dir: None,
             },
         ];
         assert!(
@@ -3678,11 +3877,13 @@ binding = "DB"
                 name: "main".to_owned(),
                 database_type: DatabaseType::Sql,
                 default: true,
+                migrations_dir: None,
             },
             DatabaseEntry {
                 name: "analytics".to_owned(),
                 database_type: DatabaseType::Sql,
                 default: true,
+                migrations_dir: None,
             },
         ];
         assert!(
@@ -4047,5 +4248,187 @@ concurrency = 2
             database_ident_from_name("main-db").unwrap().to_string(),
             "MainDbDb"
         );
+    }
+}
+
+/// `embed_migrations!` and `#[skyzen::test(migrations = ...)]`, exercised without a compiler.
+///
+/// The expansion itself is checked end-to-end by the `skyzen` crate's `tests/migrations.rs`, which
+/// actually invokes the macro. What is worth testing here is the half a successful compile can
+/// never show: the *rejections*. There is no `trybuild` in this workspace, so rather than assert on
+/// compiler output, the rejecting paths are plain functions returning `syn::Result` and are called
+/// directly.
+#[cfg(test)]
+mod embed_migrations_tests {
+    use super::{TestOptions, embed_migrations_tokens};
+    use quote::quote;
+    use std::path::{Path, PathBuf};
+    use syn::{MetaNameValue, Token, parse_quote, punctuated::Punctuated};
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    fn expand(name: &str) -> syn::Result<String> {
+        embed_migrations_tokens(&fixture(name), proc_macro2::Span::call_site())
+            .map(|tokens| tokens.to_string())
+    }
+
+    fn rejection(name: &str) -> String {
+        expand(name).expect_err(name).to_string()
+    }
+
+    fn options(args: proc_macro2::TokenStream) -> syn::Result<TestOptions> {
+        let parsed: Punctuated<MetaNameValue, Token![,]> =
+            syn::parse::Parser::parse2(Punctuated::parse_terminated, args)?;
+        TestOptions::from_args(&parsed)
+    }
+
+    #[test]
+    fn a_valid_directory_embeds_every_file_in_version_order() {
+        let expanded = expand("good").expect("the fixture is valid");
+
+        // Both files, with their parsed versions and names.
+        assert!(expanded.contains("1u64"), "{expanded}");
+        assert!(expanded.contains("\"create_users\""), "{expanded}");
+        assert!(expanded.contains("2u64"), "{expanded}");
+        assert!(expanded.contains("\"seed_and_index\""), "{expanded}");
+
+        // `create_users` must come first: the array order is the run order.
+        let first = expanded.find("create_users").expect("first migration");
+        let second = expanded.find("seed_and_index").expect("second migration");
+        assert!(first < second, "{expanded}");
+    }
+
+    #[test]
+    fn the_contents_reach_the_binary_through_include_str_with_an_absolute_path() {
+        // A `fs::read` inside the macro is invisible to cargo, so an edited migration would not
+        // rebuild the crate and the binary would keep claiming the old checksum. And the path must
+        // be absolute, because `include_str!` resolves relative to the *source file* that expands
+        // the macro — a relative path breaks as soon as the macro is called from a nested module.
+        let expanded = expand("good").expect("the fixture is valid");
+        assert!(expanded.contains("include_str !"), "{expanded}");
+        let absolute = fixture("good").join("0001_create_users.sql");
+        assert!(
+            expanded.contains(&absolute.display().to_string()),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn the_expansion_binds_a_static_array_rather_than_a_temporary() {
+        // `Migration` holds a `Cow`, so it has drop glue and cannot be promoted to `'static` as a
+        // temporary inside a `static`/`const` initializer. Passing a reference to a named `static`
+        // is what makes `static MIGRATIONS: Migrations = embed_migrations!("…");` compile at all.
+        let expanded = expand("good").expect("the fixture is valid");
+        assert!(
+            expanded.contains("static __SKYZEN_EMBEDDED_MIGRATIONS"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("from_static (& __SKYZEN_EMBEDDED_MIGRATIONS)"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn the_embedded_checksum_is_the_sha256_of_the_file() {
+        // Pinned rather than recomputed: this is the value a deployed `_skyzen_migrations` row
+        // holds, so the macro and `skyzen migrate` agreeing is the whole point.
+        let expanded = expand("good").expect("the fixture is valid");
+        let sql = std::fs::read_to_string(fixture("good").join("0001_create_users.sql"))
+            .expect("fixture readable");
+        let checksum = skyzen_manifest::migrations::checksum(&sql);
+        let rendered = checksum
+            .iter()
+            .map(|byte| format!("{byte}u8"))
+            .collect::<Vec<_>>()
+            .join(" , ");
+        assert!(expanded.contains(&rendered), "{expanded}");
+    }
+
+    #[test]
+    fn an_empty_directory_embeds_an_empty_set() {
+        let expanded = expand("empty").expect("an empty directory is not an error");
+        assert!(expanded.contains("Migration ; 0usize] = []"), "{expanded}");
+    }
+
+    #[test]
+    fn a_misnamed_file_is_rejected_with_the_shape_it_should_have_had() {
+        let rendered = rejection("bad_name");
+        assert!(rendered.contains("0001-create-a.sql"), "{rendered}");
+        assert!(rendered.contains("0001_create_users.sql"), "{rendered}");
+    }
+
+    #[test]
+    fn two_files_claiming_one_version_are_rejected_naming_both() {
+        let rendered = rejection("duplicate_version");
+        assert!(
+            rendered.contains("0001_a.sql") && rendered.contains("1_b.sql"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_missing_directory_is_rejected_naming_it() {
+        let rendered = rejection("not_a_directory_at_all");
+        assert!(rendered.contains("not_a_directory_at_all"), "{rendered}");
+        assert!(rendered.contains("does not exist"), "{rendered}");
+    }
+
+    #[test]
+    fn a_rejection_becomes_a_real_compile_error() {
+        // Every failure is built with `Error::new(<the path literal's span>, ...)`, so the
+        // compiler underlines the argument rather than the whole invocation. Comparing spans
+        // directly needs proc-macro2's `span-locations`, which is not worth turning on for the
+        // whole build; what is checkable here is that the failure renders as a `compile_error!`
+        // rather than being swallowed into an empty expansion.
+        let literal: syn::LitStr = parse_quote!("tests/fixtures/bad_name");
+        let error =
+            embed_migrations_tokens(&fixture("bad_name"), literal.span()).expect_err("misnamed");
+        assert!(
+            error
+                .to_compile_error()
+                .to_string()
+                .contains("compile_error"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_test_attribute_takes_a_migrations_path() {
+        let parsed = options(quote! { migrations = crate::MIGRATIONS }).expect("valid argument");
+        let path = parsed.migrations.expect("a path was given");
+        assert_eq!(quote! { #path }.to_string(), "crate :: MIGRATIONS");
+    }
+
+    #[test]
+    fn the_test_attribute_still_takes_no_arguments_at_all() {
+        assert!(
+            options(quote! {})
+                .expect("no arguments")
+                .migrations
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_migrations_value_that_is_not_a_path_is_rejected() {
+        let error = options(quote! { migrations = "migrations" }).expect_err("string literal");
+        assert!(error.to_string().contains("path"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_argument_is_rejected_listing_the_one_that_exists() {
+        let error = options(quote! { schema = MIGRATIONS }).expect_err("unknown option");
+        assert!(error.to_string().contains("migrations"), "{error}");
+    }
+
+    #[test]
+    fn a_repeated_migrations_argument_is_rejected() {
+        let error = options(quote! { migrations = A, migrations = B }).expect_err("duplicate");
+        assert!(error.to_string().contains("duplicate"), "{error}");
     }
 }

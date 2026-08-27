@@ -86,7 +86,15 @@ pub enum Command {
     Provision,
 
     /// Apply pending SQL migrations to every declared database.
+    ///
+    /// With no subcommand, pending migrations are applied. `--provider cloudflare` (the default)
+    /// hands the work to `wrangler d1 migrations apply`; `--provider native` connects through the
+    /// `[native.database.<name>].url_env` connection string and applies them itself.
     Migrate {
+        /// What to do. Applying pending migrations is the default.
+        #[command(subcommand)]
+        command: Option<MigrateCommand>,
+
         /// Apply to the local emulator's database rather than the deployed one.
         #[arg(long)]
         local: bool,
@@ -114,6 +122,18 @@ pub enum Command {
         /// The shell to generate completions for.
         shell: clap_complete::Shell,
     },
+}
+
+/// The `skyzen migrate` operations beyond applying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum MigrateCommand {
+    /// List which migrations have been applied and which are still pending.
+    ///
+    /// This reads the database through the native connection string, so it needs a
+    /// `[native.database.<name>]` wiring. It creates the `_skyzen_migrations` bookkeeping table if
+    /// the database has never been migrated — otherwise there would be nothing to report on — but
+    /// applies nothing.
+    Status,
 }
 
 /// The `skyzen secret` operations.
@@ -309,6 +329,53 @@ mod tests {
             panic!("expected `logs`");
         };
         assert_eq!(wrangler_args, vec!["--format", "json"]);
+    }
+
+    #[test]
+    fn migrate_applies_by_default_and_takes_a_status_subcommand() {
+        let apply = parse(&["skyzen", "migrate"]);
+        let Command::Migrate { command, local } = apply.command else {
+            panic!("expected `migrate`");
+        };
+        assert_eq!(command, None, "no subcommand means apply");
+        assert!(!local);
+
+        let local_apply = parse(&["skyzen", "migrate", "--local"]);
+        let Command::Migrate { command, local } = local_apply.command else {
+            panic!("expected `migrate`");
+        };
+        assert_eq!(command, None);
+        assert!(local);
+
+        let status = parse(&["skyzen", "migrate", "status"]);
+        let Command::Migrate { command, .. } = status.command else {
+            panic!("expected `migrate`");
+        };
+        assert_eq!(command, Some(super::MigrateCommand::Status));
+    }
+
+    #[test]
+    fn migrate_still_sees_the_global_provider_flag() {
+        // `--provider native` is what selects the in-process runner over `wrangler d1 migrations
+        // apply`, so an optional subcommand that swallowed the flag would silently run the wrong
+        // path.
+        for args in [
+            vec!["skyzen", "migrate", "--provider", "native"],
+            vec!["skyzen", "migrate", "status", "--provider", "native"],
+        ] {
+            let parsed = parse(&args);
+            assert_eq!(parsed.provider, Some(Provider::Native), "{args:?}");
+            assert!(
+                matches!(parsed.command, Command::Migrate { .. }),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_migrate_subcommand_is_rejected() {
+        Cli::try_parse_from(["skyzen", "migrate", "rollback"])
+            .expect_err("there is no rollback; migrations are forward-only");
     }
 
     #[test]

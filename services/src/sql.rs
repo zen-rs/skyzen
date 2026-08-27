@@ -128,6 +128,36 @@ pub enum DbError {
         /// How long the backend asked the caller to wait, when it says.
         retry_after: Option<core::time::Duration>,
     },
+
+    /// An already-applied migration's file no longer hashes to what the database recorded.
+    ///
+    /// Editing a migration that has shipped is the one mistake that hides itself: production keeps
+    /// the schema the old file produced while the source says something else, and every later
+    /// migration is written against a schema that only exists on a fresh database. Applying
+    /// anything on top of that is refused.
+    #[error(
+        "migration `{name}` (version {version}) has changed since it was applied: the database \
+         recorded checksum {recorded} but the embedded file hashes to {embedded}. Applied \
+         migrations are immutable — add a new migration instead of editing this one."
+    )]
+    MigrationChanged {
+        /// The version whose file no longer matches.
+        version: u64,
+        /// The migration's name, so the message points at a file.
+        name: String,
+        /// The checksum recorded when the migration was applied.
+        recorded: String,
+        /// The checksum of the file as it is now.
+        embedded: String,
+    },
+
+    /// The backend refused the caller's credentials, or the caller lacks the privilege.
+    ///
+    /// This is a *deployment* fault, not a request fault — the connection string, the database
+    /// role or the IAM policy is wrong — so it renders as a 500 like the other backend failures
+    /// rather than telling the HTTP caller they are unauthenticated.
+    #[error("database request was not authorized")]
+    Unauthorized,
 }
 
 backend_error!(DbError);
@@ -142,6 +172,8 @@ service_http_error!(DbError {
     Self::BatchesUnsupported => NOT_IMPLEMENTED,
     Self::Conflict => CONFLICT,
     Self::Throttled { .. } => TOO_MANY_REQUESTS,
+    Self::MigrationChanged { .. } => INTERNAL_SERVER_ERROR,
+    Self::Unauthorized => INTERNAL_SERVER_ERROR,
 });
 
 #[cfg(all(
@@ -153,8 +185,44 @@ impl From<sqlx::Error> for DbError {
         if matches!(error, sqlx::Error::RowNotFound) {
             return Self::RowNotFound;
         }
+        if is_authorization_failure(&error) {
+            return Self::Unauthorized;
+        }
         Self::backend_with(error.to_string(), error)
     }
+}
+
+/// Whether a driver error means "the caller may not do this" rather than "the statement is wrong".
+///
+/// The distinction is worth drawing because the two have completely different fixes: an
+/// authorization failure is a connection string, a database role or an IAM policy, and burying it
+/// in a generic backend error sends the reader hunting through SQL instead.
+///
+/// Only `SQLSTATE`s are consulted, and only the unambiguous ones:
+///
+/// - **class `28`** (`invalid_authorization_specification`) is `PostgreSQL`'s `28000`/`28P01` and
+///   `MySQL`'s `28000` — every one of them means the credentials were rejected;
+/// - **`42501`** is `PostgreSQL`'s `insufficient_privilege`.
+///
+/// `MySQL` reports privilege failures as `42000`, which it *also* uses for ordinary syntax errors,
+/// so that code is deliberately left alone: calling a typo an authorization failure would send a
+/// reader looking at `GRANT`s. The `SQLite` driver reports a numeric extended result code rather
+/// than a `SQLSTATE`, and the five-character length check is what keeps it out of here.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "postgres", feature = "mysql", feature = "sqlite")
+))]
+fn is_authorization_failure(error: &sqlx::Error) -> bool {
+    let Some(code) = error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+    else {
+        return false;
+    };
+    if code.len() != 5 {
+        return false;
+    }
+    code.starts_with("28") || code == "42501"
 }
 
 /// A SQL parameter value.
@@ -532,6 +600,16 @@ impl Db {
     #[must_use]
     pub const fn query<'a>(&'a self, sql: &'a str) -> DbQuery<'a> {
         SqlQuery::new(self, Cow::Borrowed(sql))
+    }
+
+    /// Which SQL dialect this database expects.
+    ///
+    /// Portable code never needs this — `?` placeholders work everywhere — but a caller writing
+    /// one statement per dialect (the migration runner does, for the one expression that renders
+    /// a timestamp as text) has to be able to ask.
+    #[must_use]
+    pub fn dialect(&self) -> DbDialect {
+        self.0.dialect()
     }
 
     /// Begin a database transaction.
@@ -988,7 +1066,17 @@ fn tokenize_sql(query: &str, dialect: DbDialect) -> Result<Vec<TokenWithSpan>, D
     }
 }
 
-fn tokenize_with_dialect(
+/// Tokenize `query` with `dialect`, turning a tokenizer failure into a [`DbError::SqlParse`].
+///
+/// Exported as plumbing for the platform backends that have to rewrite SQL a second time — the
+/// RDS Data API turns Skyzen's already-rewritten placeholders into its own named form — so the
+/// error mapping lives in one place rather than being re-derived per backend. Like
+/// [`QuerySource`], it is not an extension point.
+///
+/// # Errors
+///
+/// Returns [`DbError::SqlParse`] when `query` does not tokenize.
+pub fn tokenize_with_dialect(
     query: &str,
     dialect: &dyn Dialect,
 ) -> Result<Vec<TokenWithSpan>, DbError> {
@@ -996,6 +1084,51 @@ fn tokenize_with_dialect(
     tokenizer
         .tokenize_with_location()
         .map_err(|error| DbError::SqlParse(error.to_string()))
+}
+
+/// Split `sql` into its individual statements, at the semicolons that actually separate them.
+///
+/// Splitting on the byte `;` is wrong the moment a migration contains
+/// `INSERT INTO t VALUES ('a;b')` or a `-- comment; with a semicolon`, and both are ordinary in
+/// hand-written SQL. Tokenizing first makes those a single `Token` each, so only a
+/// [`Token::SemiColon`] the tokenizer produced at statement level is treated as a separator.
+///
+/// Segments carrying nothing but whitespace and comments are dropped — a trailing `;` or a final
+/// `-- done` line would otherwise be handed to the backend as an empty statement. The returned
+/// slices borrow the original text rather than being re-rendered from tokens, so formatting,
+/// comments and multi-byte content survive exactly as written.
+pub(crate) fn split_statements(sql: &str, dialect: DbDialect) -> Result<Vec<&str>, DbError> {
+    let tokens = tokenize_sql(sql, dialect)?;
+    let mut mapper = LocationMapper::new(sql);
+    let mut statements = Vec::new();
+    let mut start = 0usize;
+    let mut meaningful = false;
+
+    for token in &tokens {
+        match &token.token {
+            Token::SemiColon => {
+                // A semicolon is always one byte, so the token's start is all that is needed; its
+                // reported end cannot be trusted, for the same lookahead reason the placeholder
+                // rewriter documents.
+                let at = mapper.byte_index(token.span.start);
+                if meaningful {
+                    statements.push(sql[start..at].trim());
+                }
+                start = at + 1;
+                meaningful = false;
+            }
+            // Comments arrive as `Whitespace` variants, which is what makes a comment-only
+            // segment indistinguishable from an empty one here — exactly as it should be.
+            Token::Whitespace(_) | Token::EOF => {}
+            _ => meaningful = true,
+        }
+    }
+
+    if meaningful {
+        statements.push(sql[start..].trim());
+    }
+
+    Ok(statements)
 }
 
 fn is_bind_placeholder(token: &TokenWithSpan, dialect: DbDialect) -> bool {
@@ -1008,13 +1141,34 @@ fn is_bind_placeholder(token: &TokenWithSpan, dialect: DbDialect) -> bool {
     }
 }
 
-/// Maps 1-based line/column [`Location`]s to byte indices in a single forward
-/// pass over the query.
+/// Maps the 1-based line/column [`Location`]s sqlparser reports to byte indices in a single
+/// forward pass over the query.
 ///
 /// Token spans arrive in source order, so the mapper only ever advances; the
 /// total cost of mapping every token location is `O(n)` in the query length
 /// (a per-token rescan from the start would be `O(n²)`).
-struct LocationMapper<'a> {
+///
+/// This is exported as documented plumbing, like [`QuerySource`]: every backend that rewrites or
+/// splices SQL needs the same mapping, because sqlparser hands back line/column pairs while
+/// slicing a `&str` needs byte offsets. It is not an extension point — the type has no
+/// configuration and one method.
+///
+/// ```
+/// # use skyzen_services::sql::{tokenize_with_dialect, LocationMapper};
+/// # use sqlparser::dialect::PostgreSqlDialect;
+/// let sql = "SELECT 1;\nSELECT 2";
+/// let tokens = tokenize_with_dialect(sql, &PostgreSqlDialect {})?;
+/// let mut mapper = LocationMapper::new(sql);
+/// // The second statement's `SELECT` starts on line 2, which is byte 10.
+/// let second_select = tokens
+///     .iter()
+///     .find(|token| token.span.start.line == 2)
+///     .expect("the second line has tokens");
+/// assert_eq!(mapper.byte_index(second_select.span.start), 10);
+/// # Ok::<(), skyzen_services::DbError>(())
+/// ```
+#[derive(Debug)]
+pub struct LocationMapper<'a> {
     chars: core::iter::Peekable<core::str::CharIndices<'a>>,
     len: usize,
     line: u64,
@@ -1022,7 +1176,9 @@ struct LocationMapper<'a> {
 }
 
 impl<'a> LocationMapper<'a> {
-    fn new(query: &'a str) -> Self {
+    /// Start mapping locations reported for `query`.
+    #[must_use]
+    pub fn new(query: &'a str) -> Self {
         Self {
             chars: query.char_indices().peekable(),
             len: query.len(),
@@ -1033,8 +1189,9 @@ impl<'a> LocationMapper<'a> {
 
     /// Byte index of `target`, saturating to the end of the query.
     ///
-    /// Targets must be requested in non-decreasing source order.
-    fn byte_index(&mut self, target: Location) -> usize {
+    /// Targets must be requested in non-decreasing source order: the mapper never rewinds, so a
+    /// location behind one already asked for maps to wherever the scan currently stands.
+    pub fn byte_index(&mut self, target: Location) -> usize {
         if target.line == 0 && target.column == 0 {
             return 0;
         }
@@ -1750,6 +1907,93 @@ mod single_row_tests {
                 .expect("statement should tokenize");
             assert_eq!(rendered, "SELECT * FROM t\nLIMIT 1");
         }
+    }
+}
+
+/// Statement splitting shares the rewriter's literal-awareness: both rely on the tokenizer to
+/// decide what is content and what is syntax, so both are tested against the same hostile SQL.
+#[cfg(test)]
+mod split_tests {
+    use super::{split_statements, DbDialect};
+
+    fn split(sql: &str) -> Vec<&str> {
+        split_statements(sql, DbDialect::Sqlite).expect("statement should tokenize")
+    }
+
+    #[test]
+    fn splits_on_the_semicolons_between_statements() {
+        assert_eq!(
+            split("CREATE TABLE a (id INTEGER);\nCREATE TABLE b (id INTEGER);\n"),
+            vec!["CREATE TABLE a (id INTEGER)", "CREATE TABLE b (id INTEGER)"]
+        );
+    }
+
+    #[test]
+    fn a_single_statement_needs_no_terminator() {
+        assert_eq!(split("SELECT 1"), vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_string_literal_is_content() {
+        // The reason this is tokenized rather than split on the byte: `split(';')` would cut this
+        // statement in half and hand the backend two syntax errors.
+        assert_eq!(
+            split("INSERT INTO t (v) VALUES ('a;b');"),
+            vec!["INSERT INTO t (v) VALUES ('a;b')"]
+        );
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_comment_is_content() {
+        assert_eq!(
+            split("SELECT 1; -- and then; something\nSELECT 2;"),
+            vec!["SELECT 1", "-- and then; something\nSELECT 2"]
+        );
+        assert_eq!(split("SELECT 1 /* a ; b */;"), vec!["SELECT 1 /* a ; b */"]);
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_quoted_identifier_is_content() {
+        assert_eq!(
+            split(r#"SELECT "odd;name" FROM t;"#),
+            vec![r#"SELECT "odd;name" FROM t"#]
+        );
+    }
+
+    #[test]
+    fn segments_holding_only_whitespace_or_comments_are_dropped() {
+        // A trailing terminator, a blank line and a closing comment are all things a hand-written
+        // migration ends with, and none of them is a statement the backend can run.
+        assert_eq!(split("SELECT 1;\n\n-- done\n"), vec!["SELECT 1"]);
+        assert_eq!(split(";;\n"), Vec::<&str>::new());
+        assert_eq!(split("   \n-- nothing here\n"), Vec::<&str>::new());
+        assert_eq!(split(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn multibyte_content_keeps_its_boundaries() {
+        // Locations arrive as line/column, so a naive column-as-byte-offset split would slice
+        // through these characters.
+        assert_eq!(
+            split("INSERT INTO t (v) VALUES ('héllo; wörld');\nSELECT '→';"),
+            vec!["INSERT INTO t (v) VALUES ('héllo; wörld')", "SELECT '→'"]
+        );
+    }
+
+    #[test]
+    fn every_dialect_splits_the_same_ordinary_migration() {
+        let sql = "CREATE TABLE t (id INTEGER);\nINSERT INTO t (id) VALUES (1);";
+        for dialect in [DbDialect::Postgres, DbDialect::MySql, DbDialect::Sqlite] {
+            let statements = split_statements(sql, dialect).expect("tokenizes");
+            assert_eq!(statements.len(), 2, "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn unbalanced_quoting_is_a_parse_error_not_a_silent_split() {
+        let error = split_statements("SELECT 'unterminated", DbDialect::Sqlite)
+            .expect_err("the tokenizer rejects this");
+        assert!(matches!(error, super::DbError::SqlParse(_)), "{error:?}");
     }
 }
 

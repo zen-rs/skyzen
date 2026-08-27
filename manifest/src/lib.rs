@@ -39,9 +39,11 @@
 //! ```
 
 mod merge;
+pub mod migrations;
 mod schema;
 
 pub use merge::deep_merge;
+pub use migrations::{MigrationFile, MigrationsError, DEFAULT_MIGRATIONS_DIR};
 pub use schema::{
     AwsSection, AzureHttpMode, AzureQueueTrigger, AzureSection, CfAssets, CfAssetsNotFoundHandling,
     CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableObjects, CfDurableRenamedClass,

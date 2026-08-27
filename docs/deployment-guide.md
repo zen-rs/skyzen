@@ -234,16 +234,28 @@ new_sqlite_classes = ["AppState"]
 
 Bump the migration `tag` (`v2`, `v3`, ...) whenever class definitions change.
 
-### D1 Migrations
+### SQL Migrations
 
-SQL migrations live in `migrations/` (wrangler's `migrations_dir` default; override it through
-`[cloudflare.raw]`). Apply them to every declared `[[cloudflare.d1_databases]]`:
+SQL migrations live in `migrations/` — wrangler's `migrations_dir` default, and Skyzen's
+`[[database]].migrations_dir` default, so both paths read the same files. Apply them to every
+declared `[[cloudflare.d1_databases]]`:
 
 ```sh
 skyzen migrate --local     # the emulator's database, for `skyzen dev`
 skyzen migrate             # the deployed database
 skyzen migrate --env staging
 ```
+
+The same files apply to a native database without wrangler:
+
+```sh
+skyzen migrate --provider native   # through [native.database.<name>].url_env
+skyzen migrate status              # what is applied, what is pending
+```
+
+The full rules — file naming, per-backend atomicity, the checksum policy that refuses an edited
+migration, and how an application embeds the same set with `skyzen::embed_migrations!` — are in the
+[Migrations Guide](migrations.md).
 
 ## AWS Lambda
 

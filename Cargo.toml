@@ -111,8 +111,14 @@ tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "
 executor-core = { version = "0.7.1", features = ["tokio"] }
 femme = "2.2.1"
 skyzen-hyper.workspace = true
+# `tests/migrations.rs` asserts that what `embed_migrations!` baked in is byte-for-byte what the
+# shared reader produces, which means naming that reader directly.
+skyzen-manifest.workspace = true
 skyzen-services.workspace = true
-skyzen-test.workspace = true
+# `InMemoryDb` — and therefore every `#[skyzen::test]` that takes a `Db` — needs a sqlx driver and
+# a sqlx runtime, which `skyzen-test` leaves to the consumer to choose. Picking one here is what
+# lets `cargo test -p skyzen` run the migration tests without a feature flag on the command line.
+skyzen-test = { workspace = true, features = ["runtime-tokio-rustls"] }
 tempfile = "3.25"
 futures-lite = "2.6"
 serial_test = "3.2"

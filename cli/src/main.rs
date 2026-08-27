@@ -4,6 +4,7 @@ mod capabilities;
 mod cli;
 mod dev;
 mod environment;
+mod migrate;
 mod output;
 mod project;
 mod providers;
@@ -63,18 +64,31 @@ fn run() -> Result<()> {
             providers::provision(&cli.manifest, cli.provider, cli.env.as_deref(), cli.dry_run)
         }
         Command::Doctor => providers::doctor(&cli.manifest, cli.provider, cli.env.as_deref()),
-        command => {
-            let action = action_for(command);
-            let plan = providers::prepare(
-                &action,
-                &cli.manifest,
-                cli.provider,
-                cli.env.as_deref(),
-                cli.dry_run,
-            )?;
-            execute(&plan, cli.dry_run)
+        // `migrate` is the one action with two genuinely different implementations rather than two
+        // renderings of one plan: the Cloudflare path shells out to wrangler and is planned like
+        // everything else, while the native path opens a connection and applies the files itself.
+        // `migrate::dispatch` picks between them, and refuses the combinations that would answer a
+        // different question than the one typed.
+        Command::Migrate { command, local } => {
+            match migrate::dispatch(cli.provider, command.is_some(), *local)? {
+                migrate::Dispatch::Native => migrate::run(&cli.manifest, *command, cli.dry_run),
+                migrate::Dispatch::Provider => run_plan(&cli, &Action::Migrate { local: *local }),
+            }
         }
+        command => run_plan(&cli, &action_for(command)),
     }
+}
+
+/// Build the provider's plan for `action` and execute it.
+fn run_plan(cli: &Cli, action: &Action) -> Result<()> {
+    let plan = providers::prepare(
+        action,
+        &cli.manifest,
+        cli.provider,
+        cli.env.as_deref(),
+        cli.dry_run,
+    )?;
+    execute(&plan, cli.dry_run)
 }
 
 /// The directory `cargo add` should run in.
@@ -102,11 +116,13 @@ fn action_for(command: &Command) -> Action {
             wrangler_args: wrangler_args.clone(),
         },
         Command::Secret { command } => Action::Secret(command.clone()),
-        Command::Migrate { local } => Action::Migrate { local: *local },
+        // `Migrate` belongs here too: `run` picks between the native runner and the provider plan
+        // itself, and builds the `Action` on the branch that needs one.
         Command::New { .. }
         | Command::Add { .. }
         | Command::Provision
         | Command::Doctor
+        | Command::Migrate { .. }
         | Command::Completions { .. } => {
             unreachable!("handled before dispatch")
         }

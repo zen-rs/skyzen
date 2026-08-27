@@ -18,6 +18,11 @@ thiserror = "2"
 futures-core = "0.3"
 bytes = "1"
 sqlparser = "0.58"
+tracing.workspace = true
+# Migration checksums are recorded in the database as hex. Hashing happens at build time (in
+# `skyzen-manifest`, where the files are read); this crate only ever renders and compares, so it
+# needs the encoder and not the hash.
+hex = "0.4"
 # The parameter types `DbValue` carries. These are named directly rather than through
 # `sqlx::types` because `DbValue` must exist on wasm32, where sqlx is not compiled at all; the
 # versions are the ones sqlx 0.8 re-exports, so cargo unifies them into one crate and a bound
