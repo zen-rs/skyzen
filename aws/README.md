@@ -30,6 +30,19 @@ AWS platform implementations for the [Skyzen](https://github.com/zen-rs/skyzen) 
   - FIFO queues via `SqsQueue::fifo`, which sends a `MessageGroupId` with every message; a `.fifo`
     URL without a group id (or a standard URL with one) is refused at construction.
 - **`S3Storage`**: Amazon S3 implementation of `ObjectStorage` (re-exported from `skyzen-s3`).
+- **`RdsDataDb`**: A `DbBackend` implementation running SQL on Aurora through the RDS Data API — an
+  HTTP endpoint, so it needs no connection and no pool, which is what makes it usable from a Lambda
+  or any runtime that cannot hold a socket open.
+  - Aurora PostgreSQL and Aurora MySQL, chosen with `RdsEngine`, which decides the SQL dialect.
+  - `?` placeholders are rewritten to the Data API's named parameters with `sqlparser`'s tokenizer,
+    so a `?` inside a string literal or a comment is never mistaken for a bind.
+  - Rich parameters (`Timestamp`, `Uuid`, `Decimal`, `Json`) bind through the service's type hints
+    instead of being stringified by the caller.
+  - **Real interactive transactions** — `BeginTransaction` / `CommitTransaction` /
+    `RollbackTransaction` — which no other serverless backend in Skyzen offers, plus
+    `execute_batch` as one all-or-nothing transaction.
+  - See the module documentation for the service's limits (a 1 MiB response cap, a 45-second
+    statement timeout, writer instances only) and for how its rows differ from the sqlx backends'.
 
 ## Installation
 
@@ -47,6 +60,7 @@ skyzen-aws = "0.1"
 - `dynamodb`: Enables DynamoDB support (default)
 - `sqs`: Enables SQS support (default)
 - `s3`: Enables S3 support (default)
+- `rds-data`: Enables Aurora RDS Data API support (default)
 
 ## Configuration
 
@@ -122,6 +136,48 @@ async fn main() {
         // Only needed when the queue does not have ContentBasedDeduplication enabled.
         .with_deduplication(SqsDeduplication::ContentHash)
         .unwrap();
+}
+```
+
+### Aurora SQL through the RDS Data API
+
+`RdsDataDb::from_env` reads `RDS_RESOURCE_ARN`, `RDS_SECRET_ARN`, `RDS_DATABASE` and `RDS_ENGINE`
+(`aurora-postgresql` or `aurora-mysql`), and refuses to start on an engine name it does not know:
+
+```rust
+use serde::Deserialize;
+use skyzen_aws::RdsDataDb;
+use skyzen_services::Db;
+
+#[derive(Deserialize)]
+struct User {
+    id: i64,
+    email: String,
+}
+
+#[tokio::main]
+async fn main() {
+    let db = Db::new(RdsDataDb::from_env().await.unwrap());
+
+    // `?` on every dialect: Skyzen rewrites it for the engine, and this backend rewrites it again
+    // into the Data API's named parameters.
+    let user: User = db
+        .query("SELECT id, email FROM users WHERE id = ?")
+        .bind(7_i64)
+        .fetch_one()
+        .await
+        .unwrap();
+
+    // A real transaction, not a batch pretending to be one.
+    let mut transaction = db.begin().await.unwrap();
+    transaction
+        .query("UPDATE accounts SET balance = balance - ? WHERE id = ?")
+        .bind(100_i64)
+        .bind(user.id)
+        .execute()
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
 }
 ```
 

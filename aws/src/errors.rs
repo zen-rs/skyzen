@@ -54,29 +54,52 @@ pub fn categorize<E: ProvideErrorMetadata>(error: &E) -> AwsErrorCategory {
     }
 }
 
+/// An error carrying nothing but a service error code, which is all classification reads.
+///
+/// Lives here rather than inside the test module so every service's error-mapping tests classify
+/// the same stand-in instead of each rebuilding one. It implements [`std::error::Error`] because
+/// the per-service mappers take the SDK error by value and keep it as a source.
+#[cfg(test)]
+#[derive(Debug)]
+pub struct Coded(aws_smithy_types::error::metadata::ErrorMetadata);
+
+#[cfg(test)]
+impl Coded {
+    /// An error reporting `code` as its service error code.
+    pub fn new(code: &str) -> Self {
+        Self(
+            aws_smithy_types::error::metadata::ErrorMetadata::builder()
+                .code(code)
+                .build(),
+        )
+    }
+
+    /// An error reporting no service error code at all, as a connection failure does.
+    pub fn without_code() -> Self {
+        Self(aws_smithy_types::error::metadata::ErrorMetadata::builder().build())
+    }
+}
+
+#[cfg(test)]
+impl core::fmt::Display for Coded {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{}", self.0.code().unwrap_or("service error"))
+    }
+}
+
+#[cfg(test)]
+impl std::error::Error for Coded {}
+
+#[cfg(test)]
+impl ProvideErrorMetadata for Coded {
+    fn meta(&self) -> &aws_smithy_types::error::metadata::ErrorMetadata {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{categorize, AwsErrorCategory, THROTTLING_CODES, UNAUTHORIZED_CODES};
-    use aws_smithy_types::error::metadata::{ErrorMetadata, ProvideErrorMetadata};
-
-    /// An error carrying nothing but a service error code, which is all `categorize` reads.
-    struct Coded(ErrorMetadata);
-
-    impl Coded {
-        fn new(code: &str) -> Self {
-            Self(ErrorMetadata::builder().code(code).build())
-        }
-
-        fn without_code() -> Self {
-            Self(ErrorMetadata::builder().build())
-        }
-    }
-
-    impl ProvideErrorMetadata for Coded {
-        fn meta(&self) -> &ErrorMetadata {
-            &self.0
-        }
-    }
+    use super::{categorize, AwsErrorCategory, Coded, THROTTLING_CODES, UNAUTHORIZED_CODES};
 
     #[test]
     fn throttling_codes_are_retryable() {
