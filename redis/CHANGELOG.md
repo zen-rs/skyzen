@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/zen-rs/skyzen/compare/skyzen-redis-v0.1.0...skyzen-redis-v0.2.0) - 2026-08-27
+
+### Added
+
+- *(redis)* implement the atomic KV primitives and a from_env constructor
+- *(services)* [**breaking**] give Kv the atomic primitives and paginate its listing
+- *(services)* [**breaking**] give service errors an HttpError bridge and a source chain
+
+### Fixed
+
+- *(ci)* repair lint, feature-matrix and workerd jobs
+- *(redis)* make runtime features exclusive, escape scan globs, add TTL
+
+### Other
+
+- make every documented claim match the shipped code
+
 ## [0.1.0](https://github.com/zen-rs/skyzen/releases/tag/skyzen-redis-v0.1.0) - 2026-07-10
 
 ### Other
