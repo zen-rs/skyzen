@@ -164,6 +164,9 @@ impl AzureBlobConfig {
             },
             AzureBlobAuth::SasToken(token) => Credential::SasToken {
                 token: token.clone(),
+                // The token's own `se=` parameter governs expiry; the signer needs no
+                // refresh deadline for a caller-supplied static token.
+                expires_at: None,
             },
         }
     }

@@ -1,7 +1,9 @@
 //! Runtime utilities used by `#[skyzen::main]`.
 
 /// Cloudflare's `request.cf` edge metadata. `wasm32`-only — see [`CfProperties`].
-#[cfg(target_arch = "wasm32")]
+// Compiled under `test` as well so the decode regression tests run in native CI; the
+// JS-touching halves inside stay wasm-gated.
+#[cfg(any(target_arch = "wasm32", test))]
 mod cf;
 mod context;
 
