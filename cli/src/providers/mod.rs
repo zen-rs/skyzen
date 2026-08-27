@@ -45,10 +45,12 @@ pub enum Action {
     },
     /// Manage the deployed application's secrets.
     Secret(SecretCommand),
-    /// Apply pending SQL migrations.
+    /// Apply pending SQL migrations, or report which are still pending.
     Migrate {
-        /// Apply to the local emulator rather than the deployed database.
+        /// Act on the local emulator rather than the deployed database.
         local: bool,
+        /// Report what is applied and what is pending instead of applying anything.
+        status: bool,
     },
 }
 
@@ -268,7 +270,8 @@ const fn action_name(action: &Action) -> &'static str {
         Action::Deploy => "deploy",
         Action::Logs { .. } => "logs",
         Action::Secret(_) => "secret",
-        Action::Migrate { .. } => "migrate",
+        Action::Migrate { status: true, .. } => "migrate status",
+        Action::Migrate { status: false, .. } => "migrate",
     }
 }
 
@@ -588,7 +591,11 @@ mod tests {
             wrangler_args: Vec::new()
         }
         .requires_cloud());
-        assert!(Action::Migrate { local: false }.requires_cloud());
+        assert!(Action::Migrate {
+            local: false,
+            status: false
+        }
+        .requires_cloud());
         assert!(!Action::Dev {
             runner_args: Vec::new()
         }
