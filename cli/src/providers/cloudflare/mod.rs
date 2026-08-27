@@ -164,16 +164,17 @@ fn wrangler_commands(
             args.extend(runner_args.iter().cloned());
             vec![command(args)]
         }
-        // One `wrangler d1 migrations apply` per declared database. The migrations directory
-        // comes from the generated config, so `migrations_dir` is set the same way every other
-        // wrangler key is.
-        Action::Migrate { local } => databases
+        // One `wrangler d1 migrations` invocation per declared database — `apply` to run the
+        // pending files, `list` to report them, which is D1's own `migrate status`. The migrations
+        // directory comes from the generated config, so `migrations_dir` is set the same way every
+        // other wrangler key is.
+        Action::Migrate { local, status } => databases
             .iter()
             .map(|database| {
                 let mut args = vec![
                     "d1".to_owned(),
                     "migrations".to_owned(),
-                    "apply".to_owned(),
+                    if *status { "list" } else { "apply" }.to_owned(),
                     database.clone(),
                 ];
                 args.extend(config_args()?);
@@ -431,13 +432,13 @@ mod tests {
 
     #[test]
     fn a_wired_service_whose_binding_exists_has_no_problems() {
-        assert!(problems(
+        let found = problems(
             "[[service]]\nname = \"cache\"\ntype = \"kv\"\n\n\
              [cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
              [cloudflare.service.cache]\nbinding = \"CACHE\"\n\n\
-             [[cloudflare.kv_namespaces]]\nbinding = \"CACHE\"\nid = \"abc\"\n"
-        )
-        .is_empty());
+             [[cloudflare.kv_namespaces]]\nbinding = \"CACHE\"\nid = \"abc\"\n",
+        );
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -544,12 +545,20 @@ mod tests {
 
     #[test]
     fn build_needs_no_wrangler_invocation() {
-        assert!(planned(&Action::Build { release: false }, None, false).is_empty());
+        let commands = planned(&Action::Build { release: false }, None, false);
+        assert!(commands.is_empty(), "{commands:?}");
     }
 
     #[test]
     fn migrate_applies_to_every_declared_database_and_picks_a_target() {
-        let remote = planned(&Action::Migrate { local: false }, None, false);
+        let remote = planned(
+            &Action::Migrate {
+                local: false,
+                status: false,
+            },
+            None,
+            false,
+        );
         assert_eq!(remote.len(), 1);
         assert!(
             remote[0].contains("wrangler d1 migrations apply app"),
@@ -557,7 +566,32 @@ mod tests {
         );
         assert!(remote[0].contains("--remote"), "{remote:?}");
 
-        let local = planned(&Action::Migrate { local: true }, None, false);
+        let local = planned(
+            &Action::Migrate {
+                local: true,
+                status: false,
+            },
+            None,
+            false,
+        );
         assert!(local[0].contains("--local"), "{local:?}");
+    }
+
+    #[test]
+    fn migrate_status_lists_rather_than_applying() {
+        let status = planned(
+            &Action::Migrate {
+                local: false,
+                status: true,
+            },
+            None,
+            false,
+        );
+        assert_eq!(status.len(), 1);
+        assert!(
+            status[0].contains("wrangler d1 migrations list app"),
+            "{status:?}"
+        );
+        assert!(status[0].contains("--remote"), "{status:?}");
     }
 }
