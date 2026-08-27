@@ -4311,10 +4311,10 @@ mod embed_migrations_tests {
         let expanded = expand("good").expect("the fixture is valid");
         assert!(expanded.contains("include_str !"), "{expanded}");
         let absolute = fixture("good").join("0001_create_users.sql");
-        assert!(
-            expanded.contains(&absolute.display().to_string()),
-            "{expanded}"
-        );
+        // Render the expectation through the same string-literal escaping the expansion uses,
+        // so a Windows path's backslashes compare in their escaped form.
+        let literal = proc_macro2::Literal::string(&absolute.display().to_string()).to_string();
+        assert!(expanded.contains(&literal), "{expanded}");
     }
 
     #[test]
