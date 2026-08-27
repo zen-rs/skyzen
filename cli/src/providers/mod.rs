@@ -30,7 +30,10 @@ pub enum Action {
         release: bool,
     },
     /// Run locally, rebuilding on change.
-    Dev,
+    Dev {
+        /// Arguments forwarded verbatim to the underlying runner.
+        runner_args: Vec<String>,
+    },
     /// Build and upload.
     Deploy,
     /// Stream logs from the deployed application.
@@ -40,6 +43,11 @@ pub enum Action {
     },
     /// Manage the deployed application's secrets.
     Secret(SecretCommand),
+    /// Apply pending SQL migrations.
+    Migrate {
+        /// Apply to the local emulator rather than the deployed database.
+        local: bool,
+    },
 }
 
 impl Action {
@@ -48,14 +56,17 @@ impl Action {
         match self {
             // Local development defaults to the native binary: it is the fast loop, and it needs
             // no cloud account.
-            Self::Dev => Provider::Native,
+            Self::Dev { .. } => Provider::Native,
             _ => Provider::Cloudflare,
         }
     }
 
     /// Whether the action is meaningless without a cloud provider.
     const fn requires_cloud(&self) -> bool {
-        matches!(self, Self::Deploy | Self::Logs { .. } | Self::Secret(_))
+        matches!(
+            self,
+            Self::Deploy | Self::Logs { .. } | Self::Secret(_) | Self::Migrate { .. }
+        )
     }
 }
 
@@ -191,10 +202,11 @@ pub fn provision(
 const fn action_name(action: &Action) -> &'static str {
     match action {
         Action::Build { .. } => "build",
-        Action::Dev => "dev",
+        Action::Dev { .. } => "dev",
         Action::Deploy => "deploy",
         Action::Logs { .. } => "logs",
         Action::Secret(_) => "secret",
+        Action::Migrate { .. } => "migrate",
     }
 }
 
@@ -411,7 +423,13 @@ mod tests {
 
     #[test]
     fn dev_defaults_to_native_and_deployment_defaults_to_the_cloud() {
-        assert_eq!(Action::Dev.default_provider(), Provider::Native);
+        assert_eq!(
+            Action::Dev {
+                runner_args: Vec::new()
+            }
+            .default_provider(),
+            Provider::Native
+        );
         assert_eq!(Action::Deploy.default_provider(), Provider::Cloudflare);
         assert_eq!(
             Action::Build { release: true }.default_provider(),
@@ -426,7 +444,11 @@ mod tests {
             wrangler_args: Vec::new()
         }
         .requires_cloud());
-        assert!(!Action::Dev.requires_cloud());
+        assert!(Action::Migrate { local: false }.requires_cloud());
+        assert!(!Action::Dev {
+            runner_args: Vec::new()
+        }
+        .requires_cloud());
         assert!(!Action::Build { release: false }.requires_cloud());
     }
 
