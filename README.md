@@ -821,6 +821,10 @@ skyzen dev --provider cloudflare
 
 # Deploy to Cloudflare Workers
 skyzen deploy --provider cloudflare
+
+# Or to AWS Lambda, or Azure Functions — the same application, no code changes
+skyzen deploy --provider aws
+skyzen deploy --provider azure
 ```
 
 ---
@@ -832,6 +836,7 @@ skyzen deploy --provider cloudflare
 | [`skyzen`](.) | Root | Core framework: routing, extractors, responders, middleware, and runtime |
 | [`skyzen-core`](core/) | `core/` | Foundational traits (`Extractor`, `Responder`, `Server`), `no_std` compatible |
 | [`skyzen-hyper`](hyper/) | `hyper/` | Hyper backend implementing `Server` for native runtimes |
+| [`skyzen-lambda`](lambda/) | `lambda/` | AWS Lambda adapter: HTTP invocations and SQS batches (root crate's `lambda` feature) |
 | [`skyzen-macros`](macros/) | `macros/` | Procedural macros (`#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, etc.) |
 | [`skyzen-services`](services/) | `services/` | Portable service abstractions (`Kv`, `Storage`, `Queue`, `Db`) |
 | [`skyzen-test`](test/) | `test/` | In-memory mocks (`InMemoryKv`, `InMemoryStorage`), test client, and assertion tools |

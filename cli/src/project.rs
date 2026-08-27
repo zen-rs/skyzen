@@ -80,6 +80,18 @@ impl Project {
             .any(|dependency| dependency.name == crate_name)
     }
 
+    /// Whether a direct dependency on `crate_name` turns `feature` on.
+    ///
+    /// Only what this package's own `Cargo.toml` asks for: a feature another crate in the graph
+    /// enables is invisible here, which is why callers report a *missing* one as a warning.
+    pub fn dependency_enables(&self, crate_name: &str, feature: &str) -> bool {
+        self.package
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.name == crate_name)
+            .any(|dependency| dependency.features.iter().any(|name| name == feature))
+    }
+
     /// The name of the package's `cdylib` target — the wasm module a Worker build produces.
     ///
     /// # Errors
@@ -98,6 +110,34 @@ impl Project {
                     self.manifest_path.display()
                 )
             })
+    }
+
+    /// The name of the package's executable target — the binary a server or function deploys.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the package defines no `bin` target, and when it defines several: the deployment
+    /// would then have to guess which one the platform should run.
+    pub fn binary_target_name(&self) -> Result<&str> {
+        let mut binaries = self
+            .package
+            .targets
+            .iter()
+            .filter(|target| target.crate_types.iter().any(|kind| kind == "bin"));
+
+        let first = binaries.next().map(|target| target.name.as_str());
+        match (first, binaries.next()) {
+            (Some(name), None) => Ok(name),
+            (Some(_), Some(_)) => anyhow::bail!(
+                "{} defines more than one [[bin]] target; a deployment runs exactly one binary, \
+                 so name it in the manifest or split the package",
+                self.manifest_path.display()
+            ),
+            (None, _) => anyhow::bail!(
+                "{} defines no [[bin]] target; a server or function deployment needs an executable",
+                self.manifest_path.display()
+            ),
+        }
     }
 
     /// The version `crate_name` resolves to in the dependency graph for `target`.
@@ -189,6 +229,9 @@ struct Package {
 #[derive(Debug, Clone, Deserialize)]
 struct Dependency {
     name: String,
+    /// The features this package asks the dependency for, as written in its `Cargo.toml`.
+    #[serde(default)]
+    features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

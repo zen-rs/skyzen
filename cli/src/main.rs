@@ -138,7 +138,7 @@ fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
             output::dry_run(build.describe());
         } else {
             output::step(build.describe());
-            providers::cloudflare::build::run(build)?;
+            build.run()?;
         }
     }
 
@@ -159,7 +159,7 @@ fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
         .context("a supervised run needs a directory to watch")?;
     dev::supervise(&dev::Supervision {
         command,
-        build: plan.build.as_ref(),
+        build: plan.build.as_deref(),
         mode: plan.run_mode,
         child_env: &plan.child_env,
         watch_root,

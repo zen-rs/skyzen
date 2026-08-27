@@ -415,7 +415,73 @@ renamed_classes = [{ from = "Old", to = "New" }]
 | `deleted_classes` | string[] | Classes to remove |
 | `renamed_classes` | object[] | Classes to rename (`{ from = "Old", to = "New" }`) |
 
+## AWS Section
+
+`[aws]` configures an AWS Lambda deployment. Nothing here reaches the application at compile time:
+the same binary serves every target, so this is only what `cargo lambda` needs to be told.
+
+```toml
+[aws]
+function_name = "skyzen-api"   # optional; defaults to the binary's own name
+memory_mb = 512                # optional; Lambda scales CPU with memory
+timeout = "30s"                # optional humantime; sent to Lambda as whole seconds
+architecture = "arm64"         # "arm64" (default) or "x86_64"
+url = true                     # create and keep a Function URL; default true
+
+[aws.env]                      # plaintext environment variables set on the function
+RUST_LOG = "info"
+```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `function_name` | string | the binary's name | Passed positionally to `cargo lambda deploy` |
+| `memory_mb` | integer > 0 | Lambda's own default | `--memory` |
+| `timeout` | humantime duration | Lambda's own default | `--timeout`, in seconds |
+| `architecture` | `"arm64"` \| `"x86_64"` | `"arm64"` | Selects the build's target triple |
+| `url` | boolean | `true` | `false` passes `--disable-function-url`, removing an existing URL |
+| `env` | table of strings | empty | One `--env-var` each; not for secrets |
+
+`url` defaults to `true` because a Skyzen application is an HTTP server: without a Function URL — or
+an API Gateway wired up by hand — nothing can reach it.
+
+An SQS-triggered Lambda additionally needs an event source mapping, which `cargo lambda deploy`
+does not create. See the [deployment guide](deployment-guide.md#queues).
+
+## Azure Section
+
+`[azure]` configures an Azure Functions deployment, where the binary runs as a custom handler.
+
+```toml
+[azure]
+app_name = "skyzen-demo"                 # the Function App to publish to
+target = "x86_64-unknown-linux-musl"     # a Function App runs Linux
+http_mode = "forward"                    # "forward" (default) or "proxy"
+
+[[azure.queue_triggers]]
+function = "process"                     # the Functions name, and the path the host POSTs to
+queue = "jobs"                           # the Storage queue to trigger on
+connection_env = "AzureWebJobsStorage"   # the app setting holding the connection
+```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `app_name` | string | none | Required by `deploy` and `logs`; nothing can infer it |
+| `target` | string | the host's own target | A Linux triple; a macOS build is refused before publishing |
+| `http_mode` | `"forward"` \| `"proxy"` | `"forward"` | `proxy` streams responses; `forward` buffers them |
+| `queue_triggers` | array of tables | empty | One Functions queue trigger each |
+
+Each `[[azure.queue_triggers]]` entry needs all three keys. `function` must be a valid Functions
+name (a letter, then letters, digits, hyphens or underscores) and each one must be unique — both are
+compile-time errors, because the name is also a URL path the runtime mounts.
+
+A `function` whose path the application already serves as a literal route is a **startup** error:
+under the Functions host the trigger takes precedence, so the route would silently stop being
+reachable.
+
 ## Environments
+
+Environment overlays are Cloudflare-only: `[cloudflare.env.<name>]` exists because wrangler models
+environments itself, and neither `cargo lambda` nor the Functions host does.
 
 `[cloudflare.env.<name>]` declares an overlay with the same shape as `[cloudflare]`, selected with
 `skyzen <command> --env <name>` and forwarded to wrangler as `--env <name>`:
@@ -541,6 +607,8 @@ The `skyzen` CLI generates provider-specific config files from `Skyzen.toml`:
 | Provider | Generated Config | `dev` Command | `deploy` Command |
 |----------|-----------------|---------------|-----------------|
 | Cloudflare | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` | `wrangler dev --local` | `wrangler deploy` |
+| AWS | none — the flags are derived from `[aws]` | — (run it as a server with `skyzen dev`) | `cargo lambda build` then `cargo lambda deploy` |
+| Azure | `.skyzen/gen/azure/{host.json, local.settings.json, <function>/function.json}` plus the staged binary | — (`func start` over a built bundle) | `func azure functionapp publish` |
 
 The generated files are derived artifacts, rewritten on every run — edit `Skyzen.toml`, not them.
 

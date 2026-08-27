@@ -94,6 +94,17 @@ impl<E: Clone> Clone for Layered<E> {
     }
 }
 
+impl<E> Layered<E> {
+    /// The endpoint this layer wraps.
+    ///
+    /// Layering is how `#[skyzen::main]` injects the manifest's services, so the router an
+    /// application built is usually several `Layered`s deep by the time the runtime sees it. This
+    /// is what lets a question about the endpoint — which routes does it serve? — still reach it.
+    pub const fn endpoint(&self) -> &E {
+        &self.endpoint
+    }
+}
+
 /// Wrap `endpoint` so `middleware` runs around every request it serves.
 ///
 /// Prefer [`Route::layer`](crate::routing::Route::layer) when the endpoint is a router: layers

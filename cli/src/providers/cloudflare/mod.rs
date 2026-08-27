@@ -61,6 +61,10 @@ pub fn prepare(
     let build = needs_artifacts
         .then(|| resolve_build_plan(action, manifest.root_dir(), project, config))
         .transpose()?;
+    // Kept typed for the entry path below, and boxed into the plan for the CLI to run.
+    let boxed_build = build
+        .clone()
+        .map(|plan| Box::new(plan) as Box<dyn crate::providers::ArtifactBuild>);
 
     let entry_js_path = build.as_ref().map_or_else(
         || manifest.root_dir().join(entry_relative_path(config)),
@@ -119,7 +123,7 @@ pub fn prepare(
             path: wrangler_path,
             contents: rendered,
         }],
-        build,
+        build: boxed_build,
         run_mode,
         child_env: Vec::new(),
         watch_root: matches!(action, Action::Dev { .. }).then(|| manifest.root_dir().to_path_buf()),

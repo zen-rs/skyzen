@@ -17,6 +17,10 @@ pub mod native;
 #[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
 pub mod consumer;
 
+/// The Azure Functions custom-handler integration.
+#[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
+pub mod azure;
+
 /// Native test runtime utilities used by `#[skyzen::test]`.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod testing;
