@@ -14,7 +14,16 @@ pub fn prepare(action: &Action, manifest: &Manifest) -> Result<ProviderPlan> {
     let root_dir = manifest.root_dir().to_path_buf();
 
     let (args, run_mode) = match action {
-        Action::Dev => (vec!["run".to_owned()], RunMode::Restart),
+        Action::Dev { runner_args } => {
+            let mut args = vec!["run".to_owned()];
+            if !runner_args.is_empty() {
+                // `cargo run` needs the separator before the binary's own arguments, so
+                // `skyzen dev -- --port 3000` reaches the application rather than cargo.
+                args.push("--".to_owned());
+                args.extend(runner_args.iter().cloned());
+            }
+            (args, RunMode::Restart)
+        }
         Action::Build { release } => {
             let mut args = vec!["build".to_owned()];
             if *release {
@@ -44,7 +53,7 @@ pub fn prepare(action: &Action, manifest: &Manifest) -> Result<ProviderPlan> {
         build: None,
         run_mode,
         child_env,
-        watch_root: matches!(action, Action::Dev).then_some(root_dir),
+        watch_root: matches!(action, Action::Dev { .. }).then_some(root_dir),
         execute_despite_dry_run: false,
     })
 }
@@ -63,9 +72,18 @@ mod tests {
     fn dev_supervises_cargo_run_and_build_does_not() {
         let manifest = manifest("");
 
-        let dev = prepare(&Action::Dev, &manifest).expect("dev plan");
+        let dev = prepare(
+            &Action::Dev {
+                runner_args: vec!["--port".to_owned(), "3000".to_owned()],
+            },
+            &manifest,
+        )
+        .expect("dev plan");
         assert_eq!(dev.run_mode, RunMode::Restart);
-        assert!(dev.commands[0].display().contains("cargo run"));
+        // The separator is what makes the arguments reach the application, not cargo.
+        assert!(dev.commands[0]
+            .display()
+            .contains("cargo run -- --port 3000"));
         assert!(dev.watch_root.is_some());
 
         let build = prepare(&Action::Build { release: true }, &manifest).expect("build plan");
@@ -91,7 +109,13 @@ mod tests {
             "[[service]]\nname = \"cache\"\ntype = \"kv\"\n\n\
              [native.service.cache]\nbackend = \"redis\"\nurl_env = \"SKYZEN_NEVER_SET_URL\"\n",
         );
-        let error = prepare(&Action::Dev, &manifest).expect_err("the variable is not set");
+        let error = prepare(
+            &Action::Dev {
+                runner_args: Vec::new(),
+            },
+            &manifest,
+        )
+        .expect_err("the variable is not set");
         assert!(
             error.to_string().contains("SKYZEN_NEVER_SET_URL"),
             "{error}"

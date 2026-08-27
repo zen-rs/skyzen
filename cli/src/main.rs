@@ -94,12 +94,15 @@ fn project_root(manifest_path: &Path) -> Result<PathBuf> {
 fn action_for(command: &Command) -> Action {
     match command {
         Command::Build { release } => Action::Build { release: *release },
-        Command::Dev => Action::Dev,
+        Command::Dev { runner_args } => Action::Dev {
+            runner_args: runner_args.clone(),
+        },
         Command::Deploy => Action::Deploy,
         Command::Logs { wrangler_args } => Action::Logs {
             wrangler_args: wrangler_args.clone(),
         },
         Command::Secret { command } => Action::Secret(command.clone()),
+        Command::Migrate { local } => Action::Migrate { local: *local },
         Command::New { .. }
         | Command::Add { .. }
         | Command::Provision
