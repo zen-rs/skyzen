@@ -68,16 +68,23 @@ All services provide a `from_env()` constructor that uses `aws_config::load_defa
 
 ### Skyzen.toml Example
 
-When using the Skyzen CLI or runtime helpers, you can configure AWS settings in your `Skyzen.toml`:
+`[aws]` in `Skyzen.toml` configures the **Lambda deployment**, not these clients — the SDK resolves
+its own credentials and region the way every AWS tool does. It is what `skyzen deploy --provider
+aws` tells `cargo lambda`:
 
 ```toml
 [aws]
-template = "cloudformation.yaml"
-stack_name = "my-app-prod"
-region = "us-east-1"
-profile = "default"
-local_port = 4566 # For LocalStack development
+function_name = "skyzen-api"   # optional; defaults to the binary's own name
+memory_mb = 512                # Lambda scales CPU with memory
+timeout = "30s"                # humantime; sent to Lambda as whole seconds
+architecture = "arm64"         # "arm64" (default) or "x86_64"
+url = true                     # create and keep a Function URL; the default
+
+[aws.env]                      # plaintext environment variables set on the function
+RUST_LOG = "info"
 ```
+
+See the [Skyzen.toml reference](../docs/skyzen-toml-reference.md#aws-section) for the full table.
 
 ## Quick Start
 

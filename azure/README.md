@@ -141,8 +141,14 @@ queue.send_json(&event).await?;
 
 A message body travels as text inside an XML document, so bodies XML cannot carry are base64-encoded
 behind a `skyzen-b64:` prefix and text that would look like a prefix is escaped behind
-`skyzen-utf8:`. Messages are capped at 64 KB of encoded text, one `receive` takes at most 32, and
-there is no long polling — `ReceiveOptions::wait` reports `Unsupported`.
+`skyzen-utf8:`. That encoding is `skyzen_services::queue::envelope`, not this crate's own: the
+framework's Azure Functions integration has to reverse it for messages the host delivers, and a
+platform crate never depends on the framework crate.
+
+Messages are capped at 64 KB of encoded text and one `receive` takes at most 32. The service has no
+long polling of its own, so `ReceiveOptions::wait` is **emulated** — the queue is re-polled every
+`POLL_INTERVAL` until a message arrives or the wait elapses, which is what lets one portable
+consumer loop drive this backend and a genuinely long-polling one with the same options.
 
 ## Wiring
 

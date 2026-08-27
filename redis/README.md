@@ -67,7 +67,11 @@ hashes to another slot comes back as a `MOVED` error rather than being followed.
 Wrap the `Redis` instance in `Kv` and inject it as middleware:
 
 ```rust
-use skyzen::routing::{CreateRouteNode, Route, Router};
+use skyzen::{
+    extract::Path,
+    routing::{CreateRouteNode, Route, Router},
+    Result,
+};
 use skyzen_redis::Redis;
 use skyzen_services::Kv;
 
@@ -83,12 +87,10 @@ async fn main() -> Router {
     .build()
 }
 
-async fn get_cached(kv: Kv, params: skyzen::routing::Params) -> Result<String> {
-    let key = params.get("key")?;
-    let value = kv.get_text(key).await.map_err(|e| {
-        skyzen_core::error::Error::internal(e.to_string())
-    })?;
-    Ok(value.unwrap_or_default())
+// `KvError` implements `HttpError`, so a bare `?` carries it — and its status — into the response.
+// There is no `map_err` to write.
+async fn get_cached(kv: Kv, Path(key): Path<String>) -> Result<String> {
+    Ok(kv.get_text(&key).await?.unwrap_or_default())
 }
 ```
 

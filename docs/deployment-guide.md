@@ -244,14 +244,18 @@ declared `[[cloudflare.d1_databases]]`:
 skyzen migrate --local     # the emulator's database, for `skyzen dev`
 skyzen migrate             # the deployed database
 skyzen migrate --env staging
+skyzen migrate status      # `wrangler d1 migrations list` — what is applied, what is pending
 ```
 
 The same files apply to a native database without wrangler:
 
 ```sh
-skyzen migrate --provider native   # through [native.database.<name>].url_env
-skyzen migrate status              # what is applied, what is pending
+skyzen migrate --provider native          # through [native.database.<name>].url_env
+skyzen migrate status --provider native   # reads the `_skyzen_migrations` table
 ```
+
+`status` follows the same `--provider` as applying does, so it always reports on the database
+`skyzen migrate` would write to.
 
 The full rules — file naming, per-backend atomicity, the checksum policy that refuses an edited
 migration, and how an application embeds the same set with `skyzen::embed_migrations!` — are in the
