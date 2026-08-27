@@ -227,13 +227,8 @@ fn convert_request(request: &Request) -> Result<crate::Request, JsValue> {
 
     // `cf` is Cloudflare's, not WinterCG's, so it is simply absent on other hosts — which is not
     // an error, just a request with no edge metadata to extract.
-    if let Some(properties) = super::CfProperties::read(request)? {
-        if let Err(error) = &properties {
-            tracing::error!(error, "failed to decode `request.cf`");
-        }
-        sky_request
-            .extensions_mut()
-            .insert(super::CfPropertiesSlot(properties));
+    if let Some(slot) = super::CfPropertiesSlot::read(request)? {
+        sky_request.extensions_mut().insert(slot);
     }
 
     Ok(sky_request)

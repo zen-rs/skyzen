@@ -69,6 +69,10 @@ base64 = { version = "0.22", optional = true }
 sha1 = { version = "0.10", optional = true }
 futures-util = { version = "0.3.32" }
 futures-core = { version = "0.3.32" }
+# The websocket session plumbing needs oneshot/mpsc channels on every target: wasm converts the
+# socket's JS events into a stream, and native hands a failed session's socket back to the
+# framework so it can still send a close frame.
+futures-channel = { version = "0.3.32", optional = true }
 multer = { version = "3.1", optional = true }
 http = "1.4"
 utoipa = { version = "5.4", default-features = false }
@@ -116,7 +120,6 @@ js-sys = "0.3.87"
 wasm-streams = "0.5"
 serde-wasm-bindgen = "0.6"
 web-sys = { version = "0.3.87", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
-futures-channel = { version = "0.3.32", optional = true }
 
 # `serde_html_form` rather than `serde_urlencoded`: it deserializes repeated keys
 # (`tags=a&tags=b`) into `Vec<_>`, which the query and form extractors both need.

@@ -8,18 +8,22 @@
 //!
 //! async fn ws_handler(ws: WebSocketUpgrade) -> impl Responder {
 //!     ws.on_upgrade(|mut socket| async move {
-//!         while let Some(Ok(message)) = socket.next().await {
-//!             if let Some(reply) = message.into_text() {
-//!                 let _ = socket.send_text(reply).await;
+//!         while let Some(message) = socket.next().await {
+//!             if let Some(reply) = message?.into_text() {
+//!                 socket.send_text(reply).await?;
 //!             }
 //!         }
+//!         Ok::<_, skyzen::Error>(())
 //!     })
 //! }
 //! ```
 
 use crate::{
     header,
-    websocket::types::{WebSocketCloseFrame, WebSocketError, WebSocketResult},
+    websocket::{
+        session::{internal_error_frame, IntoWebSocketOutcome},
+        types::{WebSocketCloseFrame, WebSocketError, WebSocketResult},
+    },
     Method, Request, Response, StatusCode,
 };
 use async_tungstenite::{
@@ -35,6 +39,7 @@ use async_tungstenite::{
 };
 use core::future::{ready, Future};
 use executor_core::{AnyExecutor, Executor};
+use futures_channel::oneshot;
 use futures_core::Stream;
 use futures_util::Sink;
 use http_kit::utils::{AsyncRead, AsyncWrite};
@@ -47,13 +52,16 @@ use hyper::{
     upgrade::{OnUpgrade, Upgraded},
 };
 use serde::Serialize;
-use skyzen_core::{Extractor, Responder};
+use skyzen_core::{
+    error::{Error, ErrorChain},
+    Extractor, Responder,
+};
 use std::sync::Arc;
 use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tracing::error;
+use tracing::{debug, error};
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -177,8 +185,47 @@ type NativeIo = UpgradedIo;
 
 /// Stream representing a WebSocket connection handled by `async-tungstenite`.
 pub struct WebSocket {
-    inner: WebSocketStream<NativeIo>,
+    stream: SessionStream,
     config: WebSocketConfig,
+}
+
+/// The live connection, plus where it goes once the session handler is done with it.
+///
+/// A session handler takes the socket by value, so a handler that fails has already given up the
+/// only handle to the connection — `async-tungstenite`'s sender half is not cloneable, and
+/// `split` consumes the stream, so no second handle exists to close with. Handing the stream back
+/// here when the socket is dropped is what lets the framework still send a `1011` close frame
+/// after a failed session instead of letting the connection die silently.
+struct SessionStream {
+    /// `None` only after [`SessionStream::into_stream`], which consumes the whole socket.
+    stream: Option<WebSocketStream<NativeIo>>,
+    release: Option<oneshot::Sender<WebSocketStream<NativeIo>>>,
+}
+
+impl SessionStream {
+    const fn stream_mut(&mut self) -> &mut WebSocketStream<NativeIo> {
+        self.stream.as_mut().expect(
+            "the websocket stream is taken only by `into_stream`, which consumes the socket",
+        )
+    }
+
+    /// Take the stream out, giving up the ability to hand it back.
+    fn into_stream(mut self) -> WebSocketStream<NativeIo> {
+        self.release = None;
+        self.stream
+            .take()
+            .expect("`into_stream` consumes the socket, so it runs at most once")
+    }
+}
+
+impl Drop for SessionStream {
+    fn drop(&mut self) {
+        if let (Some(stream), Some(release)) = (self.stream.take(), self.release.take()) {
+            // The receiver is gone whenever the session succeeded, which is the common case; the
+            // stream is simply dropped here then, closing the connection as before.
+            let _ = release.send(stream);
+        }
+    }
 }
 
 impl WebSocket {
@@ -186,11 +233,18 @@ impl WebSocket {
         stream: NativeIo,
         role: Role,
         config: WebSocketConfig,
+        release: Option<oneshot::Sender<WebSocketStream<NativeIo>>>,
     ) -> Self {
         let inner =
             WebSocketStream::from_raw_socket(stream, role, Some(to_tungstenite_config(&config)))
                 .await;
-        Self { inner, config }
+        Self {
+            stream: SessionStream {
+                stream: Some(inner),
+                release,
+            },
+            config,
+        }
     }
 
     /// Serialize a value to JSON text and send it over the websocket connection.
@@ -253,7 +307,8 @@ impl WebSocket {
     ///
     /// Returns [`WebSocketError::Transport`] if the connection fails to send the message.
     pub async fn send_message(&mut self, message: WebSocketMessage) -> WebSocketResult<()> {
-        self.inner
+        self.stream
+            .stream_mut()
             .send(to_tungstenite_msg(message))
             .await
             .map_err(WebSocketError::from)
@@ -307,16 +362,24 @@ impl WebSocket {
     ///
     /// Returns [`WebSocketError::Transport`] if the connection fails to close.
     pub async fn close(&mut self, close_frame: Option<WebSocketCloseFrame>) -> WebSocketResult<()> {
-        self.inner
+        self.stream
+            .stream_mut()
             .close(close_frame.map(Into::into))
             .await
             .map_err(WebSocketError::from)
     }
 
     /// Split the websocket into independent sender and receiver halves.
+    ///
+    /// # Note
+    ///
+    /// Splitting gives up the framework's ability to close the connection for a session handler
+    /// that returns an error: the halves own the stream from then on. Such a session is still
+    /// logged, but sending the [`INTERNAL_ERROR`](super::INTERNAL_ERROR) close frame is then the
+    /// handler's own job.
     pub fn split(self) -> (WebSocketSender, WebSocketReceiver) {
         let config = self.config.clone();
-        let (inner_sink, inner_stream) = self.inner.split();
+        let (inner_sink, inner_stream) = self.stream.into_stream().split();
 
         (
             WebSocketSender {
@@ -341,7 +404,7 @@ impl Stream for WebSocket {
     type Item = WebSocketResult<WebSocketMessage>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).poll_next(cx) {
+        match Pin::new(self.stream.stream_mut()).poll_next(cx) {
             Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(to_websocket_msg(message))),
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(None) => Poll::Ready(None),
@@ -357,7 +420,7 @@ impl Sink<WebSocketMessage> for WebSocket {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), Self::Error>> {
-        Pin::new(&mut self.inner)
+        Pin::new(self.stream.stream_mut())
             .poll_ready(cx)
             .map_err(WebSocketError::from)
     }
@@ -366,7 +429,7 @@ impl Sink<WebSocketMessage> for WebSocket {
         mut self: Pin<&mut Self>,
         item: WebSocketMessage,
     ) -> std::result::Result<(), Self::Error> {
-        Pin::new(&mut self.inner)
+        Pin::new(self.stream.stream_mut())
             .start_send(to_tungstenite_msg(item))
             .map_err(WebSocketError::from)
     }
@@ -375,7 +438,7 @@ impl Sink<WebSocketMessage> for WebSocket {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), Self::Error>> {
-        Pin::new(&mut self.inner)
+        Pin::new(self.stream.stream_mut())
             .poll_flush(cx)
             .map_err(WebSocketError::from)
     }
@@ -384,7 +447,7 @@ impl Sink<WebSocketMessage> for WebSocket {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), Self::Error>> {
-        Pin::new(&mut self.inner)
+        Pin::new(self.stream.stream_mut())
             .poll_close(cx)
             .map_err(WebSocketError::from)
     }
@@ -642,22 +705,92 @@ impl WebSocketUpgrade {
     }
 
     /// Finalize the handshake and start handling the upgraded socket with `callback`.
-    pub fn on_upgrade<F, Fut>(self, callback: F) -> WebSocketUpgradeResponder
+    ///
+    /// The callback owns the connection until it returns. What it returns says how the session
+    /// ended: `()` says nothing beyond "it ended", while a `Result<(), E>` — for any `E` that
+    /// converts into [`Error`], which includes [`WebSocketError`] — lets the handler use `?` and
+    /// report what stopped it. An error is logged with its whole `source()` chain, and the
+    /// framework then tries to close the connection with
+    /// [`INTERNAL_ERROR`](super::INTERNAL_ERROR).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use futures_util::StreamExt;
+    /// use skyzen::{websocket::WebSocketUpgrade, Responder};
+    ///
+    /// async fn echo(ws: WebSocketUpgrade) -> impl Responder {
+    ///     ws.on_upgrade(|mut socket| async move {
+    ///         while let Some(message) = socket.next().await {
+    ///             if let Some(text) = message?.into_text() {
+    ///                 socket.send_text(text).await?;
+    ///             }
+    ///         }
+    ///         Ok::<_, skyzen::Error>(())
+    ///     })
+    /// }
+    /// ```
+    pub fn on_upgrade<F, Fut, R>(self, callback: F) -> WebSocketUpgradeResponder
     where
         F: FnOnce(WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = R> + Send + 'static,
+        R: IntoWebSocketOutcome + 'static,
     {
         WebSocketUpgradeResponder {
             upgrade: self,
             callback: Some(Box::new(move |socket| {
-                Box::pin(callback(socket)) as WebSocketCallbackFuture
+                Box::pin(async move { callback(socket).await.into_outcome() })
+                    as WebSocketCallbackFuture
             })),
         }
     }
 }
 
-type WebSocketCallbackFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+type WebSocketCallbackFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send>>;
 type DynCallback = Box<dyn FnOnce(WebSocket) -> WebSocketCallbackFuture + Send + Sync>;
+
+/// Drive one upgraded connection: build the socket, hand it to the session, and report how the
+/// session ended.
+async fn run_session(on_upgrade: OnUpgrade, config: WebSocketConfig, callback: DynCallback) {
+    let upgraded = match on_upgrade.await {
+        Ok(upgraded) => upgraded,
+        Err(error) => {
+            error!("WebSocket upgrade failed: {error}");
+            return;
+        }
+    };
+
+    let (release, released) = oneshot::channel();
+    let socket =
+        WebSocket::from_raw_socket(UpgradedIo(upgraded), Role::Server, config, Some(release)).await;
+
+    // The session future is dropped at the end of this statement, and dropping the socket with it
+    // is what hands the stream back through `released`.
+    let outcome = callback(socket).await;
+
+    if let Err(error) = outcome {
+        error!(error = %ErrorChain(&error), "websocket session handler failed");
+        close_failed_session(released).await;
+    }
+}
+
+/// Best-effort close for a session that reported an error, so the peer learns the connection died
+/// of a server-side failure rather than watching it go quiet.
+async fn close_failed_session(mut released: oneshot::Receiver<WebSocketStream<NativeIo>>) {
+    match released.try_recv() {
+        Ok(Some(mut stream)) => {
+            if let Err(error) = stream.close(Some(internal_error_frame().into())).await {
+                debug!("failed to close a failed websocket session: {error}");
+            }
+        }
+        // The socket outlived the session future — it was split, or moved into a task of the
+        // handler's own — so no handle to close with exists and the error log is all there is.
+        Ok(None) | Err(oneshot::Canceled) => {
+            debug!("a failed websocket session kept its socket, so no close frame was sent");
+        }
+    }
+}
 
 fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeError> {
     if request.method() != Method::GET {
@@ -791,18 +924,7 @@ impl Responder for WebSocketUpgradeResponder {
                 .ok_or(WebSocketUpgradeError::MissingExecutor)?;
 
             executor
-                .spawn(async move {
-                    match on_upgrade.await {
-                        Ok(upgraded) => {
-                            let io = UpgradedIo(upgraded);
-                            let stream = WebSocket::from_raw_socket(io, Role::Server, config).await;
-                            callback(stream).await;
-                        }
-                        Err(error) => {
-                            error!("WebSocket upgrade failed: {error}");
-                        }
-                    }
-                })
+                .spawn(run_session(on_upgrade, config, callback))
                 .detach();
         }
 

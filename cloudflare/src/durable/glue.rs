@@ -444,6 +444,13 @@ async fn convert_request(request: web_sys::Request) -> Result<Request, JsValue> 
         sky_request.headers_mut().insert(name, value);
     }
 
+    // A Durable Object's requests carry the same `cf` the main fetch handler sees — they are the
+    // edge request, forwarded — so a handler that reads [`CfProperties`] must not go blind just
+    // because it runs inside an object.
+    if let Some(slot) = skyzen::runtime::CfPropertiesSlot::read(&request)? {
+        sky_request.extensions_mut().insert(slot);
+    }
+
     Ok(sky_request)
 }
 

@@ -7,7 +7,7 @@ use skyzen_services::{
     DbExecResult, DbValue,
 };
 use wasm_bindgen::JsValue;
-use worker_sys::{DurableObjectState, SqlStorage};
+use worker_sys::{DurableObjectState, SqlStorage, SqlStorageCursor};
 
 use crate::database_error::integer_to_js_number;
 
@@ -65,6 +65,125 @@ impl CfDurableDb {
             rows_written: f64_to_u64(cursor.rows_written(), "rowsWritten")?,
         })
     }
+
+    /// Run one statement and walk its rows one at a time, instead of materializing them all.
+    ///
+    /// [`DurableDbBackend::query`] collects every row into a `Vec` before returning, which is the
+    /// portable shape but the wrong one for a scan over a large table: the whole result set sits
+    /// in the isolate's memory at once. The platform's cursor is a real JavaScript iterator, so
+    /// this walks it with `next()` and yields each row as it arrives.
+    ///
+    /// The cursor also carries what the portable result cannot: the statement's
+    /// [`column_names`](CfSqlCursor::column_names), which is the only way to see the columns of a
+    /// row that came back empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableDbError`] if a bound parameter cannot be represented or the statement
+    /// itself fails. Failures while decoding a row surface on the iterator, not here.
+    pub fn exec_cursor(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> Result<CfSqlCursor, DurableDbError> {
+        let bindings = js_sys::Array::new();
+        for value in params {
+            bindings.push(&db_value_to_js(value)?);
+        }
+
+        let cursor = self.sql.exec(query, bindings).map_err(js_err)?;
+        Ok(CfSqlCursor { cursor })
+    }
+}
+
+/// A cursor over the rows of one Durable Object SQL statement.
+///
+/// Yields each row as a JSON object, in the order the statement produced them, without holding the
+/// whole result set. The cursor is consumed as it is walked: a row it has yielded is gone.
+pub struct CfSqlCursor {
+    cursor: SqlStorageCursor,
+}
+
+// SAFETY: Workers WASM executes on a single thread, so the JS handle inside is safe to mark
+// `Send`/`Sync`. Written out rather than taken from `impl_js_handle_traits!` because that macro
+// also derives `Clone`, and a clone of a cursor would silently share one iteration state with the
+// original — the opposite of what cloning an iterator reads as.
+unsafe impl Send for CfSqlCursor {}
+// SAFETY: see above.
+unsafe impl Sync for CfSqlCursor {}
+
+impl std::fmt::Debug for CfSqlCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CfSqlCursor").finish_non_exhaustive()
+    }
+}
+
+impl CfSqlCursor {
+    /// The statement's column names, in the order the platform reports them.
+    ///
+    /// Available before the first row and on a result set with no rows at all, which is what makes
+    /// it worth exposing: an empty `Vec` of rows says nothing about the shape of what was queried.
+    #[must_use]
+    pub fn column_names(&self) -> Vec<String> {
+        self.cursor
+            .column_names()
+            .iter()
+            .filter_map(|name| name.as_string())
+            .collect()
+    }
+
+    /// How many rows this statement has read *so far*.
+    ///
+    /// The counter tracks the cursor's progress, so on a half-walked cursor it reports a partial
+    /// number. Read it after the iteration finishes to bill the whole statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableDbError`] if the runtime reports a value that is not a whole count.
+    pub fn rows_read(&self) -> Result<u64, DurableDbError> {
+        f64_to_u64(self.cursor.rows_read(), "rowsRead")
+    }
+
+    /// How many rows this statement has written so far. See [`rows_read`](Self::rows_read) for
+    /// when to read it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableDbError`] if the runtime reports a value that is not a whole count.
+    pub fn rows_written(&self) -> Result<u64, DurableDbError> {
+        f64_to_u64(self.cursor.rows_written(), "rowsWritten")
+    }
+}
+
+impl Iterator for CfSqlCursor {
+    type Item = Result<Value, DurableDbError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let step = self.cursor.next();
+
+        let done = match js_sys::Reflect::get(&step, &JsValue::from_str("done")) {
+            Ok(done) => done.as_bool(),
+            Err(error) => return Some(Err(js_err(error))),
+        };
+
+        match done {
+            Some(true) => None,
+            Some(false) => Some(decode_row(&step)),
+            // The iterator protocol guarantees the flag; its absence means the runtime handed back
+            // something that is not a cursor step, which is worth reporting rather than reading as
+            // the end of the rows.
+            None => Some(Err(DurableDbError::backend(
+                "SqlStorageCursor.next() returned an object without a `done` flag",
+            ))),
+        }
+    }
+}
+
+/// Pull the `value` out of one `{ done, value }` cursor step.
+fn decode_row(step: &js_sys::Object) -> Result<Value, DurableDbError> {
+    let row = js_sys::Reflect::get(step, &JsValue::from_str("value")).map_err(js_err)?;
+    serde_wasm_bindgen::from_value(row)
+        .map_err(|error| DurableDbError::backend(format!("failed to deserialize sql row: {error}")))
 }
 
 // The Durable Object storage API is synchronous, so each future is ready on creation rather than

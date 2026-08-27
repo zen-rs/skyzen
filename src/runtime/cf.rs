@@ -162,23 +162,39 @@ impl Extractor for CfProperties {
     }
 }
 
-impl CfProperties {
-    /// Decode the `cf` property of an incoming Workers request.
+impl CfPropertiesSlot {
+    /// Read `request.cf` off an incoming Workers request, ready to be put into request extensions.
     ///
     /// Returns `Ok(None)` when the runtime attached no `cf` at all, which is the normal case off
-    /// Cloudflare.
-    pub(crate) fn read(
-        request: &web_sys::Request,
-    ) -> Result<Option<Result<Self, String>>, wasm_bindgen::JsValue> {
+    /// Cloudflare and not an error. A `cf` that is present but undecodable is kept as the slot's
+    /// `Err` — and logged here, once, for whichever runtime read it — so [`CfProperties`] can
+    /// report *why* it is unavailable instead of collapsing that into "absent".
+    ///
+    /// Every entry point into a Worker has to do this: the main `fetch` handler, and the Durable
+    /// Object glue in `skyzen-cloudflare`, which receives its own requests from the runtime and
+    /// would otherwise serve them with the edge metadata silently missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runtime's own `JsValue` if the `cf` property cannot be read off the request at
+    /// all, which means the object is not the request shape this runtime documents.
+    pub fn read(request: &web_sys::Request) -> Result<Option<Self>, wasm_bindgen::JsValue> {
         use wasm_bindgen::JsValue;
 
         let cf = js_sys::Reflect::get(request.as_ref(), &JsValue::from_str("cf"))?;
         if cf.is_undefined() || cf.is_null() {
             return Ok(None);
         }
-        Ok(Some(Self::decode(cf)))
-    }
 
+        let properties = CfProperties::decode(cf);
+        if let Err(error) = &properties {
+            tracing::error!(error, "failed to decode `request.cf`");
+        }
+        Ok(Some(Self(properties)))
+    }
+}
+
+impl CfProperties {
     /// Turn the raw `cf` value into the typed struct, keeping the whole object alongside it.
     ///
     /// Decoding runs through `serde_json::Value` rather than straight off the JS value so the

@@ -105,9 +105,9 @@ pub use database_error::CfDatabaseError;
 #[cfg(target_arch = "wasm32")]
 pub use durable::{
     invoke_alarm, invoke_websocket_close, invoke_websocket_error, invoke_websocket_message,
-    CfAlarm, CfDurableConnections, CfDurableDb, CfDurableKv, CfDurableNamespace,
-    CfDurableObjectStub, CfDurableState, CfJurisdiction, CfWebSocketConnection,
-    DurableObjectRuntime,
+    AbortOptions, CfAlarm, CfDurableConnections, CfDurableDb, CfDurableKv, CfDurableNamespace,
+    CfDurableObjectStub, CfDurableState, CfJurisdiction, CfSqlCursor, CfWebSocketConnection,
+    DurableObjectRuntime, DurableWriteOptions,
 };
 #[cfg(target_arch = "wasm32")]
 pub use events::{
@@ -124,7 +124,10 @@ pub use kv::{CfKv, CfKvPutOptions, CfKvValueWithMetadata};
 #[cfg(target_arch = "wasm32")]
 pub use queues::CfQueue;
 #[cfg(target_arch = "wasm32")]
-pub use r2::{CfR2, CfR2Conditional, CfR2ConditionalGet, CfR2MultipartUpload, CfR2UploadedPart};
+pub use r2::{
+    CfR2, CfR2Conditional, CfR2ConditionalGet, CfR2ListOptions, CfR2ListResult,
+    CfR2MultipartUpload, CfR2UploadedPart,
+};
 #[cfg(target_arch = "wasm32")]
 pub use secret::{
     optional_string as optional_secret, required_string as required_secret, CfSecretError,
