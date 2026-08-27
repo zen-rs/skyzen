@@ -83,9 +83,10 @@ Read the columns honestly:
 
 - **Native server** is a *runtime*, not a separate set of backends. Every backend that is a plain
   HTTP client — `SqsQueue`, `DynamoKv`, `S3Storage`, `AzureBlob`, `CosmosKv`, `ServiceBusQueue`,
-  `AzureStorageQueue` — works from a native binary too; the column names what
-  [`Skyzen.toml`](docs/skyzen-toml-reference.md)'s `[native.service.*]` wiring can build for you
-  today (`redis`, `s3`, `sqs`, `memory`), and anything else is one `Kv::new(..)` away in code.
+  `AzureStorageQueue`, `RdsDataDb` — works from a native binary too, and every one of them can be
+  declared in [`Skyzen.toml`](docs/skyzen-toml-reference.md)'s `[native.service.*]` /
+  `[native.database.*]` wiring rather than constructed by hand. The column names the one this
+  table's row is *about*, not the limit of what a native binary can reach.
 - **Azure has no portable `Db`.** Cosmos DB is wired as a key–value store, not as SQL. A Skyzen
   application deployed to Azure Functions reaches SQL through a native `[[database]]` (Azure
   Database for PostgreSQL/MySQL over sqlx), not through a portable Azure binding.
@@ -137,6 +138,11 @@ url_env = "CACHE_URL"
 [cloudflare.service.cache]
 binding = "CACHE"
 ```
+
+Any backend goes in that `backend = …` — `dynamodb`, `cosmos`, `blob`, `servicebus`,
+`storage-queue`, `rds-data` and the rest — each with its own keys, and unknown ones rejected where
+they are written. `skyzen add <backend>` installs the crate it needs, and `skyzen dev` refuses to
+start when a variable one of them reads is set nowhere.
 
 ```rust
 // `[[service]] name = "cache"` generates `pub struct Cache(Kv)` with `Deref<Target = Kv>`;

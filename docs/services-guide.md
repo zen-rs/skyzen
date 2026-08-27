@@ -296,6 +296,24 @@ binding = "DB"
 
 `#[skyzen::main]` reads these declarations and injects the portable wrappers automatically. Provider SDK types stay in generated wiring; handlers keep using `Kv`, `Storage`, and `Db`.
 
+Every backend this guide covers can go in that `backend = …`, not only the three above — the
+`dynamodb`, `cosmos`, `blob`, `servicebus`, `storage-queue` and `rds-data` wirings are in the
+[Skyzen.toml reference](skyzen-toml-reference.md#native-service-wiring), with the keys each takes:
+
+```toml
+[native.service.sessions]
+backend = "dynamodb"
+table = "skyzen-sessions"
+
+[native.service.uploads]
+backend = "blob"
+container = "uploads"       # connection_env defaults to AZURE_STORAGE_CONNECTION_STRING
+
+[native.service.jobs]
+backend = "storage-queue"
+sas_url_env = "JOBS_SAS_URL"
+```
+
 ### One Extractor Per Declared Instance
 
 Every entry also generates a newtype named after it: `[[service]] name = "cache"` generates
@@ -379,9 +397,13 @@ Runtime and provider are independent axes, so a backend that is a plain HTTP cli
 `DynamoKv`, `S3Storage`, `AzureBlob`, `CosmosKv` — is reachable from a native server too;
 `SqsQueue` appears twice for that reason.
 
-What `[native.service.*]` / `[native.database.*]` wiring can build *for* you is narrower than what
-you can build by hand: `redis`, `s3`, `sqs` and `memory` for services, `postgres`, `mysql` and
-`sqlite` for databases. Everything else is one constructor call in `#[skyzen::main]`'s body.
+Every backend in this table can be declared in `Skyzen.toml` rather than constructed by hand:
+`redis`, `dynamodb`, `cosmos`, `s3`, `blob`, `sqs`, `servicebus`, `storage-queue` and `memory` for
+services, `postgres`, `mysql`, `sqlite` and `rds-data` for databases. See the
+[Skyzen.toml reference](skyzen-toml-reference.md#native-service-wiring) for the keys each one
+takes. Writing the constructor yourself stays available, and is what the options a wiring does not
+model need — a FIFO SQS queue, a `DynamoDB` table keyed on something other than `pk`, an Entra ID
+credential in place of a connection string.
 
 Azure has no portable `Db`: Cosmos DB is wired here as a key-value store, not as SQL. An
 application on Azure Functions reaches SQL through a native `[[database]]` — Azure Database for
