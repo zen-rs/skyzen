@@ -3,8 +3,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use skyzen_manifest::{
-    AzureQueueTrigger, DatabaseEntry, DatabaseType, Manifest, NativeDatabaseBackend,
-    NativeQueueConsumer, NativeServiceBackend, ServiceEntry, ServiceType, SkyzenManifest,
+    AzureQueueTrigger, DatabaseEntry, DatabaseType, Manifest, NativeDatabaseSection,
+    NativeQueueConsumer, NativeServiceSection, ServiceEntry, ServiceType, SkyzenManifest,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -2428,7 +2428,7 @@ fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
     for service in services {
         let ident = service_ident_from_name(&service.name)?;
         let binding = service_binding_ident(&ident);
-        let native_init = generate_native_service_init(service, &manifest)?;
+        let native_init = generate_native_service_init(service, &manifest);
         let cloudflare_init = generate_cloudflare_service_init(service, &manifest);
         // The bare `Kv`/`Storage`/`Queue` extractor names whichever service of that type is the
         // only one, so it is injected exactly when the type is unambiguous.
@@ -2772,105 +2772,209 @@ fn native_database_wiring<'a>(
     manifest.native.as_ref()?.database.get(name)
 }
 
-/// A required `url_env`/`bucket_env` key that the wiring section left out.
-fn missing_wiring_key(section: &str, key: &str) -> Error {
-    Error::new(
+/// Read one environment variable at startup, panicking with the entry that asked for it.
+///
+/// Every native backend that takes a URL, a bucket or a connection string reads it this way, so
+/// the lookup and its failure message are written once here rather than in each arm.
+fn env_value_expr(kind: &str, entry: &str, variable: &str) -> proc_macro2::TokenStream {
+    let variable_lit = LitStr::new(variable, proc_macro2::Span::call_site());
+    let missing_message = LitStr::new(
+        &format!("portable {kind} `{entry}` missing native env var `{variable}`"),
         proc_macro2::Span::call_site(),
-        format!("{section} is missing `{key}`"),
-    )
+    );
+    quote! {
+        ::std::env::var(#variable_lit).unwrap_or_else(|_| panic!("{}", #missing_message))
+    }
 }
 
 fn generate_native_service_init(
     service: &ServiceEntry,
     manifest: &SkyzenManifest,
-) -> syn::Result<proc_macro2::TokenStream> {
+) -> proc_macro2::TokenStream {
     let Some(wiring) = native_service_wiring(manifest, &service.name) else {
-        return Ok(compile_error_block(&format!(
+        return compile_error_block(&format!(
             "missing [native.service.{}] wiring for portable service `{}`",
             service.name, service.name
-        )));
+        ));
     };
 
-    let label = format!("[native.service.{}]", service.name);
     let wrapper = service_wrapper_path(service.service_type);
-
-    // Every env-configured backend has the same shape — read one variable, hand its value to a
-    // constructor, wrap the result — so the lookup, the missing-variable panic and the wrapper
-    // construction are written once and each arm supplies only the constructor call.
-    let env_key = |key: &'static str, value: Option<&String>| {
-        value
-            .cloned()
-            .ok_or_else(|| missing_wiring_key(&label, key))
+    let Some(backend) = native_backend_tokens(service, wiring) else {
+        return compile_error_block(&format!(
+            "unsupported native backend `{}` for portable service `{}` of type `{}`",
+            wiring.backend().as_str(),
+            service.name,
+            service.service_type.as_str()
+        ));
     };
 
-    let (env_key, build) = match (service.service_type, wiring.backend) {
-        (ServiceType::Kv, NativeServiceBackend::Redis) => {
-            let key = env_key("url_env", wiring.url_env.as_ref())?;
+    quote! {{
+        let backend = #backend;
+        #wrapper::new(backend)
+    }}
+}
+
+/// The constructor call one service's wiring expands to, or `None` when the backend it names
+/// implements a different portable service than the entry declares.
+///
+/// A required key is no longer an arm's concern: the manifest schema rejects a wiring that leaves
+/// one out, so every field named below is present by construction.
+fn native_backend_tokens(
+    service: &ServiceEntry,
+    wiring: &NativeServiceSection,
+) -> Option<proc_macro2::TokenStream> {
+    if matches!(wiring, NativeServiceSection::Memory(_)) {
+        // The one backend that is not a service type's own: every type has a mock.
+        return Some(match service.service_type {
+            ServiceType::Kv => quote! { ::skyzen_test::mock::InMemoryKv::new() },
+            ServiceType::Storage => quote! { ::skyzen_test::mock::InMemoryStorage::new() },
+            ServiceType::Queue => quote! { ::skyzen_test::mock::InMemoryQueue::new() },
+        });
+    }
+
+    let name = service.name.as_str();
+    match service.service_type {
+        ServiceType::Kv => native_kv_tokens(name, wiring),
+        ServiceType::Storage => native_storage_tokens(name, wiring),
+        ServiceType::Queue => native_queue_tokens(name, wiring),
+    }
+}
+
+/// The KV backends.
+fn native_kv_tokens(name: &str, wiring: &NativeServiceSection) -> Option<proc_macro2::TokenStream> {
+    Some(match wiring {
+        NativeServiceSection::Redis(redis) => {
+            let url = env_value_expr("service", name, &redis.url_env);
             let failure =
-                connect_failure_lit(&service.name, &format!("connect to Redis using `{key}`"));
-            (
-                key,
-                quote! {
-                    ::skyzen_redis::Redis::connect(&__skyzen_env_value)
-                        .await
-                        .unwrap_or_else(|error| panic!("{}: {error}", #failure))
-                },
-            )
+                connect_failure_lit(name, &format!("connect to Redis using `{}`", redis.url_env));
+            quote! {
+                ::skyzen_redis::Redis::connect(&#url)
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+            }
         }
-        (ServiceType::Storage, NativeServiceBackend::S3) => (
-            env_key("bucket_env", wiring.bucket_env.as_ref())?,
-            quote! { ::skyzen_s3::S3Storage::from_env(&__skyzen_env_value).await },
-        ),
-        (ServiceType::Queue, NativeServiceBackend::Sqs) => {
-            let key = env_key("url_env", wiring.url_env.as_ref())?;
+        NativeServiceSection::DynamoDb(dynamodb) => {
+            // No environment variable: the table is named in the manifest, and the credentials and
+            // region come from the ambient AWS chain `DynamoKv::from_env` loads. The two options
+            // are applied only when the manifest asks for them, so the constructor's own defaults
+            // stay the defaults.
+            let table = LitStr::new(&dynamodb.table, proc_macro2::Span::call_site());
+            let mut build = quote! { ::skyzen_aws::DynamoKv::from_env(#table).await };
+            if let Some(ttl_attribute) = &dynamodb.ttl_attribute {
+                let ttl_lit = LitStr::new(ttl_attribute, proc_macro2::Span::call_site());
+                build = quote! { #build.with_ttl_attribute(#ttl_lit) };
+            }
+            if let Some(consistent_reads) = dynamodb.consistent_reads {
+                build = quote! { #build.with_consistent_reads(#consistent_reads) };
+            }
+            build
+        }
+        NativeServiceSection::Cosmos(cosmos) => {
+            // `CosmosKv::from_env` reads the container's definition before it returns, so a
+            // container whose partition key or time-to-life this backend cannot work with fails
+            // here, at startup, rather than on the first write.
+            let database = LitStr::new(&cosmos.database, proc_macro2::Span::call_site());
+            let container = LitStr::new(&cosmos.container, proc_macro2::Span::call_site());
+            let failure = connect_failure_lit(
+                name,
+                &format!(
+                    "bind to Cosmos DB container `{}` in database `{}`",
+                    cosmos.container, cosmos.database
+                ),
+            );
+            quote! {
+                ::skyzen_azure::CosmosKv::from_env(#database, #container)
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The object storage backends.
+fn native_storage_tokens(
+    name: &str,
+    wiring: &NativeServiceSection,
+) -> Option<proc_macro2::TokenStream> {
+    Some(match wiring {
+        NativeServiceSection::S3(s3) => {
+            let bucket = env_value_expr("service", name, &s3.bucket_env);
+            quote! { ::skyzen_s3::S3Storage::from_env(&#bucket).await }
+        }
+        NativeServiceSection::Blob(blob) => {
+            let connection = env_value_expr("service", name, &blob.connection_env);
+            let container = LitStr::new(&blob.container, proc_macro2::Span::call_site());
+            let failure = connect_failure_lit(
+                name,
+                &format!(
+                    "reach the Azure Blob container `{}` using `{}`",
+                    blob.container, blob.connection_env
+                ),
+            );
+            quote! {
+                ::skyzen_azure::AzureBlob::from_connection_string(&#connection, #container)
+                    .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The message queue backends.
+fn native_queue_tokens(
+    name: &str,
+    wiring: &NativeServiceSection,
+) -> Option<proc_macro2::TokenStream> {
+    Some(match wiring {
+        NativeServiceSection::Sqs(sqs) => {
+            let url = env_value_expr("service", name, &sqs.url_env);
             // `SqsQueue::from_env` builds a *standard* queue and refuses a `.fifo` URL, which
             // needs a message group id on every send. A FIFO queue is wired in code with
             // `SqsQueue::fifo`, so the manifest path reports the mismatch rather than hiding it.
             let failure = connect_failure_lit(
-                &service.name,
-                &format!("use the SQS queue named by `{key}`"),
+                name,
+                &format!("use the SQS queue named by `{}`", sqs.url_env),
             );
-            (
-                key,
-                quote! {
-                    ::skyzen_aws::SqsQueue::from_env(&__skyzen_env_value)
-                        .await
-                        .unwrap_or_else(|error| panic!("{}: {error}", #failure))
-                },
-            )
+            quote! {
+                ::skyzen_aws::SqsQueue::from_env(&#url)
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+            }
         }
-        (_, NativeServiceBackend::Memory) => {
-            let mock = match service.service_type {
-                ServiceType::Kv => quote! { ::skyzen_test::mock::InMemoryKv },
-                ServiceType::Storage => quote! { ::skyzen_test::mock::InMemoryStorage },
-                ServiceType::Queue => quote! { ::skyzen_test::mock::InMemoryQueue },
-            };
-            return Ok(quote! { #wrapper::new(#mock::new()) });
+        NativeServiceSection::ServiceBus(service_bus) => {
+            let connection = env_value_expr("service", name, &service_bus.connection_env);
+            let queue = LitStr::new(&service_bus.queue, proc_macro2::Span::call_site());
+            let failure = connect_failure_lit(
+                name,
+                &format!(
+                    "reach the Service Bus queue `{}` using `{}`",
+                    service_bus.queue, service_bus.connection_env
+                ),
+            );
+            quote! {
+                ::skyzen_azure::ServiceBusQueue::from_connection_string(&#connection, #queue)
+                    .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+            }
         }
-        (service_type, backend) => {
-            return Ok(compile_error_block(&format!(
-                "unsupported native backend `{}` for portable service `{}` of type `{}`",
-                backend.as_str(),
-                service.name,
-                service_type.as_str()
-            )));
+        NativeServiceSection::StorageQueue(storage_queue) => {
+            // The signed URL *is* the credential, so the constructor is handed the variable's name
+            // and reports it itself rather than being handed a value read here.
+            let variable = LitStr::new(&storage_queue.sas_url_env, proc_macro2::Span::call_site());
+            let failure = connect_failure_lit(
+                name,
+                &format!(
+                    "reach the Azure Storage queue named by `{}`",
+                    storage_queue.sas_url_env
+                ),
+            );
+            quote! {
+                ::skyzen_azure::AzureStorageQueue::from_sas_env(#variable)
+                    .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+            }
         }
-    };
-
-    let env_lit = LitStr::new(&env_key, proc_macro2::Span::call_site());
-    let missing_message = LitStr::new(
-        &format!(
-            "portable service `{}` missing native env var `{env_key}`",
-            service.name
-        ),
-        proc_macro2::Span::call_site(),
-    );
-    Ok(quote! {{
-        let __skyzen_env_value = ::std::env::var(#env_lit)
-            .unwrap_or_else(|_| panic!("{}", #missing_message));
-        let backend = #build;
-        #wrapper::new(backend)
-    }})
+        _ => return None,
+    })
 }
 
 /// The panic message for a native backend whose constructor failed.
@@ -2930,35 +3034,46 @@ fn generate_native_database_init(
         ));
     };
 
-    // Every SQL driver takes the same shape — read one env var, hand the URL to a
-    // `Db::connect_*` — so the arms differ only in which constructor they name.
-    let connect = match (database.database_type, wiring.backend) {
-        (DatabaseType::Sql, NativeDatabaseBackend::Postgres) => quote! { connect_postgres },
-        (DatabaseType::Sql, NativeDatabaseBackend::Mysql) => quote! { connect_mysql },
-        (DatabaseType::Sql, NativeDatabaseBackend::Sqlite) => quote! { connect_sqlite },
+    let name = database.name.as_str();
+
+    // Every sqlx driver takes the same shape — read one env var, hand the URL to a `Db::connect_*`
+    // — so those arms differ only in which constructor they name. The RDS Data API is not a
+    // connection at all: it is an HTTP service reached by ARN, and its own constructor reads every
+    // parameter it needs from the environment.
+    let (connect, url_env) = match (database.database_type, wiring) {
+        (DatabaseType::Sql, NativeDatabaseSection::Postgres(sql)) => {
+            (quote! { connect_postgres }, &sql.url_env)
+        }
+        (DatabaseType::Sql, NativeDatabaseSection::Mysql(sql)) => {
+            (quote! { connect_mysql }, &sql.url_env)
+        }
+        (DatabaseType::Sql, NativeDatabaseSection::Sqlite(sql)) => {
+            (quote! { connect_sqlite }, &sql.url_env)
+        }
+        (DatabaseType::Sql, NativeDatabaseSection::RdsData(_)) => {
+            let failure = LitStr::new(
+                &format!(
+                    "portable database `{name}` failed to reach Aurora through the RDS Data API"
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            return quote! {{
+                let backend = ::skyzen_aws::RdsDataDb::from_env()
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error}", #failure));
+                ::skyzen_services::Db::new(backend)
+            }};
+        }
     };
 
-    let url_env = &wiring.url_env;
-    let env_lit = LitStr::new(url_env, proc_macro2::Span::call_site());
-    let missing_message = LitStr::new(
-        &format!(
-            "portable database `{}` missing native env var `{url_env}`",
-            database.name
-        ),
-        proc_macro2::Span::call_site(),
-    );
+    let url = env_value_expr("database", name, url_env);
     let connect_message = LitStr::new(
-        &format!(
-            "portable database `{}` failed to connect using `{url_env}`",
-            database.name
-        ),
+        &format!("portable database `{name}` failed to connect using `{url_env}`"),
         proc_macro2::Span::call_site(),
     );
 
     quote! {{
-        let url = ::std::env::var(#env_lit)
-            .unwrap_or_else(|_| panic!("{}", #missing_message));
-        ::skyzen_services::Db::#connect(&url)
+        ::skyzen_services::Db::#connect(&#url)
             .await
             .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
     }}
@@ -3720,15 +3835,200 @@ type = "sql"
         assert!(!manifest.database[0].default);
     }
 
+    /// The tokens `[native.service.cache]` with `wiring` expands to, for a service of `kind`.
+    fn service_init(kind: &str, wiring: &str) -> String {
+        let manifest = manifest(&format!(
+            "[[service]]\nname = \"cache\"\ntype = \"{kind}\"\n\n[native.service.cache]\n{wiring}\n"
+        ));
+        generate_native_service_init(&manifest.service[0], &manifest).to_string()
+    }
+
+    /// The tokens `[native.database.main]` with `wiring` expands to.
+    fn database_init(wiring: &str) -> String {
+        let manifest = manifest(&format!(
+            "[[database]]\nname = \"main\"\ntype = \"sql\"\n\n[native.database.main]\n{wiring}\n"
+        ));
+        generate_native_database_init(&manifest.database[0], &manifest).to_string()
+    }
+
     #[test]
     fn missing_wiring_becomes_a_compile_error_naming_the_section_to_add() {
         let manifest = manifest("[[service]]\nname = \"cache\"\ntype = \"kv\"\n");
 
-        let generated = generate_native_service_init(&manifest.service[0], &manifest)
-            .expect("init tokens")
-            .to_string();
+        let generated = generate_native_service_init(&manifest.service[0], &manifest).to_string();
         assert!(generated.contains("compile_error !"));
         assert!(generated.contains("[native.service.cache]"));
+    }
+
+    #[test]
+    fn a_backend_of_the_wrong_service_type_is_a_compile_error_naming_both() {
+        // A queue backend under a `type = "kv"` service parses — the wiring table is well formed —
+        // and is caught here, where the service it belongs to is known.
+        let generated = service_init("kv", "backend = \"servicebus\"\nqueue = \"jobs\"");
+        assert!(generated.contains("compile_error !"), "{generated}");
+        assert!(generated.contains("servicebus"), "{generated}");
+        assert!(generated.contains("kv"), "{generated}");
+    }
+
+    #[test]
+    fn every_native_service_backend_reaches_its_own_constructor() {
+        for (kind, wiring, expected) in [
+            (
+                "kv",
+                "backend = \"redis\"\nurl_env = \"CACHE_URL\"",
+                "skyzen_redis :: Redis :: connect",
+            ),
+            (
+                "kv",
+                "backend = \"dynamodb\"\ntable = \"skyzen-sessions\"",
+                "skyzen_aws :: DynamoKv :: from_env",
+            ),
+            (
+                "kv",
+                "backend = \"cosmos\"\ndatabase = \"appdb\"\ncontainer = \"sessions\"",
+                "skyzen_azure :: CosmosKv :: from_env",
+            ),
+            (
+                "storage",
+                "backend = \"s3\"\nbucket_env = \"UPLOADS_BUCKET\"",
+                "skyzen_s3 :: S3Storage :: from_env",
+            ),
+            (
+                "storage",
+                "backend = \"blob\"\ncontainer = \"uploads\"",
+                "skyzen_azure :: AzureBlob :: from_connection_string",
+            ),
+            (
+                "queue",
+                "backend = \"sqs\"\nurl_env = \"JOBS_QUEUE_URL\"",
+                "skyzen_aws :: SqsQueue :: from_env",
+            ),
+            (
+                "queue",
+                "backend = \"servicebus\"\nqueue = \"jobs\"",
+                "skyzen_azure :: ServiceBusQueue :: from_connection_string",
+            ),
+            (
+                "queue",
+                "backend = \"storage-queue\"\nsas_url_env = \"JOBS_SAS_URL\"",
+                "skyzen_azure :: AzureStorageQueue :: from_sas_env",
+            ),
+            (
+                "queue",
+                "backend = \"memory\"",
+                "skyzen_test :: mock :: InMemoryQueue",
+            ),
+        ] {
+            let generated = service_init(kind, wiring);
+            assert!(
+                generated.contains(expected),
+                "`{wiring}` should reach `{expected}`, got: {generated}"
+            );
+            assert!(!generated.contains("compile_error !"), "{generated}");
+        }
+    }
+
+    #[test]
+    fn a_backend_that_reads_a_variable_names_it_and_the_service_that_asked_for_it() {
+        for (kind, wiring, variable) in [
+            (
+                "kv",
+                "backend = \"redis\"\nurl_env = \"CACHE_URL\"",
+                "CACHE_URL",
+            ),
+            (
+                "storage",
+                "backend = \"blob\"\ncontainer = \"uploads\"",
+                "AZURE_STORAGE_CONNECTION_STRING",
+            ),
+            (
+                "storage",
+                "backend = \"blob\"\ncontainer = \"uploads\"\nconnection_env = \"UPLOADS_ACCOUNT\"",
+                "UPLOADS_ACCOUNT",
+            ),
+            (
+                "queue",
+                "backend = \"servicebus\"\nqueue = \"jobs\"",
+                "SERVICEBUS_CONNECTION_STRING",
+            ),
+            (
+                "queue",
+                "backend = \"storage-queue\"\nsas_url_env = \"JOBS_SAS_URL\"",
+                "JOBS_SAS_URL",
+            ),
+        ] {
+            let generated = service_init(kind, wiring);
+            assert!(generated.contains(variable), "{wiring}: {generated}");
+        }
+
+        // The two backends that authenticate through an ambient chain read nothing themselves.
+        let dynamodb = service_init("kv", "backend = \"dynamodb\"\ntable = \"sessions\"");
+        assert!(!dynamodb.contains("env :: var"), "{dynamodb}");
+    }
+
+    #[test]
+    fn a_dynamodb_wiring_applies_only_the_options_it_declares() {
+        let bare = service_init("kv", "backend = \"dynamodb\"\ntable = \"sessions\"");
+        assert!(!bare.contains("with_ttl_attribute"), "{bare}");
+        assert!(!bare.contains("with_consistent_reads"), "{bare}");
+
+        let configured = service_init(
+            "kv",
+            "backend = \"dynamodb\"\ntable = \"sessions\"\n\
+             ttl_attribute = \"ttl\"\nconsistent_reads = true",
+        );
+        assert!(
+            configured.contains("with_ttl_attribute (\"ttl\")"),
+            "{configured}"
+        );
+        assert!(
+            configured.contains("with_consistent_reads (true)"),
+            "{configured}"
+        );
+    }
+
+    #[test]
+    fn the_async_constructors_are_awaited_and_the_synchronous_ones_are_not() {
+        // Getting this wrong is a type error in the generated code rather than a wrong result, but
+        // the error lands in a user's crate — so it is asserted here, where it is cheap.
+        for (kind, wiring) in [
+            ("kv", "backend = \"dynamodb\"\ntable = \"sessions\""),
+            (
+                "kv",
+                "backend = \"cosmos\"\ndatabase = \"appdb\"\ncontainer = \"sessions\"",
+            ),
+        ] {
+            let generated = service_init(kind, wiring);
+            assert!(generated.contains(". await"), "{wiring}: {generated}");
+        }
+
+        for (kind, wiring) in [
+            ("storage", "backend = \"blob\"\ncontainer = \"uploads\""),
+            ("queue", "backend = \"servicebus\"\nqueue = \"jobs\""),
+            (
+                "queue",
+                "backend = \"storage-queue\"\nsas_url_env = \"JOBS_SAS_URL\"",
+            ),
+        ] {
+            let generated = service_init(kind, wiring);
+            assert!(!generated.contains(". await"), "{wiring}: {generated}");
+        }
+    }
+
+    #[test]
+    fn the_rds_data_api_is_built_from_its_own_environment_and_wrapped_in_a_db() {
+        let generated = database_init("backend = \"rds-data\"");
+        assert!(
+            generated.contains("skyzen_aws :: RdsDataDb :: from_env ()"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("skyzen_services :: Db :: new"),
+            "{generated}"
+        );
+        assert!(generated.contains(". await"), "{generated}");
+        // It reads its four variables itself, so the expansion reads none.
+        assert!(!generated.contains("env :: var"), "{generated}");
     }
 
     #[test]
@@ -3738,12 +4038,9 @@ type = "sql"
             ("mysql", "connect_mysql"),
             ("sqlite", "connect_sqlite"),
         ] {
-            let manifest = manifest(&format!(
-                "[[database]]\nname = \"main\"\ntype = \"sql\"\n\n\
-                 [native.database.main]\nbackend = \"{backend}\"\nurl_env = \"DATABASE_URL\"\n"
+            let generated = database_init(&format!(
+                "backend = \"{backend}\"\nurl_env = \"DATABASE_URL\""
             ));
-            let generated =
-                generate_native_database_init(&manifest.database[0], &manifest).to_string();
             assert!(
                 generated.contains(expected),
                 "backend `{backend}` should reach `{expected}`, got: {generated}"
@@ -3771,9 +4068,8 @@ binding = "DB"
 "#,
         );
 
-        let native_service = generate_native_service_init(&manifest.service[0], &manifest)
-            .expect("native service init")
-            .to_string();
+        let native_service =
+            generate_native_service_init(&manifest.service[0], &manifest).to_string();
         assert!(native_service.contains("skyzen_services :: Kv :: new"));
         assert!(native_service.contains("skyzen_redis :: Redis :: connect"));
 
