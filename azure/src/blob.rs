@@ -30,6 +30,14 @@ const DEFAULT_ENDPOINT_SUFFIX: &str = "core.windows.net";
 /// [`presign_put`](ObjectStorage::presign_put), whose request the client builds itself.
 const HONOURED_PUT_OPTIONS: [PutOption; 2] = [PutOption::CacheControl, PutOption::StorageClass];
 
+/// How much of a streamed upload is buffered into one block.
+///
+/// A block blob is assembled from at most 50,000 blocks, and `OpenDAL` sends one block per chunk it
+/// is handed unless it is told otherwise — so a body arriving in 8 KB pieces would spend a request
+/// on each and run out of blocks before 400 MB. Buffering 4 MiB per block is Azure's own
+/// recommended block size and lifts that ceiling to 200 GB.
+const UPLOAD_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+
 /// How a storage account authenticates.
 #[derive(Clone)]
 pub enum AzureBlobAuth {
@@ -516,7 +524,7 @@ impl ObjectStorage for AzureBlob {
         Ok(Some(StorageStream::new(stream)))
     }
 
-    /// Upload from a stream, letting `OpenDAL` flush blocks as they arrive.
+    /// Upload from a stream, one [`UPLOAD_BLOCK_SIZE`] block at a time.
     ///
     /// A `content_length` that disagrees with what the stream actually yielded fails the upload
     /// rather than storing a truncated or over-long object — the blob is deleted first, so a
@@ -530,9 +538,12 @@ impl ObjectStorage for AzureBlob {
     ) -> Result<(), StorageError> {
         options.reject_unsupported(&HONOURED_PUT_OPTIONS)?;
 
-        let mut writer = with_put_options!(self.operator.writer_with(key), options)
-            .await
-            .map_err(storage_error)?;
+        let mut writer = with_put_options!(
+            self.operator.writer_with(key).chunk(UPLOAD_BLOCK_SIZE),
+            options
+        )
+        .await
+        .map_err(storage_error)?;
 
         let mut written: u64 = 0;
         while let Some(chunk) = stream.next().await {
