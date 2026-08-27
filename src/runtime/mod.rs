@@ -13,6 +13,10 @@ pub use context::{WorkerContext, WorkerContextError, WorkerContextNotConfigured}
 #[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
 pub mod native;
 
+/// The native queue-consumer runtime that drives `#[skyzen::queue]` off the edge.
+#[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
+pub mod consumer;
+
 /// Native test runtime utilities used by `#[skyzen::test]`.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod testing;

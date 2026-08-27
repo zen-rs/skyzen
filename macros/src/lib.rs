@@ -3,8 +3,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use skyzen_manifest::{
-    DatabaseEntry, DatabaseType, Manifest, NativeDatabaseBackend, NativeServiceBackend,
-    ServiceEntry, ServiceType, SkyzenManifest,
+    DatabaseEntry, DatabaseType, Manifest, NativeDatabaseBackend, NativeQueueConsumer,
+    NativeServiceBackend, ServiceEntry, ServiceType, SkyzenManifest,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -47,15 +47,24 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! { #entry_ident() }
     };
-    let portable_injection_wrap_steps = match portable_injection_wrap_steps() {
-        Ok(steps) => steps,
+    let wiring = match portable_injection_wrap_steps() {
+        Ok(wiring) => wiring,
         Err(error) => return error.to_compile_error().into(),
     };
+    let PortableWiring { steps, consumers } = wiring;
+    // Natively the factory yields the endpoint *and* the queue consumers, both built from the one
+    // set of service instances; on wasm the platform owns event delivery, so it yields only the
+    // endpoint and this whole arm is stripped.
     let factory_body = quote! {
         async move {
             let endpoint = #entry_call;
-            #(#portable_injection_wrap_steps)*
-            endpoint
+            #(#steps)*
+            {
+                #[cfg(not(target_arch = "wasm32"))]
+                { (endpoint, #consumers) }
+                #[cfg(target_arch = "wasm32")]
+                { endpoint }
+            }
         }
     };
     let native_factory = factory_body.clone();
@@ -88,6 +97,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         #function
 
         #[cfg(not(target_arch = "wasm32"))]
+        #[allow(clippy::redundant_clone)]
         fn main() {
             #init_logging
             let __skyzen_listen_addr =
@@ -210,7 +220,24 @@ pub fn openapi(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// Export a Cloudflare queue consumer entrypoint on wasm targets.
+/// Export a queue consumer entrypoint: the Cloudflare `queue` handler on wasm targets, and the
+/// handler Skyzen's own polling loop drives natively.
+///
+/// # Dual-target consumption
+///
+/// On wasm the platform pushes a batch into the exported `queue` handler. Natively there is no
+/// platform to do that, so `[[native.queue_consumer]]` entries in `Skyzen.toml` tell
+/// `#[skyzen::main]` to run the loop itself — receive, invoke this function, settle — against the
+/// portable `[[service]]` they name.
+///
+/// A native consumer needs a handler it can call with nothing but a batch, so with native
+/// consumers declared the annotated function must take exactly one argument, `QueueBatch<T>`. The
+/// wasm-only extras (`Env`, `CfEventContext`, `CfQueueBatch`) have no native counterpart and are
+/// rejected rather than silently ignored.
+///
+/// The generated glue is referenced by `#[skyzen::main]`, so the two must sit in the same module
+/// — the crate root, for the usual `main.rs` or `lib.rs`. A handler that lives elsewhere is
+/// reachable with a `use` of the generated `__SkyzenNativeQueueHandler` next to `#[skyzen::main]`.
 #[proc_macro_attribute]
 pub fn queue(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args =
@@ -2162,20 +2189,36 @@ fn manifest_tracking_tokens() -> proc_macro2::TokenStream {
     }
 }
 
-fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>> {
+/// What `#[skyzen::main]` inserts between building the endpoint and launching it.
+struct PortableWiring {
+    /// One group of statements per manifest entry: bind the service, then wrap the endpoint with
+    /// the middleware that injects it.
+    steps: Vec<proc_macro2::TokenStream>,
+    /// The `ConsumerSet` the native runtime is launched with — `()` when the manifest declares no
+    /// `[[native.queue_consumer]]`.
+    consumers: proc_macro2::TokenStream,
+}
+
+fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
+    let empty = PortableWiring {
+        steps: Vec::new(),
+        consumers: quote! { () },
+    };
+
     let Some(manifest) = load_manifest()? else {
-        return Ok(Vec::new());
+        return Ok(empty);
     };
 
     let services = &manifest.service;
     let databases = &manifest.database;
     if services.is_empty() && databases.is_empty() {
-        return Ok(Vec::new());
+        return Ok(empty);
     }
     let default_database = default_database_index(databases)?;
 
     let mut steps = Vec::with_capacity(services.len() + databases.len() + 1);
     let service_type_counts = service_type_counts(services);
+    let mut service_bindings = HashMap::new();
 
     // On wasm, `__skyzen_wasm_env` is bound by the factory closure parameter generated in
     // `#[skyzen::main]`; the environment is threaded explicitly rather than read from a
@@ -2183,41 +2226,184 @@ fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>>
 
     for service in services {
         let ident = service_ident_from_name(&service.name)?;
+        let binding = service_binding_ident(&ident);
         let native_init = generate_native_service_init(service, &manifest)?;
         let cloudflare_init = generate_cloudflare_service_init(service, &manifest);
         // The bare `Kv`/`Storage`/`Queue` extractor names whichever service of that type is the
         // only one, so it is injected exactly when the type is unambiguous.
         let inject_bare = service_type_counts[&service.service_type] == 1;
-        let native = named_injection_tokens(&ident, &native_init, inject_bare);
-        let cloudflare = named_injection_tokens(&ident, &cloudflare_init, inject_bare);
-        steps.push(quote! {
-            let endpoint = {
-                #[cfg(not(target_arch = "wasm32"))]
-                { #native }
-                #[cfg(target_arch = "wasm32")]
-                { #cloudflare }
-            };
-        });
+        steps.push(named_injection_tokens(
+            &binding,
+            &ident,
+            &native_init,
+            &cloudflare_init,
+            inject_bare,
+        ));
+        service_bindings.insert(service.name.clone(), binding);
     }
 
     for (index, database) in databases.iter().enumerate() {
         let ident = database_ident_from_name(&database.name)?;
+        let binding = service_binding_ident(&ident);
         let native_init = generate_native_database_init(database, &manifest);
         let cloudflare_init = generate_cloudflare_database_init(database, &manifest);
         let inject_bare = default_database == Some(index);
-        let native = named_injection_tokens(&ident, &native_init, inject_bare);
-        let cloudflare = named_injection_tokens(&ident, &cloudflare_init, inject_bare);
-        steps.push(quote! {
-            let endpoint = {
-                #[cfg(not(target_arch = "wasm32"))]
-                { #native }
-                #[cfg(target_arch = "wasm32")]
-                { #cloudflare }
-            };
+        steps.push(named_injection_tokens(
+            &binding,
+            &ident,
+            &native_init,
+            &cloudflare_init,
+            inject_bare,
+        ));
+    }
+
+    let consumers = queue_consumer_tokens(&manifest, &service_bindings)?;
+
+    Ok(PortableWiring { steps, consumers })
+}
+
+/// The local binding that holds one manifest entry's service for the length of the factory.
+///
+/// The service is built **once** and cloned into the middleware and into any consumer that reads
+/// it: building it twice would give an in-memory backend two unrelated instances, so a message
+/// enqueued through the injected `Queue` would never reach the consumer polling "the same" queue.
+fn service_binding_ident(ident: &proc_macro2::Ident) -> proc_macro2::Ident {
+    format_ident!("__skyzen_service_{}", ident.to_string().to_lowercase())
+}
+
+/// Build the `QueueConsumers` value for every `[[native.queue_consumer]]` entry.
+///
+/// Everything the runtime would otherwise have to re-check — that the named service exists, is a
+/// queue, is declared once, and that the retry delay fits the portable `QueueRetry` — is settled
+/// here, at compile time.
+fn queue_consumer_tokens(
+    manifest: &SkyzenManifest,
+    service_bindings: &HashMap<String, proc_macro2::Ident>,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let consumers = native_queue_consumers(manifest);
+    if consumers.is_empty() {
+        return Ok(quote! { () });
+    }
+
+    let mut claimed = HashSet::new();
+    let mut entries = Vec::with_capacity(consumers.len());
+
+    for consumer in consumers {
+        let service = manifest
+            .service
+            .iter()
+            .find(|service| service.name == consumer.service)
+            .ok_or_else(|| {
+                Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "[[native.queue_consumer]] names `{}`, which is not a [[service]] in this manifest",
+                        consumer.service
+                    ),
+                )
+            })?;
+
+        if service.service_type != ServiceType::Queue {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "[[native.queue_consumer]] can only consume a queue, but service `{}` is of type `{}`",
+                    consumer.service,
+                    service.service_type.as_str()
+                ),
+            ));
+        }
+
+        if !claimed.insert(consumer.service.clone()) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "[[native.queue_consumer]] declares `{}` twice; raise `concurrency` on the one entry instead",
+                    consumer.service
+                ),
+            ));
+        }
+
+        let binding = service_bindings.get(&consumer.service).ok_or_else(|| {
+            Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "[[native.queue_consumer]] names `{}`, which has no generated binding",
+                    consumer.service
+                ),
+            )
+        })?;
+
+        let name = LitStr::new(&consumer.service, proc_macro2::Span::call_site());
+        let concurrency = consumer.concurrency.get();
+        let batch_size = consumer.batch_size.get();
+        let poll_wait = duration_tokens(consumer.poll_wait);
+        let visibility_timeout = consumer.visibility_timeout.map_or_else(
+            || quote! { ::core::option::Option::None },
+            |timeout| {
+                let timeout = duration_tokens(timeout);
+                quote! { ::core::option::Option::Some(#timeout) }
+            },
+        );
+        let retry_seconds = retry_delay_seconds(consumer)?;
+
+        entries.push(quote! {
+            (
+                ::skyzen::runtime::consumer::ConsumerConfig {
+                    queue: ::std::string::String::from(#name),
+                    concurrency: ::core::num::NonZeroUsize::new(#concurrency)
+                        .expect("the manifest rejects a zero concurrency"),
+                    batch_size: ::core::num::NonZeroUsize::new(#batch_size)
+                        .expect("the manifest rejects a zero batch size"),
+                    poll_wait: #poll_wait,
+                    visibility_timeout: #visibility_timeout,
+                    default_retry: ::skyzen_services::QueueRetry::new()
+                        .with_delay_seconds(#retry_seconds),
+                },
+                ::std::clone::Clone::clone(&#binding),
+            )
         });
     }
 
-    Ok(steps)
+    Ok(quote! {
+        ::skyzen::runtime::consumer::QueueConsumers::new(
+            __SkyzenNativeQueueHandler,
+            ::std::vec![#(#entries),*],
+        )
+    })
+}
+
+/// A `Duration` literal, always exactly the value the manifest parsed.
+fn duration_tokens(duration: core::time::Duration) -> proc_macro2::TokenStream {
+    let seconds = duration.as_secs();
+    let nanos = duration.subsec_nanos();
+    quote! { ::core::time::Duration::new(#seconds, #nanos) }
+}
+
+/// The retry delay in the whole seconds the portable [`QueueRetry`] carries.
+///
+/// A sub-second delay is rejected rather than rounded: the portable retry has no finer unit, so
+/// silently turning `"250ms"` into "no delay" would make the manifest lie about redelivery.
+fn retry_delay_seconds(consumer: &NativeQueueConsumer) -> syn::Result<u32> {
+    if consumer.retry_delay.subsec_nanos() != 0 {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "[[native.queue_consumer]] `{}` sets a `retry_delay` finer than a second; queue retries are delayed in whole seconds",
+                consumer.service
+            ),
+        ));
+    }
+
+    u32::try_from(consumer.retry_delay.as_secs()).map_err(|_| {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "[[native.queue_consumer]] `{}` sets a `retry_delay` longer than a queue retry can express",
+                consumer.service
+            ),
+        )
+    })
 }
 
 /// How many `[[service]]` entries each service type has.
@@ -2232,30 +2418,44 @@ fn service_type_counts(services: &[ServiceEntry]) -> HashMap<ServiceType, usize>
     counts
 }
 
-/// Wrap the router with one manifest entry's middleware.
+/// Bind one manifest entry's service and wrap the router with the middleware that injects it.
+///
+/// The service lands in a named local rather than a temporary so that everything needing it —
+/// the newtype middleware, the bare wrapper, a queue consumer — shares the one instance.
 ///
 /// The named newtype is always installed. `inject_bare` additionally installs the portable wrapper
 /// itself, which is what makes `async fn h(kv: Kv)` work when the manifest declares exactly one
 /// service of that type (or the default database).
 fn named_injection_tokens(
+    binding: &proc_macro2::Ident,
     ident: &proc_macro2::Ident,
-    init: &proc_macro2::TokenStream,
+    native_init: &proc_macro2::TokenStream,
+    cloudflare_init: &proc_macro2::TokenStream,
     inject_bare: bool,
 ) -> proc_macro2::TokenStream {
-    if inject_bare {
+    let bare = if inject_bare {
         quote! {
-            let __service = #init;
             let endpoint = ::skyzen::__private::with_middleware(
                 endpoint,
-                #ident::new(::std::clone::Clone::clone(&__service)),
+                ::std::clone::Clone::clone(&#binding),
             );
-            ::skyzen::__private::with_middleware(endpoint, __service)
         }
     } else {
-        quote! {
-            let __service = #init;
-            ::skyzen::__private::with_middleware(endpoint, #ident::new(__service))
-        }
+        quote! {}
+    };
+
+    quote! {
+        let #binding = {
+            #[cfg(not(target_arch = "wasm32"))]
+            { #native_init }
+            #[cfg(target_arch = "wasm32")]
+            { #cloudflare_init }
+        };
+        let endpoint = ::skyzen::__private::with_middleware(
+            endpoint,
+            #ident::new(::std::clone::Clone::clone(&#binding)),
+        );
+        #bare
     }
 }
 
@@ -2265,6 +2465,15 @@ fn named_injection_tokens(
 /// `Ok(None)` rather than an error. Everything else (unreadable, malformed, unknown key,
 /// unsupported `type`) is a compile error, reported at the macro's call site.
 fn load_manifest() -> syn::Result<Option<SkyzenManifest>> {
+    Ok(load_manifest_document()?.map(|manifest| manifest.data().clone()))
+}
+
+/// Read the project's `Skyzen.toml`, keeping the resolved environment overlays.
+///
+/// [`load_manifest`] is enough for wiring, which only ever reads the base document; the whole
+/// document is needed to answer questions about *any* environment, such as whether a queue
+/// handler is consumed somewhere.
+fn load_manifest_document() -> syn::Result<Option<Manifest>> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|error| {
         Error::new(
             proc_macro2::Span::call_site(),
@@ -2277,8 +2486,37 @@ fn load_manifest() -> syn::Result<Option<SkyzenManifest>> {
     }
 
     Manifest::load(&config_path)
-        .map(|manifest| Some(manifest.data().clone()))
+        .map(Some)
         .map_err(|error| Error::new(proc_macro2::Span::call_site(), error.to_string()))
+}
+
+/// The `[[native.queue_consumer]]` entries the manifest declares.
+fn native_queue_consumers(manifest: &SkyzenManifest) -> &[NativeQueueConsumer] {
+    manifest
+        .native
+        .as_ref()
+        .map_or(&[], |native| native.queue_consumer.as_slice())
+}
+
+/// Whether *any* target consumes the queue handler this crate declares.
+///
+/// Cloudflare consumers can be declared in an environment overlay alone, so every resolved
+/// environment is consulted rather than only the base document — otherwise a Worker that consumes
+/// `jobs` in staging only would be told its handler is unreachable.
+fn queue_handler_is_consumed(manifest: &Manifest) -> bool {
+    if !native_queue_consumers(manifest.data()).is_empty() {
+        return true;
+    }
+
+    core::iter::once(None)
+        .chain(manifest.environment_names().map(Some))
+        .any(|environment| {
+            manifest
+                .cloudflare(environment)
+                .ok()
+                .flatten()
+                .is_some_and(|cloudflare| !cloudflare.queues.consumers.is_empty())
+        })
 }
 
 /// The `[native.service.<name>]` wiring for one portable service.
@@ -2672,6 +2910,74 @@ impl CloudflareEventKind {
     }
 }
 
+/// The native half of `#[skyzen::queue]`: the handler the polling loop calls.
+///
+/// Emitted only when the manifest declares `[[native.queue_consumer]]` entries, which is exactly
+/// when `#[skyzen::main]` references it. A wasm-only Worker therefore expands byte for byte as it
+/// did before native consumption existed.
+fn native_queue_handler(
+    function: &ItemFn,
+    internal_ident: &proc_macro2::Ident,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let arguments = &function.sig.inputs;
+    let [FnArg::Typed(batch)] = arguments.iter().collect::<Vec<_>>()[..] else {
+        return Err(Error::new_spanned(
+            arguments,
+            "a #[skyzen::queue] handler driven by [[native.queue_consumer]] takes exactly one \
+             argument, `QueueBatch<T>`: `Env` and `CfEventContext` exist only on Cloudflare",
+        ));
+    };
+
+    let batch_type = &batch.ty;
+    if last_type_ident(batch_type)? != "QueueBatch" {
+        return Err(Error::new_spanned(
+            batch_type,
+            "a #[skyzen::queue] handler driven by [[native.queue_consumer]] must take \
+             `QueueBatch<T>`: `CfQueueBatch` wraps a Cloudflare message batch and has no native \
+             counterpart",
+        ));
+    }
+    let message_type = single_generic_type(batch_type)?;
+
+    let call = if function.sig.asyncness.is_some() {
+        quote! { #internal_ident(__skyzen_batch).await }
+    } else {
+        quote! { #internal_ident(__skyzen_batch) }
+    };
+
+    Ok(quote! {
+        /// The `#[skyzen::queue]` handler, as the native consumer runtime drives it.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[doc(hidden)]
+        #[derive(Debug, Clone, Copy)]
+        pub struct __SkyzenNativeQueueHandler;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        impl ::skyzen::runtime::consumer::QueueConsumer for __SkyzenNativeQueueHandler {
+            // An `async` block rather than an `async fn` so that a *synchronous* handler is still
+            // run lazily, when the driver polls the future inside its panic guard, rather than
+            // eagerly here — where a panicking handler would escape that guard. The lint would
+            // have this written as an `async fn`, which a synchronous handler then trips the
+            // opposite lint with, so the shape is pinned here rather than in every user's crate.
+            #[allow(clippy::manual_async_fn)]
+            fn handle(
+                &self,
+                __skyzen_batch: ::skyzen_services::QueueBatch<::std::vec::Vec<u8>>,
+            ) -> impl ::std::future::Future<
+                Output = ::std::result::Result<
+                    ::skyzen_services::QueueBatchDisposition,
+                    ::skyzen_services::BoxError,
+                >,
+            > + ::std::marker::Send {
+                async move {
+                    let __skyzen_batch = __skyzen_batch.decode_json::<#message_type>()?;
+                    ::skyzen::runtime::consumer::IntoQueueDisposition::into_queue_disposition(#call)
+                }
+            }
+        }
+    })
+}
+
 fn expand_cloudflare_event(
     mut function: ItemFn,
     kind: CloudflareEventKind,
@@ -2689,6 +2995,31 @@ fn expand_cloudflare_event(
     function.sig.ident = internal_ident.clone();
 
     let wrapper_ident = format_ident!("{export_name}");
+
+    // The native consumer glue and `#[skyzen::main]`'s reference to it are gated on the very same
+    // manifest question, which is what keeps a wasm-only Worker's expansion unchanged.
+    let native_glue = match kind {
+        CloudflareEventKind::Queue => {
+            let manifest = load_manifest_document()?;
+            match manifest {
+                Some(manifest) if !native_queue_consumers(manifest.data()).is_empty() => {
+                    native_queue_handler(&function, &internal_ident)?
+                }
+                Some(manifest) if !queue_handler_is_consumed(&manifest) => {
+                    return Err(Error::new_spanned(
+                        &function.sig.ident,
+                        "this #[skyzen::queue] handler is never invoked: declare the queue it \
+                         consumes as [[native.queue_consumer]] for native targets, or as \
+                         [[cloudflare.queues.consumers]] for Cloudflare",
+                    ));
+                }
+                _ => proc_macro2::TokenStream::new(),
+            }
+        }
+        CloudflareEventKind::Scheduled | CloudflareEventKind::Email | CloudflareEventKind::Tail => {
+            proc_macro2::TokenStream::new()
+        }
+    };
 
     let (wrapper_signature, wrapper_args) = build_cloudflare_event_wrapper(&function, kind)?;
 
@@ -2714,6 +3045,8 @@ fn expand_cloudflare_event(
 
     Ok(quote! {
         #function
+
+        #native_glue
 
         #[cfg(target_arch = "wasm32")]
         #[::skyzen::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::skyzen::wasm_bindgen)]
@@ -3105,10 +3438,10 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        DatabaseEntry, DatabaseType, ServiceType, SkyzenManifest, database_ident_from_name,
-        default_database_index, documented_extractor_payload, documented_response_payload,
-        first_generic_type, generate_cloudflare_database_init, generate_native_database_init,
-        generate_native_service_init, single_generic_type,
+        DatabaseEntry, DatabaseType, HashMap, ServiceType, SkyzenManifest,
+        database_ident_from_name, default_database_index, documented_extractor_payload,
+        documented_response_payload, first_generic_type, generate_cloudflare_database_init,
+        generate_native_database_init, generate_native_service_init, single_generic_type,
     };
     use quote::ToTokens;
     use skyzen_manifest::Manifest;
@@ -3452,19 +3785,159 @@ type = "storage"
 
     #[test]
     fn injection_installs_the_newtype_and_only_then_the_bare_wrapper() {
-        use super::named_injection_tokens;
+        use super::{named_injection_tokens, service_binding_ident};
         use quote::{format_ident, quote};
 
-        let init = quote! { ::skyzen_services::Kv::new(backend) };
+        let ident = format_ident!("Cache");
+        let binding = service_binding_ident(&ident);
+        let native = quote! { ::skyzen_services::Kv::new(backend) };
+        let cloudflare = quote! { ::skyzen_services::Kv::new(cf_backend) };
 
-        let unambiguous = named_injection_tokens(&format_ident!("Cache"), &init, true).to_string();
+        let unambiguous =
+            named_injection_tokens(&binding, &ident, &native, &cloudflare, true).to_string();
         assert!(unambiguous.contains("Cache :: new"));
+        // The service is bound once and cloned into each layer, never built twice.
+        assert!(unambiguous.contains("let __skyzen_service_cache"));
+        assert_eq!(unambiguous.matches("Kv :: new").count(), 2);
         // Both the newtype and the bare wrapper are layered on.
         assert_eq!(unambiguous.matches("with_middleware").count(), 2);
 
-        let ambiguous = named_injection_tokens(&format_ident!("Cache"), &init, false).to_string();
+        let ambiguous =
+            named_injection_tokens(&binding, &ident, &native, &cloudflare, false).to_string();
         assert!(ambiguous.contains("Cache :: new"));
         assert_eq!(ambiguous.matches("with_middleware").count(), 1);
+    }
+
+    #[test]
+    fn a_queue_consumer_expands_its_manifest_values_into_the_runtime_config() {
+        use super::{queue_consumer_tokens, service_binding_ident};
+        use quote::format_ident;
+
+        let manifest = manifest(
+            r#"[[service]]
+name = "jobs"
+type = "queue"
+
+[[native.queue_consumer]]
+service = "jobs"
+concurrency = 3
+batch_size = 7
+poll_wait = "5s"
+visibility_timeout = "1m"
+retry_delay = "45s"
+"#,
+        );
+        let bindings = HashMap::from([(
+            "jobs".to_owned(),
+            service_binding_ident(&format_ident!("Jobs")),
+        )]);
+
+        let tokens = queue_consumer_tokens(&manifest, &bindings)
+            .expect("the consumer is valid")
+            .to_string();
+
+        assert!(tokens.contains("QueueConsumers :: new"));
+        assert!(tokens.contains("__SkyzenNativeQueueHandler"));
+        assert!(tokens.contains("NonZeroUsize :: new (3usize)"));
+        assert!(tokens.contains("NonZeroUsize :: new (7usize)"));
+        assert!(tokens.contains("Duration :: new (5u64 , 0u32)"));
+        assert!(tokens.contains("Duration :: new (60u64 , 0u32)"));
+        assert!(tokens.contains("with_delay_seconds (45u32)"));
+        assert!(tokens.contains("& __skyzen_service_jobs"));
+    }
+
+    #[test]
+    fn an_application_with_no_consumers_launches_with_an_empty_consumer_set() {
+        use super::queue_consumer_tokens;
+
+        let manifest = manifest(
+            r#"[[service]]
+name = "jobs"
+type = "queue"
+"#,
+        );
+
+        let tokens = queue_consumer_tokens(&manifest, &HashMap::new())
+            .expect("no consumers is not an error")
+            .to_string();
+        assert_eq!(tokens, "()");
+    }
+
+    #[test]
+    fn a_queue_consumer_must_name_a_declared_queue_service() {
+        use super::queue_consumer_tokens;
+
+        let unknown = manifest(
+            r#"[[native.queue_consumer]]
+service = "jobs"
+"#,
+        );
+        let error = queue_consumer_tokens(&unknown, &HashMap::new())
+            .expect_err("an unknown service is refused");
+        assert!(error.to_string().contains("not a [[service]]"));
+
+        let wrong_type = manifest(
+            r#"[[service]]
+name = "jobs"
+type = "kv"
+
+[[native.queue_consumer]]
+service = "jobs"
+"#,
+        );
+        let error = queue_consumer_tokens(&wrong_type, &HashMap::new())
+            .expect_err("a non-queue service is refused");
+        assert!(error.to_string().contains("is of type `kv`"));
+    }
+
+    #[test]
+    fn one_queue_is_consumed_by_one_entry_however_concurrent_it_is() {
+        use super::{queue_consumer_tokens, service_binding_ident};
+        use quote::format_ident;
+
+        let manifest = manifest(
+            r#"[[service]]
+name = "jobs"
+type = "queue"
+
+[[native.queue_consumer]]
+service = "jobs"
+
+[[native.queue_consumer]]
+service = "jobs"
+concurrency = 2
+"#,
+        );
+        let bindings = HashMap::from([(
+            "jobs".to_owned(),
+            service_binding_ident(&format_ident!("Jobs")),
+        )]);
+
+        let error = queue_consumer_tokens(&manifest, &bindings)
+            .expect_err("a queue is consumed by one entry");
+        assert!(error.to_string().contains("declares `jobs` twice"));
+    }
+
+    #[test]
+    fn a_retry_delay_finer_than_the_portable_retry_is_refused_rather_than_rounded() {
+        use super::retry_delay_seconds;
+        use skyzen_manifest::NativeQueueConsumer;
+
+        let consumer = |retry_delay: &str| -> NativeQueueConsumer {
+            manifest(&format!(
+                "[[native.queue_consumer]]\nservice = \"jobs\"\nretry_delay = \"{retry_delay}\"\n"
+            ))
+            .native
+            .expect("native section")
+            .queue_consumer
+            .remove(0)
+        };
+
+        assert_eq!(retry_delay_seconds(&consumer("45s")).unwrap(), 45);
+        assert_eq!(retry_delay_seconds(&consumer("0s")).unwrap(), 0);
+
+        let error = retry_delay_seconds(&consumer("250ms")).unwrap_err();
+        assert!(error.to_string().contains("finer than a second"));
     }
 
     #[test]

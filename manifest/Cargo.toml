@@ -10,6 +10,7 @@ keywords = ["skyzen", "manifest", "config", "serverless"]
 categories = ["config", "development-tools"]
 
 [dependencies]
+humantime-serde = "1.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "1.0"
