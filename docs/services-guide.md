@@ -297,8 +297,9 @@ binding = "DB"
 `#[skyzen::main]` reads these declarations and injects the portable wrappers automatically. Provider SDK types stay in generated wiring; handlers keep using `Kv`, `Storage`, and `Db`.
 
 Every backend this guide covers can go in that `backend = …`, not only the three above — the
-`dynamodb`, `cosmos`, `blob`, `servicebus`, `storage-queue` and `rds-data` wirings are in the
-[Skyzen.toml reference](skyzen-toml-reference.md#native-service-wiring), with the keys each takes:
+`dynamodb`, `cosmos`, `blob`, `servicebus`, `storage-queue`, `azure-sql` and `rds-data` wirings are
+in the [Skyzen.toml reference](skyzen-toml-reference.md#native-service-wiring), with the keys each
+takes:
 
 ```toml
 [native.service.sessions]
@@ -312,6 +313,10 @@ container = "uploads"       # connection_env defaults to AZURE_STORAGE_CONNECTIO
 [native.service.jobs]
 backend = "storage-queue"
 sas_url_env = "JOBS_SAS_URL"
+
+[native.database.main]
+backend = "azure-sql"
+url_env = "AZURE_SQL_CONNECTION_STRING"   # the ADO.NET connection string, not a URL
 ```
 
 ### One Extractor Per Declared Instance
@@ -400,7 +405,7 @@ Runtime and provider are independent axes, so a backend that is a plain HTTP cli
 
 Every backend in this table can be declared in `Skyzen.toml` rather than constructed by hand:
 `redis`, `dynamodb`, `cosmos`, `s3`, `blob`, `sqs`, `servicebus`, `storage-queue` and `memory` for
-services, `postgres`, `mysql`, `sqlite` and `rds-data` for databases. See the
+services, `postgres`, `mysql`, `sqlite`, `azure-sql` and `rds-data` for databases. See the
 [Skyzen.toml reference](skyzen-toml-reference.md#native-service-wiring) for the keys each one
 takes. Writing the constructor yourself stays available, and is what the options a wiring does not
 model need — a FIFO SQS queue, a `DynamoDB` table keyed on something other than `pk`, an Entra ID
@@ -409,8 +414,10 @@ credential in place of a connection string.
 On Azure, which `Db` you want depends on which database it is. Azure Database for PostgreSQL and
 Azure Database for MySQL speak the wire protocols sqlx already speaks, so they are a native
 `[[database]]` and need nothing from `skyzen-azure`. **Azure SQL** speaks T-SQL over TDS, which sqlx
-has no driver for, and is what `AzureSqlDb` exists for. Cosmos DB is not SQL here at all — it is
-wired as a key-value store.
+has no driver for, and is what `AzureSqlDb` exists for — declared as
+`[native.database.<name>] backend = "azure-sql"`, whose `url_env` names the variable holding the
+portal's ADO.NET connection string. Cosmos DB is not SQL here at all — it is wired as a key-value
+store.
 
 ### Dialects
 
