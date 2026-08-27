@@ -161,7 +161,7 @@ pub fn prepare(
         );
     }
 
-    let manifest = Manifest::load(manifest_path)?;
+    let manifest = load_or_empty(manifest_path)?;
     let project = Project::load(manifest.root_dir())?;
     capabilities::ensure_present(manifest.data(), &project)?;
 
@@ -171,6 +171,31 @@ pub fn prepare(
             cloudflare::prepare(action, &manifest, &project, environment, dry_run)
         }
     }
+}
+
+/// Load the manifest, or synthesize an empty one when the project has none.
+///
+/// `Skyzen.toml` is optional — an application can wire every service by hand in Rust, and the
+/// macros treat a missing file the same way — so `skyzen dev` has to work in a project that never
+/// had one. An empty manifest declares no capabilities and no environment variables, which is
+/// exactly right for the native path; the Cloudflare path then fails with "missing [cloudflare]
+/// section", which says what to do, rather than with a file-not-found.
+fn load_or_empty(manifest_path: &Path) -> Result<Manifest> {
+    if manifest_path.exists() {
+        return Ok(Manifest::load(manifest_path)?);
+    }
+
+    let absolute = if manifest_path.is_absolute() {
+        manifest_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to read the current directory")?
+            .join(manifest_path)
+    };
+    let root_dir = absolute
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    Ok(Manifest::parse("", &absolute, root_dir)?)
 }
 
 /// Run a provisioning pass, which owns its own manifest write-back rather than producing a plan.
@@ -450,6 +475,47 @@ mod tests {
         }
         .requires_cloud());
         assert!(!Action::Build { release: false }.requires_cloud());
+    }
+
+    #[test]
+    fn a_project_with_no_manifest_can_still_be_run_natively() {
+        // `Skyzen.toml` is optional — services can be wired by hand in Rust, and the macros treat
+        // a missing file as "nothing declared". Requiring one here would have broken every
+        // project that never had one.
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").expect("write main.rs");
+
+        let missing = dir.path().join("Skyzen.toml");
+        assert!(!missing.exists());
+
+        let plan = super::prepare(
+            &Action::Dev {
+                runner_args: Vec::new(),
+            },
+            &missing,
+            Some(Provider::Native),
+            None,
+            false,
+        )
+        .expect("native dev needs no manifest");
+        assert!(plan.commands[0].display().contains("cargo run"));
+
+        // The Cloudflare path still fails, but with the message that says what to add.
+        let error = super::prepare(
+            &Action::Deploy,
+            &missing,
+            Some(Provider::Cloudflare),
+            None,
+            false,
+        )
+        .expect_err("a Worker needs a [cloudflare] section");
+        assert!(error.to_string().contains("[cloudflare]"), "{error}");
     }
 
     #[test]
