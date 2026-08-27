@@ -31,7 +31,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use worker::send::IntoSendFuture;
 use worker_sys::{
-    FixedLengthStream, R2Bucket, R2MultipartUpload, R2Object, R2ObjectBody, R2UploadedPart,
+    FixedLengthStream, R2Bucket, R2MultipartUpload, R2Object, R2ObjectBody, R2Objects,
+    R2UploadedPart,
 };
 
 use skyzen_services::storage::{
@@ -354,6 +355,60 @@ pub enum CfR2ConditionalGet {
     NotFound,
 }
 
+/// What [`CfR2::list_with`] asks R2 for, beyond the portable [`ListOptions`].
+#[derive(Debug, Clone, Default)]
+pub struct CfR2ListOptions {
+    /// Only list keys starting with this prefix.
+    pub prefix: Option<String>,
+    /// Continuation token from a previous truncated listing.
+    pub cursor: Option<String>,
+    /// Maximum number of objects to return; R2 caps this at 1000.
+    pub limit: Option<usize>,
+    /// Roll keys up at this separator, usually `/`.
+    ///
+    /// Every key below `prefix` that still contains the delimiter is reported once, as a member of
+    /// [`CfR2ListResult::prefixes`], instead of appearing among the objects. That is how a flat
+    /// keyspace is browsed one level at a time.
+    pub delimiter: Option<String>,
+    /// Return each object's HTTP metadata (content type, encoding, disposition, cache headers).
+    pub include_http_metadata: bool,
+    /// Return each object's custom metadata, the user-defined key/value pairs stored with it.
+    pub include_custom_metadata: bool,
+}
+
+impl CfR2ListOptions {
+    /// Start from the portable [`ListOptions`], then add what only R2 offers.
+    #[must_use]
+    pub fn from_portable(options: ListOptions) -> Self {
+        Self {
+            prefix: options.prefix,
+            cursor: options.cursor,
+            limit: options.limit,
+            ..Self::default()
+        }
+    }
+}
+
+/// What [`CfR2::list_with`] returns: a page of objects, plus the prefixes it rolled up.
+#[derive(Debug, Clone)]
+pub struct CfR2ListResult {
+    /// The objects in this page.
+    ///
+    /// Their `content_type` and `metadata` are populated only when the listing asked for them
+    /// through [`CfR2ListOptions::include_http_metadata`] /
+    /// [`CfR2ListOptions::include_custom_metadata`]; otherwise R2 omits them and they read as
+    /// absent rather than empty.
+    pub objects: Vec<ObjectMetadata>,
+    /// The common prefixes a `delimiter` rolled up — the "directories" at this level.
+    ///
+    /// Always empty when the listing carried no delimiter.
+    pub prefixes: Vec<String>,
+    /// Continuation token for the next page, present only when [`truncated`](Self::truncated).
+    pub cursor: Option<String>,
+    /// Whether R2 has more objects to give beyond this page.
+    pub truncated: bool,
+}
+
 /// The preconditions R2's `onlyIf` can carry.
 ///
 /// An empty set makes the read unconditional. Combining several is allowed and the platform
@@ -466,6 +521,84 @@ impl CfR2 {
             body,
             metadata,
         })))
+    }
+
+    /// List a bucket the way R2 itself can, rather than the way every object store can.
+    ///
+    /// [`ObjectStorage::list`] is the portable listing: a flat page of objects. R2 adds two things
+    /// to that, and both change what a listing is *for*:
+    ///
+    /// - a **delimiter**, which turns a flat keyspace into one level of a tree — every key below
+    ///   `prefix` that still contains the delimiter collapses into a single entry in
+    ///   [`prefixes`](CfR2ListResult::prefixes) instead of being listed one by one;
+    /// - **`include`**, which asks the platform to return each object's HTTP metadata and custom
+    ///   metadata inline, so a listing that needs them costs one request rather than one `head`
+    ///   per object.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`] when the runtime rejects the listing or answers with a shape this binding
+    /// does not recognize.
+    pub async fn list_with(
+        &self,
+        options: CfR2ListOptions,
+    ) -> Result<CfR2ListResult, StorageError> {
+        let js_options = js_sys::Object::new();
+
+        if let Some(prefix) = &options.prefix {
+            set(&js_options, "prefix", &JsValue::from_str(prefix))?;
+        }
+        if let Some(cursor) = &options.cursor {
+            set(&js_options, "cursor", &JsValue::from_str(cursor))?;
+        }
+        if let Some(delimiter) = &options.delimiter {
+            set(&js_options, "delimiter", &JsValue::from_str(delimiter))?;
+        }
+        if let Some(limit) = options.limit {
+            #[allow(clippy::cast_precision_loss)]
+            // JS numbers are f64; a listing limit never approaches 2^53.
+            set(&js_options, "limit", &JsValue::from_f64(limit as f64))?;
+        }
+
+        let include = js_sys::Array::new();
+        if options.include_http_metadata {
+            include.push(&JsValue::from_str("httpMetadata"));
+        }
+        if options.include_custom_metadata {
+            include.push(&JsValue::from_str("customMetadata"));
+        }
+        if include.length() > 0 {
+            set(&js_options, "include", include.as_ref())?;
+        }
+
+        let promise = self.bucket.list(js_options.into()).map_err(js_err)?;
+        let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
+        let listing: R2Objects = result.unchecked_into();
+
+        let entries = listing.objects().map_err(js_err)?;
+        let mut objects = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            objects.push(object_metadata(entry)?);
+        }
+
+        // Delimited prefixes are the directories this listing rolled up. R2 reports them beside
+        // the objects rather than as entries, so walking a tree needs both halves.
+        let prefixes = listing
+            .delimited_prefixes()
+            .map_err(js_err)?
+            .iter()
+            .map(|prefix| prefix.as_string())
+            .collect::<Option<Vec<String>>>()
+            .ok_or_else(|| {
+                StorageError::backend("R2 returned a delimited prefix that is not a string")
+            })?;
+
+        Ok(CfR2ListResult {
+            objects,
+            prefixes,
+            cursor: listing.cursor().map_err(js_err)?,
+            truncated: listing.truncated().map_err(js_err)?,
+        })
     }
 
     /// Delete up to [`MAX_BULK_DELETE_KEYS`] keys in one round trip.

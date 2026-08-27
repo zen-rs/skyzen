@@ -67,6 +67,39 @@ extern "C" {
         callback: &js_sys::Function,
     ) -> Result<Promise, JsValue>;
 
+    /// Immediately reset the object, logging `reason` as a JavaScript `Error`. `options` carries
+    /// `{ retryAlarm }`; pass `JsValue::UNDEFINED` for the runtime's default.
+    #[wasm_bindgen(method, catch, js_name = abort)]
+    pub fn abort(
+        this: &DurableObjectStateExt,
+        reason: &str,
+        options: &JsValue,
+    ) -> Result<(), JsValue>;
+
+    /// `DurableObjectStorage`, seen through the option-taking overloads missing from `worker-sys`.
+    ///
+    /// `worker-sys` binds `put(key, value)` and `delete(key)` without their options argument, so
+    /// the write flags the platform documents are unreachable through it.
+    #[wasm_bindgen(extends = js_sys::Object)]
+    pub type DurableObjectStorageExt;
+
+    /// `put(key, value, options)`, where `options` carries the documented write flags.
+    #[wasm_bindgen(method, catch, js_name = put)]
+    pub fn put_with_options(
+        this: &DurableObjectStorageExt,
+        key: &str,
+        value: &JsValue,
+        options: &JsValue,
+    ) -> Result<Promise, JsValue>;
+
+    /// `delete(key, options)`, resolving to whether the key existed.
+    #[wasm_bindgen(method, catch, js_name = delete)]
+    pub fn delete_with_options(
+        this: &DurableObjectStorageExt,
+        key: &str,
+        options: &JsValue,
+    ) -> Result<Promise, JsValue>;
+
     /// `DurableObjectNamespace`, seen through the methods missing from `worker-sys`.
     #[wasm_bindgen(extends = js_sys::Object)]
     pub type DurableObjectNamespaceExt;

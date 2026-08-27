@@ -19,6 +19,22 @@ use super::{
     websocket::{clone_state, CfDurableConnections, SendSyncDurableState},
 };
 
+/// How [`CfDurableState::abort_with`] resets the object.
+#[derive(Debug, Clone, Copy)]
+pub struct AbortOptions {
+    /// Whether an alarm the reset interrupted is retried afterwards.
+    ///
+    /// Defaults to `true`, which is the runtime's own behaviour. Set it to `false` when the alarm
+    /// is what put the object into the state being aborted, so the retry does not repeat it.
+    pub retry_alarm: bool,
+}
+
+impl Default for AbortOptions {
+    fn default() -> Self {
+        Self { retry_alarm: true }
+    }
+}
+
 /// Cloudflare Durable Object state wrapper.
 pub struct CfDurableState {
     state: worker_sys::DurableObjectState,
@@ -127,6 +143,87 @@ impl CfDurableState {
             .await
             .map_err(runtime_err)?;
         Ok(())
+    }
+
+    /// Hand `work` to the runtime alongside the current event.
+    ///
+    /// # This is not `WorkerContext::wait_until`
+    ///
+    /// On a plain Worker, `waitUntil` is what keeps the isolate alive past the response. On a
+    /// Durable Object it does neither: Cloudflare documents the method as existing "for API
+    /// compatibility with Workers Runtime APIs" and says it "has no effect in Durable Objects. It
+    /// does not extend the lifetime of a Durable Object or affect when a request or RPC
+    /// completes", because "Durable Objects automatically remain active as long as there is
+    /// ongoing work or pending I/O".
+    ///
+    /// So this wrapper is for code that must call the platform method — usually because it is
+    /// shared with a Worker path — and not a way to schedule background work. Work spawned from a
+    /// Durable Object already outlives the response on its own.
+    ///
+    /// See <https://developers.cloudflare.com/durable-objects/api/state/>.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableObjectError::Runtime`] if the runtime rejects the call.
+    pub fn wait_until<F>(&self, work: F) -> Result<(), DurableObjectError>
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        let promise = future_to_promise(async move {
+            work.await;
+            Ok(JsValue::UNDEFINED)
+        });
+        self.state.wait_until(&promise).map_err(runtime_err)
+    }
+
+    /// Immediately reset this Durable Object, logging `reason` as the error that caused it.
+    ///
+    /// The runtime tears the object down and rebuilds it on the next request: in-memory state is
+    /// discarded and in-flight work is abandoned. That is the point — it is the escape hatch for
+    /// an object that has reached a state it cannot serve from, where continuing would serve
+    /// wrong answers rather than none.
+    ///
+    /// Uses the platform's default alarm behaviour, under which an alarm interrupted by the abort
+    /// is retried. Use [`abort_with`](Self::abort_with) to say otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableObjectError::Runtime`] if the state handle does not expose `abort` or the
+    /// runtime rejects the call.
+    pub fn abort(&self, reason: &str) -> Result<(), DurableObjectError> {
+        let state: &ffi::DurableObjectStateExt = self.state.unchecked_ref();
+        state
+            .abort(reason, &JsValue::UNDEFINED)
+            .map_err(runtime_err)
+    }
+
+    /// Reset this Durable Object, choosing what happens to an alarm the reset interrupts.
+    ///
+    /// Cloudflare's guidance is to pass `retry_alarm = false` "on any abort call that should
+    /// prevent an interrupted alarm from retrying, including abort calls outside the alarm
+    /// handler" — an alarm that aborted the object once will do it again on retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableObjectError::Runtime`] if the state handle does not expose `abort` or the
+    /// runtime rejects the call.
+    pub fn abort_with(
+        &self,
+        reason: &str,
+        options: AbortOptions,
+    ) -> Result<(), DurableObjectError> {
+        let js_options = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &js_options,
+            &JsValue::from_str("retryAlarm"),
+            &JsValue::from_bool(options.retry_alarm),
+        )
+        .map_err(runtime_err)?;
+
+        let state: &ffi::DurableObjectStateExt = self.state.unchecked_ref();
+        state
+            .abort(reason, js_options.as_ref())
+            .map_err(runtime_err)
     }
 
     /// Build the websocket connections extractor wrapper.

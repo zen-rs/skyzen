@@ -111,33 +111,38 @@
 //!
 //! let routes = Route::new((
 //!     "/chat".ws(|mut socket| async move {
-//!         while let Some(Ok(message)) = socket.next().await {
-//!             if let Some(text) = message.into_text() {
-//!                 let _ = socket.send_text(text).await;
+//!         while let Some(message) = socket.next().await {
+//!             if let Some(text) = message?.into_text() {
+//!                 socket.send_text(text).await?;
 //!             }
 //!         }
+//!         Ok::<_, skyzen::Error>(())
 //!     }),
 //! ));
 //! ```
-//! The `.ws` builder enforces the HTTP upgrade requirements automatically.
+//! The `.ws` builder enforces the HTTP upgrade requirements automatically. A session that returns
+//! an error is logged and closed with
+//! [`websocket::INTERNAL_ERROR`](crate::websocket::INTERNAL_ERROR); a session that returns `()`
+//! keeps the older, quieter behaviour. The same route compiles on `wasm32`, where session futures
+//! hold JS handles and are never `Send`.
 //!
 //! Middleware is applied from the outermost route to the innermost endpoint, so errors bubble up
 //! until they are handled.
 
-#[cfg(feature = "ws")]
-use std::future::Future;
 use std::{fmt, sync::Arc};
 
 #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
 use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "ws")]
-use crate::websocket::{WebSocket, WebSocketUpgrade};
+use crate::websocket::{MaybeSend, MaybeSync, WebSocket};
 use crate::{handler, handler::Handler, middleware::Middleware, openapi, openapi::OpenApi};
 use http_kit::endpoint::AnyEndpoint;
 use http_kit::{Endpoint, Method};
 use skyzen_core::{
     middleware::boxed, middleware::BoxMiddleware, Extractor, Requirement, Responder,
 };
+#[cfg(feature = "ws")]
+use std::future::Future;
 
 /// Type alias for dynamically dispatched endpoints stored in the routing tree.
 pub type BoxEndpoint = AnyEndpoint;
@@ -714,18 +719,18 @@ impl RouteNode {
     }
 
     /// Attach a WebSocket handler that performs the upgrade under the current path.
+    ///
+    /// See [`CreateRouteNode::ws`] for what a session may return and what the framework does with
+    /// it.
     #[cfg(feature = "ws")]
     #[must_use]
-    pub fn ws<F, Fut>(self, handler: F) -> Self
+    pub fn ws<F, Fut>(self, session: F) -> Self
     where
-        F: Fn(WebSocket) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + MaybeSync + 'static,
+        Fut: Future + MaybeSend + 'static,
+        Fut::Output: crate::websocket::IntoWebSocketOutcome + 'static,
     {
-        let builder = move |upgrade: WebSocketUpgrade| {
-            let callback = handler.clone();
-            async move { upgrade.on_upgrade(callback) }
-        };
-        self.at(builder)
+        self.at(crate::websocket::session_handler(session))
     }
 
     fn with_handler<H, T, R>(self, method: MethodFilter, handler: H) -> Self
@@ -1072,17 +1077,37 @@ pub trait CreateRouteNode: Sized {
         E: Endpoint + Clone + Send + Sync + 'static;
 
     /// Attach a WebSocket handler that automatically performs the upgrade handshake.
+    ///
+    /// The session owns the socket until it returns. Returning `()` says only that it ended;
+    /// returning `Result<(), E>` — for any `E` that converts into [`Error`](crate::Error),
+    /// [`WebSocketError`](crate::websocket::WebSocketError) included — lets the session use `?`
+    /// and hand back whatever stopped it. The framework logs that error with its whole `source()`
+    /// chain and closes the connection with
+    /// [`websocket::INTERNAL_ERROR`](crate::websocket::INTERNAL_ERROR).
+    ///
+    /// ```no_run
+    /// use futures_util::StreamExt;
+    /// use skyzen::routing::{CreateRouteNode, Route};
+    ///
+    /// let routes = Route::new((
+    ///     "/chat".ws(|mut socket| async move {
+    ///         while let Some(message) = socket.next().await {
+    ///             if let Some(text) = message?.into_text() {
+    ///                 socket.send_text(text).await?;
+    ///             }
+    ///         }
+    ///         Ok::<_, skyzen::Error>(())
+    ///     }),
+    /// ));
+    /// ```
     #[cfg(feature = "ws")]
-    fn ws<F, Fut>(self, handler: F) -> RouteNode
+    fn ws<F, Fut>(self, session: F) -> RouteNode
     where
-        F: Fn(WebSocket) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + MaybeSync + 'static,
+        Fut: Future + MaybeSend + 'static,
+        Fut::Output: crate::websocket::IntoWebSocketOutcome + 'static,
     {
-        let builder = move |upgrade: WebSocketUpgrade| {
-            let callback = handler.clone();
-            async move { upgrade.on_upgrade(callback) }
-        };
-        self.at(builder)
+        self.at(crate::websocket::session_handler(session))
     }
 }
 
