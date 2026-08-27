@@ -301,9 +301,11 @@ mod tests {
         files: &'a [(PathBuf, serde_json::Value)],
         name: &str,
     ) -> &'a serde_json::Value {
+        // `Path::ends_with` compares whole components, so a `/`-separated `name` matches the
+        // platform separator on Windows too — a string `contains` would not.
         &files
             .iter()
-            .find(|(path, _)| path.to_string_lossy().contains(name))
+            .find(|(path, _)| path.ends_with(name))
             .unwrap_or_else(|| panic!("no {name} in the bundle"))
             .1
     }
