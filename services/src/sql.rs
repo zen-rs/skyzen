@@ -13,11 +13,14 @@
 //!     .await?;
 //! ```
 //!
-//! Skyzen rewrites each `?` into the backend's native form (`$1`, `$2`, … for
-//! `PostgreSQL`) before execution. `$1`-style placeholders are **not**
-//! recognized: they are passed through verbatim and are not counted, so a
-//! query using them fails the placeholder/parameter count check. A `?` inside
-//! a string literal or comment is never treated as a placeholder.
+//! Skyzen rewrites each `?` into the backend's native form before execution —
+//! `$1`, `$2`, … for `PostgreSQL`, `@P1`, `@P2`, … for Azure SQL / SQL Server.
+//! Native-form placeholders are **not** recognized on the way in: a `$1` or an
+//! `@P1` written by the caller is passed through verbatim and is not counted,
+//! so a query using them fails the placeholder/parameter count check — and on
+//! `DbDialect::Mssql` a hand-written `@P1` additionally collides with the name
+//! the rewriter generates for the first `?`. A `?` inside a string literal or
+//! comment is never treated as a placeholder.
 //!
 //! # Native drivers
 //!
@@ -26,6 +29,9 @@
 //! constructors such as [`Db::connect_sqlite`] only exist on non-wasm targets
 //! with the matching feature enabled; on wasm32 targets, use a platform
 //! backend (e.g. Cloudflare D1) instead.
+//!
+//! sqlx has no T-SQL driver, so [`DbDialect::Mssql`] has no constructor here: Azure SQL and SQL
+//! Server are reached through `skyzen_azure::AzureSqlDb`, which is built on `tiberius`.
 //!
 //! # Rows travel as JSON, and what that costs
 //!
@@ -59,7 +65,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlparser::{
-    dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
+    dialect::{Dialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     keywords::Keyword,
     tokenizer::{Location, Token, TokenWithSpan, Tokenizer},
 };
@@ -254,8 +260,15 @@ pub enum DbValue {
     /// `SQLite` has no decimal type and sqlx has no `SQLite` encoder for one, so on that backend
     /// the value is bound as its decimal `TEXT` rendering. Comparisons against it are then string
     /// comparisons, which is a real difference in behaviour, not just in storage.
+    ///
+    /// T-SQL's `DECIMAL` tops out at 38 digits of precision, so a value needing more is refused by
+    /// the Azure SQL backend rather than being silently rounded.
     Decimal(BigDecimal),
     /// A JSON document, bound as `JSON` / `JSONB` where the backend has one.
+    ///
+    /// SQL Server has no such column type in the versions this targets — JSON lives in `nvarchar`
+    /// and is read with `JSON_VALUE` / `OPENJSON` — so on [`DbDialect::Mssql`] the document binds
+    /// as its serialized text.
     Json(serde_json::Value),
 }
 
@@ -419,14 +432,25 @@ impl BatchStatement {
 }
 
 /// SQL dialect expected by a backend.
+///
+/// A dialect settles three things the portable query API has to get right: how a `?` placeholder is
+/// rendered, which tokenizer decides what is a literal and what is syntax, and how a statement is
+/// bounded to one row. The first three variants agree on the last of those — `LIMIT 1` — and
+/// [`Mssql`](Self::Mssql) does not, which is the whole reason this is an enum the rewriter matches
+/// on rather than a flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbDialect {
-    /// `PostgreSQL` syntax and placeholder rules.
+    /// `PostgreSQL` syntax and placeholder rules: `$1`, `$2`, … and `LIMIT 1`.
     Postgres,
-    /// `MySQL` syntax and placeholder rules.
+    /// `MySQL` syntax and placeholder rules: `?` and `LIMIT 1`.
     MySql,
-    /// `SQLite` syntax and placeholder rules.
+    /// `SQLite` syntax and placeholder rules: `?` and `LIMIT 1`.
     Sqlite,
+    /// T-SQL — Azure SQL and Microsoft SQL Server: `@P1`, `@P2`, … and `TOP (1)`.
+    ///
+    /// T-SQL has no `LIMIT`, brackets its identifiers (`[order]`), and writes unicode literals as
+    /// `N'…'`, so it needs its own tokenizer as well as its own placeholder form.
+    Mssql,
 }
 
 /// A unified SQL database backend.
@@ -594,9 +618,10 @@ impl Db {
     /// Start building a SQL query.
     ///
     /// Use `?` for every bind placeholder, on every backend — including
-    /// `PostgreSQL`, where Skyzen rewrites `?` to `$1`, `$2`, … before
-    /// execution. `$1`-style placeholders are **not** supported and will fail
-    /// the placeholder/parameter count check.
+    /// `PostgreSQL`, where Skyzen rewrites `?` to `$1`, `$2`, …, and Azure SQL,
+    /// where it rewrites `?` to `@P1`, `@P2`, … before execution. Native-form
+    /// placeholders are **not** supported and will fail the
+    /// placeholder/parameter count check.
     #[must_use]
     pub const fn query<'a>(&'a self, sql: &'a str) -> DbQuery<'a> {
         SqlQuery::new(self, Cow::Borrowed(sql))
@@ -898,10 +923,10 @@ impl<S: QuerySource> SqlQuery<'_, S> {
 
     /// Execute a query and deserialize the first row into `T`, if present.
     ///
-    /// A `LIMIT 1` is appended when the statement is a `SELECT` that does not already bound its
-    /// own result set, so the backend stops after the row that is actually used instead of
-    /// transferring and converting every match. See [`append_single_row_limit`] for exactly when
-    /// that applies.
+    /// A single-row bound — `LIMIT 1`, or `TOP (1)` on [`DbDialect::Mssql`] — is added when the
+    /// statement is a `SELECT` that does not already bound its own result set, so the backend stops
+    /// after the row that is actually used instead of transferring and converting every match. See
+    /// [`restrict_to_single_row`] for exactly when that applies.
     ///
     /// # Errors
     ///
@@ -913,7 +938,7 @@ impl<S: QuerySource> SqlQuery<'_, S> {
     {
         let dialect = self.source.dialect();
         let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), dialect)?;
-        let sql = append_single_row_limit(&sql, dialect)?;
+        let sql = restrict_to_single_row(&sql, dialect)?;
         let result = self.source.query(&sql, &self.params).await?;
         result
             .rows
@@ -960,6 +985,12 @@ pub(crate) fn prepare_query_sql(
                     rendered.push('$');
                     rendered.push_str(&expected_params.to_string());
                 }
+                // tiberius names a bound parameter `@P1`, `@P2`, …, and matches those names
+                // to the values by the order they were bound.
+                DbDialect::Mssql => {
+                    rendered.push_str("@P");
+                    rendered.push_str(&expected_params.to_string());
+                }
                 DbDialect::MySql | DbDialect::Sqlite => rendered.push('?'),
             }
             // A bind placeholder is always the single byte `?`. Its reported
@@ -987,24 +1018,53 @@ pub(crate) fn prepare_query_sql(
     Ok(rendered)
 }
 
-/// Append `LIMIT 1` to a statement whose caller only reads the first row.
+/// Bound a statement whose caller only reads the first row to a single row.
 ///
 /// `fetch_one` and `fetch_optional` otherwise pay for every matching row: the backend transfers
 /// them all and the converter turns each into a `serde_json::Value` before all but one is dropped.
-/// `LIMIT 1` is understood by all three dialects, so no dialect-specific rendering is needed —
-/// only the decision of whether appending it is safe, which is deliberately conservative:
+/// Three of the four dialects say this with a trailing `LIMIT 1`; T-SQL has no `LIMIT` and says it
+/// with a `TOP (1)` immediately after `SELECT` — see [`insert_top_one`], whose different shape is
+/// why the rewrite is not safe in quite the same places.
 ///
-/// - the statement must start with `SELECT` or `WITH`, so `INSERT ... RETURNING`, `CALL` and DDL
-///   are left alone;
+/// Whether bounding is safe at all is [`bounding_is_safe`]'s decision, and it is deliberately
+/// conservative: anything that fails a check is returned unchanged, which costs the optimization
+/// and nothing else.
+fn restrict_to_single_row(sql: &str, dialect: DbDialect) -> Result<Cow<'_, str>, DbError> {
+    let tokens = tokenize_sql(sql, dialect)?;
+    if !bounding_is_safe(&tokens, dialect) {
+        return Ok(Cow::Borrowed(sql));
+    }
+
+    Ok(match dialect {
+        DbDialect::Postgres | DbDialect::MySql | DbDialect::Sqlite => {
+            Cow::Owned(append_limit_one(sql))
+        }
+        DbDialect::Mssql => insert_top_one(sql, &tokens),
+    })
+}
+
+/// Whether a single-row bound can be added to this statement without changing what it means.
+///
+/// Shared by both renderings:
+///
+/// - the statement must start with `SELECT` — or `WITH`, on the dialects that append the bound at
+///   the end — so `INSERT ... RETURNING`, `CALL` and DDL are left alone;
 /// - it must contain no `LIMIT`, `FETCH`, `TOP` or `OFFSET` of its own, since the caller's own
-///   bound wins and a second `LIMIT` is a syntax error;
-/// - it must contain no `FOR` (`FOR UPDATE`, `FOR SHARE`) or `INTO`, because `LIMIT` has to
-///   precede those clauses rather than follow them;
+///   bound wins and a second one is a syntax error;
+/// - it must contain no `FOR` (`FOR UPDATE`, `FOR SHARE`) or `INTO`, because `LIMIT` has to precede
+///   those clauses rather than follow them;
 /// - it must contain no `;` except a trailing one, so a multi-statement string is never rewritten.
 ///
-/// Anything that fails a check is returned unchanged, which costs the optimization and nothing
-/// else. The clause goes on its own line so a trailing `--` comment cannot swallow it.
-fn append_single_row_limit(sql: &str, dialect: DbDialect) -> Result<Cow<'_, str>, DbError> {
+/// [`DbDialect::Mssql`] adds two of its own, both because `TOP (1)` binds the query it sits inside
+/// rather than the whole statement:
+///
+/// - a `WITH` query is refused outright, because the first `SELECT` in one is the CTE's, and
+///   bounding *that* would change which rows the outer query even sees;
+/// - `UNION`, `EXCEPT` and `INTERSECT` are refused, because a `TOP (1)` after the first `SELECT`
+///   would bound only the first branch of the set operation.
+///
+/// A trailing `LIMIT 1` has neither problem, which is why the extra bail-outs are not shared.
+fn bounding_is_safe(tokens: &[TokenWithSpan], dialect: DbDialect) -> bool {
     /// Clauses that either already bound the result set or must come after `LIMIT`.
     const BLOCKING: &[Keyword] = &[
         Keyword::LIMIT,
@@ -1015,17 +1075,18 @@ fn append_single_row_limit(sql: &str, dialect: DbDialect) -> Result<Cow<'_, str>
         Keyword::INTO,
     ];
 
-    let tokens = tokenize_sql(sql, dialect)?;
+    /// Set operations, whose branches a `TOP (1)` cannot bound together.
+    const BLOCKING_MSSQL: &[Keyword] = &[Keyword::UNION, Keyword::EXCEPT, Keyword::INTERSECT];
 
-    let starts_a_query = tokens
-        .iter()
-        .find_map(|token| match &token.token {
-            Token::Word(word) => Some(word.keyword),
-            _ => None,
-        })
-        .is_some_and(|keyword| matches!(keyword, Keyword::SELECT | Keyword::WITH));
+    let first_keyword = tokens.iter().find_map(keyword_of);
+    let starts_a_query = match dialect {
+        DbDialect::Mssql => first_keyword == Some(Keyword::SELECT),
+        DbDialect::Postgres | DbDialect::MySql | DbDialect::Sqlite => {
+            matches!(first_keyword, Some(Keyword::SELECT | Keyword::WITH))
+        }
+    };
     if !starts_a_query {
-        return Ok(Cow::Borrowed(sql));
+        return false;
     }
 
     let last_meaningful = tokens
@@ -1035,34 +1096,96 @@ fn append_single_row_limit(sql: &str, dialect: DbDialect) -> Result<Cow<'_, str>
         matches!(token.token, Token::SemiColon) && Some(index) != last_meaningful
     });
     if has_inner_semicolon {
-        return Ok(Cow::Borrowed(sql));
+        return false;
     }
 
-    let bounded_already = tokens.iter().any(|token| match &token.token {
-        Token::Word(word) => BLOCKING.contains(&word.keyword),
-        _ => false,
-    });
-    if bounded_already {
-        return Ok(Cow::Borrowed(sql));
+    !tokens.iter().filter_map(keyword_of).any(|keyword| {
+        BLOCKING.contains(&keyword)
+            || (dialect == DbDialect::Mssql && BLOCKING_MSSQL.contains(&keyword))
+    })
+}
+
+/// The keyword `token` is, if it is an unquoted word that matched one.
+///
+/// A quoted identifier — `"select"`, `[union]`, `` `limit` `` — carries [`Keyword::NoKeyword`], so
+/// a column named after a clause never reads as that clause.
+const fn keyword_of(token: &TokenWithSpan) -> Option<Keyword> {
+    match &token.token {
+        Token::Word(word) => Some(word.keyword),
+        _ => None,
     }
+}
+
+/// Append the trailing `LIMIT 1` the non-T-SQL dialects all accept.
+///
+/// The clause goes on its own line so a trailing `--` comment in the caller's SQL cannot comment it
+/// out, and it goes before a trailing `;` rather than after it.
+fn append_limit_one(sql: &str) -> String {
+    /// The clause this adds, newline-prefixed for the reason above.
+    const LIMIT_ONE_CLAUSE: &str = "\nLIMIT 1";
 
     let trimmed = sql.trim_end();
     let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
     let mut rendered = String::with_capacity(body.len() + LIMIT_ONE_CLAUSE.len());
     rendered.push_str(body);
     rendered.push_str(LIMIT_ONE_CLAUSE);
-    Ok(Cow::Owned(rendered))
+    rendered
 }
 
-/// The clause [`append_single_row_limit`] adds, newline-prefixed so a trailing `--` comment in the
-/// caller's SQL cannot comment it out.
-const LIMIT_ONE_CLAUSE: &str = "\nLIMIT 1";
+/// Splice a `TOP (1)` into a T-SQL `SELECT`.
+///
+/// T-SQL puts the row bound at the front of the select list, and the grammar is
+/// `SELECT [ ALL | DISTINCT ] [ TOP (n) ] <select list>` — so the clause goes after the `SELECT`,
+/// and after an `ALL` or `DISTINCT` that follows it, never between the two. Everything else about
+/// the statement is left byte-for-byte as written, including its comments and formatting.
+///
+/// Returns the statement unchanged when the first token is not a `SELECT` that has something after
+/// it: [`bounding_is_safe`] has already checked the first *keyword*, but a statement opening with a
+/// parenthesis reaches the same keyword through a token that is not one, and splicing into that
+/// would put the clause in the wrong query.
+fn insert_top_one<'a>(sql: &'a str, tokens: &[TokenWithSpan]) -> Cow<'a, str> {
+    /// The clause this adds, space-prefixed so it never runs into the keyword before it.
+    const TOP_ONE_CLAUSE: &str = " TOP (1)";
+
+    let mut meaningful = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF));
+
+    let Some(select) = meaningful.next() else {
+        return Cow::Borrowed(sql);
+    };
+    if keyword_of(select) != Some(Keyword::SELECT) {
+        return Cow::Borrowed(sql);
+    }
+
+    let Some(after_select) = meaningful.next() else {
+        return Cow::Borrowed(sql);
+    };
+    let anchor = if matches!(
+        keyword_of(after_select),
+        Some(Keyword::ALL | Keyword::DISTINCT)
+    ) {
+        after_select.span.end
+    } else {
+        select.span.end
+    };
+
+    // Only one location is ever asked for, so the mapper's forward-only scan is trivially in order.
+    let at = LocationMapper::new(sql).byte_index(anchor);
+    debug_assert!(sql.is_char_boundary(at), "token spans land on characters");
+    let mut rendered = String::with_capacity(sql.len() + TOP_ONE_CLAUSE.len());
+    rendered.push_str(&sql[..at]);
+    rendered.push_str(TOP_ONE_CLAUSE);
+    rendered.push_str(&sql[at..]);
+    Cow::Owned(rendered)
+}
 
 fn tokenize_sql(query: &str, dialect: DbDialect) -> Result<Vec<TokenWithSpan>, DbError> {
     match dialect {
         DbDialect::Postgres => tokenize_with_dialect(query, &PostgreSqlDialect {}),
         DbDialect::MySql => tokenize_with_dialect(query, &MySqlDialect {}),
         DbDialect::Sqlite => tokenize_with_dialect(query, &SQLiteDialect {}),
+        DbDialect::Mssql => tokenize_with_dialect(query, &MsSqlDialect {}),
     }
 }
 
@@ -1820,10 +1943,16 @@ where
 
 #[cfg(test)]
 mod single_row_tests {
-    use super::{append_single_row_limit, DbDialect};
+    use super::{restrict_to_single_row, DbDialect};
 
     fn limited(sql: &str) -> String {
-        append_single_row_limit(sql, DbDialect::Postgres)
+        restrict_to_single_row(sql, DbDialect::Postgres)
+            .expect("statement should tokenize")
+            .into_owned()
+    }
+
+    fn topped(sql: &str) -> String {
+        restrict_to_single_row(sql, DbDialect::Mssql)
             .expect("statement should tokenize")
             .into_owned()
     }
@@ -1901,12 +2030,97 @@ mod single_row_tests {
     }
 
     #[test]
-    fn every_dialect_accepts_the_same_clause() {
+    fn every_limit_dialect_accepts_the_same_clause() {
         for dialect in [DbDialect::Postgres, DbDialect::MySql, DbDialect::Sqlite] {
-            let rendered = append_single_row_limit("SELECT * FROM t", dialect)
+            let rendered = restrict_to_single_row("SELECT * FROM t", dialect)
                 .expect("statement should tokenize");
             assert_eq!(rendered, "SELECT * FROM t\nLIMIT 1");
         }
+    }
+
+    #[test]
+    fn t_sql_bounds_the_row_count_with_top_instead_of_limit() {
+        assert_eq!(
+            topped("SELECT * FROM [events] WHERE [user_id] = @P1"),
+            "SELECT TOP (1) * FROM [events] WHERE [user_id] = @P1"
+        );
+    }
+
+    #[test]
+    fn t_sql_puts_top_after_distinct_where_the_grammar_wants_it() {
+        // `SELECT TOP (1) DISTINCT x` is a syntax error; `SELECT DISTINCT TOP (1) x` is not.
+        assert_eq!(
+            topped("SELECT DISTINCT name FROM events"),
+            "SELECT DISTINCT TOP (1) name FROM events"
+        );
+        assert_eq!(
+            topped("SELECT ALL name FROM events"),
+            "SELECT ALL TOP (1) name FROM events"
+        );
+    }
+
+    #[test]
+    fn t_sql_keeps_the_statement_it_splices_into_byte_for_byte() {
+        // Comments, casing and a trailing semicolon are all left exactly as written: only the
+        // clause is inserted.
+        assert_eq!(
+            topped("select /* hi */ [odd name]\n  from t;"),
+            "select TOP (1) /* hi */ [odd name]\n  from t;"
+        );
+    }
+
+    #[test]
+    fn t_sql_leaves_a_statement_that_already_bounds_itself_alone() {
+        for sql in [
+            "SELECT TOP 5 * FROM events",
+            "SELECT * FROM events ORDER BY id OFFSET 5 ROWS FETCH NEXT 1 ROWS ONLY",
+        ] {
+            assert_eq!(topped(sql), sql, "{sql}");
+        }
+    }
+
+    #[test]
+    fn t_sql_refuses_to_bound_a_query_top_cannot_bound_whole() {
+        // `TOP (1)` binds the query it sits in, so on a CTE it would bound the CTE and on a set
+        // operation only the first branch — both change which rows come back, which a trailing
+        // `LIMIT 1` never does. Refusing costs the optimization and nothing else.
+        for sql in [
+            "WITH recent AS (SELECT 1 AS n) SELECT * FROM recent",
+            "SELECT a FROM t UNION SELECT b FROM u",
+            "SELECT a FROM t UNION ALL SELECT b FROM u",
+            "SELECT a FROM t EXCEPT SELECT b FROM u",
+            "SELECT a FROM t INTERSECT SELECT b FROM u",
+            "(SELECT a FROM t)",
+        ] {
+            assert_eq!(topped(sql), sql, "{sql}");
+        }
+    }
+
+    #[test]
+    fn t_sql_leaves_everything_that_is_not_a_select_alone() {
+        for sql in [
+            "INSERT INTO events (id) VALUES (@P1)",
+            "UPDATE events SET seen = 1",
+            "EXEC do_something",
+            "SELECT 1; SELECT 2",
+        ] {
+            assert_eq!(topped(sql), sql, "{sql}");
+        }
+    }
+
+    #[test]
+    fn t_sql_multibyte_content_keeps_its_boundaries() {
+        // Locations arrive as line/column, so a column-as-byte-offset splice would cut a character
+        // in half — and the column list here starts with one.
+        assert_eq!(
+            topped("SELECT N'héllo → 世界' AS greeting FROM t"),
+            "SELECT TOP (1) N'héllo → 世界' AS greeting FROM t"
+        );
+    }
+
+    #[test]
+    fn a_bare_select_keyword_is_left_alone_rather_than_panicking() {
+        assert_eq!(topped("SELECT"), "SELECT");
     }
 }
 
@@ -1983,10 +2197,28 @@ mod split_tests {
     #[test]
     fn every_dialect_splits_the_same_ordinary_migration() {
         let sql = "CREATE TABLE t (id INTEGER);\nINSERT INTO t (id) VALUES (1);";
-        for dialect in [DbDialect::Postgres, DbDialect::MySql, DbDialect::Sqlite] {
+        for dialect in [
+            DbDialect::Postgres,
+            DbDialect::MySql,
+            DbDialect::Sqlite,
+            DbDialect::Mssql,
+        ] {
             let statements = split_statements(sql, dialect).expect("tokenizes");
             assert_eq!(statements.len(), 2, "{dialect:?}");
         }
+    }
+
+    #[test]
+    fn a_t_sql_migration_splits_on_statement_semicolons_only() {
+        // Every place T-SQL hides a semicolon that is content rather than a separator: a bracketed
+        // identifier, an `N'…'` unicode literal, and both comment forms.
+        let statements =
+            split_statements(include_str!("sql/mssql_migration.sql"), DbDialect::Mssql)
+                .expect("the T-SQL migration should tokenize");
+        assert_eq!(statements.len(), 3, "{statements:#?}");
+        assert!(statements[0].starts_with("CREATE TABLE"), "{statements:#?}");
+        assert!(statements[1].contains("N'semi;colon'"), "{statements:#?}");
+        assert!(statements[2].contains("[odd;name]"), "{statements:#?}");
     }
 
     #[test]
@@ -2105,6 +2337,51 @@ mod prepare_tests {
             rendered,
             "SELECT '日本語',\n       $1,\n       'ещё',\n       $2\nFROM t"
         );
+    }
+
+    #[test]
+    fn rewrites_placeholders_to_the_at_p_form_for_mssql() {
+        let rendered = prepare_query_sql(
+            "SELECT * FROM [events] WHERE a = ? AND b = ?",
+            2,
+            DbDialect::Mssql,
+        )
+        .expect("query should prepare");
+        assert_eq!(rendered, "SELECT * FROM [events] WHERE a = @P1 AND b = @P2");
+    }
+
+    #[test]
+    fn t_sql_literals_identifiers_and_comments_survive_the_rewrite() {
+        // Every T-SQL construct that can hold a `?` which is content, not a placeholder: a
+        // bracketed identifier, an `N'…'` unicode literal, a `--` comment and a `/* */` comment.
+        assert_eq!(
+            prepare_query_sql(include_str!("sql/mssql_literals.sql"), 2, DbDialect::Mssql)
+                .expect("should prepare"),
+            include_str!("sql/mssql_literals_rewritten.sql")
+        );
+    }
+
+    #[test]
+    fn a_t_sql_parameter_count_mismatch_is_reported() {
+        let error = prepare_query_sql("SELECT ? , ?", 1, DbDialect::Mssql)
+            .expect_err("mismatched parameter count should fail");
+        assert!(
+            matches!(
+                error,
+                DbError::ParameterCountMismatch {
+                    expected: 2,
+                    actual: 1
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_t_sql_literal_fails_to_tokenize() {
+        let error = prepare_query_sql("SELECT N'unterminated", 0, DbDialect::Mssql)
+            .expect_err("the tokenizer rejects this");
+        assert!(matches!(error, DbError::SqlParse(_)), "{error:?}");
     }
 }
 
