@@ -1300,7 +1300,7 @@ mod tests {
             .build();
 
         let discarded = exec_result(&result, RowMode::Discard).unwrap();
-        assert!(discarded.rows.is_empty());
+        assert!(discarded.rows.is_empty(), "{:?}", discarded.rows);
         assert_eq!(discarded.rows_read, 0);
         assert_eq!(discarded.rows_written, 3);
     }
