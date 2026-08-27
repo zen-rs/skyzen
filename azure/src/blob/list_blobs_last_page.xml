@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="https://skyzentest.blob.core.windows.net/" ContainerName="uploads">
+  <Prefix>photos/</Prefix>
+  <Marker>2!108!MDAwMDI0</Marker>
+  <MaxResults>2</MaxResults>
+  <Blobs>
+    <Blob>
+      <Name>photos/three.png</Name>
+      <Properties>
+        <Creation-Time>Thu, 01 Sep 2022 07:26:51 GMT</Creation-Time>
+        <Last-Modified>Thu, 01 Sep 2022 07:26:51 GMT</Last-Modified>
+        <Etag>"0x8DA8BEB55E20D41"</Etag>
+        <Content-Length>512</Content-Length>
+        <Content-Type>image/png</Content-Type>
+        <BlobType>BlockBlob</BlobType>
+        <LeaseStatus>unlocked</LeaseStatus>
+        <LeaseState>available</LeaseState>
+        <ServerEncrypted>true</ServerEncrypted>
+      </Properties>
+      <OrMetadata />
+    </Blob>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>

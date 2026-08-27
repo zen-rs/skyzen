@@ -49,7 +49,7 @@ mod status;
 pub mod storage_queue;
 
 #[cfg(feature = "blob")]
-pub use blob::AzureBlob;
+pub use blob::{AzureBlob, AzureBlobAuth, AzureBlobConfig};
 #[cfg(feature = "cosmos")]
 pub use cosmos::{CosmosKv, CosmosKvBuilder, PartitionStrategy};
 #[cfg(feature = "servicebus")]
