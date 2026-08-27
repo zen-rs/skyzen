@@ -2,9 +2,13 @@
 //!
 //! A migration set is built once, at compile time, by `skyzen::embed_migrations!("migrations")`,
 //! and applied by [`Db::migrate`]. The same set runs against sqlx-backed `PostgreSQL`, `MySQL` and
-//! `SQLite`, against Cloudflare D1, and against the Aurora Data API, because everything the runner
-//! needs is already portable: [`Db::execute_batch`] for atomicity and `?` placeholders for the one
-//! parameter it binds.
+//! `SQLite`, against Cloudflare D1, against the Aurora Data API and against Azure SQL, because
+//! everything the runner needs is already portable: [`Db::execute_batch`] for atomicity and `?`
+//! placeholders for the one parameter it binds.
+//!
+//! The migration files themselves are not portable, and never were: `CREATE TABLE` is written in
+//! the dialect the deployment targets. Only the runner's own two statements are per-dialect here,
+//! in [`create_table_sql`] and [`insert_version_sql`].
 //!
 //! # What the runner guarantees
 //!
@@ -34,9 +38,6 @@
 
 use crate::sql::{split_statements, BatchStatement, Db, DbDialect, DbError};
 use std::borrow::Cow;
-
-/// The `CREATE TABLE IF NOT EXISTS` for the bookkeeping table. Identical on all three dialects.
-const CREATE_TABLE: &str = include_str!("migrate/create_table.sql");
 
 /// The bookkeeping read, ordered by version so the runner never has to sort it.
 const SELECT_APPLIED: &str = include_str!("migrate/select_applied.sql");
@@ -315,7 +316,9 @@ impl Db {
 
     /// Create `_skyzen_migrations` if it is not there yet.
     async fn ensure_migrations_table(&self) -> Result<(), DbError> {
-        self.query(CREATE_TABLE).execute().await?;
+        self.query(create_table_sql(self.dialect()))
+            .execute()
+            .await?;
         Ok(())
     }
 
@@ -391,17 +394,39 @@ impl Db {
     }
 }
 
+/// The statement that creates the bookkeeping table, for `dialect`.
+///
+/// Three of the four dialects share one `CREATE TABLE IF NOT EXISTS`. T-SQL has neither half of
+/// that: `CREATE TABLE` takes no `IF NOT EXISTS` clause — the documented idiom is an
+/// `IF OBJECT_ID(…) IS NULL` guard around it — and `TEXT` there is a deprecated LOB type rather
+/// than the ordinary string column the other three mean by it, so the columns are `NVARCHAR`.
+///
+/// Neither form is atomic against a concurrent first deploy: `IF NOT EXISTS` is documented as
+/// racy on `PostgreSQL` too, and the loser of that race sees the backend's "already exists" error
+/// and succeeds on a retry. The migrations themselves do not depend on it — their race is settled
+/// by the primary key, as [the module documentation](self#concurrency) describes.
+const fn create_table_sql(dialect: DbDialect) -> &'static str {
+    match dialect {
+        DbDialect::Postgres | DbDialect::MySql | DbDialect::Sqlite => {
+            include_str!("migrate/create_table.sql")
+        }
+        DbDialect::Mssql => include_str!("migrate/create_table_mssql.sql"),
+    }
+}
+
 /// The version-recording statement for `dialect`.
 ///
 /// Only the timestamp expression differs: `applied_at` is written by the database, so the
-/// dialect's own way of rendering `CURRENT_TIMESTAMP` as text is what varies. `PostgreSQL` casts
-/// to `TEXT`, `MySQL` has no `TEXT` cast target and uses `CHAR`, and `SQLite`'s
-/// `CURRENT_TIMESTAMP` is already text.
+/// dialect's own way of rendering the current instant as text is what varies. `PostgreSQL` casts
+/// `CURRENT_TIMESTAMP` to `TEXT`, `MySQL` has no `TEXT` cast target and uses `CHAR`, `SQLite`'s
+/// `CURRENT_TIMESTAMP` is already text, and T-SQL renders `SYSUTCDATETIME()` — the UTC clock,
+/// where `CURRENT_TIMESTAMP` is the server's local one — through `CONVERT`'s ISO-8601 style 126.
 const fn insert_version_sql(dialect: DbDialect) -> &'static str {
     match dialect {
         DbDialect::Postgres => include_str!("migrate/insert_version_postgres.sql"),
         DbDialect::MySql => include_str!("migrate/insert_version_mysql.sql"),
         DbDialect::Sqlite => include_str!("migrate/insert_version_sqlite.sql"),
+        DbDialect::Mssql => include_str!("migrate/insert_version_mssql.sql"),
     }
 }
 
@@ -440,10 +465,62 @@ fn verify_applied_checksums(
 
 #[cfg(test)]
 mod tests {
-    use super::{Migration, Migrations};
+    use super::{create_table_sql, insert_version_sql, Migration, Migrations};
+    use crate::sql::{prepare_query_sql, split_statements, DbDialect};
+
+    /// Every dialect the runner can be pointed at, so adding one cannot leave these untested.
+    const DIALECTS: &[DbDialect] = &[
+        DbDialect::Postgres,
+        DbDialect::MySql,
+        DbDialect::Sqlite,
+        DbDialect::Mssql,
+    ];
 
     fn migration(version: u64, name: &'static str, sql: &'static str) -> Migration {
         Migration::embedded(version, name, sql, [0u8; 32])
+    }
+
+    #[test]
+    fn every_dialects_bookkeeping_statements_are_one_statement_that_tokenizes() {
+        for &dialect in DIALECTS {
+            let create = create_table_sql(dialect);
+            assert_eq!(
+                split_statements(create, dialect).expect("tokenizes").len(),
+                1,
+                "{dialect:?} create"
+            );
+            prepare_query_sql(create, 0, dialect).expect("create binds nothing");
+        }
+    }
+
+    #[test]
+    fn every_dialects_version_row_binds_exactly_the_three_values_the_runner_supplies() {
+        for &dialect in DIALECTS {
+            let insert = insert_version_sql(dialect);
+            prepare_query_sql(insert, 3, dialect).expect("the version row binds three values");
+            // A fourth would mean the timestamp had become a value the runner supplies, which is
+            // exactly what `applied_at` must never be — a skewed clock could then misorder history.
+            prepare_query_sql(insert, 4, dialect)
+                .expect_err("the timestamp is the database's own, not a bound value");
+        }
+    }
+
+    #[test]
+    fn t_sql_guards_the_create_rather_than_using_if_not_exists() {
+        let create = create_table_sql(DbDialect::Mssql);
+        assert!(create.contains("OBJECT_ID"), "{create}");
+        assert!(!create.contains("IF NOT EXISTS"), "{create}");
+        // `TEXT` on T-SQL is a deprecated LOB type, not the ordinary string column the other
+        // dialects mean by it.
+        assert!(!create.contains("TEXT"), "{create}");
+    }
+
+    #[test]
+    fn t_sql_records_the_applied_time_from_the_utc_clock() {
+        // `CURRENT_TIMESTAMP` on SQL Server is the server's *local* time; `SYSUTCDATETIME()` is the
+        // one that cannot misorder a history across regions.
+        let insert = insert_version_sql(DbDialect::Mssql);
+        assert!(insert.contains("SYSUTCDATETIME()"), "{insert}");
     }
 
     #[test]

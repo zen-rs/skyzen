@@ -389,8 +389,9 @@ an Azure Functions custom handler. The application code above them is the same i
 | Key-Value | [`Redis`](../redis/) | `CfKv` | `DynamoKv` | `CosmosKv` | `InMemoryKv` |
 | Object Storage | [`S3Storage`](../s3/) | `CfR2` | `S3Storage` | `AzureBlob` | `InMemoryStorage` |
 | Message Queue | [`SqsQueue`](../aws/) | `CfQueue` | `SqsQueue` | `ServiceBusQueue`, `AzureStorageQueue` | `InMemoryQueue` |
-| Portable SQL | `Db` via sqlx (Postgres, MySQL, SQLite) | `CfD1` | `RdsDataDb` (Aurora Data API) | — | `InMemoryDb` |
-| SQL transactions | yes | no — `execute_batch` is D1's atomic unit | yes | — | yes |
+| Portable SQL | `Db` via sqlx (Postgres, MySQL, SQLite) | `CfD1` | `RdsDataDb` (Aurora Data API) | `AzureSqlDb` (Azure SQL) | `InMemoryDb` |
+| SQL transactions | yes | no — `execute_batch` is D1's atomic unit | yes | yes | yes |
+| SQL dialect | `Postgres` / `MySql` / `Sqlite` | `Sqlite` | `Postgres` or `MySql`, per Aurora engine | `Mssql` | `Sqlite` |
 
 The **Native** column names what a native deployment can wire, not a separate implementation.
 Runtime and provider are independent axes, so a backend that is a plain HTTP client — `SqsQueue`,
@@ -405,9 +406,40 @@ takes. Writing the constructor yourself stays available, and is what the options
 model need — a FIFO SQS queue, a `DynamoDB` table keyed on something other than `pk`, an Entra ID
 credential in place of a connection string.
 
-Azure has no portable `Db`: Cosmos DB is wired here as a key-value store, not as SQL. An
-application on Azure Functions reaches SQL through a native `[[database]]` — Azure Database for
-PostgreSQL or MySQL over sqlx.
+On Azure, which `Db` you want depends on which database it is. Azure Database for PostgreSQL and
+Azure Database for MySQL speak the wire protocols sqlx already speaks, so they are a native
+`[[database]]` and need nothing from `skyzen-azure`. **Azure SQL** speaks T-SQL over TDS, which sqlx
+has no driver for, and is what `AzureSqlDb` exists for. Cosmos DB is not SQL here at all — it is
+wired as a key-value store.
+
+### Dialects
+
+`DbDialect` is what a backend answers when asked which SQL it expects, and it settles three things:
+how a `?` placeholder is rendered, which tokenizer decides what is a literal, and how `fetch_one`
+bounds a statement to one row.
+
+| Dialect | Placeholders | Single-row bound | Backends |
+|---------|--------------|------------------|----------|
+| `Postgres` | `$1`, `$2`, … | trailing `LIMIT 1` | sqlx Postgres, `RdsDataDb` on Aurora PostgreSQL |
+| `MySql` | `?` | trailing `LIMIT 1` | sqlx MySQL, `RdsDataDb` on Aurora MySQL |
+| `Sqlite` | `?` | trailing `LIMIT 1` | sqlx SQLite, `CfD1`, `InMemoryDb`, Durable Object SQL |
+| `Mssql` | `@P1`, `@P2`, … | `TOP (1)` after `SELECT` | `AzureSqlDb` |
+
+Applications never write the native form — `?` works everywhere and is rewritten before execution —
+and writing one by hand fails the placeholder/parameter count check. On `Mssql` a hand-written `@P1`
+additionally collides with the name generated for the first `?`.
+
+The `TOP (1)` rewrite is more cautious than the `LIMIT 1` one, because `TOP` bounds the query it
+sits inside rather than the whole statement: on `Mssql`, a `WITH` query and any `UNION` / `EXCEPT` /
+`INTERSECT` are left unbounded rather than being given a `TOP` that would change which rows come
+back. That costs the optimization, never correctness.
+
+Migrations are per-dialect only in the runner's own two statements: `_skyzen_migrations` is created
+with `CREATE TABLE IF NOT EXISTS` on three dialects and with T-SQL's `IF OBJECT_ID(…) IS NULL` guard
+on `Mssql`, and `applied_at` is written by the database — `CURRENT_TIMESTAMP` on three, and
+`SYSUTCDATETIME()` rendered as ISO-8601 on `Mssql`, since T-SQL's `CURRENT_TIMESTAMP` is the
+server's local clock. Your own migration files are written in the dialect you deploy to, as they
+always were.
 
 ## Service Futures Are `Send`, Including On WASM
 
