@@ -227,6 +227,32 @@ mod tests {
     }
 
     #[test]
+    fn an_rds_data_wiring_that_names_its_values_declares_no_variables_to_set() {
+        // The manifest replaced the four variables, so demanding them would refuse to start a
+        // deployment whose configuration is complete.
+        let variables = required_variables(&manifest(
+            "[[database]]\nname = \"main\"\ntype = \"sql\"\n\n\
+             [native.database.main]\nbackend = \"rds-data\"\n\
+             resource_arn = \"arn:aws:rds:us-east-1:111122223333:cluster:skyzen\"\n\
+             secret_arn = \"arn:aws:secretsmanager:us-east-1:111122223333:secret:skyzen-Ab12Cd\"\n\
+             database = \"appdb\"\nengine = \"aurora-postgresql\"\n",
+        ));
+        assert!(variables.is_empty(), "{variables:?}");
+    }
+
+    #[test]
+    fn an_azure_sql_wiring_declares_the_variable_holding_its_connection_string() {
+        let variables = required_variables(&manifest(
+            "[[database]]\nname = \"main\"\ntype = \"sql\"\n\n\
+             [native.database.main]\nbackend = \"azure-sql\"\n\
+             url_env = \"AZURE_SQL_CONNECTION_STRING\"\n",
+        ));
+
+        assert_eq!(variables[0].name, "AZURE_SQL_CONNECTION_STRING");
+        assert_eq!(variables[0].declared_by, "[native.database.main].url_env");
+    }
+
+    #[test]
     fn a_backend_whose_variable_the_manifest_names_reports_the_key() {
         let variables = required_variables(&manifest(
             "[[service]]\nname = \"jobs\"\ntype = \"queue\"\n\n\

@@ -52,9 +52,9 @@ pub use schema::{
     CloudflareSection, CloudflareServiceSection, CosmosWiring, DatabaseEntry, DatabaseType,
     DynamoDbWiring, LambdaArchitecture, MemoryWiring, NativeDatabaseBackend, NativeDatabaseSection,
     NativeQueueConsumer, NativeSection, NativeServiceBackend, NativeServiceSection,
-    QueueTriggerError, RdsDataWiring, RedisWiring, S3Wiring, ServiceBusWiring, ServiceEntry,
-    ServiceType, SkyzenManifest, SqlUrlWiring, SqsWiring, StorageQueueWiring, WiringEnvVar,
-    HTTP_FUNCTION_NAME,
+    PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring, RdsEngine, RedisWiring,
+    S3Wiring, ServiceBusWiring, ServiceEntry, ServiceType, SkyzenManifest, SqlUrlWiring, SqsWiring,
+    StorageQueueWiring, WiringEnvVar, HTTP_FUNCTION_NAME,
 };
 
 use std::{
@@ -110,6 +110,16 @@ pub enum ManifestError {
         path: PathBuf,
         /// What is wrong with the entry.
         source: schema::QueueTriggerError,
+    },
+    /// A `[native.database.<name>]` RDS Data API wiring names some of its four values, not all.
+    #[error("{path}: [native.database.{database}] {source}")]
+    PartialRdsDataWiring {
+        /// The manifest path.
+        path: PathBuf,
+        /// The `[[database]]` whose wiring is half-written.
+        database: String,
+        /// Which keys are named and which are missing.
+        source: schema::PartialRdsDataWiring,
     },
     /// A named environment was requested that the manifest does not declare.
     #[error(
@@ -218,6 +228,24 @@ impl Manifest {
                     path: path.clone(),
                     source,
                 })?;
+        }
+
+        // An RDS Data API wiring names all four of its values or none of them. Checked here, next
+        // to the other cross-field rule, so the macro reports it as a compile error and the CLI
+        // reports it before generating anything — one rule, both consumers.
+        if let Some(native) = &data.native {
+            for (name, database) in &native.database {
+                let NativeDatabaseSection::RdsData(wiring) = database else {
+                    continue;
+                };
+                wiring
+                    .parts()
+                    .map_err(|source| ManifestError::PartialRdsDataWiring {
+                        path: path.clone(),
+                        database: name.clone(),
+                        source,
+                    })?;
+            }
         }
 
         let base_cloudflare = document
@@ -335,7 +363,7 @@ fn take_environment_overlays(
 mod tests {
     use super::{
         Manifest, ManifestError, NativeDatabaseBackend, NativeDatabaseSection,
-        NativeServiceBackend, NativeServiceSection, ServiceType,
+        NativeServiceBackend, NativeServiceSection, RdsEngine, ServiceType,
     };
     use std::time::Duration;
 
@@ -520,10 +548,15 @@ mod tests {
     }
 
     #[test]
-    fn an_rds_data_wiring_declares_the_four_variables_its_constructor_reads() {
+    fn an_rds_data_wiring_that_names_nothing_declares_the_four_variables_instead() {
         let wiring = database_wiring("backend = \"rds-data\"\n").expect("parses");
         assert_eq!(wiring.backend(), NativeDatabaseBackend::RdsData);
         assert_eq!(wiring.url_env(), None);
+
+        let NativeDatabaseSection::RdsData(rds) = &wiring else {
+            panic!("expected the rds-data variant");
+        };
+        assert_eq!(rds.parts().expect("naming none of them is complete"), None);
 
         let names: Vec<_> = wiring.env_vars().iter().map(|var| var.name).collect();
         assert_eq!(
@@ -535,6 +568,61 @@ mod tests {
                 "RDS_ENGINE"
             ]
         );
+    }
+
+    #[test]
+    fn an_rds_data_wiring_that_names_all_four_values_reads_no_variables() {
+        let wiring = database_wiring(
+            "backend = \"rds-data\"\n\
+             resource_arn = \"arn:aws:rds:us-east-1:111122223333:cluster:skyzen\"\n\
+             secret_arn = \"arn:aws:secretsmanager:us-east-1:111122223333:secret:skyzen-Ab12Cd\"\n\
+             database = \"appdb\"\nengine = \"aurora-postgresql\"\n",
+        )
+        .expect("parses");
+
+        let NativeDatabaseSection::RdsData(rds) = &wiring else {
+            panic!("expected the rds-data variant");
+        };
+        let parts = rds
+            .parts()
+            .expect("all four are named")
+            .expect("all four are named");
+        assert_eq!(
+            parts.resource_arn,
+            "arn:aws:rds:us-east-1:111122223333:cluster:skyzen"
+        );
+        assert_eq!(parts.database, "appdb");
+        assert_eq!(parts.engine, RdsEngine::AuroraPostgres);
+        assert_eq!(parts.engine.as_str(), "aurora-postgresql");
+
+        // The wiring replaced the variables, so `skyzen dev` must not demand them.
+        assert!(wiring.env_vars().is_empty(), "{:?}", wiring.env_vars());
+    }
+
+    #[test]
+    fn an_rds_data_wiring_that_names_only_some_values_is_rejected_naming_the_missing_keys() {
+        let error = database_wiring(
+            "backend = \"rds-data\"\nresource_arn = \"arn:aws:rds:us-east-1:1:cluster:c\"\n\
+             database = \"appdb\"\n",
+        )
+        .expect_err("half a wiring is not a wiring")
+        .to_string();
+
+        assert!(error.contains("[native.database.main]"), "{error}");
+        // The keys it does name, and the ones to add.
+        assert!(error.contains("`resource_arn`, `database`"), "{error}");
+        assert!(error.contains("`secret_arn`, `engine`"), "{error}");
+    }
+
+    #[test]
+    fn an_rds_data_wiring_rejects_an_engine_rds_does_not_name() {
+        let error = database_wiring(
+            "backend = \"rds-data\"\nresource_arn = \"a\"\nsecret_arn = \"b\"\n\
+             database = \"appdb\"\nengine = \"postgres\"\n",
+        )
+        .expect_err("`postgres` is not an RDS engine identifier")
+        .to_string();
+        assert!(error.contains("aurora-postgresql"), "{error}");
     }
 
     #[test]
@@ -637,10 +725,12 @@ mod tests {
     }
 
     #[test]
-    fn an_rds_data_wiring_rejects_the_keys_its_constructor_cannot_honour() {
-        for key in ["database", "engine", "resource_arn_env", "url_env"] {
+    fn an_rds_data_wiring_rejects_a_key_that_names_a_variable_rather_than_a_value() {
+        // The four values are named directly (`resource_arn = "arn:…"`); the variables the
+        // fall-back constructor reads are fixed by it, so there is no `*_env` key to point at one.
+        for key in ["resource_arn_env", "engine_env", "url_env"] {
             let error = database_wiring(&format!("backend = \"rds-data\"\n{key} = \"x\"\n"))
-                .expect_err("the RDS Data API reads its own variables")
+                .expect_err("the RDS Data API takes values, not variable names")
                 .to_string();
             assert!(error.contains(key), "{key}: {error}");
         }
