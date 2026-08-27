@@ -420,7 +420,8 @@ mod tests {
     #[test]
     fn a_manifest_with_no_capabilities_needs_nothing() {
         let manifest = manifest("[cloudflare]\ncompatibility_date = \"2025-02-01\"\n");
-        assert!(required(&manifest).is_empty());
+        let needed = required(&manifest);
+        assert!(needed.is_empty(), "{needed:?}");
     }
 
     #[test]

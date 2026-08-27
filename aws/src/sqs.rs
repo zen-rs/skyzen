@@ -920,7 +920,7 @@ mod tests {
 
         let failure = batch_send_failure(&entry).unwrap();
         assert_eq!(failure.index, 4);
-        assert!(failure.message.is_empty());
+        assert!(failure.message.is_empty(), "{:?}", failure.message);
     }
 
     #[test]

@@ -181,7 +181,7 @@ mod tests {
             "[[service]]\nname = \"cache\"\ntype = \"kv\"\n\n\
              [native.service.cache]\nbackend = \"memory\"\n",
         ));
-        assert!(variables.is_empty());
+        assert!(variables.is_empty(), "{variables:?}");
     }
 
     #[test]
