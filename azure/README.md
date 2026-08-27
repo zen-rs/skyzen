@@ -180,6 +180,18 @@ let db = Db::new(AzureSqlDb::new(
 )?);
 ```
 
+**Declaratively.** The same backend is wired from `Skyzen.toml` with
+
+```toml
+[native.database.main]
+backend = "azure-sql"
+url_env = "AZURE_SQL_CONNECTION_STRING"
+```
+
+where `url_env` names the variable holding the connection string — `skyzen dev` refuses to start
+without it, and `skyzen add azure-sql` installs this crate with the `sql` feature. See the
+[Skyzen.toml reference](../docs/skyzen-toml-reference.md#native-database-wiring).
+
 **Dialect.** `dialect()` is `DbDialect::Mssql`. Skyzen rewrites each `?` into `@P1`, `@P2`, … before
 execution, and bounds `fetch_one`/`fetch_optional` with `TOP (1)` rather than `LIMIT 1` — T-SQL has
 no `LIMIT`. Writing `@P1` yourself collides with the generated name, the same way a hand-written

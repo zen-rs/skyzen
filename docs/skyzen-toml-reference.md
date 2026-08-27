@@ -301,8 +301,34 @@ url_env = "DATABASE_URL"
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `backend` | string | **Required.** `postgres`, `mysql`, `sqlite` or `rds-data` |
-| `url_env` | string | **Required** for `postgres`, `mysql` and `sqlite`. Environment variable containing the connection URL |
+| `backend` | string | **Required.** `postgres`, `mysql`, `sqlite`, `azure-sql` or `rds-data` |
+| `url_env` | string | **Required** for `postgres`, `mysql`, `sqlite` and `azure-sql`. Environment variable containing the connection string |
+
+#### `backend = "azure-sql"`
+
+```toml
+[native.database.main]
+backend = "azure-sql"
+url_env = "AZURE_SQL_CONNECTION_STRING"
+```
+
+Azure SQL, reached over TDS by `AzureSqlDb`. Azure Database for PostgreSQL and for MySQL are *not*
+this backend — they speak the wire protocols sqlx already speaks, so they are `postgres` and
+`mysql` above.
+
+What `url_env` names holds the **ADO.NET connection string** the portal hands out
+(`Server=tcp:…,1433;Database=…;User ID=…;Password=…;Encrypt=True;`), not a URL. It is read from the
+environment for the same reason the URLs are: it carries the password.
+`AZURE_SQL_CONNECTION_STRING` is the conventional name, because it is the one `AzureSqlDb::from_env`
+reads, but any name works — the wiring passes what it reads to `AzureSqlConfig::new`. `skyzen dev`
+refuses to start when the variable is set nowhere, and `skyzen new` lists it in `.env.example`.
+
+`skyzen migrate --provider native` cannot migrate this database: the runner links sqlx, which has
+no T-SQL driver. It says so and migrates the others; apply these migrations from the application
+itself with `Db::migrate` (see the [Migrations Guide](migrations.md)).
+
+Statements are written with `?` placeholders like everywhere else — `Db` rewrites them to `@P1`,
+`@P2`, … and bounds `fetch_one` with `TOP (1)`, because T-SQL has no `LIMIT`.
 
 #### `backend = "rds-data"`
 
@@ -313,8 +339,9 @@ backend = "rds-data"
 
 Aurora reached through the RDS Data API — an HTTP service addressed by ARN rather than a server
 addressed by URL, which is what lets a Lambda talk to Aurora Serverless with no connection pool.
-The table holds only `backend`, because `RdsDataDb::from_env` builds its own client and reads
-everything it needs from four variables whose names it fixes:
+
+A Data API call is addressed by four values. Written as above, the table names none of them, and
+`RdsDataDb::from_env` reads all four from variables whose names it fixes:
 
 | Variable | Holds |
 |----------|-------|
@@ -323,8 +350,34 @@ everything it needs from four variables whose names it fixes:
 | `RDS_DATABASE` | The database statements run against |
 | `RDS_ENGINE` | `aurora-postgresql` or `aurora-mysql` — it decides how placeholders are rewritten |
 
-`skyzen dev` checks all four by name, and `skyzen new` lists them in `.env.example`. The
-credentials and the region come from the ambient AWS chain, as with `dynamodb`.
+`skyzen dev` checks all four by name, and `skyzen new` lists them in `.env.example`.
+
+Or the table names all four itself, and nothing is read from the environment — the wiring is built
+with `RdsDataDb::from_parts`:
+
+```toml
+[native.database.main]
+backend = "rds-data"
+resource_arn = "arn:aws:rds:us-east-1:111122223333:cluster:skyzen"
+secret_arn = "arn:aws:secretsmanager:us-east-1:111122223333:secret:skyzen-Ab12Cd"
+database = "appdb"
+engine = "aurora-postgresql"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `resource_arn` | string | The Aurora cluster's ARN |
+| `secret_arn` | string | The Secrets Manager secret holding its credentials |
+| `database` | string | The database statements run against |
+| `engine` | string | `aurora-postgresql` or `aurora-mysql` |
+
+**All four or none.** Naming some and not the rest is a parse error listing the keys that are set
+and the ones to add: a wiring that took its ARN from this file and its database from a variable
+would be half-declared, and the half nobody wrote down is the half `skyzen dev` cannot check. None
+of the four is a secret — the credentials themselves live in Secrets Manager, which is what
+`secret_arn` points at — so a checked-in manifest can carry them.
+
+The credentials and the region come from the ambient AWS chain either way, as with `dynamodb`.
 
 `skyzen migrate --provider native` cannot migrate this database: the runner links sqlx and its
 drivers, and there is no connection to open. It says so and migrates the others; apply these
@@ -810,6 +863,7 @@ One capability per backend, plus one per portable extractor:
 | `servicebus` | `servicebus` | `skyzen-azure` (`servicebus`) |
 | `storage-queue` | `storage-queue` | `skyzen-azure` (`storage-queue`) |
 | `postgres` / `mysql` / `sqlite` | same name | `skyzen-services` (that feature) |
+| `azure-sql` | `azure-sql` | `skyzen-azure` (`sql`) |
 | `rds-data` | `rds-data` | `skyzen-aws` (`rds-data`) |
 | `memory` | `memory` | `skyzen-test` |
 

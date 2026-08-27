@@ -191,8 +191,9 @@ already applied, rather than reporting as edited history.
 The native path applies to **every** `[[database]]` that has a `[native.database.<name>]` wiring it
 can open a connection to, one after another, matching the Cloudflare path's
 one-`wrangler`-call-per-database behaviour. Databases without native wiring are skipped with a
-warning, and so is `backend = "rds-data"`: the CLI links sqlx and its drivers, and the RDS Data API
-is an HTTP service reached by ARN rather than a connection. Its migrations run from the application
+warning, and so are the two backends the CLI cannot dial: `backend = "rds-data"`, because the RDS
+Data API is an HTTP service reached by ARN rather than a connection, and `backend = "azure-sql"`,
+because the CLI links sqlx and sqlx has no T-SQL driver. Their migrations run from the application
 itself, through the same embedded set — `db.migrate(MIGRATIONS).await?` at startup.
 
 `--dry-run` reads and validates the directories and prints what would run. It never opens a
@@ -215,8 +216,9 @@ default = true
 migrations_dir = "db/changes"   # optional; defaults to "migrations"
 
 [native.database.main]
-backend = "postgres"            # postgres | mysql | sqlite | rds-data
-url_env = "DATABASE_URL"        # not used by rds-data, which reads RDS_* itself
+backend = "postgres"            # postgres | mysql | sqlite | azure-sql | rds-data
+url_env = "DATABASE_URL"        # the ADO.NET string for azure-sql; unused by rds-data, which
+                                # names its four values itself or reads RDS_* for them
 ```
 
 `migrations_dir` defaults to `migrations/`, which is also `wrangler d1 migrations apply`'s default,
