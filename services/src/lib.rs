@@ -5,10 +5,20 @@
 //!
 //! Each service follows a two-layer design:
 //! - A **public trait** (e.g. [`KeyValueStore`]) that is ergonomic for implementors
-//! - A **wrapper struct** (e.g. [`Kv`]) that provides type-erased dynamic dispatch
-//!   and implements [`skyzen_core::Extractor`] for use in handlers
+//! - A **wrapper struct** (e.g. [`Kv`]) that provides type-erased dynamic dispatch, and implements
+//!   both [`skyzen_core::Extractor`] (a handler names it as an argument) and
+//!   [`skyzen_core::middleware::Middleware`] (attaching it injects it)
 //!
-//! Portable SQL support is provided through [`Db`].
+//! Portable SQL support is provided through [`Db`], including transactions where the backend has
+//! them and [`Db::migrate`] everywhere.
+//!
+//! Three modules sit alongside the four capabilities:
+//!
+//! - [`migrate`] — the portable migration runner, its bookkeeping table and its checksum policy.
+//! - [`queue::envelope`] — the in-band encoding for queue transports that carry only text, owned
+//!   here because two crates that must not depend on each other both speak it.
+//! - [`durable`] — [`DurableKv`](durable::DurableKv), [`DurableDb`](durable::DurableDb) and
+//!   [`Alarm`](durable::Alarm), the object-scoped storage a Durable Object gets.
 //!
 //! # Example
 //!

@@ -223,7 +223,7 @@ Most of what you reach for has a direct equivalent:
 | `axum::middleware::from_fn` | `skyzen::middleware::from_fn` | Closure returns a boxed future |
 | `Router::layer` | `Route::layer` / `Router::layer` | Covers the whole router *including* its 404 and 405 paths |
 | `Router::fallback` | `Route::fallback` | Plus `Route::method_not_allowed`, which can read `AllowedMethods` |
-| `Router::nest` | `Route::nest(router)` | Mounts an already-built `Router` |
+| `Router::nest` | `"/api".nest(router)` | Mounts an already-built `Router` under a path |
 | `tower_http::cors::CorsLayer` | `skyzen::middleware::Cors` | |
 | `tower_http::limit::RequestBodyLimitLayer` | `skyzen::middleware::BodyLimit` | On by default at 2 MiB — see below |
 | `tower_http::compression` | `skyzen::middleware::CompressionMiddleware` | |
@@ -376,7 +376,7 @@ let api = Route::new((
 ));
 ```
 
-`Route::nest(router)` mounts an already-built `Router` under a path, and `Router::routes()` lists
+`"/api".nest(router)` mounts an already-built `Router` under a path, and `Router::routes()` lists
 every registered `(method, path)` so a wrongly nested tree is one `dbg!` away.
 
 ---
@@ -638,7 +638,7 @@ Durable Objects get their own object-scoped SQLite through `DurableDb`:
 
 ```rust
 use skyzen::durable::DurableObject;
-use skyzen::routing::{CreateRouteNode, Route};
+use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::{utils::Json, Result};
 use skyzen_services::durable::DurableDb;
 
@@ -647,7 +647,7 @@ use skyzen_services::durable::DurableDb;
 struct ChatRoom;
 
 impl DurableObject for ChatRoom {
-    fn fetch(&mut self) -> impl skyzen::Endpoint + 'static {
+    fn fetch(&mut self) -> Router {
         Route::new(("/messages".get(get_messages),)).build()
     }
 }
