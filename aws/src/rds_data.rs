@@ -43,11 +43,30 @@
 //! Three of those rows deserve their reasoning spelled out:
 //!
 //! - **Timestamps are rendered in UTC with microsecond precision.** AWS documents the accepted
-//!   format as `YYYY-MM-DD HH:MM:SS[.FFF]`, but three fractional digits would silently truncate
-//!   values both engines store to microsecond precision, so six are sent: a service that rejected
-//!   them would fail loudly rather than quietly rounding a caller's data. The rendering carries no
-//!   zone, so a `timestamptz` column applies the session time zone — UTC on an unmodified cluster,
-//!   which is what the value was rendered in.
+//!   format as `YYYY-MM-DD HH:MM:SS[.FFF]`, and that grammar is descriptive rather than enforced —
+//!   the service does not reject a longer fraction. The six-digit path is the one with evidence
+//!   behind it: it was validated against a live Aurora `PostgreSQL` cluster in
+//!   [py-data-api issue #56](https://github.com/koxudaxi/py-data-api/issues/56), where the
+//!   maintainer removed a three-digit truncation (commit `17f8d42`) and the reporter confirmed the
+//!   microseconds arrived intact, and AWS's own `aws-sdk-pandas` binds `str(datetime)` — six digits
+//!   — with no rejection filed against it. Three digits would silently truncate values both engines
+//!   store to microsecond precision, so six are sent. The rendering carries no zone, so a
+//!   `timestamptz` column applies the session time zone — UTC on an unmodified cluster, which is
+//!   what the value was rendered in.
+//!
+//!   Two residuals are stated rather than implied. **Silent truncation on the hinted path has no
+//!   published round-trip proof**: the evidence above shows the service accepts six digits, not
+//!   what a column declared with fewer does with them. And **every direct observation is on Aurora
+//!   Serverless v1**; v2 is inferred to behave the same because both are served by one Data API,
+//!   not measured. One call settles both at the first live contact — add the cluster's
+//!   `--resource-arn`, `--secret-arn` and `--database`:
+//!
+//!   ```sh
+//!   aws rds-data execute-statement --sql "SELECT CAST(:p AS text) AS echoed" --parameters '[{"name":"p","typeHint":"TIMESTAMP","value":{"stringValue":"2020-09-17 13:49:32.780180"}}]'
+//!   ```
+//!
+//!   An `echoed` of `2020-09-17 13:49:32.78018` confirms six digits end to end. A `.780` would mean
+//!   the service truncates and `TIMESTAMP_FORMAT` has to change.
 //! - **A UUID binds as 16 bytes on Aurora `MySQL`**, not as a hinted string, because that is what
 //!   the sqlx `MySQL` backend binds and `MySQL` has no UUID type; the same application code has to
 //!   read the same rows against either backend. On Aurora `PostgreSQL` the `UUID` hint is exact.
@@ -159,9 +178,10 @@ const ENGINE_ENV: &str = "RDS_ENGINE";
 
 /// How a [`DbValue::Timestamp`] is rendered for a `TIMESTAMP` type hint.
 ///
-/// AWS documents `YYYY-MM-DD HH:MM:SS[.FFF]`; the six fractional digits here are the precision
-/// Aurora `PostgreSQL` and Aurora `MySQL` actually store, and truncating to three would lose a
-/// caller's data without saying so.
+/// Six fractional digits: the precision Aurora `PostgreSQL` and Aurora `MySQL` actually store, and
+/// the one the service is known to accept. The documented `[.FFF]` grammar, the live-cluster
+/// evidence behind six digits, and the probe that re-checks it are in the
+/// [module documentation](self#binding-values-and-type-hints).
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.6f";
 
 /// The Data API's own code for "these credentials may not make this call".
@@ -265,10 +285,37 @@ impl RdsDataDb {
         }
     }
 
+    /// Create an `RdsDataDb` from the cluster's own coordinates, building the client itself.
+    ///
+    /// The four values a Data API call is addressed by — the cluster ARN, the secret ARN, the
+    /// database and the engine — are taken as arguments; the client comes from the ambient AWS
+    /// configuration, the way every other backend in this crate loads it. That is the difference
+    /// from [`new`](Self::new), which is handed a client, and from [`from_env`](Self::from_env),
+    /// which reads the same four values from the environment.
+    ///
+    /// Nothing is dialled here: the credentials and the ARNs are first exercised by the first
+    /// statement.
+    pub async fn from_parts(
+        resource_arn: impl Into<String>,
+        secret_arn: impl Into<String>,
+        database: impl Into<String>,
+        engine: RdsEngine,
+    ) -> Self {
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        Self::new(
+            Client::new(&config),
+            resource_arn,
+            secret_arn,
+            database,
+            engine,
+        )
+    }
+
     /// Create an `RdsDataDb` from environment configuration.
     ///
-    /// Reads `RDS_RESOURCE_ARN`, `RDS_SECRET_ARN`, `RDS_DATABASE` and `RDS_ENGINE`, and builds the
-    /// client from the ambient AWS configuration the way every other backend in this crate does.
+    /// Reads `RDS_RESOURCE_ARN`, `RDS_SECRET_ARN`, `RDS_DATABASE` and `RDS_ENGINE`, then builds the
+    /// backend through [`from_parts`](Self::from_parts) — one construction path, so a client built
+    /// from the environment and one built from named values cannot differ.
     ///
     /// # Errors
     ///
@@ -280,14 +327,7 @@ impl RdsDataDb {
         let database = required_env(DATABASE_ENV, "a database name")?;
         let engine = required_env(ENGINE_ENV, "`aurora-postgresql` or `aurora-mysql`")?.parse()?;
 
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        Ok(Self::new(
-            Client::new(&config),
-            resource_arn,
-            secret_arn,
-            database,
-            engine,
-        ))
+        Ok(Self::from_parts(resource_arn, secret_arn, database, engine).await)
     }
 
     /// Let a statement keep running server-side after the Data API's 45-second call timeout.
