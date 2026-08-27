@@ -305,7 +305,11 @@ mod tests {
         let ids = vec!["a".to_owned(), "b".to_owned()];
         let response = batch_response(&QueueBatchDisposition::ack_all(), &ids);
 
-        assert!(response.batch_item_failures.is_empty());
+        assert!(
+            response.batch_item_failures.is_empty(),
+            "{:?}",
+            response.batch_item_failures
+        );
     }
 
     #[test]

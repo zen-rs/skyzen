@@ -497,7 +497,11 @@ mod tests {
             azure.http_mode.host_json_key(),
             "enableForwardingHttpRequest"
         );
-        assert!(azure.queue_triggers.is_empty());
+        assert!(
+            azure.queue_triggers.is_empty(),
+            "{:?}",
+            azure.queue_triggers
+        );
     }
 
     fn trigger(function: &str) -> Result<Manifest, ManifestError> {
