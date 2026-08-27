@@ -117,19 +117,37 @@ where
 }
 
 macro_rules! impl_handler {
-    ($($ty:ident),*) => {
-        #[allow(non_snake_case)]
-
-        impl<F, Fut, Res,$($ty:Extractor,)*> Handler<($($ty,)*) , Res> for F
+    // A handler taking no arguments extracts nothing. Its extractor is `()`, whose error type is
+    // `Infallible`, so the variadic arm's `map_err` would be a call that can never run — which is
+    // what nightly reports as an unreachable call. The arm is written out separately rather than
+    // silenced, the same way `skyzen_core`'s own `()` extractor is.
+    () => {
+        impl<F, Fut, Res> Handler<(), Res> for F
         where
-            F: 'static + Clone + Send + Sync + Fn($($ty,)*) -> Fut,
+            F: 'static + Clone + Send + Sync + Fn() -> Fut,
             Fut: Send + Future<Output = Res>,
             Res: Responder,
         {
-            async fn call_handler(&self, request: &mut Request) -> Result<Response, HandlerError<($($ty,)*), Res>> {
-                let ($($ty,)*) = <($($ty,)*) as Extractor>::extract(request).await.map_err(|e| HandlerError::ExtractorError(e))?;
+            async fn call_handler(&self, request: &mut Request) -> Result<Response, HandlerError<(), Res>> {
                 let mut response = Response::new(http_kit::Body::empty());
-                (self)($($ty,)*).await.respond_to(request,&mut response).map_err(|e| HandlerError::ResponderError(e))?;
+                (self)().await.respond_to(request,&mut response).map_err(|e| HandlerError::ResponderError(e))?;
+                Ok(response)
+            }
+        }
+    };
+    ($($ty:ident),+) => {
+        #[allow(non_snake_case)]
+
+        impl<F, Fut, Res,$($ty:Extractor,)+> Handler<($($ty,)+) , Res> for F
+        where
+            F: 'static + Clone + Send + Sync + Fn($($ty,)+) -> Fut,
+            Fut: Send + Future<Output = Res>,
+            Res: Responder,
+        {
+            async fn call_handler(&self, request: &mut Request) -> Result<Response, HandlerError<($($ty,)+), Res>> {
+                let ($($ty,)+) = <($($ty,)+) as Extractor>::extract(request).await.map_err(|e| HandlerError::ExtractorError(e))?;
+                let mut response = Response::new(http_kit::Body::empty());
+                (self)($($ty,)+).await.respond_to(request,&mut response).map_err(|e| HandlerError::ResponderError(e))?;
                 Ok(response)
             }
         }
