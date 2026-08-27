@@ -64,6 +64,11 @@ macro_rules! impl_tuple_responder {
             const _:() = {
                     // To prevent these macro-generated errors from overwhelming users.
             #[doc(hidden)]
+            // The arity-0 expansion — the responder for `()` — has no variants, which is correct:
+            // a unit responder cannot fail, so its error type is uninhabited. `empty_enums` is
+            // asking for `!` or `Infallible` there, which would need a second hand-written impl
+            // for the one degenerate case.
+            #[allow(clippy::empty_enums)]
             pub enum TupleResponderError<$($ty:Responder),*> {
                 $($ty(<$ty as Responder>::Error),)*
             }
