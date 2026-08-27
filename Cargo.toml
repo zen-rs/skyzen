@@ -1,13 +1,14 @@
 [workspace]
-members = ["core", "hyper", "macros", "services", "test", "redis", "s3", "cloudflare", "cloudflare-admin", "aws", "azure", "cli"]
+members = ["core", "hyper", "macros", "manifest", "services", "test", "redis", "s3", "cloudflare", "cloudflare-admin", "aws", "azure", "cli"]
 # cloudflare is wasm32-only — exclude from default builds, build with:
 #   cargo check -p skyzen-cloudflare --target wasm32-unknown-unknown
-default-members = ["core", "hyper", "macros", "services", "test", "redis", "s3", "cloudflare-admin", "aws", "azure", "cli", "."]
+default-members = ["core", "hyper", "macros", "manifest", "services", "test", "redis", "s3", "cloudflare-admin", "aws", "azure", "cli", "."]
 resolver = "2"
 
 [workspace.dependencies]
 skyzen-core = { path = "core", version = "0.1.1" }
 skyzen-macros = { path = "macros", version = "0.1.2" }
+skyzen-manifest = { path = "manifest", version = "0.1.0" }
 skyzen-services = { path = "services", version = "0.1.0" }
 skyzen-test = { path = "test", version = "0.1.0" }
 skyzen-redis = { path = "redis", version = "0.1.0" }

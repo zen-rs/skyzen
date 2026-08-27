@@ -2,9 +2,12 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
+use skyzen_manifest::{
+    DatabaseEntry, DatabaseType, Manifest, NativeDatabaseBackend, NativeServiceBackend,
+    ServiceEntry, ServiceType, SkyzenManifest,
+};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    fs,
     path::PathBuf,
 };
 use syn::{
@@ -44,10 +47,6 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! { #entry_ident() }
     };
-    let datasource_wrap_steps = match datasource_wrap_steps() {
-        Ok(steps) => steps,
-        Err(error) => return error.to_compile_error().into(),
-    };
     let portable_injection_wrap_steps = match portable_injection_wrap_steps() {
         Ok(steps) => steps,
         Err(error) => return error.to_compile_error().into(),
@@ -55,7 +54,6 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     let factory_body = quote! {
         async move {
             let endpoint = #entry_call;
-            #(#datasource_wrap_steps)*
             #(#portable_injection_wrap_steps)*
             endpoint
         }
@@ -738,11 +736,8 @@ fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
     let output = function.sig.output.clone();
     let vis = function.vis.clone();
 
-    let manifest = load_manifest_value()?;
-    let databases = manifest
-        .as_ref()
-        .map(load_databases_from_value)
-        .transpose()?
+    let databases = load_manifest()?
+        .map(|manifest| manifest.database)
         .unwrap_or_default();
     let database_types = test_database_types(&databases)?;
     let bindings = collect_test_param_bindings(inputs, &database_types)?;
@@ -774,7 +769,7 @@ fn expand_test(mut function: ItemFn) -> syn::Result<TokenStream> {
 }
 
 fn test_database_types(
-    databases: &[DatabaseConfig],
+    databases: &[DatabaseEntry],
 ) -> syn::Result<Vec<(usize, proc_macro2::Ident)>> {
     databases
         .iter()
@@ -873,7 +868,7 @@ fn push_test_param_binding(
 
 fn test_setup_statements(
     requirements: &TestRequirements,
-    databases: &[DatabaseConfig],
+    databases: &[DatabaseEntry],
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let mut statements = Vec::new();
     push_test_service_setup(requirements, &mut statements);
@@ -897,7 +892,7 @@ fn push_test_service_setup(
 
 fn push_test_database_setup(
     requirements: &TestRequirements,
-    databases: &[DatabaseConfig],
+    databases: &[DatabaseEntry],
     statements: &mut Vec<proc_macro2::TokenStream>,
 ) -> syn::Result<()> {
     if !requirements.databases.default_db && requirements.databases.named_db_indices.is_empty() {
@@ -932,7 +927,7 @@ fn push_test_database_init(
     index: usize,
     default_database: Option<usize>,
     requirements: &TestRequirements,
-    databases: &[DatabaseConfig],
+    databases: &[DatabaseEntry],
     statements: &mut Vec<proc_macro2::TokenStream>,
 ) {
     if index == usize::MAX {
@@ -1993,238 +1988,25 @@ fn doc_string(attrs: &[Attribute]) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct DatasourceConfig {
-    name: String,
-    engine: String,
-    strategy: String,
-    url_env: String,
-    key_env: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ServiceConfig {
-    name: String,
-    service_type: ServiceType,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ServiceType {
-    Kv,
-    Storage,
-    Queue,
-}
-
-impl ServiceType {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Kv => "kv",
-            Self::Storage => "storage",
-            Self::Queue => "queue",
-        }
-    }
-
-    /// The portable wrapper this service type is bound to.
-    fn wrapper_path(self) -> proc_macro2::TokenStream {
-        match self {
-            Self::Kv => quote! { ::skyzen_services::Kv },
-            Self::Storage => quote! { ::skyzen_services::Storage },
-            Self::Queue => quote! { ::skyzen_services::Queue },
-        }
+/// The portable wrapper a service type is bound to.
+fn service_wrapper_path(service_type: ServiceType) -> proc_macro2::TokenStream {
+    match service_type {
+        ServiceType::Kv => quote! { ::skyzen_services::Kv },
+        ServiceType::Storage => quote! { ::skyzen_services::Storage },
+        ServiceType::Queue => quote! { ::skyzen_services::Queue },
     }
 }
 
-#[derive(Debug, Clone)]
-struct DatabaseConfig {
-    name: String,
-    database_type: DatabaseType,
-    default: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum DatabaseType {
-    Sql,
-}
-
-impl DatabaseType {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sql => "sql",
-        }
-    }
-}
-
-#[allow(clippy::too_many_lines)]
 fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
-    let datasources = load_datasources()?;
-    let (services, databases) = match load_manifest_value()? {
-        Some(value) => (
-            load_services_from_value(&value)?,
-            load_databases_from_value(&value)?,
-        ),
-        None => (Vec::new(), Vec::new()),
-    };
-    let mut generated_items =
-        Vec::with_capacity(datasources.len() + services.len() + databases.len());
-    // Datasources, services and databases all land in the same module, so one set catches a
-    // collision between kinds — a service named `main-db` and a database named `main` both
-    // normalize to `MainDb`.
+    let manifest = load_manifest()?.unwrap_or_default();
+    let services = &manifest.service;
+    let databases = &manifest.database;
+    let mut generated_items = Vec::with_capacity(services.len() + databases.len());
+    // Services and databases land in the same module, so one set catches a collision between
+    // kinds — a service named `main-db` and a database named `main` both normalize to `MainDb`.
     let mut seen_idents = HashSet::new();
 
-    for datasource in datasources {
-        let ident = ident_from_name(&datasource.name)?;
-        if !seen_idents.insert(ident.to_string()) {
-            return Err(Error::new(
-                proc_macro2::Span::call_site(),
-                format!("duplicate datasource type name after normalization: `{ident}`"),
-            ));
-        }
-
-        let init_error_ident = format_ident!("{ident}InitError");
-        let missing_ident = format_ident!("{ident}NotConfigured");
-
-        let name_lit = LitStr::new(&datasource.name, proc_macro2::Span::call_site());
-        let engine_lit = LitStr::new(&datasource.engine, proc_macro2::Span::call_site());
-        let strategy_lit = LitStr::new(&datasource.strategy, proc_macro2::Span::call_site());
-        let url_env_lit = LitStr::new(&datasource.url_env, proc_macro2::Span::call_site());
-        let key_env_const = datasource.key_env.as_ref().map_or_else(
-            || quote! { None },
-            |value| {
-                let lit = LitStr::new(value, proc_macro2::Span::call_site());
-                quote! { Some(#lit) }
-            },
-        );
-        let missing_message = LitStr::new(
-            &format!(
-                "{} not configured. Ensure {}::init() is called and middleware is installed.",
-                datasource.name, datasource.name
-            ),
-            proc_macro2::Span::call_site(),
-        );
-        generated_items.push(quote! {
-            #[derive(Debug, Clone)]
-            pub struct #ident {
-                url: ::std::sync::Arc<str>,
-                key: ::std::option::Option<::std::sync::Arc<str>>,
-            }
-
-            #[derive(Debug, Clone)]
-            pub enum #init_error_ident {
-                MissingEnv(&'static str),
-                EmptyEnv(&'static str),
-            }
-
-            impl ::std::fmt::Display for #init_error_ident {
-                fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                    match self {
-                        Self::MissingEnv(key) => write!(f, "missing environment variable: {key}"),
-                        Self::EmptyEnv(key) => write!(f, "environment variable is empty: {key}"),
-                    }
-                }
-            }
-
-            impl ::std::error::Error for #init_error_ident {}
-
-            impl #ident {
-                pub const NAME: &'static str = #name_lit;
-                pub const ENGINE: &'static str = #engine_lit;
-                pub const STRATEGY: &'static str = #strategy_lit;
-                pub const URL_ENV: &'static str = #url_env_lit;
-                pub const KEY_ENV: ::std::option::Option<&'static str> = #key_env_const;
-
-                pub fn init() -> ::std::result::Result<Self, #init_error_ident> {
-                    static INSTANCE: ::std::sync::OnceLock<
-                        ::std::result::Result<#ident, #init_error_ident>
-                    > = ::std::sync::OnceLock::new();
-                    INSTANCE.get_or_init(|| {
-                        let url = ::std::env::var(Self::URL_ENV)
-                            .map_err(|_| #init_error_ident::MissingEnv(Self::URL_ENV))?;
-                        if url.trim().is_empty() {
-                            return Err(#init_error_ident::EmptyEnv(Self::URL_ENV));
-                        }
-
-                        let key = match Self::KEY_ENV {
-                            Some(key_env) => {
-                                let value = ::std::env::var(key_env)
-                                    .map_err(|_| #init_error_ident::MissingEnv(key_env))?;
-                                if value.trim().is_empty() {
-                                    return Err(#init_error_ident::EmptyEnv(key_env));
-                                }
-                                Some(value.into())
-                            }
-                            None => None,
-                        };
-
-                        Ok(Self {
-                            url: url.into(),
-                            key,
-                        })
-                    }).clone()
-                }
-
-                #[must_use]
-                pub fn url(&self) -> &str {
-                    &self.url
-                }
-
-                #[must_use]
-                pub fn key(&self) -> ::std::option::Option<&str> {
-                    self.key.as_deref()
-                }
-            }
-
-            ::skyzen::http_kit::http_error!(
-                pub #missing_ident,
-                ::skyzen::StatusCode::INTERNAL_SERVER_ERROR,
-                #missing_message
-            );
-
-            impl ::skyzen::extract::Extractor for #ident {
-                type Error = #missing_ident;
-
-                async fn extract(
-                    request: &mut ::skyzen::Request,
-                ) -> ::std::result::Result<Self, Self::Error> {
-                    request
-                        .extensions()
-                        .get::<Self>()
-                        .cloned()
-                        .ok_or_else(#missing_ident::new)
-                }
-            }
-
-            impl ::skyzen::middleware::Middleware for #ident {
-                async fn handle(
-                    &self,
-                    request: &mut ::skyzen::Request,
-                    next: ::skyzen::middleware::Next<'_>,
-                ) -> ::std::result::Result<::skyzen::Response, ::skyzen::Error> {
-                    request.extensions_mut().insert(self.clone());
-                    next.run(request).await
-                }
-
-                fn provisions(&self) -> ::std::vec::Vec<::std::any::TypeId> {
-                    ::std::vec![::std::any::TypeId::of::<Self>()]
-                }
-            }
-
-            #[cfg(test)]
-            impl #ident {
-                #[must_use]
-                pub fn from_raw_parts(
-                    url: impl Into<::std::sync::Arc<str>>,
-                    key: ::std::option::Option<::std::sync::Arc<str>>,
-                ) -> Self {
-                    Self {
-                        url: url.into(),
-                        key,
-                    }
-                }
-            }
-        });
-    }
-
-    for service in &services {
+    for service in services {
         let ident = service_ident_from_name(&service.name)?;
         if !seen_idents.insert(ident.to_string()) {
             return Err(Error::new(
@@ -2235,7 +2017,7 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
 
         generated_items.push(named_binding_tokens(
             &ident,
-            &service.service_type.wrapper_path(),
+            &service_wrapper_path(service.service_type),
             &format!(
                 "{} `{}` not configured. Ensure Skyzen.toml service wiring is installed.",
                 service.service_type.as_str(),
@@ -2244,7 +2026,7 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
         ));
     }
 
-    for database in &databases {
+    for database in databases {
         let ident = database_ident_from_name(&database.name)?;
         if !seen_idents.insert(ident.to_string()) {
             return Err(Error::new(
@@ -2380,59 +2162,29 @@ fn manifest_tracking_tokens() -> proc_macro2::TokenStream {
     }
 }
 
-fn datasource_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>> {
-    let datasources = load_datasources()?;
-    let mut steps = Vec::with_capacity(datasources.len());
-    let mut seen_idents = HashSet::new();
-
-    for datasource in datasources {
-        let ident = ident_from_name(&datasource.name)?;
-        if !seen_idents.insert(ident.to_string()) {
-            return Err(Error::new(
-                proc_macro2::Span::call_site(),
-                format!("duplicate datasource type name after normalization: `{ident}`"),
-            ));
-        }
-
-        let panic_message = LitStr::new(
-            &format!("failed to initialize datasource `{}`", datasource.name),
-            proc_macro2::Span::call_site(),
-        );
-
-        steps.push(quote! {
-            let endpoint = ::skyzen::__private::with_middleware(
-                endpoint,
-                #ident::init().unwrap_or_else(|error| panic!("{}: {error}", #panic_message)),
-            );
-        });
-    }
-
-    Ok(steps)
-}
-
 fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>> {
-    let Some(value) = load_manifest_value()? else {
+    let Some(manifest) = load_manifest()? else {
         return Ok(Vec::new());
     };
 
-    let services = load_services_from_value(&value)?;
-    let databases = load_databases_from_value(&value)?;
+    let services = &manifest.service;
+    let databases = &manifest.database;
     if services.is_empty() && databases.is_empty() {
         return Ok(Vec::new());
     }
-    let default_database = default_database_index(&databases)?;
+    let default_database = default_database_index(databases)?;
 
     let mut steps = Vec::with_capacity(services.len() + databases.len() + 1);
-    let service_type_counts = service_type_counts(&services);
+    let service_type_counts = service_type_counts(services);
 
     // On wasm, `__skyzen_wasm_env` is bound by the factory closure parameter generated in
     // `#[skyzen::main]`; the environment is threaded explicitly rather than read from a
     // thread-local that concurrent invocations could race.
 
-    for service in &services {
+    for service in services {
         let ident = service_ident_from_name(&service.name)?;
-        let native_init = generate_native_service_init(service, &value)?;
-        let cloudflare_init = generate_cloudflare_service_init(service, &value)?;
+        let native_init = generate_native_service_init(service, &manifest)?;
+        let cloudflare_init = generate_cloudflare_service_init(service, &manifest);
         // The bare `Kv`/`Storage`/`Queue` extractor names whichever service of that type is the
         // only one, so it is injected exactly when the type is unambiguous.
         let inject_bare = service_type_counts[&service.service_type] == 1;
@@ -2450,8 +2202,8 @@ fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>>
 
     for (index, database) in databases.iter().enumerate() {
         let ident = database_ident_from_name(&database.name)?;
-        let native_init = generate_native_database_init(database, &value)?;
-        let cloudflare_init = generate_cloudflare_database_init(database, &value)?;
+        let native_init = generate_native_database_init(database, &manifest);
+        let cloudflare_init = generate_cloudflare_database_init(database, &manifest);
         let inject_bare = default_database == Some(index);
         let native = named_injection_tokens(&ident, &native_init, inject_bare);
         let cloudflare = named_injection_tokens(&ident, &cloudflare_init, inject_bare);
@@ -2472,7 +2224,7 @@ fn portable_injection_wrap_steps() -> syn::Result<Vec<proc_macro2::TokenStream>>
 ///
 /// A type with exactly one entry is unambiguous, so the bare `Kv`/`Storage`/`Queue` extractor can
 /// be injected alongside the named newtype; with two or more, only the newtypes are injected.
-fn service_type_counts(services: &[ServiceConfig]) -> HashMap<ServiceType, usize> {
+fn service_type_counts(services: &[ServiceEntry]) -> HashMap<ServiceType, usize> {
     let mut counts = HashMap::new();
     for service in services {
         *counts.entry(service.service_type).or_insert(0) += 1;
@@ -2507,110 +2259,12 @@ fn named_injection_tokens(
     }
 }
 
-fn load_datasources() -> syn::Result<Vec<DatasourceConfig>> {
-    let Some(value) = load_manifest_value()? else {
-        return Ok(Vec::new());
-    };
-
-    let Some(entries) = value.get("datasource").and_then(toml::Value::as_array) else {
-        return Ok(Vec::new());
-    };
-
-    entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| parse_datasource(entry, index))
-        .collect()
-}
-
-fn parse_datasource(entry: &toml::Value, index: usize) -> syn::Result<DatasourceConfig> {
-    let Some(table) = entry.as_table() else {
-        return Err(Error::new(
-            proc_macro2::Span::call_site(),
-            format!("datasource[{index}] must be a TOML table"),
-        ));
-    };
-
-    let label = format!("datasource[{index}]");
-    let name = required_string(table, "name", &label)?;
-    let engine = optional_string(table, &["engine"]).unwrap_or_else(|| "custom".to_owned());
-    let strategy = optional_string(table, &["strategy"]).unwrap_or_else(|| "tcp".to_owned());
-    let url_env = required_url_env(table, &label)?;
-    let key_env = optional_string(
-        table,
-        &[
-            "key_from_env",
-            "auth_from_env",
-            "secret_from_env",
-            "password_from_env",
-        ],
-    );
-
-    Ok(DatasourceConfig {
-        name,
-        engine,
-        strategy,
-        url_env,
-        key_env,
-    })
-}
-
-fn required_string(
-    table: &toml::map::Map<String, toml::Value>,
-    key: &str,
-    label: &str,
-) -> syn::Result<String> {
-    table
-        .get(key)
-        .and_then(toml::Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            Error::new(
-                proc_macro2::Span::call_site(),
-                format!("{label} is missing `{key}`"),
-            )
-        })
-}
-
-fn optional_string(table: &toml::map::Map<String, toml::Value>, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| table.get(*key).and_then(toml::Value::as_str))
-        .map(ToOwned::to_owned)
-}
-
-fn required_url_env(
-    table: &toml::map::Map<String, toml::Value>,
-    label: &str,
-) -> syn::Result<String> {
-    if let Some(env) = optional_string(table, &["url_from_env", "url_env", "url_env_var"]) {
-        return Ok(env);
-    }
-
-    if let Some(url_value) = table.get("url") {
-        if let Some(url_table) = url_value.as_table() {
-            if let Some(env) = url_table.get("env").and_then(toml::Value::as_str) {
-                return Ok(env.to_owned());
-            }
-        } else if let Some(url_str) = url_value.as_str() {
-            if let Some(stripped) = parse_env_ref(url_str) {
-                return Ok(stripped);
-            }
-            if looks_like_env_name(url_str) {
-                return Ok(url_str.to_owned());
-            }
-        }
-    }
-
-    Err(Error::new(
-        proc_macro2::Span::call_site(),
-        format!(
-            "{label} is missing URL env reference; use `url_from_env = \"ENV_KEY\"` \
-or `url = {{ env = \"ENV_KEY\" }}`"
-        ),
-    ))
-}
-
-fn load_manifest_value() -> syn::Result<Option<toml::Value>> {
+/// Read the project's `Skyzen.toml` through the shared schema.
+///
+/// The file is optional — an application can wire every service by hand — so a missing file is
+/// `Ok(None)` rather than an error. Everything else (unreadable, malformed, unknown key,
+/// unsupported `type`) is a compile error, reported at the macro's call site.
+fn load_manifest() -> syn::Result<Option<SkyzenManifest>> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|error| {
         Error::new(
             proc_macro2::Span::call_site(),
@@ -2622,108 +2276,40 @@ fn load_manifest_value() -> syn::Result<Option<toml::Value>> {
         return Ok(None);
     }
 
-    let content = fs::read_to_string(&config_path).map_err(|error| {
-        Error::new(
-            proc_macro2::Span::call_site(),
-            format!("failed to read {}: {error}", config_path.display()),
-        )
-    })?;
-    let value: toml::Value = toml::from_str(&content).map_err(|error| {
-        Error::new(
-            proc_macro2::Span::call_site(),
-            format!("failed to parse {}: {error}", config_path.display()),
-        )
-    })?;
-    Ok(Some(value))
+    Manifest::load(&config_path)
+        .map(|manifest| Some(manifest.data().clone()))
+        .map_err(|error| Error::new(proc_macro2::Span::call_site(), error.to_string()))
 }
 
-fn load_services_from_value(value: &toml::Value) -> syn::Result<Vec<ServiceConfig>> {
-    let Some(entries) = value.get("service").and_then(toml::Value::as_array) else {
-        return Ok(Vec::new());
-    };
-
-    entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| parse_service(entry, index))
-        .collect()
+/// The `[native.service.<name>]` wiring for one portable service.
+fn native_service_wiring<'a>(
+    manifest: &'a SkyzenManifest,
+    name: &str,
+) -> Option<&'a skyzen_manifest::NativeServiceSection> {
+    manifest.native.as_ref()?.service.get(name)
 }
 
-fn parse_service(entry: &toml::Value, index: usize) -> syn::Result<ServiceConfig> {
-    let Some(table) = entry.as_table() else {
-        return Err(Error::new(
-            proc_macro2::Span::call_site(),
-            format!("service[{index}] must be a TOML table"),
-        ));
-    };
-
-    let label = format!("service[{index}]");
-    let name = required_string(table, "name", &label)?;
-    let type_name = required_string(table, "type", &label)?;
-    let service_type = match type_name.as_str() {
-        "kv" => ServiceType::Kv,
-        "storage" => ServiceType::Storage,
-        "queue" => ServiceType::Queue,
-        other => {
-            return Err(Error::new(
-                proc_macro2::Span::call_site(),
-                format!("{label} has unsupported type `{other}`; expected kv|storage|queue"),
-            ));
-        }
-    };
-
-    Ok(ServiceConfig { name, service_type })
+/// The `[native.database.<name>]` wiring for one portable database.
+fn native_database_wiring<'a>(
+    manifest: &'a SkyzenManifest,
+    name: &str,
+) -> Option<&'a skyzen_manifest::NativeDatabaseSection> {
+    manifest.native.as_ref()?.database.get(name)
 }
 
-fn load_databases_from_value(value: &toml::Value) -> syn::Result<Vec<DatabaseConfig>> {
-    let Some(entries) = value.get("database").and_then(toml::Value::as_array) else {
-        return Ok(Vec::new());
-    };
-
-    entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| parse_database(entry, index))
-        .collect()
-}
-
-fn parse_database(entry: &toml::Value, index: usize) -> syn::Result<DatabaseConfig> {
-    let Some(table) = entry.as_table() else {
-        return Err(Error::new(
-            proc_macro2::Span::call_site(),
-            format!("database[{index}] must be a TOML table"),
-        ));
-    };
-
-    let label = format!("database[{index}]");
-    let name = required_string(table, "name", &label)?;
-    let type_name = required_string(table, "type", &label)?;
-    let default = table
-        .get("default")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
-    let database_type = match type_name.as_str() {
-        "sql" => DatabaseType::Sql,
-        other => {
-            return Err(Error::new(
-                proc_macro2::Span::call_site(),
-                format!("{label} has unsupported type `{other}`; expected sql"),
-            ));
-        }
-    };
-
-    Ok(DatabaseConfig {
-        name,
-        database_type,
-        default,
-    })
+/// A required `url_env`/`bucket_env` key that the wiring section left out.
+fn missing_wiring_key(section: &str, key: &str) -> Error {
+    Error::new(
+        proc_macro2::Span::call_site(),
+        format!("{section} is missing `{key}`"),
+    )
 }
 
 fn generate_native_service_init(
-    service: &ServiceConfig,
-    value: &toml::Value,
+    service: &ServiceEntry,
+    manifest: &SkyzenManifest,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let Some(table) = lookup_table(value, &["native", "service", service.name.as_str()]) else {
+    let Some(wiring) = native_service_wiring(manifest, &service.name) else {
         return Ok(compile_error_block(&format!(
             "missing [native.service.{}] wiring for portable service `{}`",
             service.name, service.name
@@ -2731,276 +2317,207 @@ fn generate_native_service_init(
     };
 
     let label = format!("[native.service.{}]", service.name);
-    let backend = required_string(table, "backend", &label)?;
+    let wrapper = service_wrapper_path(service.service_type);
 
-    match (service.service_type, backend.as_str()) {
-        (ServiceType::Kv, "redis") => {
-            let env_key = required_string(table, "url_env", &label)?;
-            let env_lit = LitStr::new(&env_key, proc_macro2::Span::call_site());
-            let missing_message = LitStr::new(
-                &format!(
-                    "portable service `{}` missing native env var `{}`",
-                    service.name, env_key
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            let connect_message = LitStr::new(
-                &format!(
-                    "portable service `{}` failed to connect to Redis using `{}`",
-                    service.name, env_key
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            Ok(quote! {{
-                let url = ::std::env::var(#env_lit)
-                    .unwrap_or_else(|_| panic!("{}", #missing_message));
-                let backend = ::skyzen_redis::Redis::connect(&url)
-                    .await
-                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message));
-                ::skyzen_services::Kv::new(backend)
-            }})
+    // Every env-configured backend has the same shape — read one variable, hand its value to a
+    // constructor, wrap the result — so the lookup, the missing-variable panic and the wrapper
+    // construction are written once and each arm supplies only the constructor call.
+    let env_key = |key: &'static str, value: Option<&String>| {
+        value
+            .cloned()
+            .ok_or_else(|| missing_wiring_key(&label, key))
+    };
+
+    let (env_key, build) = match (service.service_type, wiring.backend) {
+        (ServiceType::Kv, NativeServiceBackend::Redis) => {
+            let key = env_key("url_env", wiring.url_env.as_ref())?;
+            let failure = connect_failure_lit(&service.name, &format!("connect to Redis using `{key}`"));
+            (
+                key,
+                quote! {
+                    ::skyzen_redis::Redis::connect(&__skyzen_env_value)
+                        .await
+                        .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+                },
+            )
         }
-        (ServiceType::Kv, "memory") => Ok(quote! {
-            ::skyzen_services::Kv::new(::skyzen_test::mock::InMemoryKv::new())
-        }),
-        (ServiceType::Storage, "s3") => {
-            let env_key = required_string(table, "bucket_env", &label)?;
-            let env_lit = LitStr::new(&env_key, proc_macro2::Span::call_site());
-            let missing_message = LitStr::new(
-                &format!(
-                    "portable service `{}` missing native env var `{}`",
-                    service.name, env_key
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            Ok(quote! {{
-                let bucket = ::std::env::var(#env_lit)
-                    .unwrap_or_else(|_| panic!("{}", #missing_message));
-                let backend = ::skyzen_s3::S3Storage::from_env(&bucket).await;
-                ::skyzen_services::Storage::new(backend)
-            }})
-        }
-        (ServiceType::Storage, "memory") => Ok(quote! {
-            ::skyzen_services::Storage::new(::skyzen_test::mock::InMemoryStorage::new())
-        }),
-        (ServiceType::Queue, "sqs") => {
-            let env_key = required_string(table, "url_env", &label)?;
-            let env_lit = LitStr::new(&env_key, proc_macro2::Span::call_site());
-            let missing_message = LitStr::new(
-                &format!(
-                    "portable service `{}` missing native env var `{}`",
-                    service.name, env_key
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            // `SqsQueue::from_env` builds a *standard* queue and refuses a `.fifo` URL, which needs
-            // a message group id on every send. A FIFO queue is wired in code with
+        (ServiceType::Storage, NativeServiceBackend::S3) => (
+            env_key("bucket_env", wiring.bucket_env.as_ref())?,
+            quote! { ::skyzen_s3::S3Storage::from_env(&__skyzen_env_value).await },
+        ),
+        (ServiceType::Queue, NativeServiceBackend::Sqs) => {
+            let key = env_key("url_env", wiring.url_env.as_ref())?;
+            // `SqsQueue::from_env` builds a *standard* queue and refuses a `.fifo` URL, which
+            // needs a message group id on every send. A FIFO queue is wired in code with
             // `SqsQueue::fifo`, so the manifest path reports the mismatch rather than hiding it.
-            let connect_message = LitStr::new(
-                &format!(
-                    "portable service `{}` cannot use the SQS queue named by `{}`",
-                    service.name, env_key
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            Ok(quote! {{
-                let url = ::std::env::var(#env_lit)
-                    .unwrap_or_else(|_| panic!("{}", #missing_message));
-                let backend = ::skyzen_aws::SqsQueue::from_env(&url)
-                    .await
-                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message));
-                ::skyzen_services::Queue::new(backend)
-            }})
+            let failure =
+                connect_failure_lit(&service.name, &format!("use the SQS queue named by `{key}`"));
+            (
+                key,
+                quote! {
+                    ::skyzen_aws::SqsQueue::from_env(&__skyzen_env_value)
+                        .await
+                        .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+                },
+            )
         }
-        (ServiceType::Queue, "memory") => Ok(quote! {
-            ::skyzen_services::Queue::new(::skyzen_test::mock::InMemoryQueue::new())
-        }),
-        (service_type, other) => Ok(compile_error_block(&format!(
-            "unsupported native backend `{other}` for portable service `{}` of type `{}`",
-            service.name,
-            service_type.as_str()
-        ))),
-    }
+        (_, NativeServiceBackend::Memory) => {
+            let mock = match service.service_type {
+                ServiceType::Kv => quote! { ::skyzen_test::mock::InMemoryKv },
+                ServiceType::Storage => quote! { ::skyzen_test::mock::InMemoryStorage },
+                ServiceType::Queue => quote! { ::skyzen_test::mock::InMemoryQueue },
+            };
+            return Ok(quote! { #wrapper::new(#mock::new()) });
+        }
+        (service_type, backend) => {
+            return Ok(compile_error_block(&format!(
+                "unsupported native backend `{}` for portable service `{}` of type `{}`",
+                backend.as_str(),
+                service.name,
+                service_type.as_str()
+            )));
+        }
+    };
+
+    let env_lit = LitStr::new(&env_key, proc_macro2::Span::call_site());
+    let missing_message = LitStr::new(
+        &format!(
+            "portable service `{}` missing native env var `{env_key}`",
+            service.name
+        ),
+        proc_macro2::Span::call_site(),
+    );
+    Ok(quote! {{
+        let __skyzen_env_value = ::std::env::var(#env_lit)
+            .unwrap_or_else(|_| panic!("{}", #missing_message));
+        let backend = #build;
+        #wrapper::new(backend)
+    }})
+}
+
+/// The panic message for a native backend whose constructor failed.
+fn connect_failure_lit(service_name: &str, what: &str) -> LitStr {
+    LitStr::new(
+        &format!("portable service `{service_name}` failed to {what}"),
+        proc_macro2::Span::call_site(),
+    )
 }
 
 fn generate_cloudflare_service_init(
-    service: &ServiceConfig,
-    value: &toml::Value,
-) -> syn::Result<proc_macro2::TokenStream> {
-    let Some(table) = lookup_table(value, &["cloudflare", "service", service.name.as_str()]) else {
-        return Ok(compile_error_block(&format!(
+    service: &ServiceEntry,
+    manifest: &SkyzenManifest,
+) -> proc_macro2::TokenStream {
+    let Some(wiring) = manifest
+        .cloudflare
+        .as_ref()
+        .and_then(|cloudflare| cloudflare.service.get(&service.name))
+    else {
+        return compile_error_block(&format!(
             "missing [cloudflare.service.{}] wiring for portable service `{}`",
             service.name, service.name
-        )));
+        ));
     };
 
-    let label = format!("[cloudflare.service.{}]", service.name);
-    let binding = required_string(table, "binding", &label)?;
-    let binding_lit = LitStr::new(&binding, proc_macro2::Span::call_site());
+    let binding = &wiring.binding;
+    let binding_lit = LitStr::new(binding, proc_macro2::Span::call_site());
     let failure_message = LitStr::new(
         &format!(
-            "portable service `{}` failed to resolve Cloudflare binding `{}`",
-            service.name, binding
+            "portable service `{}` failed to resolve Cloudflare binding `{binding}`",
+            service.name
+        ),
+        proc_macro2::Span::call_site(),
+    );
+    let backend = match service.service_type {
+        ServiceType::Kv => quote! { ::skyzen_cloudflare::CfKv },
+        ServiceType::Storage => quote! { ::skyzen_cloudflare::CfR2 },
+        ServiceType::Queue => quote! { ::skyzen_cloudflare::CfQueue },
+    };
+    let wrapper = service_wrapper_path(service.service_type);
+
+    quote! {{
+        let backend = #backend::from_env(&__skyzen_wasm_env, #binding_lit)
+            .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
+        #wrapper::new(backend)
+    }}
+}
+
+fn generate_native_database_init(
+    database: &DatabaseEntry,
+    manifest: &SkyzenManifest,
+) -> proc_macro2::TokenStream {
+    let Some(wiring) = native_database_wiring(manifest, &database.name) else {
+        return compile_error_block(&format!(
+            "missing [native.database.{}] wiring for portable database `{}`",
+            database.name, database.name
+        ));
+    };
+
+    // Every SQL driver takes the same shape — read one env var, hand the URL to a
+    // `Db::connect_*` — so the arms differ only in which constructor they name.
+    let connect = match (database.database_type, wiring.backend) {
+        (DatabaseType::Sql, NativeDatabaseBackend::Postgres) => quote! { connect_postgres },
+        (DatabaseType::Sql, NativeDatabaseBackend::Mysql) => quote! { connect_mysql },
+        (DatabaseType::Sql, NativeDatabaseBackend::Sqlite) => quote! { connect_sqlite },
+    };
+
+    let url_env = &wiring.url_env;
+    let env_lit = LitStr::new(url_env, proc_macro2::Span::call_site());
+    let missing_message = LitStr::new(
+        &format!(
+            "portable database `{}` missing native env var `{url_env}`",
+            database.name
+        ),
+        proc_macro2::Span::call_site(),
+    );
+    let connect_message = LitStr::new(
+        &format!(
+            "portable database `{}` failed to connect using `{url_env}`",
+            database.name
         ),
         proc_macro2::Span::call_site(),
     );
 
-    match service.service_type {
-        ServiceType::Kv => Ok(quote! {{
-            let backend = ::skyzen_cloudflare::CfKv::from_env(&__skyzen_wasm_env, #binding_lit)
-                .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
-            ::skyzen_services::Kv::new(backend)
-        }}),
-        ServiceType::Storage => Ok(quote! {{
-            let backend = ::skyzen_cloudflare::CfR2::from_env(&__skyzen_wasm_env, #binding_lit)
-                .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
-            ::skyzen_services::Storage::new(backend)
-        }}),
-        ServiceType::Queue => Ok(quote! {{
-            let backend = ::skyzen_cloudflare::CfQueue::from_env(&__skyzen_wasm_env, #binding_lit)
-                .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
-            ::skyzen_services::Queue::new(backend)
-        }}),
-    }
-}
-
-fn generate_native_database_init(
-    database: &DatabaseConfig,
-    value: &toml::Value,
-) -> syn::Result<proc_macro2::TokenStream> {
-    let Some(table) = lookup_table(value, &["native", "database", database.name.as_str()]) else {
-        return Ok(compile_error_block(&format!(
-            "missing [native.database.{}] wiring for portable database `{}`",
-            database.name, database.name
-        )));
-    };
-
-    let label = format!("[native.database.{}]", database.name);
-    let backend = required_string(table, "backend", &label)?;
-    let url_env = required_string(table, "url_env", &label)?;
-
-    match (database.database_type, backend.as_str()) {
-        (DatabaseType::Sql, "postgres") => {
-            let env_lit = LitStr::new(&url_env, proc_macro2::Span::call_site());
-            let missing_message = LitStr::new(
-                &format!(
-                    "portable database `{}` missing native env var `{}`",
-                    database.name, url_env
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            let connect_message = LitStr::new(
-                &format!(
-                    "portable database `{}` failed to connect using `{}`",
-                    database.name, url_env
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            Ok(quote! {{
-                let url = ::std::env::var(#env_lit)
-                    .unwrap_or_else(|_| panic!("{}", #missing_message));
-                ::skyzen_services::Db::connect_postgres(&url)
-                    .await
-                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
-            }})
-        }
-        (DatabaseType::Sql, "mysql") => {
-            let env_lit = LitStr::new(&url_env, proc_macro2::Span::call_site());
-            let missing_message = LitStr::new(
-                &format!(
-                    "portable database `{}` missing native env var `{}`",
-                    database.name, url_env
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            let connect_message = LitStr::new(
-                &format!(
-                    "portable database `{}` failed to connect using `{}`",
-                    database.name, url_env
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            Ok(quote! {{
-                let url = ::std::env::var(#env_lit)
-                    .unwrap_or_else(|_| panic!("{}", #missing_message));
-                ::skyzen_services::Db::connect_mysql(&url)
-                    .await
-                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
-            }})
-        }
-        (DatabaseType::Sql, "sqlite") => {
-            let env_lit = LitStr::new(&url_env, proc_macro2::Span::call_site());
-            let missing_message = LitStr::new(
-                &format!(
-                    "portable database `{}` missing native env var `{}`",
-                    database.name, url_env
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            let connect_message = LitStr::new(
-                &format!(
-                    "portable database `{}` failed to connect using `{}`",
-                    database.name, url_env
-                ),
-                proc_macro2::Span::call_site(),
-            );
-            Ok(quote! {{
-                let url = ::std::env::var(#env_lit)
-                    .unwrap_or_else(|_| panic!("{}", #missing_message));
-                ::skyzen_services::Db::connect_sqlite(&url)
-                    .await
-                    .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
-            }})
-        }
-        (database_type, other) => Ok(compile_error_block(&format!(
-            "unsupported native backend `{other}` for portable database `{}` of type `{}`",
-            database.name,
-            database_type.as_str()
-        ))),
-    }
+    quote! {{
+        let url = ::std::env::var(#env_lit)
+            .unwrap_or_else(|_| panic!("{}", #missing_message));
+        ::skyzen_services::Db::#connect(&url)
+            .await
+            .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
+    }}
 }
 
 fn generate_cloudflare_database_init(
-    database: &DatabaseConfig,
-    value: &toml::Value,
-) -> syn::Result<proc_macro2::TokenStream> {
-    let Some(table) = lookup_table(value, &["cloudflare", "database", database.name.as_str()])
+    database: &DatabaseEntry,
+    manifest: &SkyzenManifest,
+) -> proc_macro2::TokenStream {
+    let Some(wiring) = manifest
+        .cloudflare
+        .as_ref()
+        .and_then(|cloudflare| cloudflare.database.get(&database.name))
     else {
-        return Ok(compile_error_block(&format!(
+        return compile_error_block(&format!(
             "missing [cloudflare.database.{}] wiring for portable database `{}`",
             database.name, database.name
-        )));
+        ));
     };
 
-    let label = format!("[cloudflare.database.{}]", database.name);
-    let binding = required_string(table, "binding", &label)?;
-    let binding_lit = LitStr::new(&binding, proc_macro2::Span::call_site());
+    let binding = &wiring.binding;
+    let binding_lit = LitStr::new(binding, proc_macro2::Span::call_site());
     let failure_message = LitStr::new(
         &format!(
-            "portable database `{}` failed to resolve Cloudflare binding `{}`",
-            database.name, binding
+            "portable database `{}` failed to resolve Cloudflare binding `{binding}`",
+            database.name
         ),
         proc_macro2::Span::call_site(),
     );
 
     match database.database_type {
-        DatabaseType::Sql => Ok(quote! {{
+        DatabaseType::Sql => quote! {{
             let backend = ::skyzen_cloudflare::CfD1::from_env(&__skyzen_wasm_env, #binding_lit)
                 .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
             ::skyzen_services::Db::new(backend)
-        }}),
+        }},
     }
-}
-
-fn lookup_table<'a>(
-    value: &'a toml::Value,
-    path: &[&str],
-) -> Option<&'a toml::map::Map<String, toml::Value>> {
-    let mut current = value;
-    for segment in path {
-        current = current.get(*segment)?;
-    }
-    current.as_table()
 }
 
 fn compile_error_block(message: &str) -> proc_macro2::TokenStream {
@@ -3009,48 +2526,6 @@ fn compile_error_block(message: &str) -> proc_macro2::TokenStream {
         compile_error!(#message);
         unreachable!()
     }}
-}
-
-fn parse_env_ref(value: &str) -> Option<String> {
-    value
-        .strip_prefix("${")
-        .and_then(|value| value.strip_suffix('}'))
-        .map(ToOwned::to_owned)
-}
-
-fn looks_like_env_name(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
-}
-
-fn ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
-    let mut normalized = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            normalized.push(ch);
-        } else {
-            normalized.push('_');
-        }
-    }
-
-    if normalized.is_empty() {
-        return Err(Error::new(
-            proc_macro2::Span::call_site(),
-            "datasource name must contain at least one alphanumeric character",
-        ));
-    }
-
-    if normalized
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_digit())
-    {
-        normalized.insert(0, '_');
-    }
-
-    Ok(format_ident!("{normalized}"))
 }
 
 /// Turn a manifest entry's name into a type name: `main-db` becomes `MainDb`.
@@ -3101,7 +2576,7 @@ fn service_ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
     pascal_ident_from_name(name, "", "service")
 }
 
-fn default_database_index(databases: &[DatabaseConfig]) -> syn::Result<Option<usize>> {
+fn default_database_index(databases: &[DatabaseEntry]) -> syn::Result<Option<usize>> {
     if databases.is_empty() {
         return Ok(None);
     }
@@ -3627,18 +3102,26 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        DatabaseConfig, DatabaseType, ServiceType, database_ident_from_name,
+        DatabaseEntry, DatabaseType, ServiceType, SkyzenManifest, database_ident_from_name,
         default_database_index, documented_extractor_payload, documented_response_payload,
-        first_generic_type, generate_cloudflare_database_init, generate_native_service_init,
-        ident_from_name, load_databases_from_value, load_services_from_value, looks_like_env_name,
-        lookup_table, parse_env_ref, single_generic_type,
+        first_generic_type, generate_cloudflare_database_init, generate_native_database_init,
+        generate_native_service_init, single_generic_type,
     };
     use quote::ToTokens;
+    use skyzen_manifest::Manifest;
     use syn::parse_quote;
+
+    /// Parse a manifest through the same shared schema the macros use at compile time.
+    fn manifest(source: &str) -> SkyzenManifest {
+        Manifest::parse(source, "Skyzen.toml", ".")
+            .expect("valid manifest")
+            .data()
+            .clone()
+    }
 
     #[test]
     fn parses_portable_services_and_databases() {
-        let value: toml::Value = toml::from_str(
+        let manifest = manifest(
             r#"[[service]]
 name = "cache"
 type = "kv"
@@ -3651,73 +3134,53 @@ type = "storage"
 name = "main"
 type = "sql"
 "#,
-        )
-        .expect("valid toml");
+        );
 
-        let services = load_services_from_value(&value).expect("services");
-        assert_eq!(services.len(), 2);
-        assert_eq!(services[0].name, "cache");
-        assert_eq!(services[0].service_type, ServiceType::Kv);
-        assert_eq!(services[1].service_type, ServiceType::Storage);
+        assert_eq!(manifest.service.len(), 2);
+        assert_eq!(manifest.service[0].name, "cache");
+        assert_eq!(manifest.service[0].service_type, ServiceType::Kv);
+        assert_eq!(manifest.service[1].service_type, ServiceType::Storage);
 
-        let databases = load_databases_from_value(&value).expect("databases");
-        assert_eq!(databases.len(), 1);
-        assert_eq!(databases[0].name, "main");
-        assert_eq!(databases[0].database_type, DatabaseType::Sql);
-        assert!(!databases[0].default);
+        assert_eq!(manifest.database.len(), 1);
+        assert_eq!(manifest.database[0].name, "main");
+        assert_eq!(manifest.database[0].database_type, DatabaseType::Sql);
+        assert!(!manifest.database[0].default);
     }
 
     #[test]
-    fn locates_named_wiring_tables() {
-        let value: toml::Value = toml::from_str(
-            r#"[native.service.cache]
-backend = "redis"
-url_env = "CACHE_URL"
+    fn missing_wiring_becomes_a_compile_error_naming_the_section_to_add() {
+        let manifest = manifest("[[service]]\nname = \"cache\"\ntype = \"kv\"\n");
 
-[cloudflare.service.cache]
-binding = "CACHE"
+        let generated = generate_native_service_init(&manifest.service[0], &manifest)
+            .expect("init tokens")
+            .to_string();
+        assert!(generated.contains("compile_error !"));
+        assert!(generated.contains("[native.service.cache]"));
+    }
 
-[native.database.main]
-backend = "postgres"
-url_env = "DATABASE_URL"
-"#,
-        )
-        .expect("valid toml");
-
-        let native_cache =
-            lookup_table(&value, &["native", "service", "cache"]).expect("native cache section");
-        assert_eq!(
-            native_cache
-                .get("backend")
-                .and_then(toml::Value::as_str)
-                .expect("backend"),
-            "redis"
-        );
-
-        let cloudflare_cache = lookup_table(&value, &["cloudflare", "service", "cache"])
-            .expect("cloudflare cache section");
-        assert_eq!(
-            cloudflare_cache
-                .get("binding")
-                .and_then(toml::Value::as_str)
-                .expect("binding"),
-            "CACHE"
-        );
-
-        let native_database =
-            lookup_table(&value, &["native", "database", "main"]).expect("native db section");
-        assert_eq!(
-            native_database
-                .get("url_env")
-                .and_then(toml::Value::as_str)
-                .expect("url_env"),
-            "DATABASE_URL"
-        );
+    #[test]
+    fn every_native_sql_driver_reaches_its_own_connect_constructor() {
+        for (backend, expected) in [
+            ("postgres", "connect_postgres"),
+            ("mysql", "connect_mysql"),
+            ("sqlite", "connect_sqlite"),
+        ] {
+            let manifest = manifest(&format!(
+                "[[database]]\nname = \"main\"\ntype = \"sql\"\n\n\
+                 [native.database.main]\nbackend = \"{backend}\"\nurl_env = \"DATABASE_URL\"\n"
+            ));
+            let generated =
+                generate_native_database_init(&manifest.database[0], &manifest).to_string();
+            assert!(
+                generated.contains(expected),
+                "backend `{backend}` should reach `{expected}`, got: {generated}"
+            );
+        }
     }
 
     #[test]
     fn generates_portable_wrapper_inits() {
-        let value: toml::Value = toml::from_str(
+        let manifest = manifest(
             r#"[[service]]
 name = "cache"
 type = "kv"
@@ -3733,21 +3196,16 @@ url_env = "CACHE_URL"
 [cloudflare.database.main]
 binding = "DB"
 "#,
-        )
-        .expect("valid toml");
+        );
 
-        let services = load_services_from_value(&value).expect("services");
-        let databases = load_databases_from_value(&value).expect("databases");
-
-        let native_service = generate_native_service_init(&services[0], &value)
+        let native_service = generate_native_service_init(&manifest.service[0], &manifest)
             .expect("native service init")
             .to_string();
         assert!(native_service.contains("skyzen_services :: Kv :: new"));
         assert!(native_service.contains("skyzen_redis :: Redis :: connect"));
 
-        let cloudflare_database = generate_cloudflare_database_init(&databases[0], &value)
-            .expect("cloudflare database init")
-            .to_string();
+        let cloudflare_database =
+            generate_cloudflare_database_init(&manifest.database[0], &manifest).to_string();
         assert!(cloudflare_database.contains("skyzen_services :: Db :: new"));
         assert!(cloudflare_database.contains("skyzen_cloudflare :: CfD1 :: from_env"));
     }
@@ -3812,7 +3270,7 @@ binding = "DB"
 
     #[test]
     fn default_database_index_enforces_default_selection_rules() {
-        let single = vec![DatabaseConfig {
+        let single = vec![DatabaseEntry {
             name: "main".to_owned(),
             database_type: DatabaseType::Sql,
             default: false,
@@ -3820,12 +3278,12 @@ binding = "DB"
         assert_eq!(default_database_index(&single).unwrap(), Some(0));
 
         let multiple_missing_default = vec![
-            DatabaseConfig {
+            DatabaseEntry {
                 name: "main".to_owned(),
                 database_type: DatabaseType::Sql,
                 default: false,
             },
-            DatabaseConfig {
+            DatabaseEntry {
                 name: "analytics".to_owned(),
                 database_type: DatabaseType::Sql,
                 default: false,
@@ -3839,12 +3297,12 @@ binding = "DB"
         );
 
         let multiple_defaults = vec![
-            DatabaseConfig {
+            DatabaseEntry {
                 name: "main".to_owned(),
                 database_type: DatabaseType::Sql,
                 default: true,
             },
-            DatabaseConfig {
+            DatabaseEntry {
                 name: "analytics".to_owned(),
                 database_type: DatabaseType::Sql,
                 default: true,
@@ -3946,7 +3404,7 @@ binding = "DB"
     fn the_bare_wrapper_is_injected_only_for_an_unambiguous_service_type() {
         use super::service_type_counts;
 
-        let value: toml::Value = toml::from_str(
+        let manifest = manifest(
             r#"[[service]]
 name = "cache"
 type = "kv"
@@ -3959,10 +3417,8 @@ type = "kv"
 name = "uploads"
 type = "storage"
 "#,
-        )
-        .expect("valid toml");
-        let services = load_services_from_value(&value).expect("services");
-        let counts = service_type_counts(&services);
+        );
+        let counts = service_type_counts(&manifest.service);
 
         // Two KV namespaces: only `Cache` and `Sessions` are injected, never a bare `Kv`.
         assert_eq!(counts[&ServiceType::Kv], 2);
@@ -4032,23 +3488,14 @@ type = "storage"
     }
 
     #[test]
-    fn env_reference_helpers_and_identifier_normalization_are_stable() {
-        assert_eq!(
-            parse_env_ref("${DATABASE_URL}"),
-            Some("DATABASE_URL".to_owned())
-        );
-        assert_eq!(parse_env_ref("DATABASE_URL"), None);
-        assert!(looks_like_env_name("DATABASE_URL_2"));
-        assert!(!looks_like_env_name("database-url"));
-
-        assert_eq!(
-            ident_from_name("cache-service").unwrap().to_string(),
-            "cache_service"
-        );
-        assert_eq!(ident_from_name("9cache").unwrap().to_string(), "_9cache");
+    fn identifier_normalization_is_stable() {
         assert_eq!(
             database_ident_from_name("primary").unwrap().to_string(),
             "PrimaryDb"
+        );
+        assert_eq!(
+            database_ident_from_name("main-db").unwrap().to_string(),
+            "MainDbDb"
         );
     }
 }
