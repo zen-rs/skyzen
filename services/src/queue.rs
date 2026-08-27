@@ -8,6 +8,8 @@ use core::future::Future;
 
 use serde::{de::DeserializeOwned, Serialize};
 
+pub mod envelope;
+
 // ── Error type ──
 
 /// Errors that can occur during message queue operations.

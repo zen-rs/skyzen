@@ -24,11 +24,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use base64::Engine as _;
 use http_kit::{Body, Endpoint, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use skyzen_services::queue::{
-    QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition,
+    envelope, QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition,
 };
 use tracing::{debug, error, info, warn};
 
@@ -39,18 +38,6 @@ use crate::{
 
 /// The environment variable the Functions host sets, and the signal that we are running under it.
 pub const CUSTOM_HANDLER_PORT_ENV: &str = "FUNCTIONS_CUSTOMHANDLER_PORT";
-
-/// The envelope prefix marking a base64-encoded body.
-///
-/// Azure Storage queues carry a message as text inside an XML document and offer no property
-/// channel to tag an encoding with, so `skyzen-azure` puts the tag in the body itself. The format
-/// is owned by `azure/src/storage_queue.rs`; this reverses it for a message the *host* delivered
-/// rather than one this process received, which is why it is spelled out again here instead of
-/// being called there — the platform crates deliberately do not depend on the framework.
-const BASE64_PREFIX: &str = "skyzen-b64:";
-
-/// The envelope prefix marking text that would otherwise be mistaken for an envelope.
-const UTF8_PREFIX: &str = "skyzen-utf8:";
 
 /// One `[[azure.queue_triggers]]` entry, as the runtime sees it.
 ///
@@ -376,8 +363,8 @@ pub enum EnvelopeError {
     Malformed(String),
     /// `Data` does not hold exactly the one trigger binding the generated `function.json` declares.
     UnexpectedBindings(Vec<String>),
-    /// The message text carries this framework's base64 tag but is not base64.
-    MalformedBase64(String),
+    /// The message text is not a [`envelope`] the producer could have written.
+    MalformedEnvelope(String),
 }
 
 impl core::fmt::Display for EnvelopeError {
@@ -399,10 +386,9 @@ impl core::fmt::Display for EnvelopeError {
                 names.len(),
                 names.join(", ")
             ),
-            Self::MalformedBase64(error) => write!(
-                f,
-                "the message is tagged `{BASE64_PREFIX}` but is not valid base64: {error}"
-            ),
+            Self::MalformedEnvelope(error) => {
+                write!(f, "the queue message could not be decoded: {error}")
+            }
         }
     }
 }
@@ -467,7 +453,7 @@ impl InvokeRequest {
     }
 }
 
-/// Reverse the in-band envelope `AzureStorageQueue::send` applies.
+/// Reverse the in-band [`envelope`] `AzureStorageQueue::send` applies.
 ///
 /// The host hands over whatever text the queue holds — `messageEncoding: none` in the generated
 /// `host.json` is what keeps it from base64-decoding first — so what arrives is exactly what the
@@ -480,15 +466,7 @@ fn decode_message(value: &serde_json::Value) -> Result<Vec<u8>, EnvelopeError> {
             .expect("a value that was just deserialized always serializes"));
     };
 
-    if let Some(encoded) = text.strip_prefix(BASE64_PREFIX) {
-        return base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| EnvelopeError::MalformedBase64(error.to_string()));
-    }
-    if let Some(escaped) = text.strip_prefix(UTF8_PREFIX) {
-        return Ok(escaped.as_bytes().to_vec());
-    }
-    Ok(text.as_bytes().to_vec())
+    envelope::decode(text).map_err(|error| EnvelopeError::MalformedEnvelope(error.to_string()))
 }
 
 /// A metadata count, which the host writes as a number and some hosts as a string.

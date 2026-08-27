@@ -17,22 +17,13 @@ use azure_storage_queue::{
     },
     QueueClient,
 };
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use skyzen_services::queue::{
-    BatchSendFailure, MessageQueue, MessageReceipt, QueueError, QueueRetry, ReceiveOptions,
-    ReceivedMessage, SendOptions,
+    envelope, BatchSendFailure, MessageQueue, MessageReceipt, QueueError, QueueRetry,
+    ReceiveOptions, ReceivedMessage, SendOptions,
 };
 
 use crate::status::{classify, retry_after, AzureStatus};
-
-/// The envelope prefix marking a base64-encoded body.
-const BASE64_PREFIX: &str = "skyzen-b64:";
-
-/// The envelope prefix marking a body that is text but had to be escaped.
-///
-/// Only a payload that would otherwise be mistaken for an envelope carries it.
-const UTF8_PREFIX: &str = "skyzen-utf8:";
 
 /// The largest message Azure Storage queues accept, in bytes of encoded text.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -52,18 +43,15 @@ const MAX_VISIBILITY_TIMEOUT_SECONDS: i32 = 604_800;
 /// # Wire format
 ///
 /// Azure Storage queues carry a message as text inside an XML document and offer no property
-/// channel to tag an encoding with, so the tag travels in the body:
+/// channel to tag an encoding with, so the tag travels in the body, in the shared
+/// [`queue::envelope`](skyzen_services::queue::envelope) format: XML-safe text verbatim, anything
+/// else behind `skyzen-b64:`, and text that would itself look like an envelope behind
+/// `skyzen-utf8:`. The mapping is injective, so [`receive`](MessageQueue::receive) returns exactly
+/// the bytes [`send`](MessageQueue::send) was given.
 ///
-/// - Text that XML can carry, and that does not begin with one of this backend's prefixes, is sent
-///   **verbatim**: JSON produced by `send_json` arrives as plain JSON, readable by any other
-///   consumer of the queue.
-/// - Anything else — binary, or text with characters XML 1.0 cannot represent — is sent as
-///   `skyzen-b64:` followed by standard base64.
-/// - Text that would itself begin with `skyzen-b64:` or `skyzen-utf8:` is sent as `skyzen-utf8:`
-///   followed by the text, so it cannot be mistaken for one of the other two forms.
-///
-/// The mapping is injective, so [`receive`](MessageQueue::receive) returns exactly the bytes
-/// [`send`](MessageQueue::send) was given.
+/// The format lives in `skyzen-services` rather than here because the framework's Azure Functions
+/// integration reads it back off messages the *host* delivers, and a platform crate never depends
+/// on the framework crate.
 ///
 /// # Platform limits
 ///
@@ -277,37 +265,12 @@ fn is_queue_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Whether `c` can be carried by the XML document a queue message travels in.
-///
-/// Azure documents the message as having to fit "an XML request with UTF-8 encoding", which is the
-/// W3C XML 1.0 character range: `#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] |
-/// [#x10000-#x10FFFF]`. A Rust `char` is never a surrogate, so that range needs no check. This is
-/// the same rule the SQS backend applies to its own bodies.
-const fn is_xml_text_char(c: char) -> bool {
-    matches!(c,
-        '\u{9}' | '\u{A}' | '\u{D}'
-        | '\u{20}'..='\u{D7FF}'
-        | '\u{E000}'..='\u{FFFD}'
-        | '\u{10000}'..='\u{10FFFF}')
-}
-
 /// Encode a payload into the in-band envelope, refusing one the service would reject.
+///
+/// The envelope itself is [`skyzen_services::queue::envelope`]; the only thing added here is the
+/// platform's size cap, which applies to the encoded text.
 fn encode_message(message: &[u8]) -> Result<String, AzureError> {
-    let encoded = match core::str::from_utf8(message) {
-        Ok(text) if text.chars().all(is_xml_text_char) => {
-            if text.starts_with(BASE64_PREFIX) || text.starts_with(UTF8_PREFIX) {
-                // Escaping a body that already looks like an envelope is what keeps the encoding
-                // injective: without it, `receive` could not tell this text from an encoded blob.
-                format!("{UTF8_PREFIX}{text}")
-            } else {
-                text.to_owned()
-            }
-        }
-        _ => format!(
-            "{BASE64_PREFIX}{}",
-            base64::engine::general_purpose::STANDARD.encode(message)
-        ),
-    };
+    let encoded = envelope::encode(message);
 
     if encoded.len() > MAX_MESSAGE_BYTES {
         return Err(AzureError::with_message(
@@ -325,22 +288,9 @@ fn encode_message(message: &[u8]) -> Result<String, AzureError> {
 
 /// Reverse [`encode_message`].
 fn decode_message(text: &str) -> Result<Vec<u8>, QueueError> {
-    if let Some(encoded) = text.strip_prefix(BASE64_PREFIX) {
-        return base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| {
-                QueueError::backend_with(
-                    format!("a message body prefixed {BASE64_PREFIX:?} is not valid base64"),
-                    error,
-                )
-            });
-    }
-
-    Ok(text
-        .strip_prefix(UTF8_PREFIX)
-        .unwrap_or(text)
-        .as_bytes()
-        .to_vec())
+    envelope::decode(text).map_err(|error| {
+        QueueError::backend_with("a queue message is not a Skyzen envelope", error)
+    })
 }
 
 /// The lease this backend hands back, and takes back to settle a message.
@@ -620,78 +570,36 @@ impl MessageQueue for AzureStorageQueue {
 mod tests {
     use super::{
         decode_message, encode_message, is_queue_name, long_poll, queue_url, receive_batch_size,
-        retry_visibility_seconds, AzureStorageQueue, Duration, StorageQueueReceipt, BASE64_PREFIX,
-        MAX_MESSAGE_BYTES, MAX_RECEIVE_MESSAGES, UTF8_PREFIX,
+        retry_visibility_seconds, AzureStorageQueue, Duration, StorageQueueReceipt,
+        MAX_MESSAGE_BYTES, MAX_RECEIVE_MESSAGES,
     };
-    use skyzen_services::queue::{MessageReceipt, QueueError, QueueRetry, ReceivedMessage};
+    use skyzen_services::queue::{
+        envelope::BASE64_PREFIX, MessageReceipt, QueueError, QueueRetry, ReceivedMessage,
+    };
 
-    /// The round trip the wire format promises: what `send` encodes, `receive` decodes.
-    fn round_trip(payload: &[u8]) -> Vec<u8> {
-        decode_message(&encode_message(payload).expect("payload should encode"))
-            .expect("payload should decode")
-    }
-
-    #[test]
-    fn json_passes_through_unchanged() {
-        let payload = br#"{"kind":"email"}"#;
-        assert_eq!(encode_message(payload).unwrap(), r#"{"kind":"email"}"#);
-        assert_eq!(round_trip(payload), payload.to_vec());
-    }
-
-    #[test]
-    fn unicode_text_passes_through_unchanged() {
-        let payload = "hello 世界".as_bytes();
-        assert_eq!(encode_message(payload).unwrap(), "hello 世界");
-        assert_eq!(round_trip(payload), payload.to_vec());
-    }
-
-    #[test]
-    fn binary_is_base64_encoded_behind_the_prefix() {
-        let payload = [0xFF, 0xFE, 0x00, 0x01];
-        let encoded = encode_message(&payload).unwrap();
-        assert!(encoded.starts_with(BASE64_PREFIX));
-        assert_eq!(round_trip(&payload), payload.to_vec());
-    }
-
-    #[test]
-    fn text_xml_cannot_carry_is_base64_encoded() {
-        // A lone form feed is valid UTF-8 and invalid XML 1.0, so it cannot travel verbatim.
-        let payload = b"before\x0Cafter";
-        let encoded = encode_message(payload).unwrap();
-        assert!(encoded.starts_with(BASE64_PREFIX));
-        assert_eq!(round_trip(payload), payload.to_vec());
-    }
-
-    #[test]
-    fn text_that_looks_like_an_envelope_is_escaped_so_the_encoding_stays_injective() {
-        for payload in [
-            format!("{BASE64_PREFIX}aGVsbG8="),
-            format!("{UTF8_PREFIX}hello"),
-        ] {
-            let encoded = encode_message(payload.as_bytes()).unwrap();
-            assert_eq!(encoded, format!("{UTF8_PREFIX}{payload}"));
-            assert_eq!(round_trip(payload.as_bytes()), payload.as_bytes().to_vec());
-        }
-    }
-
-    #[test]
-    fn a_body_that_merely_looks_base64_is_not_decoded() {
-        let payload = b"aGVsbG8=";
-        assert_eq!(round_trip(payload), payload.to_vec());
-    }
+    // The envelope's own round trip is tested where it lives, in
+    // `skyzen_services::queue::envelope`. What is tested here is what this backend adds to it:
+    // the platform's size cap, and that a malformed envelope surfaces as a `QueueError`.
 
     #[test]
     fn a_message_beyond_the_platform_cap_is_refused_before_it_is_sent() {
         let payload = vec![b'a'; MAX_MESSAGE_BYTES + 1];
         let error = encode_message(&payload).expect_err("an oversized message should be refused");
-        assert!(error.to_string().contains("65536"));
+        assert!(error.to_string().contains("65536"), "{error}");
+    }
+
+    #[test]
+    fn a_payload_that_fits_once_encoded_is_accepted() {
+        let payload = vec![b'a'; MAX_MESSAGE_BYTES];
+        let encoded = encode_message(&payload).expect("a payload at the cap should encode");
+        assert_eq!(decode_message(&encoded).unwrap(), payload);
     }
 
     #[test]
     fn a_body_prefixed_base64_that_is_not_base64_is_refused() {
         let error = decode_message(&format!("{BASE64_PREFIX}not base64!"))
             .expect_err("a malformed envelope should be refused");
-        assert!(error.to_string().contains("base64"));
+        assert!(error.to_string().contains("envelope"), "{error}");
     }
 
     #[test]

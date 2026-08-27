@@ -17,6 +17,9 @@ serde_json = "1"
 thiserror = "2"
 futures-core = "0.3"
 bytes = "1"
+# The queue envelope codec (`queue::envelope`), which tags a body a text-only transport could not
+# otherwise carry.
+base64 = "0.22"
 sqlparser = "0.58"
 tracing.workspace = true
 # Migration checksums are recorded in the database as hex. Hashing happens at build time (in
