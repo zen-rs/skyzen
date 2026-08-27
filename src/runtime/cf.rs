@@ -35,6 +35,10 @@ pub struct CfBotManagement {
     /// The JA4 TLS client fingerprint.
     pub ja4: Option<String>,
     /// Identifiers of the heuristics that fired.
+    ///
+    /// Production sends a sequence, but workerd's placeholder `cf` sends an empty map, so the
+    /// deserializer accepts either shape rather than letting one field void the whole object.
+    #[serde(deserialize_with = "sequence_or_map_values")]
     pub detection_ids: Vec<u32>,
 }
 
@@ -163,6 +167,7 @@ impl Extractor for CfProperties {
 }
 
 impl CfPropertiesSlot {
+    #[cfg(target_arch = "wasm32")]
     /// Read `request.cf` off an incoming Workers request, ready to be put into request extensions.
     ///
     /// Returns `Ok(None)` when the runtime attached no `cf` at all, which is the normal case off
@@ -194,7 +199,44 @@ impl CfPropertiesSlot {
     }
 }
 
+/// Accept `detection_ids` as either the documented sequence or workerd's placeholder map.
+fn sequence_or_map_values<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    struct Ids;
+
+    impl<'de> Visitor<'de> for Ids {
+        type Value = Vec<u32>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a sequence of detection ids, or the placeholder map workerd sends")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut ids = Vec::new();
+            while let Some(id) = seq.next_element()? {
+                ids.push(id);
+            }
+            Ok(ids)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut ids = Vec::new();
+            while let Some((IgnoredAny, id)) = map.next_entry()? {
+                ids.push(id);
+            }
+            Ok(ids)
+        }
+    }
+
+    deserializer.deserialize_any(Ids)
+}
+
 impl CfProperties {
+    #[cfg(target_arch = "wasm32")]
     /// Turn the raw `cf` value into the typed struct, keeping the whole object alongside it.
     ///
     /// Decoding runs through `serde_json::Value` rather than straight off the JS value so the
@@ -207,5 +249,30 @@ impl CfProperties {
             .map_err(|error| format!("`request.cf` has an unexpected field type: {error}"))?;
         properties.raw = raw;
         Ok(properties)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CfBotManagement;
+
+    #[test]
+    fn detection_ids_decode_from_the_documented_sequence() {
+        let bm: CfBotManagement =
+            serde_json::from_str(r#"{"score":99,"detectionIds":[7,11]}"#).unwrap();
+        assert_eq!(bm.detection_ids, vec![7, 11]);
+    }
+
+    #[test]
+    fn detection_ids_decode_from_workerds_placeholder_map() {
+        // `wrangler dev --local` sends `detectionIds: {}` — a map, not a sequence. This shape
+        // voided the entire `request.cf` decode before the tolerant deserializer.
+        let bm: CfBotManagement =
+            serde_json::from_str(r#"{"score":99,"detectionIds":{}}"#).unwrap();
+        assert!(bm.detection_ids.is_empty());
+
+        let bm: CfBotManagement =
+            serde_json::from_str(r#"{"detectionIds":{"a":3,"b":5}}"#).unwrap();
+        assert_eq!(bm.detection_ids, vec![3, 5]);
     }
 }
