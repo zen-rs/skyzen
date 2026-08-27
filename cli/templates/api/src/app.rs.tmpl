@@ -1,5 +1,5 @@
-use crate::Cache;
-use serde::Serialize;
+use crate::{Cache, JournalDb};
+use serde::{Deserialize, Serialize};
 use skyzen::{
     routing::{CreateRouteNode, Params, Route, Router},
     utils::Json,
@@ -10,6 +10,14 @@ use skyzen::{
 struct Greeting {
     name: String,
     seen_before: bool,
+    greeted: i64,
+}
+
+/// One row of `SELECT COUNT(*) AS greeted`. A row arrives as a JSON object keyed by column name,
+/// so a query's result type is a struct with a field per selected column.
+#[derive(Deserialize)]
+struct GreetedCount {
+    greeted: i64,
 }
 
 async fn root() -> &'static str {
@@ -20,17 +28,36 @@ async fn health() -> &'static str {
     "OK"
 }
 
-/// Skyzen.toml declares `[[service]] name = "cache"`, so `#[skyzen::main]` generates a `Cache`
-/// extractor around the portable `Kv` and injects it into every request.
+/// Skyzen.toml declares `[[service]] name = "cache"` and `[[database]] name = "journal"`, so
+/// `#[skyzen::main]` generates a `Cache` extractor around the portable `Kv`, a `JournalDb`
+/// extractor around the portable `Db`, and injects both into every request.
 ///
-/// This handler is the whole point of the framework: it runs unchanged against the in-process
-/// mock during `skyzen dev` and against a Cloudflare KV namespace after `skyzen deploy`. Changing
-/// backends is a Skyzen.toml edit, never a code edit.
-async fn greet(cache: Cache, params: Params) -> Result<Json<Greeting>> {
+/// This handler is the whole point of the framework: it runs unchanged against the in-process mock
+/// and SQLite during `skyzen dev`, and against a Cloudflare KV namespace and a D1 database after
+/// `skyzen deploy`. Changing backends is a Skyzen.toml edit, never a code edit.
+async fn greet(cache: Cache, journal: JournalDb, params: Params) -> Result<Json<Greeting>> {
     let name = params.get("name")?.to_owned();
     // `Cache` derefs to `Kv`, so every `Kv` method is reachable through it.
     let seen_before = !cache.put_if_absent(&format!("greeted:{name}"), b"1").await?;
-    Ok(Json(Greeting { name, seen_before }))
+
+    // `JournalDb` derefs to `Db`. The `greetings` table comes from `migrations/`, which
+    // `skyzen migrate` applies to whichever database this deployment is wired to.
+    journal
+        .query("INSERT INTO greetings (name, greeted_at) VALUES (?, CURRENT_TIMESTAMP)")
+        .bind(name.clone())
+        .execute()
+        .await?;
+    let count = journal
+        .query("SELECT COUNT(*) AS greeted FROM greetings WHERE name = ?")
+        .bind(name.clone())
+        .fetch_one::<GreetedCount>()
+        .await?;
+
+    Ok(Json(Greeting {
+        name,
+        seen_before,
+        greeted: count.greeted,
+    }))
 }
 
 pub fn router() -> Router {

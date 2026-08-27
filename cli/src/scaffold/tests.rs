@@ -133,10 +133,43 @@ fn the_api_template_demonstrates_a_portable_service_end_to_end() {
     assert!(manifest.contains("[native.service.cache]"));
     assert!(manifest.contains("[cloudflare.service.cache]"));
     assert!(manifest.contains("[[cloudflare.kv_namespaces]]"));
+    assert!(manifest.contains("[[database]]"));
+    assert!(manifest.contains("[native.database.journal]"));
+    assert!(manifest.contains("[cloudflare.database.journal]"));
+    assert!(manifest.contains("[[cloudflare.d1_databases]]"));
 
-    // The generated extractor has to actually appear in a handler, or the manifest is decoration.
+    // The generated extractors have to actually appear in a handler, or the manifest is
+    // decoration.
     let app = fs::read_to_string(root.join("src/app.rs")).expect("app.rs");
     assert!(app.contains("cache: Cache"), "{app}");
+    assert!(app.contains("journal: JournalDb"), "{app}");
+}
+
+#[test]
+fn the_api_template_ships_migrations_skyzen_migrate_can_apply() {
+    let dir = temp_dir();
+    let root = project_dir(&dir);
+    create_project(&request(&root, Template::Api)).expect("scaffold");
+
+    // `migrations_dir` is left at its default, so this is the directory both `skyzen migrate` and
+    // `wrangler d1 migrations apply` read. A fresh project therefore has something to migrate.
+    let manifest = Manifest::parse(
+        &fs::read_to_string(root.join("Skyzen.toml")).expect("Skyzen.toml"),
+        "Skyzen.toml",
+        &root,
+    )
+    .expect("parses");
+    let database = &manifest.data().database[0];
+    let files = skyzen_manifest::migrations::load(&root.join(database.migrations_dir()))
+        .expect("the scaffolded migrations directory is readable");
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].version, 1);
+    assert!(files[0].sql.contains("CREATE TABLE greetings"), "{files:?}");
+
+    // The `.env.example` has to name the connection variable, or a first `skyzen dev` stops on a
+    // variable the user was never told about.
+    let env_example = fs::read_to_string(root.join(".env.example")).expect(".env.example");
+    assert!(env_example.contains("JOURNAL_URL"), "{env_example}");
 }
 
 #[test]
@@ -424,8 +457,18 @@ fn the_env_example_lists_what_the_template_manifest_declares() {
     let root = project_dir(&dir);
     create_project(&request(&root, Template::Api)).expect("scaffold");
     let example = fs::read_to_string(root.join(".env.example")).expect(".env.example");
-    // The api template's native backend is the in-process mock, so it needs no variables — and
-    // the file says so rather than being empty and mysterious.
+    // The api template's KV backend is the in-process mock, but its database is SQLite behind a
+    // `url_env`, so exactly that one variable has to be listed — with the manifest key that asked
+    // for it, or the reader has nowhere to go when they want to change it.
+    assert!(example.contains("JOURNAL_URL"), "{example}");
+    assert!(example.contains("[native.database.journal]"), "{example}");
+
+    // The minimal template wires nothing native, and its file says so rather than being empty and
+    // mysterious.
+    let dir = temp_dir();
+    let root = project_dir(&dir);
+    create_project(&request(&root, Template::Minimal)).expect("scaffold");
+    let example = fs::read_to_string(root.join(".env.example")).expect(".env.example");
     assert!(
         example.contains("declares no native environment variables"),
         "{example}"
