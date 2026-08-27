@@ -701,9 +701,10 @@ impl MessageQueue for ServiceBusQueue {
     ///
     /// # Platform notes
     ///
-    /// - A peek-lock always waits for a message: the REST API has no non-blocking form, so `wait`
-    ///   bounds the wait and `None` leaves the bound to the service's own default. A consumer that
-    ///   must not sit on an empty queue should set an explicit `wait`.
+    /// - [`ReceiveOptions::wait`] is **required**. A peek-lock always waits for a message: the REST
+    ///   API documents no non-blocking form, so there is nothing to map `None` — "answer with
+    ///   whatever is available immediately" — onto. Rather than block for the service's own
+    ///   default and call it immediate, a `None` wait is refused, naming the wait to pass instead.
     /// - [`ReceiveOptions::visibility_timeout`] is refused: the lease lasts the queue's configured
     ///   `LockDuration`, and the REST API has no way to override it for one delivery.
     /// - A request that fails part-way through a batch fails the whole call. The messages already
@@ -721,6 +722,14 @@ impl MessageQueue for ServiceBusQueue {
             return Err(QueueError::Unsupported(
                 "Service Bus leases a peek-locked message for the queue's configured LockDuration; \
                  its REST API cannot set a per-delivery visibility timeout",
+            ));
+        }
+
+        if options.wait.is_none() {
+            return Err(QueueError::Unsupported(
+                "Service Bus peek-lock has no documented non-blocking receive form, so this \
+                 backend cannot answer a `wait` of `None` immediately; pass an explicit wait, \
+                 e.g. `ReceiveOptions::new().with_wait(Duration::from_secs(30))`",
             ));
         }
 
@@ -775,7 +784,9 @@ mod tests {
     };
     use base64::Engine as _;
     use core::time::Duration;
-    use skyzen_services::queue::{MessageQueue, MessageReceipt, QueueError, QueueRetry};
+    use skyzen_services::queue::{
+        MessageQueue, MessageReceipt, QueueError, QueueRetry, ReceiveOptions,
+    };
 
     const CONNECTION_STRING: &str = "Endpoint=sb://skyzen-test.servicebus.windows.net/;\
          SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=c2t5emVuLXRlc3Qta2V5";
@@ -1062,11 +1073,33 @@ mod tests {
 
         let error = queue
             .receive(
-                skyzen_services::queue::ReceiveOptions::new()
+                ReceiveOptions::new()
+                    .with_wait(Duration::from_secs(30))
                     .with_visibility_timeout(Duration::from_secs(30)),
             )
             .await
             .expect_err("a per-delivery lock duration should be refused");
         assert!(matches!(error, QueueError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn a_receive_without_a_wait_is_refused_and_names_the_wait_to_pass() {
+        let queue = ServiceBusQueue::from_connection_string(CONNECTION_STRING, "jobs")
+            .expect("should build");
+
+        // The default options carry no wait, and Service Bus has no immediate receive to answer
+        // them with — so the call says so instead of blocking for the service's own default.
+        let error = queue
+            .receive(ReceiveOptions::new())
+            .await
+            .expect_err("a receive with no wait should be refused");
+
+        assert!(matches!(error, QueueError::Unsupported(_)));
+        let message = error.to_string();
+        assert!(message.contains("non-blocking"), "{message}");
+        assert!(
+            message.contains("ReceiveOptions::new().with_wait(Duration::from_secs(30))"),
+            "{message}"
+        );
     }
 }

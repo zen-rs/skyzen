@@ -109,7 +109,11 @@ let queue = Queue::new(ServiceBusQueue::from_env("jobs")?);
 
 queue.send_json(&event).await?;
 
-for message in queue.receive(ReceiveOptions::new().with_max_messages(10)).await? {
+let options = ReceiveOptions::new()
+    .with_max_messages(10)
+    .with_wait(Duration::from_secs(30));
+
+for message in queue.receive(options).await? {
     queue.ack(&message.receipt).await?;
 }
 ```
@@ -117,7 +121,9 @@ for message in queue.receive(ReceiveOptions::new().with_max_messages(10)).await?
 UTF-8 payloads travel verbatim; binary ones are base64-encoded and tagged with a
 `skyzen-content-encoding` message property, so the wire format is unambiguous either way.
 Consumption is peek-lock, and the lease lasts the queue's configured `LockDuration` — the REST API
-has no per-delivery visibility timeout, so asking for one reports `Unsupported`. `send_batch` is a
+has no per-delivery visibility timeout, so asking for one reports `Unsupported`. A peek-lock always
+waits for a message, and the REST API documents no non-blocking form, so `receive` needs an explicit
+`wait` rather than blocking for the service's own default and calling it immediate. `send_batch` is a
 request per message (the REST API has no batch send) and reports `PartialBatch` naming exactly which
 entries were rejected.
 
