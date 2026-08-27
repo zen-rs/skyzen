@@ -101,6 +101,11 @@ template_set!(
         (ApiApp, "api/src/app.rs.tmpl", "src/app.rs"),
         (ApiLib, "api/src/lib.rs.tmpl", "src/lib.rs"),
         (ApiMain, "api/src/main.rs.tmpl", "src/main.rs"),
+        (
+            ApiMigration,
+            "api/migrations/0001_create_greetings.sql.tmpl",
+            "migrations/0001_create_greetings.sql"
+        ),
     ]
 );
 
