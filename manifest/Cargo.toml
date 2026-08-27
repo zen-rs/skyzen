@@ -1,0 +1,18 @@
+[package]
+name = "skyzen-manifest"
+version = "0.1.0"
+edition = "2021"
+description = "Typed Skyzen.toml schema shared by the Skyzen CLI and the Skyzen procedural macros"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "README.md"
+keywords = ["skyzen", "manifest", "config", "serverless"]
+categories = ["config", "development-tools"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "1.0"
+
+[lints]
+workspace = true

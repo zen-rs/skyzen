@@ -15,16 +15,30 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+askama = "0.16"
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 ctrlc = "3.5"
+dotenvy = "0.15"
+flate2 = "1.1"
 ignore = "0.4"
 notify-debouncer-full = "0.4"
 pathdiff = "0.2"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+skyzen-manifest.workspace = true
 time = { version = "0.3", features = ["formatting", "macros"] }
 toml = "1.0"
 toml_edit = "0.22"
+# `wasm-bindgen-cli-support` requires `wasm-bindgen-shared = "=0.2.120"`, so pinning the same
+# exact version here makes cargo unify the two: `wasm_bindgen_shared::version()` is then
+# guaranteed by the resolver to be the version of the generator this binary embeds. That is what
+# the build-time and `skyzen doctor` agreement checks compare the application's resolved
+# `wasm-bindgen` against, and what `skyzen new` pins into generated projects.
 wasm-bindgen-cli-support = "=0.2.120"
+wasm-bindgen-shared = "=0.2.120"
+wasm-opt = "0.116"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["signal", "process"] }
