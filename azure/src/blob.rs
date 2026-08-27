@@ -545,22 +545,43 @@ impl ObjectStorage for AzureBlob {
         .await
         .map_err(storage_error)?;
 
+        // Every way out of the upload but a successful `close` aborts the writer, so the blocks it
+        // has already staged are released rather than left for Azure to garbage-collect a week
+        // later — a stream that fails half way through is the ordinary case here, not a rare one.
         let mut written: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            written = written
-                .checked_add(size_of(chunk.len())?)
-                .ok_or_else(|| StorageError::backend("the streamed upload overflowed u64"))?;
-            writer.write(chunk).await.map_err(storage_error)?;
+        loop {
+            let chunk = match stream.next().await {
+                None => break,
+                Some(Ok(chunk)) => chunk,
+                Some(Err(error)) => return abort_upload(&mut writer, error).await,
+            };
+
+            written = match written.checked_add(size_of(chunk.len())?) {
+                Some(written) => written,
+                None => {
+                    return abort_upload(
+                        &mut writer,
+                        StorageError::backend("the streamed upload overflowed u64"),
+                    )
+                    .await
+                }
+            };
+
+            if let Err(error) = writer.write(chunk).await {
+                return abort_upload(&mut writer, storage_error(error)).await;
+            }
         }
 
         if let Some(declared) = content_length {
             if declared != written {
-                writer.abort().await.map_err(storage_error)?;
-                return Err(StorageError::backend(format!(
-                    "streamed upload of {key:?} declared {declared} bytes but the stream \
-                     yielded {written}"
-                )));
+                return abort_upload(
+                    &mut writer,
+                    StorageError::backend(format!(
+                        "streamed upload of {key:?} declared {declared} bytes but the stream \
+                         yielded {written}"
+                    )),
+                )
+                .await;
             }
         }
 
@@ -731,6 +752,24 @@ fn upload_headers(options: &PutOptions) -> Result<Vec<(HeaderName, HeaderValue)>
     }
 
     Ok(headers)
+}
+
+/// Give up on a streamed upload, releasing the blocks it has already staged.
+///
+/// The abort's own failure is reported as the source of `error` rather than replacing it: what the
+/// caller needs to know is why the upload stopped, and the leftover blocks expire on their own.
+async fn abort_upload(
+    writer: &mut opendal::Writer,
+    error: StorageError,
+) -> Result<(), StorageError> {
+    if let Err(abort) = writer.abort().await {
+        return Err(StorageError::backend_with(
+            format!("{error} (the upload's staged blocks could not be released: {abort})"),
+            error,
+        ));
+    }
+
+    Err(error)
 }
 
 /// Read `OpenDAL`'s metadata into the portable shape.
