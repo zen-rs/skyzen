@@ -72,13 +72,25 @@ pub enum Command {
     },
 
     /// Run the project locally, rebuilding on source changes.
-    Dev,
+    Dev {
+        /// Extra arguments forwarded verbatim to the underlying runner (`wrangler dev` or
+        /// `cargo run`). This is how wrangler-only flags such as `--test-scheduled` are reached.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        runner_args: Vec<String>,
+    },
 
     /// Build and deploy the project.
     Deploy,
 
     /// Create the cloud resources the manifest declares but has no id for.
     Provision,
+
+    /// Apply pending SQL migrations to every declared database.
+    Migrate {
+        /// Apply to the local emulator's database rather than the deployed one.
+        #[arg(long)]
+        local: bool,
+    },
 
     /// Stream live logs from the deployed Worker (`wrangler tail`).
     Logs {
@@ -227,6 +239,15 @@ mod tests {
             rendered.contains("native") && rendered.contains("cloudflare"),
             "the error should list the providers that do work: {rendered}"
         );
+    }
+
+    #[test]
+    fn dev_forwards_trailing_arguments_to_the_runner() {
+        let parsed = parse(&["skyzen", "dev", "--test-scheduled"]);
+        let Command::Dev { runner_args } = parsed.command else {
+            panic!("expected `dev`");
+        };
+        assert_eq!(runner_args, vec!["--test-scheduled"]);
     }
 
     #[test]

@@ -195,6 +195,39 @@ fn every_template_manifest_survives_the_cloudflare_binding_cross_check() {
 }
 
 #[test]
+fn every_template_manifest_renders_a_wrangler_config_wrangler_can_read() {
+    use crate::providers::cloudflare::wrangler::{render, IdPolicy, RenderRequest};
+
+    for (label, template) in ALL_TEMPLATES {
+        let contents = rendered_manifest(*template, label);
+        let manifest = Manifest::parse(&contents, "Skyzen.toml", "/tmp/proj").expect("parses");
+        let base = manifest
+            .cloudflare(None)
+            .expect("base")
+            .expect("cloudflare section");
+
+        let rendered = render(&RenderRequest {
+            base,
+            environments: Vec::new(),
+            root_dir: Path::new("/tmp/proj"),
+            entry_js_path: Path::new("/tmp/proj/dist/worker.js"),
+            wrangler_dir: PathBuf::from("/tmp/proj/.skyzen/gen"),
+            // A scaffolded project has no provisioned ids yet, which is exactly what `dev` does.
+            id_policy: IdPolicy::LocalPlaceholder,
+        })
+        .unwrap_or_else(|error| panic!("template `{label}` failed to render: {error:#}"));
+
+        let parsed: toml::Table = toml::from_str(&rendered)
+            .unwrap_or_else(|error| panic!("template `{label}` rendered invalid TOML: {error}"));
+        assert_eq!(parsed["main"].as_str(), Some("../../dist/worker.js"));
+        assert!(
+            parsed.contains_key("compatibility_date"),
+            "template `{label}`"
+        );
+    }
+}
+
+#[test]
 fn every_template_declares_the_crates_its_code_uses() {
     // The capability check refuses to build a project whose manifest declares capabilities its
     // Cargo.toml has no crates for, so a template must list every crate its own manifest implies.

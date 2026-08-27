@@ -48,7 +48,10 @@ pub fn prepare(
         .context("the generated wrangler.toml has no parent directory")?
         .to_path_buf();
 
-    let needs_artifacts = matches!(action, Action::Build { .. } | Action::Dev | Action::Deploy);
+    let needs_artifacts = matches!(
+        action,
+        Action::Build { .. } | Action::Dev { .. } | Action::Deploy
+    );
     if needs_artifacts {
         // Before `cargo build`, not after: a mismatch surfaces from wasm-bindgen as an opaque
         // schema-version error, and the whole point is to replace that with the remedy.
@@ -88,14 +91,20 @@ pub fn prepare(
         },
     })?;
 
+    let database_names: Vec<String> = config
+        .d1_databases
+        .iter()
+        .map(|entry| entry.database_name.clone())
+        .collect();
     let commands = wrangler_commands(
         action,
         &wrangler_path,
         manifest.root_dir(),
         environment,
         dry_run,
+        &database_names,
     )?;
-    let run_mode = if matches!(action, Action::Dev) {
+    let run_mode = if matches!(action, Action::Dev { .. }) {
         // wrangler picks up the regenerated `dist/` on its own, so a source change re-runs the
         // build while `wrangler dev` keeps running — restarting it would drop local state and
         // rebind the port for no reason.
@@ -113,7 +122,7 @@ pub fn prepare(
         build,
         run_mode,
         child_env: Vec::new(),
-        watch_root: matches!(action, Action::Dev).then(|| manifest.root_dir().to_path_buf()),
+        watch_root: matches!(action, Action::Dev { .. }).then(|| manifest.root_dir().to_path_buf()),
         execute_despite_dry_run: matches!(action, Action::Deploy),
     })
 }
@@ -125,6 +134,7 @@ fn wrangler_commands(
     root_dir: &Path,
     environment: Option<&str>,
     dry_run: bool,
+    databases: &[String],
 ) -> Result<Vec<CommandPlan>> {
     let config_args = || -> Result<Vec<String>> {
         let mut args = vec!["--config".to_owned(), path_string(wrangler_path)?];
@@ -144,11 +154,29 @@ fn wrangler_commands(
     let commands = match action {
         // `build` produces artifacts and stops; there is nothing for wrangler to do.
         Action::Build { .. } => Vec::new(),
-        Action::Dev => {
+        Action::Dev { runner_args } => {
             let mut args = vec!["dev".to_owned(), "--local".to_owned()];
             args.extend(config_args()?);
+            args.extend(runner_args.iter().cloned());
             vec![command(args)]
         }
+        // One `wrangler d1 migrations apply` per declared database. The migrations directory
+        // comes from the generated config, so `migrations_dir` is set the same way every other
+        // wrangler key is.
+        Action::Migrate { local } => databases
+            .iter()
+            .map(|database| {
+                let mut args = vec![
+                    "d1".to_owned(),
+                    "migrations".to_owned(),
+                    "apply".to_owned(),
+                    database.clone(),
+                ];
+                args.extend(config_args()?);
+                args.push(if *local { "--local" } else { "--remote" }.to_owned());
+                Ok(command(args))
+            })
+            .collect::<Result<Vec<_>>>()?,
         Action::Deploy => {
             let mut args = vec!["deploy".to_owned()];
             args.extend(config_args()?);
@@ -377,7 +405,10 @@ fn path_string(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{binding_problems, collect_local_durable_exports, wrangler_commands};
-    use crate::{cli::SecretCommand, providers::Action};
+    use crate::{
+        cli::SecretCommand,
+        providers::{Action, CommandPlan},
+    };
     use skyzen_manifest::Manifest;
     use std::path::Path;
 
@@ -440,29 +471,45 @@ mod tests {
         assert_eq!(exports[0].bindings_export_name, "StateObject");
     }
 
-    fn rendered(action: &Action, environment: Option<&str>, dry_run: bool) -> String {
+    fn planned(action: &Action, environment: Option<&str>, dry_run: bool) -> Vec<String> {
         wrangler_commands(
             action,
             Path::new("/tmp/app/.skyzen/gen/wrangler.toml"),
             Path::new("/tmp/app"),
             environment,
             dry_run,
+            &["app".to_owned()],
         )
         .expect("commands")
-        .first()
-        .expect("one command")
-        .display()
+        .iter()
+        .map(CommandPlan::display)
+        .collect()
+    }
+
+    fn rendered(action: &Action, environment: Option<&str>, dry_run: bool) -> String {
+        planned(action, environment, dry_run)
+            .into_iter()
+            .next()
+            .expect("one command")
     }
 
     #[test]
     fn every_wrangler_command_carries_the_generated_config_and_the_environment() {
-        let dev = rendered(&Action::Dev, Some("staging"), false);
+        let dev = rendered(
+            &Action::Dev {
+                runner_args: vec!["--test-scheduled".to_owned()],
+            },
+            Some("staging"),
+            false,
+        );
         assert!(dev.contains("wrangler dev --local"), "{dev}");
         assert!(
             dev.contains("--config /tmp/app/.skyzen/gen/wrangler.toml"),
             "{dev}"
         );
         assert!(dev.contains("--env staging"), "{dev}");
+        // wrangler-only flags reach wrangler rather than being rejected by the parser.
+        assert!(dev.contains("--test-scheduled"), "{dev}");
 
         let logs = rendered(
             &Action::Logs {
@@ -493,14 +540,20 @@ mod tests {
 
     #[test]
     fn build_needs_no_wrangler_invocation() {
-        assert!(wrangler_commands(
-            &Action::Build { release: false },
-            Path::new("/tmp/app/.skyzen/gen/wrangler.toml"),
-            Path::new("/tmp/app"),
-            None,
-            false,
-        )
-        .expect("commands")
-        .is_empty());
+        assert!(planned(&Action::Build { release: false }, None, false).is_empty());
+    }
+
+    #[test]
+    fn migrate_applies_to_every_declared_database_and_picks_a_target() {
+        let remote = planned(&Action::Migrate { local: false }, None, false);
+        assert_eq!(remote.len(), 1);
+        assert!(
+            remote[0].contains("wrangler d1 migrations apply app"),
+            "{remote:?}"
+        );
+        assert!(remote[0].contains("--remote"), "{remote:?}");
+
+        let local = planned(&Action::Migrate { local: true }, None, false);
+        assert!(local[0].contains("--local"), "{local:?}");
     }
 }
