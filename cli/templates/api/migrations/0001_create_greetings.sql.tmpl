@@ -1,0 +1,10 @@
+-- Migrations are `<version>_<name>.sql` and run in ascending version order. `skyzen migrate`
+-- applies them, records each file's checksum in `_skyzen_migrations`, and refuses to run again if
+-- an applied file has since been edited — add a new migration instead of changing this one.
+--
+-- The SQL here is deliberately the common subset SQLite, D1, Postgres and MySQL all accept, so
+-- switching `[native.database.journal].backend` does not invalidate it.
+CREATE TABLE greetings (
+    name       TEXT NOT NULL,
+    greeted_at TEXT NOT NULL
+);

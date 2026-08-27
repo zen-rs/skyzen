@@ -1,10 +1,10 @@
 [cloudflare]
-name = "{{WORKER_NAME}}"
+name = "{{ ctx.worker_name }}"
 main = "dist/worker.js"
-compatibility_date = "{{COMPATIBILITY_DATE}}"
+compatibility_date = "{{ ctx.compatibility_date }}"
 workers_dev = true
 
-[triggers]
+[cloudflare.triggers]
 crons = ["*/10 * * * *"]
 
 [[cloudflare.queues.producers]]

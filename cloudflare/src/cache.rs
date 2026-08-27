@@ -28,23 +28,7 @@ pub struct CfCache {
     inner: worker::web_sys::Cache,
 }
 
-impl Clone for CfCache {
-    fn clone(&self) -> Self {
-        let js: &wasm_bindgen::JsValue = self.inner.as_ref();
-        Self {
-            inner: js.clone().unchecked_into(),
-        }
-    }
-}
-
-unsafe impl Send for CfCache {}
-unsafe impl Sync for CfCache {}
-
-impl std::fmt::Debug for CfCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CfCache").finish_non_exhaustive()
-    }
-}
+impl_js_handle_traits!(CfCache { inner });
 
 impl Default for CfCache {
     fn default() -> Self {
@@ -57,6 +41,10 @@ impl Default for CfCache {
 
 impl CfCache {
     /// Open a named cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn open(
         name: impl Into<String>,
     ) -> impl core::future::Future<Output = Result<Self, CfCacheError>> + Send {
@@ -75,6 +63,10 @@ impl CfCache {
     }
 
     /// Store a response under a URL key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn put_url(
         &self,
         url: impl Into<String>,
@@ -94,6 +86,10 @@ impl CfCache {
     }
 
     /// Store a response under a request key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn put_request(
         &self,
         request: &Request,
@@ -114,6 +110,10 @@ impl CfCache {
     }
 
     /// Lookup a response by URL key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn get_url(
         &self,
         url: impl Into<String>,
@@ -142,6 +142,10 @@ impl CfCache {
     }
 
     /// Lookup a response by URL key and return its body as bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn get_url_bytes(
         &self,
         url: impl Into<String>,
@@ -155,6 +159,10 @@ impl CfCache {
     }
 
     /// Lookup a response by URL key and return its body as text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn get_url_text(
         &self,
         url: impl Into<String>,
@@ -168,6 +176,10 @@ impl CfCache {
     }
 
     /// Lookup a response by URL key and deserialize its body as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn get_url_json<T>(
         &self,
         url: impl Into<String>,
@@ -184,6 +196,10 @@ impl CfCache {
     }
 
     /// Lookup a response by request key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn get_request(
         &self,
         request: &Request,
@@ -213,6 +229,12 @@ impl CfCache {
     }
 
     /// Lookup a response by request key and return its body as bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
+    // The explicit `impl Future + Send` return is part of the API contract.
+    #[allow(clippy::manual_async_fn)]
     pub fn get_request_bytes<'a>(
         &'a self,
         request: &'a Request,
@@ -225,6 +247,12 @@ impl CfCache {
     }
 
     /// Lookup a response by request key and return its body as text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
+    // The explicit `impl Future + Send` return is part of the API contract.
+    #[allow(clippy::manual_async_fn)]
     pub fn get_request_text<'a>(
         &'a self,
         request: &'a Request,
@@ -237,6 +265,12 @@ impl CfCache {
     }
 
     /// Lookup a response by request key and deserialize its body as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
+    // The explicit `impl Future + Send` return is part of the API contract.
+    #[allow(clippy::manual_async_fn)]
     pub fn get_request_json<'a, T>(
         &'a self,
         request: &'a Request,
@@ -252,6 +286,10 @@ impl CfCache {
     }
 
     /// Delete a response by URL key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn delete_url(
         &self,
         url: impl Into<String>,
@@ -278,6 +316,10 @@ impl CfCache {
     }
 
     /// Delete a response by request key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CfCacheError::Backend`] when the Cache API call fails.
     pub fn delete_request(
         &self,
         request: &Request,
@@ -310,6 +352,7 @@ fn js_err(error: wasm_bindgen::JsValue) -> CfCacheError {
     CfCacheError::Backend(format!("{error:?}"))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn worker_err(error: worker::Error) -> CfCacheError {
     CfCacheError::Backend(error.to_string())
 }

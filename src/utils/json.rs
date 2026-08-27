@@ -10,6 +10,7 @@ pub use serde_json::json;
 pub use serde_json::Value as JsonValue;
 
 use serde::{de::DeserializeOwned, Serialize};
+use skyzen_core::{take_body_bytes, BodyExtractorError};
 
 #[allow(clippy::declare_interior_mutable_const)]
 const APPLICATION_JSON: HeaderValue = HeaderValue::from_static("application/json");
@@ -17,6 +18,9 @@ const APPLICATION_JSON: HeaderValue = HeaderValue::from_static("application/json
 /// JSON extractor/responder.
 #[derive(Debug, Clone)]
 pub struct Json<T: Send + Sync + 'static = JsonValue>(pub T);
+
+/// What a [`Json`] extraction can fail with: the body was unavailable, or it was not JSON.
+pub type JsonRejection = BodyExtractorError<JsonContentTypeError>;
 
 http_error!(
     /// An error occurred when encoding the JSON response.
@@ -64,24 +68,28 @@ pub enum JsonContentTypeError {
     )]
     Unsupported,
     /// The payload could not be parsed as JSON.
-    #[error("Failed to parse JSON payload", status = StatusCode::BAD_REQUEST)]
-    InvalidPayload,
+    ///
+    /// Carries the deserializer's own message so the 4xx response tells the caller which field
+    /// was wrong, rather than only saying that something was.
+    #[error("Failed to parse JSON payload: {0}", status = StatusCode::BAD_REQUEST)]
+    InvalidPayload(String),
 }
 
 impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
-    type Error = JsonContentTypeError;
+    type Error = JsonRejection;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
             if !is_json_content_type(content_type) {
-                return Err(JsonContentTypeError::Unsupported);
+                return Err(JsonRejection::Parse(JsonContentTypeError::Unsupported));
             }
         } else {
-            return Err(JsonContentTypeError::Missing);
+            return Err(JsonRejection::Parse(JsonContentTypeError::Missing));
         }
 
-        let value = request.body_mut().into_json().await.map_err(|error| {
+        let bytes = take_body_bytes::<Self>(request).await?;
+        let value = serde_json::from_slice(&bytes).map_err(|error| {
             tracing::debug!(%error, "failed to deserialize JSON request body");
-            JsonContentTypeError::InvalidPayload
+            JsonRejection::Parse(JsonContentTypeError::InvalidPayload(error.to_string()))
         })?;
         Ok(Self(value))
     }
@@ -103,12 +111,25 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
     }
 }
 
+/// Accept `application/json` as well as any `application/*+json` media type
+/// (e.g. `application/problem+json`).
 fn is_json_content_type(value: &HeaderValue) -> bool {
     value
         .to_str()
         .ok()
         .and_then(|raw| raw.split(';').next())
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        .is_some_and(|mime| {
+            const PREFIX: &[u8] = b"application/";
+            const SUFFIX: &[u8] = b"+json";
+            let mime = mime.trim();
+            if mime.eq_ignore_ascii_case("application/json") {
+                return true;
+            }
+            let bytes = mime.as_bytes();
+            bytes.len() > PREFIX.len() + SUFFIX.len()
+                && bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+                && bytes[bytes.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+        })
 }
 
 #[cfg(test)]
@@ -146,6 +167,41 @@ mod test {
     }
 
     #[tokio::test]
+    async fn accepts_json_suffix_media_types() {
+        let mut request = request_with_body(br#"{"ok":true}"#);
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("application/problem+json"),
+        );
+
+        let Json(payload) = Json::<Payload>::extract(&mut request)
+            .await
+            .expect("json should parse");
+        assert!(payload.ok);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_json_payload_with_bad_request() {
+        let mut request = request_with_body(b"{not json");
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("application/json"),
+        );
+
+        let error = Json::<Payload>::extract(&mut request).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let message = error.to_string();
+        assert!(
+            message.starts_with("Failed to parse JSON payload: "),
+            "rejection should keep its prefix, got {message}"
+        );
+        assert!(
+            message.contains("line 1"),
+            "rejection should carry the deserializer detail, got {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_non_json_content_type() {
         let mut request = request_with_body(br#"{"ok":true}"#);
         request.headers_mut().insert(
@@ -162,5 +218,39 @@ mod test {
         let mut request = request_with_body(br#"{"ok":true}"#);
         let error = Json::<Payload>::extract(&mut request).await.unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_json_body_is_rejected_with_413() {
+        let mut request = request_with_body(br#"{"ok":true}"#);
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("application/json"),
+        );
+        request
+            .extensions_mut()
+            .insert(skyzen_core::RequestBodyLimit::new(4));
+
+        let error = Json::<Payload>::extract(&mut request).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_second_body_read_names_both_extractors() {
+        let mut request = request_with_body(br#"{"ok":true}"#);
+        request.headers_mut().insert(
+            CONTENT_TYPE,
+            http_kit::header::HeaderValue::from_static("application/json"),
+        );
+
+        Json::<Payload>::extract(&mut request)
+            .await
+            .expect("first read succeeds");
+        let error = Json::<Payload>::extract(&mut request).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            error.to_string().contains("already consumed by"),
+            "rejection should explain the double read, got {error}"
+        );
     }
 }

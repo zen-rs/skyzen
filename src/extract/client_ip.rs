@@ -1,5 +1,6 @@
 //! Look up the IP address of client.
 
+use core::future::{ready, Future};
 use std::{
     net::{AddrParseError, IpAddr, Ipv6Addr},
     str::{FromStr, Utf8Error},
@@ -30,36 +31,42 @@ impl_deref!(ClientIp, IpAddr);
 
 impl Extractor for ClientIp {
     type Error = ClientIpError;
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        if let Some(v) = request.headers().get(header::FORWARDED) {
-            if let Some(addr) = parse_forwarded(v.as_bytes())? {
-                return Ok(Self(addr));
-            }
-        }
-
-        if let Some(v) = request
-            .headers()
-            .get(HeaderName::from_static("x-forwarded-for"))
-        {
-            if let Some(addr) = parse_x_forwarded_for(v.as_bytes())? {
-                return Ok(Self(addr));
-            }
-        }
-
-        Ok(Self(
-            request
-                .extensions()
-                .get::<PeerAddr>()
-                .ok_or(ClientIpError::MissingRemoteAddr)?
-                .0
-                .ip(),
-        ))
-
-        // It's unnecessary to consume the extension.
+    // Every source is already on the request, so the future is ready on creation rather than an
+    // `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(client_ip(request))
     }
 
     // The client IP is derived server-side from connection metadata and proxy headers, so it is
     // not a client-supplied request parameter and contributes no OpenAPI schema.
+}
+
+/// Resolve the client address from the proxy headers, falling back to the connection's peer.
+fn client_ip(request: &Request) -> Result<ClientIp, ClientIpError> {
+    if let Some(v) = request.headers().get(header::FORWARDED) {
+        if let Some(addr) = parse_forwarded(v.as_bytes())? {
+            return Ok(ClientIp(addr));
+        }
+    }
+
+    if let Some(v) = request
+        .headers()
+        .get(HeaderName::from_static("x-forwarded-for"))
+    {
+        if let Some(addr) = parse_x_forwarded_for(v.as_bytes())? {
+            return Ok(ClientIp(addr));
+        }
+    }
+
+    // It's unnecessary to consume the extension.
+    Ok(ClientIp(
+        request
+            .extensions()
+            .get::<PeerAddr>()
+            .ok_or(ClientIpError::MissingRemoteAddr)?
+            .0
+            .ip(),
+    ))
 }
 
 /// An error occurred while extracting the client's IP.
@@ -75,8 +82,12 @@ pub enum ClientIpError {
     #[error("Failed to parse address")]
     /// Failed to parse the address.
     AddrParseError(#[from] AddrParseError),
-    /// The remote address is missing.
-    #[error("Missing remote addr, maybe it's not a tcp/udp connection")]
+    /// The remote address is missing. This points at a server configuration
+    /// problem (the backend did not record a peer address), not a bad request.
+    #[error(
+        "Missing remote addr, maybe it's not a tcp/udp connection",
+        status = StatusCode::INTERNAL_SERVER_ERROR
+    )]
     MissingRemoteAddr,
 }
 
@@ -154,12 +165,10 @@ fn parse_bracketed_ipv6(value: &str) -> Result<Option<Ipv6Addr>, ClientIpError> 
 }
 
 fn parse_x_forwarded_for(v: &[u8]) -> Result<Option<IpAddr>, ClientIpError> {
-    if let Some(mut v) = v.split(|v| *v == b',').next() {
-        trim(&mut v);
-        Ok(Some(IpAddr::from_str(std::str::from_utf8(v)?)?))
-    } else {
-        Ok(None)
-    }
+    // `split` always yields at least one (possibly empty) chunk.
+    let mut first = v.split(|v| *v == b',').next().unwrap_or_default();
+    trim(&mut first);
+    Ok(Some(IpAddr::from_str(std::str::from_utf8(first)?)?))
 }
 
 fn split_once(s: &[u8], pat: u8) -> Option<(&[u8], &[u8])> {
@@ -171,13 +180,22 @@ fn split_once(s: &[u8], pat: u8) -> Option<(&[u8], &[u8])> {
     None
 }
 
-fn trim(s: &mut &[u8]) {
-    while let Some(s2) = s.strip_prefix(b" ") {
-        *s = s2;
+/// Strip optional whitespace (spaces and horizontal tabs) from both ends.
+const fn trim(s: &mut &[u8]) {
+    while let Some((first, rest)) = s.split_first() {
+        if matches!(first, b' ' | b'\t') {
+            *s = rest;
+        } else {
+            break;
+        }
     }
 
-    while let Some(s2) = s.strip_suffix(b" ") {
-        *s = s2;
+    while let Some((last, rest)) = s.split_last() {
+        if matches!(last, b' ' | b'\t') {
+            *s = rest;
+        } else {
+            break;
+        }
     }
 }
 

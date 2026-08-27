@@ -29,10 +29,11 @@
 //! async fn chat_handler(ws: WebSocketUpgrade) -> impl Responder {
 //!     ws.on_upgrade(|mut socket| async move {
 //!         // Receive JSON messages using the convenient recv_json method
-//!         while let Some(Ok(msg)) = socket.recv_json::<ChatMessage>().await {
+//!         while let Some(message) = socket.recv_json::<ChatMessage>().await {
 //!             // Echo back with automatic JSON serialization
-//!             let _ = socket.send(&msg).await;
+//!             socket.send(&message?).await?;
 //!         }
+//!         Ok::<_, skyzen::Error>(())
 //!     })
 //! }
 //! ```
@@ -45,11 +46,12 @@
 //! # use skyzen::Responder;
 //! async fn text_echo(ws: WebSocketUpgrade) -> impl Responder {
 //!     ws.on_upgrade(|mut socket| async move {
-//!         while let Some(Ok(message)) = socket.next().await {
-//!             if let Some(text) = message.into_text() {
-//!                 let _ = socket.send_text(text).await;
+//!         while let Some(message) = socket.next().await {
+//!             if let Some(text) = message?.into_text() {
+//!                 socket.send_text(text).await?;
 //!             }
 //!         }
+//!         Ok::<_, skyzen::Error>(())
 //!     })
 //! }
 //! ```
@@ -62,14 +64,24 @@
 //! # use skyzen::Responder;
 //! async fn binary_echo(ws: WebSocketUpgrade) -> impl Responder {
 //!     ws.on_upgrade(|mut socket| async move {
-//!         while let Some(Ok(message)) = socket.next().await {
-//!             if let Some(data) = message.into_bytes() {
-//!                 let _ = socket.send_binary(data).await;
+//!         while let Some(message) = socket.next().await {
+//!             if let Some(data) = message?.into_bytes() {
+//!                 socket.send_binary(data).await?;
 //!             }
 //!         }
+//!         Ok::<_, skyzen::Error>(())
 //!     })
 //! }
 //! ```
+//!
+//! # Reporting a failed session
+//!
+//! A session handler may return `()` or a `Result<(), E>` for any `E` that converts into
+//! [`skyzen::Error`](crate::Error) — [`WebSocketError`] included, so `?` works on every socket
+//! operation. An error ends the session, is logged with its whole `source()` chain, and closes the
+//! connection with [`INTERNAL_ERROR`] (`1011`) so the peer can tell a server-side failure from a
+//! clean goodbye. Returning `()` keeps the older behaviour: whatever the handler swallows stays
+//! swallowed.
 //!
 //! # Convenience Methods
 //!
@@ -110,6 +122,7 @@
 //! }
 //! ```
 
+mod session;
 mod types;
 
 #[cfg(target_arch = "wasm32")]
@@ -122,6 +135,8 @@ mod wasm;
 pub use http_kit::ws::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
+pub(crate) use session::session_handler;
+pub use session::{IntoWebSocketOutcome, MaybeSend, MaybeSync, INTERNAL_ERROR};
 pub use types::*;
 #[cfg(target_arch = "wasm32")]
 pub use wasm::*;

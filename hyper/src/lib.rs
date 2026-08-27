@@ -18,18 +18,77 @@ use executor_core::{AnyExecutor, Executor, Task};
 use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, Stream, StreamExt};
 use hyper::server::conn::{http1::Builder as Http1Builder, http2::Builder as Http2Builder};
 use skyzen_core::{Endpoint, Server};
+use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tracing::error;
 
 mod service;
-pub use service::IntoService;
+pub use service::{IntoService, SkyzenBody};
 
 /// Hyper-based [`Server`] implementation.
+///
+/// # Protocol support
+///
+/// HTTP/1.1 is served with upgrades enabled (WebSocket works out of the box).
+/// HTTP/2 is detected by sniffing the client connection preface, so h2 support
+/// through the byte-stream [`Server`] trait is *prior-knowledge h2c only*: the
+/// client must speak cleartext HTTP/2 directly. There is no TLS/ALPN-based
+/// negotiation at this layer — terminate TLS in front of the server (or embed
+/// [`IntoService`] into your own hyper setup) if you need ALPN.
+///
+/// # Peer addresses
+///
+/// [`Server::serve`] receives opaque byte streams and therefore cannot learn
+/// the remote address of a connection. Embedders that accept connections
+/// themselves and know the peer address should build the service via
+/// [`IntoService::with_peer_addr`] so the `PeerAddr`/`ClientIp` extractors
+/// resolve.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Hyper;
+
+/// Maximum time allowed for the pre-serve protocol sniff.
+///
+/// Without this, a client that connects and never sends a byte would park the
+/// connection task forever, since hyper's own header read timeout only starts
+/// once the connection is handed to it.
+const SNIFF_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// [`hyper::rt::Timer`] backed by [`async_io::Timer`], usable on any executor.
+///
+/// Hyper's HTTP/1 header read timeout (30s by default) and HTTP/2 keep-alive
+/// are silently disabled unless a timer is configured on the connection
+/// builders, so we always install this one.
+///
+/// Exported so the built-in `#[skyzen::main]` runtime installs the same timer on its own
+/// connection builders instead of carrying a second copy of it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AsyncIoTimer;
+
+struct AsyncIoSleep(async_io::Timer);
+
+impl Future for AsyncIoSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx).map(|_| ())
+    }
+}
+
+impl hyper::rt::Sleep for AsyncIoSleep {}
+
+impl hyper::rt::Timer for AsyncIoTimer {
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(AsyncIoSleep(async_io::Timer::after(duration)))
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(AsyncIoSleep(async_io::Timer::at(deadline)))
+    }
+}
 
 struct ExecutorWrapper<E>(Arc<E>);
 
@@ -66,9 +125,17 @@ impl<C: Unpin + AsyncRead> hyper::rt::Read for ConnectionWrapper<C> {
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         let inner = &mut self.get_mut().0;
 
-        // SAFETY: `buf.as_mut()` gives us a `&mut [MaybeUninit<u8>]`.
-        // We must cast it to `&mut [u8]` and guarantee we will only write `n` bytes and call `advance(n)`
-        let buffer = unsafe { &mut *(ptr::from_mut(buf.as_mut()) as *mut [u8]) };
+        // SAFETY: `buf.as_mut()` gives us the unfilled portion of the buffer as
+        // `&mut [MaybeUninit<u8>]`. We zero-initialize every byte before casting to
+        // `&mut [u8]`, so the cast never exposes uninitialized memory — the inner reader is
+        // arbitrary user code, and a safe `AsyncRead` implementation may legally read from the
+        // buffer it is given. After the read we call `advance(n)` for exactly the `n` bytes the
+        // reader reports having written.
+        let buffer = unsafe {
+            let uninit = buf.as_mut();
+            uninit.fill(MaybeUninit::new(0));
+            &mut *(ptr::from_mut(uninit) as *mut [u8])
+        };
 
         match Pin::new(inner).poll_read(cx, buffer) {
             Poll::Ready(Ok(n)) => {
@@ -193,7 +260,7 @@ impl Server for Hyper {
                     let shared_executor = shared_executor.clone();
                     let serve_future = async move {
                         let (connection, is_h2) =
-                            match sniff_protocol(connection, HTTP2_PREFACE).await {
+                            match sniff_protocol_timeout(connection, HTTP2_PREFACE).await {
                                 Ok(result) => result,
                                 Err(error) => {
                                     error!("Failed to read connection preface: {error}");
@@ -202,7 +269,8 @@ impl Server for Hyper {
                             };
 
                         if is_h2 {
-                            let builder = Http2Builder::new(hyper_executor);
+                            let mut builder = Http2Builder::new(hyper_executor);
+                            builder.timer(AsyncIoTimer);
                             let service = IntoService::new(endpoint, shared_executor);
                             if let Err(error) = builder
                                 .serve_connection(ConnectionWrapper(connection), service)
@@ -211,7 +279,8 @@ impl Server for Hyper {
                                 error!("Failed to serve Hyper h2 connection: {error}");
                             }
                         } else {
-                            let builder = Http1Builder::new();
+                            let mut builder = Http1Builder::new();
+                            builder.timer(AsyncIoTimer);
                             let service = IntoService::new(endpoint, shared_executor);
                             if let Err(error) = builder
                                 .serve_connection(ConnectionWrapper(connection), service)
@@ -230,20 +299,40 @@ impl Server for Hyper {
     }
 }
 
+/// Run [`sniff_protocol`] with [`SNIFF_TIMEOUT`] applied, so a client that connects but never
+/// sends its preface cannot park the connection task forever.
+async fn sniff_protocol_timeout<C>(
+    stream: C,
+    preface: &'static [u8],
+) -> std::io::Result<(Prefixed<C>, bool)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let sniff = std::pin::pin!(sniff_protocol(stream, preface));
+    match futures_util::future::select(sniff, async_io::Timer::after(SNIFF_TIMEOUT)).await {
+        futures_util::future::Either::Left((result, _)) => result,
+        futures_util::future::Either::Right(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out reading connection preface",
+        )),
+    }
+}
+
 async fn sniff_protocol<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Prefixed<C>, bool)>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
+    // Large enough for the HTTP/2 preface (24 bytes); a fixed stack buffer avoids a heap
+    // allocation per read.
+    let mut chunk = [0u8; 24];
     let mut buf = Vec::with_capacity(preface.len());
     while buf.len() < preface.len() {
-        let remaining = preface.len() - buf.len();
-        let mut chunk = vec![0u8; remaining];
-        let n = stream.read(&mut chunk).await?;
+        let remaining = (preface.len() - buf.len()).min(chunk.len());
+        let n = stream.read(&mut chunk[..remaining]).await?;
         if n == 0 {
             break;
         }
-        chunk.truncate(n);
-        buf.extend_from_slice(&chunk);
+        buf.extend_from_slice(&chunk[..n]);
         if !preface.starts_with(&buf) {
             return Ok((Prefixed::new(stream, buf), false));
         }

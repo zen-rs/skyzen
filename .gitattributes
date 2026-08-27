@@ -1,0 +1,8 @@
+# These files are embedded verbatim (`include_str!`) and written straight into
+# generated projects or worker bundles, so their exact bytes are part of the
+# output. A Windows checkout with `core.autocrlf=true` would otherwise turn
+# them into CRLF, emitting CRLF files from the CLI and breaking tests that
+# assert on the rendered contents.
+cli/assets/** text eol=lf
+cli/templates/** text eol=lf
+ci/** text eol=lf

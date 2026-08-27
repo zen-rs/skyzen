@@ -112,8 +112,13 @@ jobs:
         with:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack check --each-feature --no-dev-deps
-      - run: cargo hack check --feature-powerset --no-dev-deps
+      # `--workspace` gives every member its own feature matrix; without it
+      # cargo-hack drives the root package's features while cargo still builds
+      # all default members, so member-specific combinations go unchecked.
+      - run: cargo hack check --workspace --each-feature --no-dev-deps
+      # `skyzen` alone has 14 non-default features, so an unbounded powerset is
+      # over 16k `cargo check` runs. Depth 2 covers every pair (~180 runs).
+      - run: cargo hack check --workspace --feature-powerset --depth 2 --no-dev-deps
 
   test:
     name: Test

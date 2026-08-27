@@ -1,0 +1,17 @@
+use skyzen::routing::{CreateRouteNode, Route, Router};
+
+async fn root() -> &'static str {
+    "Hello from {{ ctx.package_name }}!"
+}
+
+async fn health() -> &'static str {
+    "OK"
+}
+
+pub fn router() -> Router {
+    Route::new((
+        "/".at(root),
+        "/health".at(health),
+    ))
+    .build()
+}

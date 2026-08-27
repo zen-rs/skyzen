@@ -1,9 +1,12 @@
 use std::{fmt::Debug, future::Future, sync::Arc};
 
-use http_kit::{error::BoxHttpError, middleware::MiddlewareError, Middleware, Request, Response};
-use skyzen_core::Responder;
+use http_kit::{error::BoxHttpError, Body, Request, Response};
+use skyzen_core::{
+    middleware::{Middleware, Next},
+    Error, Responder,
+};
 
-/// Handler error with an asynchronous function
+/// Turn an endpoint error into a response with an asynchronous function.
 pub struct ErrorHandlingMiddleware<F> {
     f: Arc<F>,
 }
@@ -25,7 +28,7 @@ impl<F> Debug for ErrorHandlingMiddleware<F> {
 impl<F, Fut, Res> ErrorHandlingMiddleware<F>
 where
     F: 'static + Send + Sync + Fn(BoxHttpError) -> Fut,
-    Fut: Send + Sync + Future<Output = Res>,
+    Fut: Send + Future<Output = Res>,
     Res: Responder,
 {
     /// New an error handling middleware with provided handler function.
@@ -37,24 +40,20 @@ where
 impl<F, Fut, Res> Middleware for ErrorHandlingMiddleware<F>
 where
     F: 'static + Send + Sync + Fn(BoxHttpError) -> Fut,
-    Fut: Send + Sync + Future<Output = Res>,
+    Fut: Send + Future<Output = Res>,
     Res: Responder,
 {
-    type Error = Res::Error;
-    async fn handle<N: http_kit::Endpoint>(
-        &mut self,
-        request: &mut Request,
-        mut next: N,
-    ) -> Result<Response, MiddlewareError<N::Error, Self::Error>> {
-        match next.respond(request).await {
+    async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        match next.run(request).await {
             Ok(response) => Ok(response),
             Err(error) => {
-                let mut response = Response::new(http_kit::Body::empty());
+                let mut response = Response::new(Body::empty());
+                // Preserve the error's status; the responder may still override it.
+                *response.status_mut() = error.status();
                 // We have to erase the error here, since we cannot write Fn(impl HttpError) -> ...
-                (self.f)(Box::new(error) as BoxHttpError)
+                (self.f)(error.into_boxed_http_error())
                     .await
-                    .respond_to(request, &mut response)
-                    .map_err(MiddlewareError::Middleware)?;
+                    .respond_to(request, &mut response)?;
                 Ok(response)
             }
         }

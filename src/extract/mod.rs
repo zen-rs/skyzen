@@ -1,9 +1,17 @@
-pub use skyzen_core::Extractor;
+pub use skyzen_core::{Extractor, RequestBodyLimit, Requirement};
 
-#[cfg(feature = "form")]
+#[cfg(feature = "query")]
 mod query;
-#[cfg(feature = "form")]
+#[cfg(feature = "query")]
 pub use query::Query;
+
+mod path;
+pub use path::{Path, PathError};
+
+#[cfg(feature = "typed-header")]
+mod typed_header;
+#[cfg(feature = "typed-header")]
+pub use typed_header::{TypedHeader, TypedHeaderError};
 
 pub mod client_ip;
 pub use client_ip::{ClientIp, PeerAddr};
