@@ -152,11 +152,11 @@ async fn main() {
 (`aurora-postgresql` or `aurora-mysql`), and refuses to start on an engine name it does not know:
 
 ```rust
-use serde::Deserialize;
+use skyzen::FromRow;
 use skyzen_aws::RdsDataDb;
 use skyzen_services::Db;
 
-#[derive(Deserialize)]
+#[derive(FromRow)]
 struct User {
     id: i64,
     email: String,

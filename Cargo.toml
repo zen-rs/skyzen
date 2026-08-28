@@ -119,6 +119,12 @@ skyzen-services.workspace = true
 # a sqlx runtime, which `skyzen-test` leaves to the consumer to choose. Picking one here is what
 # lets `cargo test -p skyzen` run the migration tests without a feature flag on the command line.
 skyzen-test = { workspace = true, features = ["runtime-tokio-rustls"] }
+# `tests/sql_rows.rs` binds and reads the parameter types `DbValue` carries, exactly as an
+# application does: the types are named from their own crates, at the versions `skyzen-services`
+# depends on, so cargo unifies them into the same ones the backends encode.
+bigdecimal = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = "1"
 tempfile = "3.25"
 futures-lite = "2.6"
 serial_test = "3.2"

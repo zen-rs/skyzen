@@ -1,5 +1,7 @@
 //! Procedural macros for the Skyzen framework.
 
+mod row;
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use skyzen_manifest::{
@@ -415,6 +417,76 @@ pub fn derive_http_error(item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     match expand_http_error(input) {
         Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+/// Derive a typed decode from a SQL result row.
+///
+/// One field per column, each read through
+/// [`FromColumn`](https://docs.rs/skyzen-services/latest/skyzen_services/sql/trait.FromColumn.html)
+/// — so the field's own type says how the column is decoded, and a `Uuid`, a `DateTime<Utc>` or a
+/// `BigDecimal` reads correctly whichever JSON shape its backend produced.
+///
+/// ```ignore
+/// #[derive(skyzen::FromRow)]
+/// struct Order {
+///     id: Uuid,
+///     #[row(rename = "customer_id")]
+///     customer: CustomerId,
+///     placed_at: DateTime<Utc>,
+///     #[row(json)]
+///     items: Vec<LineItem>,
+/// }
+/// ```
+///
+/// A column is matched to a field by name. `#[row(rename_all = "…")]` on the struct spells every
+/// column with one of `serde`'s eight rules, `#[row(rename = "…")]` on a field names one column
+/// outright, and `#[row(json)]` deserializes a column holding a JSON document with `serde` instead
+/// of decoding it as a value.
+///
+/// A missing column, or one holding something the field's type does not accept, is an error naming
+/// both the column and what was expected — never a default.
+#[proc_macro_derive(FromRow, attributes(row))]
+pub fn derive_from_row(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match row::expand_from_row(&input) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+/// Derive both directions of the mapping for a type stored in one column.
+///
+/// Applies to two shapes:
+///
+/// - a **newtype** wrapping a type that is already one column, which is how a domain id stops
+///   being a bare `Uuid` or `i64` at the call site:
+///
+///   ```ignore
+///   #[derive(skyzen::Column)]
+///   struct CustomerId(Uuid);
+///   ```
+///
+/// - an **enum whose variants carry no fields**, stored as one text token per variant. The tokens
+///   are the variant names in `snake_case`; `#[column(rename_all = "…")]` picks another of
+///   `serde`'s eight rules and `#[column(rename = "…")]` names one variant's token outright. Two
+///   variants that would share a token are a compile error, and
+///   [`ColumnEnum::TOKENS`](https://docs.rs/skyzen-services/latest/skyzen_services/sql/trait.ColumnEnum.html)
+///   is the list to check a `CHECK (state IN (…))` constraint against:
+///
+///   ```ignore
+///   #[derive(skyzen::Column)]
+///   enum OrderState { AwaitingPayment, Shipped }  // "awaiting_payment", "shipped"
+///   ```
+///
+/// Either shape gets `From<Self> for DbValue` for binding and `FromColumn` for reading, so the
+/// type works in `.bind(…)` and as a `#[derive(FromRow)]` field alike.
+#[proc_macro_derive(Column, attributes(column))]
+pub fn derive_column(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match row::expand_column(&input) {
+        Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
 }

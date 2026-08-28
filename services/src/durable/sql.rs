@@ -41,6 +41,10 @@ pub enum DurableDbError {
     /// A query expected one row but none were returned.
     #[error("durable database row not found")]
     RowNotFound,
+
+    /// A result row did not have the shape the type it was fetched into declared.
+    #[error("durable database row could not be decoded: {0}")]
+    Decode(#[from] crate::sql::RowError),
 }
 
 backend_error!(DurableDbError);
@@ -51,6 +55,7 @@ service_http_error!(DurableDbError {
     Self::ParameterCountMismatch { .. } => INTERNAL_SERVER_ERROR,
     Self::SqlParse(_) => INTERNAL_SERVER_ERROR,
     Self::RowNotFound => NOT_FOUND,
+    Self::Decode(_) => INTERNAL_SERVER_ERROR,
 });
 
 impl From<DbError> for DurableDbError {
@@ -63,6 +68,7 @@ impl From<DbError> for DurableDbError {
             }
             DbError::SqlParse(message) => Self::SqlParse(message),
             DbError::RowNotFound => Self::RowNotFound,
+            DbError::Decode(error) => Self::Decode(error),
             error @ (DbError::TransactionsUnsupported
             | DbError::BatchesUnsupported
             | DbError::Conflict
