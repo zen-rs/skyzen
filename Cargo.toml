@@ -129,7 +129,7 @@ wasm-bindgen-futures = "0.4.60"
 js-sys = "0.3.87"
 wasm-streams = "0.5"
 serde-wasm-bindgen = "0.6"
-web-sys = { version = "0.3.87", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
+web-sys = { version = "0.3.87", features = ["Request", "RequestInit", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
 
 # `serde_html_form` rather than `serde_urlencoded`: it deserializes repeated keys
 # (`tags=a&tags=b`) into `Vec<_>`, which the query and form extractors both need.
