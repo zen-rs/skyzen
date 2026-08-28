@@ -6,8 +6,8 @@
 //!   the queue's lease/ack/nack behaviour — rather than a stub
 //! - **`InMemoryDb`** for `SQLite` in-memory database tests (requires a runtime feature), with
 //!   `with_schema` for raw DDL and `with_migrations` for the real migration set
-//! - **Durable Object mocks** (`InMemoryDurableKv`, `InMemoryDurableDb`, `InMemoryAlarm`), so a
-//!   Workers application is testable on a native `cargo test`
+//! - **Durable Object test services** (`InMemoryDurableKv`, SQLite-backed `InMemoryDurableDb`,
+//!   `InMemoryAlarm`), so a Workers application is testable on a native `cargo test`
 //! - **`TestContext`** for creating HTTP test clients, with a slot for every one of those services
 //! - **`TestClient`** for sending requests to endpoints without network I/O
 //! - **Response assertions** for validating status codes, headers, and body content

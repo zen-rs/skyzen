@@ -32,3 +32,16 @@ impl From<skyzen_services::DbError> for DurableObjectError {
         Self::Runtime(error.to_string())
     }
 }
+
+impl From<skyzen_services::DurableDbError> for DurableObjectError {
+    fn from(error: skyzen_services::DurableDbError) -> Self {
+        Self::Runtime(error.to_string())
+    }
+}
+
+#[cfg(feature = "ws")]
+impl From<crate::websocket::WebSocketError> for DurableObjectError {
+    fn from(error: crate::websocket::WebSocketError) -> Self {
+        Self::WebSocket(error.to_string())
+    }
+}

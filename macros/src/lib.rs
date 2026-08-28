@@ -758,9 +758,16 @@ impl TestService {
                     ::skyzen_test::mock::InMemoryDurableKv::new(),
                 )
             },
+            // The durable database is a real SQLite database rather than a recorder, so opening
+            // it is fallible and asynchronous — and a test whose database cannot open has to say
+            // so, not carry on against a store that answers nothing.
             Self::DurableDb => quote! {
                 ::skyzen::__services::durable::DurableDb::new(
-                    ::skyzen_test::mock::InMemoryDurableDb::new(),
+                    ::skyzen_test::mock::InMemoryDurableDb::in_memory()
+                        .await
+                        .unwrap_or_else(|error| panic!(
+                            "failed to open the in-memory Durable Object database: {error}"
+                        )),
                 )
             },
             Self::Alarm => quote! {

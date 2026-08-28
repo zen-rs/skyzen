@@ -11,8 +11,12 @@
 pub mod alarm;
 pub mod kv;
 pub mod sql;
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+mod sqlite;
 
 pub use crate::sql::{DbExecResult, DbValue};
 pub use alarm::{Alarm, AlarmError, AlarmScheduler};
 pub use kv::{DurableKv, DurableKvError, DurableKvStore, DurableListOptions};
 pub use sql::{DurableDb, DurableDbBackend, DurableDbError, DurableDbQuery};
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+pub use sqlite::SqliteDurableDb;
