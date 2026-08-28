@@ -26,9 +26,11 @@ To enable type-erased dynamic dispatch while maintaining an ergonomic API for im
 | `KeyValueStore` | `Kv` | `get`, `put`, `put_with_ttl`, `delete`, `exists`, paginated `list`; the atomics `put_if_absent`, `compare_and_swap`, `increment`, `expire`; and `get_json` / `get_text` / `put_json` / `list_all` on the wrapper |
 | `ObjectStorage` | `Storage` | `get`, `put`, `put_with`, `delete`, `head`, paginated `list`, plus `get_stream`, `put_stream`, `get_range`, `presign_get`, `presign_put` |
 | `MessageQueue` | `Queue` | produce with `send`, `send_batch`, `send_with`; consume with `receive`, `ack`, `nack`; and `send_json` / `send_json_batch` / `receive_json` on the wrapper |
-| `DbBackend` | `Db` | `query(..).bind(..).fetch_one/fetch_all/fetch_optional/execute`, `begin` transactions, `execute_batch`, `migrate` |
+| `DbBackend` | `Db` | `query(..).bind(..).fetch_one/fetch_all/fetch_optional/execute`, the single-column `fetch_scalar/fetch_scalar_optional/fetch_scalars`, `begin` transactions, `execute_batch`, `migrate` |
 
 A method a backend genuinely cannot provide keeps its `Unsupported` default and fails loudly, rather than being emulated with something racy.
+
+Rows are decoded by the type they are fetched into: `FromColumn` says which of the JSON shapes a backend can produce a given Rust type accepts, `FromRow` composes those into a struct, and `#[derive(FromRow)]` (in `skyzen-macros`, re-exported as `skyzen::FromRow`) writes the composition. `#[derive(skyzen::Column)]` covers the other half — a newtype id or a unit-variant enum, mapped in both directions so it works in `.bind(..)` and as a field alike.
 
 Two more modules sit alongside the traits:
 

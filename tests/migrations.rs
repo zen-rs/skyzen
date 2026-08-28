@@ -4,8 +4,7 @@
 //! database. The macro's *rejections* are unit-tested inside `skyzen-macros`, because a compile
 //! error cannot be observed from a test that has to compile.
 
-use serde::Deserialize;
-use skyzen::embed_migrations;
+use skyzen::{embed_migrations, FromRow};
 use skyzen_services::{Db, Migrations};
 use skyzen_test::mock::InMemoryDb;
 
@@ -15,7 +14,7 @@ use skyzen_test::mock::InMemoryDb;
 /// path, so the set has to live somewhere nameable.
 static MIGRATIONS: Migrations = embed_migrations!("tests/fixtures/migrations");
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, FromRow, PartialEq, Eq)]
 struct User {
     id: i64,
     email: String,

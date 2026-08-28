@@ -1,5 +1,5 @@
 use crate::{Cache, JournalDb};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use skyzen::{
     routing::{CreateRouteNode, Params, Route, Router},
     utils::Json,
@@ -10,13 +10,6 @@ use skyzen::{
 struct Greeting {
     name: String,
     seen_before: bool,
-    greeted: i64,
-}
-
-/// One row of `SELECT COUNT(*) AS greeted`. A row arrives as a JSON object keyed by column name,
-/// so a query's result type is a struct with a field per selected column.
-#[derive(Deserialize)]
-struct GreetedCount {
     greeted: i64,
 }
 
@@ -47,16 +40,19 @@ async fn greet(cache: Cache, journal: JournalDb, params: Params) -> Result<Json<
         .bind(name.clone())
         .execute()
         .await?;
-    let count = journal
-        .query("SELECT COUNT(*) AS greeted FROM greetings WHERE name = ?")
+    // A query selecting one column needs no row struct: `fetch_scalar` decodes that column into
+    // the type asked for. A query selecting several is a struct with `#[derive(skyzen::FromRow)]`,
+    // one field per column, each decoded by the field's own type.
+    let greeted = journal
+        .query("SELECT COUNT(*) FROM greetings WHERE name = ?")
         .bind(name.clone())
-        .fetch_one::<GreetedCount>()
+        .fetch_scalar::<i64>()
         .await?;
 
     Ok(Json(Greeting {
         name,
         seen_before,
-        greeted: count.greeted,
+        greeted,
     }))
 }
 

@@ -139,9 +139,8 @@ db.query("CREATE TABLE IF NOT EXISTS counter (id TEXT PRIMARY KEY, value INTEGER
     .execute()
     .await?;
 
-// Rows arrive as JSON objects keyed by column name, so a row type is a struct with a field per
-// selected column.
-#[derive(serde::Deserialize)]
+// One field per selected column, decoded by the field's own type.
+#[derive(skyzen::FromRow)]
 struct Counter { id: String, value: i64 }
 
 let counters: Vec<Counter> = db.query("SELECT id, value FROM counter").fetch_all().await?;
