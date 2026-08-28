@@ -215,9 +215,13 @@ let ctx = TestContext::new()
     .with_queue(Queue::new(InMemoryQueue::new()))
     .with_db(db)
     .with_durable_kv(DurableKv::new(InMemoryDurableKv::new()))
-    .with_durable_db(DurableDb::new(InMemoryDurableDb::new()))
+    .with_durable_db(DurableDb::new(InMemoryDurableDb::in_memory().await?))
     .with_alarm(Alarm::new(InMemoryAlarm::new()));
 ```
+
+`InMemoryDurableDb` is a real database — an isolated in-memory SQLite, the same backend the native
+Durable Object simulator runs on — so a test reads back what the handler wrote instead of a list of
+statements it issued. Opening one is fallible and asynchronous for that reason.
 
 `#[skyzen::test]` does this for you: name any of `Kv`, `Storage`, `Queue`, `Db`, `DurableKv`,
 `DurableDb`, `Alarm`, a generated database wrapper, or `TestContext` as a parameter and the macro
