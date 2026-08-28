@@ -1,6 +1,10 @@
 //! Cloudflare Durable Object namespace and stub wrappers.
 
+use core::future::Future;
+
 use skyzen::durable::{DurableObjectError, DurableObjectId};
+use skyzen::runtime::wasm::{from_js_response, into_js_request};
+use skyzen::{Body, Method, Request, Response};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use worker::send::{IntoSendFuture, SendWrapper};
@@ -182,58 +186,74 @@ pub struct CfDurableObjectStub {
 impl_js_handle_traits!(CfDurableObjectStub { stub });
 
 impl CfDurableObjectStub {
-    /// Dispatch request to the remote Durable Object.
+    /// Dispatch a request to the remote Durable Object.
+    ///
+    /// The request and the response are Skyzen's own — the same signature
+    /// `NativeDurableObjectStub` has natively — so one handler body works against a simulated
+    /// object in a test and a real one on Workers. Bodies stream in both directions; nothing is
+    /// buffered on the way through.
+    ///
+    /// A `101` answer keeps its socket: it travels in the response extensions, so returning the
+    /// response from a handler hands the client the Durable Object's end of the connection, which
+    /// is all a websocket proxy route has to do.
     ///
     /// # Errors
     ///
-    /// Returns [`DurableObjectError`] if the fetch call fails or returns an invalid response.
+    /// Returns [`DurableObjectError`] if the request cannot be rendered for the platform, the
+    /// fetch call fails, or the object answers with something that is not a response.
+    // The explicit `impl Future + Send` return is part of the API contract: a handler awaiting
+    // this must stay `Send`, which is what makes the `SendFuture` wrapper unnecessary.
+    #[allow(clippy::manual_async_fn)]
     pub fn fetch(
         &self,
-        request: &web_sys::Request,
-    ) -> impl core::future::Future<Output = Result<web_sys::Response, DurableObjectError>> + Send + '_
-    {
-        let request = SendWrapper::new(request.clone().map_err(runtime_err));
+        request: Request,
+    ) -> impl Future<Output = Result<Response, DurableObjectError>> + Send + '_ {
         async move {
-            let request = request.0?;
-            let promise = self
-                .stub
-                .fetch_with_request(&request)
-                .map_err(runtime_err)?;
-            let value = JsFuture::from(promise)
+            // The JS request lives and dies inside `dispatch`, so the only thing crossing the
+            // suspension point is the promise — wrapped, because a `Promise` is not `Send`.
+            let promise = SendWrapper::new(self.dispatch(request));
+            let value = JsFuture::from(promise.0?)
                 .into_send()
                 .await
                 .map_err(runtime_err)?;
-            value.dyn_into().map_err(|value| {
+            let response: web_sys::Response = value.dyn_into().map_err(|value| {
                 DurableObjectError::Runtime(format!(
                     "DurableObject.fetch returned non-Response value: {value:?}"
                 ))
-            })
+            })?;
+            from_js_response(&response).map_err(runtime_err)
         }
     }
 
-    /// Dispatch request to the remote Durable Object by URL string.
+    /// Dispatch a `GET` to the remote Durable Object by URL.
     ///
     /// # Errors
     ///
-    /// Returns [`DurableObjectError`] if the fetch call fails or returns an invalid response.
-    pub fn fetch_url(
-        &self,
-        url: &str,
-    ) -> impl core::future::Future<Output = Result<web_sys::Response, DurableObjectError>> + Send + '_
-    {
-        let url = url.to_owned();
+    /// Returns [`DurableObjectError`] if `url` is not a valid URI, the fetch call fails, or the
+    /// object answers with something that is not a response.
+    // The explicit `impl Future + Send` return is part of the API contract.
+    #[allow(clippy::manual_async_fn)]
+    pub fn fetch_url<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> impl Future<Output = Result<Response, DurableObjectError>> + Send + 'a {
         async move {
-            let promise = self.stub.fetch_with_str(&url).map_err(runtime_err)?;
-            let value = JsFuture::from(promise)
-                .into_send()
-                .await
-                .map_err(runtime_err)?;
-            value.dyn_into().map_err(|value| {
-                DurableObjectError::Runtime(format!(
-                    "DurableObject.fetch returned non-Response value: {value:?}"
-                ))
-            })
+            let mut request = Request::new(Body::empty());
+            *request.method_mut() = Method::GET;
+            *request.uri_mut() = url.parse().map_err(|error| {
+                DurableObjectError::Runtime(format!("invalid durable URL `{url}`: {error}"))
+            })?;
+            self.fetch(request).await
         }
+    }
+
+    /// Render the request for the platform and start the subrequest.
+    ///
+    /// Kept separate so no JS handle is ever a local of the returned future: the `web_sys`
+    /// request is dropped here, and only the promise travels back.
+    fn dispatch(&self, request: Request) -> Result<js_sys::Promise, DurableObjectError> {
+        let request = into_js_request(request).map_err(runtime_err)?;
+        self.stub.fetch_with_request(&request).map_err(runtime_err)
     }
 }
 

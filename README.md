@@ -22,7 +22,7 @@ async fn order(Path(id): Path<u64>, kv: Kv, db: Db) -> Result<Json<Order>> {
     }
     let order = db
         .query("SELECT id, total FROM orders WHERE id = ?")
-        .bind(id as i64)
+        .bind(id)
         .fetch_one::<Order>()
         .await?;
     kv.put_json(&format!("order:{id}"), &order).await?;
@@ -65,7 +65,7 @@ and a set of convenience methods on top.
 | Key–value | `Kv` | `get`/`put`/`put_with_ttl`/`delete`/`exists`, paginated `list`, and the atomics: `put_if_absent`, `compare_and_swap`, `increment`, `expire` |
 | Object storage | `Storage` | `get`/`put`/`put_with`/`head`/`delete`, paginated `list`, plus `get_stream`, `put_stream`, `get_range`, `presign_get`, `presign_put` |
 | Message queue | `Queue` | produce with `send`/`send_batch`/`send_with`, consume with `receive`/`ack`/`nack` |
-| SQL | `Db` | `query(..).bind(..).fetch_one/fetch_all/fetch_optional/execute`, `begin` transactions, `execute_batch`, and `migrate` |
+| SQL | `Db` | `query(..).bind(..).fetch_one/fetch_all/fetch_optional/fetch_scalar/execute`, typed rows through `#[derive(FromRow)]`, `begin` transactions, `execute_batch`, and `migrate` |
 
 ### Provider Matrix
 
@@ -644,6 +644,54 @@ The same files are what `skyzen migrate` applies from the CLI, and what
 is recorded, so an edited migration is refused rather than skipped. See the
 [Migrations Guide](docs/migrations.md).
 
+### Typed Rows
+
+Binding is typed — `DbValue` carries timestamps, UUIDs, exact decimals and JSON documents — and
+reading is typed the same way. `#[derive(FromRow)]` reads one column per field, through the field's
+own type:
+
+```rust
+use skyzen::{Column, FromRow};
+
+/// A newtype and a state machine, each stored in one column, in both directions.
+#[derive(Column)]
+struct CustomerId(Uuid);
+
+#[derive(Column)]                    // "awaiting_payment", "shipped", "cancelled"
+enum OrderState { AwaitingPayment, Shipped, Cancelled }
+
+#[derive(FromRow)]
+struct Order {
+    id: Uuid,
+    #[row(rename = "customer")]
+    customer_id: CustomerId,
+    state: OrderState,
+    placed_at: DateTime<Utc>,
+    total: BigDecimal,
+    budget: u64,
+    #[row(json)]
+    items: Vec<LineItem>,
+}
+
+let order: Order = db.query("SELECT * FROM orders WHERE id = ?").bind(id).fetch_one().await?;
+```
+
+A `Uuid` column is a string on PostgreSQL and sixteen bytes on SQLite; a `NUMERIC` is a string
+everywhere. The field's type is what decides how the column is read, so the same struct decodes on
+every backend. A missing column, or one holding something the field's type does not accept, is an
+error naming both — never a default.
+
+Single-column queries need no struct at all:
+
+```rust
+let orders: i64 = db.query("SELECT COUNT(*) FROM orders").fetch_scalar().await?;
+let ids: Vec<CustomerId> = db.query("SELECT customer FROM orders").fetch_scalars().await?;
+```
+
+`OrderState::TOKENS` is the list of tokens the enum stores, so a `CHECK (state IN (…))` constraint
+can be checked against the type instead of drifting from it. For a type whose `Deserialize` someone
+else wrote, `JsonRow<T>` hands the whole row to `serde`.
+
 Durable Objects get their own object-scoped SQLite through `DurableDb`:
 
 ```rust
@@ -662,11 +710,11 @@ impl DurableObject for ChatRoom {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(skyzen::FromRow, serde::Serialize)]
 struct Message { message: String }
 
 async fn get_messages(db: DurableDb) -> Result<Json<Vec<Message>>> {
-    // A row arrives as a JSON object keyed by column name, so the row type is a struct.
+    // One column per field, decoded by the field's own type.
     Ok(Json(db.query("SELECT message FROM messages").fetch_all::<Message>().await?))
 }
 ```

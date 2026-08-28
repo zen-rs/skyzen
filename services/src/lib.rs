@@ -10,7 +10,8 @@
 //!   [`skyzen_core::middleware::Middleware`] (attaching it injects it)
 //!
 //! Portable SQL support is provided through [`Db`], including transactions where the backend has
-//! them and [`Db::migrate`] everywhere.
+//! them and [`Db::migrate`] everywhere. Rows are decoded by the type they are fetched into, one
+//! column per field — see [`sql::FromRow`] and [`sql::FromColumn`].
 //!
 //! Three modules sit alongside the four capabilities:
 //!
@@ -23,12 +24,20 @@
 //! # Example
 //!
 //! ```ignore
+//! use skyzen::FromRow;
 //! use skyzen_services::{Db, Kv, Storage};
 //!
-//! async fn handler(kv: Kv, db: Db) -> Result<Json<Value>> {
+//! /// One field per selected column, decoded by the field's own type — see [`sql::FromRow`].
+//! #[derive(FromRow, Serialize)]
+//! struct User {
+//!     id: Uuid,
+//!     email: String,
+//! }
+//!
+//! async fn handler(kv: Kv, db: Db) -> Result<Json<Vec<User>>> {
 //!     kv.put_json("cache:key", &json!({"hello": "world"})).await?;
-//!     let result: Vec<Value> = db.query("SELECT * FROM users").fetch_all().await?;
-//!     Ok(Json(result))
+//!     let users: Vec<User> = db.query("SELECT id, email FROM users").fetch_all().await?;
+//!     Ok(Json(users))
 //! }
 //! ```
 
@@ -73,6 +82,13 @@ pub mod storage;
 /// to agree.
 pub use sqlparser;
 
+/// The JSON implementation a row's portable form is written in.
+///
+/// Re-exported for the same reason [`sqlparser`] is: [`sql::FromColumn`] is written against
+/// `serde_json::Value`, so a macro expansion or a backend crate has to be able to name the *same*
+/// `Value` type, not merely one from a version that happens to agree.
+pub use serde_json;
+
 pub use durable::{DurableDb, DurableDbBackend, DurableDbError, DurableDbQuery};
 pub use events::ScheduledTick;
 pub use kv::{KeyValueStore, Kv, KvError, KvListOptions, KvListResult};
@@ -83,8 +99,9 @@ pub use queue::{
     SendOptions,
 };
 pub use sql::{
-    BatchStatement, Db, DbBackend, DbDialect, DbError, DbExecResult, DbQuery, DbTransaction,
-    DbTransactionBackend, DbTransactionQuery, DbValue, LocationMapper, QuerySource, SqlQuery,
+    BatchStatement, ColumnEnum, ColumnError, Db, DbBackend, DbDialect, DbError, DbExecResult,
+    DbQuery, DbTransaction, DbTransactionBackend, DbTransactionQuery, DbValue, FromColumn, FromRow,
+    JsonRow, LocationMapper, QuerySource, Row, RowError, SqlQuery,
 };
 pub use storage::{
     ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest, PutOption,

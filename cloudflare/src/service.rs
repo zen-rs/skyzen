@@ -199,25 +199,12 @@ impl CfAssets {
             .map_err(|error| CfServiceError::Fetch(error.to_string()))?;
         let response = self.0.fetch(&request).await?;
 
-        let mut response = SendWrapper::new(response);
-        let status = response.0.status_code();
-        let headers = response.0.headers().clone();
-        let body = response.0.bytes().into_send().await.map_err(worker_err)?;
-
-        let mut skyzen_response = skyzen::Response::new(skyzen::Body::from(body));
-        *skyzen_response.status_mut() = skyzen::StatusCode::from_u16(status)
-            .map_err(|error| CfServiceError::Fetch(format!("asset status {status}: {error}")))?;
-        for (name, value) in &headers {
-            let name =
-                skyzen::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-                    CfServiceError::Fetch(format!("asset header `{name}`: {error}"))
-                })?;
-            let value = skyzen::header::HeaderValue::from_str(&value).map_err(|error| {
-                CfServiceError::Fetch(format!("asset header value for `{name}`: {error}"))
-            })?;
-            skyzen_response.headers_mut().append(name, value);
-        }
-        Ok(skyzen_response)
+        // Status, headers and body come straight through the framework's own conversion, so an
+        // asset is rendered exactly the way an inbound response is anywhere else — and its body
+        // streams rather than being buffered into the wasm heap on the way past.
+        let response = SendWrapper::new(worker::web_sys::Response::from(response));
+        skyzen::runtime::wasm::from_js_response(&response.0)
+            .map_err(|error| CfServiceError::Fetch(format!("{error:?}")))
     }
 
     /// The underlying fetcher, for requests this wrapper does not build.

@@ -34,7 +34,7 @@ Your object code is the same on native and Cloudflare. The runtime changes, not 
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
 use skyzen::routing::{CreateRouteNode, Route, Router};
-use skyzen::Result;
+use skyzen::{FromRow, Result};
 use skyzen_services::durable::DurableDb;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -71,7 +71,7 @@ async fn join_room(db: DurableDb) -> Result<&'static str> {
     Ok("joined")
 }
 
-#[derive(Deserialize)]
+#[derive(FromRow)]
 struct Member {
     id: String,
     name: String,
@@ -101,23 +101,17 @@ async fn compact_room(db: DurableDb) -> Result<&'static str> {
 - start with `query("...")`
 - always pass values via `.bind(...)`
 - use `?` placeholders
-- finish with `execute`, `fetch_one`, `fetch_optional`, or `fetch_all`
+- finish with `execute`, `fetch_one`, `fetch_optional`, `fetch_all`, or — for a query selecting a
+  single column — `fetch_scalar`
 
-Example:
-
-A row arrives as a JSON object keyed by column name, so a query's row type is a struct with one
-field per selected column — name the aggregate in SQL and the field will find it:
+A row is decoded into a struct with one field per selected column, through `#[derive(FromRow)]`. A
+query that selects one column needs no struct:
 
 ```rust
-#[derive(serde::Deserialize)]
-struct CountRow {
-    count: i64,
-}
-
-let count = db
-    .query("SELECT COUNT(*) AS count FROM members WHERE name = ?")
+let count: i64 = db
+    .query("SELECT COUNT(*) FROM members WHERE name = ?")
     .bind("alice")
-    .fetch_one::<CountRow>()
+    .fetch_scalar()
     .await?;
 ```
 
@@ -136,6 +130,12 @@ let namespace = CfDurableNamespace::from_env(&env, "ROOMS")?;
 let stub = namespace.get_by_name("room:general")?;
 let response = stub.fetch_url("https://room/join").await?;
 ```
+
+`fetch_url` and `fetch` take and return Skyzen's own `Request` and `Response` — the same signature
+the native simulator's `NativeDurableObjectStub` has — so a handler that talks to an object needs no
+`web_sys` types and no `SendFuture` wrapper around itself. Both directions stream, and a `101`
+answer carries its socket along in the response extensions, which is all a route has to forward to
+turn a Durable Object into a websocket room.
 
 The runtime injects:
 
@@ -184,6 +184,7 @@ Each object gets:
 - isolated in-memory `DurableKv`
 - isolated in-memory SQLite-backed `DurableDb`
 - isolated alarm state
+- its own registry of accepted WebSocket connections
 
 Example:
 
@@ -207,6 +208,41 @@ This is useful for:
 - integration tests
 - reproducing object-local bugs
 - validating alarm logic without Cloudflare deployment
+
+### WebSockets Off The Edge
+
+`HibernationWebSocketUpgrade` is a responder on native too, so a room or relay object runs under
+`skyzen dev` and under `cargo test` exactly as it does on Workers: forward the upgrade request into
+the object with `stub.fetch(request)`, return what comes back, and the simulator drives
+`DurableObject::websocket` for every frame, close and error.
+
+Tags are real — `DurableConnections::all`, `by_tag` and the `broadcast_*` helpers see the sockets
+the object actually accepted — and `set_auto_response` is answered before the handler is woken, the
+way the platform answers it during hibernation. Each connection is driven by its own command
+channel, and events are dispatched through the same per-object serialization as `fetch` and
+`alarm`, so an object never sees two events at once.
+
+A browser cannot put a header on a `WebSocket`, so the subprotocol list is its only in-band
+credential channel. `HibernationWebSocketUpgrade::protocol` answers the offer verbatim, which
+RFC 6455 §4.1 requires before the client will open the socket:
+
+```rust
+use skyzen::durable::HibernationWebSocketUpgrade;
+use skyzen::websocket::{RequestedSubprotocols, WebSocketError};
+
+async fn join(offered: RequestedSubprotocols) -> Result<HibernationWebSocketUpgrade, WebSocketError> {
+    let token = offered
+        .iter()
+        .find_map(|protocol| protocol.strip_prefix("app.bearer."))
+        .ok_or_else(|| WebSocketError::Protocol("no bearer subprotocol".to_owned()))?;
+    // ... verify `token` ...
+
+    let answer = offered
+        .answer(|protocol| protocol.starts_with("app.bearer."))
+        .ok_or_else(|| WebSocketError::Protocol("unanswerable subprotocol".to_owned()))?;
+    Ok(HibernationWebSocketUpgrade::new().tag("room").protocol(answer))
+}
+```
 
 ## Object Identity
 
@@ -262,11 +298,13 @@ What it guarantees:
 - same `DurableDb` query style
 - per-object isolation
 - alarm handler dispatch through `Route::on_alarm`
+- WebSocket event dispatch, connection tags and auto-responses
 
 What it does not try to emulate exactly:
 
 - Cloudflare runtime internals
-- platform WebSocket hibernation behavior
+- hibernation itself: a native connection is a live socket held by the process, so an object is
+  never evicted between frames and never restored from storage to answer one
 - Cloudflare binding APIs
 
 ## Related Docs

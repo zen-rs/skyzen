@@ -29,7 +29,7 @@ Extractor (handler arg)     ← Pulled from request extensions automatically
 | `KeyValueStore` | `Kv` | `get`, `put`, `put_with_ttl`, `delete`, `exists`, `list` + the atomics below + `get_json`, `get_text`, `put_json`, `list_all` |
 | `ObjectStorage` | `Storage` | `get`, `put`, `put_with`, `delete`, `list`, `head`, `get_stream`, `put_stream`, `get_range`, `presign_get`, `presign_put` |
 | `MessageQueue` | `Queue` | `send`, `send_batch`, `send_with`, `receive`, `ack`, `nack` + `send_json`, `send_json_batch`, `receive_json` |
-| `DbBackend` | `Db` | `query(...).bind(...).fetch_*`, `execute` |
+| `DbBackend` | `Db` | `query(...).bind(...).fetch_*`, `execute`, typed rows via `#[derive(FromRow)]` |
 
 Cloudflare-specific primitives such as `CfD1`, `DurableDb`, and Durable Objects are provider extensions, not part of the portable core.
 
@@ -489,7 +489,14 @@ WASM backend means following that recipe — not weakening the trait.
 Portable SQL uses `Db`:
 
 ```rust
+use skyzen::FromRow;
 use skyzen_services::Db;
+
+#[derive(FromRow)]
+struct User {
+    id: Uuid,
+    name: String,
+}
 
 let users = db
     .query("SELECT id, name FROM users WHERE active = ?")
@@ -497,6 +504,28 @@ let users = db
     .fetch_all::<User>()
     .await?;
 ```
+
+### Reading Rows
+
+A row is decoded by the type it is fetched into, one column per field:
+
+- **`#[derive(FromRow)]`** reads each field with `FromColumn`, so the field's declared type decides
+  how its column is read. That matters because the same SQL type does not arrive in the same JSON
+  shape on every backend — a `UUID` is a string on PostgreSQL and sixteen bytes on SQLite, a
+  `NUMERIC` is a string everywhere — and a `Uuid` or `BigDecimal` field reads correctly on all of
+  them. `#[row(rename = "…")]` names a column, `#[row(rename_all = "…")]` spells every column with
+  one of serde's eight rules, and `#[row(json)]` deserializes a JSON document column with serde.
+- **`#[derive(Column)]`** makes a domain type into one column in *both* directions — a newtype
+  (`struct CustomerId(Uuid)`) delegates to what it wraps, and an enum whose variants carry no
+  fields is stored as one `snake_case` token per variant, with `ColumnEnum::TOKENS` listing them so
+  a `CHECK (state IN (…))` constraint can be checked against the type.
+- **`fetch_scalar` / `fetch_scalar_optional` / `fetch_scalars`** read a single-column query without
+  a struct at all: `SELECT COUNT(*)` is an `i64`, `SELECT id FROM …` is a `Vec<Uuid>`.
+- **`JsonRow<T>`** hands the whole row to serde, for a type whose `Deserialize` someone else wrote.
+
+A column the query did not select, or one holding something the field's type does not accept, is an
+error naming the column and what was expected. Nothing is defaulted, and only an `Option<T>` field
+accepts `NULL`.
 
 Enable the required runtime and database features:
 
