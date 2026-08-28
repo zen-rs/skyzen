@@ -1,15 +1,15 @@
 //! WebSocket types for Durable Object hibernation.
 
-#[cfg(all(feature = "ws", target_arch = "wasm32"))]
+#[cfg(feature = "ws")]
 use std::sync::Arc;
 
-#[cfg(all(feature = "ws", target_arch = "wasm32"))]
+#[cfg(feature = "ws")]
 use http_kit::error::BoxHttpError;
-#[cfg(all(feature = "ws", target_arch = "wasm32"))]
+#[cfg(feature = "ws")]
 use http_kit::http_error;
 use http_kit::ws::WebSocketMessage;
 use serde::{de::DeserializeOwned, Serialize};
-#[cfg(all(feature = "ws", target_arch = "wasm32"))]
+#[cfg(feature = "ws")]
 use skyzen_core::Responder;
 #[cfg(all(feature = "ws", target_arch = "wasm32"))]
 use wasm_bindgen::JsCast;
@@ -185,6 +185,81 @@ impl WebSocketConnection {
 #[derive(Debug, Default)]
 pub struct HibernationWebSocketUpgrade {
     tags: Vec<String>,
+    #[cfg(feature = "ws")]
+    subprotocol: Subprotocol,
+}
+
+/// What a hibernation handshake answers the client's subprotocol offer with.
+#[cfg(feature = "ws")]
+#[derive(Debug, Default)]
+enum Subprotocol {
+    /// The client's offer goes unanswered — correct only when it made none.
+    #[default]
+    Unanswered,
+    /// Answer with the first of these the client offered.
+    Negotiated(Vec<String>),
+    /// Answer with exactly this value.
+    Exact(http_kit::header::HeaderValue),
+}
+
+#[cfg(feature = "ws")]
+impl Subprotocol {
+    /// The value to echo on the `101`, given what the client offered.
+    fn answer(&self, request: &crate::Request) -> Option<http_kit::header::HeaderValue> {
+        match self {
+            Self::Unanswered => None,
+            Self::Negotiated(supported) => {
+                crate::websocket::select_offered_protocol(request.headers(), supported)
+            }
+            Self::Exact(protocol) => Some(protocol.clone()),
+        }
+    }
+}
+
+#[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
+type NativeDurableObjectWebSocketAcceptFn = dyn Fn(
+        crate::websocket::WebSocket,
+        Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    + Send
+    + Sync;
+
+/// Native simulator adapter that hands an upgraded connection to its Durable Object instance.
+#[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
+#[derive(Clone)]
+pub struct NativeDurableObjectState {
+    accept_websocket: Arc<NativeDurableObjectWebSocketAcceptFn>,
+}
+
+#[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
+impl std::fmt::Debug for NativeDurableObjectState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeDurableObjectState")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
+impl NativeDurableObjectState {
+    pub(crate) fn new<F, Fut>(accept_websocket: F) -> Self
+    where
+        F: Fn(crate::websocket::WebSocket, Vec<String>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        Self {
+            accept_websocket: Arc::new(move |websocket, tags| {
+                Box::pin(accept_websocket(websocket, tags))
+            }),
+        }
+    }
+
+    fn accept_websocket(
+        &self,
+        websocket: crate::websocket::WebSocket,
+        tags: Vec<String>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        (self.accept_websocket)(websocket, tags)
+    }
 }
 
 impl HibernationWebSocketUpgrade {
@@ -211,6 +286,43 @@ impl HibernationWebSocketUpgrade {
     #[must_use]
     pub fn into_tags(self) -> Vec<String> {
         self.tags
+    }
+
+    /// Answer the handshake with the first of `protocols` the client also offered.
+    ///
+    /// RFC 6455 §4.1 requires the echo whenever the client offered a subprotocol: without it the
+    /// client fails the connection, so a hibernating socket that ignores the offer never opens.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn protocols<I, S>(mut self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.subprotocol = Subprotocol::Negotiated(
+            protocols
+                .into_iter()
+                .map(|protocol| protocol.as_ref().to_owned())
+                .collect(),
+        );
+        self
+    }
+
+    /// Answer the handshake with exactly this subprotocol, whatever the client offered.
+    ///
+    /// This is how a browser authenticates a Durable Object socket. It cannot attach an
+    /// `Authorization` header to a `WebSocket`, so the credential travels in the subprotocol list
+    /// (`new WebSocket(url, ["app.bearer." + token])`) and the server echoes the accepted token
+    /// back — which the client requires before it will open the socket.
+    ///
+    /// A [`HeaderValue`](http_kit::header::HeaderValue) rather than a string, because a
+    /// subprotocol that cannot be sent as a header value is not an answer, and the handler is
+    /// where that is known.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn protocol(mut self, protocol: http_kit::header::HeaderValue) -> Self {
+        self.subprotocol = Subprotocol::Exact(protocol);
+        self
     }
 }
 
@@ -290,6 +402,41 @@ http_error!(
     "DurableObjectState missing in request extensions for hibernation websocket upgrade."
 );
 
+#[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
+http_error!(
+    NativeHibernationDurableStateMissing,
+    http_kit::StatusCode::INTERNAL_SERVER_ERROR,
+    "NativeDurableObjectState missing in request extensions for hibernation websocket upgrade."
+);
+
+#[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
+impl Responder for HibernationWebSocketUpgrade {
+    type Error = BoxHttpError;
+
+    fn respond_to(
+        self,
+        request: &crate::Request,
+        response: &mut crate::Response,
+    ) -> Result<(), Self::Error> {
+        let state = request
+            .extensions()
+            .get::<NativeDurableObjectState>()
+            .cloned()
+            .ok_or_else(|| Box::new(NativeHibernationDurableStateMissing::new()) as BoxHttpError)?;
+        let mut upgrade = crate::websocket::upgrade_from_request(request)
+            .map_err(|error| Box::new(error) as BoxHttpError)?;
+        if let Some(protocol) = self.subprotocol.answer(request) {
+            upgrade = upgrade.protocol(protocol);
+        }
+        let tags = self.into_tags();
+        let responder =
+            upgrade.on_upgrade(move |websocket| state.accept_websocket(websocket, tags));
+        responder
+            .respond_to(request, response)
+            .map_err(|error| Box::new(error) as BoxHttpError)
+    }
+}
+
 #[cfg(all(feature = "ws", target_arch = "wasm32"))]
 http_error!(
     HibernationWebSocketAcceptFailed,
@@ -325,6 +472,15 @@ impl Responder for HibernationWebSocketUpgrade {
             })?;
 
         *response.status_mut() = http_kit::StatusCode::SWITCHING_PROTOCOLS;
+
+        // The answer to the client's subprotocol offer is an ordinary response header; the Worker
+        // runtime carries the whole header map onto the `101` it builds for the host.
+        if let Some(protocol) = self.subprotocol.answer(request) {
+            response
+                .headers_mut()
+                .insert(http_kit::header::SEC_WEBSOCKET_PROTOCOL, protocol);
+        }
+
         let client_socket: web_sys::WebSocket = client.unchecked_into();
         response
             .extensions_mut()
