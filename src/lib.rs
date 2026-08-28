@@ -107,6 +107,12 @@ pub use http_kit;
 pub use http_kit::{
     header, Body, BodyError, Endpoint, HttpError, Method, Request, Response, StatusCode, Uri,
 };
+/// Service types used by macro expansions.
+///
+/// Keeping this path behind the root crate means applications using manifest-driven wiring do
+/// not need to declare Skyzen's implementation dependency themselves.
+#[doc(hidden)]
+pub use skyzen_services as __services;
 
 /// RFC-typed headers, for use with [`TypedHeader`](crate::extract::TypedHeader).
 ///
