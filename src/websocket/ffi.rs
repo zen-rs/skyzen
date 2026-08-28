@@ -104,21 +104,3 @@ extern "C" {
     #[wasm_bindgen(method, getter)]
     pub fn message(this: &ErrorEvent) -> String;
 }
-
-/// Create a WebSocket upgrade response.
-///
-/// This creates a Response with status 101 and the client WebSocket attached via the
-/// non-standard `webSocket` init property (a Cloudflare Workers/WinterCG extension),
-/// which is the required format for WebSocket upgrades on those runtimes.
-///
-/// # Errors
-///
-/// Returns the underlying `JsValue` error if the reflective property set or
-/// the `Response` construction is rejected by the runtime.
-pub fn create_websocket_response(client: &WebSocket) -> Result<web_sys::Response, JsValue> {
-    let init = web_sys::ResponseInit::new();
-    init.set_status(101);
-    // `web_sys::ResponseInit` has no `webSocket` field, so attach it reflectively.
-    js_sys::Reflect::set(init.as_ref(), &"webSocket".into(), client.as_ref())?;
-    web_sys::Response::new_with_opt_buffer_source_and_init(None, &init)
-}
