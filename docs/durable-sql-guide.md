@@ -137,6 +137,12 @@ let stub = namespace.get_by_name("room:general")?;
 let response = stub.fetch_url("https://room/join").await?;
 ```
 
+`fetch_url` and `fetch` take and return Skyzen's own `Request` and `Response` — the same signature
+the native simulator's `NativeDurableObjectStub` has — so a handler that talks to an object needs no
+`web_sys` types and no `SendFuture` wrapper around itself. Both directions stream, and a `101`
+answer carries its socket along in the response extensions, which is all a route has to forward to
+turn a Durable Object into a websocket room.
+
 The runtime injects:
 
 - `DurableDb`
