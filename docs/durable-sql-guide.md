@@ -34,7 +34,7 @@ Your object code is the same on native and Cloudflare. The runtime changes, not 
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
 use skyzen::routing::{CreateRouteNode, Route, Router};
-use skyzen::Result;
+use skyzen::{FromRow, Result};
 use skyzen_services::durable::DurableDb;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -71,7 +71,7 @@ async fn join_room(db: DurableDb) -> Result<&'static str> {
     Ok("joined")
 }
 
-#[derive(Deserialize)]
+#[derive(FromRow)]
 struct Member {
     id: String,
     name: String,
@@ -101,23 +101,17 @@ async fn compact_room(db: DurableDb) -> Result<&'static str> {
 - start with `query("...")`
 - always pass values via `.bind(...)`
 - use `?` placeholders
-- finish with `execute`, `fetch_one`, `fetch_optional`, or `fetch_all`
+- finish with `execute`, `fetch_one`, `fetch_optional`, `fetch_all`, or — for a query selecting a
+  single column — `fetch_scalar`
 
-Example:
-
-A row arrives as a JSON object keyed by column name, so a query's row type is a struct with one
-field per selected column — name the aggregate in SQL and the field will find it:
+A row is decoded into a struct with one field per selected column, through `#[derive(FromRow)]`. A
+query that selects one column needs no struct:
 
 ```rust
-#[derive(serde::Deserialize)]
-struct CountRow {
-    count: i64,
-}
-
-let count = db
-    .query("SELECT COUNT(*) AS count FROM members WHERE name = ?")
+let count: i64 = db
+    .query("SELECT COUNT(*) FROM members WHERE name = ?")
     .bind("alice")
-    .fetch_one::<CountRow>()
+    .fetch_scalar()
     .await?;
 ```
 
