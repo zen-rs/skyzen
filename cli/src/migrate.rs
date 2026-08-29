@@ -15,7 +15,7 @@
 
 use crate::{
     cli::{MigrateCommand, Provider},
-    environment::{ensure_available, load_dotenv_files, required_variables},
+    environment::{ensure_available, load_dotenv_files, load_manifest, required_variables},
     output,
 };
 use anyhow::{Context, Result};
@@ -108,7 +108,7 @@ pub fn run(
     command: Option<MigrateCommand>,
     dry_run: bool,
 ) -> Result<()> {
-    let manifest = Manifest::load(manifest_path)?;
+    let manifest = load_manifest(manifest_path)?;
     let targets = resolve_targets(&manifest)?;
 
     // A dry run neither connects nor creates anything: it reads and validates the directories and

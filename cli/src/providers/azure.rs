@@ -11,7 +11,7 @@
 mod bundle;
 
 use crate::{
-    output,
+    environment, output,
     project::Project,
     providers::{
         prepare_child_environment, Action, ArtifactBuild, CommandPlan, ProviderPlan, RunMode,
@@ -303,7 +303,7 @@ fn ensure_runs_on_linux(artifact: &Path, target: Option<&str>, require: bool) ->
 /// Only meaningful when the manifest names one: without `target`, the build is whatever the host
 /// is, which is right on a Linux CI machine and caught before the upload anywhere else.
 pub fn check_linux_target(manifest_path: &Path) -> usize {
-    let target = Manifest::load(manifest_path)
+    let target = environment::load_manifest(manifest_path)
         .ok()
         .and_then(|manifest| manifest.data().azure.as_ref()?.target.clone());
     let Some(target) = target else {
