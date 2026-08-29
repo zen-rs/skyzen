@@ -17,18 +17,18 @@ use skyzen::{
     extract::Path,
     routing::{CreateRouteNode, Route, Router},
     utils::Json,
-    Result as SkyResult,
+    Result as SkyResult, ToSchema,
 };
 use skyzen_services::{Kv, Storage};
 use skyzen_test::mock::{InMemoryKv, InMemoryStorage};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 struct FileMetadata {
     name: String,
     size: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct UploadRequest {
     name: String,
     content: String,

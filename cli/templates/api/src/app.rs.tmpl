@@ -3,10 +3,12 @@ use serde::Serialize;
 use skyzen::{
     routing::{CreateRouteNode, Params, Route, Router},
     utils::Json,
-    Result,
+    Result, ToSchema,
 };
 
-#[derive(Serialize)]
+/// A payload carried by `Json` derives `ToSchema` as well as `Serialize`: the first says how it
+/// is written to the wire, the second how the generated OpenAPI document describes it.
+#[derive(Serialize, ToSchema)]
 struct Greeting {
     name: String,
     seen_before: bool,

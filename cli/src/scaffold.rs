@@ -204,12 +204,20 @@ pub const fn dependencies(template: Template) -> &'static [DependencySpec] {
         name: "futures-util",
         features: &[],
     };
+    /// A payload carried by `Json`, `Form` or `Query` has to implement `ToSchema`, and utoipa's
+    /// derive expands to `::utoipa::…` paths — so the crate that writes `#[derive(ToSchema)]`
+    /// needs the dependency itself. `skyzen::ToSchema` re-exports the trait, which is what the
+    /// bound is written against; it cannot re-export the crate the expansion names.
+    const UTOIPA: DependencySpec = DependencySpec {
+        name: "utoipa",
+        features: &[],
+    };
 
     match template {
         Template::Minimal => &[SKYZEN],
         // The api template declares a portable KV service, so it needs the wrappers, the
         // in-process backend `[native.service.cache]` names, and the Cloudflare one.
-        Template::Api => &[SKYZEN, SERVICES, TEST, CLOUDFLARE, SERDE],
+        Template::Api => &[SKYZEN, SERVICES, TEST, CLOUDFLARE, SERDE, UTOIPA],
         Template::ServerlessEvents => &[SKYZEN, SERVICES, CLOUDFLARE, SERDE, TRACING],
         Template::DurableRealtime => &[SKYZEN_WS, CLOUDFLARE, SERDE, FUTURES],
     }

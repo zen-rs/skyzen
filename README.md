@@ -278,15 +278,17 @@ use skyzen::{
     extract::{Path, Query},
     routing::{CreateRouteNode, Route, Router},
     utils::Json,
-    Result,
+    Result, ToSchema,
 };
 
-#[derive(Serialize)]
+// A payload carried by `Json`, `Form` or `Query` derives `ToSchema` alongside its serde derive:
+// one says how it goes on the wire, the other how the OpenAPI document describes it.
+#[derive(Serialize, ToSchema)]
 struct MessageResponse {
     message: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct GreetingQuery {
     prefix: Option<String>,
 }
@@ -419,9 +421,9 @@ async fn update_profile(
 
 | Extractor | Path | Description |
 |---|---|---|
-| `Json<T>` | `skyzen::utils::Json` | Deserializes a JSON request body |
-| `Query<T>` | `skyzen::extract::Query` | Deserializes the query string, repeated keys included |
-| `Form<T>` | `skyzen::utils::Form` | Deserializes `application/x-www-form-urlencoded` |
+| `Json<T>` | `skyzen::utils::Json` | Deserializes a JSON request body (`T: ToSchema`) |
+| `Query<T>` | `skyzen::extract::Query` | Deserializes the query string, repeated keys included (`T: ToSchema`) |
+| `Form<T>` | `skyzen::utils::Form` | Deserializes `application/x-www-form-urlencoded` (`T: ToSchema`) |
 | `Path<T>` | `skyzen::extract::Path` | Deserializes the captured `{name}` segments into a struct, tuple or primitive |
 | `Params` | `skyzen::routing::Params` | Path parameters by name at runtime (`params.get("id")?`) |
 | `Multipart` | `skyzen::utils::Multipart` | Streams multipart form data and file uploads |
@@ -436,12 +438,23 @@ async fn update_profile(
 | `RequestBodyLimit` | `skyzen::RequestBodyLimit` | The body cap in force, so a handler can size its own reads |
 | `Option<T>`, `Result<T, _>` | — | Wrap any extractor to make its failure recoverable |
 
+A body payload carries `T: ToSchema` so that what the endpoint documents is what it actually
+serializes — the bound is what makes the generated document trustworthy rather than best-effort.
+`#[derive(ToSchema)]` beside the serde derive is the whole cost, and every primitive, collection
+and `serde_json::Value` already has one. The derive expands to `::utoipa::…` paths, so an
+application declares `utoipa = "5"` alongside `skyzen` (`skyzen new` does this for you);
+`skyzen::ToSchema` re-exports the trait the bound is written against.
+
+`Path<T>` is the exception and takes no bound: the route pattern names its parameters, and
+`Path<(String, u32)>` for a multi-segment route has no schema to give. `#[skyzen::openapi]` types
+those parameters by probing the payload at the handler's own call site instead.
+
 ### Built-in Responders
 
 | Responder | Description |
 |---|---|
 | `&'static str`, `String`, `Bytes` | Plain text or raw bytes |
-| `Json<T>` / `PrettyJson<T>` | Serializes `T` to `application/json` |
+| `Json<T>` / `PrettyJson<T>` | Serializes `T` to `application/json` (`T: ToSchema`) |
 | `Html<T>` | Sends its payload as `text/html; charset=utf-8` |
 | `StatusCode` | An empty response with that status |
 | `Redirect` | `to` (302), `see_other` (303), `temporary` (307), `permanent` (308), or `with_status` |

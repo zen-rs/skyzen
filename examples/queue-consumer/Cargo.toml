@@ -16,9 +16,16 @@ skyzen-services = { path = "../../services" }
 # The `backend = "memory"` wiring in Skyzen.toml expands to `skyzen_test`'s in-process mock.
 skyzen-test = { path = "../../test" }
 serde = { version = "1", features = ["derive"] }
+# utoipa's `ToSchema` derive expands to `::utoipa::…`, so the crate deriving it needs the
+# dependency; `skyzen::ToSchema` re-exports the trait, not the crate the expansion names.
+utoipa = "5"
 tracing = "0.1"
 
 [package.metadata.cargo-machete]
+# `utoipa` is reached only through what `#[derive(ToSchema)]` EXPANDS to — `::utoipa::…` paths —
+# so no source line names the crate and machete cannot see the use. The dependency is load-bearing
+# regardless: without it the derive does not resolve.
+#
 # Consumed by the code `#[skyzen::main]` GENERATES for `backend = "memory"`, which
 # cargo-machete cannot see in the source text.
-ignored = ["skyzen-test"]
+ignored = ["skyzen-test", "utoipa"]

@@ -68,7 +68,8 @@ impl<E: Extractor, R: Responder> core::error::Error for HandlerError<E, R> {}
     note = "a handler is an `async fn` (or closure) whose arguments all implement `Extractor` and whose return type implements `Responder`",
     note = "the future a handler returns must be `Send`: do not hold an `Rc` or a `MutexGuard` across an `.await`",
     note = "a handler takes at most 15 arguments; group the rest into one extractor",
-    note = "common fixes: take path parameters as `Path<T>` or `Params`, take a body as `Json<T>`/`Bytes`/`String`, and return `Json<T>`, `String` or `Result<T>` rather than a bare value"
+    note = "common fixes: take path parameters as `Path<T>` or `Params`, take a body as `Json<T>`/`Bytes`/`String`, and return `Json<T>`, `String` or `Result<T>` rather than a bare value",
+    note = "a payload carried by `Json<T>`, `Form<T>`, `Query<T>` or `PrettyJson<T>` must also derive `ToSchema`, since that is what the generated OpenAPI document describes it with: `#[derive(Serialize, skyzen::ToSchema)]`"
 )]
 pub trait Handler<T: Extractor, R: Responder>: Send + Sync + Clone + 'static {
     /// Handle the request and make a response.
