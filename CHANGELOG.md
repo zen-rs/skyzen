@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/zen-rs/skyzen/compare/v0.2.0...v0.2.1) - 2026-08-29
+
+### Added
+
+- *(cli)* refuse committed secrets on CLI load
+- *(manifest)* interpolate deploy-time environment placeholders
+
 ## [0.2.0](https://github.com/zen-rs/skyzen/compare/v0.1.2...v0.2.0) - 2026-08-27
 
 ### Added
