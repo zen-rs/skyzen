@@ -15,9 +15,9 @@
 //! # Deploy-time interpolation
 //!
 //! String values may contain `${NAME}` placeholders. The CLI expands them from the process
-//! environment when it reads the file (GitHub Actions secrets mapped into the job env, or
-//! `.env`). [`Manifest::parse`] leaves them as written so `#[skyzen::main]` does not depend on
-//! secrets the compiler does not have. A missing name fails the CLI parse; there is no default.
+//! environment and the project's `.env` files when it reads the file. [`Manifest::parse`] leaves
+//! them as written so `#[skyzen::main]` does not depend on secrets the compiler does not have.
+//! A missing name fails the CLI parse; there is no default.
 //!
 //! ```
 //! # use skyzen_manifest::Manifest;
@@ -49,6 +49,7 @@ mod interpolate;
 mod merge;
 pub mod migrations;
 mod schema;
+mod secrets;
 
 pub use interpolate::{expand, expand_table, process_env, EnvLookup, InterpolateError};
 pub use merge::deep_merge;
@@ -65,6 +66,7 @@ pub use schema::{
     S3Wiring, ServiceBusWiring, ServiceEntry, ServiceType, SkyzenManifest, SqlUrlWiring, SqsWiring,
     StorageQueueWiring, WiringEnvVar, HTTP_FUNCTION_NAME,
 };
+pub use secrets::{scan_table, SecretError, SecretFinding, SecretReport};
 
 use std::{
     collections::BTreeMap,
@@ -138,6 +140,14 @@ pub enum ManifestError {
         /// What was wrong with the placeholder, including the TOML path.
         source: interpolate::InterpolateError,
     },
+    /// A string value is a documented credential form stored in the file.
+    #[error("{path}: {source}")]
+    CommittedSecret {
+        /// The manifest path.
+        path: PathBuf,
+        /// What was found, without the secret value.
+        source: secrets::SecretError,
+    },
     /// A named environment was requested that the manifest does not declare.
     #[error(
         "{path} declares no Cloudflare environment named `{name}`{}",
@@ -164,6 +174,9 @@ pub struct Manifest {
     root_dir: PathBuf,
     data: SkyzenManifest,
     environments: BTreeMap<String, CloudflareSection>,
+    /// Heuristic secret-shaped values. Empty unless this manifest was loaded with interpolation
+    /// (the CLI). Blocking forms have already failed the parse.
+    secret_warnings: Vec<SecretFinding>,
 }
 
 impl Manifest {
@@ -253,6 +266,22 @@ impl Manifest {
                 source: Box::new(source),
             })?;
 
+        // Scan the file as committed, before interpolation fills in CI secrets. Macros pass
+        // `lookup = None` and skip the scan so `cargo build` does not fail on a token the
+        // compiler never needed.
+        let secret_warnings = if lookup.is_some() {
+            let report = secrets::scan_table(&document);
+            if let Some(source) = secrets::blocking_error(&report) {
+                return Err(ManifestError::CommittedSecret {
+                    path: path.clone(),
+                    source,
+                });
+            }
+            report.warnings
+        } else {
+            Vec::new()
+        };
+
         if let Some(lookup) = lookup {
             interpolate::expand_table(&mut document, lookup).map_err(|source| {
                 ManifestError::Interpolation {
@@ -332,6 +361,7 @@ impl Manifest {
             root_dir: root_dir.into(),
             data,
             environments,
+            secret_warnings,
         })
     }
 
@@ -356,6 +386,16 @@ impl Manifest {
     /// The names of every declared `[cloudflare.env.<name>]` overlay, in sorted order.
     pub fn environment_names(&self) -> impl ExactSizeIterator<Item = &str> {
         self.environments.keys().map(String::as_str)
+    }
+
+    /// Heuristic secret-shaped values found while loading with interpolation.
+    ///
+    /// Blocking credential forms have already failed the parse. These leftovers — a
+    /// secret-named key whose value is not a known token, a JWT-shaped string — are
+    /// warnings for the CLI to print.
+    #[must_use]
+    pub fn secret_warnings(&self) -> &[SecretFinding] {
+        &self.secret_warnings
     }
 
     /// The Cloudflare configuration for `environment`, or the base configuration when `None`.
@@ -1186,6 +1226,36 @@ mod tests {
                 .expect("cloudflare")
                 .vars["BANNER"],
             "he said \"hi\""
+        );
+    }
+
+    #[test]
+    fn the_cli_parse_blocks_a_github_token_and_the_macro_parse_does_not() {
+        let source = "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+             [cloudflare.vars]\nTOKEN = \"ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n";
+        let error = parse_expanded(source, &[]).expect_err("CLI load blocks a known token");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("GitHub personal access token"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("ghp_"), "{rendered}");
+
+        parse(source).expect("compile-time parse does not scan");
+    }
+
+    #[test]
+    fn a_secret_named_literal_warns_on_cli_load_but_does_not_fail() {
+        let manifest = parse_expanded(
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+             [cloudflare.vars]\nAPI_KEY = \"dev-only\"\n",
+            &[],
+        )
+        .expect("heuristic is a warning");
+        assert_eq!(manifest.secret_warnings().len(), 1);
+        assert_eq!(
+            manifest.secret_warnings()[0].kind,
+            "plaintext value of a secret-named key"
         );
     }
 
