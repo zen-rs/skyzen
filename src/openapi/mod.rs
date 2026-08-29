@@ -267,9 +267,20 @@ where
 /// else falls through to the second.
 ///
 /// The choice is made where the call is written, so it only discriminates when `T` is concrete
-/// there. Calling it from a function generic over `T` always yields the fallback — which is why
-/// `#[skyzen::openapi]` emits the probe at the handler's own call site, where the extractor's
-/// payload type is spelled out.
+/// there. Calling it from a function generic over `T` always yields the fallback, silently — so
+/// this is reachable from exactly one place, `#[skyzen::openapi]`'s expansion, where the payload
+/// type is spelled out and the answer is therefore real.
+///
+/// It exists for one caller: [`Path<T>`](crate::extract::Path), whose payload is legitimately
+/// allowed not to describe itself. A multi-segment route is extracted as `Path<(String, u32)>`,
+/// tuples have no `ToSchema`, and the route pattern already names those parameters — so the
+/// payload only supplies types, and its absence costs a type rather than failing the build. Every
+/// *body* payload takes the opposite route and requires the bound outright: see
+/// [`Json`](crate::utils::Json), whose schema is the documented contract rather than a bonus.
+///
+/// There is deliberately no generic `maybe_schema_of<T>()` wrapper around this. Such a function
+/// can only ever return `None`, and having one meant six extractors and responders reported no
+/// schema while looking as though they reported one.
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct SchemaProbe<T>(PhantomData<T>);
@@ -330,23 +341,6 @@ where
     pub const fn maybe_register(&self, defs: &mut BTreeMap<String, SchemaRef>) {
         let _ = defs;
     }
-}
-
-/// Return the schema for `T` when it implements `ToSchema`; otherwise return `None`.
-///
-/// `T` is generic here, so this always takes the fallback; it exists for extractors whose own
-/// payload type is generic and therefore cannot be probed. `#[skyzen::openapi]` probes at the
-/// handler's call site instead, which is what puts real types in the generated document.
-#[cfg(feature = "openapi")]
-#[must_use]
-pub fn maybe_schema_of<T>() -> Option<SchemaRef> {
-    SchemaProbe::<T>::new().maybe_schema()
-}
-
-/// Register the schema for `T` when it implements `ToSchema`; otherwise do nothing.
-#[cfg(feature = "openapi")]
-pub fn maybe_register_schema_for<T>(defs: &mut BTreeMap<String, SchemaRef>) {
-    SchemaProbe::<T>::new().maybe_register(defs);
 }
 
 /// Register a schema and its dependencies when `OpenAPI` is enabled.

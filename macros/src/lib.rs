@@ -1,6 +1,7 @@
 //! Procedural macros for the Skyzen framework.
 
 mod row;
+mod sql;
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -417,6 +418,49 @@ pub fn derive_http_error(item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     match expand_http_error(input) {
         Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+/// Build a query whose bind order comes from the query text.
+///
+/// ```ignore
+/// let user: User = sql!(db, "SELECT id, login FROM users WHERE id = {id} AND state = {state}")
+///     .fetch_one()
+///     .await?;
+/// ```
+///
+/// expands to exactly what it replaces, with one `?` and one `.bind()` per capture, in the order
+/// the captures are written:
+///
+/// ```ignore
+/// db.query("SELECT id, login FROM users WHERE id = ? AND state = ?")
+///     .bind(id)
+///     .bind(state)
+/// ```
+///
+/// Positional binding is a silent correctness hazard, not just boilerplate: splice one condition
+/// into the middle of a statement and every later `.bind()` shifts by one, and because SQL has so
+/// few distinct types the result usually still compiles and still runs — against the wrong
+/// columns. Writing the value where the placeholder is leaves only one possible ordering.
+///
+/// - **A capture is always a bound value, never substituted text.** An identifier, a table name or
+///   a SQL fragment cannot be interpolated, so the injection question is closed by construction.
+/// - `{name}` binds a value in scope and `{ an.expression() }` binds anything else; `{{` and `}}`
+///   are literal braces, as in `format!`. There are no positional arguments — an argument list is
+///   the very thing that can fall out of step with the query.
+/// - Each capture is bound through `Into<DbValue>`, so it accepts exactly what `.bind()` accepts.
+/// - The first argument is whatever the query runs against: a `Db`, a transaction, or a
+///   `DurableDb`.
+///
+/// Nothing here reads a schema, opens a connection at build time, or parses the SQL beyond finding
+/// the captures. The same statement runs on five backends, so checking it against one dialect's
+/// parser would be a guarantee that does not hold.
+#[proc_macro]
+pub fn sql(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as sql::SqlInput);
+    match sql::expand(&input) {
+        Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
 }

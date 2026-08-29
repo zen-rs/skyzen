@@ -23,7 +23,7 @@ impl_deref!(Query);
 )]
 pub struct QueryError(String);
 
-impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
+impl<T: Send + Sync + DeserializeOwned + crate::ToSchema + 'static> Extractor for Query<T> {
     type Error = QueryError;
     // The query string is already on the request, so the future is ready on creation rather than
     // an `async` block with nothing to await.
@@ -40,7 +40,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
         Some(crate::openapi::ExtractorSchema {
             location: crate::openapi::ParameterLocation::Query,
             content_type: None,
-            schema: crate::openapi::maybe_schema_of::<T>(),
+            schema: crate::openapi::schema_of::<T>(),
         })
     }
 
@@ -48,7 +48,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Query<T> {
     fn register_openapi_schemas(
         defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
-        crate::openapi::maybe_register_schema_for::<T>(defs);
+        crate::openapi::register_schema_for::<T>(defs);
     }
 }
 
@@ -60,13 +60,13 @@ mod tests {
     use serde::Deserialize;
     use skyzen_core::Extractor;
 
-    #[derive(Debug, Deserialize, PartialEq)]
+    #[derive(Debug, Deserialize, PartialEq, crate::ToSchema)]
     struct Search {
         q: String,
         page: u8,
     }
 
-    #[derive(Debug, Deserialize, PartialEq)]
+    #[derive(Debug, Deserialize, PartialEq, crate::ToSchema)]
     struct Filter {
         tags: Option<Vec<String>>,
     }
