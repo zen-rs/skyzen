@@ -12,9 +12,10 @@
 //! same way a key-named one does.
 //!
 //! The same files, plus the process environment, fill `${NAME}` placeholders in `Skyzen.toml`
-//! itself when the CLI reads it. That is deploy-time interpolation (GitHub Actions secrets), not
-//! the runtime environment of the deployed process. `#[skyzen::main]` does not expand them.
+//! itself when the CLI reads it. That is deploy-time interpolation, not the runtime environment
+//! of the deployed process. `#[skyzen::main]` does not expand them.
 
+use crate::{output, secret_files};
 use anyhow::{Context, Result};
 use askama::Template;
 use skyzen_manifest::{InterpolateError, Manifest, SkyzenManifest, WiringEnvVar};
@@ -93,7 +94,8 @@ fn collect(
 ///
 /// # Errors
 ///
-/// Fails when the file cannot be read, a placeholder cannot be expanded, a dotenv file is
+/// Fails when the file cannot be read, a placeholder cannot be expanded, a documented
+/// credential form is stored as a literal, a dotenv file is tracked by git, a dotenv file is
 /// malformed, or the document does not match the schema.
 pub fn load_manifest(path: &Path) -> Result<Manifest> {
     let absolute = if path.is_absolute() {
@@ -106,7 +108,16 @@ pub fn load_manifest(path: &Path) -> Result<Manifest> {
     let root_dir = absolute.parent().unwrap_or_else(|| Path::new("."));
     let dotenv = load_dotenv_files(root_dir)?;
     let lookup = |name: &str| lookup_var(name, &dotenv);
-    Ok(Manifest::load_with(&absolute, Some(&lookup))?)
+    let manifest = Manifest::load_with(&absolute, Some(&lookup))?;
+    for finding in manifest.secret_warnings() {
+        output::warn(format!(
+            "{finding}; if this is a secret, use a ${{NAME}} placeholder or `skyzen secret set`"
+        ));
+    }
+    for warning in secret_files::ensure(root_dir)? {
+        output::warn(warning);
+    }
+    Ok(manifest)
 }
 
 /// Process environment first, then the dotenv map. Invalid Unicode fails rather than skipping.
@@ -423,5 +434,24 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("account_id"), "{rendered}");
+    }
+
+    #[test]
+    fn load_manifest_blocks_a_github_token_without_echoing_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("Skyzen.toml"),
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+             [cloudflare.vars]\nTOKEN = \"ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        )
+        .expect("write manifest");
+
+        let error = load_manifest(&dir.path().join("Skyzen.toml")).expect_err("block");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("GitHub personal access token"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("ghp_"), "{rendered}");
     }
 }
