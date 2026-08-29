@@ -207,31 +207,19 @@ skyzen logs --env staging
 
 See [Environments](skyzen-toml-reference.md#environments) for the merge rules.
 
-### GitHub Actions
+### CI
 
-`${NAME}` in `Skyzen.toml` is expanded from the job's environment when the CLI reads the file.
-Map repository secrets into `env:` on the deploy step — that is the process environment of
-`skyzen deploy`, not the Worker after it starts.
-
-```yaml
-- run: skyzen deploy --provider cloudflare
-  env:
-    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-    CACHE_NAMESPACE_ID: ${{ secrets.CACHE_NAMESPACE_ID }}
-```
-
-```toml
-[cloudflare]
-account_id = "${CLOUDFLARE_ACCOUNT_ID}"
-
-[[cloudflare.kv_namespaces]]
-binding = "CACHE"
-id = "${CACHE_NAMESPACE_ID}"
-```
+`${NAME}` in `Skyzen.toml` is expanded from the process environment, then `.env` / `.env.local`,
+when the CLI reads the file. Drop a gitignored `.env` onto the runner (one file, not one `env:`
+line per key) or export the variables in the job. That is the environment of `skyzen deploy`, not
+the Worker after it starts.
 
 See [Deploy-time interpolation](skyzen-toml-reference.md#deploy-time-interpolation) for the syntax.
 `CLOUDFLARE_API_TOKEN` is wrangler's own credential and stays out of the file.
+
+The CLI refuses to load a checkout that has committed a known credential form in `Skyzen.toml`, or
+that is tracking `.env` / `.env.local` / `.dev.vars`. A secret-named key whose value is not a
+known token is a warning, not a hard failure.
 
 ### Logs and Secrets
 

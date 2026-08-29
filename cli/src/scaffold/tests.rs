@@ -119,6 +119,14 @@ fn every_template_generates_the_files_a_project_needs() {
             )),
             "template `{label}` must pin wasm-bindgen to the embedded generator"
         );
+
+        let gitignore = fs::read_to_string(root.join(".gitignore")).expect(".gitignore");
+        for secret_file in [".env", ".env.local", ".dev.vars"] {
+            assert!(
+                gitignore.lines().any(|line| line == secret_file),
+                "template `{label}` .gitignore must ignore {secret_file}"
+            );
+        }
     }
 }
 
