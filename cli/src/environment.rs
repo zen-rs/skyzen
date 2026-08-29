@@ -10,10 +10,14 @@
 //! A backend whose constructor fixes its own variable names (Cosmos DB, the RDS Data API) is
 //! covered too: the section reports those names, so they reach this check and `.env.example` the
 //! same way a key-named one does.
+//!
+//! The same files, plus the process environment, fill `${NAME}` placeholders in `Skyzen.toml`
+//! itself when the CLI reads it. That is deploy-time interpolation (GitHub Actions secrets), not
+//! the runtime environment of the deployed process. `#[skyzen::main]` does not expand them.
 
 use anyhow::{Context, Result};
 use askama::Template;
-use skyzen_manifest::{SkyzenManifest, WiringEnvVar};
+use skyzen_manifest::{InterpolateError, Manifest, SkyzenManifest, WiringEnvVar};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -79,6 +83,38 @@ fn collect(
             |key| format!("{section}.{key}"),
         ),
     }));
+}
+
+/// Read `Skyzen.toml`, expanding `${NAME}` from the process environment and then `.env` files.
+///
+/// Process environment wins, matching [`ensure_available`]: a one-off
+/// `CACHE_ID=... skyzen deploy` still overrides `.env`. The CLI's own environment is never
+/// mutated.
+///
+/// # Errors
+///
+/// Fails when the file cannot be read, a placeholder cannot be expanded, a dotenv file is
+/// malformed, or the document does not match the schema.
+pub fn load_manifest(path: &Path) -> Result<Manifest> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to read the current directory")?
+            .join(path)
+    };
+    let root_dir = absolute.parent().unwrap_or_else(|| Path::new("."));
+    let dotenv = load_dotenv_files(root_dir)?;
+    let lookup = |name: &str| lookup_var(name, &dotenv);
+    Ok(Manifest::load_with(&absolute, Some(&lookup))?)
+}
+
+/// Process environment first, then the dotenv map. Invalid Unicode fails rather than skipping.
+fn lookup_var(
+    name: &str,
+    dotenv: &BTreeMap<String, String>,
+) -> Result<Option<String>, InterpolateError> {
+    Ok(skyzen_manifest::process_env(name)?.or_else(|| dotenv.get(name).cloned()))
 }
 
 /// The variables loaded from the project's `.env` files.
@@ -168,7 +204,9 @@ pub fn dotenv_paths(root_dir: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_available, load_dotenv_files, render_example, required_variables};
+    use super::{
+        ensure_available, load_dotenv_files, load_manifest, render_example, required_variables,
+    };
     use skyzen_manifest::Manifest;
     use std::collections::BTreeMap;
 
@@ -338,5 +376,52 @@ mod tests {
     fn the_example_explains_itself_when_nothing_is_declared() {
         let rendered = render_example(&manifest("")).expect("render");
         assert!(rendered.contains("declares no native environment variables"));
+    }
+
+    #[test]
+    fn load_manifest_interpolates_from_dotenv() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("Skyzen.toml"),
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\
+             account_id = \"${SKYZEN_TEST_ACCOUNT_ID}\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            dir.path().join(".env"),
+            "SKYZEN_TEST_ACCOUNT_ID=acct_from_dotenv\n",
+        )
+        .expect("write dotenv");
+
+        let loaded = load_manifest(&dir.path().join("Skyzen.toml")).expect("load");
+        assert_eq!(
+            loaded
+                .data()
+                .cloudflare
+                .as_ref()
+                .expect("cloudflare")
+                .account_id
+                .as_deref(),
+            Some("acct_from_dotenv")
+        );
+    }
+
+    #[test]
+    fn load_manifest_fails_when_a_placeholder_is_unset() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("Skyzen.toml"),
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\
+             account_id = \"${SKYZEN_TEST_UNSET_INTERPOLATION}\"\n",
+        )
+        .expect("write manifest");
+
+        let error = load_manifest(&dir.path().join("Skyzen.toml")).expect_err("unset");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("SKYZEN_TEST_UNSET_INTERPOLATION"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("account_id"), "{rendered}");
     }
 }
