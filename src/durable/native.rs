@@ -14,18 +14,23 @@ use std::{
 };
 
 use futures_util::lock::Mutex;
-use skyzen_services::{
-    durable::{
-        kv::{DurableKvStore, DurableListOptions},
-        Alarm, AlarmError, AlarmScheduler, DurableDb, DurableDbBackend, DurableDbError, DurableKv,
-        DurableKvError,
-    },
-    Db, DbExecResult, DbValue,
+#[cfg(feature = "ws")]
+use futures_util::{FutureExt as _, StreamExt as _};
+use skyzen_services::durable::{
+    kv::{DurableKvStore, DurableListOptions},
+    Alarm, AlarmError, AlarmScheduler, DurableDb, DurableKv, DurableKvError, SqliteDurableDb,
 };
 
 use super::{
     DurableConnections, DurableConnectionsInner, DurableObject, DurableObjectError,
     DurableObjectId, WebSocketConnection,
+};
+#[cfg(feature = "ws")]
+use super::{WebSocketConnectionInner, WebSocketEvent};
+#[cfg(feature = "ws")]
+use crate::{
+    durable::websocket::NativeDurableObjectState,
+    websocket::{WebSocket, WebSocketCloseFrame, WebSocketMessage},
 };
 use crate::{Body, Endpoint, Method, Request, Response};
 
@@ -66,7 +71,7 @@ struct NativeDurableInstance {
 struct NativeDurableSlot {
     state: Option<Vec<u8>>,
     kv: NativeDurableKvStore,
-    db: NativeDurableDbStore,
+    db: SqliteDurableDb,
     alarm: NativeAlarmScheduler,
     connections: NativeDurableConnections,
 }
@@ -76,13 +81,11 @@ impl NativeDurableSlot {
         Ok(Self {
             state: None,
             kv: NativeDurableKvStore::default(),
-            db: NativeDurableDbStore::new(
-                Db::connect_sqlite_memory()
-                    .await
-                    .map_err(DurableObjectError::from)?,
-            ),
+            db: SqliteDurableDb::in_memory()
+                .await
+                .map_err(DurableObjectError::from)?,
             alarm: NativeAlarmScheduler::default(),
-            connections: NativeDurableConnections,
+            connections: NativeDurableConnections::default(),
         })
     }
 
@@ -128,7 +131,7 @@ impl NativeDurableSlot {
 
 impl<T> Default for NativeDurableNamespace<T>
 where
-    T: DurableObject,
+    T: DurableObject + Send,
 {
     fn default() -> Self {
         Self::new()
@@ -137,7 +140,7 @@ where
 
 impl<T> NativeDurableNamespace<T>
 where
-    T: DurableObject,
+    T: DurableObject + Send,
 {
     /// Create a new in-process Durable Object namespace.
     #[must_use]
@@ -320,6 +323,24 @@ where
         let mut object = {
             let slot = instance.slot.lock().await;
             inject_durable_extensions(&mut request, &slot, id.clone());
+            #[cfg(feature = "ws")]
+            {
+                let namespace = self.clone();
+                let object_id = id.clone();
+                request
+                    .extensions_mut()
+                    .insert(NativeDurableObjectState::new(move |websocket, tags| {
+                        let namespace = namespace.clone();
+                        let object_id = object_id.clone();
+                        async move {
+                            if let Err(error) =
+                                namespace.run_websocket(&object_id, websocket, tags).await
+                            {
+                                tracing::error!(%error, "native durable websocket session failed");
+                            }
+                        }
+                    }));
+            }
             slot.load_object::<T>()?
         };
 
@@ -374,6 +395,131 @@ where
         instance.slot.lock().await.save_object(&object)?;
         Ok(())
     }
+
+    #[cfg(feature = "ws")]
+    async fn dispatch_websocket_event(
+        &self,
+        id: &DurableObjectId,
+        websocket: &WebSocketConnection,
+        event: WebSocketEvent,
+    ) -> Result<(), DurableObjectError> {
+        let instance = self.slot_for(id).await?;
+        let _dispatch = instance.dispatch.lock().await;
+
+        let (mut object, context) = {
+            let slot = instance.slot.lock().await;
+            (
+                slot.load_object::<T>()?,
+                super::DurableContext::new(
+                    DurableKv::new(slot.kv.clone()),
+                    DurableDb::new(slot.db.clone()),
+                    Alarm::new(slot.alarm.clone()),
+                    DurableConnections::new(Box::new(slot.connections.clone())),
+                    id.clone(),
+                ),
+            )
+        };
+
+        object.websocket(websocket, event, &context).await?;
+        instance.slot.lock().await.save_object(&object)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "ws")]
+    async fn run_websocket(
+        &self,
+        id: &DurableObjectId,
+        websocket: WebSocket,
+        tags: Vec<String>,
+    ) -> Result<(), DurableObjectError> {
+        let instance = self.slot_for(id).await?;
+        let (connection_id, inner, mut commands) = {
+            let slot = instance.slot.lock().await;
+            slot.connections.register(tags)?
+        };
+        let connection = WebSocketConnection::new(Box::new(inner));
+        let (mut sender, mut receiver) = websocket.split();
+
+        let outcome = async {
+            loop {
+                futures_util::select! {
+                    incoming = receiver.next().fuse() => {
+                        match incoming {
+                            Some(Ok(WebSocketMessage::Text(text))) => {
+                                let auto_response = {
+                                    let slot = instance.slot.lock().await;
+                                    slot.connections.auto_response(text.as_str())?
+                                };
+                                if let Some(response) = auto_response {
+                                    sender.send_text(response).await?;
+                                } else {
+                                    self.dispatch_websocket_event(
+                                        id,
+                                        &connection,
+                                        WebSocketEvent::Message(WebSocketMessage::Text(text)),
+                                    ).await?;
+                                }
+                            }
+                            Some(Ok(WebSocketMessage::Binary(data))) => {
+                                self.dispatch_websocket_event(
+                                    id,
+                                    &connection,
+                                    WebSocketEvent::Message(WebSocketMessage::Binary(data)),
+                                ).await?;
+                            }
+                            Some(Ok(WebSocketMessage::Ping(data))) => {
+                                sender.send_pong(data).await?;
+                            }
+                            Some(Ok(WebSocketMessage::Pong(_))) => {}
+                            Some(Ok(WebSocketMessage::Close)) | None => {
+                                self.dispatch_websocket_event(
+                                    id,
+                                    &connection,
+                                    WebSocketEvent::Close {
+                                        code: 1000,
+                                        reason: String::new(),
+                                        was_clean: true,
+                                    },
+                                ).await?;
+                                break;
+                            }
+                            Some(Err(error)) => {
+                                self.dispatch_websocket_event(
+                                    id,
+                                    &connection,
+                                    WebSocketEvent::Error(error.to_string()),
+                                ).await?;
+                                break;
+                            }
+                        }
+                    },
+                    command = commands.next().fuse() => {
+                        match command {
+                            Some(NativeWebSocketCommand::Text(text)) => {
+                                sender.send_text(text).await?;
+                            }
+                            Some(NativeWebSocketCommand::Binary(data)) => {
+                                sender.send_binary(data).await?;
+                            }
+                            Some(NativeWebSocketCommand::Close { code, reason }) => {
+                                sender
+                                    .close(Some(WebSocketCloseFrame::new(code, reason)))
+                                    .await
+                                    ?;
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        let removal = instance.slot.lock().await.connections.remove(connection_id);
+        outcome.and(removal)
+    }
 }
 
 /// Native stub for invoking a process-local Durable Object.
@@ -394,7 +540,7 @@ impl<T> Clone for NativeDurableObjectStub<T> {
 
 impl<T> NativeDurableObjectStub<T>
 where
-    T: DurableObject,
+    T: DurableObject + Send,
 {
     /// The target Durable Object ID.
     #[must_use]
@@ -464,9 +610,179 @@ fn lock_poisoned<T>(_: T) -> DurableObjectError {
     DurableObjectError::Runtime("native durable simulator lock poisoned".to_owned())
 }
 
+/// The sockets one simulated object has accepted.
+///
+/// Shared by handle: every clone of the object's slot, and every [`WebSocketConnection`] handed to
+/// a handler, has to see the same registry.
+#[cfg(feature = "ws")]
 #[derive(Debug, Clone, Default)]
-struct NativeDurableConnections;
+struct NativeDurableConnections {
+    state: Arc<NativeDurableConnectionsState>,
+}
 
+#[cfg(feature = "ws")]
+#[derive(Debug, Default)]
+struct NativeDurableConnectionsState {
+    next_id: AtomicU64,
+    sockets: RwLock<HashMap<u64, NativeWebSocketInner>>,
+    auto_response: RwLock<Option<(String, String)>>,
+}
+
+/// Without the `ws` feature nothing can accept a socket, so there is no registry to keep.
+#[cfg(not(feature = "ws"))]
+#[derive(Debug, Clone, Default)]
+struct NativeDurableConnections {}
+
+#[cfg(feature = "ws")]
+#[derive(Debug)]
+enum NativeWebSocketCommand {
+    Text(String),
+    Binary(Vec<u8>),
+    Close { code: u16, reason: String },
+}
+
+#[cfg(feature = "ws")]
+#[derive(Debug, Clone)]
+struct NativeWebSocketInner {
+    commands: futures_channel::mpsc::UnboundedSender<NativeWebSocketCommand>,
+    tags: Arc<Vec<String>>,
+    attachment: Arc<RwLock<Option<Vec<u8>>>>,
+}
+
+#[cfg(feature = "ws")]
+impl WebSocketConnectionInner for NativeWebSocketInner {
+    fn send_text(&self, text: &str) -> Result<(), DurableObjectError> {
+        self.commands
+            .unbounded_send(NativeWebSocketCommand::Text(text.to_owned()))
+            .map_err(|_| closed_websocket())
+    }
+
+    fn send_binary(&self, data: &[u8]) -> Result<(), DurableObjectError> {
+        self.commands
+            .unbounded_send(NativeWebSocketCommand::Binary(data.to_vec()))
+            .map_err(|_| closed_websocket())
+    }
+
+    fn close(&self, code: u16, reason: &str) -> Result<(), DurableObjectError> {
+        self.commands
+            .unbounded_send(NativeWebSocketCommand::Close {
+                code,
+                reason: reason.to_owned(),
+            })
+            .map_err(|_| closed_websocket())
+    }
+
+    fn tags(&self) -> Result<Vec<String>, DurableObjectError> {
+        Ok(self.tags.as_ref().clone())
+    }
+
+    fn get_attachment_raw(&self) -> Result<Option<Vec<u8>>, DurableObjectError> {
+        self.attachment
+            .read()
+            .map_err(lock_poisoned)
+            .map(|attachment| attachment.clone())
+    }
+
+    fn set_attachment_raw(&self, data: &[u8]) -> Result<(), DurableObjectError> {
+        self.attachment
+            .write()
+            .map_err(lock_poisoned)
+            .map(|mut attachment| *attachment = Some(data.to_vec()))
+    }
+}
+
+#[cfg(feature = "ws")]
+fn closed_websocket() -> DurableObjectError {
+    DurableObjectError::WebSocket("native durable websocket is closed".to_owned())
+}
+
+#[cfg(feature = "ws")]
+impl NativeDurableConnections {
+    fn register(
+        &self,
+        tags: Vec<String>,
+    ) -> Result<
+        (
+            u64,
+            NativeWebSocketInner,
+            futures_channel::mpsc::UnboundedReceiver<NativeWebSocketCommand>,
+        ),
+        DurableObjectError,
+    > {
+        let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
+        let (commands, receiver) = futures_channel::mpsc::unbounded();
+        let inner = NativeWebSocketInner {
+            commands,
+            tags: Arc::new(tags),
+            attachment: Arc::new(RwLock::new(None)),
+        };
+        self.state
+            .sockets
+            .write()
+            .map_err(lock_poisoned)?
+            .insert(id, inner.clone());
+        Ok((id, inner, receiver))
+    }
+
+    fn remove(&self, id: u64) -> Result<(), DurableObjectError> {
+        self.state
+            .sockets
+            .write()
+            .map_err(lock_poisoned)?
+            .remove(&id);
+        Ok(())
+    }
+
+    fn auto_response(&self, message: &str) -> Result<Option<String>, DurableObjectError> {
+        self.state
+            .auto_response
+            .read()
+            .map_err(lock_poisoned)
+            .map(|pair| {
+                pair.as_ref()
+                    .filter(|(request, _)| request == message)
+                    .map(|(_, response)| response.clone())
+            })
+    }
+
+    /// Every registered socket, or only those carrying `tag`.
+    ///
+    /// `all` and `by_tag` differ by exactly this filter, so they share one read of the registry.
+    fn connections(
+        &self,
+        tag: Option<&str>,
+    ) -> Result<Vec<WebSocketConnection>, DurableObjectError> {
+        self.state
+            .sockets
+            .read()
+            .map_err(lock_poisoned)
+            .map(|sockets| {
+                sockets
+                    .values()
+                    .filter(|socket| {
+                        tag.is_none_or(|tag| socket.tags.iter().any(|candidate| candidate == tag))
+                    })
+                    .cloned()
+                    .map(|socket| WebSocketConnection::new(Box::new(socket)))
+                    .collect()
+            })
+    }
+
+    /// Remember the auto-response pair, or forget it when given `None`.
+    fn store_auto_response(&self, pair: Option<(&str, &str)>) -> Result<(), DurableObjectError> {
+        self.state
+            .auto_response
+            .write()
+            .map_err(lock_poisoned)
+            .map(|mut slot| {
+                *slot = pair.map(|(request, response)| (request.to_owned(), response.to_owned()));
+            })
+    }
+}
+
+/// Without the `ws` feature nothing can accept a socket, so an object has no connection to report
+/// and no auto-response to remember.
+#[cfg(not(feature = "ws"))]
 impl DurableConnectionsInner for NativeDurableConnections {
     fn all(&self) -> Result<Vec<WebSocketConnection>, DurableObjectError> {
         Ok(Vec::new())
@@ -482,6 +798,29 @@ impl DurableConnectionsInner for NativeDurableConnections {
 
     fn clear_auto_response(&self) -> Result<(), DurableObjectError> {
         Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn DurableConnectionsInner> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(feature = "ws")]
+impl DurableConnectionsInner for NativeDurableConnections {
+    fn all(&self) -> Result<Vec<WebSocketConnection>, DurableObjectError> {
+        self.connections(None)
+    }
+
+    fn by_tag(&self, tag: &str) -> Result<Vec<WebSocketConnection>, DurableObjectError> {
+        self.connections(Some(tag))
+    }
+
+    fn set_auto_response(&self, request: &str, response: &str) -> Result<(), DurableObjectError> {
+        self.store_auto_response(Some((request, response)))
+    }
+
+    fn clear_auto_response(&self) -> Result<(), DurableObjectError> {
+        self.store_auto_response(None)
     }
 
     fn clone_box(&self) -> Box<dyn DurableConnectionsInner> {
@@ -691,80 +1030,6 @@ fn kv_lock_err<T>(_: T) -> DurableKvError {
     DurableKvError::backend("native durable KV lock poisoned")
 }
 
-#[derive(Debug, Clone)]
-struct NativeDurableDbStore {
-    db: Db,
-}
-
-impl NativeDurableDbStore {
-    const fn new(db: Db) -> Self {
-        Self { db }
-    }
-}
-
-impl DurableDbBackend for NativeDurableDbStore {
-    async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
-        let mut statement = self.db.query(query);
-        for value in params {
-            statement = statement.bind(value.clone());
-        }
-        let rows = statement
-            .fetch_all::<serde_json::Value>()
-            .await
-            .map_err(DurableDbError::from)?;
-        Ok(DbExecResult {
-            rows_read: rows.len() as u64,
-            rows,
-            rows_written: 0,
-        })
-    }
-
-    async fn execute(
-        &self,
-        query: &str,
-        params: &[DbValue],
-    ) -> Result<DbExecResult, DurableDbError> {
-        let mut statement = self.db.query(query);
-        for value in params {
-            statement = statement.bind(value.clone());
-        }
-        statement.execute().await.map_err(DurableDbError::from)
-    }
-
-    async fn database_size(&self) -> Result<u64, DurableDbError> {
-        #[derive(serde::Deserialize)]
-        struct PageCount {
-            page_count: i64,
-        }
-
-        #[derive(serde::Deserialize)]
-        struct PageSize {
-            page_size: i64,
-        }
-
-        let page_count = self
-            .db
-            .query("PRAGMA page_count")
-            .fetch_one::<PageCount>()
-            .await
-            .map_err(DurableDbError::from)?
-            .page_count;
-        let page_size = self
-            .db
-            .query("PRAGMA page_size")
-            .fetch_one::<PageSize>()
-            .await
-            .map_err(DurableDbError::from)?
-            .page_size;
-
-        let bytes = page_count
-            .checked_mul(page_size)
-            .ok_or_else(|| DurableDbError::backend("native durable DB size overflow"))?;
-        u64::try_from(bytes)
-            .map_err(|_| DurableDbError::backend("native durable DB size was negative"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,11 +1043,6 @@ mod tests {
     #[derive(Default, Serialize, Deserialize)]
     #[skyzen::durable_object]
     struct CounterObject;
-
-    #[derive(serde::Deserialize)]
-    struct CounterRow {
-        value: i64,
-    }
 
     impl DurableObject for CounterObject {
         fn fetch(&mut self) -> crate::routing::Router {
@@ -805,9 +1065,9 @@ mod tests {
 
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
-            .fetch_optional::<CounterRow>()
+            .fetch_scalar_optional::<i64>()
             .await?
-            .map_or(0, |row| row.value);
+            .unwrap_or(0);
         let next = current + 1;
 
         if current == 0 {
@@ -834,9 +1094,9 @@ mod tests {
 
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
-            .fetch_optional::<CounterRow>()
+            .fetch_scalar_optional::<i64>()
             .await?
-            .map_or(0, |row| row.value);
+            .unwrap_or(0);
 
         async_io::Timer::after(std::time::Duration::from_millis(50)).await;
 
@@ -868,9 +1128,9 @@ mod tests {
 
         let current = db
             .query("SELECT value FROM counter LIMIT 1")
-            .fetch_optional::<CounterRow>()
+            .fetch_scalar_optional::<i64>()
             .await?
-            .map_or(0, |row| row.value);
+            .unwrap_or(0);
         Ok(current.to_string())
     }
 
@@ -881,9 +1141,9 @@ mod tests {
 
         let current = db
             .query("SELECT value FROM alarm_runs LIMIT 1")
-            .fetch_optional::<CounterRow>()
+            .fetch_scalar_optional::<i64>()
             .await?
-            .map_or(0, |row| row.value);
+            .unwrap_or(0);
         let next = current + 1;
 
         if current == 0 {
@@ -908,9 +1168,9 @@ mod tests {
 
         let current = db
             .query("SELECT value FROM alarm_runs LIMIT 1")
-            .fetch_optional::<CounterRow>()
+            .fetch_scalar_optional::<i64>()
             .await?
-            .map_or(0, |row| row.value);
+            .unwrap_or(0);
         Ok(current.to_string())
     }
 

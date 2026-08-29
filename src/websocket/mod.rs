@@ -105,6 +105,47 @@
 //! }
 //! ```
 //!
+//! The answer is echoed in the `101`'s `Sec-WebSocket-Protocol`, and that echo is mandatory:
+//! RFC 6455 §4.1 has a client that offered a subprotocol **fail the connection** when the
+//! handshake comes back without one.
+//!
+//! ## Authenticating a browser socket
+//!
+//! The browser `WebSocket` constructor sends no custom headers — no `Authorization`, no cookie you
+//! control — so the subprotocol list is the only in-band channel a page has for a credential:
+//!
+//! ```js
+//! new WebSocket(url, [`app.bearer.${token}`])
+//! ```
+//!
+//! A fixed list of supported names cannot match a value that carries a token, so read the offer
+//! and answer it verbatim. [`RequestedSubprotocols`] does both halves, and works the same in a
+//! Durable Object, where the upgrade is constructed rather than extracted:
+//!
+//! ```no_run
+//! # use skyzen::websocket::{RequestedSubprotocols, WebSocketError, WebSocketUpgrade};
+//! # use skyzen::Responder;
+//! const PREFIX: &str = "app.bearer.";
+//!
+//! async fn authenticated(
+//!     ws: WebSocketUpgrade,
+//!     offered: RequestedSubprotocols,
+//! ) -> Result<impl Responder, WebSocketError> {
+//!     let token = offered
+//!         .iter()
+//!         .find_map(|protocol| protocol.strip_prefix(PREFIX))
+//!         .ok_or_else(|| WebSocketError::Protocol("no bearer subprotocol".to_owned()))?;
+//!     // ... verify `token` ...
+//!
+//!     let answer = offered
+//!         .answer(|protocol| protocol.starts_with(PREFIX))
+//!         .ok_or_else(|| WebSocketError::Protocol("unanswerable subprotocol".to_owned()))?;
+//!     Ok(ws.protocol(answer).on_upgrade(|socket| async move {
+//!         // Handle connection
+//!     }))
+//! }
+//! ```
+//!
 //! # Configuration
 //!
 //! ```no_run
@@ -134,9 +175,12 @@ mod wasm;
 
 pub use http_kit::ws::*;
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::upgrade_from_request;
+#[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
 pub(crate) use session::session_handler;
 pub use session::{IntoWebSocketOutcome, MaybeSend, MaybeSync, INTERNAL_ERROR};
+pub(crate) use types::select_offered_protocol;
 pub use types::*;
 #[cfg(target_arch = "wasm32")]
 pub use wasm::*;
