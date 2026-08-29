@@ -72,20 +72,22 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Path<T> {
         Ok(Self(value))
     }
 
+    /// `Path<T>` names no parameters of its own — the route pattern does — so this reports where
+    /// the values come from and nothing about their types.
+    ///
+    /// The types are supplied by `#[skyzen::openapi]`, which probes `T` at the handler's own call
+    /// site with [`SchemaProbe`](crate::openapi::SchemaProbe), where `T` is spelled out and the
+    /// `ToSchema` bound is therefore provable. That indirection is what lets `Path<(String, u32)>`
+    /// keep working: a tuple has no `ToSchema` and never will, and a multi-segment route is a
+    /// perfectly ordinary thing to write. Unlike the body extractors, this one cannot simply
+    /// require the bound.
     #[cfg(feature = "openapi")]
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         Some(crate::openapi::ExtractorSchema {
             location: crate::openapi::ParameterLocation::Path,
             content_type: None,
-            schema: crate::openapi::maybe_schema_of::<T>(),
+            schema: None,
         })
-    }
-
-    #[cfg(feature = "openapi")]
-    fn register_openapi_schemas(
-        defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
-    ) {
-        crate::openapi::maybe_register_schema_for::<T>(defs);
     }
 }
 
