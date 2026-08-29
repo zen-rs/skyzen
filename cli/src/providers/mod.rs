@@ -207,7 +207,7 @@ pub fn prepare(
 /// section", which says what to do, rather than with a file-not-found.
 fn load_or_empty(manifest_path: &Path) -> Result<Manifest> {
     if manifest_path.exists() {
-        return Ok(Manifest::load(manifest_path)?);
+        return environment::load_manifest(manifest_path);
     }
 
     let absolute = if manifest_path.is_absolute() {
@@ -253,7 +253,7 @@ pub fn provision(
              --provider azure`"
         ),
         Provider::Cloudflare => {
-            let manifest = Manifest::load(manifest_path)?;
+            let manifest = environment::load_manifest(manifest_path)?;
             let config = manifest
                 .cloudflare(environment)?
                 .ok_or_else(|| anyhow::anyhow!("missing [cloudflare] section in Skyzen.toml"))?;
@@ -482,7 +482,7 @@ fn check_manifest(
         return 0;
     }
 
-    let manifest = match Manifest::load(manifest_path) {
+    let manifest = match environment::load_manifest(manifest_path) {
         Ok(manifest) => {
             output::ok(format!("{} parses", manifest_path.display()));
             manifest

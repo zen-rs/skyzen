@@ -30,6 +30,10 @@ let cloudflare = manifest.cloudflare(Some("staging"))?;
 # Ok::<_, Box<dyn std::error::Error>>(())
 ```
 
+String values may contain `${NAME}` placeholders. The CLI expands them from the process
+environment and `.env` through `Manifest::load_with`. `Manifest::load` leaves them as written,
+which is what `#[skyzen::main]` uses so a missing CI secret cannot fail `cargo build`.
+
 See the [`Skyzen.toml` reference](https://github.com/zen-rs/skyzen/blob/main/docs/skyzen-toml-reference.md)
 for the full key list.
 

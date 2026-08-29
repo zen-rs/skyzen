@@ -9,6 +9,7 @@ mod output;
 mod project;
 mod providers;
 mod scaffold;
+mod secret_files;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
