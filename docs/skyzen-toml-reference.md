@@ -740,6 +740,53 @@ The generated `wrangler.toml` contains a complete `[env.<name>]` section for eac
 
 `[cloudflare.env.<name>.env]` is rejected: overlays do not nest.
 
+## Deploy-time interpolation
+
+String values may contain `${NAME}` placeholders. `skyzen deploy`, `skyzen dev`, `skyzen provision`
+and the rest of the CLI expand them from the **process environment of the machine running the
+command**, then from `.env` / `.env.local`. Process environment wins, same as native wiring.
+
+This is not the runtime environment of the deployed Worker or Lambda. `url_env = "CACHE_URL"` names
+a variable the application reads after it starts. `${CACHE_NAMESPACE_ID}` is replaced **before**
+the CLI generates `wrangler.toml` or invokes `cargo lambda`.
+
+```toml
+[cloudflare]
+name = "api"
+compatibility_date = "2025-02-01"
+account_id = "${CLOUDFLARE_ACCOUNT_ID}"
+
+[[cloudflare.kv_namespaces]]
+binding = "CACHE"
+id = "${CACHE_NAMESPACE_ID}"
+
+[cloudflare.vars]
+API_URL = "${API_URL}"
+```
+
+Put the values in `.env` (gitignored) or export them in the shell that runs the CLI. Skyzen does
+not require a per-key mapping in GitHub Actions: write `.env` onto the runner, or export the
+variables however the job already does. `CLOUDFLARE_API_TOKEN` is wrangler's own credential and
+stays out of the file.
+
+A documented credential form (GitHub PAT, PEM private key, URL with a password, …) stored as a
+literal fails the CLI load. A `vars` / `[aws.env]` key whose *name* looks like a secret but whose
+value is not a known form is a warning. `${NAME}` is neither. `#[skyzen::main]` does not scan, so
+`cargo build` is not a secret gate.
+
+Rules:
+
+- `${NAME}` in string **values** only. Keys are not expanded.
+- `NAME` is `[A-Za-z_][A-Za-z0-9_]*`. Hyphens, defaults (`${NAME:-x}`), and unclosed `${` fail the parse.
+- A missing name fails the parse, naming the TOML path and the variable.
+- `$$` writes a literal `$`. `$${NAME}` is the text `${NAME}`, not a lookup.
+- Expansion runs on the parsed document, so a secret containing quotes or newlines cannot break TOML.
+- Integers and booleans are not strings: `memory_mb = "${MEM}"` is a type error, not an interpolation.
+- `#[skyzen::main]` does **not** expand placeholders. A missing GitHub secret must not fail `cargo build`. Do not wrap `url_env` / `binding` / service names in `${}` — those fields are consumed at compile time as literal names.
+
+Interpolating a secret into `[cloudflare.vars]` or `[aws.env]` still stores it as a plaintext
+platform variable. Worker secrets stay on `skyzen secret set`.
+
 ## Escape Hatch
 
 `[cloudflare.raw]` is merged verbatim into the generated `wrangler.toml`, using the same rules as an
