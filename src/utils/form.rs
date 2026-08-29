@@ -31,7 +31,7 @@ http_error!(
     pub FormEncodeError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to encode form data"
 );
 
-impl<T: Send + Sync + Serialize + 'static> Responder for Form<T> {
+impl<T: Send + Sync + Serialize + crate::ToSchema + 'static> Responder for Form<T> {
     type Error = FormEncodeError;
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         let encoded = to_string(&self.0).map_err(|_| FormEncodeError::new())?;
@@ -47,7 +47,7 @@ impl<T: Send + Sync + Serialize + 'static> Responder for Form<T> {
         Some(vec![crate::openapi::ResponseSchema {
             status: None,
             description: None,
-            schema: crate::openapi::maybe_schema_of::<T>(),
+            schema: crate::openapi::schema_of::<T>(),
             content_type: Some("application/x-www-form-urlencoded"),
         }])
     }
@@ -56,7 +56,7 @@ impl<T: Send + Sync + Serialize + 'static> Responder for Form<T> {
     fn register_openapi_schemas(
         defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
-        crate::openapi::maybe_register_schema_for::<T>(defs);
+        crate::openapi::register_schema_for::<T>(defs);
     }
 }
 
@@ -83,7 +83,7 @@ pub enum FormContentTypeError {
     InvalidPayload(String),
 }
 
-impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
+impl<T: Send + Sync + DeserializeOwned + crate::ToSchema + 'static> Extractor for Form<T> {
     type Error = FormRejection;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         // A GET request carries the form in the query string, so it needs no content type — and
@@ -114,7 +114,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
         Some(crate::openapi::ExtractorSchema {
             location: crate::openapi::ParameterLocation::Body,
             content_type: Some("application/x-www-form-urlencoded"),
-            schema: crate::openapi::maybe_schema_of::<T>(),
+            schema: crate::openapi::schema_of::<T>(),
         })
     }
 
@@ -122,7 +122,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Form<T> {
     fn register_openapi_schemas(
         defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
-        crate::openapi::maybe_register_schema_for::<T>(defs);
+        crate::openapi::register_schema_for::<T>(defs);
     }
 }
 
@@ -154,13 +154,13 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use skyzen_core::{Extractor, RequestBodyLimit};
 
-    #[derive(Debug, Deserialize, PartialEq)]
+    #[derive(Debug, Deserialize, PartialEq, crate::ToSchema)]
     struct Payload {
         name: String,
         age: u8,
     }
 
-    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    #[derive(Debug, Deserialize, Serialize, PartialEq, crate::ToSchema)]
     struct Tagged {
         tags: Vec<String>,
     }

@@ -38,7 +38,7 @@ http_error!(
     /// An error occurred when serializing the JSON payload.
     pub PrettyJsonError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize JSON payload");
 
-impl<T: Send + Sync + Serialize + 'static> Responder for PrettyJson<T> {
+impl<T: Send + Sync + Serialize + crate::ToSchema + 'static> Responder for PrettyJson<T> {
     type Error = PrettyJsonError;
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         let payload = to_vec_pretty(&self.0).map_err(|error| {
@@ -57,7 +57,7 @@ impl<T: Send + Sync + Serialize + 'static> Responder for PrettyJson<T> {
         Some(vec![crate::openapi::ResponseSchema {
             status: None,
             description: None,
-            schema: crate::openapi::maybe_schema_of::<T>(),
+            schema: crate::openapi::schema_of::<T>(),
             content_type: Some("application/json"),
         }])
     }
@@ -66,7 +66,7 @@ impl<T: Send + Sync + Serialize + 'static> Responder for PrettyJson<T> {
     fn register_openapi_schemas(
         defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
-        crate::openapi::maybe_register_schema_for::<T>(defs);
+        crate::openapi::register_schema_for::<T>(defs);
     }
 }
 
@@ -87,7 +87,9 @@ mod tests {
         age: u8,
     }
 
-    #[derive(Debug)]
+    /// A payload whose `Serialize` always fails, so the responder's error path is reachable.
+    /// Its schema is irrelevant and empty, but the bound is real, so it declares one.
+    #[derive(Debug, crate::ToSchema)]
     struct AlwaysFails;
 
     impl Serialize for AlwaysFails {
