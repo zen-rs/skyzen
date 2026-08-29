@@ -85,7 +85,7 @@ template_set!(
     [
         (MinimalCargoToml, "minimal/Cargo.toml.tmpl", "Cargo.toml"),
         (MinimalSkyzenToml, "minimal/Skyzen.toml.tmpl", "Skyzen.toml"),
-        (MinimalGitignore, "minimal/gitignore.tmpl", ".gitignore"),
+        (MinimalGitignore, "gitignore.tmpl", ".gitignore"),
         (MinimalApp, "minimal/src/app.rs.tmpl", "src/app.rs"),
         (MinimalLib, "minimal/src/lib.rs.tmpl", "src/lib.rs"),
         (MinimalMain, "minimal/src/main.rs.tmpl", "src/main.rs"),
@@ -97,7 +97,7 @@ template_set!(
     [
         (ApiCargoToml, "api/Cargo.toml.tmpl", "Cargo.toml"),
         (ApiSkyzenToml, "api/Skyzen.toml.tmpl", "Skyzen.toml"),
-        (ApiGitignore, "api/gitignore.tmpl", ".gitignore"),
+        (ApiGitignore, "gitignore.tmpl", ".gitignore"),
         (ApiApp, "api/src/app.rs.tmpl", "src/app.rs"),
         (ApiLib, "api/src/lib.rs.tmpl", "src/lib.rs"),
         (ApiMain, "api/src/main.rs.tmpl", "src/main.rs"),
@@ -122,11 +122,7 @@ template_set!(
             "serverless-events/Skyzen.toml.tmpl",
             "Skyzen.toml"
         ),
-        (
-            EventsGitignore,
-            "serverless-events/gitignore.tmpl",
-            ".gitignore"
-        ),
+        (EventsGitignore, "gitignore.tmpl", ".gitignore"),
         (EventsApp, "serverless-events/src/app.rs.tmpl", "src/app.rs"),
         (EventsLib, "serverless-events/src/lib.rs.tmpl", "src/lib.rs"),
         (
@@ -150,11 +146,7 @@ template_set!(
             "durable-realtime/Skyzen.toml.tmpl",
             "Skyzen.toml"
         ),
-        (
-            DurableGitignore,
-            "durable-realtime/gitignore.tmpl",
-            ".gitignore"
-        ),
+        (DurableGitignore, "gitignore.tmpl", ".gitignore"),
         (DurableApp, "durable-realtime/src/app.rs.tmpl", "src/app.rs"),
         (
             DurableObject,

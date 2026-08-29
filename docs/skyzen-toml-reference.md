@@ -744,8 +744,7 @@ The generated `wrangler.toml` contains a complete `[env.<name>]` section for eac
 
 String values may contain `${NAME}` placeholders. `skyzen deploy`, `skyzen dev`, `skyzen provision`
 and the rest of the CLI expand them from the **process environment of the machine running the
-command** — GitHub Actions secrets mapped into the job, or the project's `.env` / `.env.local`.
-Process environment wins over the dotenv files, same as native wiring.
+command**, then from `.env` / `.env.local`. Process environment wins, same as native wiring.
 
 This is not the runtime environment of the deployed Worker or Lambda. `url_env = "CACHE_URL"` names
 a variable the application reads after it starts. `${CACHE_NAMESPACE_ID}` is replaced **before**
@@ -765,18 +764,15 @@ id = "${CACHE_NAMESPACE_ID}"
 API_URL = "${API_URL}"
 ```
 
-```yaml
-# .github/workflows/deploy.yml
-- run: skyzen deploy --provider cloudflare
-  env:
-    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-    CACHE_NAMESPACE_ID: ${{ secrets.CACHE_NAMESPACE_ID }}
-    API_URL: ${{ vars.API_URL }}
-```
+Put the values in `.env` (gitignored) or export them in the shell that runs the CLI. Skyzen does
+not require a per-key mapping in GitHub Actions: write `.env` onto the runner, or export the
+variables however the job already does. `CLOUDFLARE_API_TOKEN` is wrangler's own credential and
+stays out of the file.
 
-`CLOUDFLARE_API_TOKEN` is already read by wrangler from the process environment and does not belong
-in the file.
+A documented credential form (GitHub PAT, PEM private key, URL with a password, …) stored as a
+literal fails the CLI load. A `vars` / `[aws.env]` key whose *name* looks like a secret but whose
+value is not a known form is a warning. `${NAME}` is neither. `#[skyzen::main]` does not scan, so
+`cargo build` is not a secret gate.
 
 Rules:
 
