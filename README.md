@@ -48,6 +48,7 @@ async fn order(Path(id): Path<u64>, kv: Kv, db: Db) -> Result<Json<Order>> {
 - [Static Files & SPA Support](#static-files--spa-support)
 - [OpenAPI & Documentation](#openapi--documentation)
 - [Skyzen CLI](#skyzen-cli)
+- [GitHub Secrets and `.env`](#github-secrets-and-env)
 - [Crates Overview](#crates-overview)
 - [Guides & Examples](#guides--examples)
 - [License](#license)
@@ -871,6 +872,80 @@ skyzen completions fish
 
 `--env <name>` selects a `[cloudflare.env.<name>]` overlay, `--dry-run` prints the plan without
 running it, and `--manifest` points at a `Skyzen.toml` elsewhere.
+
+---
+
+## GitHub Secrets and `.env`
+
+Values that must not live in git go in `.env` locally and in GitHub Actions secrets in CI. The CLI
+reads them when it loads `Skyzen.toml`; `#[skyzen::main]` does not, so `cargo build` never depends
+on a secret the compiler does not have.
+
+There are three different environments. They are not interchangeable:
+
+| Where | What it is |
+|---|---|
+| `url_env = "CACHE_URL"` | The **name** of a variable the native process reads after it starts |
+| `id = "${CACHE_NAMESPACE_ID}"` | A **deploy-time** placeholder. The CLI expands it before generating `wrangler.toml` |
+| `skyzen secret set API_KEY` | A **Worker secret**. `[cloudflare.vars]` is plaintext and committed; do not put credentials there |
+
+### Local
+
+`skyzen new` writes `.env.example` from the manifest and gitignores `.env`, `.env.local`, and
+wrangler's `.dev.vars`. Copy the example, fill it in, and run:
+
+```sh
+cp .env.example .env
+skyzen dev
+```
+
+`.env.local` overrides `.env`. A variable already in the process environment wins over both.
+`skyzen dev` refuses to start when a name the native wiring declared is set nowhere.
+
+### `Skyzen.toml`
+
+String values may contain `${NAME}` placeholders. The CLI expands them from the process
+environment, then from `.env` / `.env.local`, when it reads the file — including `skyzen deploy`,
+`skyzen provision`, and `skyzen doctor`. A missing name fails the load, naming the TOML path.
+
+```toml
+[cloudflare]
+account_id = "${CLOUDFLARE_ACCOUNT_ID}"
+
+[[cloudflare.kv_namespaces]]
+binding = "CACHE"
+id = "${CACHE_NAMESPACE_ID}"
+```
+
+`CLOUDFLARE_API_TOKEN` stays out of the file: wrangler reads it from the environment (and from
+`.env`) on its own. Do not wrap `url_env`, `binding`, or service names in `${}` — those are
+consumed at compile time as literal names.
+
+### GitHub Actions
+
+Skyzen does not need a workflow that maps every secret into `env:`. Keep the same file you use
+locally in **one** repository secret, write it onto the runner, then deploy:
+
+```yaml
+- run: printf '%s\n' "$DEPLOY_ENV" > .env
+  env:
+    DEPLOY_ENV: ${{ secrets.DEPLOY_ENV }}
+- run: skyzen deploy --provider cloudflare
+```
+
+`DEPLOY_ENV` is the body of `.env`, not a single key. The CLI interpolates from that file; wrangler
+picks up `CLOUDFLARE_API_TOKEN` from it the same way. If the job already exports variables, those
+win without a `.env`.
+
+### What the CLI refuses
+
+A documented credential form stored as a literal in `Skyzen.toml` (a GitHub PAT, a PEM private key,
+a URL with a password, an `AKIA…` access key id) fails the load. So does a git checkout that is
+**tracking** `.env`, `.env.local`, or `.dev.vars`. A `vars` / `[aws.env]` key whose *name* looks
+like a secret but whose value is not a known form is a warning, not a hard failure. Errors name
+the path and the kind; they never print the value.
+
+The syntax and the merge rules are in the [Skyzen.toml reference](docs/skyzen-toml-reference.md#deploy-time-interpolation).
 
 ---
 
