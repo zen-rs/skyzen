@@ -22,12 +22,15 @@ use serde::{Deserialize, Serialize};
 use skyzen::{
     routing::{CreateRouteNode, Route, Router},
     utils::Json,
-    Result,
+    Result, ToSchema,
 };
 use skyzen_services::{QueueBatch, QueueBatchDisposition, QueueMessageDisposition, QueueRetry};
 
 /// One unit of work, as it travels through the queue.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// `ToSchema` rides along with the serde derives because the job arrives as a `Json<Job>` body:
+/// the payload of a body extractor is what the generated OpenAPI document describes.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 struct Job {
     /// Caller-assigned identity, echoed in the logs.
     id: String,

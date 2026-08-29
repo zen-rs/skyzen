@@ -49,7 +49,7 @@ mod tests {
     };
     use serde::Serialize;
 
-    #[derive(Debug, Serialize)]
+    #[derive(Debug, Serialize, crate::ToSchema)]
     struct Article {
         id: u32,
     }
