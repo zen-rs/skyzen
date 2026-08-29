@@ -77,7 +77,11 @@ futures-core = { version = "0.3.32" }
 futures-channel = { version = "0.3.32", optional = true }
 multer = { version = "3.1", optional = true }
 http = "1.4"
-utoipa = { version = "5.4", default-features = false }
+# `macros` is named here rather than inherited from `skyzen-core`: `skyzen::ToSchema` re-exports
+# utoipa's *derive*, and a payload carried by `Json`/`Form`/`Query` is now required to implement
+# the trait, so the derive is part of this crate's own public surface and cannot depend on another
+# crate happening to switch it on.
+utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 utoipa-redoc = "6.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
