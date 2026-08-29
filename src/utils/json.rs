@@ -26,7 +26,7 @@ http_error!(
     /// An error occurred when encoding the JSON response.
     pub JsonEncodingError, StatusCode::INTERNAL_SERVER_ERROR, "Failed to encode JSON response");
 
-impl<T: Send + Sync + Serialize + 'static> Responder for Json<T> {
+impl<T: Send + Sync + Serialize + crate::ToSchema + 'static> Responder for Json<T> {
     type Error = JsonEncodingError;
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         response
@@ -42,7 +42,7 @@ impl<T: Send + Sync + Serialize + 'static> Responder for Json<T> {
         Some(vec![crate::openapi::ResponseSchema {
             status: None,
             description: None,
-            schema: crate::openapi::maybe_schema_of::<T>(),
+            schema: crate::openapi::schema_of::<T>(),
             content_type: Some("application/json"),
         }])
     }
@@ -51,7 +51,7 @@ impl<T: Send + Sync + Serialize + 'static> Responder for Json<T> {
     fn register_openapi_schemas(
         defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
-        crate::openapi::maybe_register_schema_for::<T>(defs);
+        crate::openapi::register_schema_for::<T>(defs);
     }
 }
 
@@ -75,7 +75,7 @@ pub enum JsonContentTypeError {
     InvalidPayload(String),
 }
 
-impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
+impl<T: Send + Sync + DeserializeOwned + crate::ToSchema + 'static> Extractor for Json<T> {
     type Error = JsonRejection;
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         if let Some(content_type) = request.headers().get(CONTENT_TYPE) {
@@ -99,7 +99,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
         Some(crate::openapi::ExtractorSchema {
             location: crate::openapi::ParameterLocation::Body,
             content_type: Some("application/json"),
-            schema: crate::openapi::maybe_schema_of::<T>(),
+            schema: crate::openapi::schema_of::<T>(),
         })
     }
 
@@ -107,7 +107,7 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Json<T> {
     fn register_openapi_schemas(
         defs: &mut std::collections::BTreeMap<String, crate::openapi::SchemaRef>,
     ) {
-        crate::openapi::maybe_register_schema_for::<T>(defs);
+        crate::openapi::register_schema_for::<T>(defs);
     }
 }
 
@@ -140,7 +140,7 @@ mod test {
     use serde::Deserialize;
     use skyzen_core::Extractor;
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, crate::ToSchema)]
     struct Payload {
         ok: bool,
     }
