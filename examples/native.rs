@@ -6,14 +6,15 @@ use skyzen::{
     extract::{Path, Query},
     routing::{CreateRouteNode, Route, Router},
     utils::Json,
+    ToSchema,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct Greeting {
     message: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct GreetingQuery {
     name: Option<String>,
     excited: Option<bool>,

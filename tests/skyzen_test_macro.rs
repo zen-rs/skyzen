@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use skyzen::{
     routing::{CreateRouteNode, Route, Router},
     utils::Form,
-    Result,
+    Result, ToSchema,
 };
 use skyzen_services::{
     durable::{Alarm, DurableDb, DurableKv},
@@ -72,7 +72,7 @@ async fn injects_the_durable_services_into_the_test_context(
     assert_eq!(durable_db.database_size().await.unwrap(), 0);
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 struct Login {
     user: String,
     remember: bool,
