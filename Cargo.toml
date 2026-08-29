@@ -119,6 +119,12 @@ skyzen-services.workspace = true
 # a sqlx runtime, which `skyzen-test` leaves to the consumer to choose. Picking one here is what
 # lets `cargo test -p skyzen` run the migration tests without a feature flag on the command line.
 skyzen-test = { workspace = true, features = ["runtime-tokio-rustls"] }
+# `tests/sql_rows.rs` binds and reads the parameter types `DbValue` carries, exactly as an
+# application does: the types are named from their own crates, at the versions `skyzen-services`
+# depends on, so cargo unifies them into the same ones the backends encode.
+bigdecimal = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = "1"
 tempfile = "3.25"
 futures-lite = "2.6"
 serial_test = "3.2"
@@ -129,7 +135,7 @@ wasm-bindgen-futures = "0.4.60"
 js-sys = "0.3.87"
 wasm-streams = "0.5"
 serde-wasm-bindgen = "0.6"
-web-sys = { version = "0.3.87", features = ["Request", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
+web-sys = { version = "0.3.87", features = ["Request", "RequestInit", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
 
 # `serde_html_form` rather than `serde_urlencoded`: it deserializes repeated keys
 # (`tags=a&tags=b`) into `Vec<_>`, which the query and form extractors both need.

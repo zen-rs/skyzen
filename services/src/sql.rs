@@ -36,24 +36,26 @@
 //! # Rows travel as JSON, and what that costs
 //!
 //! [`DbExecResult::rows`] is a `Vec<serde_json::Value>`: every backend converts its driver's
-//! native row into JSON, and `fetch_all`/`fetch_one` then deserialize that into the caller's
-//! struct. One portable row representation is what lets the same handler run against sqlx and
-//! against Cloudflare D1, but JSON cannot represent everything SQL can, and the conversions have
-//! consequences worth knowing before they surprise you at runtime:
+//! native row into JSON, and `fetch_all`/`fetch_one` then decode that into the caller's type. One
+//! portable row representation is what lets the same handler run against sqlx and against
+//! Cloudflare D1, but JSON cannot represent everything SQL can, so a column does not always arrive
+//! in the JSON shape its SQL type suggests:
 //!
 //! - **`NUMERIC` / `DECIMAL` arrive as strings.** They are exact, and JSON numbers are not, so the
-//!   converters render them with `to_string()`. A field typed `f64` will therefore fail to
-//!   deserialize; type it as `String`, or as `bigdecimal::BigDecimal`, whose `Deserialize` accepts
-//!   the string form.
-//! - **Blobs arrive as arrays of integers**, because JSON has no byte string. A `Vec<u8>` field
-//!   deserializes fine; a `#[serde(with = "serde_bytes")]` field does not.
+//!   converters render them with `to_string()`.
+//! - **Blobs arrive as arrays of integers**, because JSON has no byte string.
+//! - **Timestamps, dates, times and UUIDs arrive as strings** — RFC 3339 for `TIMESTAMPTZ`, the
+//!   driver's textual form otherwise — except a `UUID` bound on a backend without a native UUID
+//!   type, which is sixteen bytes and comes back as an array.
+//! - **`NaN` and infinity have no JSON representation** and render as `null`.
 //! - **Integers above 2^53** are exact in `serde_json`'s own number type, but lose precision the
 //!   moment the value passes through a `f64` — which is what happens if a row is re-serialized by
 //!   a JSON implementation without 64-bit integer support.
-//! - **`NaN` and infinity have no JSON representation** and render as `null`.
-//! - **Timestamps, dates, times and UUIDs arrive as strings** — RFC 3339 for `TIMESTAMPTZ`, the
-//!   driver's textual form otherwise. `chrono` and `uuid` both deserialize from exactly those, so
-//!   a typed field round-trips; a hand-rolled parser may not.
+//!
+//! Absorbing those differences is [`FromColumn`]'s job, and it is why a row is decoded by the
+//! field's declared type rather than by `serde`: a field typed `BigDecimal`, `Uuid` or
+//! `DateTime<Utc>` reads correctly on every backend, whichever shape that backend produced. See
+//! [`FromRow`] and `#[derive(FromRow)]`.
 //!
 //! The bind direction has none of these limits: [`DbValue`] carries `Timestamp`, `Uuid`, `Decimal`
 //! and `Json` variants that each backend encodes natively (with the one documented exception on
@@ -63,7 +65,6 @@ use std::{borrow::Cow, future::Future};
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use serde::de::DeserializeOwned;
 use sqlparser::{
     dialect::{Dialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     keywords::Keyword,
@@ -73,11 +74,18 @@ use uuid::Uuid;
 
 use crate::BoxFuture;
 
+mod row;
+
+use row::Scalar;
+pub use row::{ColumnEnum, ColumnError, FromColumn, FromRow, JsonRow, Row, RowError};
+
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "postgres", feature = "mysql", feature = "sqlite")
 ))]
-use sqlx::Row;
+// Imported anonymously: the `Row` name in this module is Skyzen's own portable row, and only
+// `try_get` is wanted from sqlx's trait.
+use sqlx::Row as _;
 
 /// Errors from database operations.
 #[derive(Debug, thiserror::Error)]
@@ -157,6 +165,14 @@ pub enum DbError {
         embedded: String,
     },
 
+    /// A result row did not have the shape the type it was fetched into declared.
+    ///
+    /// A column the type needs is absent, or holds something the field's type cannot decode.
+    /// Both mean the query and the row type disagree, which is a fault in the code rather than in
+    /// the request — see [`RowError`].
+    #[error("database row could not be decoded: {0}")]
+    Decode(#[from] RowError),
+
     /// The backend refused the caller's credentials, or the caller lacks the privilege.
     ///
     /// This is a *deployment* fault, not a request fault — the connection string, the database
@@ -179,6 +195,7 @@ service_http_error!(DbError {
     Self::Conflict => CONFLICT,
     Self::Throttled { .. } => TOO_MANY_REQUESTS,
     Self::MigrationChanged { .. } => INTERNAL_SERVER_ERROR,
+    Self::Decode(_) => INTERNAL_SERVER_ERROR,
     Self::Unauthorized => INTERNAL_SERVER_ERROR,
 });
 
@@ -317,6 +334,32 @@ impl From<u16> for DbValue {
 impl From<u32> for DbValue {
     fn from(value: u32) -> Self {
         Self::Integer(i64::from(value))
+    }
+}
+
+/// SQL integers are signed and 64 bits wide, so a `u64` above `i64::MAX` has no integer column to
+/// go into. Values up to `i64::MAX` — every `u64` a `BIGINT` can hold, which is every one an
+/// application counting, numbering or pricing things in microdollars will produce — bind as an
+/// ordinary [`Integer`](DbValue::Integer).
+///
+/// Above that, the value binds as an exact [`Decimal`](DbValue::Decimal) rather than being clamped
+/// or wrapped, because either of those stores a *different number* than the caller asked to store
+/// and nothing downstream can tell. What the database then does with it is the database's own
+/// rule, and all three outcomes are loud:
+///
+/// - a `NUMERIC` / `DECIMAL(20, 0)` column holds it exactly, which is where a value this wide
+///   belongs;
+/// - `PostgreSQL` and `MySQL` refuse it for a `BIGINT` column, as out of range;
+/// - `SQLite` has no exact form for it at all: a column with `INTEGER` or `NUMERIC` affinity
+///   converts the bound text to a float, and reading that column back then fails rather than
+///   handing back a rounded number. A `TEXT` column stores it exactly, and
+///   [`FromColumn`] reads a `u64` back out of one.
+///
+/// There is deliberately no `From<usize>`: its width is the target's, so the same code would bind
+/// a different type on wasm32 than on a 64-bit server.
+impl From<u64> for DbValue {
+    fn from(value: u64) -> Self {
+        i64::try_from(value).map_or_else(|_| Self::Decimal(BigDecimal::from(value)), Self::Integer)
     }
 }
 
@@ -788,9 +831,9 @@ impl DbTransaction {
 pub trait QuerySource: Send {
     /// The error this source reports.
     ///
-    /// The `From` bounds are what let the shared builder raise a placeholder-rewriting failure or
+    /// The `From` bound is what lets the shared builder raise a placeholder-rewriting failure or
     /// a row-decoding failure without knowing which of the three errors it is producing.
-    type Error: From<DbError> + From<serde_json::Error> + Send;
+    type Error: From<DbError> + Send;
 
     /// Which SQL dialect statements run through this source are written in.
     fn dialect(&self) -> DbDialect;
@@ -902,26 +945,26 @@ impl<S: QuerySource> SqlQuery<'_, S> {
         self.source.execute(&sql, &self.params).await
     }
 
-    /// Execute a query and deserialize all rows into `T`.
+    /// Execute a query and decode every row into `T`.
+    ///
+    /// `T` is usually a struct with `#[derive(FromRow)]`, which reads one column per field with
+    /// [`FromColumn`]. [`Row`] fetches the columns without decoding them, and [`JsonRow<T>`] hands
+    /// the whole row to `serde` for a type whose `Deserialize` implementation already exists.
     ///
     /// # Errors
     ///
     /// Returns an error if placeholder rewriting, backend execution, or row
-    /// deserialization fails.
+    /// decoding fails.
     pub async fn fetch_all<T>(mut self) -> Result<Vec<T>, S::Error>
     where
-        T: DeserializeOwned,
+        T: FromRow,
     {
         let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), self.source.dialect())?;
         let result = self.source.query(&sql, &self.params).await?;
-        result
-            .rows
-            .into_iter()
-            .map(|row| serde_json::from_value(row).map_err(Into::into))
-            .collect()
+        result.rows.into_iter().map(decode_row).collect()
     }
 
-    /// Execute a query and deserialize the first row into `T`, if present.
+    /// Execute a query and decode the first row into `T`, if present.
     ///
     /// A single-row bound — `LIMIT 1`, or `TOP (1)` on [`DbDialect::Mssql`] — is added when the
     /// statement is a `SELECT` that does not already bound its own result set, so the backend stops
@@ -931,36 +974,96 @@ impl<S: QuerySource> SqlQuery<'_, S> {
     /// # Errors
     ///
     /// Returns an error if placeholder rewriting, backend execution, or row
-    /// deserialization fails.
+    /// decoding fails.
     pub async fn fetch_optional<T>(mut self) -> Result<Option<T>, S::Error>
     where
-        T: DeserializeOwned,
+        T: FromRow,
     {
         let dialect = self.source.dialect();
         let sql = prepare_query_sql(self.sql.as_ref(), self.params.len(), dialect)?;
         let sql = restrict_to_single_row(&sql, dialect)?;
         let result = self.source.query(&sql, &self.params).await?;
-        result
-            .rows
-            .into_iter()
-            .next()
-            .map(|row| serde_json::from_value(row).map_err(Into::into))
-            .transpose()
+        result.rows.into_iter().next().map(decode_row).transpose()
     }
 
-    /// Execute a query and deserialize exactly one row into `T`.
+    /// Execute a query and decode exactly one row into `T`.
     ///
     /// # Errors
     ///
-    /// Returns an error if execution fails or the query returns no rows.
+    /// Returns an error if execution fails, the query returns no rows, or the row does not decode.
     pub async fn fetch_one<T>(self) -> Result<T, S::Error>
     where
-        T: DeserializeOwned,
+        T: FromRow,
     {
         self.fetch_optional()
             .await?
             .ok_or_else(|| DbError::RowNotFound.into())
     }
+
+    /// Execute a single-column query and decode that column of the first row.
+    ///
+    /// `SELECT COUNT(*) FROM orders` is a number, not a struct, and this is how it is read as one.
+    /// The statement must select exactly one column; a `NULL` in it is read by asking for
+    /// `Option<T>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails, the query returns no rows, the statement selects
+    /// anything other than one column, or the column does not decode into `T`.
+    pub async fn fetch_scalar<T>(self) -> Result<T, S::Error>
+    where
+        T: FromColumn,
+    {
+        self.fetch_one::<Scalar<T>>().await.map(|scalar| scalar.0)
+    }
+
+    /// Execute a single-column query and decode that column of the first row, if there is one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails, the statement selects anything other than one column,
+    /// or the column does not decode into `T`.
+    pub async fn fetch_scalar_optional<T>(self) -> Result<Option<T>, S::Error>
+    where
+        T: FromColumn,
+    {
+        Ok(self
+            .fetch_optional::<Scalar<T>>()
+            .await?
+            .map(|scalar| scalar.0))
+    }
+
+    /// Execute a single-column query and decode that column of every row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails, the statement selects anything other than one column,
+    /// or a column does not decode into `T`.
+    pub async fn fetch_scalars<T>(self) -> Result<Vec<T>, S::Error>
+    where
+        T: FromColumn,
+    {
+        Ok(self
+            .fetch_all::<Scalar<T>>()
+            .await?
+            .into_iter()
+            .map(|scalar| scalar.0)
+            .collect())
+    }
+}
+
+/// Decode one backend row into the type the caller asked for.
+///
+/// Shared by the three fetch methods so the [`Row`] conversion and the error mapping are written
+/// once rather than three times.
+fn decode_row<T, E>(row: serde_json::Value) -> Result<T, E>
+where
+    T: FromRow,
+    E: From<DbError>,
+{
+    Row::try_from_value(row)
+        .and_then(T::from_row)
+        .map_err(|error| DbError::from(error).into())
 }
 
 pub(crate) fn prepare_query_sql(
@@ -2257,6 +2360,23 @@ mod db_value_tests {
         let missing: Option<Uuid> = None;
         assert!(matches!(DbValue::from(missing), DbValue::Null));
     }
+
+    #[test]
+    fn an_unsigned_value_binds_exactly_whether_or_not_it_fits_a_signed_column() {
+        // Everything a `BIGINT` can hold binds as the integer it is.
+        assert!(matches!(DbValue::from(0_u64), DbValue::Integer(0)));
+        assert!(matches!(
+            DbValue::from(u64::try_from(i64::MAX).expect("i64::MAX is not negative")),
+            DbValue::Integer(i64::MAX)
+        ));
+
+        // Above that there is no integer column to hold it, so it binds as an exact decimal
+        // rather than being clamped to a number the caller did not ask to store.
+        let DbValue::Decimal(wide) = DbValue::from(u64::MAX) else {
+            panic!("a value above i64::MAX has no integer column to bind into");
+        };
+        assert_eq!(wide, BigDecimal::from(u64::MAX));
+    }
 }
 
 #[cfg(test)]
@@ -2437,11 +2557,6 @@ mod fallback_tests {
 mod tests {
     use super::{BatchStatement, Db};
 
-    #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
-    struct CountRow {
-        count: i64,
-    }
-
     #[tokio::test]
     async fn execute_batch_commits_every_statement_and_returns_selected_rows() {
         let db = Db::connect_sqlite_memory()
@@ -2465,12 +2580,12 @@ mod tests {
         // A `SELECT` inside a batch hands its rows back, matching D1's `batch()`.
         assert_eq!(results[2].rows, vec![serde_json::json!({ "count": 2_i64 })]);
 
-        let row = db
-            .query("SELECT COUNT(*) AS count FROM entries")
-            .fetch_one::<CountRow>()
+        let count = db
+            .query("SELECT COUNT(*) FROM entries")
+            .fetch_scalar::<i64>()
             .await
             .expect("count query should succeed");
-        assert_eq!(row, CountRow { count: 2 });
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]
@@ -2490,13 +2605,13 @@ mod tests {
         .await
         .expect_err("a statement against a missing table should fail the batch");
 
-        let row = db
-            .query("SELECT COUNT(*) AS count FROM entries")
-            .fetch_one::<CountRow>()
+        let count = db
+            .query("SELECT COUNT(*) FROM entries")
+            .fetch_scalar::<i64>()
             .await
             .expect("count query should succeed");
         // The first insert is discarded with the rest: the batch is all-or-nothing.
-        assert_eq!(row, CountRow { count: 0 });
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
@@ -2539,12 +2654,12 @@ mod tests {
             .expect("insert should succeed");
         tx.commit().await.expect("commit should succeed");
 
-        let row = db
-            .query("SELECT COUNT(*) AS count FROM entries")
-            .fetch_one::<CountRow>()
+        let count = db
+            .query("SELECT COUNT(*) FROM entries")
+            .fetch_scalar::<i64>()
             .await
             .expect("count query should succeed");
-        assert_eq!(row, CountRow { count: 1 });
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
@@ -2565,12 +2680,12 @@ mod tests {
             .expect("insert should succeed");
         tx.rollback().await.expect("rollback should succeed");
 
-        let row = db
-            .query("SELECT COUNT(*) AS count FROM entries")
-            .fetch_one::<CountRow>()
+        let count = db
+            .query("SELECT COUNT(*) FROM entries")
+            .fetch_scalar::<i64>()
             .await
             .expect("count query should succeed");
-        assert_eq!(row, CountRow { count: 0 });
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
@@ -2618,11 +2733,6 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_optional_stops_at_the_first_row() {
-        #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
-        struct ValueRow {
-            value: i64,
-        }
-
         let db = Db::connect_sqlite_memory()
             .await
             .expect("in-memory sqlite should connect");
@@ -2639,20 +2749,96 @@ mod tests {
         }
 
         // The injected `LIMIT 1` means the backend returns one row, not three.
-        let first: ValueRow = db
+        let first: i64 = db
             .query("SELECT value FROM entries ORDER BY value")
+            .fetch_scalar()
+            .await
+            .expect("select should succeed");
+        assert_eq!(first, 1);
+
+        // A statement that bounds itself is left alone and still yields its own first row.
+        let bounded: Option<i64> = db
+            .query("SELECT value FROM entries ORDER BY value DESC LIMIT 2")
+            .fetch_scalar_optional()
+            .await
+            .expect("select should succeed");
+        assert_eq!(bounded, Some(3));
+    }
+
+    /// The read half of the typed bind path: what `.bind()` wrote comes back as the same Rust
+    /// type, through whatever JSON shape `SQLite` happened to render it as.
+    #[tokio::test]
+    async fn typed_values_round_trip_through_a_real_backend() {
+        use super::{FromRow, Row, RowError};
+        use bigdecimal::BigDecimal;
+        use chrono::{DateTime, Utc};
+        use core::str::FromStr as _;
+        use uuid::Uuid;
+
+        #[derive(Debug, PartialEq)]
+        struct Order {
+            id: Uuid,
+            placed_at: DateTime<Utc>,
+            total: BigDecimal,
+            quantity: u64,
+            shipped: bool,
+        }
+
+        impl FromRow for Order {
+            fn from_row(row: Row) -> Result<Self, RowError> {
+                Ok(Self {
+                    id: row.get("id")?,
+                    placed_at: row.get("placed_at")?,
+                    total: row.get("total")?,
+                    quantity: row.get("quantity")?,
+                    shipped: row.get("shipped")?,
+                })
+            }
+        }
+
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory sqlite should connect");
+        db.query(
+            "CREATE TABLE orders (
+                id BLOB NOT NULL,
+                placed_at TEXT NOT NULL,
+                total TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                shipped INTEGER NOT NULL
+            )",
+        )
+        .execute()
+        .await
+        .expect("schema should be created");
+
+        let expected = Order {
+            id: Uuid::from_str("550e8400-e29b-41d4-a716-446655440000").expect("valid UUID"),
+            placed_at: DateTime::<Utc>::from_str("2024-05-06T07:08:09Z").expect("valid RFC 3339"),
+            total: BigDecimal::from_str("19.99").expect("valid decimal"),
+            quantity: 3,
+            shipped: true,
+        };
+        db.query(
+            "INSERT INTO orders (id, placed_at, total, quantity, shipped) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(expected.id)
+        .bind(expected.placed_at)
+        .bind(expected.total.clone())
+        .bind(expected.quantity)
+        .bind(expected.shipped)
+        .execute()
+        .await
+        .expect("insert should succeed");
+
+        // The UUID went in as sixteen bytes and the decimal as text, because that is all SQLite
+        // has; both come back as the type the field declared.
+        let order: Order = db
+            .query("SELECT * FROM orders")
             .fetch_one()
             .await
             .expect("select should succeed");
-        assert_eq!(first, ValueRow { value: 1 });
-
-        // A statement that bounds itself is left alone and still yields its own first row.
-        let bounded: Option<ValueRow> = db
-            .query("SELECT value FROM entries ORDER BY value DESC LIMIT 2")
-            .fetch_optional()
-            .await
-            .expect("select should succeed");
-        assert_eq!(bounded, Some(ValueRow { value: 3 }));
+        assert_eq!(order, expected);
     }
 
     #[tokio::test]

@@ -36,7 +36,9 @@
 //! reports [`DbError::Conflict`] — not the raw constraint violation, which would read as a bug in
 //! the migration.
 
-use crate::sql::{split_statements, BatchStatement, Db, DbDialect, DbError};
+use crate::sql::{
+    split_statements, BatchStatement, Db, DbDialect, DbError, FromRow, Row, RowError,
+};
 use std::borrow::Cow;
 
 /// The bookkeeping read, ordered by version so the runner never has to sort it.
@@ -233,7 +235,7 @@ impl MigrationReport {
 }
 
 /// One row of `_skyzen_migrations`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedMigration {
     /// The version that was applied.
     pub version: u64,
@@ -243,6 +245,19 @@ pub struct AppliedMigration {
     pub checksum: String,
     /// When it ran, rendered by the database itself.
     pub applied_at: String,
+}
+
+impl FromRow for AppliedMigration {
+    /// Written out rather than derived: `#[derive(FromRow)]` lives in `skyzen-macros` and expands
+    /// to paths through the root `skyzen` crate, which this one sits below.
+    fn from_row(row: Row) -> Result<Self, RowError> {
+        Ok(Self {
+            version: row.get("version")?,
+            name: row.get("name")?,
+            checksum: row.get("checksum")?,
+            applied_at: row.get("applied_at")?,
+        })
+    }
 }
 
 /// What [`Db::migration_status`] found.
@@ -626,12 +641,6 @@ mod runner_tests {
             .expect("in-memory sqlite should connect")
     }
 
-    /// The shape `SELECT COUNT(*)` comes back as, declared once rather than inside a test body.
-    #[derive(serde::Deserialize)]
-    struct Count {
-        count: i64,
-    }
-
     async fn applied(db: &Db) -> Vec<AppliedMigration> {
         db.applied_migrations()
             .await
@@ -658,12 +667,12 @@ mod runner_tests {
         // Written by the database, so the runner never had to read a clock.
         assert!(!rows[0].applied_at.is_empty(), "{:?}", rows[0]);
 
-        let count: Count = db
-            .query("SELECT COUNT(*) AS count FROM users")
-            .fetch_one()
+        let count: i64 = db
+            .query("SELECT COUNT(*) FROM users")
+            .fetch_scalar()
             .await
             .expect("the seeded rows should be there");
-        assert_eq!(count.count, 2);
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]

@@ -474,3 +474,257 @@ async fn websocket_session_success_leaves_the_connection_alone() {
     handle.abort();
     let _ = handle.await;
 }
+
+// ── Durable Object hibernation sockets, natively ──
+//
+// The native simulator has to deliver websocket events to `DurableObject::websocket` and keep a
+// registry of accepted sockets, or a room/relay object has no reachable code path off wasm32 and
+// cannot be run under `skyzen dev` at all.
+
+/// Steal the incoming request so it can be re-dispatched into a Durable Object.
+///
+/// A stub takes a whole `Request`, and a handler only ever sees extractors — so forwarding one
+/// means an extractor that hands the request over intact. The extensions move rather than clone:
+/// they carry hyper's upgrade handle, which is what makes the handshake inside the object possible.
+struct ForwardedRequest(skyzen::Request);
+
+impl skyzen_core::Extractor for ForwardedRequest {
+    type Error = std::convert::Infallible;
+
+    fn extract(
+        request: &mut skyzen::Request,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
+        let mut forwarded = skyzen::Request::new(skyzen::Body::empty());
+        *forwarded.method_mut() = request.method().clone();
+        *forwarded.uri_mut() = request.uri().clone();
+        *forwarded.headers_mut() = request.headers().clone();
+        *forwarded.extensions_mut() = std::mem::take(request.extensions_mut());
+        std::future::ready(Ok(Self(forwarded)))
+    }
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[skyzen::durable_object]
+struct RelayObject;
+
+impl skyzen::durable::DurableObject for RelayObject {
+    fn fetch(&mut self) -> skyzen::routing::Router {
+        Route::new((
+            "/relay".at(join_relay),
+            "/authenticated".at(join_authenticated),
+        ))
+        .build()
+    }
+
+    // Relaying a frame is a synchronous fan-out over the connection registry, so the future is
+    // ready on creation rather than an `async` block with nothing to await.
+    fn websocket(
+        &mut self,
+        connection: &skyzen::durable::WebSocketConnection,
+        event: skyzen::durable::WebSocketEvent,
+        context: &skyzen::durable::DurableContext,
+    ) -> impl std::future::Future<Output = Result<(), skyzen::durable::DurableObjectError>> + Send
+    {
+        std::future::ready(relay(connection, event, context))
+    }
+}
+
+fn relay(
+    connection: &skyzen::durable::WebSocketConnection,
+    event: skyzen::durable::WebSocketEvent,
+    context: &skyzen::durable::DurableContext,
+) -> Result<(), skyzen::durable::DurableObjectError> {
+    let skyzen::durable::WebSocketEvent::Message(skyzen::websocket::WebSocketMessage::Text(text)) =
+        event
+    else {
+        return Ok(());
+    };
+
+    // The sender's own tags and the tagged fan-out both come out of the connection registry, so
+    // one reply proves the socket was registered, tagged, and reachable by tag.
+    let tags = connection.tags()?.join(",");
+    let peers = context.connections().by_tag("relay")?;
+    for peer in &peers {
+        peer.send_text(&format!("{tags}/{}/{text}", peers.len()))?;
+    }
+    Ok(())
+}
+
+async fn join_relay() -> skyzen::durable::HibernationWebSocketUpgrade {
+    skyzen::durable::HibernationWebSocketUpgrade::new().tag("relay")
+}
+
+#[tokio::test]
+async fn durable_object_delivers_websocket_messages_natively() {
+    let namespace = skyzen::durable::NativeDurableNamespace::<RelayObject>::new();
+
+    let (mut client, _, handle) = spawn_router(
+        Route::new((
+            "/relay".at(move |ForwardedRequest(request): ForwardedRequest| {
+                let namespace = namespace.clone();
+                async move {
+                    namespace
+                        .get_by_name("lobby")
+                        .expect("stub for the lobby object")
+                        .fetch(request)
+                        .await
+                        .expect("durable object fetch")
+                }
+            }),
+        )),
+        "ws://localhost/relay",
+    )
+    .await;
+
+    client
+        .send(Message::text("hello"))
+        .await
+        .expect("send message");
+
+    let reply = client
+        .next()
+        .await
+        .expect("missing reply")
+        .expect("websocket frame");
+    assert_eq!(reply.into_text().unwrap(), "relay/1/hello");
+
+    let _ = client.close(None).await;
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// A hibernating socket that authenticates the way a browser has to.
+///
+/// The `WebSocket` constructor sends no custom headers, so the credential travels in the
+/// subprotocol list — and RFC 6455 §4.1 makes the client fail the connection unless the server
+/// echoes the accepted token back in the `101`.
+async fn join_authenticated(
+    offered: skyzen::websocket::RequestedSubprotocols,
+) -> Result<skyzen::durable::HibernationWebSocketUpgrade, skyzen::websocket::WebSocketError> {
+    const PREFIX: &str = "flyco.bearer.";
+
+    let token = offered
+        .iter()
+        .find_map(|protocol| protocol.strip_prefix(PREFIX))
+        .ok_or_else(|| {
+            skyzen::websocket::WebSocketError::Protocol("no bearer subprotocol offered".to_owned())
+        })?;
+    assert_eq!(token, "s3cr3t", "the handler must see the client's token");
+
+    let answer = offered
+        .answer(|protocol| protocol.starts_with(PREFIX))
+        .expect("the offered token is a valid header value");
+    Ok(skyzen::durable::HibernationWebSocketUpgrade::new()
+        .tag("relay")
+        .protocol(answer))
+}
+
+#[tokio::test]
+async fn durable_object_echoes_the_authenticating_subprotocol() {
+    let mut request = "ws://localhost/authenticated"
+        .into_client_request()
+        .expect("build websocket request");
+    request.headers_mut().append(
+        SEC_WEBSOCKET_PROTOCOL,
+        "flyco.bearer.s3cr3t"
+            .parse()
+            .expect("parse Sec-WebSocket-Protocol header"),
+    );
+
+    let namespace = skyzen::durable::NativeDurableNamespace::<RelayObject>::new();
+    let (mut client, response, handle) = spawn_router(
+        Route::new((
+            "/authenticated".at(move |ForwardedRequest(request): ForwardedRequest| {
+                let namespace = namespace.clone();
+                async move {
+                    namespace
+                        .get_by_name("lobby")
+                        .expect("stub for the lobby object")
+                        .fetch(request)
+                        .await
+                        .expect("durable object fetch")
+                }
+            }),
+        )),
+        request,
+    )
+    .await;
+
+    // Without this header the client would have failed the connection instead of opening it.
+    assert_eq!(
+        response
+            .headers()
+            .get(SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok()),
+        Some("flyco.bearer.s3cr3t")
+    );
+
+    // The socket is live: the object still relays through the registry it was tagged into.
+    client
+        .send(Message::text("hello"))
+        .await
+        .expect("send message");
+    let reply = client
+        .next()
+        .await
+        .expect("missing reply")
+        .expect("websocket frame");
+    assert_eq!(reply.into_text().unwrap(), "relay/1/hello");
+
+    let _ = client.close(None).await;
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn websocket_answers_a_credential_bearing_subprotocol_verbatim() {
+    let mut request = "ws://localhost/token"
+        .into_client_request()
+        .expect("build websocket request");
+    request.headers_mut().append(
+        SEC_WEBSOCKET_PROTOCOL,
+        "app.bearer.abc123"
+            .parse()
+            .expect("parse Sec-WebSocket-Protocol header"),
+    );
+
+    let (mut client, response, handle) = spawn_router(
+        Route::new(("/token".at(|upgrade: WebSocketUpgrade| async move {
+            // A fixed list of supported names cannot match a token, so the offer is read and
+            // answered verbatim instead.
+            let answer = upgrade
+                .requested_protocols()
+                .iter()
+                .find(|protocol| protocol.starts_with("app.bearer."))
+                .and_then(|protocol| skyzen::header::HeaderValue::from_str(protocol).ok())
+                .expect("the client offered a bearer subprotocol");
+
+            upgrade
+                .protocol(answer)
+                .on_upgrade(|mut socket| async move {
+                    let _ = socket.send_text("authenticated").await;
+                })
+        }),)),
+        request,
+    )
+    .await;
+
+    assert_eq!(
+        response
+            .headers()
+            .get(SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok()),
+        Some("app.bearer.abc123")
+    );
+
+    let first = client
+        .next()
+        .await
+        .expect("missing first frame")
+        .expect("websocket frame");
+    assert_eq!(first.into_text().unwrap(), "authenticated");
+
+    let _ = client.close(None).await;
+    handle.abort();
+    let _ = handle.await;
+}

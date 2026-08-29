@@ -3,11 +3,10 @@
 use std::marker::PhantomData;
 
 use skyzen::durable::{DurableObject, DurableObjectError, WebSocketConnection, WebSocketEvent};
-use skyzen::{Body, Endpoint, Method, Request, Response, StatusCode, Uri};
+use skyzen::runtime::wasm::{from_js_request, into_js_response};
+use skyzen::{Body, Endpoint, Method, Request, Uri};
 use skyzen_services::durable::DurableKv;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
-use worker_sys::ext::ResponseInitExt;
 
 use super::{
     kv::CfDurableKv,
@@ -47,7 +46,7 @@ where
         let mut loaded = load_state::<T>(&state).await?;
         let durable_state = CfDurableState::new(clone_state(&state), env.clone());
 
-        let mut request = convert_request(request).await?;
+        let mut request = from_js_request(&request).map_err(annotate_conversion)?;
         durable_state
             .inject_request_extensions(&mut request)
             .map_err(to_js)?;
@@ -76,7 +75,7 @@ where
         if succeeded {
             save_state(&state, &loaded).await?;
         }
-        convert_response(response).await
+        into_js_response(response).map_err(annotate_conversion)
     }
 
     /// Handle a Durable Object `alarm` event.
@@ -403,102 +402,18 @@ fn alarm_request() -> Result<Request, JsValue> {
     Ok(request)
 }
 
-async fn convert_request(request: web_sys::Request) -> Result<Request, JsValue> {
-    let method = request
-        .method()
-        .parse::<Method>()
-        .map_err(|error| JsValue::from_str(&format!("invalid request method: {error}")))?;
-    let uri = request
-        .url()
-        .parse::<Uri>()
-        .map_err(|error| JsValue::from_str(&format!("invalid request URI: {error}")))?;
-
-    let bytes = read_body_bytes(&request).await?;
-    let mut sky_request = Request::new(Body::from(bytes));
-    *sky_request.method_mut() = method;
-    *sky_request.uri_mut() = uri;
-
-    let headers = request.headers();
-    let iter = js_sys::try_iter(&headers)?
-        .ok_or_else(|| JsValue::from_str("Headers iterator unavailable"))?;
-    for entry in iter {
-        let entry = entry?;
-        let pair = js_sys::Array::from(&entry);
-        let key = pair
-            .get(0)
-            .as_string()
-            .ok_or_else(|| JsValue::from_str("invalid header name"))?;
-        let value = pair
-            .get(1)
-            .as_string()
-            .ok_or_else(|| JsValue::from_str("invalid header value"))?;
-
-        let name = skyzen::header::HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
-            JsValue::from_str(&format!("failed to parse header name '{key}': {error}"))
-        })?;
-        let value = skyzen::header::HeaderValue::from_str(&value).map_err(|error| {
-            JsValue::from_str(&format!(
-                "failed to parse header value for '{key}': {error}"
-            ))
-        })?;
-        sky_request.headers_mut().insert(name, value);
-    }
-
-    // A Durable Object's requests carry the same `cf` the main fetch handler sees — they are the
-    // edge request, forwarded — so a handler that reads [`CfProperties`] must not go blind just
-    // because it runs inside an object.
-    if let Some(slot) = skyzen::runtime::CfPropertiesSlot::read(&request)? {
-        sky_request.extensions_mut().insert(slot);
-    }
-
-    Ok(sky_request)
-}
-
-async fn convert_response(mut response: Response) -> Result<web_sys::Response, JsValue> {
-    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
-        if let Some(socket) = response
-            .extensions_mut()
-            .remove::<skyzen::durable::DurableClientWebSocket>()
-        {
-            let mut init = web_sys::ResponseInit::new();
-            init.set_status(StatusCode::SWITCHING_PROTOCOLS.as_u16());
-            init.websocket(&socket.0)?;
-            return web_sys::Response::new_with_opt_buffer_source_and_init(None, &init);
-        }
-
-        return Err(JsValue::from_str(
-            "status 101 response missing DurableClientWebSocket extension",
-        ));
-    }
-
-    let init = web_sys::ResponseInit::new();
-    init.set_status(response.status().as_u16());
-    init.set_status_text(response.status().canonical_reason().unwrap_or("OK"));
-
-    let headers = web_sys::Headers::new()?;
-    for (key, value) in response.headers() {
-        // Header values are not guaranteed to be ASCII; a lossy UTF-8 view
-        // preserves them instead of silently dropping non-ASCII values.
-        headers.append(key.as_str(), &String::from_utf8_lossy(value.as_bytes()))?;
-    }
-    init.set_headers(&headers);
-
-    let bytes = response
-        .into_body()
-        .into_bytes()
-        .await
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let body = js_sys::Uint8Array::from(bytes.as_ref());
-    web_sys::Response::new_with_opt_buffer_source_and_init(Some(&body), &init)
-}
-
-async fn read_body_bytes(request: &web_sys::Request) -> Result<Vec<u8>, JsValue> {
-    let promise = request.array_buffer()?;
-    let buffer = JsFuture::from(promise).await?;
-    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
-}
-
 #[allow(clippy::needless_pass_by_value)]
 fn to_js(error: DurableObjectError) -> JsValue {
     JsValue::from_str(&error.to_string())
+}
+
+/// Say which boundary a conversion failure came from.
+///
+/// The conversion itself is the framework's, and its messages name the offending method, header
+/// or status; what it cannot know is that this particular crossing was a Durable Object's.
+#[allow(clippy::needless_pass_by_value)]
+fn annotate_conversion(error: JsValue) -> JsValue {
+    JsValue::from_str(&format!(
+        "durable object request/response conversion: {error:?}"
+    ))
 }

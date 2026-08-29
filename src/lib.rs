@@ -85,7 +85,7 @@ pub mod runtime;
 /// Attribute & derive macros exported by Skyzen.
 pub use skyzen_macros::{
     durable_object, email, embed_migrations, error, import_config, main, openapi, queue, scheduled,
-    tail, test, HttpError,
+    tail, test, Column, FromRow, HttpError,
 };
 
 /// Static asset helpers for building file servers.
@@ -107,6 +107,12 @@ pub use http_kit;
 pub use http_kit::{
     header, Body, BodyError, Endpoint, HttpError, Method, Request, Response, StatusCode, Uri,
 };
+/// Service types used by macro expansions.
+///
+/// Keeping this path behind the root crate means applications using manifest-driven wiring do
+/// not need to declare Skyzen's implementation dependency themselves.
+#[doc(hidden)]
+pub use skyzen_services as __services;
 
 /// RFC-typed headers, for use with [`TypedHeader`](crate::extract::TypedHeader).
 ///
