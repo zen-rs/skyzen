@@ -12,6 +12,13 @@
 //! [`Manifest::parse`] resolves every overlay against the base eagerly, so a typo in an
 //! environment nobody selected still fails the parse. Overlays compose with [`deep_merge`].
 //!
+//! # Deploy-time interpolation
+//!
+//! String values may contain `${NAME}` placeholders. The CLI expands them from the process
+//! environment when it reads the file (GitHub Actions secrets mapped into the job env, or
+//! `.env`). [`Manifest::parse`] leaves them as written so `#[skyzen::main]` does not depend on
+//! secrets the compiler does not have. A missing name fails the CLI parse; there is no default.
+//!
 //! ```
 //! # use skyzen_manifest::Manifest;
 //! let manifest = Manifest::parse(
@@ -38,10 +45,12 @@
 //! assert_eq!(staging.workers_dev, Some(true));
 //! ```
 
+mod interpolate;
 mod merge;
 pub mod migrations;
 mod schema;
 
+pub use interpolate::{expand, expand_table, process_env, EnvLookup, InterpolateError};
 pub use merge::deep_merge;
 pub use migrations::{MigrationFile, MigrationsError, DEFAULT_MIGRATIONS_DIR};
 pub use schema::{
@@ -121,6 +130,14 @@ pub enum ManifestError {
         /// Which keys are named and which are missing.
         source: schema::PartialRdsDataWiring,
     },
+    /// A `${NAME}` placeholder in a string value could not be expanded.
+    #[error("{path}: {source}")]
+    Interpolation {
+        /// The manifest path.
+        path: PathBuf,
+        /// What was wrong with the placeholder, including the TOML path.
+        source: interpolate::InterpolateError,
+    },
     /// A named environment was requested that the manifest does not declare.
     #[error(
         "{path} declares no Cloudflare environment named `{name}`{}",
@@ -150,7 +167,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// Read and parse the manifest at `path`.
+    /// Read and parse the manifest at `path`, leaving `${NAME}` placeholders as written.
     ///
     /// `root_dir` — the project root every relative path in the manifest is resolved against — is
     /// taken to be the manifest's parent directory.
@@ -160,6 +177,20 @@ impl Manifest {
     /// Returns [`ManifestError`] when the file cannot be read, is not valid TOML, does not match
     /// the schema, or has a malformed `[cloudflare.env]` table.
     pub fn load(path: &Path) -> Result<Self, ManifestError> {
+        Self::load_with(path, None)
+    }
+
+    /// Read and parse the manifest at `path`, expanding `${NAME}` through `lookup`.
+    ///
+    /// `lookup` is `None` for compile-time consumers. The CLI supplies one that reads the process
+    /// environment and the project's `.env` files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError`] when the file cannot be read, a placeholder cannot be expanded,
+    /// the file is not valid TOML, does not match the schema, or has a malformed `[cloudflare.env]`
+    /// table.
+    pub fn load_with(path: &Path, lookup: Option<EnvLookup<'_>>) -> Result<Self, ManifestError> {
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -178,13 +209,14 @@ impl Manifest {
             path: path.clone(),
             source,
         })?;
-        Self::parse(&content, &path, root_dir)
+        Self::parse_with(&content, &path, root_dir, lookup)
     }
 
     /// Parse manifest `content` that came from `path`, rooted at `root_dir`.
     ///
     /// `path` is used only for error messages, so callers holding the content in memory (tests,
     /// or a manifest embedded in a template) can name whatever the user would recognize.
+    /// `${NAME}` placeholders are left as written; see [`parse_with`](Self::parse_with).
     ///
     /// # Errors
     ///
@@ -195,12 +227,40 @@ impl Manifest {
         path: impl AsRef<Path>,
         root_dir: impl Into<PathBuf>,
     ) -> Result<Self, ManifestError> {
+        Self::parse_with(content, path, root_dir, None)
+    }
+
+    /// Parse `content`, expanding `${NAME}` through `lookup` before the typed schema runs.
+    ///
+    /// Expansion walks string **values** only, so a secret containing quotes or newlines cannot
+    /// break the document. A missing name fails rather than leaving a placeholder in a field the
+    /// CLI would treat as a literal id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError`] when a placeholder cannot be expanded, the content is not valid
+    /// TOML, does not match the schema, or has a malformed `[cloudflare.env]` table.
+    pub fn parse_with(
+        content: &str,
+        path: impl AsRef<Path>,
+        root_dir: impl Into<PathBuf>,
+        lookup: Option<EnvLookup<'_>>,
+    ) -> Result<Self, ManifestError> {
         let path = path.as_ref().to_path_buf();
         let mut document: toml::Table =
             toml::from_str(content).map_err(|source| ManifestError::Syntax {
                 path: path.clone(),
                 source: Box::new(source),
             })?;
+
+        if let Some(lookup) = lookup {
+            interpolate::expand_table(&mut document, lookup).map_err(|source| {
+                ManifestError::Interpolation {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+        }
 
         // Lift the environment overlays out before any typed deserialization: the base and every
         // overlay then go through the *same* `CloudflareSection`, which is what makes
@@ -362,13 +422,21 @@ fn take_environment_overlays(
 #[cfg(test)]
 mod tests {
     use super::{
-        Manifest, ManifestError, NativeDatabaseBackend, NativeDatabaseSection,
+        InterpolateError, Manifest, ManifestError, NativeDatabaseBackend, NativeDatabaseSection,
         NativeServiceBackend, NativeServiceSection, RdsEngine, ServiceType,
     };
     use std::time::Duration;
 
     fn parse(content: &str) -> Result<Manifest, ManifestError> {
         Manifest::parse(content, "Skyzen.toml", ".")
+    }
+
+    fn parse_expanded(content: &str, env: &[(&str, &str)]) -> Result<Manifest, ManifestError> {
+        let map: std::collections::BTreeMap<&str, &str> = env.iter().copied().collect();
+        let lookup = |name: &str| -> Result<Option<String>, InterpolateError> {
+            Ok(map.get(name).map(|value| (*value).to_owned()))
+        };
+        Manifest::parse_with(content, "Skyzen.toml", ".", Some(&lookup))
     }
 
     /// The `[native.service.cache]` a manifest wiring `cache` with `body` produces.
@@ -1033,6 +1101,91 @@ mod tests {
         assert!(
             error.to_string().contains("prod") && error.to_string().contains("staging"),
             "error should name the request and the alternatives: {error}"
+        );
+    }
+
+    #[test]
+    fn interpolates_string_values_from_the_supplied_lookup() {
+        let manifest = parse_expanded(
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\naccount_id = \"${ACCOUNT}\"\n\n\
+             [[cloudflare.kv_namespaces]]\nbinding = \"CACHE\"\nid = \"${CACHE_ID}\"\n\n\
+             [cloudflare.vars]\nAPI_URL = \"${API_URL}\"\n\n\
+             [cloudflare.env.staging]\naccount_id = \"${STAGING_ACCOUNT}\"\n",
+            &[
+                ("ACCOUNT", "acct_prod"),
+                ("CACHE_ID", "ns_abc"),
+                ("API_URL", "https://api.flyco.io"),
+                ("STAGING_ACCOUNT", "acct_staging"),
+            ],
+        )
+        .expect("manifest parses");
+
+        let base = manifest
+            .cloudflare(None)
+            .expect("base")
+            .expect("cloudflare");
+        assert_eq!(base.account_id.as_deref(), Some("acct_prod"));
+        assert_eq!(base.kv_namespaces[0].id.as_deref(), Some("ns_abc"));
+        assert_eq!(base.vars["API_URL"], "https://api.flyco.io");
+
+        let staging = manifest
+            .cloudflare(Some("staging"))
+            .expect("known environment")
+            .expect("cloudflare");
+        assert_eq!(staging.account_id.as_deref(), Some("acct_staging"));
+        // Overlay inherits the expanded base binding list.
+        assert_eq!(staging.kv_namespaces[0].id.as_deref(), Some("ns_abc"));
+    }
+
+    #[test]
+    fn parse_without_expansion_leaves_placeholders_in_place() {
+        let manifest = parse(
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+             [[cloudflare.kv_namespaces]]\nbinding = \"CACHE\"\nid = \"${CACHE_ID}\"\n",
+        )
+        .expect("literal parse");
+        assert_eq!(
+            manifest
+                .data()
+                .cloudflare
+                .as_ref()
+                .expect("cloudflare")
+                .kv_namespaces[0]
+                .id
+                .as_deref(),
+            Some("${CACHE_ID}")
+        );
+    }
+
+    #[test]
+    fn a_missing_interpolation_fails_naming_the_variable_and_the_key() {
+        let error = parse_expanded(
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\naccount_id = \"${ACCOUNT}\"\n",
+            &[],
+        )
+        .expect_err("unset");
+        let rendered = error.to_string();
+        assert!(rendered.contains("ACCOUNT"), "{rendered}");
+        assert!(rendered.contains("account_id"), "{rendered}");
+        assert!(rendered.contains("Skyzen.toml"), "{rendered}");
+    }
+
+    #[test]
+    fn interpolating_a_value_with_quotes_does_not_break_toml() {
+        let manifest = parse_expanded(
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+             [cloudflare.vars]\nBANNER = \"${BANNER}\"\n",
+            &[("BANNER", "he said \"hi\"")],
+        )
+        .expect("manifest parses");
+        assert_eq!(
+            manifest
+                .data()
+                .cloudflare
+                .as_ref()
+                .expect("cloudflare")
+                .vars["BANNER"],
+            "he said \"hi\""
         );
     }
 
