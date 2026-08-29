@@ -207,6 +207,32 @@ skyzen logs --env staging
 
 See [Environments](skyzen-toml-reference.md#environments) for the merge rules.
 
+### GitHub Actions
+
+`${NAME}` in `Skyzen.toml` is expanded from the job's environment when the CLI reads the file.
+Map repository secrets into `env:` on the deploy step — that is the process environment of
+`skyzen deploy`, not the Worker after it starts.
+
+```yaml
+- run: skyzen deploy --provider cloudflare
+  env:
+    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    CACHE_NAMESPACE_ID: ${{ secrets.CACHE_NAMESPACE_ID }}
+```
+
+```toml
+[cloudflare]
+account_id = "${CLOUDFLARE_ACCOUNT_ID}"
+
+[[cloudflare.kv_namespaces]]
+binding = "CACHE"
+id = "${CACHE_NAMESPACE_ID}"
+```
+
+See [Deploy-time interpolation](skyzen-toml-reference.md#deploy-time-interpolation) for the syntax.
+`CLOUDFLARE_API_TOKEN` is wrangler's own credential and stays out of the file.
+
 ### Logs and Secrets
 
 ```sh
