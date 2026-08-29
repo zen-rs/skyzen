@@ -429,7 +429,15 @@ mod tests {
                     .expect("alarm should be injected");
 
                 kv.put("visited", b"1").await.expect("durable kv put");
-                db.query("SELECT 1").execute().await.expect("durable query");
+                db.query("CREATE TABLE visits (note TEXT NOT NULL)")
+                    .execute()
+                    .await
+                    .expect("durable ddl");
+                db.query("INSERT INTO visits (note) VALUES (?)")
+                    .bind("first")
+                    .execute()
+                    .await
+                    .expect("durable insert");
                 alarm.set_alarm(1337).await.expect("alarm set");
 
                 Ok(Response::new(Body::from("ok")))
@@ -437,7 +445,9 @@ mod tests {
         }
 
         let durable_kv = InMemoryDurableKv::new();
-        let durable_db = InMemoryDurableDb::new();
+        let durable_db = InMemoryDurableDb::in_memory()
+            .await
+            .expect("in-memory SQLite should initialize");
         let alarm = InMemoryAlarm::new();
 
         let response = TestContext::new()
@@ -456,7 +466,14 @@ mod tests {
                 .unwrap(),
             Some(b"1".to_vec())
         );
-        assert_eq!(durable_db.executed_queries().len(), 1);
+        // The durable database executes SQL rather than recording it, so the assertion is a real
+        // read of what the handler wrote — the same check the code would make on Workers.
+        let notes: Vec<String> = DurableDb::new(durable_db)
+            .query("SELECT note FROM visits")
+            .fetch_scalars()
+            .await
+            .expect("durable read-back");
+        assert_eq!(notes, vec!["first".to_owned()]);
         assert_eq!(alarm.scheduled_time(), Some(1337));
     }
 

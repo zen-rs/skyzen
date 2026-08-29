@@ -13,12 +13,14 @@ use crate::{
     websocket::{
         ffi,
         session::{internal_error_frame, IntoWebSocketOutcome},
-        types::{WebSocketCloseFrame, WebSocketError, WebSocketResult},
+        types::{
+            offered_protocols, select_protocol, WebSocketCloseFrame, WebSocketError,
+            WebSocketResult,
+        },
     },
     Method, Request, Response, StatusCode,
 };
 
-pub use ffi::create_websocket_response;
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 use http_kit::utils::ByteStr;
@@ -585,34 +587,62 @@ unsafe impl Sync for SendSyncWebSocketPair {}
 /// Helper that contains the state required to accept a WebSocket connection.
 pub struct WebSocketUpgrade {
     pair: SendSyncWebSocketPair,
-    protocols: Vec<String>,
+    requested_protocols: Vec<String>,
+    response_protocol: Option<header::HeaderValue>,
     config: WebSocketConfig,
 }
 
 impl WebSocketUpgrade {
-    fn new() -> Self {
+    fn new(requested_protocols: Vec<String>) -> Self {
         Self {
             pair: SendSyncWebSocketPair(ffi::WebSocketPair::new()),
-            protocols: Vec::new(),
+            requested_protocols,
+            response_protocol: None,
             config: WebSocketConfig::default(),
         }
     }
 
-    /// Negotiate the sub-protocol returned to the client.
+    /// Answer the handshake with the first of `protocols` the client also offered.
     ///
-    /// # Note
-    /// On WASM, protocol negotiation is tracked but not enforced by the runtime.
+    /// The chosen one is echoed in the `101`'s `Sec-WebSocket-Protocol`, which RFC 6455 §4.1
+    /// requires whenever the client offered any: without it the client fails the connection.
     #[must_use]
     pub fn protocols<I, S>(mut self, protocols: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.protocols = protocols
+        let supported: Vec<String> = protocols
             .into_iter()
-            .map(|s| s.as_ref().to_string())
+            .map(|protocol| protocol.as_ref().to_owned())
             .collect();
+
+        self.response_protocol = select_protocol(&self.requested_protocols, &supported);
         self
+    }
+
+    /// Answer the handshake with exactly this subprotocol, whatever the client offered.
+    ///
+    /// [`protocols`](Self::protocols) covers the case where the server knows the whole set of
+    /// acceptable names up front. It cannot cover the one where the *value* carries information —
+    /// a browser cannot attach an `Authorization` header to a `WebSocket`, so the standard way to
+    /// authenticate one is to smuggle the credential through the subprotocol list
+    /// (`new WebSocket(url, ["app.bearer." + token])`) and have the server echo the token back.
+    /// Read the offer with [`requested_protocols`](Self::requested_protocols), then answer with it.
+    ///
+    /// A [`HeaderValue`](header::HeaderValue) rather than a string, because a subprotocol that
+    /// cannot be sent as a header value is not an answer — and the handler, not the handshake, is
+    /// where that is known.
+    #[must_use]
+    pub fn protocol(mut self, protocol: header::HeaderValue) -> Self {
+        self.response_protocol = Some(protocol);
+        self
+    }
+
+    /// The subprotocols the client offered, in the order it offered them.
+    #[must_use]
+    pub fn requested_protocols(&self) -> &[String] {
+        &self.requested_protocols
     }
 
     /// Override the [`WebSocketConfig`] used for the upgraded stream.
@@ -650,7 +680,13 @@ impl WebSocketUpgrade {
         Fut: std::future::Future<Output = R> + 'static,
         R: IntoWebSocketOutcome + 'static,
     {
-        let pair = self.pair.0;
+        let Self {
+            pair,
+            response_protocol,
+            config,
+            requested_protocols: _,
+        } = self;
+        let pair = pair.0;
         let server = pair.server();
         let client = pair.client();
 
@@ -662,7 +698,7 @@ impl WebSocketUpgrade {
         let closer = server.clone();
 
         // Create our WebSocket wrapper
-        let socket = WebSocket::from_ffi_socket(server, self.config);
+        let socket = WebSocket::from_ffi_socket(server, config);
 
         // Spawn the callback to handle messages
         wasm_bindgen_futures::spawn_local(async move {
@@ -678,6 +714,7 @@ impl WebSocketUpgrade {
 
         WebSocketUpgradeResponder {
             client: SendSyncWebSocket(client),
+            response_protocol,
         }
     }
 }
@@ -685,7 +722,8 @@ impl WebSocketUpgrade {
 impl std::fmt::Debug for WebSocketUpgrade {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebSocketUpgrade")
-            .field("protocols", &self.protocols)
+            .field("requested_protocols", &self.requested_protocols)
+            .field("response_protocol", &self.response_protocol)
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
@@ -750,7 +788,7 @@ fn validate_upgrade(request: &Request) -> Result<WebSocketUpgrade, WebSocketUpgr
         _ => return Err(WebSocketUpgradeError::UnsupportedVersion),
     }
 
-    Ok(WebSocketUpgrade::new())
+    Ok(WebSocketUpgrade::new(offered_protocols(headers)))
 }
 
 /// Wrapper to make `ffi::WebSocket` Send/Sync safe in single-threaded WASM environment.
@@ -781,11 +819,13 @@ unsafe impl Sync for SendSyncWebSocket {}
 /// [`Responder`] returned from [`WebSocketUpgrade::on_upgrade`].
 pub struct WebSocketUpgradeResponder {
     client: SendSyncWebSocket,
+    response_protocol: Option<header::HeaderValue>,
 }
 
 impl std::fmt::Debug for WebSocketUpgradeResponder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebSocketUpgradeResponder")
+            .field("response_protocol", &self.response_protocol)
             .finish_non_exhaustive()
     }
 }
@@ -796,6 +836,14 @@ impl Responder for WebSocketUpgradeResponder {
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         // Set status to 101 Switching Protocols
         *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+
+        // The answer to the client's subprotocol offer is a response header like any other; the
+        // runtime carries the whole header map onto the `101` it builds for the host.
+        if let Some(protocol) = self.response_protocol {
+            response
+                .headers_mut()
+                .insert(header::SEC_WEBSOCKET_PROTOCOL, protocol);
+        }
 
         // Store the client socket in extensions for the runtime to extract
         // We use SendSyncWebSocket to satisfy Send + Sync bounds

@@ -22,7 +22,10 @@ use crate::{
     header,
     websocket::{
         session::{internal_error_frame, IntoWebSocketOutcome},
-        types::{WebSocketCloseFrame, WebSocketError, WebSocketResult},
+        types::{
+            offered_protocols, select_protocol, WebSocketCloseFrame, WebSocketError,
+            WebSocketResult,
+        },
     },
     Method, Request, Response, StatusCode,
 };
@@ -110,19 +113,6 @@ fn header_has_token(value: &header::HeaderValue, token: &str) -> bool {
             .split(',')
             .any(|part| part.trim().eq_ignore_ascii_case(token))
     })
-}
-
-fn parse_protocols(value: Option<&header::HeaderValue>) -> Vec<String> {
-    value
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(',')
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn compute_accept_header(key: &header::HeaderValue) -> header::HeaderValue {
@@ -652,7 +642,7 @@ pub struct WebSocketUpgrade {
     key: header::HeaderValue,
     on_upgrade: OnUpgrade,
     requested_protocols: Vec<String>,
-    response_protocol: Option<String>,
+    response_protocol: Option<header::HeaderValue>,
     config: WebSocketConfig,
     executor: Option<Arc<AnyExecutor>>,
 }
@@ -668,7 +658,10 @@ impl std::fmt::Debug for WebSocketUpgrade {
 }
 
 impl WebSocketUpgrade {
-    /// Negotiate the sub-protocol returned to the client.
+    /// Answer the handshake with the first of `protocols` the client also offered.
+    ///
+    /// The chosen one is echoed in the `101`'s `Sec-WebSocket-Protocol`, which RFC 6455 §4.1
+    /// requires whenever the client offered any: without it the client fails the connection.
     #[must_use]
     pub fn protocols<I, S>(mut self, protocols: I) -> Self
     where
@@ -677,15 +670,35 @@ impl WebSocketUpgrade {
     {
         let supported: Vec<String> = protocols
             .into_iter()
-            .map(|protocol| protocol.as_ref().to_string())
+            .map(|protocol| protocol.as_ref().to_owned())
             .collect();
 
-        self.response_protocol = self
-            .requested_protocols
-            .iter()
-            .find(|requested| supported.iter().any(|supported| supported == *requested))
-            .cloned();
+        self.response_protocol = select_protocol(&self.requested_protocols, &supported);
         self
+    }
+
+    /// Answer the handshake with exactly this subprotocol, whatever the client offered.
+    ///
+    /// [`protocols`](Self::protocols) covers the case where the server knows the whole set of
+    /// acceptable names up front. It cannot cover the one where the *value* carries information —
+    /// a browser cannot attach an `Authorization` header to a `WebSocket`, so the standard way to
+    /// authenticate one is to smuggle the credential through the subprotocol list
+    /// (`new WebSocket(url, ["app.bearer." + token])`) and have the server echo the token back.
+    /// Read the offer with [`requested_protocols`](Self::requested_protocols), then answer with it.
+    ///
+    /// A [`HeaderValue`](header::HeaderValue) rather than a string, because a subprotocol that
+    /// cannot be sent as a header value is not an answer — and the handler, not the handshake, is
+    /// where that is known.
+    #[must_use]
+    pub fn protocol(mut self, protocol: header::HeaderValue) -> Self {
+        self.response_protocol = Some(protocol);
+        self
+    }
+
+    /// The subprotocols the client offered, in the order it offered them.
+    #[must_use]
+    pub fn requested_protocols(&self) -> &[String] {
+        &self.requested_protocols
     }
 
     /// Override the [`WebSocketConfig`] used for the upgraded stream.
@@ -792,7 +805,9 @@ async fn close_failed_session(mut released: oneshot::Receiver<WebSocketStream<Na
     }
 }
 
-fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeError> {
+fn validate_upgrade(
+    request: &Request,
+) -> Result<(header::HeaderValue, Vec<String>), WebSocketUpgradeError> {
     if request.method() != Method::GET {
         return Err(WebSocketUpgradeError::MethodNotAllowed);
     }
@@ -830,11 +845,16 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
             }
         }
 
-        let requested_protocols = parse_protocols(headers.get(header::SEC_WEBSOCKET_PROTOCOL));
+        let requested_protocols = offered_protocols(headers);
 
         (key, requested_protocols)
     };
 
+    Ok((key, requested_protocols))
+}
+
+fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeError> {
+    let (key, requested_protocols) = validate_upgrade(request)?;
     let on_upgrade = request
         .extensions_mut()
         .remove::<OnUpgrade>()
@@ -842,6 +862,35 @@ fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeEr
 
     // Extract executor from request extensions (injected by the runtime)
     let executor = request.extensions_mut().remove::<Arc<AnyExecutor>>();
+
+    Ok(WebSocketUpgrade {
+        key,
+        on_upgrade,
+        requested_protocols,
+        response_protocol: None,
+        config: WebSocketConfig::default(),
+        executor,
+    })
+}
+
+/// Build an upgrade from a responder that only receives a shared request reference.
+///
+/// Hibernating Durable Object upgrades are responders rather than extractors. Hyper's upgrade
+/// handle and the executor are cloneable, so they can share the same validated handshake path
+/// without duplicating the protocol implementation.
+// `websocket::mod` re-exports this module with a glob, so `pub` here would put an internal
+// handshake helper in the public API; `pub(crate)` is load-bearing rather than redundant.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn upgrade_from_request(
+    request: &Request,
+) -> Result<WebSocketUpgrade, WebSocketUpgradeError> {
+    let (key, requested_protocols) = validate_upgrade(request)?;
+    let on_upgrade = request
+        .extensions()
+        .get::<OnUpgrade>()
+        .cloned()
+        .ok_or(WebSocketUpgradeError::MissingOnUpgrade)?;
+    let executor = request.extensions().get::<Arc<AnyExecutor>>().cloned();
 
     Ok(WebSocketUpgrade {
         key,
@@ -905,10 +954,8 @@ impl Responder for WebSocketUpgradeResponder {
             );
             headers.insert(header::SEC_WEBSOCKET_ACCEPT, accept);
 
-            if let Some(protocol) = &self.upgrade.response_protocol {
-                if let Ok(value) = header::HeaderValue::from_str(protocol) {
-                    headers.insert(header::SEC_WEBSOCKET_PROTOCOL, value);
-                }
+            if let Some(protocol) = self.upgrade.response_protocol.clone() {
+                headers.insert(header::SEC_WEBSOCKET_PROTOCOL, protocol);
             }
         }
 

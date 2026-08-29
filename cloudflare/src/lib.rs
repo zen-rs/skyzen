@@ -172,12 +172,37 @@ const _: () = {
             namespace
                 .get_by_name("room")
                 .unwrap()
-                .fetch_url("https://example.com"),
+                .fetch_url(DURABLE_OBJECT_URL),
         );
         assert_send(cache.get_url("https://example.com", false));
         assert_send(cache.put_url("https://example.com", worker::Response::empty().unwrap()));
         assert_send(fetch.request(&request));
         assert_send(fetch.request_bytes(&request));
+    }
+
+    /// The host in a stub URL is ignored — the object ID decides what answers — so this stands in
+    /// for one without claiming a domain.
+    const DURABLE_OBJECT_URL: &str = "https://durable-object/room";
+
+    /// A whole handler, not just the stub call.
+    ///
+    /// `fetch` returning a `Send` future was never enough on its own: a handler holds the response
+    /// across the await that reads its body, so a `!Send` response type made the handler `!Send`
+    /// and forced a `SendFuture` wrapper at every Durable Object call site. Asserting the shape of
+    /// a real handler is what keeps that from coming back.
+    #[allow(dead_code, clippy::needless_pass_by_value)]
+    fn assert_durable_object_handler_is_send(namespace: crate::CfDurableNamespace) {
+        assert_send(async move {
+            let stub = namespace.get_by_name("room").unwrap();
+
+            let response = stub.fetch_url(DURABLE_OBJECT_URL).await.unwrap();
+            let bytes = response.into_body().into_bytes().await.unwrap();
+
+            let mut request = skyzen::Request::new(skyzen::Body::from_bytes(bytes));
+            *request.uri_mut() = DURABLE_OBJECT_URL.parse().unwrap();
+            *request.method_mut() = skyzen::Method::POST;
+            stub.fetch(request).await.unwrap()
+        });
     }
 
     #[allow(dead_code, clippy::needless_pass_by_value)]

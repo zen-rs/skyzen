@@ -1,5 +1,7 @@
 //! Procedural macros for the Skyzen framework.
 
+mod row;
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use skyzen_manifest::{
@@ -419,6 +421,76 @@ pub fn derive_http_error(item: TokenStream) -> TokenStream {
     }
 }
 
+/// Derive a typed decode from a SQL result row.
+///
+/// One field per column, each read through
+/// [`FromColumn`](https://docs.rs/skyzen-services/latest/skyzen_services/sql/trait.FromColumn.html)
+/// — so the field's own type says how the column is decoded, and a `Uuid`, a `DateTime<Utc>` or a
+/// `BigDecimal` reads correctly whichever JSON shape its backend produced.
+///
+/// ```ignore
+/// #[derive(skyzen::FromRow)]
+/// struct Order {
+///     id: Uuid,
+///     #[row(rename = "customer_id")]
+///     customer: CustomerId,
+///     placed_at: DateTime<Utc>,
+///     #[row(json)]
+///     items: Vec<LineItem>,
+/// }
+/// ```
+///
+/// A column is matched to a field by name. `#[row(rename_all = "…")]` on the struct spells every
+/// column with one of `serde`'s eight rules, `#[row(rename = "…")]` on a field names one column
+/// outright, and `#[row(json)]` deserializes a column holding a JSON document with `serde` instead
+/// of decoding it as a value.
+///
+/// A missing column, or one holding something the field's type does not accept, is an error naming
+/// both the column and what was expected — never a default.
+#[proc_macro_derive(FromRow, attributes(row))]
+pub fn derive_from_row(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match row::expand_from_row(&input) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+/// Derive both directions of the mapping for a type stored in one column.
+///
+/// Applies to two shapes:
+///
+/// - a **newtype** wrapping a type that is already one column, which is how a domain id stops
+///   being a bare `Uuid` or `i64` at the call site:
+///
+///   ```ignore
+///   #[derive(skyzen::Column)]
+///   struct CustomerId(Uuid);
+///   ```
+///
+/// - an **enum whose variants carry no fields**, stored as one text token per variant. The tokens
+///   are the variant names in `snake_case`; `#[column(rename_all = "…")]` picks another of
+///   `serde`'s eight rules and `#[column(rename = "…")]` names one variant's token outright. Two
+///   variants that would share a token are a compile error, and
+///   [`ColumnEnum::TOKENS`](https://docs.rs/skyzen-services/latest/skyzen_services/sql/trait.ColumnEnum.html)
+///   is the list to check a `CHECK (state IN (…))` constraint against:
+///
+///   ```ignore
+///   #[derive(skyzen::Column)]
+///   enum OrderState { AwaitingPayment, Shipped }  // "awaiting_payment", "shipped"
+///   ```
+///
+/// Either shape gets `From<Self> for DbValue` for binding and `FromColumn` for reading, so the
+/// type works in `.bind(…)` and as a `#[derive(FromRow)]` field alike.
+#[proc_macro_derive(Column, attributes(column))]
+pub fn derive_column(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match row::expand_column(&input) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     let fn_ident = &function.sig.ident;
@@ -745,26 +817,33 @@ impl TestService {
     fn construction(self) -> proc_macro2::TokenStream {
         match self {
             Self::Kv => quote! {
-                ::skyzen_services::Kv::new(::skyzen_test::mock::InMemoryKv::new())
+                ::skyzen::__services::Kv::new(::skyzen_test::mock::InMemoryKv::new())
             },
             Self::Storage => quote! {
-                ::skyzen_services::Storage::new(::skyzen_test::mock::InMemoryStorage::new())
+                ::skyzen::__services::Storage::new(::skyzen_test::mock::InMemoryStorage::new())
             },
             Self::Queue => quote! {
-                ::skyzen_services::Queue::new(::skyzen_test::mock::InMemoryQueue::new())
+                ::skyzen::__services::Queue::new(::skyzen_test::mock::InMemoryQueue::new())
             },
             Self::DurableKv => quote! {
-                ::skyzen_services::durable::DurableKv::new(
+                ::skyzen::__services::durable::DurableKv::new(
                     ::skyzen_test::mock::InMemoryDurableKv::new(),
                 )
             },
+            // The durable database is a real SQLite database rather than a recorder, so opening
+            // it is fallible and asynchronous — and a test whose database cannot open has to say
+            // so, not carry on against a store that answers nothing.
             Self::DurableDb => quote! {
-                ::skyzen_services::durable::DurableDb::new(
-                    ::skyzen_test::mock::InMemoryDurableDb::new(),
+                ::skyzen::__services::durable::DurableDb::new(
+                    ::skyzen_test::mock::InMemoryDurableDb::in_memory()
+                        .await
+                        .unwrap_or_else(|error| panic!(
+                            "failed to open the in-memory Durable Object database: {error}"
+                        )),
                 )
             },
             Self::Alarm => quote! {
-                ::skyzen_services::durable::Alarm::new(::skyzen_test::mock::InMemoryAlarm::new())
+                ::skyzen::__services::durable::Alarm::new(::skyzen_test::mock::InMemoryAlarm::new())
             },
         }
     }
@@ -863,7 +942,7 @@ fn embed_migrations_tokens(
         let path = LitStr::new(&file.path.display().to_string(), span);
         let checksum = file.checksum;
         quote! {
-            ::skyzen_services::migrate::Migration::embedded(
+            ::skyzen::__services::migrate::Migration::embedded(
                 #version,
                 #name,
                 ::core::include_str!(#path),
@@ -879,8 +958,8 @@ fn embed_migrations_tokens(
     Ok(quote! {
         {
             static __SKYZEN_EMBEDDED_MIGRATIONS:
-                [::skyzen_services::migrate::Migration; #count] = [#(#entries),*];
-            ::skyzen_services::migrate::Migrations::from_static(&__SKYZEN_EMBEDDED_MIGRATIONS)
+                [::skyzen::__services::migrate::Migration; #count] = [#(#entries),*];
+            ::skyzen::__services::migrate::Migrations::from_static(&__SKYZEN_EMBEDDED_MIGRATIONS)
         }
     })
 }
@@ -1097,7 +1176,7 @@ fn push_test_migrations(
     // The production runner, against the in-memory database — so a migration that would fail on a
     // real deploy fails here too, rather than being waved through by a test-only shortcut.
     statements.push(quote! {
-        ::skyzen_services::Db::migrate(&__skyzen_test_default_db, &#migrations)
+        ::skyzen::__services::Db::migrate(&__skyzen_test_default_db, &#migrations)
             .await
             .unwrap_or_else(|error| {
                 panic!("failed to apply migrations to the in-memory test database: {error}")
@@ -2220,9 +2299,9 @@ fn doc_string(attrs: &[Attribute]) -> Option<String> {
 /// The portable wrapper a service type is bound to.
 fn service_wrapper_path(service_type: ServiceType) -> proc_macro2::TokenStream {
     match service_type {
-        ServiceType::Kv => quote! { ::skyzen_services::Kv },
-        ServiceType::Storage => quote! { ::skyzen_services::Storage },
-        ServiceType::Queue => quote! { ::skyzen_services::Queue },
+        ServiceType::Kv => quote! { ::skyzen::__services::Kv },
+        ServiceType::Storage => quote! { ::skyzen::__services::Storage },
+        ServiceType::Queue => quote! { ::skyzen::__services::Queue },
     }
 }
 
@@ -2266,7 +2345,7 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
 
         generated_items.push(named_binding_tokens(
             &ident,
-            &quote! { ::skyzen_services::Db },
+            &quote! { ::skyzen::__services::Db },
             &format!(
                 "database `{}` not configured. Ensure Skyzen.toml database wiring is installed.",
                 database.name
@@ -2559,7 +2638,7 @@ fn queue_consumer_tokens(
                         .expect("the manifest rejects a zero batch size"),
                     poll_wait: #poll_wait,
                     visibility_timeout: #visibility_timeout,
-                    default_retry: ::skyzen_services::QueueRetry::new()
+                    default_retry: ::skyzen::__services::QueueRetry::new()
                         .with_delay_seconds(#retry_seconds),
                 },
                 ::std::clone::Clone::clone(&#binding),
@@ -3077,7 +3156,7 @@ fn generate_native_database_init(
                     ::skyzen_azure::AzureSqlConfig::new(#connection)
                 )
                 .unwrap_or_else(|error| panic!("{}: {error}", #failure));
-                ::skyzen_services::Db::new(backend)
+                ::skyzen::__services::Db::new(backend)
             }};
         }
         (DatabaseType::Sql, NativeDatabaseSection::RdsData(rds)) => {
@@ -3096,7 +3175,7 @@ fn generate_native_database_init(
 
             return quote! {{
                 let backend = #build;
-                ::skyzen_services::Db::new(backend)
+                ::skyzen::__services::Db::new(backend)
             }};
         }
     };
@@ -3108,7 +3187,7 @@ fn generate_native_database_init(
     );
 
     quote! {{
-        ::skyzen_services::Db::#connect(&#url)
+        ::skyzen::__services::Db::#connect(&#url)
             .await
             .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
     }}
@@ -3181,7 +3260,7 @@ fn generate_cloudflare_database_init(
         DatabaseType::Sql => quote! {{
             let backend = ::skyzen_cloudflare::CfD1::from_env(&__skyzen_wasm_env, #binding_lit)
                 .unwrap_or_else(|error| panic!("{}: {error}", #failure_message));
-            ::skyzen_services::Db::new(backend)
+            ::skyzen::__services::Db::new(backend)
         }},
     }
 }
@@ -3387,11 +3466,11 @@ fn native_queue_handler(
             #[allow(clippy::manual_async_fn)]
             fn handle(
                 &self,
-                __skyzen_batch: ::skyzen_services::QueueBatch<::std::vec::Vec<u8>>,
+                __skyzen_batch: ::skyzen::__services::QueueBatch<::std::vec::Vec<u8>>,
             ) -> impl ::std::future::Future<
                 Output = ::std::result::Result<
-                    ::skyzen_services::QueueBatchDisposition,
-                    ::skyzen_services::BoxError,
+                    ::skyzen::__services::QueueBatchDisposition,
+                    ::skyzen::__services::BoxError,
                 >,
             > + ::std::marker::Send {
                 async move {
@@ -4096,7 +4175,7 @@ type = "sql"
             "{generated}"
         );
         assert!(
-            generated.contains("skyzen_services :: Db :: new"),
+            generated.contains("skyzen :: __services :: Db :: new"),
             "{generated}"
         );
         assert!(generated.contains(". await"), "{generated}");
@@ -4123,7 +4202,7 @@ type = "sql"
         );
         assert!(generated.contains("appdb"), "{generated}");
         assert!(
-            generated.contains("skyzen_services :: Db :: new"),
+            generated.contains("skyzen :: __services :: Db :: new"),
             "{generated}"
         );
         assert!(generated.contains(". await"), "{generated}");
@@ -4145,7 +4224,7 @@ type = "sql"
             "{generated}"
         );
         assert!(
-            generated.contains("skyzen_services :: Db :: new"),
+            generated.contains("skyzen :: __services :: Db :: new"),
             "{generated}"
         );
         // The connection string comes from the variable the wiring names, not from the backend's
@@ -4197,12 +4276,12 @@ binding = "DB"
 
         let native_service =
             generate_native_service_init(&manifest.service[0], &manifest).to_string();
-        assert!(native_service.contains("skyzen_services :: Kv :: new"));
+        assert!(native_service.contains("skyzen :: __services :: Kv :: new"));
         assert!(native_service.contains("skyzen_redis :: Redis :: connect"));
 
         let cloudflare_database =
             generate_cloudflare_database_init(&manifest.database[0], &manifest).to_string();
-        assert!(cloudflare_database.contains("skyzen_services :: Db :: new"));
+        assert!(cloudflare_database.contains("skyzen :: __services :: Db :: new"));
         assert!(cloudflare_database.contains("skyzen_cloudflare :: CfD1 :: from_env"));
     }
 
@@ -4435,12 +4514,13 @@ type = "storage"
 
         let generated = named_binding_tokens(
             &format_ident!("Cache"),
-            &quote! { ::skyzen_services::Kv },
+            &quote! { ::skyzen::__services::Kv },
             "kv `cache` not configured.",
         )
         .to_string();
 
-        assert!(generated.contains("pub struct Cache (:: skyzen_services :: Kv)"));
+        assert!(generated.contains("pub struct Cache (:: skyzen :: __services :: Kv)"));
+        assert!(!generated.contains("skyzen_services"));
         assert!(generated.contains("impl :: std :: ops :: Deref for Cache"));
         assert!(generated.contains("impl :: skyzen :: extract :: Extractor for Cache"));
         assert!(generated.contains("impl :: skyzen :: middleware :: Middleware for Cache"));
@@ -4455,8 +4535,8 @@ type = "storage"
 
         let ident = format_ident!("Cache");
         let binding = service_binding_ident(&ident);
-        let native = quote! { ::skyzen_services::Kv::new(backend) };
-        let cloudflare = quote! { ::skyzen_services::Kv::new(cf_backend) };
+        let native = quote! { ::skyzen::__services::Kv::new(backend) };
+        let cloudflare = quote! { ::skyzen::__services::Kv::new(cf_backend) };
 
         let unambiguous =
             named_injection_tokens(&binding, &ident, &native, &cloudflare, true).to_string();
