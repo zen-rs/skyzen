@@ -15,3 +15,9 @@ crate-type = ["cdylib", "rlib"]
 # restores agreement after upgrading the CLI.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "={{ ctx.wasm_bindgen_version }}"
+
+[package.metadata.cargo-machete]
+# `utoipa` is reached only through what `#[derive(ToSchema)]` EXPANDS to — `::utoipa::…` paths —
+# so no source line names the crate and an unused-dependency check cannot see the use. Removing it
+# breaks the derive.
+ignored = ["utoipa"]

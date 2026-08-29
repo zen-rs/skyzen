@@ -49,10 +49,10 @@ use skyzen::{
     hyper::Hyper,
     routing::{CreateRouteNode, Route, Router},
     utils::Json,
-    Server,
+    Server, ToSchema,
 };
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct StatusResponse {
     status: &'static str,
     runtime: &'static str,

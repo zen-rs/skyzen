@@ -5,13 +5,13 @@ use skyzen::{
     extract::{Path, Query},
     routing::{CreateRouteNode, Route},
     utils::Json,
-    Body, RequestBodyLimit, Result, StatusCode,
+    Body, RequestBodyLimit, Result, StatusCode, ToSchema,
 };
 use skyzen_test::TestContext;
 
 /// The filter shape `examples/openapi.rs` documents: a repeated query parameter collected into a
 /// list.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 struct TaskFilter {
     tags: Option<Vec<String>>,
     limit: Option<u32>,
@@ -49,7 +49,7 @@ async fn an_absent_repeated_parameter_is_still_none() {
     assert!(filter.tags.is_none());
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 struct ProjectTask {
     project: String,
     task: u32,
@@ -169,7 +169,7 @@ async fn lifting_the_limit_lets_a_large_body_through() {
 
 #[tokio::test]
 async fn a_status_and_a_body_compose_in_a_tuple() {
-    #[derive(Debug, Serialize)]
+    #[derive(Debug, Serialize, ToSchema)]
     struct Created {
         id: u32,
     }
