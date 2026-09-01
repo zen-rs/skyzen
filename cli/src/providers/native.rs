@@ -1,6 +1,9 @@
 //! The native provider: run the application as an ordinary binary.
 
-use crate::providers::{prepare_child_environment, Action, CommandPlan, ProviderPlan, RunMode};
+use crate::{
+    environment::VariableKind,
+    providers::{prepare_child_environment, Action, CommandPlan, ProviderPlan, RunMode},
+};
 use anyhow::Result;
 use skyzen_manifest::Manifest;
 
@@ -46,7 +49,7 @@ pub fn prepare(action: &Action, manifest: &Manifest) -> Result<ProviderPlan> {
     // runtime environment, and gating compilation on a connection string set only in production
     // would break every CI box.
     let child_env = if matches!(action, Action::Dev { .. }) {
-        prepare_child_environment(manifest)?
+        prepare_child_environment(manifest, VariableKind::ALL)?.child_env
     } else {
         Vec::new()
     };

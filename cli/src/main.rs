@@ -14,9 +14,11 @@ mod secret_files;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Command};
-use providers::{Action, ProviderPlan, RunMode};
+use providers::{Action, FileContents, ProviderPlan, RunMode};
+use secrecy::ExposeSecret as _;
 use std::{
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
     process::{Command as Process, Stdio},
 };
@@ -141,16 +143,10 @@ fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
 
     for file in &plan.generated_files {
         if simulate {
-            output::dry_run(format!("write {}", file.path.display()));
-            println!("{}", file.contents);
+            println!("{}", dry_run_report(file));
             continue;
         }
-        if let Some(parent) = file.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(&file.path, &file.contents)
-            .with_context(|| format!("failed to write {}", file.path.display()))?;
+        write_generated_file(file)?;
         output::step(format!("wrote {}", file.path.display()));
     }
 
@@ -187,6 +183,57 @@ fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
     })
 }
 
+/// What `--dry-run` says about one generated file.
+///
+/// A pure function so the promise it makes — that a secret's value never reaches stdout — is
+/// something a test can hold it to, rather than something a reader has to trust the printing code
+/// about.
+fn dry_run_report(file: &providers::GeneratedFile) -> String {
+    match &file.contents {
+        FileContents::Public(contents) => {
+            format!("[dry-run] write {}\n{contents}", file.path.display())
+        }
+        FileContents::Secret(_) => format!(
+            "[dry-run] write {} (secret values, not shown)",
+            file.path.display()
+        ),
+    }
+}
+
+/// Write one generated file, creating its directory.
+///
+/// A file holding values is created readable by its owner alone. Doing it in the `OpenOptions`
+/// rather than with a `set_permissions` afterwards means there is no window in which the values
+/// are on disk under the default mode.
+fn write_generated_file(file: &providers::GeneratedFile) -> Result<()> {
+    if let Some(parent) = file.path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let (contents, owner_only) = match &file.contents {
+        FileContents::Public(contents) => (contents.as_str(), false),
+        FileContents::Secret(secret) => (secret.expose_secret(), true),
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = owner_only;
+
+    let mut handle = options
+        .open(&file.path)
+        .with_context(|| format!("failed to write {}", file.path.display()))?;
+    handle
+        .write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", file.path.display()))
+}
+
 fn run_commands(
     commands: &[providers::CommandPlan],
     simulate: bool,
@@ -220,4 +267,34 @@ fn run_commands(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dry_run_report;
+    use crate::providers::{FileContents, GeneratedFile};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_dry_run_prints_configuration_verbatim() {
+        let report = dry_run_report(&GeneratedFile {
+            path: PathBuf::from("/tmp/app/wrangler.toml"),
+            contents: FileContents::Public("name = \"demo\"".to_owned()),
+        });
+        assert!(report.contains("write /tmp/app/wrangler.toml"), "{report}");
+        assert!(report.contains("name = \"demo\""), "{report}");
+    }
+
+    #[test]
+    fn a_dry_run_never_prints_a_value() {
+        let report = dry_run_report(&GeneratedFile {
+            path: PathBuf::from("/tmp/app/.dev.vars"),
+            contents: FileContents::Secret("STRIPE_KEY=sk_live_123".into()),
+        });
+        assert_eq!(
+            report,
+            "[dry-run] write /tmp/app/.dev.vars (secret values, not shown)"
+        );
+        assert!(!report.contains("sk_live_123"), "{report}");
+    }
 }

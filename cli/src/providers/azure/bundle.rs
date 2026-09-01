@@ -3,7 +3,7 @@
 //! Rendered from typed structs through `serde_json` rather than assembled as text, so a key that
 //! is renamed or dropped fails the build instead of producing a bundle the host silently ignores.
 
-use crate::providers::GeneratedFile;
+use crate::providers::{FileContents, GeneratedFile};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use skyzen_manifest::{AzureQueueTrigger, AzureSection, HTTP_FUNCTION_NAME};
@@ -34,25 +34,25 @@ pub fn render(
     let mut files = vec![
         GeneratedFile {
             path: bundle_dir.join("host.json"),
-            contents: to_json(&HostJson::new(config, binary))?,
+            contents: FileContents::Public(to_json(&HostJson::new(config, binary))?),
         },
         GeneratedFile {
             path: bundle_dir.join("local.settings.json"),
-            contents: to_json(&LocalSettings::default())?,
+            contents: FileContents::Public(to_json(&LocalSettings::default())?),
         },
         GeneratedFile {
             // Every HTTP request arrives through this one function: its route is a wildcard and
             // it accepts every method, so routing stays the application's own router's job. The
             // name is reserved in the schema, so no queue trigger can take this directory.
             path: bundle_dir.join(HTTP_FUNCTION_NAME).join("function.json"),
-            contents: to_json(&FunctionJson::http())?,
+            contents: FileContents::Public(to_json(&FunctionJson::http())?),
         },
     ];
 
     for trigger in &config.queue_triggers {
         files.push(GeneratedFile {
             path: bundle_dir.join(&trigger.function).join("function.json"),
-            contents: to_json(&FunctionJson::queue(trigger))?,
+            contents: FileContents::Public(to_json(&FunctionJson::queue(trigger))?),
         });
     }
 
@@ -268,7 +268,7 @@ struct Binding {
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{render, FileContents};
     use skyzen_manifest::Manifest;
     use std::path::{Path, PathBuf};
 
@@ -290,9 +290,12 @@ mod tests {
         .expect("the bundle renders")
         .into_iter()
         .map(|file| {
-            let parsed = serde_json::from_str(&file.contents)
+            let FileContents::Public(contents) = &file.contents else {
+                panic!("{} is configuration, not values", file.path.display());
+            };
+            let parsed = serde_json::from_str(contents)
                 .unwrap_or_else(|error| panic!("{} is not JSON: {error}", file.path.display()));
-            (file.path, parsed)
+            (file.path.clone(), parsed)
         })
         .collect()
     }

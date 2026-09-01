@@ -8,7 +8,7 @@ pub mod wrangler;
 use crate::{
     cli::SecretCommand,
     project::{Project, WASM_TARGET},
-    providers::{Action, CommandPlan, GeneratedFile, ProviderPlan, RunMode},
+    providers::{Action, CommandPlan, FileContents, GeneratedFile, ProviderPlan, RunMode},
 };
 use anyhow::{Context, Result};
 use build::{BuildPlan, DurableObjectExport};
@@ -121,7 +121,7 @@ pub fn prepare(
         commands,
         generated_files: vec![GeneratedFile {
             path: wrangler_path,
-            contents: rendered,
+            contents: FileContents::Public(rendered),
         }],
         build: boxed_build,
         run_mode,

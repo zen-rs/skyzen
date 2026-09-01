@@ -216,7 +216,7 @@ fn watch_paths(root: &Path) -> Vec<PathBuf> {
         root.join("Cargo.toml"),
     ];
     // An edited `.env` changes what the child sees, so it belongs in the watch set too.
-    candidates.extend(environment::dotenv_paths(root));
+    candidates.extend(environment::Environment::paths(root));
 
     candidates.retain(|path| path.exists());
     candidates.sort();

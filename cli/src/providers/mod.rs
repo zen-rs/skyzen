@@ -11,7 +11,8 @@ mod native;
 use crate::{
     capabilities,
     cli::{Provider, SecretCommand},
-    environment, output,
+    environment::{self, ResolvedVariables, VariableKind},
+    output,
     project::{Project, WASM_TARGET},
 };
 use anyhow::{Context, Result};
@@ -120,12 +121,36 @@ pub trait ArtifactBuild: Debug + Send {
 }
 
 /// A file the CLI generates before running anything.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GeneratedFile {
     /// Where it goes.
     pub path: PathBuf,
     /// What goes in it.
-    pub contents: String,
+    pub contents: FileContents,
+}
+
+/// What a generated file holds, and therefore what `--dry-run` may print.
+///
+/// A generated `wrangler.toml` or `host.json` is configuration a user should be able to read
+/// before it is written; a `.dev.vars` is values. Making the distinction a type rather than a
+/// convention means a new generated file has to say which it is, and a printer cannot forget.
+#[derive(Debug)]
+pub enum FileContents {
+    /// Configuration, printed verbatim by `--dry-run`.
+    Public(String),
+    /// Values, never printed and written with owner-only permissions.
+    // Nothing in the binary builds one yet — the Cloudflare `.dev.vars` writer is the first that
+    // will. `expect` rather than `allow` so the marker removes itself: the compiler points at
+    // this line the moment it stops being true. Only outside `cfg(test)`, where the dry-run test
+    // already constructs one.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the first secret-valued generated file is `.dev.vars`"
+        )
+    )]
+    Secret(secrecy::SecretString),
 }
 
 /// How the supervised process and the build relate while `dev` is running.
@@ -516,38 +541,40 @@ fn check_manifest(
 /// project is diagnosed on is routinely not the one holding the production connection strings.
 /// `skyzen dev` is where an unset variable is an error, because that is where it would panic.
 fn report_native_wiring(manifest: &Manifest) {
-    let Some(native) = manifest.data().native.as_ref() else {
-        return;
-    };
-    if native.service.is_empty() && native.database.is_empty() {
-        return;
-    }
-
-    for (name, service) in &native.service {
-        output::ok(format!(
-            "native: service `{name}` is backed by `{}`",
-            service.backend().as_str()
-        ));
-    }
-    for (name, database) in &native.database {
-        output::ok(format!(
-            "native: database `{name}` is backed by `{}`",
-            database.backend().as_str()
-        ));
-    }
-
-    let dotenv = environment::load_dotenv_files(manifest.root_dir()).unwrap_or_else(|error| {
-        output::warn(format!("native: {error:#}"));
-        std::collections::BTreeMap::new()
-    });
-    for variable in environment::required_variables(manifest.data()) {
-        if dotenv.contains_key(&variable.name) || std::env::var_os(&variable.name).is_some() {
-            continue;
+    if let Some(native) = manifest.data().native.as_ref() {
+        for (name, service) in &native.service {
+            output::ok(format!(
+                "native: service `{name}` is backed by `{}`",
+                service.backend().as_str()
+            ));
         }
-        output::warn(format!(
-            "native: {} is set nowhere (declared by {}); `skyzen dev` will refuse to start",
-            variable.name, variable.declared_by
-        ));
+        for (name, database) in &native.database {
+            output::ok(format!(
+                "native: database `{name}` is backed by `{}`",
+                database.backend().as_str()
+            ));
+        }
+    }
+
+    let variables = environment::runtime_variables(manifest.data());
+    if variables.is_empty() {
+        return;
+    }
+    let loaded = environment::Environment::load(manifest.root_dir()).unwrap_or_else(|error| {
+        output::warn(format!("native: {error:#}"));
+        environment::Environment::default()
+    });
+    for variable in variables {
+        match loaded.get(variable.name.as_str()) {
+            Ok(Some(_)) => {}
+            Ok(None) => output::warn(format!(
+                "native: {} {} is set nowhere (declared by {}); `skyzen dev` will refuse to start",
+                variable.kind.label(),
+                variable.name,
+                variable.declared_by
+            )),
+            Err(error) => output::warn(format!("native: {} {error}", variable.name)),
+        }
     }
 }
 
@@ -595,16 +622,41 @@ fn check_cloudflare_manifest(manifest: &Manifest, environment: Option<&str>) -> 
     failures
 }
 
-/// Load the project's `.env` files and check every variable the manifest declares is available.
+/// The runtime variables one provider needs, resolved, plus the environment its child gets.
+#[derive(Debug, Default)]
+pub struct ChildEnvironment {
+    /// Every variable of the requested kinds, with the value found for it.
+    ///
+    /// A provider that delivers variables to a deployed function reads these; one that only runs
+    /// the application locally needs nothing beyond the resolution having succeeded.
+    // `expect` rather than `allow`: the AWS and Azure deploy sinks are what read it, and the
+    // compiler will point at this line once they do.
+    #[expect(dead_code, reason = "read by the per-provider delivery sinks")]
+    pub resolved: ResolvedVariables,
+    /// What to add to the child process's inherited environment.
+    pub child_env: Vec<(String, String)>,
+}
+
+/// Resolve the runtime variables of the given kinds, and say what a child process should be
+/// started with.
+///
+/// The child gets only the dotenv entries the CLI's own environment does not already hold, so a
+/// one-off `CACHE_URL=... skyzen dev` beats `.env` rather than the other way round.
 ///
 /// # Errors
 ///
 /// Fails when a dotenv file cannot be read, or when a declared variable is set nowhere.
-pub fn prepare_child_environment(manifest: &Manifest) -> Result<Vec<(String, String)>> {
-    let dotenv = environment::load_dotenv_files(manifest.root_dir())
+pub fn prepare_child_environment(
+    manifest: &Manifest,
+    kinds: &[VariableKind],
+) -> Result<ChildEnvironment> {
+    let loaded = environment::Environment::load(manifest.root_dir())
         .context("failed to load the project's .env files")?;
-    environment::ensure_available(&environment::required_variables(manifest.data()), &dotenv)?;
-    Ok(dotenv.into_iter().collect())
+    let resolved = loaded.resolve(&environment::runtime_variables_of(manifest.data(), kinds))?;
+    Ok(ChildEnvironment {
+        resolved,
+        child_env: loaded.child_overrides(),
+    })
 }
 
 #[cfg(test)]
