@@ -688,6 +688,8 @@ does not create. See the [deployment guide](deployment-guide.md#queues).
 ```toml
 [azure]
 app_name = "skyzen-demo"                 # the Function App to publish to
+subscription_id = "00000000-0000-0000-0000-000000000000"   # the subscription it lives in
+resource_group = "skyzen-rg"             # the resource group it lives in
 target = "x86_64-unknown-linux-musl"     # a Function App runs Linux
 http_mode = "forward"                    # "forward" (default) or "proxy"
 
@@ -699,7 +701,9 @@ connection_env = "AzureWebJobsStorage"   # the app setting holding the connectio
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `app_name` | string | none | Required by `deploy` and `logs`; nothing can infer it |
+| `app_name` | string | none | Required by `deploy`, `logs` and `secret`; nothing can infer it |
+| `subscription_id` | string | none | Required by `deploy` and `secret`: half the ARM id of the app settings the runtime variables are delivered to (`az account show --query id -o tsv`) |
+| `resource_group` | string | none | Required by `deploy` and `secret`: the other half of that ARM id |
 | `target` | string | the host's own target | A Linux triple; a macOS build is refused before publishing |
 | `http_mode` | `"forward"` \| `"proxy"` | `"forward"` | `proxy` streams responses; `forward` buffers them |
 | `queue_triggers` | array of tables | empty | One Functions queue trigger each |

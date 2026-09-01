@@ -34,6 +34,9 @@ ignore = "0.4"
 notify-debouncer-full = "0.4"
 pathdiff = "0.2"
 regex = "1"
+# The Azure app settings are read and written over ARM, which has no Rust SDK for the Web Apps
+# provider; same rustls-only selection as `skyzen-azure` so the workspace resolves one TLS stack.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
