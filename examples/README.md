@@ -70,7 +70,7 @@ cargo run --example openapi
 Features:
 
 - Extended OpenAPI example with multiple annotated handlers.
-- Demonstrates `Route::openapi()` and `OpenApi::redoc_route("/docs")` to serve ReDoc documentation.
+- Demonstrates `Route::openapi()` and `OpenApi::scalar_route("/docs")` to serve Scalar documentation.
 - Shows typed request/response schemas with `#[skyzen::openapi]`, and `State<T>` shared across handlers.
 
 ```sh
