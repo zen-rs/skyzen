@@ -568,18 +568,28 @@ run_worker_first = false
 
 ### Secrets Store
 
+A secret is declared portably with `[[secret]]`; `[cloudflare.secret.<NAME>]` backs one with a
+Cloudflare Secrets Store entry instead of a classic Worker secret. The section's key is the
+`[[secret]]` name, which is also the binding the Worker resolves — so nothing in the application
+knows which of the two it got.
+
 ```toml
-[[cloudflare.secrets_store_secrets]]
-binding = "API_KEY"
+[[secret]]
+name = "API_KEY"
+
+[cloudflare.secret.API_KEY]
 store_id = "your-store-id"
 secret_name = "api-key"
 ```
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `binding` | string | **Required.** Binding name, as seen from `env` |
 | `store_id` | string | **Required.** The secrets store the secret lives in |
 | `secret_name` | string | **Required.** The secret's name within that store |
+
+A `[cloudflare.secret.<NAME>]` naming a secret no `[[secret]]` declares is a parse error, as is a
+`[[secret]]` whose name is also a `[cloudflare.vars]` or `[aws.env]` key — those tables are
+uploaded in plaintext.
 
 ### Handlers
 

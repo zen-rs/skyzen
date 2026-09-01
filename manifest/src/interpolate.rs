@@ -8,8 +8,11 @@
 //! quotes or newlines cannot break the file. Keys are never expanded. A missing, unclosed, or
 //! invalid name fails the parse; there is no `${NAME:-default}`. `$$` writes a literal `$`.
 
+use crate::{
+    schema::VarName,
+    walk::{walk_strings, StringSite},
+};
 use std::borrow::Cow;
-use toml::Value;
 
 /// Looks up `${NAME}` during expansion. `Ok(None)` means the name is unset.
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Result<Option<String>, InterpolateError>;
@@ -128,7 +131,7 @@ pub fn expand<'a>(
                     location: location.to_owned(),
                 });
             }
-            if !is_ident(name) {
+            if !VarName::is_valid(name) {
                 return Err(InterpolateError::InvalidName {
                     location: location.to_owned(),
                     name: name.to_owned(),
@@ -164,60 +167,12 @@ pub fn expand_table(
     table: &mut toml::Table,
     lookup: EnvLookup<'_>,
 ) -> Result<(), InterpolateError> {
-    expand_table_at(table, "", lookup)
-}
-
-fn expand_table_at(
-    table: &mut toml::Table,
-    parent: &str,
-    lookup: EnvLookup<'_>,
-) -> Result<(), InterpolateError> {
-    for (key, value) in table.iter_mut() {
-        let location = child_path(parent, key);
-        expand_value(value, &location, lookup)?;
-    }
-    Ok(())
-}
-
-fn expand_value(
-    value: &mut Value,
-    location: &str,
-    lookup: EnvLookup<'_>,
-) -> Result<(), InterpolateError> {
-    match value {
-        Value::String(text) => {
-            if let Cow::Owned(expanded) = expand(text, location, lookup)? {
-                *text = expanded;
-            }
-            Ok(())
+    walk_strings(table, &mut |site: StringSite<'_>| {
+        if let Cow::Owned(expanded) = expand(site.value, site.location, lookup)? {
+            *site.value = expanded;
         }
-        Value::Array(items) => {
-            for (index, item) in items.iter_mut().enumerate() {
-                let child = format!("{location}[{index}]");
-                expand_value(item, &child, lookup)?;
-            }
-            Ok(())
-        }
-        Value::Table(table) => expand_table_at(table, location, lookup),
-        Value::Integer(_) | Value::Float(_) | Value::Boolean(_) | Value::Datetime(_) => Ok(()),
-    }
-}
-
-fn child_path(parent: &str, key: &str) -> String {
-    if parent.is_empty() {
-        key.to_owned()
-    } else {
-        format!("{parent}.{key}")
-    }
-}
-
-fn is_ident(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    match bytes.next() {
-        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
-        _ => return false,
-    }
-    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        Ok(())
+    })
 }
 
 #[cfg(test)]

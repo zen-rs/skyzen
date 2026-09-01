@@ -78,7 +78,7 @@ fn collect(
     named: Vec<WiringEnvVar<'_>>,
 ) {
     variables.extend(named.into_iter().map(|variable| RequiredVariable {
-        name: variable.name.to_owned(),
+        name: variable.name.to_string(),
         declared_by: variable.key.map_or_else(
             || format!("{section} backend = \"{backend}\""),
             |key| format!("{section}.{key}"),
