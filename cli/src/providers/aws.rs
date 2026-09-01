@@ -9,6 +9,7 @@
 //! binary notices `AWS_LAMBDA_RUNTIME_API` and serves invocations instead of binding a port.
 
 use crate::{
+    environment::VariableKind,
     output,
     project::Project,
     providers::{prepare_child_environment, Action, CommandPlan, ProviderPlan, RunMode},
@@ -61,7 +62,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
         // `cargo lambda deploy` reads AWS credentials from the environment, and the manifest's own
         // declared variables are what the function will run with.
         child_env: if matches!(action, Action::Deploy) {
-            prepare_child_environment(manifest)?
+            prepare_child_environment(manifest, VariableKind::ALL)?.child_env
         } else {
             Vec::new()
         },

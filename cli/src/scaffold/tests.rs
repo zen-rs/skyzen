@@ -478,7 +478,7 @@ fn the_env_example_lists_what_the_template_manifest_declares() {
     create_project(&request(&root, Template::Minimal)).expect("scaffold");
     let example = fs::read_to_string(root.join(".env.example")).expect(".env.example");
     assert!(
-        example.contains("declares no native environment variables"),
+        example.contains("declares no runtime environment variables"),
         "{example}"
     );
 }
