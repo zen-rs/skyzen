@@ -16,11 +16,13 @@ use crate::{
     project::{Project, WASM_TARGET},
 };
 use anyhow::{Context, Result};
+use secrecy::{ExposeSecret as _, SecretString};
 use skyzen_manifest::Manifest;
 use std::{
     fmt::Debug,
+    io::Write as _,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 
 /// What the user asked the CLI to do, once `new`, `add` and `completions` — which need no
@@ -76,7 +78,7 @@ impl Action {
 }
 
 /// One external process to run.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CommandPlan {
     /// The program to launch.
     pub program: String,
@@ -84,10 +86,15 @@ pub struct CommandPlan {
     pub args: Vec<String>,
     /// The directory to launch it in.
     pub cwd: Option<PathBuf>,
+    /// What the process reads on its standard input.
+    pub stdin: CommandStdin,
 }
 
 impl CommandPlan {
     /// A copy-pasteable rendering, for progress output and `--dry-run`.
+    ///
+    /// The standard input is deliberately not part of it: a value delivered there is the one thing
+    /// about a command that must never reach a terminal or a log.
     pub fn display(&self) -> String {
         let command = if self.args.is_empty() {
             self.program.clone()
@@ -99,20 +106,118 @@ impl CommandPlan {
             None => command,
         }
     }
+
+    /// The same command, with `value` written to its standard input.
+    // `expect` rather than `allow` so the marker removes itself: the Cloudflare secret sinks are
+    // the first callers, and the compiler points here the moment they exist.
+    #[expect(dead_code, reason = "the first caller is `skyzen secret set`")]
+    #[must_use]
+    pub fn with_stdin(mut self, value: SecretString) -> Self {
+        self.stdin = CommandStdin::Secret(value);
+        self
+    }
 }
 
-/// The artifact build one provider performs before its commands run.
+/// What an external process reads on its standard input.
 ///
-/// Each provider's build is a different pipeline — wasm-bindgen glue for Cloudflare, a Linux
-/// cross-compile staged into a bundle for Azure — and only the provider knows what its own
-/// pipeline is, so the plan carries one of these rather than one provider's build plan standing in
-/// for all of them. A provider whose build is just a command (AWS runs `cargo lambda build`) uses
-/// a [`CommandPlan`] instead, where `--dry-run` can print it verbatim.
-pub trait ArtifactBuild: Debug + Send {
+/// The reason it is a field rather than a convention: a value handed to wrangler travels here and
+/// nowhere else, so [`CommandPlan::display`] can print every part of a command it *does* carry.
+#[derive(Debug, Default)]
+pub enum CommandStdin {
+    /// The CLI's own standard input, so a tool that prompts stays usable.
+    #[default]
+    Inherit,
+    /// A value written to the process, after which the pipe is closed.
+    #[expect(dead_code, reason = "the first caller is `skyzen secret set`")]
+    Secret(SecretString),
+}
+
+impl CommandStdin {
+    /// How the child's standard input is wired up.
+    fn stdio(&self) -> Stdio {
+        match self {
+            Self::Inherit => Stdio::inherit(),
+            Self::Secret(_) => Stdio::piped(),
+        }
+    }
+
+    /// Write the value to a spawned child, closing the pipe afterwards.
+    ///
+    /// On a thread of its own, because a value larger than the pipe buffer would otherwise
+    /// deadlock: the parent blocks writing while the child waits for input the parent is not
+    /// getting round to sending. The value is copied into the thread as another [`SecretString`],
+    /// so the copy is zeroized when the writer is done with it.
+    fn write_to(&self, child: &mut Child) -> Result<()> {
+        let Self::Secret(value) = self else {
+            return Ok(());
+        };
+        let mut pipe = child
+            .stdin
+            .take()
+            .context("the process was started without a standard input pipe")?;
+        let value = SecretString::from(value.expose_secret().to_owned());
+        std::thread::spawn(move || {
+            if let Err(error) = pipe.write_all(value.expose_secret().as_bytes()) {
+                output::warn(format!(
+                    "failed to write a value to the process's standard input: {error}"
+                ));
+            }
+        });
+        Ok(())
+    }
+}
+
+/// One piece of work in a provider's plan.
+#[derive(Debug)]
+pub enum Step {
+    /// An external process to run.
+    Command(CommandPlan),
+    /// Work the CLI performs itself.
+    #[expect(
+        dead_code,
+        reason = "the first planned task seeds a local Secrets Store entry"
+    )]
+    Task(Box<dyn Task>),
+}
+
+impl Step {
+    /// A one-line description, for progress output and `--dry-run`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Command(command) => command.display(),
+            Self::Task(task) => task.describe(),
+        }
+    }
+
+    /// Perform it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the process cannot be launched, when it exits non-zero, or when the task does.
+    pub fn run(&self, child_env: &[(String, String)]) -> Result<()> {
+        match self {
+            Self::Command(command) => run_command(command, child_env),
+            Self::Task(task) => {
+                output::step(task.describe());
+                task.run()
+            }
+        }
+    }
+}
+
+/// Work the CLI does itself rather than by launching a process.
+///
+/// An artifact build is one — wasm-bindgen glue for Cloudflare, a Linux cross-compile staged into
+/// a bundle for Azure — and so is anything whose next command depends on what the previous one
+/// answered, such as seeding a Secrets Store entry whose id is only known after listing the store.
+/// A step that is just a process uses a [`CommandPlan`] instead, where `--dry-run` prints it
+/// verbatim.
+pub trait Task: Debug + Send {
     /// A one-line description for progress output and `--dry-run`.
     fn describe(&self) -> String;
 
-    /// Produce the artifacts.
+    /// Do the work.
     ///
     /// # Errors
     ///
@@ -169,12 +274,15 @@ pub enum RunMode {
 /// What one provider decided to do.
 #[derive(Debug, Default)]
 pub struct ProviderPlan {
-    /// External processes to run, in order.
-    pub commands: Vec<CommandPlan>,
+    /// The work to perform after the build, in order.
+    pub steps: Vec<Step>,
     /// Files to write first.
     pub generated_files: Vec<GeneratedFile>,
     /// The artifact build to perform, when the action needs artifacts.
-    pub build: Option<Box<dyn ArtifactBuild>>,
+    ///
+    /// Separate from [`steps`](Self::steps) because it is the *supervised* build: `skyzen dev`
+    /// re-runs this one on every source change, and nothing else.
+    pub build: Option<Box<dyn Task>>,
     /// How to supervise the commands.
     pub run_mode: RunMode,
     /// Environment to hand the supervised process, never applied to the CLI's own environment.
@@ -186,6 +294,90 @@ pub struct ProviderPlan {
     /// `deploy --dry-run` maps onto `wrangler deploy --dry-run`, which validates the real bundle,
     /// so its plan runs for real and only the upload is skipped. Everything else prints instead.
     pub execute_despite_dry_run: bool,
+}
+
+impl ProviderPlan {
+    /// The steps a supervised run performs first, and the process it then supervises.
+    ///
+    /// The supervised process is the last step, and everything before it is a preamble that has to
+    /// have happened by the time it starts — seeding wrangler's local Secrets Store before
+    /// `wrangler dev` reads it, for one.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the plan ends in something other than a command, which would mean supervising
+    /// nothing while silently skipping the work that was planned.
+    pub fn supervised(&self) -> Result<(&[Step], &CommandPlan)> {
+        let (last, preamble) = self
+            .steps
+            .split_last()
+            .context("a supervised run needs a command to supervise")?;
+        let Step::Command(command) = last else {
+            anyhow::bail!(
+                "a supervised run must end in the process to supervise, not `{}`",
+                last.describe()
+            );
+        };
+        Ok((preamble, command))
+    }
+}
+
+/// Run every step in order, or report what they would have been.
+///
+/// # Errors
+///
+/// Fails on the first step that does, naming it.
+pub fn run_steps(steps: &[Step], simulate: bool, child_env: &[(String, String)]) -> Result<()> {
+    for step in steps {
+        if simulate {
+            output::dry_run(step.describe());
+            continue;
+        }
+        step.run(child_env)?;
+    }
+    Ok(())
+}
+
+/// Run one external command to completion.
+///
+/// # Errors
+///
+/// Fails when the program cannot be launched or exits non-zero.
+pub fn run_command(command: &CommandPlan, child_env: &[(String, String)]) -> Result<()> {
+    let display = command.display();
+    output::step(&display);
+    let mut child = spawn_command(command, child_env)?;
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for {}", command.program))?;
+    if !status.success() {
+        anyhow::bail!("command failed with status {status}: {display}");
+    }
+    Ok(())
+}
+
+/// Start one external command, handing it whatever its standard input carries.
+///
+/// # Errors
+///
+/// Fails when the program cannot be launched.
+pub fn spawn_command(command: &CommandPlan, child_env: &[(String, String)]) -> Result<Child> {
+    let mut process = Command::new(&command.program);
+    process
+        .args(&command.args)
+        .envs(child_env.iter().map(|(key, value)| (key, value)))
+        .stdin(command.stdin.stdio())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(cwd) = &command.cwd {
+        process.current_dir(cwd);
+    }
+
+    let mut child = process
+        .spawn()
+        .with_context(|| format!("failed to launch {}", command.program))?;
+    command.stdin.write_to(&mut child)?;
+    Ok(child)
 }
 
 /// Build the plan for one action.
@@ -630,7 +822,8 @@ pub struct ChildEnvironment {
     /// A provider that delivers variables to a deployed function reads these; one that only runs
     /// the application locally needs nothing beyond the resolution having succeeded.
     // `expect` rather than `allow`: the AWS and Azure deploy sinks are what read it, and the
-    // compiler will point at this line once they do.
+    // compiler will point at this line once they do. The Cloudflare sinks resolve through
+    // `resolve_variables`, because what they deliver is not what their child process runs with.
     #[expect(dead_code, reason = "read by the per-provider delivery sinks")]
     pub resolved: ResolvedVariables,
     /// What to add to the child process's inherited environment.
@@ -661,7 +854,7 @@ pub fn prepare_child_environment(
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, CommandPlan};
+    use super::{Action, CommandPlan, CommandStdin};
     use crate::cli::Provider;
     use std::path::PathBuf;
 
@@ -727,7 +920,7 @@ mod tests {
             false,
         )
         .expect("native dev needs no manifest");
-        assert!(plan.commands[0].display().contains("cargo run"));
+        assert!(plan.steps[0].describe().contains("cargo run"));
 
         // The Cloudflare path still fails, but with the message that says what to add.
         let error = super::prepare(
@@ -747,6 +940,7 @@ mod tests {
             program: "wrangler".to_owned(),
             args: vec!["dev".to_owned()],
             cwd: Some(PathBuf::from("/tmp/app")),
+            stdin: CommandStdin::Inherit,
         };
         assert_eq!(plan.display(), "(cd /tmp/app && wrangler dev)");
     }

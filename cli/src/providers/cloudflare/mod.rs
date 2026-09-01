@@ -8,7 +8,9 @@ pub mod wrangler;
 use crate::{
     cli::SecretCommand,
     project::{Project, WASM_TARGET},
-    providers::{Action, CommandPlan, FileContents, GeneratedFile, ProviderPlan, RunMode},
+    providers::{
+        Action, CommandPlan, CommandStdin, FileContents, GeneratedFile, ProviderPlan, RunMode, Step,
+    },
 };
 use anyhow::{Context, Result};
 use build::{BuildPlan, DurableObjectExport};
@@ -64,7 +66,7 @@ pub fn prepare(
     // Kept typed for the entry path below, and boxed into the plan for the CLI to run.
     let boxed_build = build
         .clone()
-        .map(|plan| Box::new(plan) as Box<dyn crate::providers::ArtifactBuild>);
+        .map(|plan| Box::new(plan) as Box<dyn crate::providers::Task>);
 
     let entry_js_path = build.as_ref().map_or_else(
         || manifest.root_dir().join(entry_relative_path(config)),
@@ -118,7 +120,7 @@ pub fn prepare(
     };
 
     Ok(ProviderPlan {
-        commands,
+        steps: commands.into_iter().map(Step::Command).collect(),
         generated_files: vec![GeneratedFile {
             path: wrangler_path,
             contents: FileContents::Public(rendered),
@@ -153,6 +155,7 @@ fn wrangler_commands(
         program: "wrangler".to_owned(),
         args,
         cwd: Some(root_dir.to_path_buf()),
+        stdin: CommandStdin::Inherit,
     };
 
     let commands = match action {

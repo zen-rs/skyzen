@@ -12,7 +12,9 @@ use crate::{
     environment::VariableKind,
     output,
     project::Project,
-    providers::{prepare_child_environment, Action, CommandPlan, ProviderPlan, RunMode},
+    providers::{
+        prepare_child_environment, Action, CommandPlan, CommandStdin, ProviderPlan, RunMode, Step,
+    },
 };
 use anyhow::Result;
 use skyzen_manifest::{AwsSection, Manifest};
@@ -55,7 +57,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
     };
 
     Ok(ProviderPlan {
-        commands,
+        steps: commands.into_iter().map(Step::Command).collect(),
         generated_files: Vec::new(),
         build: None,
         run_mode: RunMode::Once,
@@ -110,6 +112,7 @@ fn build_command(config: &AwsSection, root_dir: &std::path::Path, release: bool)
         program: "cargo".to_owned(),
         args,
         cwd: Some(root_dir.to_path_buf()),
+        stdin: CommandStdin::Inherit,
     }
 }
 
@@ -153,6 +156,7 @@ fn deploy_command(config: &AwsSection, root_dir: &std::path::Path, binary: &str)
         program: "cargo".to_owned(),
         args,
         cwd: Some(root_dir.to_path_buf()),
+        stdin: CommandStdin::Inherit,
     }
 }
 
@@ -179,6 +183,7 @@ fn logs_command(
         program: "aws".to_owned(),
         args,
         cwd: Some(root_dir.to_path_buf()),
+        stdin: CommandStdin::Inherit,
     }
 }
 
@@ -258,7 +263,7 @@ fn event_source_hint(function: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{event_source_hint, prepare};
-    use crate::providers::{Action, CommandPlan};
+    use crate::providers::{Action, Step};
     use skyzen_manifest::Manifest;
 
     fn manifest(source: &str) -> Manifest {
@@ -274,9 +279,9 @@ mod tests {
     fn planned(action: &Action, source: &str) -> Vec<String> {
         prepare(action, &manifest(source), &project())
             .expect("plan")
-            .commands
+            .steps
             .iter()
-            .map(CommandPlan::display)
+            .map(Step::describe)
             .collect()
     }
 

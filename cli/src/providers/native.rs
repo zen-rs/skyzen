@@ -2,7 +2,9 @@
 
 use crate::{
     environment::VariableKind,
-    providers::{prepare_child_environment, Action, CommandPlan, ProviderPlan, RunMode},
+    providers::{
+        prepare_child_environment, Action, CommandPlan, CommandStdin, ProviderPlan, RunMode, Step,
+    },
 };
 use anyhow::Result;
 use skyzen_manifest::Manifest;
@@ -55,11 +57,12 @@ pub fn prepare(action: &Action, manifest: &Manifest) -> Result<ProviderPlan> {
     };
 
     Ok(ProviderPlan {
-        commands: vec![CommandPlan {
+        steps: vec![Step::Command(CommandPlan {
             program: "cargo".to_owned(),
             args,
             cwd: Some(root_dir.clone()),
-        }],
+            stdin: CommandStdin::Inherit,
+        })],
         generated_files: Vec::new(),
         build: None,
         run_mode,
@@ -92,16 +95,12 @@ mod tests {
         .expect("dev plan");
         assert_eq!(dev.run_mode, RunMode::Restart);
         // The separator is what makes the arguments reach the application, not cargo.
-        assert!(dev.commands[0]
-            .display()
-            .contains("cargo run -- --port 3000"));
+        assert!(dev.steps[0].describe().contains("cargo run -- --port 3000"));
         assert!(dev.watch_root.is_some());
 
         let build = prepare(&Action::Build { release: true }, &manifest).expect("build plan");
         assert_eq!(build.run_mode, RunMode::Once);
-        assert!(build.commands[0]
-            .display()
-            .contains("cargo build --release"));
+        assert!(build.steps[0].describe().contains("cargo build --release"));
         assert!(build.watch_root.is_none());
     }
 
