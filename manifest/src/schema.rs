@@ -19,6 +19,7 @@ use std::{
     ffi::OsStr,
     fmt::{Display, Formatter},
     num::{NonZeroU32, NonZeroUsize},
+    str::FromStr,
     time::Duration,
 };
 
@@ -107,6 +108,14 @@ impl TryFrom<String> for VarName {
         } else {
             Err(InvalidVarName { name })
         }
+    }
+}
+
+impl FromStr for VarName {
+    type Err = InvalidVarName;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::try_from(name.to_owned())
     }
 }
 

@@ -1510,7 +1510,11 @@ mod tests {
             assert_eq!(name, accepted);
             assert_eq!(name.as_str(), accepted);
             assert_eq!(name.to_string(), accepted);
+            // `FromStr` is how an argument parser reaches the same rule, so `skyzen secret set
+            // FOO-BAR` is rejected by the CLI rather than by the platform it is sent to.
+            assert_eq!(accepted.parse::<VarName>().expect("an identifier"), name);
         }
+        assert!("FOO-BAR".parse::<VarName>().is_err());
     }
 
     #[test]

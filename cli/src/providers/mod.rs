@@ -10,14 +10,14 @@ mod native;
 
 use crate::{
     capabilities,
-    cli::{Provider, SecretCommand},
-    environment::{self, ResolvedVariables, VariableKind},
+    cli::Provider,
+    environment::{self, ResolvedVariables, RuntimeVariable, VariableKind},
     output,
     project::{Project, WASM_TARGET},
 };
 use anyhow::{Context, Result};
 use secrecy::{ExposeSecret as _, SecretString};
-use skyzen_manifest::Manifest;
+use skyzen_manifest::{Manifest, SkyzenManifest, VarName};
 use std::{
     fmt::Debug,
     io::Write as _,
@@ -27,7 +27,7 @@ use std::{
 
 /// What the user asked the CLI to do, once `new`, `add` and `completions` — which need no
 /// provider — have been handled.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Action {
     /// Produce deployment artifacts and stop.
     Build {
@@ -47,7 +47,7 @@ pub enum Action {
         wrangler_args: Vec<String>,
     },
     /// Manage the deployed application's secrets.
-    Secret(SecretCommand),
+    Secret(SecretAction),
     /// Apply pending SQL migrations, or report which are still pending.
     Migrate {
         /// Act on the local emulator rather than the deployed database.
@@ -55,6 +55,26 @@ pub enum Action {
         /// Report what is applied and what is pending instead of applying anything.
         status: bool,
     },
+}
+
+/// One `skyzen secret` operation, carrying the value the user piped in when there is one.
+///
+/// `main` reads the value from the CLI's own standard input before any provider is asked for a
+/// plan: every provider then sees the same thing, and no provider has to know how a terminal
+/// prompts.
+#[derive(Debug)]
+pub enum SecretAction {
+    /// Set one secret's value.
+    Set {
+        /// The secret's name, checked against the manifest's `[[secret]]` entries before dispatch.
+        name: VarName,
+        /// The value to deliver.
+        value: SecretString,
+    },
+    /// Deliver every declared secret's local value, without rebuilding anything.
+    Push,
+    /// List the secrets the deployment has.
+    List,
 }
 
 impl Action {
@@ -108,9 +128,6 @@ impl CommandPlan {
     }
 
     /// The same command, with `value` written to its standard input.
-    // `expect` rather than `allow` so the marker removes itself: the Cloudflare secret sinks are
-    // the first callers, and the compiler points here the moment they exist.
-    #[expect(dead_code, reason = "the first caller is `skyzen secret set`")]
     #[must_use]
     pub fn with_stdin(mut self, value: SecretString) -> Self {
         self.stdin = CommandStdin::Secret(value);
@@ -128,7 +145,6 @@ pub enum CommandStdin {
     #[default]
     Inherit,
     /// A value written to the process, after which the pipe is closed.
-    #[expect(dead_code, reason = "the first caller is `skyzen secret set`")]
     Secret(SecretString),
 }
 
@@ -155,7 +171,7 @@ impl CommandStdin {
             .stdin
             .take()
             .context("the process was started without a standard input pipe")?;
-        let value = SecretString::from(value.expose_secret().to_owned());
+        let value = environment::duplicate(value);
         std::thread::spawn(move || {
             if let Err(error) = pipe.write_all(value.expose_secret().as_bytes()) {
                 output::warn(format!(
@@ -173,10 +189,6 @@ pub enum Step {
     /// An external process to run.
     Command(CommandPlan),
     /// Work the CLI performs itself.
-    #[expect(
-        dead_code,
-        reason = "the first planned task seeds a local Secrets Store entry"
-    )]
     Task(Box<dyn Task>),
 }
 
@@ -244,18 +256,7 @@ pub enum FileContents {
     /// Configuration, printed verbatim by `--dry-run`.
     Public(String),
     /// Values, never printed and written with owner-only permissions.
-    // Nothing in the binary builds one yet — the Cloudflare `.dev.vars` writer is the first that
-    // will. `expect` rather than `allow` so the marker removes itself: the compiler points at
-    // this line the moment it stops being true. Only outside `cfg(test)`, where the dry-run test
-    // already constructs one.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the first secret-valued generated file is `.dev.vars`"
-        )
-    )]
-    Secret(secrecy::SecretString),
+    Secret(SecretString),
 }
 
 /// How the supervised process and the build relate while `dev` is running.
@@ -402,6 +403,9 @@ pub fn prepare(
     }
 
     let manifest = load_or_empty(manifest_path)?;
+    if let Action::Secret(SecretAction::Set { name, .. }) = action {
+        ensure_declared_secret(manifest.data(), name)?;
+    }
     let project = Project::load(manifest.root_dir())?;
     capabilities::ensure_present(manifest.data(), &project)?;
 
@@ -852,10 +856,59 @@ pub fn prepare_child_environment(
     })
 }
 
+/// Resolve the runtime variables of the given kinds that `wanted` accepts.
+///
+/// The filter is what lets a provider leave out a variable it must not demand: a Cloudflare
+/// deployment binds a Secrets Store secret rather than uploading it, so requiring the value
+/// locally would refuse a deployment whose configuration is complete.
+///
+/// # Errors
+///
+/// Fails when a dotenv file cannot be read, or when a wanted variable is set nowhere.
+pub fn resolve_variables(
+    manifest: &Manifest,
+    kinds: &[VariableKind],
+    wanted: impl Fn(&RuntimeVariable) -> bool,
+) -> Result<ResolvedVariables> {
+    let loaded = environment::Environment::load(manifest.root_dir())
+        .context("failed to load the project's .env files")?;
+    let mut variables = environment::runtime_variables_of(manifest.data(), kinds);
+    variables.retain(wanted);
+    loaded.resolve(&variables)
+}
+
+/// Refuse a `secret set` for a name the manifest does not declare.
+///
+/// A name is what the application reads through its generated `Secret` extractor, so a name
+/// nothing declares would upload a value no code can reach — and the typo would only show up as a
+/// missing secret at cold start.
+fn ensure_declared_secret(manifest: &SkyzenManifest, name: &VarName) -> Result<()> {
+    if manifest.secret.iter().any(|entry| entry.name == *name) {
+        return Ok(());
+    }
+
+    let declared = manifest
+        .secret
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    if declared.is_empty() {
+        anyhow::bail!(
+            "`{name}` is not a declared secret: Skyzen.toml has no [[secret]] entries. Add one \
+             (`[[secret]]` with `name = \"{name}\"`) so the application can read it."
+        );
+    }
+    anyhow::bail!(
+        "`{name}` is not a declared secret; Skyzen.toml declares: {}",
+        declared.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Action, CommandPlan, CommandStdin};
     use crate::cli::Provider;
+    use skyzen_manifest::VarName;
     use std::path::PathBuf;
 
     #[test]
@@ -943,5 +996,57 @@ mod tests {
             stdin: CommandStdin::Inherit,
         };
         assert_eq!(plan.display(), "(cd /tmp/app && wrangler dev)");
+    }
+
+    #[test]
+    fn what_a_command_carries_on_standard_input_is_not_part_of_its_rendering() {
+        // The whole reason values travel on standard input: `--dry-run` and every progress line
+        // print a command in full, and neither may print a secret.
+        let plan = CommandPlan {
+            program: "wrangler".to_owned(),
+            args: vec!["secret".to_owned(), "bulk".to_owned()],
+            cwd: None,
+            stdin: CommandStdin::Inherit,
+        }
+        .with_stdin(secrecy::SecretString::from(
+            r#"{"STRIPE_KEY":"sk_live_123"}"#,
+        ));
+
+        assert_eq!(plan.display(), "wrangler secret bulk");
+        assert!(!plan.display().contains("sk_live_123"));
+        assert!(!super::Step::Command(plan)
+            .describe()
+            .contains("sk_live_123"));
+    }
+
+    #[test]
+    fn a_secret_no_entry_declares_is_refused_with_the_names_that_are() {
+        let manifest = skyzen_manifest::Manifest::parse(
+            "[[secret]]\nname = \"STRIPE_KEY\"\n\n[[secret]]\nname = \"JWT_SIGNING_KEY\"\n",
+            "Skyzen.toml",
+            "/tmp/app",
+        )
+        .expect("valid manifest");
+        let name = |text: &str| VarName::try_from(text.to_owned()).expect("a name");
+
+        super::ensure_declared_secret(manifest.data(), &name("STRIPE_KEY")).expect("declared");
+
+        let error = super::ensure_declared_secret(manifest.data(), &name("STRIPE_KEYY"))
+            .expect_err("a typo must not upload a value no code can read");
+        let rendered = error.to_string();
+        assert!(rendered.contains("STRIPE_KEY"), "{rendered}");
+        assert!(rendered.contains("JWT_SIGNING_KEY"), "{rendered}");
+    }
+
+    #[test]
+    fn a_project_declaring_no_secrets_says_how_to_declare_one() {
+        let manifest =
+            skyzen_manifest::Manifest::parse("", "Skyzen.toml", "/tmp/app").expect("empty");
+        let error = super::ensure_declared_secret(
+            manifest.data(),
+            &VarName::try_from("STRIPE_KEY".to_owned()).expect("a name"),
+        )
+        .expect_err("nothing is declared");
+        assert!(error.to_string().contains("[[secret]]"), "{error}");
     }
 }
