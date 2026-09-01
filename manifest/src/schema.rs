@@ -1397,6 +1397,16 @@ pub struct AzureSection {
     /// The Function App to publish to, as `func azure functionapp publish` names it.
     #[serde(default)]
     pub app_name: Option<String>,
+    /// The Azure subscription the Function App lives in.
+    ///
+    /// Required by `skyzen deploy` and by every `skyzen secret` action: the application settings a
+    /// deployment delivers its runtime variables through are addressed by the resource's full ARM
+    /// id, which the Function App's name alone does not determine.
+    #[serde(default)]
+    pub subscription_id: Option<String>,
+    /// The resource group the Function App lives in, the second half of that ARM id.
+    #[serde(default)]
+    pub resource_group: Option<String>,
     /// The Rust target triple to build the handler for.
     ///
     /// A Function App runs Linux, so a handler built on macOS or Windows cannot be published as
