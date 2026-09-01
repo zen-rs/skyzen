@@ -44,8 +44,8 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 
 **Framework Core:**
 - **`skyzen`** (`/`) - Main framework crate: routing, extractors, responders, middleware, static files, and runtime helpers.
-- **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`) reusable by alternative runtimes. Supports `no_std` when `std` feature is disabled.
-- **`skyzen-macros`** (`macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::scheduled]`, `#[skyzen::email]`, `#[skyzen::tail]`, `#[skyzen::durable_object]`, `#[skyzen::test]`, `#[derive(HttpError)]`, plus the function-like `import_config!` and `embed_migrations!`.
+- **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`) reusable by alternative runtimes, plus `Secret`, the one runtime representation of a `[[secret]]` value. Supports `no_std` when `std` feature is disabled (`Secret` is `std`-only).
+- **`skyzen-macros`** (`macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::scheduled]`, `#[skyzen::email]`, `#[skyzen::tail]`, `#[skyzen::durable_object]`, `#[skyzen::test]`, `#[derive(HttpError)]`, plus the function-like `import_config!` (one named extractor per `[[service]]`, `[[database]]` and `[[secret]]`) and `embed_migrations!`.
 - **`skyzen-manifest`** (`manifest/`) - The one typed `Skyzen.toml` schema, consumed by **both** `skyzen-macros` (at compile time) and `skyzen-cli` (at deploy time), so a section can never be accepted by one and rejected by the other. Every struct carries `deny_unknown_fields` and the `type`/`backend` discriminants are enums, so a typo or an unsupported value fails at parse time.
 - **`skyzen-hyper`** (`hyper/`) - Hyper server adapter implementing the `Server` trait from `skyzen-core`.
 - **`skyzen-lambda`** (`lambda/`) - AWS Lambda adapter: HTTP invocations and SQS batches, driven by its own Tokio runtime. Reached through the root crate's optional `lambda` feature, never named by an application.
@@ -58,12 +58,12 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 - **`skyzen-redis`** (`redis/`) - Redis implementation of `KeyValueStore`, atomics included.
 - **`skyzen-s3`** (`s3/`) - S3-compatible implementation of `ObjectStorage`, with streaming, ranges, multipart and presigning.
 - **`skyzen-cloudflare`** (`cloudflare/`) - Cloudflare Workers implementations for KV, R2, Queues, D1 SQL, Durable Objects, the secrets store, `WorkerContext`/`CfProperties`, and the email/tail events (**wasm32-only**).
-- **`skyzen-cloudflare-admin`** (`cloudflare-admin/`) - Cloudflare REST API client, used by `skyzen provision`.
+- **`skyzen-cloudflare-admin`** (`cloudflare-admin/`) - The shared Cloudflare control-plane types: the `{success, errors, result}` response envelope and `TokenSource`. No HTTP transport and no endpoint wrappers, and nothing in this workspace depends on it — `skyzen provision` drives wrangler.
 - **`skyzen-aws`** (`aws/`) - AWS implementations: DynamoDB (`DynamoKv`), SQS (`SqsQueue`, FIFO and consume side), the Aurora Data API (`RdsDataDb`, with real transactions), and `S3Storage` re-exported from `skyzen-s3`.
 - **`skyzen-azure`** (`azure/`) - Azure implementations: Cosmos DB (`CosmosKv`), Blob Storage (`AzureBlob`), Service Bus (`ServiceBusQueue`), Azure Storage queues (`AzureStorageQueue`).
 
 **Tooling:**
-- **`skyzen-cli`** (`cli/`) - Unified CLI binary: `new`, `add`, `doctor`, `dev`, `build`, `provision`, `migrate` (+ `migrate status`), `deploy`, `logs`, `secret`, `completions`, with a global `--provider` / `--env` / `--manifest` / `--dry-run`. It links the wasm-bindgen generator and the binaryen optimizer in rather than shelling out, so `cargo install skyzen-cli` is the whole toolchain install. Templates and the generated Worker shim are askama templates under `cli/templates/`; `wrangler.toml` is a `Serialize` model, never string assembly.
+- **`skyzen-cli`** (`cli/`) - Unified CLI binary: `new`, `add`, `doctor`, `dev`, `build`, `provision`, `migrate` (+ `migrate status`), `deploy`, `logs`, `secret` (`set` / `push` / `list`, on Cloudflare, AWS and Azure), `completions`, with a global `--provider` / `--env` / `--manifest` / `--dry-run`. `environment.rs` is the one resolver for the variables a running application needs — `[[secret]]` entries and native wiring — and each provider's module is the one sink that delivers them. It links the wasm-bindgen generator and the binaryen optimizer in rather than shelling out, so `cargo install skyzen-cli` is the whole toolchain install. Templates and the generated Worker shim are askama templates under `cli/templates/`; `wrangler.toml` is a `Serialize` model, never string assembly.
 
 ---
 
@@ -142,6 +142,25 @@ remain Cloudflare-only, because nothing else has those events.
   cannot disagree about which files count or how a checksum is computed. `Db::migrate` applies each
   file and its bookkeeping row in one `execute_batch`, and refuses to run when an applied file's
   checksum no longer matches.
+
+### 5b. Secrets
+- A secret is one model on every target: `[[secret]] name = "NAME"` declares it, `import_config!`
+  generates `NameInPascalCase` wrapping `skyzen::Secret` (`STRIPE_KEY` → `StripeKey`), and
+  `#[skyzen::main]` **resolves it once at startup** — `std::env::var` natively, `CfSecret::classic`
+  or `CfSecret::from_store` on Workers when `[cloudflare.secret.<NAME>]` backs it. There is no bare
+  `Secret` extractor: the type names a value, not a capability. A test layers one in with
+  `router.layer(StripeKey::new(Secret::new("x")))`.
+- `Secret` is readable only through `expose`, its `Debug` is `Secret(<redacted>)`, and it has no
+  `Display`.
+- **One identifier rule.** Every variable name in the schema — a secret's name and every `*_env`
+  wiring key — is a `VarName`, validated `[A-Za-z_][A-Za-z0-9_]*` at parse time, so the CLI and the
+  macro cannot read different variables from the same key.
+- **No value on argv or stdout.** The CLI carries values in `SecretString`, delivers them on a
+  child process's standard input (wrangler) or in a request body (Lambda, ARM), writes value-bearing
+  files 0600, and prints `write <path> (secret values, not shown)` under `--dry-run`. A leak needs a
+  visible `expose_secret()`, which is what a review looks for. The canonical description, including
+  the `.env` precedence rule and the per-provider delivery table, is
+  `docs/skyzen-toml-reference.md#secrets`.
 
 ### 6. Error Handling & Log Security
 - `#[skyzen::error]` generates `Display`, `Error`, and `HttpError` implementations with status code attributes.

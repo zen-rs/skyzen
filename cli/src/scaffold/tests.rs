@@ -121,7 +121,7 @@ fn every_template_generates_the_files_a_project_needs() {
         );
 
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect(".gitignore");
-        for secret_file in [".env", ".env.local", ".dev.vars"] {
+        for secret_file in [".env", ".env.local"] {
             assert!(
                 gitignore.lines().any(|line| line == secret_file),
                 "template `{label}` .gitignore must ignore {secret_file}"
@@ -478,7 +478,7 @@ fn the_env_example_lists_what_the_template_manifest_declares() {
     create_project(&request(&root, Template::Minimal)).expect("scaffold");
     let example = fs::read_to_string(root.join(".env.example")).expect(".env.example");
     assert!(
-        example.contains("declares no native environment variables"),
+        example.contains("declares no runtime environment variables"),
         "{example}"
     );
 }

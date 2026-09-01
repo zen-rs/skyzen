@@ -46,3 +46,10 @@ binding = "CACHE"
 [[cloudflare.d1_databases]]
 binding = "JOURNAL"
 database_name = "{{ ctx.worker_name }}-journal"
+
+# A secret is declared portably and resolved once at startup: the environment variable `STRIPE_KEY`
+# natively, a binding of the same name on Workers. `import_config!` generates `StripeKey`, a
+# newtype around `skyzen::Secret` a handler asks for by name. Uncomment it, then
+# `printf %s "$VALUE" | skyzen secret set STRIPE_KEY`.
+# [[secret]]
+# name = "STRIPE_KEY"
