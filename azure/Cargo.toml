@@ -20,11 +20,17 @@ tracing.workspace = true
 # Cosmos DB.
 azure_data_cosmos = { version = "0.37.1", features = ["key_auth"], optional = true }
 
-# Service Bus. The legacy client is the only published one; `azure_core` 0.21 is the HTTP stack it
-# already links, and the settlement calls this crate issues go out on that same client.
-azure_messaging_servicebus = { version = "0.21", optional = true }
-azure_core_legacy = { package = "azure_core", version = "0.21", optional = true }
-time = { version = "0.3", optional = true }
+# Service Bus speaks its REST API directly, on the same reqwest stack the blob backend uses. The
+# only published client, `azure_messaging_servicebus` 0.21, is built on legacy `azure_core` 0.21,
+# which logs the outgoing `authorization` header value at debug level (RUSTSEC-2026-0275) and drags
+# `http-types`, `async-std` and `rand 0.7` in behind it; there is no Service Bus client on
+# `azure_core` 1.0. Four requests — send, peek-lock, complete, unlock — are all this backend issues,
+# and `hmac`/`sha2` mint the shared access signature that authorizes each one.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+# `serde-well-known` is what writes `ScheduledEnqueueTimeUtc` as the RFC 2822 instant Service Bus
+# reads, byte for byte what the legacy client wrote.
+time = { version = "0.3", features = ["serde-well-known"], optional = true }
 url = { version = "2", optional = true }
 
 # Azure Storage queues, and the credential types Cosmos and the queues share.
@@ -83,10 +89,11 @@ blob = [
     "dep:bytes",
 ]
 servicebus = [
-    "dep:azure_messaging_servicebus",
-    "dep:azure_core_legacy",
-    "dep:time",
+    "dep:reqwest",
     "dep:url",
+    "dep:time",
+    "dep:hmac",
+    "dep:sha2",
 ]
 storage-queue = ["dep:azure_storage_queue", "dep:azure_core", "dep:async-io"]
 sql = [

@@ -35,7 +35,7 @@ skyzen-azure = "0.1"
 |---------|---------|-------------|
 | `cosmos` | Yes | Cosmos DB `KeyValueStore` via `azure_data_cosmos` |
 | `blob` | Yes | Blob Storage `ObjectStorage` via Apache OpenDAL, plus the REST calls OpenDAL does not cover |
-| `servicebus` | Yes | Service Bus `MessageQueue` via `azure_messaging_servicebus` |
+| `servicebus` | Yes | Service Bus `MessageQueue`, speaking the Service Bus REST API on `reqwest` |
 | `storage-queue` | Yes | Azure Storage queue `MessageQueue` via `azure_storage_queue` |
 | `sql` | Yes | Azure SQL `DbBackend` via `tiberius` behind a `deadpool` pool |
 
