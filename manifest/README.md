@@ -3,9 +3,9 @@
 The typed model of `Skyzen.toml`, shared by the [Skyzen](https://github.com/zen-rs/skyzen)
 procedural macros and the `skyzen` CLI.
 
-`Skyzen.toml` declares portable capabilities (`[[service]]`, `[[database]]`) once and wires them
-per target (`[native.*]`, `[cloudflare.*]`, `[aws]`, `[azure]`). Two very different consumers read
-it:
+`Skyzen.toml` declares portable capabilities (`[[service]]`, `[[database]]`, `[[secret]]`) once and
+wires them per target (`[native.*]`, `[cloudflare.*]`, `[aws]`, `[azure]`). Two very different
+consumers read it:
 
 - `#[skyzen::main]` reads it at compile time and generates the backend construction, the typed
   extractors, and the Azure queue triggers the runtime mounts.
@@ -29,6 +29,12 @@ let manifest = Manifest::load(std::path::Path::new("Skyzen.toml"))?;
 let cloudflare = manifest.cloudflare(Some("staging"))?;
 # Ok::<_, Box<dyn std::error::Error>>(())
 ```
+
+Every variable name the schema carries — a `[[secret]]` name, and every `url_env` /
+`bucket_env` / `connection_env` / `sas_url_env` wiring key — is a `VarName`, validated as
+`[A-Za-z_][A-Za-z0-9_]*` when the file is parsed. The two consumers would otherwise read different
+variables from the same key: the CLI expands `url_env = "${FOO}"` and the macro bakes it in
+literally, so the type refuses it outright.
 
 String values may contain `${NAME}` placeholders. The CLI expands them from the process
 environment and `.env` through `Manifest::load_with`. `Manifest::load` leaves them as written,

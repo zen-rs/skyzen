@@ -33,8 +33,9 @@ provider:
 - that `wrangler whoami` succeeds, so a deploy will not fail on authentication;
 - for AWS, what `[aws]` would deploy — the function name, the architecture, whether it gets a
   Function URL;
-- for Azure, that `[azure]` names an `app_name` to publish to, and that the Linux target it names
-  is installed.
+- for Azure, that `[azure]` names the Function App to publish to — `app_name`, `subscription_id`
+  and `resource_group` — and that the Linux target it names is installed;
+- for every selected provider, which of the runtime variables it delivers have a value here.
 
 Every check runs even after one fails, and the command exits non-zero if any did.
 
@@ -209,17 +210,13 @@ See [Environments](skyzen-toml-reference.md#environments) for the merge rules.
 
 ### CI
 
-`${NAME}` in `Skyzen.toml` is expanded from the process environment, then `.env` / `.env.local`,
-when the CLI reads the file. Drop a gitignored `.env` onto the runner (one file, not one `env:`
-line per key) or export the variables in the job. That is the environment of `skyzen deploy`, not
-the Worker after it starts.
-
-See [Deploy-time interpolation](skyzen-toml-reference.md#deploy-time-interpolation) for the syntax.
+Drop a gitignored `.env` onto the runner (one file, not one `env:` line per key) or export the
+variables in the job. That is the environment of `skyzen deploy`, not the Worker after it starts.
 `CLOUDFLARE_API_TOKEN` is wrangler's own credential and stays out of the file.
 
-The CLI refuses to load a checkout that has committed a known credential form in `Skyzen.toml`, or
-that is tracking `.env` / `.env.local` / `.dev.vars`. A secret-named key whose value is not a
-known token is a warning, not a hard failure.
+[Secrets](skyzen-toml-reference.md#secrets) has where a value is looked up, what each provider
+delivers, and what the CLI refuses to load; [Deploy-time
+interpolation](skyzen-toml-reference.md#deploy-time-interpolation) has the `${NAME}` syntax.
 
 ### Logs and Secrets
 
@@ -227,10 +224,13 @@ known token is a warning, not a hard failure.
 skyzen logs                                  # wrangler tail
 skyzen logs -- --format json                 # extra arguments pass straight through
 skyzen secret set API_KEY                    # value is read from stdin
-skyzen secret list
+skyzen secret push                           # deliver every declared [[secret]], no rebuild
+skyzen secret list                           # names only
 ```
 
-Secrets are the channel for anything sensitive; `[cloudflare.vars]` is plaintext and committed.
+All three work on Cloudflare, AWS and Azure: `--provider` picks which deployment they act on, and
+a name they are given must be declared as `[[secret]]`. Anything sensitive is a `[[secret]]`;
+`[cloudflare.vars]` is plaintext and committed.
 
 ### Durable Objects
 
@@ -321,8 +321,10 @@ url = true                       # create (and keep) a Function URL; the default
 RUST_LOG = "info"
 ```
 
-`[aws.env]` values are plaintext environment variables, visible to anyone who can read the
-function's configuration. Read anything sensitive from Secrets Manager or SSM at startup instead.
+`[aws.env]` values are plaintext environment variables, committed to the manifest and visible to
+anyone who can read the function's configuration. Declare anything sensitive as `[[secret]]`
+instead: the deploy delivers it to the same function environment without it ever being written
+down. See [Secrets](skyzen-toml-reference.md#secrets).
 
 ### Deploying
 
@@ -336,8 +338,12 @@ That runs, and `--dry-run` prints, exactly:
 ```sh
 cargo lambda build --target aarch64-unknown-linux-gnu --release --features lambda
 cargo lambda deploy --binary-name my-app --memory 512 --timeout 30 \
-  --env-var RUST_LOG=info --enable-function-url skyzen-api
+  --enable-function-url skyzen-api
 ```
+
+The upload is followed by one `UpdateFunctionConfiguration` call that sets the function's
+environment to `[aws.env]` plus every `[[secret]]` and native wiring variable, merged over what the
+function already has. No value reaches a command line: that is why `--env-var` is not passed.
 
 The target triple is named outright rather than left to `cargo lambda`'s default, so the
 architecture the manifest declares is the one that gets built. Setting `url = false` passes
@@ -404,6 +410,8 @@ serves is a startup error naming both; one that merely overlaps a parameterized 
 ```toml
 [azure]
 app_name = "skyzen-demo"                 # the Function App to publish to
+subscription_id = "00000000-0000-0000-0000-000000000000"   # the subscription it lives in
+resource_group = "skyzen-rg"             # the resource group it lives in
 target = "x86_64-unknown-linux-musl"     # a Function App runs Linux
 http_mode = "forward"                    # or "proxy", which streams responses
 
@@ -416,6 +424,12 @@ connection_env = "AzureWebJobsStorage"   # the app setting holding the connectio
 `http_mode = "forward"` buffers the response, which is fine for an API and wrong for server-sent
 events or any other stream: pick `"proxy"` (the host's `enableProxyingHttpRequest`) when the
 application streams.
+
+`subscription_id` and `resource_group` are required by `deploy` and by every `skyzen secret`
+action: a Function App's application settings *are* the custom handler's environment, and they are
+addressed by the resource's full ARM id. The publish is followed by a read-modify-write of those
+settings carrying every `[[secret]]` and native wiring variable, so the host's own settings survive
+it. See [Secrets](skyzen-toml-reference.md#secrets).
 
 ### Deploying
 

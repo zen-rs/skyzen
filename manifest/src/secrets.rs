@@ -6,6 +6,9 @@
 //!   private key, a URL with a password). The CLI refuses to load the file.
 //! * **Heuristic** — a `vars` / `[aws.env]` key whose *name* looks like a secret, or a
 //!   JWT-shaped string. The CLI warns. `${NAME}` placeholders are neither.
+//!
+//! Both point at the same fix: declare the value as `[[secret]]`, which is described in
+//! `docs/skyzen-toml-reference.md#secrets`.
 
 use crate::{
     schema::{VarName, PLAINTEXT_VARIABLE_TABLES},
