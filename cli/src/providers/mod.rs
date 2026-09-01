@@ -7,6 +7,7 @@ pub mod aws;
 pub mod azure;
 pub mod cloudflare;
 mod native;
+pub mod secrets;
 
 use crate::{
     capabilities,
@@ -752,24 +753,45 @@ fn report_native_wiring(manifest: &Manifest) {
         }
     }
 
-    let variables = environment::runtime_variables(manifest.data());
+    report_runtime_variables(manifest, VariableKind::ALL, "native", "skyzen dev");
+}
+
+/// Report the runtime variables one provider is responsible for, and which of them have a value
+/// here.
+///
+/// A warning rather than a failure, and it counts none: `doctor` is not a run, and the machine a
+/// project is diagnosed on is routinely not the one holding the production connection strings. The
+/// command named in `refused_by` is where an unset variable *is* an error, because that is where
+/// it would either panic or ship a half-configured deployment.
+pub fn report_runtime_variables(
+    manifest: &Manifest,
+    kinds: &[VariableKind],
+    label: &str,
+    refused_by: &str,
+) {
+    let variables = environment::runtime_variables_of(manifest.data(), kinds);
     if variables.is_empty() {
         return;
     }
     let loaded = environment::Environment::load(manifest.root_dir()).unwrap_or_else(|error| {
-        output::warn(format!("native: {error:#}"));
+        output::warn(format!("{label}: {error:#}"));
         environment::Environment::default()
     });
     for variable in variables {
         match loaded.get(variable.name.as_str()) {
-            Ok(Some(_)) => {}
-            Ok(None) => output::warn(format!(
-                "native: {} {} is set nowhere (declared by {}); `skyzen dev` will refuse to start",
+            Ok(Some(_)) => output::ok(format!(
+                "{label}: {} {} is set (declared by {})",
                 variable.kind.label(),
                 variable.name,
                 variable.declared_by
             )),
-            Err(error) => output::warn(format!("native: {} {error}", variable.name)),
+            Ok(None) => output::warn(format!(
+                "{label}: {} {} is set nowhere (declared by {}); `{refused_by}` will refuse to run",
+                variable.kind.label(),
+                variable.name,
+                variable.declared_by
+            )),
+            Err(error) => output::warn(format!("{label}: {} {error}", variable.name)),
         }
     }
 }
@@ -824,11 +846,9 @@ pub struct ChildEnvironment {
     /// Every variable of the requested kinds, with the value found for it.
     ///
     /// A provider that delivers variables to a deployed function reads these; one that only runs
-    /// the application locally needs nothing beyond the resolution having succeeded.
-    // `expect` rather than `allow`: the AWS and Azure deploy sinks are what read it, and the
-    // compiler will point at this line once they do. The Cloudflare sinks resolve through
-    // `resolve_variables`, because what they deliver is not what their child process runs with.
-    #[expect(dead_code, reason = "read by the per-provider delivery sinks")]
+    /// the application locally needs nothing beyond the resolution having succeeded. The
+    /// Cloudflare sinks resolve through [`resolve_variables`] instead, because what they deliver
+    /// is not what their child process runs with.
     pub resolved: ResolvedVariables,
     /// What to add to the child process's inherited environment.
     pub child_env: Vec<(String, String)>,
