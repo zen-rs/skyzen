@@ -34,7 +34,9 @@ The Worker events Cloudflare documents are covered too: `fetch` from `#[skyzen::
 
 A handler normally does not name `CfSecret`: `import_config!` generates a named type per
 `[[secret]]` manifest entry and calls the right reader for it, so the binding name is checked
-against the manifest rather than repeated as a string literal.
+against the manifest rather than repeated as a string literal. Declaring a secret, backing one with
+a Secrets Store entry and getting its value to the deployment are in
+[Secrets](https://github.com/zen-rs/skyzen/blob/main/docs/skyzen-toml-reference.md#secrets).
 
 ## Usage
 

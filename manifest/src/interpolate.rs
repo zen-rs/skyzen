@@ -1,8 +1,9 @@
 //! Deploy-time `${NAME}` expansion in `Skyzen.toml` string values.
 //!
-//! The CLI expands placeholders from the process environment (and the project's `.env` files)
-//! when it reads the manifest. `#[skyzen::main]` does **not**: compile-time env is not the
-//! deploy runner, and a GitHub secret the compiler does not have must not fail `cargo build`.
+//! The CLI expands placeholders when it reads the manifest, from the sources and in the order
+//! `docs/skyzen-toml-reference.md#secrets` states. `#[skyzen::main]` does **not**: compile-time env
+//! is not the deploy runner, and a GitHub secret the compiler does not have must not fail
+//! `cargo build`.
 //!
 //! Expansion runs on the parsed TOML document, before the typed schema, so a value containing
 //! quotes or newlines cannot break the file. Keys are never expanded. A missing, unclosed, or
