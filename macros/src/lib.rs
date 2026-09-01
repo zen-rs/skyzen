@@ -2900,8 +2900,12 @@ fn native_database_wiring<'a>(
 ///
 /// Every native backend that takes a URL, a bucket or a connection string reads it this way, so
 /// the lookup and its failure message are written once here rather than in each arm.
-fn env_value_expr(kind: &str, entry: &str, variable: &str) -> proc_macro2::TokenStream {
-    let variable_lit = LitStr::new(variable, proc_macro2::Span::call_site());
+fn env_value_expr(
+    kind: &str,
+    entry: &str,
+    variable: &skyzen_manifest::VarName,
+) -> proc_macro2::TokenStream {
+    let variable_lit = LitStr::new(variable.as_str(), proc_macro2::Span::call_site());
     let missing_message = LitStr::new(
         &format!("portable {kind} `{entry}` missing native env var `{variable}`"),
         proc_macro2::Span::call_site(),
@@ -3091,7 +3095,10 @@ fn native_queue_tokens(
         NativeServiceSection::StorageQueue(storage_queue) => {
             // The signed URL *is* the credential, so the constructor is handed the variable's name
             // and reports it itself rather than being handed a value read here.
-            let variable = LitStr::new(&storage_queue.sas_url_env, proc_macro2::Span::call_site());
+            let variable = LitStr::new(
+                storage_queue.sas_url_env.as_str(),
+                proc_macro2::Span::call_site(),
+            );
             let failure = connect_failure_lit(
                 name,
                 &format!(
