@@ -129,7 +129,7 @@ pub use middleware::Middleware;
 pub use routing::{CreateRouteNode, Route};
 pub use skyzen_core::error::*;
 pub use skyzen_core::Server;
-pub use skyzen_core::{error_response, log_endpoint_error, ErrorChain, RequestBodyLimit};
+pub use skyzen_core::{error_response, log_endpoint_error, ErrorChain, RequestBodyLimit, Secret};
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use wasm_bindgen;
