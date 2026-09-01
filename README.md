@@ -835,10 +835,12 @@ async fn get_item(Path(id): Path<u64>) -> Result<Json<Item>> {
 
 fn router() -> Router {
     let routes = Route::new(("/items/{id}".get(get_item),));
-    let redoc = routes.openapi().redoc();     // interactive ReDoc page
-    Route::new((routes, "/docs".get(redoc))).build()
+    let docs = routes.openapi().scalar_route("/docs"); // interactive Scalar page
+    Route::new((routes, docs)).build()
 }
 ```
+
+`Route::enable_api_doc()` mounts the same Scalar UI at `/api-docs`. `.redoc()` / `.redoc_route()` remain available if you want Redoc instead.
 
 *Schema generation is gated to debug builds and native targets, so release binaries and edge wasm
 bundles stay small.*
