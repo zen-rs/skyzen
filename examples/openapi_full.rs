@@ -174,7 +174,7 @@ fn main() -> Router {
     ));
 
     let openapi = api_routes.openapi();
-    let docs = openapi.redoc_route("/docs");
+    let docs = openapi.scalar_route("/docs");
 
     Route::new((api_routes, docs)).middleware(store).build()
 }
