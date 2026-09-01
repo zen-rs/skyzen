@@ -17,6 +17,7 @@ use crate::{
     cli::{MigrateCommand, Provider},
     environment::{self, load_manifest_with, runtime_variables_of, Environment, VariableKind},
     output,
+    runtime::block_on,
 };
 use anyhow::{Context, Result};
 use secrecy::SecretString;
@@ -129,19 +130,13 @@ pub fn run(
         &[VariableKind::Wiring],
     ))?;
 
-    // A current-thread runtime: this is one connection doing a handful of statements, so a thread
-    // pool would be pure startup cost. `enable_all` is what gives sqlx's TCP drivers a reactor.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to start the async runtime the database drivers need")?;
-
-    runtime.block_on(async {
+    // One connection doing a handful of statements, on the CLI's own current-thread runtime.
+    block_on(async {
         for target in &targets {
             run_target(target, &environment, command).await?;
         }
         Ok(())
-    })
+    })?
 }
 
 /// Apply or report one database's migrations.
