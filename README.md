@@ -869,6 +869,7 @@ skyzen migrate status                 # what is applied, what is pending
 skyzen deploy --provider cloudflare   # or aws, or azure — same application, no code changes
 skyzen logs --env staging             # stream the deployed application's logs
 skyzen secret set API_KEY             # value read from stdin
+skyzen secret push                    # deliver every declared [[secret]]
 skyzen completions fish
 ```
 
@@ -889,39 +890,7 @@ There are three different environments. They are not interchangeable:
 |---|---|
 | `url_env = "CACHE_URL"` | The **name** of a variable the native process reads after it starts |
 | `id = "${CACHE_NAMESPACE_ID}"` | A **deploy-time** placeholder. The CLI expands it before generating `wrangler.toml` |
-| `skyzen secret set API_KEY` | A **Worker secret**. `[cloudflare.vars]` is plaintext and committed; do not put credentials there |
-
-### Local
-
-`skyzen new` writes `.env.example` from the manifest and gitignores `.env`, `.env.local`, and
-wrangler's `.dev.vars`. Copy the example, fill it in, and run:
-
-```sh
-cp .env.example .env
-skyzen dev
-```
-
-`.env.local` overrides `.env`. A variable already in the process environment wins over both.
-`skyzen dev` refuses to start when a name the native wiring declared is set nowhere.
-
-### `Skyzen.toml`
-
-String values may contain `${NAME}` placeholders. The CLI expands them from the process
-environment, then from `.env` / `.env.local`, when it reads the file — including `skyzen deploy`,
-`skyzen provision`, and `skyzen doctor`. A missing name fails the load, naming the TOML path.
-
-```toml
-[cloudflare]
-account_id = "${CLOUDFLARE_ACCOUNT_ID}"
-
-[[cloudflare.kv_namespaces]]
-binding = "CACHE"
-id = "${CACHE_NAMESPACE_ID}"
-```
-
-`CLOUDFLARE_API_TOKEN` stays out of the file: wrangler reads it from the environment (and from
-`.env`) on its own. Do not wrap `url_env`, `binding`, or service names in `${}` — those are
-consumed at compile time as literal names.
+| `[[secret]] name = "API_KEY"` | A **portable secret**. `skyzen deploy` delivers it, and `import_config!` generates the `ApiKey` type a handler asks for. `[cloudflare.vars]` is plaintext and committed; do not put credentials there |
 
 ### GitHub Actions
 
@@ -953,11 +922,12 @@ jobs:
 
       - name: Deploy to Cloudflare
         run: skyzen deploy --provider cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 ```
 
-`DEPLOY_ENV` is the body of `.env` (multi-line), not a single key. The CLI interpolates from that
-file; wrangler picks up `CLOUDFLARE_API_TOKEN` from it the same way. If the job already exports
-variables in the process environment, those win over `.env`.
+`DEPLOY_ENV` is the body of `.env` (multi-line), not a single key. `CLOUDFLARE_API_TOKEN` is
+wrangler's own credential rather than one of the application's: export it in the job's `env:`.
 
 To target a named environment overlay (e.g. `[cloudflare.env.staging]`), pair GitHub Actions
 Environments with the `--env` flag:
@@ -972,15 +942,9 @@ jobs:
       - run: skyzen deploy --provider cloudflare --env staging
 ```
 
-### What the CLI refuses
-
-A documented credential form stored as a literal in `Skyzen.toml` (a GitHub PAT, a PEM private key,
-a URL with a password, an `AKIA…` access key id) fails the load. So does a git checkout that is
-**tracking** `.env`, `.env.local`, or `.dev.vars`. A `vars` / `[aws.env]` key whose *name* looks
-like a secret but whose value is not a known form is a warning, not a hard failure. Errors name
-the path and the kind; they never print the value.
-
-The syntax and the merge rules are in the [Skyzen.toml reference](docs/skyzen-toml-reference.md#deploy-time-interpolation).
+Declaring a secret, where a value is looked up, what each provider delivers and what the CLI
+refuses to load are all in [Secrets](docs/skyzen-toml-reference.md#secrets) and
+[Deploy-time interpolation](docs/skyzen-toml-reference.md#deploy-time-interpolation).
 
 ---
 
@@ -989,8 +953,8 @@ The syntax and the merge rules are in the [Skyzen.toml reference](docs/skyzen-to
 | Crate | Path | Description |
 |---|---|---|
 | [`skyzen`](.) | Root | Routing, extractors, responders, middleware, static files, WebSockets, runtime |
-| [`skyzen-core`](core/) | `core/` | `Extractor`, `Responder`, `Middleware`, `Server`, the error types; `no_std`-capable |
-| [`skyzen-macros`](macros/) | `macros/` | `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::test]`, `embed_migrations!`, … |
+| [`skyzen-core`](core/) | `core/` | `Extractor`, `Responder`, `Middleware`, `Server`, `Secret`, the error types; `no_std`-capable |
+| [`skyzen-macros`](macros/) | `macros/` | `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::test]`, `import_config!` (services, databases and `[[secret]]` types), `embed_migrations!`, … |
 | [`skyzen-manifest`](manifest/) | `manifest/` | The one typed `Skyzen.toml` schema, shared by the macros and the CLI |
 | [`skyzen-services`](services/) | `services/` | The portable capabilities: `Kv`, `Storage`, `Queue`, `Db`, migrations, durable variants |
 | [`skyzen-test`](test/) | `test/` | `TestClient`, `TestContext`, in-memory backends, assertions, `insta` snapshots |
@@ -998,11 +962,11 @@ The syntax and the merge rules are in the [Skyzen.toml reference](docs/skyzen-to
 | [`skyzen-lambda`](lambda/) | `lambda/` | AWS Lambda adapter — HTTP invocations and SQS batches (root crate's `lambda` feature) |
 | [`skyzen-redis`](redis/) | `redis/` | Redis `KeyValueStore` |
 | [`skyzen-s3`](s3/) | `s3/` | S3-compatible `ObjectStorage` |
-| [`skyzen-cloudflare`](cloudflare/) | `cloudflare/` | Workers KV, R2, Queues, D1, Durable Objects, secrets store, `request.cf` (*wasm32 only*) |
-| [`skyzen-cloudflare-admin`](cloudflare-admin/) | `cloudflare-admin/` | Cloudflare REST client, used by `skyzen provision` |
+| [`skyzen-cloudflare`](cloudflare/) | `cloudflare/` | Workers KV, R2, Queues, D1, Durable Objects, `CfSecret`, `request.cf` (*wasm32 only*) |
+| [`skyzen-cloudflare-admin`](cloudflare-admin/) | `cloudflare-admin/` | Shared Cloudflare API response envelopes and token-source types for tools that call the control-plane API |
 | [`skyzen-aws`](aws/) | `aws/` | `DynamoKv`, `SqsQueue`, `RdsDataDb`, and `S3Storage` re-exported |
 | [`skyzen-azure`](azure/) | `azure/` | `CosmosKv`, `AzureBlob`, `ServiceBusQueue`, `AzureStorageQueue`, `AzureSqlDb` |
-| [`skyzen-cli`](cli/) | `cli/` | The `skyzen` binary: scaffolding, local emulation, provisioning, migrations, deployment |
+| [`skyzen-cli`](cli/) | `cli/` | The `skyzen` binary: scaffolding, local emulation, provisioning, migrations, secret delivery, deployment |
 
 ---
 

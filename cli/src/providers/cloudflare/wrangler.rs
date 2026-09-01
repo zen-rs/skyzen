@@ -165,11 +165,13 @@ fn section_config(
                 environment: entry.environment.clone(),
             })
             .collect(),
+        // The binding is the `[[secret]]` name: it is what the map is keyed by, what the
+        // application reads the secret under, and what wrangler creates the `env.NAME` object as.
         secrets_store_secrets: config
-            .secrets_store_secrets
+            .secret
             .iter()
-            .map(|entry| WranglerSecretsStoreSecret {
-                binding: entry.binding.clone(),
+            .map(|(binding, entry)| WranglerSecretsStoreSecret {
+                binding: binding.to_string(),
                 store_id: entry.store_id.clone(),
                 secret_name: entry.secret_name.clone(),
             })
@@ -522,7 +524,8 @@ mod tests {
     #[test]
     fn renders_every_modelled_binding_kind() {
         let rendered = render_base(
-            "[cloudflare]\nname = \"skyzen-worker\"\nmain = \"dist/worker.js\"\n\
+            "[[secret]]\nname = \"API_KEY\"\n\n\
+             [cloudflare]\nname = \"skyzen-worker\"\nmain = \"dist/worker.js\"\n\
              compatibility_date = \"2025-02-01\"\ncompatibility_flags = [\"nodejs_compat\"]\n\
              account_id = \"abc\"\nworkers_dev = true\n\n\
              [cloudflare.vars]\nAPP_ENV = \"dev\"\n\n\
@@ -534,7 +537,7 @@ mod tests {
              [[cloudflare.queues.consumers]]\nqueue = \"jobs\"\nmax_batch_size = 10\ndead_letter_queue = \"jobs-dlq\"\n\n\
              [[cloudflare.services]]\nbinding = \"AUTH\"\nservice = \"auth-worker\"\nenvironment = \"production\"\n\n\
              [cloudflare.assets]\ndirectory = \"public\"\nbinding = \"ASSETS\"\nnot_found_handling = \"single-page-application\"\n\n\
-             [[cloudflare.secrets_store_secrets]]\nbinding = \"API_KEY\"\nstore_id = \"store\"\nsecret_name = \"api-key\"\n\n\
+             [cloudflare.secret.API_KEY]\nstore_id = \"store\"\nsecret_name = \"api-key\"\n\n\
              [[cloudflare.durable_objects.bindings]]\nname = \"STATE\"\nclass_name = \"State\"\n\n\
              [[cloudflare.durable_objects.migrations]]\ntag = \"v1\"\nnew_sqlite_classes = [\"State\"]\n",
             IdPolicy::RequireProvisioned,

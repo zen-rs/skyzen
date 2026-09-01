@@ -6,8 +6,18 @@
 //!   private key, a URL with a password). The CLI refuses to load the file.
 //! * **Heuristic** — a `vars` / `[aws.env]` key whose *name* looks like a secret, or a
 //!   JWT-shaped string. The CLI warns. `${NAME}` placeholders are neither.
+//!
+//! Both point at the same fix: declare the value as `[[secret]]`, which is described in
+//! `docs/skyzen-toml-reference.md#secrets`.
 
-use std::fmt::{Display, Formatter};
+use crate::{
+    schema::{VarName, PLAINTEXT_VARIABLE_TABLES},
+    walk::{walk_strings, StringSite},
+};
+use std::{
+    convert::Infallible,
+    fmt::{Display, Formatter},
+};
 
 /// One string in the document that looks like a secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,52 +69,24 @@ pub struct SecretReport {
 }
 
 /// Walk every string **value** in `table`. Keys are not inspected for credential forms.
+///
+/// The table is taken by mutable reference because the walk is shared with `${NAME}` expansion,
+/// which rewrites what it visits; this pass only reads.
 #[must_use]
-pub fn scan_table(table: &toml::Table) -> SecretReport {
+pub fn scan_table(table: &mut toml::Table) -> SecretReport {
     let mut report = SecretReport::default();
-    scan_table_at(table, "", &mut report);
+    let visit = &mut |site: StringSite<'_>| -> Result<(), Infallible> {
+        classify(
+            site.location,
+            site.key,
+            site.parent,
+            site.value,
+            &mut report,
+        );
+        Ok(())
+    };
+    walk_strings(table, visit).unwrap_or_else(|never| match never {});
     report
-}
-
-fn scan_table_at(table: &toml::Table, parent: &str, report: &mut SecretReport) {
-    for (key, value) in table {
-        let location = child_path(parent, key);
-        match value {
-            toml::Value::String(text) => classify(&location, key, parent, text, report),
-            toml::Value::Array(items) => {
-                for (index, item) in items.iter().enumerate() {
-                    scan_value(&format!("{location}[{index}]"), key, parent, item, report);
-                }
-            }
-            toml::Value::Table(child) => scan_table_at(child, &location, report),
-            toml::Value::Integer(_)
-            | toml::Value::Float(_)
-            | toml::Value::Boolean(_)
-            | toml::Value::Datetime(_) => {}
-        }
-    }
-}
-
-fn scan_value(
-    location: &str,
-    key: &str,
-    parent: &str,
-    value: &toml::Value,
-    report: &mut SecretReport,
-) {
-    match value {
-        toml::Value::String(text) => classify(location, key, parent, text, report),
-        toml::Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                scan_value(&format!("{location}[{index}]"), key, parent, item, report);
-            }
-        }
-        toml::Value::Table(child) => scan_table_at(child, location, report),
-        toml::Value::Integer(_)
-        | toml::Value::Float(_)
-        | toml::Value::Boolean(_)
-        | toml::Value::Datetime(_) => {}
-    }
 }
 
 fn classify(location: &str, key: &str, parent: &str, text: &str, report: &mut SecretReport) {
@@ -128,10 +110,17 @@ fn classify(location: &str, key: &str, parent: &str, text: &str, report: &mut Se
     if is_secret_key_table(parent) && is_secret_named_key(key) {
         report.warnings.push(SecretFinding {
             location: location.to_owned(),
-            kind: "plaintext value of a secret-named key",
+            kind: SECRET_NAMED_KEY,
         });
     }
 }
+
+/// The warning a plaintext value under a secret-named key produces.
+///
+/// Named because the scanner emits it and two tests assert on it; the fix it names is the one
+/// portable one, `[[secret]]`, rather than a per-provider table.
+const SECRET_NAMED_KEY: &str =
+    "plaintext value of a secret-named key; declare it as [[secret]] and run `skyzen secret push`";
 
 /// Documented forms that cannot reasonably be a resource id or a URL.
 fn block_kind(text: &str) -> Option<&'static str> {
@@ -287,9 +276,14 @@ fn url_has_password(text: &str) -> bool {
     }
 }
 
+/// A JWT anywhere in the value, matched token by token like the issuer prefixes above: a token
+/// pasted into a longer string ("Authorization: Bearer eyJ…") is the same leak as one on its own.
 fn looks_like_jwt(text: &str) -> bool {
-    let trimmed = text.trim();
-    let mut parts = trimmed.split('.');
+    text.split_whitespace().any(is_jwt_token)
+}
+
+fn is_jwt_token(token: &str) -> bool {
+    let mut parts = token.split('.');
     let Some(header) = parts.next() else {
         return false;
     };
@@ -307,20 +301,31 @@ fn is_placeholder(text: &str) -> bool {
     trimmed
         .strip_prefix("${")
         .and_then(|inner| inner.strip_suffix('}'))
-        .is_some_and(is_ident)
+        .is_some_and(VarName::is_valid)
 }
 
-fn is_ident(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    match bytes.next() {
-        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
-        _ => return false,
-    }
-    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
-}
-
+/// Whether `parent` is one of the tables whose keys are plaintext platform variables.
+///
+/// Matched against the schema's own list, plus the Cloudflare environment overlay spelling of it:
+/// `[cloudflare.env.staging.vars]` is `[cloudflare.vars]` for one environment, and a secret
+/// committed there is committed just the same.
 fn is_secret_key_table(parent: &str) -> bool {
-    parent == "aws.env" || parent == "vars" || parent.strip_suffix(".vars").is_some()
+    PLAINTEXT_VARIABLE_TABLES
+        .iter()
+        .any(|table| parent == *table || is_cloudflare_overlay_of(parent, table))
+}
+
+/// Whether `parent` is `cloudflare.env.<name>.<rest>` for a `cloudflare.<rest>` table.
+fn is_cloudflare_overlay_of(parent: &str, table: &str) -> bool {
+    let Some(rest) = table.strip_prefix("cloudflare.") else {
+        return false;
+    };
+    let Some(overlay) = parent.strip_prefix("cloudflare.env.") else {
+        return false;
+    };
+    overlay
+        .split_once('.')
+        .is_some_and(|(name, tail)| !name.is_empty() && tail == rest)
 }
 
 const SECRET_KEY_NEEDLES: &[&str] = &[
@@ -343,14 +348,6 @@ fn is_secret_named_key(key: &str) -> bool {
         .any(|needle| upper.contains(needle))
 }
 
-fn child_path(parent: &str, key: &str) -> String {
-    if parent.is_empty() {
-        key.to_owned()
-    } else {
-        format!("{parent}.{key}")
-    }
-}
-
 /// Turn blocking findings into an error. `None` when there are none.
 #[must_use]
 pub fn blocking_error(report: &SecretReport) -> Option<SecretError> {
@@ -368,8 +365,8 @@ mod tests {
     use super::scan_table;
 
     fn scan(source: &str) -> super::SecretReport {
-        let table: toml::Table = toml::from_str(source).expect("toml");
-        scan_table(&table)
+        let mut table: toml::Table = toml::from_str(source).expect("toml");
+        scan_table(&mut table)
     }
 
     #[test]
@@ -393,10 +390,7 @@ mod tests {
         let report = scan("[cloudflare.vars]\nAPI_KEY = \"dev-only\"\n");
         assert_eq!(report.blocks, []);
         assert_eq!(report.warnings.len(), 1);
-        assert_eq!(
-            report.warnings[0].kind,
-            "plaintext value of a secret-named key"
-        );
+        assert_eq!(report.warnings[0].kind, super::SECRET_NAMED_KEY);
     }
 
     #[test]

@@ -15,16 +15,18 @@
 
 use crate::{
     cli::{MigrateCommand, Provider},
-    environment::{ensure_available, load_dotenv_files, load_manifest, required_variables},
+    environment::{self, load_manifest_with, runtime_variables_of, Environment, VariableKind},
     output,
+    runtime::block_on,
 };
 use anyhow::{Context, Result};
+use secrecy::SecretString;
 use skyzen_manifest::{
     migrations::MigrationFile, DatabaseEntry, Manifest, NativeDatabaseBackend,
-    NativeDatabaseSection,
+    NativeDatabaseSection, VarName,
 };
 use skyzen_services::{Db, Migration, Migrations};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 /// One `[[database]]` entry with everything the runner needs resolved.
 #[derive(Debug)]
@@ -34,7 +36,7 @@ struct Target {
     /// The driver its `[native.database.<name>]` names.
     backend: NativeDatabaseBackend,
     /// The environment variable holding the connection URL.
-    url_env: String,
+    url_env: VarName,
     /// The migrations directory, resolved against the project root.
     directory: PathBuf,
     /// The files that directory holds, already validated and checksummed.
@@ -108,7 +110,7 @@ pub fn run(
     command: Option<MigrateCommand>,
     dry_run: bool,
 ) -> Result<()> {
-    let manifest = load_manifest(manifest_path)?;
+    let (manifest, environment) = load_manifest_with(manifest_path)?;
     let targets = resolve_targets(&manifest)?;
 
     // A dry run neither connects nor creates anything: it reads and validates the directories and
@@ -120,32 +122,30 @@ pub fn run(
         return Ok(());
     }
 
-    let dotenv = load_dotenv_files(manifest.root_dir())
-        .context("failed to load the project's .env files")?;
-    ensure_available(&required_variables(manifest.data()), &dotenv)?;
+    // The wiring variables only: this opens one connection, so demanding the project's
+    // `[[secret]]` values as well would refuse to migrate from a machine that has no business
+    // holding them.
+    environment.resolve(&runtime_variables_of(
+        manifest.data(),
+        &[VariableKind::Wiring],
+    ))?;
 
-    // A current-thread runtime: this is one connection doing a handful of statements, so a thread
-    // pool would be pure startup cost. `enable_all` is what gives sqlx's TCP drivers a reactor.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to start the async runtime the database drivers need")?;
-
-    runtime.block_on(async {
+    // One connection doing a handful of statements, on the CLI's own current-thread runtime.
+    block_on(async {
         for target in &targets {
-            run_target(target, &dotenv, command).await?;
+            run_target(target, &environment, command).await?;
         }
         Ok(())
-    })
+    })?
 }
 
 /// Apply or report one database's migrations.
 async fn run_target(
     target: &Target,
-    dotenv: &BTreeMap<String, String>,
+    environment: &Environment,
     command: Option<MigrateCommand>,
 ) -> Result<()> {
-    let url = connection_url(target, dotenv)?;
+    let url = connection_url(target, environment)?;
     let migrations = target.migrations();
 
     output::step(format!(
@@ -156,7 +156,7 @@ async fn run_target(
         target.directory.display()
     ));
 
-    let db = connect(target, &url).await?;
+    let db = connect(target, environment::expose(&url)).await?;
 
     match command {
         Some(MigrateCommand::Status) => report_status(target, &db, &migrations).await,
@@ -277,11 +277,11 @@ async fn connect(target: &Target, url: &str) -> Result<Db> {
     })
 }
 
-/// The connection URL for `target`, preferring the real environment over the dotenv files.
-fn connection_url(target: &Target, dotenv: &BTreeMap<String, String>) -> Result<String> {
-    std::env::var(&target.url_env)
-        .ok()
-        .or_else(|| dotenv.get(&target.url_env).cloned())
+/// The connection URL for `target`, read through the one resolver.
+fn connection_url(target: &Target, environment: &Environment) -> Result<SecretString> {
+    environment
+        .get(target.url_env.as_str())
+        .with_context(|| format!("failed to read {}", target.url_env))?
         .with_context(|| {
             format!(
                 "{} is not set; it holds the connection URL for database `{}` \
@@ -388,7 +388,7 @@ fn target_for(
         url_env: section
             .url_env()
             .context("a database with no connection URL is not resolved into a target")?
-            .to_owned(),
+            .clone(),
         directory,
         files,
     })
@@ -397,9 +397,12 @@ fn target_for(
 #[cfg(test)]
 mod tests {
     use super::{connection_url, dispatch, resolve_targets, run, Dispatch, Target};
-    use crate::cli::{MigrateCommand, Provider};
-    use skyzen_manifest::{Manifest, NativeDatabaseBackend};
-    use std::{collections::BTreeMap, fs, path::Path};
+    use crate::{
+        cli::{MigrateCommand, Provider},
+        environment::{expose, from_dotenv, Environment},
+    };
+    use skyzen_manifest::{Manifest, NativeDatabaseBackend, VarName};
+    use std::{fs, path::Path};
 
     /// A manifest wiring one SQLite database whose URL comes from `variable`.
     fn manifest_source(variable: &str) -> String {
@@ -579,19 +582,22 @@ mod tests {
         let target = Target {
             name: "main".to_owned(),
             backend: NativeDatabaseBackend::Sqlite,
-            url_env: "SKYZEN_TEST_URL_PRECEDENCE".to_owned(),
+            url_env: VarName::from_static("SKYZEN_TEST_URL_PRECEDENCE"),
             directory: std::path::PathBuf::from("migrations"),
             files: Vec::new(),
         };
-        let dotenv = BTreeMap::from([(target.url_env.clone(), "from-dotenv".to_owned())]);
+        let environment = from_dotenv(&format!("{}=from-dotenv\n", target.url_env));
         assert_eq!(
-            connection_url(&target, &dotenv).expect("dotenv"),
+            expose(&connection_url(&target, &environment).expect("dotenv")),
             "from-dotenv"
         );
 
         // SAFETY: single-threaded test process, and the variable is unique to this test.
         unsafe { std::env::set_var(&target.url_env, "from-env") };
-        assert_eq!(connection_url(&target, &dotenv).expect("env"), "from-env");
+        assert_eq!(
+            expose(&connection_url(&target, &environment).expect("env")),
+            "from-env"
+        );
         unsafe { std::env::remove_var(&target.url_env) };
     }
 
@@ -600,12 +606,12 @@ mod tests {
         let target = Target {
             name: "main".to_owned(),
             backend: NativeDatabaseBackend::Sqlite,
-            url_env: "SKYZEN_TEST_NEVER_SET_URL".to_owned(),
+            url_env: VarName::from_static("SKYZEN_TEST_NEVER_SET_URL"),
             directory: std::path::PathBuf::from("migrations"),
             files: Vec::new(),
         };
-        let error =
-            connection_url(&target, &BTreeMap::new()).expect_err("the variable is set nowhere");
+        let error = connection_url(&target, &Environment::default())
+            .expect_err("the variable is set nowhere");
         let rendered = error.to_string();
         assert!(rendered.contains("SKYZEN_TEST_NEVER_SET_URL"), "{rendered}");
         assert!(

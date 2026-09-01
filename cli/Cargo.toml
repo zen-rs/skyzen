@@ -16,6 +16,15 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 askama = "0.16"
+# The Lambda environment is delivered in-process rather than through `cargo lambda`, so a value
+# never reaches a command line. Same feature selection as `skyzen-aws`, so the workspace resolves
+# one HTTP stack: the SDK default `rustls` feature pulls the legacy connector (rustls 0.21 /
+# hyper-rustls 0.24) alongside the modern `default-https-client`, and carries unpatched advisories.
+aws-config = "1"
+aws-sdk-lambda = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 ctrlc = "3.5"
@@ -25,6 +34,10 @@ ignore = "0.4"
 notify-debouncer-full = "0.4"
 pathdiff = "0.2"
 regex = "1"
+# The Azure app settings are read and written over ARM, which has no Rust SDK for the Web Apps
+# provider; same rustls-only selection as `skyzen-azure` so the workspace resolves one TLS stack.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 skyzen-manifest.workspace = true

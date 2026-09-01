@@ -8,17 +8,19 @@ mod migrate;
 mod output;
 mod project;
 mod providers;
+mod runtime;
 mod scaffold;
 mod secret_files;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
-use cli::{Cli, Command};
-use providers::{Action, ProviderPlan, RunMode};
+use cli::{Cli, Command, SecretCommand};
+use providers::{Action, FileContents, ProviderPlan, RunMode, SecretAction};
+use secrecy::{zeroize::Zeroize as _, ExposeSecret as _};
 use std::{
     fs,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
-    process::{Command as Process, Stdio},
 };
 
 fn main() {
@@ -80,7 +82,7 @@ fn run() -> Result<()> {
                 },
             ),
         },
-        command => run_plan(&cli, &action_for(command)),
+        command => run_plan(&cli, &action_for(command)?),
     }
 }
 
@@ -110,8 +112,8 @@ fn project_root(manifest_path: &Path) -> Result<PathBuf> {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf))
 }
 
-fn action_for(command: &Command) -> Action {
-    match command {
+fn action_for(command: &Command) -> Result<Action> {
+    Ok(match command {
         Command::Build { release } => Action::Build { release: *release },
         Command::Dev { runner_args } => Action::Dev {
             runner_args: runner_args.clone(),
@@ -120,7 +122,16 @@ fn action_for(command: &Command) -> Action {
         Command::Logs { wrangler_args } => Action::Logs {
             wrangler_args: wrangler_args.clone(),
         },
-        Command::Secret { command } => Action::Secret(command.clone()),
+        Command::Secret { command } => Action::Secret(match command {
+            // Read here rather than in a provider: every provider then delivers the same value the
+            // same way, and none of them has to know how a terminal prompts for one.
+            SecretCommand::Set { name } => SecretAction::Set {
+                name: name.clone(),
+                value: read_secret_value(name)?,
+            },
+            SecretCommand::Push => SecretAction::Push,
+            SecretCommand::List => SecretAction::List,
+        }),
         // `Migrate` belongs here too: `run` picks between the native runner and the provider plan
         // itself, and builds the `Action` on the branch that needs one.
         Command::New { .. }
@@ -131,7 +142,29 @@ fn action_for(command: &Command) -> Action {
         | Command::Completions { .. } => {
             unreachable!("handled before dispatch")
         }
+    })
+}
+
+/// Read one secret's value from the CLI's own standard input.
+///
+/// All of it, with the trailing newline a `printf`, an `echo` or a here-string leaves behind
+/// removed — the same trimming wrangler does — because a value with an accidental newline is
+/// rejected by whatever it is eventually sent to, hours later.
+fn read_secret_value(name: &skyzen_manifest::VarName) -> Result<secrecy::SecretString> {
+    let mut buffer = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buffer)
+        .with_context(|| format!("failed to read the value for `{name}` from standard input"))?;
+    let value = secrecy::SecretString::from(buffer.trim_end_matches(['\n', '\r']).to_owned());
+    buffer.zeroize();
+
+    if value.expose_secret().is_empty() {
+        anyhow::bail!(
+            "no value for `{name}` on standard input; pipe one in, as in `printf %s \"$VALUE\" | \
+             skyzen secret set {name}`"
+        );
     }
+    Ok(value)
 }
 
 fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
@@ -141,16 +174,10 @@ fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
 
     for file in &plan.generated_files {
         if simulate {
-            output::dry_run(format!("write {}", file.path.display()));
-            println!("{}", file.contents);
+            println!("{}", dry_run_report(file));
             continue;
         }
-        if let Some(parent) = file.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(&file.path, &file.contents)
-            .with_context(|| format!("failed to write {}", file.path.display()))?;
+        write_generated_file(file)?;
         output::step(format!("wrote {}", file.path.display()));
     }
 
@@ -164,12 +191,13 @@ fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
     }
 
     if plan.run_mode == RunMode::Once {
-        return run_commands(&plan.commands, simulate, &plan.child_env);
+        return providers::run_steps(&plan.steps, simulate, &plan.child_env);
     }
 
-    let Some(command) = plan.commands.first() else {
-        anyhow::bail!("a supervised run needs at least one command");
-    };
+    // Everything a supervised process needs done first — seeding a local store, say — is a step
+    // ahead of it, and runs before it starts.
+    let (preamble, command) = plan.supervised()?;
+    providers::run_steps(preamble, simulate, &plan.child_env)?;
     if simulate {
         output::dry_run(format!("supervise {}", command.display()));
         return Ok(());
@@ -187,37 +215,83 @@ fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
     })
 }
 
-fn run_commands(
-    commands: &[providers::CommandPlan],
-    simulate: bool,
-    child_env: &[(String, String)],
-) -> Result<()> {
-    for command in commands {
-        let display = command.display();
-        if simulate {
-            output::dry_run(display);
-            continue;
+/// What `--dry-run` says about one generated file.
+///
+/// A pure function so the promise it makes — that a secret's value never reaches stdout — is
+/// something a test can hold it to, rather than something a reader has to trust the printing code
+/// about.
+fn dry_run_report(file: &providers::GeneratedFile) -> String {
+    match &file.contents {
+        FileContents::Public(contents) => {
+            format!("[dry-run] write {}\n{contents}", file.path.display())
         }
+        FileContents::Secret(_) => format!(
+            "[dry-run] write {} (secret values, not shown)",
+            file.path.display()
+        ),
+    }
+}
 
-        output::step(&display);
-        let mut process = Process::new(&command.program);
-        process
-            .args(&command.args)
-            .envs(child_env.iter().map(|(key, value)| (key, value)))
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        if let Some(cwd) = &command.cwd {
-            process.current_dir(cwd);
-        }
-
-        let status = process
-            .status()
-            .with_context(|| format!("failed to launch {}", command.program))?;
-        if !status.success() {
-            anyhow::bail!("command failed with status {status}: {display}");
-        }
+/// Write one generated file, creating its directory.
+///
+/// A file holding values is created readable by its owner alone. Doing it in the `OpenOptions`
+/// rather than with a `set_permissions` afterwards means there is no window in which the values
+/// are on disk under the default mode.
+fn write_generated_file(file: &providers::GeneratedFile) -> Result<()> {
+    if let Some(parent) = file.path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    Ok(())
+    let (contents, owner_only) = match &file.contents {
+        FileContents::Public(contents) => (contents.as_str(), false),
+        FileContents::Secret(secret) => (secret.expose_secret(), true),
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = owner_only;
+
+    let mut handle = options
+        .open(&file.path)
+        .with_context(|| format!("failed to write {}", file.path.display()))?;
+    handle
+        .write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", file.path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dry_run_report;
+    use crate::providers::{FileContents, GeneratedFile};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_dry_run_prints_configuration_verbatim() {
+        let report = dry_run_report(&GeneratedFile {
+            path: PathBuf::from("/tmp/app/wrangler.toml"),
+            contents: FileContents::Public("name = \"demo\"".to_owned()),
+        });
+        assert!(report.contains("write /tmp/app/wrangler.toml"), "{report}");
+        assert!(report.contains("name = \"demo\""), "{report}");
+    }
+
+    #[test]
+    fn a_dry_run_never_prints_a_value() {
+        let report = dry_run_report(&GeneratedFile {
+            path: PathBuf::from("/tmp/app/.dev.vars"),
+            contents: FileContents::Secret("STRIPE_KEY=sk_live_123".into()),
+        });
+        assert_eq!(
+            report,
+            "[dry-run] write /tmp/app/.dev.vars (secret values, not shown)"
+        );
+        assert!(!report.contains("sk_live_123"), "{report}");
+    }
 }

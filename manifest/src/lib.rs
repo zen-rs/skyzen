@@ -50,6 +50,7 @@ mod merge;
 pub mod migrations;
 mod schema;
 mod secrets;
+mod walk;
 
 pub use interpolate::{expand, expand_table, process_env, EnvLookup, InterpolateError};
 pub use merge::deep_merge;
@@ -58,18 +59,19 @@ pub use schema::{
     AwsSection, AzureHttpMode, AzureQueueTrigger, AzureSection, BlobWiring, CfAssets,
     CfAssetsNotFoundHandling, CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableObjects,
     CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer, CfQueueProducer, CfQueues,
-    CfR2Bucket, CfSecretsStoreSecret, CfServiceBinding, CfTriggers, CloudflareDatabaseSection,
+    CfR2Bucket, CfServiceBinding, CfTriggers, CloudflareDatabaseSection, CloudflareSecretSection,
     CloudflareSection, CloudflareServiceSection, CosmosWiring, DatabaseEntry, DatabaseType,
-    DynamoDbWiring, LambdaArchitecture, MemoryWiring, NativeDatabaseBackend, NativeDatabaseSection,
-    NativeQueueConsumer, NativeSection, NativeServiceBackend, NativeServiceSection,
-    PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring, RdsEngine, RedisWiring,
-    S3Wiring, ServiceBusWiring, ServiceEntry, ServiceType, SkyzenManifest, SqlUrlWiring, SqsWiring,
-    StorageQueueWiring, WiringEnvVar, HTTP_FUNCTION_NAME,
+    DynamoDbWiring, InvalidVarName, LambdaArchitecture, MemoryWiring, NativeDatabaseBackend,
+    NativeDatabaseSection, NativeQueueConsumer, NativeSection, NativeServiceBackend,
+    NativeServiceSection, PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring,
+    RdsEngine, RedisWiring, S3Wiring, SecretEntry, ServiceBusWiring, ServiceEntry, ServiceType,
+    SkyzenManifest, SqlUrlWiring, SqsWiring, StorageQueueWiring, VarName, WiringEnvVar,
+    HTTP_FUNCTION_NAME, PLAINTEXT_VARIABLE_TABLES,
 };
 pub use secrets::{scan_table, SecretError, SecretFinding, SecretReport};
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -131,6 +133,41 @@ pub enum ManifestError {
         database: String,
         /// Which keys are named and which are missing.
         source: schema::PartialRdsDataWiring,
+    },
+    /// Two `[[secret]]` entries declare the same name.
+    #[error("{path}: `[[secret]]` declares `{name}` twice; one secret is one name")]
+    DuplicateSecret {
+        /// The manifest path.
+        path: PathBuf,
+        /// The name declared more than once.
+        name: String,
+    },
+    /// A `[cloudflare.secret.<NAME>]` section backs a secret nothing declares.
+    #[error(
+        "{path}: [{section}.secret.{name}] backs a secret the manifest does not declare; add \
+         `[[secret]]` with `name = \"{name}\"`, or remove the section"
+    )]
+    UnknownSecret {
+        /// The manifest path.
+        path: PathBuf,
+        /// The section the backing was written in — `cloudflare`, or `cloudflare.env.<name>`.
+        section: String,
+        /// The secret the section names.
+        name: String,
+    },
+    /// A `[[secret]]` name is also a plaintext variable key on some platform.
+    #[error(
+        "{path}: `{name}` is declared as `[[secret]]` and is also a key of [{table}]; the two \
+         would claim the same name on the deployed application, and [{table}] is uploaded in \
+         plaintext. Keep the `[[secret]]`, or rename one of them."
+    )]
+    SecretIsPlaintextVariable {
+        /// The manifest path.
+        path: PathBuf,
+        /// The name declared twice over.
+        name: String,
+        /// The plaintext table that also holds it.
+        table: String,
     },
     /// A `${NAME}` placeholder in a string value could not be expanded.
     #[error("{path}: {source}")]
@@ -270,7 +307,7 @@ impl Manifest {
         // `lookup = None` and skip the scan so `cargo build` does not fail on a token the
         // compiler never needed.
         let secret_warnings = if lookup.is_some() {
-            let report = secrets::scan_table(&document);
+            let report = secrets::scan_table(&mut document);
             if let Some(source) = secrets::blocking_error(&report) {
                 return Err(ManifestError::CommittedSecret {
                     path: path.clone(),
@@ -356,6 +393,8 @@ impl Manifest {
             environments.insert(name, section);
         }
 
+        check_secrets(&data, &environments, &path)?;
+
         Ok(Self {
             path,
             root_dir: root_dir.into(),
@@ -426,6 +465,88 @@ impl Manifest {
     }
 }
 
+/// Check `[[secret]]` against everything that would claim one of its names.
+///
+/// Three rules, checked once for both consumers: a name is declared at most once, every
+/// `[cloudflare.secret.<NAME>]` backs a declared secret, and a secret's name is not also a key of
+/// a plaintext variable table — where the value would be uploaded in the clear, under the name the
+/// application reads its secret from. Every resolved overlay is checked, not only the base, so an
+/// environment that adds the collision fails the parse the same way.
+fn check_secrets(
+    data: &SkyzenManifest,
+    environments: &BTreeMap<String, CloudflareSection>,
+    path: &Path,
+) -> Result<(), ManifestError> {
+    let mut declared: BTreeSet<&str> = BTreeSet::new();
+    for entry in &data.secret {
+        if !declared.insert(entry.name.as_str()) {
+            return Err(ManifestError::DuplicateSecret {
+                path: path.to_path_buf(),
+                name: entry.name.to_string(),
+            });
+        }
+    }
+
+    if let Some(aws) = &data.aws {
+        check_plaintext_table(aws.env.keys(), &declared, path, schema::AWS_ENV_TABLE)?;
+    }
+    if let Some(cloudflare) = &data.cloudflare {
+        check_cloudflare_secrets(cloudflare, &declared, path, "cloudflare")?;
+    }
+    for (name, section) in environments {
+        check_cloudflare_secrets(
+            section,
+            &declared,
+            path,
+            &format!("cloudflare.{ENVIRONMENTS_KEY}.{name}"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Check one `[cloudflare]` section — the base, or a resolved overlay — against `declared`.
+fn check_cloudflare_secrets(
+    section: &CloudflareSection,
+    declared: &BTreeSet<&str>,
+    path: &Path,
+    label: &str,
+) -> Result<(), ManifestError> {
+    for name in section.secret.keys() {
+        if !declared.contains(name.as_str()) {
+            return Err(ManifestError::UnknownSecret {
+                path: path.to_path_buf(),
+                section: label.to_owned(),
+                name: name.to_string(),
+            });
+        }
+    }
+    check_plaintext_table(
+        section.vars.keys(),
+        declared,
+        path,
+        &format!("{label}.vars"),
+    )
+}
+
+/// Fail when a plaintext variable table holds a key a `[[secret]]` already declares.
+fn check_plaintext_table<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    declared: &BTreeSet<&str>,
+    path: &Path,
+    table: &str,
+) -> Result<(), ManifestError> {
+    for key in keys {
+        if declared.contains(key.as_str()) {
+            return Err(ManifestError::SecretIsPlaintextVariable {
+                path: path.to_path_buf(),
+                name: key.clone(),
+                table: table.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Remove `[cloudflare.env]` from `document` and return the overlays it held.
 fn take_environment_overlays(
     document: &mut toml::Table,
@@ -463,7 +584,7 @@ fn take_environment_overlays(
 mod tests {
     use super::{
         InterpolateError, Manifest, ManifestError, NativeDatabaseBackend, NativeDatabaseSection,
-        NativeServiceBackend, NativeServiceSection, RdsEngine, ServiceType,
+        NativeServiceBackend, NativeServiceSection, RdsEngine, ServiceType, VarName,
     };
     use std::time::Duration;
 
@@ -1253,10 +1374,147 @@ mod tests {
         )
         .expect("heuristic is a warning");
         assert_eq!(manifest.secret_warnings().len(), 1);
-        assert_eq!(
-            manifest.secret_warnings()[0].kind,
-            "plaintext value of a secret-named key"
+        assert!(
+            manifest.secret_warnings()[0]
+                .kind
+                .starts_with("plaintext value of a secret-named key"),
+            "{:?}",
+            manifest.secret_warnings()[0]
         );
+        // The fix the warning names is the portable one.
+        assert!(
+            manifest.secret_warnings()[0].kind.contains("[[secret]]"),
+            "{:?}",
+            manifest.secret_warnings()[0]
+        );
+    }
+
+    #[test]
+    fn a_secret_entry_declares_one_portable_name() {
+        let manifest = parse(
+            "[[secret]]\nname = \"STRIPE_KEY\"\n\n[[secret]]\nname = \"JWT_SIGNING_KEY\"\n\n\
+             [cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+             [cloudflare.secret.STRIPE_KEY]\nstore_id = \"0c2a3f\"\nsecret_name = \"stripe-key\"\n",
+        )
+        .expect("manifest parses");
+
+        let secrets = &manifest.data().secret;
+        assert_eq!(secrets.len(), 2);
+        assert_eq!(secrets[0].name, "STRIPE_KEY");
+        assert_eq!(secrets[1].name, "JWT_SIGNING_KEY");
+
+        let backing = &manifest
+            .cloudflare(None)
+            .expect("base")
+            .expect("cloudflare")
+            .secret[&secrets[0].name];
+        assert_eq!(backing.store_id, "0c2a3f");
+        assert_eq!(backing.secret_name, "stripe-key");
+    }
+
+    #[test]
+    fn two_secrets_cannot_share_a_name() {
+        let error = parse("[[secret]]\nname = \"API_KEY\"\n\n[[secret]]\nname = \"API_KEY\"\n")
+            .expect_err("one secret, one name");
+        assert!(
+            error.to_string().contains("twice") && error.to_string().contains("API_KEY"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn backing_a_secret_the_manifest_does_not_declare_is_rejected() {
+        let error = parse(
+            "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+             [cloudflare.secret.STRIPE_KEY]\nstore_id = \"s\"\nsecret_name = \"stripe-key\"\n",
+        )
+        .expect_err("nothing declares STRIPE_KEY");
+        assert!(
+            error.to_string().contains("[cloudflare.secret.STRIPE_KEY]"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("[[secret]]"), "{error}");
+    }
+
+    #[test]
+    fn an_overlay_backing_an_undeclared_secret_is_rejected_too() {
+        let error = parse(
+            "[[secret]]\nname = \"API_KEY\"\n\n\
+             [cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+             [cloudflare.env.staging.secret.OTHER_KEY]\nstore_id = \"s\"\nsecret_name = \"o\"\n",
+        )
+        .expect_err("the overlay backs a secret nothing declares");
+        assert!(
+            error
+                .to_string()
+                .contains("cloudflare.env.staging.secret.OTHER_KEY"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_secret_cannot_also_be_a_plaintext_variable() {
+        for (source, table) in [
+            (
+                "[[secret]]\nname = \"API_KEY\"\n\n[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+                 [cloudflare.vars]\nAPI_KEY = \"not-a-secret\"\n",
+                "cloudflare.vars",
+            ),
+            (
+                "[[secret]]\nname = \"API_KEY\"\n\n[aws.env]\nAPI_KEY = \"not-a-secret\"\n",
+                "aws.env",
+            ),
+            // Only the overlay collides: the base has no such var, and the parse still fails.
+            (
+                "[[secret]]\nname = \"API_KEY\"\n\n[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
+                 [cloudflare.env.staging.vars]\nAPI_KEY = \"not-a-secret\"\n",
+                "cloudflare.env.staging.vars",
+            ),
+        ] {
+            let error = parse(source).expect_err("one name, one kind of variable");
+            let rendered = error.to_string();
+            assert!(rendered.contains(table), "{table}: {rendered}");
+            assert!(rendered.contains("API_KEY"), "{table}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn a_placeholder_cannot_name_a_variable() {
+        // The CLI expands `${FOO}`; `#[skyzen::main]` does not. A variable name that means two
+        // things to the two consumers is refused where it is written.
+        let wiring = database_wiring("backend = \"postgres\"\nurl_env = \"${FOO}\"\n")
+            .expect_err("a placeholder is not a variable name")
+            .to_string();
+        // A `backend`-tagged wiring is buffered by serde before the payload struct sees it, which
+        // costs the key's span: the error locates the wiring's table and quotes the value.
+        assert!(wiring.contains("native.database.main"), "{wiring}");
+        assert!(wiring.contains("${FOO}"), "{wiring}");
+        assert!(wiring.contains("placeholder"), "{wiring}");
+
+        // Everywhere the span survives, the field itself is named.
+        let secret = parse("[[secret]]\nname = \"${FOO}\"\n")
+            .expect_err("a placeholder is not a secret name")
+            .to_string();
+        assert!(secret.contains("secret.name"), "{secret}");
+    }
+
+    #[test]
+    fn a_variable_name_is_an_identifier_or_it_is_not_a_name() {
+        for rejected in ["FOO-BAR", "${X}", "1abc", "", "FOO BAR", "a.b"] {
+            let error = VarName::try_from(rejected.to_owned())
+                .expect_err("not an environment variable name");
+            assert!(error.to_string().contains(rejected), "{rejected}: {error}");
+        }
+        for accepted in ["FOO", "_private", "a1", "STRIPE_KEY"] {
+            let name = VarName::try_from(accepted.to_owned()).expect("an identifier");
+            assert_eq!(name, accepted);
+            assert_eq!(name.as_str(), accepted);
+            assert_eq!(name.to_string(), accepted);
+            // `FromStr` is how an argument parser reaches the same rule, so `skyzen secret set
+            // FOO-BAR` is rejected by the CLI rather than by the platform it is sent to.
+            assert_eq!(accepted.parse::<VarName>().expect("an identifier"), name);
+        }
+        assert!("FOO-BAR".parse::<VarName>().is_err());
     }
 
     #[test]
