@@ -1311,6 +1311,31 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(content_type.contains("text/html"));
+        let body = response.into_body().into_string().await.unwrap();
+        assert!(
+            body.contains("@scalar/api-reference"),
+            "enable_api_doc should serve Scalar HTML"
+        );
+        assert!(body.contains("id=\"api-reference\""));
+    }
+
+    #[tokio::test]
+    async fn redoc_route_serves_redoc_html() {
+        async fn ping() -> Result<&'static str> {
+            Ok("pong")
+        }
+
+        let route = Route::new(("/ping".at(ping),));
+        let docs = route.openapi().redoc_route("/redoc");
+        let router = build(Route::new((route, docs))).unwrap();
+
+        let response = router.clone().go(get_request("/redoc")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().into_string().await.unwrap();
+        assert!(
+            body.contains("redoc"),
+            "redoc_route should serve Redoc HTML"
+        );
     }
 
     #[cfg(feature = "ws")]

@@ -28,6 +28,7 @@ use utoipa::openapi::{
     Deprecated, OpenApi as UtoipaSpec, RefOr, Required,
 };
 use utoipa_redoc::Redoc;
+use utoipa_scalar::Scalar;
 
 /// `OpenAPI` schema reference type alias.
 pub type SchemaRef = RefOr<Schema>;
@@ -552,22 +553,38 @@ impl OpenApi {
         ))
     }
 
+    /// Convert the collected spec to a [`Scalar`](utoipa_scalar::Scalar) endpoint.
+    ///
+    /// This is the recommended interactive documentation UI.
     #[must_use]
-    /// Convert the collected spec to a [`Redoc`](utoipa_redoc::Redoc) endpoint.
-    pub fn redoc(&self) -> OpenApiRedocEndpoint {
-        if !self.is_enabled() {
-            return OpenApiRedocEndpoint::disabled();
-        }
-
-        let html = Redoc::new(self.to_utoipa_spec()).to_html();
-        OpenApiRedocEndpoint::enabled(html)
+    pub fn scalar(&self) -> OpenApiUiEndpoint {
+        self.ui_endpoint(|| Scalar::new(self.to_utoipa_spec()).to_html())
     }
 
-    /// Build a [`RouteNode`] that serves the generated `OpenAPI` document at the provided mount path.
+    /// Build a [`RouteNode`] that serves the generated `OpenAPI` document via Scalar at `mount_path`.
+    #[must_use]
+    pub fn scalar_route(&self, mount_path: impl Into<String>) -> RouteNode {
+        ui_route(self.scalar(), mount_path.into())
+    }
+
+    /// Convert the collected spec to a [`Redoc`](utoipa_redoc::Redoc) endpoint.
+    #[must_use]
+    pub fn redoc(&self) -> OpenApiUiEndpoint {
+        self.ui_endpoint(|| Redoc::new(self.to_utoipa_spec()).to_html())
+    }
+
+    /// Build a [`RouteNode`] that serves the generated `OpenAPI` document via Redoc at `mount_path`.
     #[must_use]
     pub fn redoc_route(&self, mount_path: impl Into<String>) -> RouteNode {
-        let endpoint = self.redoc();
-        redoc_route(endpoint, mount_path.into())
+        ui_route(self.redoc(), mount_path.into())
+    }
+
+    fn ui_endpoint(&self, html: impl FnOnce() -> String) -> OpenApiUiEndpoint {
+        if self.is_enabled() {
+            OpenApiUiEndpoint::enabled(html())
+        } else {
+            OpenApiUiEndpoint::disabled()
+        }
     }
 
     /// Convert collected operations to a fully hydrated [`utoipa::openapi::OpenApi`] document.
@@ -665,12 +682,12 @@ impl fmt::Debug for OpenApiOperation {
 }
 
 #[derive(Clone, Debug)]
-/// Endpoint that renders the `OpenAPI` document via Redoc.
-pub struct OpenApiRedocEndpoint {
+/// Endpoint that serves a pre-rendered `OpenAPI` documentation page.
+pub struct OpenApiUiEndpoint {
     html: Option<Arc<String>>,
 }
 
-impl OpenApiRedocEndpoint {
+impl OpenApiUiEndpoint {
     fn enabled(html: String) -> Self {
         Self {
             html: Some(Arc::new(html)),
@@ -684,10 +701,10 @@ impl OpenApiRedocEndpoint {
 
 http_error!(
     /// Error returned when OpenAPI support is disabled.
-    pub OpenApiRedocDisabledError, StatusCode::NOT_IMPLEMENTED, "OpenAPI support is disabled for this build");
+    pub OpenApiUiDisabledError, StatusCode::NOT_IMPLEMENTED, "OpenAPI support is disabled for this build");
 
-impl Endpoint for OpenApiRedocEndpoint {
-    type Error = OpenApiRedocDisabledError;
+impl Endpoint for OpenApiUiEndpoint {
+    type Error = OpenApiUiDisabledError;
     // The document is rendered at build time, so the future is ready on creation rather than an
     // `async` block with nothing to await.
     fn respond(
@@ -695,7 +712,7 @@ impl Endpoint for OpenApiRedocEndpoint {
         _request: &mut Request,
     ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
         ready(self.html.as_ref().map_or_else(
-            || Err(OpenApiRedocDisabledError::new()),
+            || Err(OpenApiUiDisabledError::new()),
             |html| {
                 let mut response = Response::new(Body::from(html.as_bytes().to_vec()));
                 response.headers_mut().insert(
@@ -708,7 +725,7 @@ impl Endpoint for OpenApiRedocEndpoint {
     }
 }
 
-fn redoc_route(endpoint: OpenApiRedocEndpoint, mount_path: String) -> RouteNode {
+fn ui_route(endpoint: OpenApiUiEndpoint, mount_path: String) -> RouteNode {
     let wildcard_suffix = "/{*path}";
     let route = Route::new((
         RouteNode::new_endpoint(
@@ -730,12 +747,12 @@ fn redoc_route(endpoint: OpenApiRedocEndpoint, mount_path: String) -> RouteNode 
     RouteNode::new_route(mount_path, route)
 }
 
-/// Default mount path for the generated Redoc API documentation page.
+/// Default mount path for the generated API documentation page.
 pub const DEFAULT_API_DOCS_MOUNT: &str = "/api-docs";
 
-impl IntoRouteNode for OpenApiRedocEndpoint {
+impl IntoRouteNode for OpenApiUiEndpoint {
     fn into_route_node(self) -> RouteNode {
-        redoc_route(self, DEFAULT_API_DOCS_MOUNT.to_string())
+        ui_route(self, DEFAULT_API_DOCS_MOUNT.to_string())
     }
 }
 
