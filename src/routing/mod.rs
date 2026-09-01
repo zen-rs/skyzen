@@ -445,12 +445,12 @@ impl Route {
         }
     }
 
-    /// Enable the Redoc API documentation endpoint at `/api-docs`.
+    /// Enable the Scalar API documentation endpoint at `/api-docs`.
     #[must_use]
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.openapi();
         self.nodes
-            .push(openapi.redoc_route(openapi::DEFAULT_API_DOCS_MOUNT));
+            .push(openapi.scalar_route(openapi::DEFAULT_API_DOCS_MOUNT));
         self
     }
 }
@@ -508,13 +508,13 @@ impl RouteWithAlarm {
         router
     }
 
-    /// Enable the Redoc API documentation endpoint at `/api-docs`.
+    /// Enable the Scalar API documentation endpoint at `/api-docs`.
     #[must_use]
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.route.openapi();
         self.route
             .nodes
-            .push(openapi.redoc_route(openapi::DEFAULT_API_DOCS_MOUNT));
+            .push(openapi.scalar_route(openapi::DEFAULT_API_DOCS_MOUNT));
         self
     }
 }
