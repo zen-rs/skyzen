@@ -47,6 +47,10 @@ pub use server::Server;
 mod net;
 #[cfg(feature = "std")]
 pub use net::{error_response, log_endpoint_error, panic_message, MissingRemoteAddr, PeerAddr};
+#[cfg(feature = "std")]
+mod secret;
+#[cfg(feature = "std")]
+pub use secret::Secret;
 #[cfg(feature = "openapi")]
 pub mod openapi;
 
