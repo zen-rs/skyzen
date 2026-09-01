@@ -13,12 +13,16 @@
 //! - [`CfD1`] — Cloudflare D1 SQL database
 //! - [`CfService`] — Cloudflare service bindings (Worker-to-Worker over HTTP)
 //! - [`CfAssets`] — Cloudflare Static Assets binding
-//! - [`CfSecretStore`] — Cloudflare Secrets Store bindings
+//! - [`CfSecret`] — classic Worker secrets and Secrets Store bindings, read as [`skyzen::Secret`]
 //! - [`CfCache`] — Cloudflare Cache API
 //! - [`CfFetch`] — outbound `fetch` with Cloudflare's own request options
 //! - [`CfDurableDb`], [`CfDurableKv`], [`CfAlarm`] — Durable Object storage (`state.storage.sql`,
 //!   the key-value API, and alarms), plus [`CfDurableNamespace`] and [`CfDurableObjectStub`] for
 //!   addressing one
+//!
+//! [`CfSecret`] is the one type a handler does not normally name: `import_config!` generates a
+//! named type per `[[secret]]` manifest entry and calls the right reader for it, so the binding
+//! name is checked against the manifest instead of being repeated as a string literal.
 //!
 //! The Worker event payloads live here too — [`CfQueueBatch`], [`CfScheduledEvent`],
 //! [`CfEmailMessage`] and [`TailTraceItem`] — behind `#[skyzen::queue]`, `#[skyzen::scheduled]`,
@@ -136,10 +140,7 @@ pub use r2::{
     CfR2MultipartUpload, CfR2UploadedPart,
 };
 #[cfg(target_arch = "wasm32")]
-pub use secret::{
-    optional_string as optional_secret, required_string as required_secret, CfSecretError,
-    CfSecretStore,
-};
+pub use secret::{CfSecret, CfSecretError};
 #[cfg(target_arch = "wasm32")]
 pub use service::{CfAssets, CfService, CfServiceError};
 #[cfg(target_arch = "wasm32")]
@@ -226,7 +227,7 @@ const _: () = {
         assert_send(d1.batch(&[]));
         assert_send(service.fetch(&request));
         assert_send(service.fetch_json::<serde_json::Value>(&request));
-        assert_send(crate::CfSecretStore::get(
+        assert_send(crate::CfSecret::from_store(
             &wasm_bindgen::JsValue::NULL,
             "SECRET",
         ));
