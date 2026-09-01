@@ -397,6 +397,144 @@ binding = "DB"
 |-----|------|-------------|
 | `binding` | string | **Required.** Cloudflare D1 binding name |
 
+## Secrets
+
+A secret is a portable capability, declared once and resolved once at startup on every target:
+
+```toml
+[[secret]]
+name = "STRIPE_KEY"
+
+[[secret]]
+name = "JWT_SIGNING_KEY"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | string | **Required.** `[A-Za-z_][A-Za-z0-9_]*`. The environment variable natively, and the binding on Workers |
+
+The name is the identifier everywhere: the native process reads an environment variable of that
+name, and the Worker resolves a binding of that name. Nothing in the application knows which it
+got.
+
+### The Generated Type
+
+`import_config!` generates one newtype around `skyzen::Secret` per entry, with the name converted
+from `SCREAMING_SNAKE_CASE`: `STRIPE_KEY` generates `pub struct StripeKey(Secret)`. There is no
+bare `Secret` extractor to fall back on — the type names a value rather than a capability — so a
+handler always asks for the entry by name:
+
+```rust
+async fn charge(stripe: StripeKey) -> Result<&'static str> {
+    gateway(stripe.expose()).await?;   // `Deref` reaches `Secret::expose`
+    Ok("ok")
+}
+```
+
+`Secret` is readable only through `expose`, its `Debug` prints `Secret(<redacted>)`, and it has no
+`Display`, so a struct holding one cannot interpolate it into a log.
+
+`#[skyzen::main]` binds each type once at startup: `std::env::var` natively, `CfSecret::classic` or
+`CfSecret::from_store` on Workers. A name that is set nowhere is a startup panic naming the
+`[[secret]]` entry, not a failure on the first request that needed the value.
+
+The generated type is a `Middleware` that injects itself, which is how `#[skyzen::main]` binds it
+and how a test supplies its own value — the same as for a named service type:
+
+```rust
+let router = router.layer(StripeKey::new(Secret::new("sk_test_123")));
+```
+
+### Cloudflare Secrets Store
+
+`[cloudflare.secret.<NAME>]` backs one declared secret with a Cloudflare
+[Secrets Store](https://developers.cloudflare.com/secrets-store/) entry instead of a classic Worker
+secret. The section's key is the `[[secret]]` name, which is still the binding:
+
+```toml
+[[secret]]
+name = "STRIPE_KEY"
+
+[cloudflare.secret.STRIPE_KEY]
+store_id = "your-store-id"
+secret_name = "stripe-key"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `store_id` | string | **Required.** The store the entry lives in |
+| `secret_name` | string | **Required.** The entry's name within that store |
+
+A store-backed secret is **externally managed**. `skyzen deploy` and `skyzen secret push` neither
+need nor write its value, so a deployment whose store is already populated is complete without a
+local copy. `skyzen secret set <NAME>` is the only command that writes one.
+
+The backing belongs in the base `[cloudflare]` section. A Worker reads one kind of binding in every
+environment, so a backing declared only in a `[cloudflare.env.<name>]` overlay is a compile-time
+error rather than a wrong reader in that environment.
+
+A `[cloudflare.secret.<NAME>]` naming a secret no `[[secret]]` declares is a parse error, as is a
+`[[secret]]` whose name is also a `[cloudflare.vars]` or `[aws.env]` key — those tables are
+uploaded in plaintext.
+
+### Where a Value Comes From
+
+The CLI looks for a value in the **process environment** first, then in `.env.local`, then in
+`.env`. An exported variable wins over both files, and `.env.local` wins over `.env`.
+
+That one rule covers everything the CLI does with a value: `${NAME}` expansion when it reads
+`Skyzen.toml`, the environment `skyzen dev` gives the process it starts, the connection string
+`skyzen migrate` dials, what `skyzen doctor` reports, and what `deploy` and `secret push` deliver.
+
+`skyzen new` writes `.env.example` from the manifest — every `[[secret]]` first, then the native
+wiring variables — and gitignores `.env` and `.env.local`. The CLI refuses to load a checkout that
+tracks either of them.
+
+`#[skyzen::main]` reads none of this. It resolves a secret from the real process environment at
+startup, and it never expands `${NAME}`, so a value only CI holds cannot fail `cargo build`.
+
+### Delivery
+
+Two kinds of variable reach a running application: a `[[secret]]`, and the *wiring* variables a
+native backend reads (`url_env`, `bucket_env`, `connection_env`, `sas_url_env`, and the names a
+backend fixes itself). A Worker binds its services rather than dialling them, so it never wants a
+wiring variable; the Lambda and the Functions binaries *are* the native binary, so they want both.
+
+| Provider | `dev` | `deploy` | `secret set NAME` / `secret push` | `secret list` |
+|---|---|---|---|---|
+| native | secrets and wiring must resolve; the `.env` entries the shell does not already hold are added to the child's environment | — | refused: nothing remote to write to | refused |
+| cloudflare | every secret must resolve. Classic ones are written to `.skyzen/gen/.dev.vars` (`.dev.vars.<env>` under `--env`); store-backed ones are seeded into wrangler's *local* store, which starts out empty however full the account's is | `wrangler deploy`, then the classic secrets through `wrangler secret bulk`. Store-backed ones are neither needed nor written | `set`: `wrangler secret put`, or a write to the account's store for a store-backed name. `push`: the same `secret bulk` the deploy runs | `wrangler secret list` |
+| aws | — (run it as an ordinary server with `skyzen dev`) | `cargo lambda deploy`, then `UpdateFunctionConfiguration` with `[aws.env]` plus the secrets and wiring variables | the same call, without the build | the function environment's names |
+| azure | — (`func start` over a built bundle) | `func azure functionapp publish`, then the application settings — which *are* the custom handler's environment — set to the secrets and wiring variables | the same call, without the publish | the app settings' names |
+
+`deploy` delivers, and refuses before it uploads anything when a variable it has to deliver is set
+nowhere — listing every one of them, rather than shipping a deployment that panics at cold start.
+`secret push` is that same delivery without the build.
+
+Both cloud sinks are a read-modify-write, because the call that writes them replaces the whole map:
+a setting the Functions host or a console made survives a deploy that never mentioned it. A name
+that is both a delivered variable and an `[aws.env]` key keeps the delivered value — `[aws.env]` is
+the plaintext table, and shipping its copy over a real value would deploy a placeholder.
+
+`[azure]` needs `subscription_id` and `resource_group` before any of this works: application
+settings are addressed by the resource's full ARM id, which `app_name` alone does not determine.
+
+### Setting a Value, and What Is Never Printed
+
+`skyzen secret set NAME` reads the value from the CLI's own standard input, and `NAME` must be a
+declared `[[secret]]` — an undeclared name is refused, naming the ones that exist:
+
+```sh
+printf '%s' "$STRIPE_KEY" | skyzen secret set STRIPE_KEY
+skyzen secret push --provider aws          # deliver every declared value, no rebuild
+skyzen secret list --provider azure        # names only
+```
+
+No value is ever placed on a command line or printed. Values travel on a child process's standard
+input (every `wrangler` invocation) or inside a request body (Lambda, ARM). A file that carries
+values is created owner-only, and `--dry-run` reports it as `write <path> (secret values, not
+shown)` instead of its contents.
+
 ## Cloudflare Section
 
 ```toml
@@ -424,7 +562,7 @@ API_URL = "https://api.example.com"
 | `workers_dev` | bool | Enable `*.workers.dev` subdomain |
 | `route` | string | URL pattern for routing |
 | `zone_id` | string | Cloudflare zone ID |
-| `vars` | table | Plaintext environment variables. Use `skyzen secret set` for anything sensitive |
+| `vars` | table | Plaintext environment variables. Declare anything sensitive as `[[secret]]` — see [Secrets](#secrets) |
 
 > **Two different `service` keys.** `[cloudflare.service.<name>]` (a table, below) wires a **portable** `[[service]]` entry to a Cloudflare binding. `[[cloudflare.services]]` (an array, below) declares a wrangler **service binding** to another Worker. They are unrelated.
 
@@ -568,28 +706,9 @@ run_worker_first = false
 
 ### Secrets Store
 
-A secret is declared portably with `[[secret]]`; `[cloudflare.secret.<NAME>]` backs one with a
-Cloudflare Secrets Store entry instead of a classic Worker secret. The section's key is the
-`[[secret]]` name, which is also the binding the Worker resolves — so nothing in the application
-knows which of the two it got.
-
-```toml
-[[secret]]
-name = "API_KEY"
-
-[cloudflare.secret.API_KEY]
-store_id = "your-store-id"
-secret_name = "api-key"
-```
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `store_id` | string | **Required.** The secrets store the secret lives in |
-| `secret_name` | string | **Required.** The secret's name within that store |
-
-A `[cloudflare.secret.<NAME>]` naming a secret no `[[secret]]` declares is a parse error, as is a
-`[[secret]]` whose name is also a `[cloudflare.vars]` or `[aws.env]` key — those tables are
-uploaded in plaintext.
+`[cloudflare.secret.<NAME>]` backs a declared `[[secret]]` with a Cloudflare Secrets Store entry
+instead of a classic Worker secret, keeping the same binding name. The keys, the externally
+managed rule and the delivery are in [Secrets](#secrets).
 
 ### Handlers
 
@@ -757,8 +876,8 @@ The generated `wrangler.toml` contains a complete `[env.<name>]` section for eac
 ## Deploy-time interpolation
 
 String values may contain `${NAME}` placeholders. `skyzen deploy`, `skyzen dev`, `skyzen provision`
-and the rest of the CLI expand them from the **process environment of the machine running the
-command**, then from `.env` / `.env.local`. Process environment wins, same as native wiring.
+and the rest of the CLI expand them when they read the file, from the sources and in the order
+[Secrets](#secrets) states.
 
 This is not the runtime environment of the deployed Worker or Lambda. `url_env = "CACHE_URL"` names
 a variable the application reads after it starts. `${CACHE_NAMESPACE_ID}` is replaced **before**
@@ -778,10 +897,9 @@ id = "${CACHE_NAMESPACE_ID}"
 API_URL = "${API_URL}"
 ```
 
-Put the values in `.env` (gitignored) or export them in the shell that runs the CLI. Skyzen does
-not require a per-key mapping in GitHub Actions: write `.env` onto the runner, or export the
-variables however the job already does. `CLOUDFLARE_API_TOKEN` is wrangler's own credential and
-stays out of the file.
+Skyzen does not require a per-key mapping in GitHub Actions: write `.env` onto the runner, or
+export the variables however the job already does. `CLOUDFLARE_API_TOKEN` is wrangler's own
+credential and stays out of the file.
 
 A documented credential form (GitHub PAT, PEM private key, URL with a password, …) stored as a
 literal fails the CLI load. A `vars` / `[aws.env]` key whose *name* looks like a secret but whose
@@ -799,7 +917,8 @@ Rules:
 - `#[skyzen::main]` does **not** expand placeholders. A missing GitHub secret must not fail `cargo build`. Do not wrap `url_env` / `binding` / service names in `${}` — those fields are consumed at compile time as literal names.
 
 Interpolating a secret into `[cloudflare.vars]` or `[aws.env]` still stores it as a plaintext
-platform variable. Worker secrets stay on `skyzen secret set`.
+platform variable. A real secret is declared as `[[secret]]` and delivered — see
+[Secrets](#secrets).
 
 ## Escape Hatch
 
@@ -835,6 +954,9 @@ type = "storage"
 [[database]]
 name = "main"
 type = "sql"
+
+[[secret]]
+name = "STRIPE_KEY"
 
 [native.service.cache]
 backend = "redis"
@@ -891,9 +1013,9 @@ The `skyzen` CLI generates provider-specific config files from `Skyzen.toml`:
 
 | Provider | Generated Config | `dev` Command | `deploy` Command |
 |----------|-----------------|---------------|-----------------|
-| Cloudflare | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` | `wrangler dev --local` | `wrangler deploy` |
-| AWS | none — the flags are derived from `[aws]` | — (run it as a server with `skyzen dev`) | `cargo lambda build` then `cargo lambda deploy` |
-| Azure | `.skyzen/gen/azure/{host.json, local.settings.json, <function>/function.json}` plus the staged binary | — (`func start` over a built bundle) | `func azure functionapp publish` |
+| Cloudflare | `.skyzen/gen/wrangler.toml`, `.skyzen/gen/.dev.vars`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` | `wrangler dev --local` | `wrangler deploy`, then `wrangler secret bulk` |
+| AWS | none — the flags are derived from `[aws]` | — (run it as a server with `skyzen dev`) | `cargo lambda build` then `cargo lambda deploy`, then the function environment |
+| Azure | `.skyzen/gen/azure/{host.json, local.settings.json, <function>/function.json}` plus the staged binary | — (`func start` over a built bundle) | `func azure functionapp publish`, then the app settings |
 
 The generated files are derived artifacts, rewritten on every run — edit `Skyzen.toml`, not them.
 

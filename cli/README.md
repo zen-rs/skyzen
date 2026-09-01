@@ -152,8 +152,13 @@ skyzen deploy --provider cloudflare --dry-run   # real build, `wrangler deploy -
 skyzen logs
 skyzen logs -- --format json     # forwarded to `wrangler tail`
 skyzen secret set API_KEY        # value read from stdin
-skyzen secret list
+skyzen secret push               # deliver every declared [[secret]], no rebuild
+skyzen secret list               # names only
 ```
+
+`skyzen secret` works on Cloudflare, AWS and Azure, on the names `[[secret]]` declares; an
+undeclared name is refused rather than uploaded, and no value reaches a command line. See
+[Secrets](../docs/skyzen-toml-reference.md#secrets).
 
 ### `skyzen completions`
 
@@ -180,9 +185,9 @@ Global flags are accepted before or after the subcommand.
 | Provider | `dev` | `deploy` | Generated Config |
 |----------|-------|----------|-----------------|
 | Native | `cargo run` with Skyzen watch/restart | — | none |
-| Cloudflare | wasm build + `wrangler dev --local`, rebuilt on change | `wrangler deploy` | `.skyzen/gen/wrangler.toml`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` |
-| AWS | — (run it as a server with `skyzen dev`) | `cargo lambda build` then `cargo lambda deploy`, with the flags derived from `[aws]` | none |
-| Azure | — (`func start` over a built bundle) | `func azure functionapp publish` | `.skyzen/gen/azure/{host.json, local.settings.json, <function>/function.json}` plus the staged binary |
+| Cloudflare | wasm build + `wrangler dev --local`, rebuilt on change | `wrangler deploy`, then the classic secrets through `wrangler secret bulk` | `.skyzen/gen/wrangler.toml`, `.skyzen/gen/.dev.vars`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` |
+| AWS | — (run it as a server with `skyzen dev`) | `cargo lambda build` then `cargo lambda deploy`, with the flags derived from `[aws]`, then the function environment | none |
+| Azure | — (`func start` over a built bundle) | `func azure functionapp publish`, then the app settings | `.skyzen/gen/azure/{host.json, local.settings.json, <function>/function.json}` plus the staged binary |
 
 ## Skyzen.toml
 

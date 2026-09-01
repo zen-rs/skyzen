@@ -109,7 +109,7 @@ pub enum Command {
         wrangler_args: Vec<String>,
     },
 
-    /// Manage the deployed Worker's secrets.
+    /// Manage the deployed application's secrets, on Cloudflare, AWS or Azure.
     Secret {
         /// The secret operation to perform.
         #[command(subcommand)]
@@ -142,6 +142,10 @@ pub enum MigrateCommand {
 ///
 /// Every one of them works on a name the manifest declares as `[[secret]]`: the CLI has no notion
 /// of a secret the application does not read, and a typo is refused rather than uploaded.
+///
+/// All three work on every cloud provider — `wrangler` on Cloudflare, the function environment on
+/// AWS, the application settings on Azure — and none of them puts a value on a command line. See
+/// `docs/skyzen-toml-reference.md#secrets`.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum SecretCommand {
     /// Set one secret, reading its value from this command's standard input.
@@ -154,7 +158,7 @@ pub enum SecretCommand {
     /// The same delivery `skyzen deploy` performs, without rebuilding: the values come from the
     /// process environment and the project's `.env` files, and a missing one is refused.
     Push,
-    /// List the secrets the deployment has.
+    /// List the names the deployment has. Never a value: no command prints one.
     List,
 }
 
