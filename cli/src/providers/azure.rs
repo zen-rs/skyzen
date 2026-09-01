@@ -15,7 +15,8 @@ use crate::{
     output,
     project::Project,
     providers::{
-        prepare_child_environment, Action, ArtifactBuild, CommandPlan, ProviderPlan, RunMode,
+        prepare_child_environment, Action, CommandPlan, CommandStdin, ProviderPlan, RunMode, Step,
+        Task,
     },
 };
 use anyhow::{Context, Result};
@@ -50,7 +51,9 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
     let needs_bundle = matches!(action, Action::Build { .. } | Action::Deploy);
     if !needs_bundle {
         return Ok(ProviderPlan {
-            commands: vec![non_bundling_command(action, &config, &root_dir)?],
+            steps: vec![Step::Command(non_bundling_command(
+                action, &config, &root_dir,
+            )?)],
             generated_files: Vec::new(),
             build: None,
             run_mode: RunMode::Once,
@@ -78,7 +81,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
     };
 
     Ok(ProviderPlan {
-        commands,
+        steps: commands.into_iter().map(Step::Command).collect(),
         generated_files: files,
         build: Some(Box::new(build)),
         run_mode: RunMode::Once,
@@ -111,6 +114,7 @@ fn non_bundling_command(
                 program: "func".to_owned(),
                 args,
                 cwd: Some(root_dir.to_path_buf()),
+                stdin: CommandStdin::Inherit,
             })
         }
         other => anyhow::bail!(
@@ -150,6 +154,7 @@ fn publish_command(config: &AzureSection, bundle_dir: &Path) -> Result<CommandPl
             app_name(config)?,
         ],
         cwd: Some(bundle_dir.to_path_buf()),
+        stdin: CommandStdin::Inherit,
     })
 }
 
@@ -205,11 +210,12 @@ impl HandlerBuild {
             program: "cargo".to_owned(),
             args,
             cwd: Some(self.root_dir.clone()),
+            stdin: CommandStdin::Inherit,
         }
     }
 }
 
-impl ArtifactBuild for HandlerBuild {
+impl Task for HandlerBuild {
     fn describe(&self) -> String {
         format!(
             "{} && stage {} into {}",
@@ -379,7 +385,7 @@ pub fn check_manifest(manifest: &Manifest) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{ensure_runs_on_linux, prepare, ELF_MAGIC};
-    use crate::providers::{Action, CommandPlan};
+    use crate::providers::{Action, Step};
     use skyzen_manifest::Manifest;
 
     fn manifest(source: &str) -> Manifest {
@@ -410,7 +416,7 @@ mod tests {
         );
         assert!(described.contains("stage demo"), "{described}");
 
-        let commands: Vec<String> = plan.commands.iter().map(CommandPlan::display).collect();
+        let commands: Vec<String> = plan.steps.iter().map(Step::describe).collect();
         assert_eq!(commands.len(), 1);
         assert!(
             commands[0].contains("func azure functionapp publish skyzen-demo"),
@@ -432,7 +438,7 @@ mod tests {
         )
         .expect("plan");
 
-        assert!(plan.commands.is_empty(), "a build uploads nothing");
+        assert!(plan.steps.is_empty(), "a build uploads nothing");
         assert!(plan.build.is_some());
     }
 
@@ -456,11 +462,11 @@ mod tests {
         .expect("plan");
 
         assert!(
-            plan.commands[0]
-                .display()
+            plan.steps[0]
+                .describe()
                 .contains("func azure functionapp logstream skyzen-demo"),
             "{:?}",
-            plan.commands[0]
+            plan.steps[0]
         );
     }
 

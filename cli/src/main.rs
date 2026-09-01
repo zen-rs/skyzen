@@ -20,7 +20,6 @@ use std::{
     fs,
     io::Write as _,
     path::{Path, PathBuf},
-    process::{Command as Process, Stdio},
 };
 
 fn main() {
@@ -160,12 +159,13 @@ fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
     }
 
     if plan.run_mode == RunMode::Once {
-        return run_commands(&plan.commands, simulate, &plan.child_env);
+        return providers::run_steps(&plan.steps, simulate, &plan.child_env);
     }
 
-    let Some(command) = plan.commands.first() else {
-        anyhow::bail!("a supervised run needs at least one command");
-    };
+    // Everything a supervised process needs done first — seeding a local store, say — is a step
+    // ahead of it, and runs before it starts.
+    let (preamble, command) = plan.supervised()?;
+    providers::run_steps(preamble, simulate, &plan.child_env)?;
     if simulate {
         output::dry_run(format!("supervise {}", command.display()));
         return Ok(());
@@ -232,41 +232,6 @@ fn write_generated_file(file: &providers::GeneratedFile) -> Result<()> {
     handle
         .write_all(contents.as_bytes())
         .with_context(|| format!("failed to write {}", file.path.display()))
-}
-
-fn run_commands(
-    commands: &[providers::CommandPlan],
-    simulate: bool,
-    child_env: &[(String, String)],
-) -> Result<()> {
-    for command in commands {
-        let display = command.display();
-        if simulate {
-            output::dry_run(display);
-            continue;
-        }
-
-        output::step(&display);
-        let mut process = Process::new(&command.program);
-        process
-            .args(&command.args)
-            .envs(child_env.iter().map(|(key, value)| (key, value)))
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        if let Some(cwd) = &command.cwd {
-            process.current_dir(cwd);
-        }
-
-        let status = process
-            .status()
-            .with_context(|| format!("failed to launch {}", command.program))?;
-        if !status.success() {
-            anyhow::bail!("command failed with status {status}: {display}");
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

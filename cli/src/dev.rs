@@ -7,14 +7,14 @@
 
 use crate::{
     environment, output,
-    providers::{ArtifactBuild, CommandPlan, RunMode},
+    providers::{self, CommandPlan, RunMode, Task},
 };
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
 use std::{
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Child,
     sync::mpsc::{self, RecvTimeoutError},
     time::Duration,
 };
@@ -40,7 +40,7 @@ pub struct Supervision<'a> {
     /// The process to run.
     pub command: &'a CommandPlan,
     /// The build to re-run under [`RunMode::Rebuild`].
-    pub build: Option<&'a dyn ArtifactBuild>,
+    pub build: Option<&'a dyn Task>,
     /// Whether a change restarts the child or re-runs the build.
     pub mode: RunMode,
     /// Environment for the child, from the project's `.env` files.
@@ -61,19 +61,7 @@ struct SupervisedChild {
 impl SupervisedChild {
     fn spawn(command: &CommandPlan, child_env: &[(String, String)]) -> Result<Self> {
         output::step(command.display());
-        let mut process = Command::new(&command.program);
-        process
-            .args(&command.args)
-            .envs(child_env.iter().map(|(key, value)| (key, value)))
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        if let Some(cwd) = &command.cwd {
-            process.current_dir(cwd);
-        }
-        let child = process
-            .spawn()
-            .with_context(|| format!("failed to launch {}", command.program))?;
+        let child = providers::spawn_command(command, child_env)?;
         Ok(Self { child: Some(child) })
     }
 
