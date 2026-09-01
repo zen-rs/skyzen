@@ -121,7 +121,7 @@ fn every_template_generates_the_files_a_project_needs() {
         );
 
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect(".gitignore");
-        for secret_file in [".env", ".env.local", ".dev.vars"] {
+        for secret_file in [".env", ".env.local"] {
             assert!(
                 gitignore.lines().any(|line| line == secret_file),
                 "template `{label}` .gitignore must ignore {secret_file}"

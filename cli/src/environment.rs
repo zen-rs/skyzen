@@ -380,6 +380,17 @@ pub fn expose(value: &SecretString) -> &str {
     value.expose_secret()
 }
 
+/// A second, owned handle on a resolved value.
+///
+/// `SecretString` is deliberately not `Clone`, which is what stops a value being copied about
+/// casually. A sink that has to *own* one — a command whose standard input carries it — still
+/// needs a copy, and the copy zeroizes itself like the original, so this is the one way to make
+/// one and it reads the same way in a diff as [`expose`].
+#[must_use]
+pub fn duplicate(value: &SecretString) -> SecretString {
+    SecretString::from(value.expose_secret().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

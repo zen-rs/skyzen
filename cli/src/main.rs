@@ -13,12 +13,12 @@ mod secret_files;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
-use cli::{Cli, Command};
-use providers::{Action, FileContents, ProviderPlan, RunMode};
-use secrecy::ExposeSecret as _;
+use cli::{Cli, Command, SecretCommand};
+use providers::{Action, FileContents, ProviderPlan, RunMode, SecretAction};
+use secrecy::{zeroize::Zeroize as _, ExposeSecret as _};
 use std::{
     fs,
-    io::Write as _,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -81,7 +81,7 @@ fn run() -> Result<()> {
                 },
             ),
         },
-        command => run_plan(&cli, &action_for(command)),
+        command => run_plan(&cli, &action_for(command)?),
     }
 }
 
@@ -111,8 +111,8 @@ fn project_root(manifest_path: &Path) -> Result<PathBuf> {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf))
 }
 
-fn action_for(command: &Command) -> Action {
-    match command {
+fn action_for(command: &Command) -> Result<Action> {
+    Ok(match command {
         Command::Build { release } => Action::Build { release: *release },
         Command::Dev { runner_args } => Action::Dev {
             runner_args: runner_args.clone(),
@@ -121,7 +121,16 @@ fn action_for(command: &Command) -> Action {
         Command::Logs { wrangler_args } => Action::Logs {
             wrangler_args: wrangler_args.clone(),
         },
-        Command::Secret { command } => Action::Secret(command.clone()),
+        Command::Secret { command } => Action::Secret(match command {
+            // Read here rather than in a provider: every provider then delivers the same value the
+            // same way, and none of them has to know how a terminal prompts for one.
+            SecretCommand::Set { name } => SecretAction::Set {
+                name: name.clone(),
+                value: read_secret_value(name)?,
+            },
+            SecretCommand::Push => SecretAction::Push,
+            SecretCommand::List => SecretAction::List,
+        }),
         // `Migrate` belongs here too: `run` picks between the native runner and the provider plan
         // itself, and builds the `Action` on the branch that needs one.
         Command::New { .. }
@@ -132,7 +141,29 @@ fn action_for(command: &Command) -> Action {
         | Command::Completions { .. } => {
             unreachable!("handled before dispatch")
         }
+    })
+}
+
+/// Read one secret's value from the CLI's own standard input.
+///
+/// All of it, with the trailing newline a `printf`, an `echo` or a here-string leaves behind
+/// removed — the same trimming wrangler does — because a value with an accidental newline is
+/// rejected by whatever it is eventually sent to, hours later.
+fn read_secret_value(name: &skyzen_manifest::VarName) -> Result<secrecy::SecretString> {
+    let mut buffer = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buffer)
+        .with_context(|| format!("failed to read the value for `{name}` from standard input"))?;
+    let value = secrecy::SecretString::from(buffer.trim_end_matches(['\n', '\r']).to_owned());
+    buffer.zeroize();
+
+    if value.expose_secret().is_empty() {
+        anyhow::bail!(
+            "no value for `{name}` on standard input; pipe one in, as in `printf %s \"$VALUE\" | \
+             skyzen secret set {name}`"
+        );
     }
+    Ok(value)
 }
 
 fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
