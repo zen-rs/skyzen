@@ -11,7 +11,8 @@
 mod bundle;
 
 use crate::{
-    environment, output,
+    environment::{self, VariableKind},
+    output,
     project::Project,
     providers::{
         prepare_child_environment, Action, ArtifactBuild, CommandPlan, ProviderPlan, RunMode,
@@ -82,7 +83,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
         build: Some(Box::new(build)),
         run_mode: RunMode::Once,
         child_env: if matches!(action, Action::Deploy) {
-            prepare_child_environment(manifest)?
+            prepare_child_environment(manifest, VariableKind::ALL)?.child_env
         } else {
             Vec::new()
         },
