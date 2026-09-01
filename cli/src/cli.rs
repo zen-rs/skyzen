@@ -5,6 +5,7 @@
 //! a bespoke parser has to reimplement one at a time.
 
 use clap::{Parser, Subcommand, ValueEnum};
+use skyzen_manifest::VarName;
 use std::path::PathBuf;
 
 /// Unified local emulation and deployment CLI for Skyzen.
@@ -108,7 +109,7 @@ pub enum Command {
         wrangler_args: Vec<String>,
     },
 
-    /// Manage the deployed Worker's secrets.
+    /// Manage the deployed application's secrets, on Cloudflare, AWS or Azure.
     Secret {
         /// The secret operation to perform.
         #[command(subcommand)]
@@ -138,14 +139,26 @@ pub enum MigrateCommand {
 }
 
 /// The `skyzen secret` operations.
+///
+/// Every one of them works on a name the manifest declares as `[[secret]]`: the CLI has no notion
+/// of a secret the application does not read, and a typo is refused rather than uploaded.
+///
+/// All three work on every cloud provider — `wrangler` on Cloudflare, the function environment on
+/// AWS, the application settings on Azure — and none of them puts a value on a command line. See
+/// `docs/skyzen-toml-reference.md#secrets`.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum SecretCommand {
-    /// Set a secret, reading its value from stdin.
+    /// Set one secret, reading its value from this command's standard input.
     Set {
-        /// The secret's name, as seen from `env` in the Worker.
-        name: String,
+        /// The secret's name, as declared by a `[[secret]]` entry.
+        name: VarName,
     },
-    /// List the secrets the deployed Worker has.
+    /// Deliver every declared secret's local value to the deployment.
+    ///
+    /// The same delivery `skyzen deploy` performs, without rebuilding: the values come from the
+    /// process environment and the project's `.env` files, and a missing one is refused.
+    Push,
+    /// List the names the deployment has. Never a value: no command prints one.
     List,
 }
 
@@ -377,6 +390,31 @@ mod tests {
     fn an_unknown_migrate_subcommand_is_rejected() {
         Cli::try_parse_from(["skyzen", "migrate", "rollback"])
             .expect_err("there is no rollback; migrations are forward-only");
+    }
+
+    #[test]
+    fn a_secret_is_named_by_an_environment_variable_name_or_it_is_not_named() {
+        let parsed = parse(&["skyzen", "secret", "set", "STRIPE_KEY"]);
+        let Command::Secret { command } = parsed.command else {
+            panic!("expected `secret`");
+        };
+        assert_eq!(
+            command,
+            super::SecretCommand::Set {
+                name: "STRIPE_KEY".parse().expect("a name")
+            }
+        );
+
+        // The manifest's rule, applied by the parser: a name an operating system would not accept
+        // is refused before anything is read from standard input.
+        Cli::try_parse_from(["skyzen", "secret", "set", "STRIPE-KEY"])
+            .expect_err("not an environment variable name");
+
+        let push = parse(&["skyzen", "secret", "push"]);
+        let Command::Secret { command } = push.command else {
+            panic!("expected `secret`");
+        };
+        assert_eq!(command, super::SecretCommand::Push);
     }
 
     #[test]

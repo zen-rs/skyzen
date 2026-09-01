@@ -8,16 +8,20 @@
 //!
 //! [custom handler]: https://learn.microsoft.com/azure/azure-functions/functions-custom-handlers
 
+mod app_settings;
 mod bundle;
 
 use crate::{
-    environment, output,
+    environment::{self, VariableKind},
+    output,
     project::Project,
     providers::{
-        prepare_child_environment, Action, ArtifactBuild, CommandPlan, ProviderPlan, RunMode,
+        prepare_child_environment, secrets::Delivery, Action, CommandPlan, CommandStdin,
+        ProviderPlan, RunMode, SecretAction, Step, Task,
     },
 };
 use anyhow::{Context, Result};
+use app_settings::{AppSettingNames, AppSettings, FunctionApp};
 use skyzen_manifest::{AzureSection, Manifest};
 use std::{
     fs,
@@ -38,24 +42,31 @@ pub const DEFAULT_LINUX_TARGET: &str = "x86_64-unknown-linux-musl";
 ///
 /// # Errors
 ///
-/// Fails when the project cannot name the binary to publish, when `deploy` has no `app_name` to
-/// publish to, or when the action has no Azure meaning.
+/// Fails when the project cannot name the binary to publish, when `[azure]` does not say which
+/// Function App to act on, or when the action has no Azure meaning.
 pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Result<ProviderPlan> {
     let config = manifest.data().azure.clone().unwrap_or_default();
     let root_dir = manifest.root_dir().to_path_buf();
     let bundle_dir = root_dir.join(BUNDLE_DIR);
+
+    // Before the binary is looked up: a secret action neither builds nor publishes anything, so a
+    // project that cannot name one is no obstacle to setting a value.
+    if let Action::Secret(secret) = action {
+        return Ok(ProviderPlan {
+            steps: vec![secret_step(secret, manifest, &config)?],
+            ..ProviderPlan::default()
+        });
+    }
+
     let binary = project.binary_target_name()?.to_owned();
 
     let needs_bundle = matches!(action, Action::Build { .. } | Action::Deploy);
     if !needs_bundle {
         return Ok(ProviderPlan {
-            commands: vec![non_bundling_command(action, &config, &root_dir)?],
-            generated_files: Vec::new(),
-            build: None,
-            run_mode: RunMode::Once,
-            child_env: Vec::new(),
-            watch_root: None,
-            execute_despite_dry_run: false,
+            steps: vec![Step::Command(non_bundling_command(
+                action, &config, &root_dir,
+            )?)],
+            ..ProviderPlan::default()
         });
     }
 
@@ -70,25 +81,64 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
         require_linux: matches!(action, Action::Deploy),
     };
 
-    let commands = match action {
+    let mut child_env = Vec::new();
+    let steps = match action {
         Action::Build { .. } => Vec::new(),
-        Action::Deploy => vec![publish_command(&config, &bundle_dir)?],
+        Action::Deploy => {
+            // Both are read before anything is built: a deploy that would have nowhere to deliver
+            // its variables, or no value for one of them, must fail before it uploads a binary.
+            let app = function_app(&config)?;
+            let publish = publish_command(&config, &bundle_dir)?;
+            let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
+            child_env = prepared.child_env;
+            let mut steps = vec![Step::Command(publish)];
+            let delivery = Delivery::from_resolved(&prepared.resolved);
+            if !delivery.is_empty() {
+                steps.push(Step::Task(Box::new(AppSettings::new(app, delivery))));
+            }
+            steps
+        }
         other => unreachable!("{} does not need a bundle", super::action_name(other)),
     };
 
     Ok(ProviderPlan {
-        commands,
+        steps,
         generated_files: files,
         build: Some(Box::new(build)),
         run_mode: RunMode::Once,
-        child_env: if matches!(action, Action::Deploy) {
-            prepare_child_environment(manifest)?
-        } else {
-            Vec::new()
-        },
+        child_env,
         watch_root: None,
         execute_despite_dry_run: false,
     })
+}
+
+/// The one step a `skyzen secret` action performs.
+///
+/// Functions has no secret store of its own: an app's settings *are* its environment, so every one
+/// of these is the same read-modify-write against them.
+///
+/// # Errors
+///
+/// Fails when `[azure]` does not say which app to talk to, when a declared variable is set
+/// nowhere, or when there is nothing at all to push.
+fn secret_step(action: &SecretAction, manifest: &Manifest, config: &AzureSection) -> Result<Step> {
+    let app = function_app(config)?;
+    let delivery = match action {
+        SecretAction::Set { name, value } => Delivery::one(name.as_str(), value),
+        SecretAction::Push => {
+            let resolved = prepare_child_environment(manifest, VariableKind::ALL)?.resolved;
+            let delivery = Delivery::from_resolved(&resolved);
+            if delivery.is_empty() {
+                anyhow::bail!(
+                    "there is nothing to push: Skyzen.toml declares no [[secret]] and no native \
+                     wiring variable"
+                );
+            }
+            delivery
+        }
+        SecretAction::List => return Ok(Step::Task(Box::new(AppSettingNames::new(app)))),
+    };
+    Ok(Step::Task(Box::new(AppSettings::new(app, delivery))))
 }
 
 /// The one command an action that needs no bundle runs.
@@ -110,6 +160,7 @@ fn non_bundling_command(
                 program: "func".to_owned(),
                 args,
                 cwd: Some(root_dir.to_path_buf()),
+                stdin: CommandStdin::Inherit,
             })
         }
         other => anyhow::bail!(
@@ -126,10 +177,6 @@ const fn unsupported_hint(action: &Action) -> &'static str {
         Action::Dev { .. } => {
             ": run it as an ordinary server with `skyzen dev`, or start the host over a built \
              bundle with `func start` from .skyzen/gen/azure"
-        }
-        Action::Secret(_) => {
-            ": Functions keeps secrets in the app's settings — `az functionapp config appsettings \
-             set` — or in Key Vault references"
         }
         Action::Migrate { .. } => {
             ": point `skyzen migrate` at the database directly rather than through the Function App"
@@ -149,6 +196,7 @@ fn publish_command(config: &AzureSection, bundle_dir: &Path) -> Result<CommandPl
             app_name(config)?,
         ],
         cwd: Some(bundle_dir.to_path_buf()),
+        stdin: CommandStdin::Inherit,
     })
 }
 
@@ -158,6 +206,27 @@ fn app_name(config: &AzureSection) -> Result<String> {
         "missing `app_name` in [azure]; it names the Function App to publish to, and there is \
          nothing to infer it from",
     )
+}
+
+/// The Function App an ARM call addresses.
+///
+/// `func azure functionapp publish` finds an app by name alone, but ARM addresses the settings
+/// resource by its full id, so a deploy — which delivers the runtime variables — and every
+/// `skyzen secret` action need all three parts. Reported together with the same wording as
+/// `app_name`, because a project missing one is usually missing both.
+fn function_app(config: &AzureSection) -> Result<FunctionApp> {
+    Ok(FunctionApp {
+        name: app_name(config)?,
+        subscription_id: config.subscription_id.clone().context(
+            "missing `subscription_id` in [azure]; it is half of the ARM id of the application \
+             settings a deployment delivers its runtime variables through, and there is nothing \
+             to infer it from (`az account show --query id -o tsv`)",
+        )?,
+        resource_group: config.resource_group.clone().context(
+            "missing `resource_group` in [azure]; it is the other half of that ARM id (`az \
+             functionapp list --query \"[].{name:name,group:resourceGroup}\" -o table`)",
+        )?,
+    })
 }
 
 /// Compile the handler and stage it inside the bundle.
@@ -204,11 +273,12 @@ impl HandlerBuild {
             program: "cargo".to_owned(),
             args,
             cwd: Some(self.root_dir.clone()),
+            stdin: CommandStdin::Inherit,
         }
     }
 }
 
-impl ArtifactBuild for HandlerBuild {
+impl Task for HandlerBuild {
     fn describe(&self) -> String {
         format!(
             "{} && stage {} into {}",
@@ -347,6 +417,9 @@ pub fn check_linux_target(manifest_path: &Path) -> usize {
 
 /// Report what `skyzen doctor --provider azure` can tell from the manifest alone.
 pub fn check_manifest(manifest: &Manifest) -> usize {
+    // The Functions host runs the native binary, so a deploy delivers both kinds.
+    super::report_runtime_variables(manifest, VariableKind::ALL, "azure", "skyzen deploy");
+
     let Some(config) = manifest.data().azure.as_ref() else {
         output::failed(
             "azure: Skyzen.toml has no [azure] section; `skyzen deploy` needs `app_name`",
@@ -355,14 +428,15 @@ pub fn check_manifest(manifest: &Manifest) -> usize {
     };
 
     let mut failures = 0;
-    if config.app_name.is_none() {
-        output::failed("azure: [azure] has no `app_name`; there is nothing to publish to");
-        failures += 1;
-    } else {
-        output::ok(format!(
-            "azure: publishing to {}",
-            config.app_name.as_deref().unwrap_or_default()
-        ));
+    match function_app(config) {
+        Ok(app) => output::ok(format!(
+            "azure: publishing to {} in {}/{}",
+            app.name, app.subscription_id, app.resource_group
+        )),
+        Err(error) => {
+            output::failed(format!("azure: {error}"));
+            failures += 1;
+        }
     }
 
     for trigger in &config.queue_triggers {
@@ -378,8 +452,14 @@ pub fn check_manifest(manifest: &Manifest) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{ensure_runs_on_linux, prepare, ELF_MAGIC};
-    use crate::providers::{Action, CommandPlan};
-    use skyzen_manifest::Manifest;
+    use crate::providers::{Action, SecretAction, Step};
+    use secrecy::SecretString;
+    use skyzen_manifest::{Manifest, VarName};
+
+    /// An `[azure]` section naming everything a deploy needs.
+    const ADDRESSED: &str = "[azure]\napp_name = \"skyzen-demo\"\n\
+         subscription_id = \"00000000-0000-0000-0000-000000000000\"\n\
+         resource_group = \"skyzen-rg\"\n";
 
     fn manifest(source: &str) -> Manifest {
         Manifest::parse(source, "Skyzen.toml", "/tmp/app").expect("valid manifest")
@@ -394,9 +474,9 @@ mod tests {
     fn a_deploy_publishes_the_generated_bundle_and_builds_the_handler_first() {
         let plan = prepare(
             &Action::Deploy,
-            &manifest(
-                "[azure]\napp_name = \"skyzen-demo\"\ntarget = \"x86_64-unknown-linux-musl\"\n",
-            ),
+            &manifest(&format!(
+                "{ADDRESSED}target = \"x86_64-unknown-linux-musl\"\n"
+            )),
             &project(),
         )
         .expect("plan");
@@ -409,7 +489,7 @@ mod tests {
         );
         assert!(described.contains("stage demo"), "{described}");
 
-        let commands: Vec<String> = plan.commands.iter().map(CommandPlan::display).collect();
+        let commands: Vec<String> = plan.steps.iter().map(Step::describe).collect();
         assert_eq!(commands.len(), 1);
         assert!(
             commands[0].contains("func azure functionapp publish skyzen-demo"),
@@ -429,9 +509,9 @@ mod tests {
             &manifest("[azure]\napp_name = \"skyzen-demo\"\n"),
             &project(),
         )
-        .expect("plan");
+        .expect("a build needs no ARM id: it uploads nothing");
 
-        assert!(plan.commands.is_empty(), "a build uploads nothing");
+        assert!(plan.steps.is_empty(), "a build uploads nothing");
         assert!(plan.build.is_some());
     }
 
@@ -441,6 +521,99 @@ mod tests {
             .expect_err("there is nothing to publish to");
 
         assert!(error.to_string().contains("app_name"), "{error}");
+    }
+
+    #[test]
+    fn a_deploy_that_cannot_address_the_settings_resource_names_the_missing_key() {
+        for (source, missing) in [
+            (
+                "[azure]\napp_name = \"skyzen-demo\"\nresource_group = \"skyzen-rg\"\n",
+                "subscription_id",
+            ),
+            (
+                "[azure]\napp_name = \"skyzen-demo\"\n\
+                 subscription_id = \"00000000-0000-0000-0000-000000000000\"\n",
+                "resource_group",
+            ),
+        ] {
+            let error = prepare(&Action::Deploy, &manifest(source), &project())
+                .expect_err("the runtime variables would have nowhere to go");
+            assert!(error.to_string().contains(missing), "{error}");
+
+            let error = prepare(
+                &Action::Secret(SecretAction::List),
+                &manifest(source),
+                &project(),
+            )
+            .expect_err("nor can a secret action address the app");
+            assert!(error.to_string().contains(missing), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_deploy_ends_by_delivering_the_variables_it_names_and_no_values() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join(".env"), "STRIPE_KEY=sk_live_123\n").expect("write .env");
+        let manifest = Manifest::parse(
+            &format!("[[secret]]\nname = \"STRIPE_KEY\"\n\n{ADDRESSED}"),
+            dir.path().join("Skyzen.toml"),
+            dir.path(),
+        )
+        .expect("valid manifest");
+
+        let plan = prepare(&Action::Deploy, &manifest, &project()).expect("plan");
+        let last = plan.steps.last().expect("a deploy delivers its settings");
+        let described = last.describe();
+
+        assert!(matches!(last, Step::Task(_)), "{described}");
+        assert!(described.contains("skyzen-demo"), "{described}");
+        assert!(described.contains("STRIPE_KEY"), "{described}");
+        assert!(!described.contains("sk_live_123"), "{described}");
+        // The publish still comes first: settings that named a binary nobody uploaded would be
+        // delivered to the previous deployment.
+        assert!(
+            plan.steps[0].describe().contains("functionapp publish"),
+            "{:?}",
+            plan.steps[0]
+        );
+    }
+
+    #[test]
+    fn a_deploy_refuses_when_a_declared_variable_is_set_nowhere() {
+        let error = prepare(
+            &Action::Deploy,
+            &manifest(&format!(
+                "[[secret]]\nname = \"SKYZEN_TEST_AZURE_UNSET_SECRET\"\n\n{ADDRESSED}"
+            )),
+            &project(),
+        )
+        .expect_err("the published handler would panic at startup");
+
+        assert!(
+            format!("{error:#}").contains("SKYZEN_TEST_AZURE_UNSET_SECRET"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn setting_one_secret_delivers_that_pair_and_names_no_value() {
+        let plan = prepare(
+            &Action::Secret(SecretAction::Set {
+                name: VarName::try_from("STRIPE_KEY".to_owned()).expect("a name"),
+                value: SecretString::from("sk_live_123"),
+            }),
+            &manifest(&format!("[[secret]]\nname = \"STRIPE_KEY\"\n\n{ADDRESSED}")),
+            &project(),
+        )
+        .expect("plan");
+
+        let described = plan.steps[0].describe();
+        assert!(described.contains("STRIPE_KEY"), "{described}");
+        assert!(described.contains("skyzen-demo"), "{described}");
+        assert!(!described.contains("sk_live_123"), "{described}");
+        // A secret action publishes nothing, so it generates no bundle either.
+        assert!(plan.generated_files.is_empty());
+        assert!(plan.build.is_none());
     }
 
     #[test]
@@ -455,11 +628,11 @@ mod tests {
         .expect("plan");
 
         assert!(
-            plan.commands[0]
-                .display()
+            plan.steps[0]
+                .describe()
                 .contains("func azure functionapp logstream skyzen-demo"),
             "{:?}",
-            plan.commands[0]
+            plan.steps[0]
         );
     }
 
