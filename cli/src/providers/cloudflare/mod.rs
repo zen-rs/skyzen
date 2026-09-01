@@ -639,8 +639,10 @@ mod tests {
             false,
         );
         assert!(dev.contains("wrangler dev --local"), "{dev}");
+        // Joined the way the plan joins it, so the separator is the host's on every platform.
+        let config = PathBuf::from("/tmp/app").join(super::WRANGLER_CONFIG_PATH);
         assert!(
-            dev.contains("--config /tmp/app/.skyzen/gen/wrangler.toml"),
+            dev.contains(&format!("--config {}", config.display())),
             "{dev}"
         );
         assert!(dev.contains("--env staging"), "{dev}");
