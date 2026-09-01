@@ -21,7 +21,7 @@ use crate::{
 use anyhow::{Context, Result};
 use skyzen_manifest::{
     migrations::MigrationFile, DatabaseEntry, Manifest, NativeDatabaseBackend,
-    NativeDatabaseSection,
+    NativeDatabaseSection, VarName,
 };
 use skyzen_services::{Db, Migration, Migrations};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -34,7 +34,7 @@ struct Target {
     /// The driver its `[native.database.<name>]` names.
     backend: NativeDatabaseBackend,
     /// The environment variable holding the connection URL.
-    url_env: String,
+    url_env: VarName,
     /// The migrations directory, resolved against the project root.
     directory: PathBuf,
     /// The files that directory holds, already validated and checksummed.
@@ -281,7 +281,7 @@ async fn connect(target: &Target, url: &str) -> Result<Db> {
 fn connection_url(target: &Target, dotenv: &BTreeMap<String, String>) -> Result<String> {
     std::env::var(&target.url_env)
         .ok()
-        .or_else(|| dotenv.get(&target.url_env).cloned())
+        .or_else(|| dotenv.get(target.url_env.as_str()).cloned())
         .with_context(|| {
             format!(
                 "{} is not set; it holds the connection URL for database `{}` \
@@ -388,7 +388,7 @@ fn target_for(
         url_env: section
             .url_env()
             .context("a database with no connection URL is not resolved into a target")?
-            .to_owned(),
+            .clone(),
         directory,
         files,
     })
@@ -398,7 +398,7 @@ fn target_for(
 mod tests {
     use super::{connection_url, dispatch, resolve_targets, run, Dispatch, Target};
     use crate::cli::{MigrateCommand, Provider};
-    use skyzen_manifest::{Manifest, NativeDatabaseBackend};
+    use skyzen_manifest::{Manifest, NativeDatabaseBackend, VarName};
     use std::{collections::BTreeMap, fs, path::Path};
 
     /// A manifest wiring one SQLite database whose URL comes from `variable`.
@@ -579,11 +579,11 @@ mod tests {
         let target = Target {
             name: "main".to_owned(),
             backend: NativeDatabaseBackend::Sqlite,
-            url_env: "SKYZEN_TEST_URL_PRECEDENCE".to_owned(),
+            url_env: VarName::from_static("SKYZEN_TEST_URL_PRECEDENCE"),
             directory: std::path::PathBuf::from("migrations"),
             files: Vec::new(),
         };
-        let dotenv = BTreeMap::from([(target.url_env.clone(), "from-dotenv".to_owned())]);
+        let dotenv = BTreeMap::from([(target.url_env.to_string(), "from-dotenv".to_owned())]);
         assert_eq!(
             connection_url(&target, &dotenv).expect("dotenv"),
             "from-dotenv"
@@ -600,7 +600,7 @@ mod tests {
         let target = Target {
             name: "main".to_owned(),
             backend: NativeDatabaseBackend::Sqlite,
-            url_env: "SKYZEN_TEST_NEVER_SET_URL".to_owned(),
+            url_env: VarName::from_static("SKYZEN_TEST_NEVER_SET_URL"),
             directory: std::path::PathBuf::from("migrations"),
             files: Vec::new(),
         };
