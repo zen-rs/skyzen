@@ -269,7 +269,7 @@ mod tests {
         // voided the entire `request.cf` decode before the tolerant deserializer.
         let bm: CfBotManagement =
             serde_json::from_str(r#"{"score":99,"detectionIds":{}}"#).unwrap();
-        assert!(bm.detection_ids.is_empty());
+        assert_eq!(bm.detection_ids, Vec::<u32>::new());
 
         let bm: CfBotManagement =
             serde_json::from_str(r#"{"detectionIds":{"a":3,"b":5}}"#).unwrap();

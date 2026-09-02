@@ -772,37 +772,40 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         fn_ident.to_string().to_uppercase()
     );
 
-    // All generated items are gated on `debug_assertions` + native targets only. The condition
-    // must not mention any cargo feature: these `cfg`s are evaluated against the *user's* crate
-    // features, and downstream crates have no feature named `openapi`. The referenced
-    // `::skyzen::openapi` symbols exist whenever skyzen itself is compiled for a native debug
-    // build, independent of skyzen's `openapi` feature.
+    // Whether to emit any of this is decided *here*, in this crate's own compilation, because
+    // this is the only place the question can be answered correctly. The expansion lands in the
+    // user's crate, so a `#[cfg(feature = "openapi")]` inside it would ask about the application's
+    // features rather than skyzen's — which is why this used to ride on `debug_assertions` as a
+    // stand-in switch, and why a release build had no document. `skyzen/openapi` turns on this
+    // crate's own `openapi` feature instead, so the real switch is finally readable.
+    if !cfg!(feature = "openapi") {
+        return Ok(quote! { #function }.into());
+    }
+
+    // Nothing below mentions a target: `__register_handler_spec!` owns that split, so a handler
+    // documents itself identically whether it is compiled for a server or for an isolate.
     Ok(quote! {
         #function
 
-        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         const _: fn() = || {
             #(#assertions)*
         };
 
-        #(
-            #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
-            #schema_collector_defs
-        )*
+        #(#schema_collector_defs)*
 
-        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
-        #[::skyzen::openapi::linkme::distributed_slice(::skyzen::openapi::HANDLER_SPECS)]
-        #[linkme(crate = ::skyzen::openapi::linkme)]
-        static #spec_ident: ::skyzen::openapi::HandlerSpec = ::skyzen::openapi::HandlerSpec {
-            type_name: #type_name_literal,
-            operation_name: #operation_name_literal,
-            docs: #doc_tokens,
-            deprecated: #deprecated,
-            parameters: #schema_array,
-            parameter_names: #parameter_names_array,
-            response: #response_schema_fn,
-            schemas: #schema_collectors,
-        };
+        ::skyzen::__register_handler_spec!(
+            #spec_ident,
+            ::skyzen::openapi::HandlerSpec {
+                type_name: #type_name_literal,
+                operation_name: #operation_name_literal,
+                docs: #doc_tokens,
+                deprecated: #deprecated,
+                parameters: #schema_array,
+                parameter_names: #parameter_names_array,
+                response: #response_schema_fn,
+                schemas: #schema_collectors,
+            }
+        );
     }
     .into())
 }

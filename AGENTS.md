@@ -162,6 +162,23 @@ remain Cloudflare-only, because nothing else has those events.
   the `.env` precedence rule and the per-provider delivery table, is
   `docs/skyzen-toml-reference.md#secrets`.
 
+### 5c. OpenAPI
+- The document is target-independent. `#[skyzen::openapi]` collects a `HandlerSpec` per handler and
+  `describe_handler` resolves it by `type_name` when the route is built — on a server, in Lambda, in
+  Azure Functions and inside a Worker alike, in release as in debug.
+- **The `openapi` cargo feature is the only switch**, and the decision is made in `skyzen-macros`,
+  not in the expansion. Macro output lands in the *application's* crate, where
+  `cfg(feature = "openapi")` would ask about the application's features; so `skyzen/openapi` enables
+  `skyzen-macros/openapi` and `expand_openapi_fn` checks `cfg!(feature = "openapi")` at expansion
+  time. Feature off ⇒ nothing is emitted at all. This replaced `debug_assertions`, which used to
+  stand in for a switch that was not readable and left release builds with an empty document.
+- **`src/openapi/registry.rs` is the only file that asks what target it is.** Native registers into a
+  `linkme` distributed slice — linker-section data, nothing before `main`, free at runtime. wasm32
+  has no such linker support, so it uses `inventory`: one life-before-main constructor per handler,
+  pushing onto a list at isolate start. The cost difference is the entire reason for two backends,
+  and `__register_handler_spec!` hides the shape difference from the macro. Do not spread either
+  crate's name beyond that file, and do not adopt `inventory` natively.
+
 ### 6. Error Handling & Log Security
 - `#[skyzen::error]` generates `Display`, `Error`, and `HttpError` implementations with status code attributes.
 - **4xx errors** return formatted JSON messages to clients.
