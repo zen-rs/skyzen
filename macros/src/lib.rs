@@ -99,8 +99,12 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         .as_ref()
         .map_or_else(|| quote! { || async {} }, |path| quote! { || #path() });
 
+    let register_app_info = app_info_registration();
+
     let output = quote! {
         ::skyzen::import_config!();
+
+        #register_app_info
 
         #function
 
@@ -108,6 +112,13 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(clippy::redundant_clone)]
         fn main() {
             #init_logging
+            // Answers `SKYZEN_OPENAPI_DUMP` before anything binds or connects. The document is
+            // built from the router the entry function returns, ahead of the service wiring the
+            // factory does, so `skyzen openapi` works in a project whose backends do not exist
+            // yet.
+            if ::skyzen::runtime::native::dump_openapi_if_requested(|| async { #entry_call }) {
+                return;
+            }
             ::skyzen::runtime::native::launch(
                 ::skyzen::runtime::native::LaunchOptions {
                     listen: ::skyzen::runtime::native::apply_cli_overrides(::std::env::args()),
@@ -2365,6 +2376,30 @@ fn service_wrapper_path(service_type: ServiceType) -> proc_macro2::TokenStream {
         ServiceType::Kv => quote! { ::skyzen::__services::Kv },
         ServiceType::Storage => quote! { ::skyzen::__services::Storage },
         ServiceType::Queue => quote! { ::skyzen::__services::Queue },
+    }
+}
+
+/// The application's identity, registered exactly as `#[skyzen::openapi]` registers a handler.
+///
+/// `env!` expands in the application's crate, which is the only place it reads the application's
+/// own name rather than skyzen's — and registering it there means no document, and no routing call
+/// that builds one, has to carry the name as an argument. One per binary, because `#[skyzen::main]`
+/// is what defines a binary; emitted at item level rather than inside `main` so the wasm build,
+/// which has no `main`, registers it too.
+fn app_info_registration() -> proc_macro2::TokenStream {
+    if !cfg!(feature = "openapi") {
+        return quote! {};
+    }
+
+    quote! {
+        ::skyzen::__register_app_info!(
+            __SKYZEN_APP_INFO,
+            ::skyzen::openapi::AppInfo {
+                name: env!("CARGO_PKG_NAME"),
+                version: env!("CARGO_PKG_VERSION"),
+                description: option_env!("CARGO_PKG_DESCRIPTION"),
+            }
+        );
     }
 }
 

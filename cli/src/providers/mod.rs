@@ -427,7 +427,7 @@ pub fn prepare(
 /// had one. An empty manifest declares no capabilities and no environment variables, which is
 /// exactly right for the native path; the Cloudflare path then fails with "missing [cloudflare]
 /// section", which says what to do, rather than with a file-not-found.
-fn load_or_empty(manifest_path: &Path) -> Result<Manifest> {
+pub fn load_or_empty(manifest_path: &Path) -> Result<Manifest> {
     if manifest_path.exists() {
         return environment::load_manifest(manifest_path);
     }

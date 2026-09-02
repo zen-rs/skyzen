@@ -172,6 +172,20 @@ remain Cloudflare-only, because nothing else has those events.
   `skyzen-macros/openapi` and `expand_openapi_fn` checks `cfg!(feature = "openapi")` at expansion
   time. Feature off ⇒ nothing is emitted at all. This replaced `debug_assertions`, which used to
   stand in for a switch that was not readable and left release builds with an empty document.
+- **The document names the application, and no API carries that name.** `env!("CARGO_PKG_NAME")`
+  expands where it is written, so `OpenApi::default_info` used to title every user's document
+  `skyzen 0.2.1`. The fix is not an argument on `enable_api_doc`: `#[skyzen::main]` expands in the
+  application's crate, so it registers an `AppInfo` into `registry::APP_INFO` exactly as
+  `#[skyzen::openapi]` registers a `HandlerSpec`, and `OpenApi::info` reads it. One per binary,
+  because one attribute defines a binary. `OpenApi::with_info` overrides it; with neither, the title
+  is an anonymous `API 0.0.0`, since naming skyzen is worse. **Do not add a name parameter to a
+  routing method** — that was tried and reverted; the registry is why it is not needed.
+- **`skyzen openapi` runs the application, and that is the only way.** Only the compiled binary
+  knows what was collected. `SKYZEN_OPENAPI_DUMP` (defined once in `skyzen-core`, so the CLI and the
+  runtime cannot spell it differently) makes `#[skyzen::main]` print the document and exit *before*
+  the factory's service wiring — which is what lets the command work with no credentials, no
+  reachable backend and an incomplete `.env`, where `skyzen dev` refuses to start. Keep the dump
+  ahead of the wiring; moving it after would quietly reintroduce that requirement.
 - **`src/openapi/registry.rs` is the only file that asks what target it is.** Native registers into a
   `linkme` distributed slice — linker-section data, nothing before `main`, free at runtime. wasm32
   has no such linker support, so it uses `inventory`: one life-before-main constructor per handler,

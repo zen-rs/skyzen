@@ -81,6 +81,26 @@ pub enum Command {
     },
 
     /// Build and deploy the project.
+    /// Open the application's API reference in a browser.
+    ///
+    /// Runs the application so it prints its own `OpenAPI` document and exits — before it wires any
+    /// service, so this needs no credentials and no reachable backend — then renders a Scalar page
+    /// around it as a local file. Nothing is served and no port is used.
+    // clap would derive `open-api` from the variant name; the command is one word.
+    #[command(name = "openapi")]
+    OpenApi {
+        /// Write the document here instead of rendering a page.
+        #[arg(long, value_name = "PATH", conflicts_with = "print")]
+        json: Option<PathBuf>,
+
+        /// Write the document to standard output instead of rendering a page.
+        #[arg(long, conflicts_with = "no_open")]
+        print: bool,
+
+        /// Render the page but print its path instead of opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     Deploy,
 
     /// Create the cloud resources the manifest declares but has no id for.
@@ -301,6 +321,44 @@ mod tests {
             panic!("expected `dev`");
         };
         assert_eq!(runner_args, vec!["--test-scheduled"]);
+    }
+
+    #[test]
+    fn the_openapi_command_is_one_word() {
+        // clap derives `open-api` from the variant name, which is not what any documentation says.
+        let Command::OpenApi {
+            json,
+            print,
+            no_open,
+        } = parse(&["skyzen", "openapi"]).command
+        else {
+            panic!("expected the openapi command");
+        };
+        assert_eq!(json, None);
+        assert!(!print);
+        assert!(!no_open);
+    }
+
+    #[test]
+    fn openapi_output_destinations_are_mutually_exclusive() {
+        // Each of these asks for the document in a different place; taking two silently would mean
+        // honouring one and dropping the other.
+        for args in [
+            vec!["skyzen", "openapi", "--print", "--json", "spec.json"],
+            vec!["skyzen", "openapi", "--print", "--no-open"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn openapi_writes_the_document_where_asked() {
+        let Command::OpenApi { json, .. } =
+            parse(&["skyzen", "openapi", "--json", "spec.json"]).command
+        else {
+            panic!("expected the openapi command");
+        };
+        assert_eq!(json, Some(std::path::PathBuf::from("spec.json")));
     }
 
     #[test]

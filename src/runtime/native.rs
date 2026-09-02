@@ -433,6 +433,70 @@ enum Platform {
     },
 }
 
+pub use skyzen_core::OPENAPI_DUMP_ENV;
+
+/// Print the application's `OpenAPI` document and report that the process should now exit, if
+/// [`OPENAPI_DUMP_ENV`] asked for it.
+///
+/// Returns `false` — having touched nothing, not even `factory` — when the variable is unset, so
+/// the ordinary startup path pays a single `getenv` for this.
+///
+/// `#[skyzen::main]` calls this *before* wiring services into the router, which is the whole point:
+/// a document describes the shape of an API, not a connection to anything, so producing one must
+/// not require credentials, a reachable database or a provisioned queue. `skyzen openapi` relies on
+/// that — it runs the binary in a project whose backends may not exist yet.
+///
+/// # Panics
+///
+/// Never returns on a failure: an unwritable path or a build with the `openapi` feature off exits
+/// non-zero, because a caller asked for a document and a silent empty one is worse than no answer.
+pub fn dump_openapi_if_requested<Fut, E>(factory: impl FnOnce() -> Fut) -> bool
+where
+    Fut: Future<Output = E>,
+    E: ServedRoutes,
+{
+    let Some(target) = std::env::var_os(OPENAPI_DUMP_ENV) else {
+        return false;
+    };
+
+    let document = smol::block_on(factory()).openapi_document();
+    if !document.is_enabled() {
+        error!(
+            "{OPENAPI_DUMP_ENV} was set, but this binary was built without skyzen's `openapi` \
+             feature, so it has no document to print"
+        );
+        std::process::exit(1);
+    }
+
+    let json = match serde_json::to_string_pretty(&document.to_utoipa_spec()) {
+        Ok(json) => json,
+        Err(error) => {
+            error!("Failed to serialize the OpenAPI document: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    let path = std::path::Path::new(&target);
+    if path == std::path::Path::new("-") {
+        // The one place a Skyzen binary writes to stdout: the caller asked for the document *as*
+        // this process's output, so a logger would put it in the wrong stream.
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        if let Err(error) = writeln!(stdout, "{json}").and_then(|()| stdout.flush()) {
+            error!("Failed to write the OpenAPI document to stdout: {error}");
+            std::process::exit(1);
+        }
+    } else if let Err(error) = std::fs::write(path, &json) {
+        error!(
+            "Failed to write the OpenAPI document to {}: {error}",
+            path.display()
+        );
+        std::process::exit(1);
+    }
+
+    true
+}
+
 /// Set by the AWS Lambda execution environment, and by nothing else.
 const LAMBDA_RUNTIME_API_ENV: &str = "AWS_LAMBDA_RUNTIME_API";
 

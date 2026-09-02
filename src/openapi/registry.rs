@@ -20,7 +20,7 @@
 //! backend answers is a private matter of this file — the `#[skyzen::openapi]` expansion, the rest
 //! of the crate and an application's own code all name the same items whatever they compile for.
 
-use super::HandlerSpec;
+use super::{AppInfo, HandlerSpec};
 
 /// Every handler specification this binary registered, in no particular order.
 pub fn iter() -> impl Iterator<Item = &'static HandlerSpec> {
@@ -35,12 +35,35 @@ pub fn iter() -> impl Iterator<Item = &'static HandlerSpec> {
     }
 }
 
+/// The identity `#[skyzen::main]` registered for this binary, if it was built with one.
+///
+/// This is how a document learns whose it is without anybody passing it along. Skyzen cannot read
+/// `CARGO_PKG_NAME` on an application's behalf — `env!` expands where it is *written*, so asking
+/// inside skyzen names skyzen — but `#[skyzen::main]` expands in the application's crate, where
+/// the answer is right, and registers it here exactly as `#[skyzen::openapi]` registers a handler.
+///
+/// One per binary, because `#[skyzen::main]` defines the entry point and there is only one of
+/// those. `None` for a library under test, or an application that embeds skyzen behind its own
+/// runtime; both can still name themselves with [`OpenApi::with_info`](super::OpenApi::with_info).
+#[must_use]
+pub fn app_info() -> Option<&'static AppInfo> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        backend::APP_INFO.first()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        backend::inventory::iter::<AppInfo>().next()
+    }
+}
+
 /// The chosen backend's plumbing.
 ///
 /// Public because [`__register_handler_spec!`](crate::__register_handler_spec) expands in the
 /// application's crate and has to name it from there, and hidden because naming it from anywhere
-/// else is a mistake: these are the items that genuinely differ by target, and keeping them behind
-/// one door is what lets everything above be the same everywhere.
+/// else is a mistake: these are the two items that genuinely differ by target, and keeping them
+/// behind one door is what lets everything above be the same everywhere.
 #[doc(hidden)]
 pub mod backend {
     #[cfg(not(target_arch = "wasm32"))]
@@ -55,8 +78,17 @@ pub mod backend {
     #[linkme(crate = ::skyzen::openapi::registry::backend::linkme)]
     pub static HANDLER_SPECS: [super::HandlerSpec] = [..];
 
+    /// The same, for the one identity `#[skyzen::main]` registers per binary.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[linkme::distributed_slice]
+    #[linkme(crate = ::skyzen::openapi::registry::backend::linkme)]
+    pub static APP_INFO: [super::AppInfo] = [..];
+
     #[cfg(target_arch = "wasm32")]
     inventory::collect!(super::HandlerSpec);
+
+    #[cfg(target_arch = "wasm32")]
+    inventory::collect!(super::AppInfo);
 }
 
 /// Register one handler's specification with the registry.
@@ -92,5 +124,34 @@ macro_rules! __register_handler_spec {
 macro_rules! __register_handler_spec {
     ($ident:ident, $spec:expr) => {
         $crate::openapi::registry::backend::inventory::submit! { $spec }
+    };
+}
+
+/// Register this binary's identity, so a document can be titled without anybody passing a name
+/// down through the routing API.
+///
+/// Emitted once by `#[skyzen::main]`, in the application's crate, where `env!("CARGO_PKG_NAME")`
+/// reads the application rather than skyzen.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __register_app_info {
+    ($ident:ident, $info:expr) => {
+        #[$crate::openapi::registry::backend::linkme::distributed_slice(
+            $crate::openapi::registry::backend::APP_INFO
+        )]
+        #[linkme(crate = $crate::openapi::registry::backend::linkme)]
+        static $ident: $crate::openapi::AppInfo = $info;
+    };
+}
+
+/// Register this binary's identity. See the native definition above; same arguments, same one
+/// invocation, for the target whose registry is `inventory`.
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __register_app_info {
+    ($ident:ident, $info:expr) => {
+        $crate::openapi::registry::backend::inventory::submit! { $info }
     };
 }

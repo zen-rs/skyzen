@@ -171,17 +171,34 @@ pub use nest::{NestedPathError, NestedRouter};
 pub trait ServedRoutes {
     /// Every `(method, path)` pair this endpoint answers, in `matchit` path syntax.
     fn served_routes(&self) -> &[(MethodFilter, String)];
+
+    /// The `OpenAPI` document these routes describe.
+    ///
+    /// Defaulted so that a hand-written implementation — a test stub standing in for a router —
+    /// does not have to invent one. [`Router`] and every wrapper the framework puts around one
+    /// override it, so an ordinary application always gets the real document.
+    fn openapi_document(&self) -> OpenApi {
+        OpenApi::default()
+    }
 }
 
 impl ServedRoutes for Router {
     fn served_routes(&self) -> &[(MethodFilter, String)] {
         self.routes()
     }
+
+    fn openapi_document(&self) -> OpenApi {
+        self.openapi()
+    }
 }
 
 impl<E: ServedRoutes> ServedRoutes for crate::middleware::Layered<E> {
     fn served_routes(&self) -> &[(MethodFilter, String)] {
         self.endpoint().served_routes()
+    }
+
+    fn openapi_document(&self) -> OpenApi {
+        self.endpoint().openapi_document()
     }
 }
 
@@ -446,6 +463,12 @@ impl Route {
     }
 
     /// Enable the Scalar API documentation endpoint at `/api-docs`.
+    ///
+    /// The document is titled after the application, which it learns from what `#[skyzen::main]`
+    /// registered rather than from an argument — see [`AppInfo`](openapi::AppInfo). Override that
+    /// with [`OpenApi::with_info`](openapi::OpenApi::with_info) and
+    /// [`scalar_route`](openapi::OpenApi::scalar_route) when the API's public name is not the
+    /// crate's.
     #[must_use]
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.openapi();
@@ -509,6 +532,8 @@ impl RouteWithAlarm {
     }
 
     /// Enable the Scalar API documentation endpoint at `/api-docs`.
+    ///
+    /// Titled the same way [`Route::enable_api_doc`] is.
     #[must_use]
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.route.openapi();

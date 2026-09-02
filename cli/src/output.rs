@@ -15,6 +15,15 @@ pub fn step(message: impl Display) {
     println!("{PREFIX} {message}");
 }
 
+/// Report an action on stderr, for a command whose stdout is a payload rather than a transcript.
+///
+/// `skyzen openapi --print` writes the document to stdout, so its progress cannot go there too:
+/// `skyzen openapi --print | jq` has to receive a document and nothing else. A person watching a
+/// terminal still sees these lines; a pipe does not.
+pub fn step_aside(message: impl Display) {
+    eprintln!("{PREFIX} {message}");
+}
+
 /// Report an action the CLI would take, but is not taking because of `--dry-run`.
 pub fn dry_run(message: impl Display) {
     println!("[dry-run] {message}");
