@@ -484,6 +484,25 @@ fn the_env_example_lists_what_the_template_manifest_declares() {
 }
 
 #[test]
+fn a_scaffolded_project_pins_its_compatibility_date_instead_of_reading_the_clock() {
+    // #51: `now_utc()` here produced a project workerd refused to start, because it rejects any
+    // date newer than its own binary knows — on the `skyzen new` → `skyzen dev` path. Deriving it
+    // from the clock also made two runs on different days produce different projects.
+    let dir = temp_dir();
+    let path = project_dir(&dir);
+    create_project(&request(&path, Template::Api)).expect("template generation should succeed");
+
+    let manifest = std::fs::read_to_string(path.join("Skyzen.toml")).unwrap();
+    let declared = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("compatibility_date = "))
+        .expect("the api template declares a compatibility date")
+        .trim_matches('"');
+
+    assert_eq!(declared, crate::scaffold::COMPATIBILITY_DATE);
+}
+
+#[test]
 fn scaffolded_templates_compile() {
     let dir = temp_dir();
     let root = dir.path().to_path_buf();

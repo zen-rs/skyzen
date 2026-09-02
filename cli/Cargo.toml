@@ -45,7 +45,6 @@ skyzen-manifest.workspace = true
 # links the same runner and the same sqlx drivers the application would use. `runtime-tokio-rustls`
 # picks sqlx's primary runtime; the CLI drives it on a current-thread runtime of its own.
 skyzen-services = { workspace = true, features = ["runtime-tokio-rustls"] }
-time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = { version = "1.49", features = ["rt", "net", "time"] }
 toml = "1.0"
 toml_edit = "0.22"
