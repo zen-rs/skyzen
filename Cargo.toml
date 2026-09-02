@@ -19,7 +19,7 @@ executor-core = { version = "0.7.1", default-features = false, features = ["std"
 skyzen-hyper = { path = "hyper", version = "0.2.0" }
 skyzen-lambda = { path = "lambda", version = "0.1.0" }
 tracing = "0.1.44"
-skyzen = { path = ".", version = "0.2.1" }
+skyzen = { path = ".", version = "0.3.0" }
 smol = "2.0"
 async-executor = "1.13"
 async-io = "2.6"
@@ -43,7 +43,7 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1 }
 
 [package]
 name = "skyzen"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "A fast, ergonomic HTTP framework that works everywhere"
 license = "MIT OR Apache-2.0"

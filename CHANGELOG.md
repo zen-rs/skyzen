@@ -7,6 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/skyzen/compare/v0.2.1...v0.3.0) - 2026-09-02
+
+### Added
+
+- *(cli)* refuse committed secrets on CLI load
+- *(manifest)* interpolate deploy-time environment placeholders
+- *(macros)* add sql! so bind order comes from the query text
+- *(sql)* [**breaking**] decode rows by the type they are fetched into
+- *(durable)* [**breaking**] deliver websocket events in the native simulator and keep the handshake's headers
+- *(manifest)* let an rds-data wiring name the cluster it addresses
+- *(manifest)* wire Azure SQL from a [native.database] declaration
+- *(aws)* build an RdsDataDb from named parts
+- [**breaking**] reach Azure SQL through a portable T-SQL DbBackend
+- *(cli)* install, preflight and report every declarative backend
+- *(macros)* wire every cloud backend from [native.*] declarations
+- *(azure)* read a Storage queue's signed URL from a named variable
+- *(manifest)* model native wiring as per-backend tagged variants
+- *(cli)* give the api template a database and a migration to apply
+- *(cli)* report D1 migration status instead of refusing to
+- *(services)* portable SQL migrations, embedded and applied on every backend
+- *(deploy)* serve AWS Lambda and Azure Functions from the same binary
+- *(aws)* add an RDS Data API DbBackend for Aurora
+- *(runtime)* [**breaking**] drive `#[skyzen::queue]` natively, not only on Cloudflare
+- *(cli)* add d1 migrations and forward runner arguments from dev
+- *(cli)* [**breaking**] rebuild the command surface, the wrangler renderer and the dev loop
+- *(manifest)* [**breaking**] one typed Skyzen.toml schema for the CLI and the macros
+- *(ws)* [**breaking**] give websocket sessions an error channel and make `.ws` work on wasm32
+- *(azure)* [**breaking**] page blob listings server-side, and own the account credentials
+- *(azure)* [**breaking**] bind CosmosKv to a container that already exists
+- *(azure)* [**breaking**] give Service Bus a consume side and add Azure Storage queues
+- *(redis)* implement the atomic KV primitives and a from_env constructor
+- *(s3)* stream, range, presign and multipart, and wire every put option
+- *(aws)* [**breaking**] give SQS a consume side and FIFO support, DynamoDB atomics
+- *(services)* [**breaking**] report which batch messages a queue send rejected
+- *(cloudflare)* close the outbound cf, static assets and service-binding props gaps
+- *(macros)* [**breaking**] export the email and tail Worker handlers
+- *(durable)* [**breaking**] block concurrency, target jurisdictions, and let an object opt out of blob state
+- *(cloudflare)* [**breaking**] reach the depth of KV, R2, Queues, D1 and service bindings
+- *(runtime)* surface the Workers execution context and request.cf
+- *(services)* [**breaking**] widen object storage options and give SQL an atomic batch
+- *(test)* [**breaking**] carry all seven services through TestContext and open up the verbs
+- *(macros)* [**breaking**] generate a named extractor per service, not just per database
+- *(services)* [**breaking**] bind rich SQL types, bound single-row fetches, share one query builder
+- *(services)* stream, range and presign objects instead of buffering them
+- *(services)* [**breaking**] let queues delay a send and consume by pull
+- *(services)* [**breaking**] give Kv the atomic primitives and paginate its listing
+- *(sse,diagnostics)* keep SSE connections alive and explain unsatisfied trait bounds
+- *(static-files)* [**breaking**] stream files and answer conditional and range requests
+- *(routing)* [**breaking**] mount an already-built Router with nest()
+- *(responder)* add Redirect, Html and TypedHeader, and re-export CookieJar
+- *(extract)* add a typed Path<T> extractor and give path parameters real OpenAPI types
+- *(extract)* [**breaking**] honour the body limit in Json/Form/Multipart and deserialize repeated keys
+- *(core)* [**breaking**] enforce the request body limit and refuse a second body read
+- *(runtime)* [**breaking**] drain connections on Ctrl+C, install hyper's timer, add on_shutdown
+- *(routing)* [**breaking**] router layers, fallbacks and build-time wiring validation
+- *(core)* [**breaking**] own the middleware trait, request-body limit and wiring requirements
+
+### Fixed
+
+- *(ci)* stop release-plz aborting on the example crate's publish flag
+- *(openapi)* [**breaking**] require a schema where a schema is the contract
+- *(cloudflare)* [**breaking**] hand Durable Object stubs Skyzen requests and responses
+- *(macros)* resolve generated service paths through skyzen
+- *(azure)* take the platform TLS path for tiberius
+- *(handler)* stop generating an unreachable map_err for a handler with no arguments
+- *(macros)* say what a mismatched backend does provide
+- *(macros)* compare the embedded path in its escaped literal form for Windows
+- *(cli)* assert the bundle location by path components, not a slashed string
+- *(cli)* match bundle paths by component so the Azure tests pass on Windows
+- *(ci)* satisfy machete and the Windows dead-code gate
+- *(ci)* clear the two checks a current toolchain already fails
+- *(azure)* give the test SAS credential its new expires_at field
+- *(runtime)* re-export the cf module under test so its types are reachable
+- *(runtime,azure)* survive fresh dependency resolves and workerd placeholder cf
+- *(cli)* keep Skyzen.toml optional, and stop gating a build on runtime variables
+- *(azure)* [**breaking**] refuse a Service Bus receive that carries no wait
+- *(azure)* release a streamed upload's staged blocks when it gives up
+- *(azure)* settle by sequence number, read 410 as a missing queue, block streamed uploads
+- *(azure)* drop an unverifiable peek-lock cap and stop coupling `get` to an ETag
+- *(docs)* correct three spellings the typos job flags
+- *(openapi)* make the feature-off schema probe genuinely const
+- *(routing)* keep a mounted router's path rooted when the prefix takes the slash
+- *(openapi)* gate the Serialize import on the feature that uses it
+
+### Other
+
+- release
+- Merge pull request #25 from zen-rs/dev
+- *(lambda)* add crate README
+- add rust-cache to dep-check workflow
+- Merge main into dev: ultrareview implementation (PR #11)
+- state where Azure SQL and a named RDS cluster are declared
+- *(macros)* fix a typo in the Cosmos DB wiring comment
+- document every backend a manifest can now declare
+- correct four API shapes the guides had wrong
+- *(examples)* take path parameters as `Path<T>`, not as strings
+- make every documented claim match the shipped code
+- *(services)* own the queue envelope codec in one place
+- assert on emptiness in the form clippy asks for
+- *(runtime)* make the consumer test driver future Send
+- drop unused async from await-free trait impls
+- the native queue cell contradicted the manifest that wires SQS natively
+- *(aws)* say what a whole-chunk SQS batch failure loses
+- *(ci)* exercise the execution context on the real workerd runtime
+- *(services)* [**breaking**] delete MaybeSend and generate the object-safe service layer
+- *(test)* encode form bodies with the same crate the framework decodes them with
+- cover the new extractors end to end and make the docs match what ships
+- *(middleware)* state that the body limit is advertised, not yet enforced
+- describe the middleware trait, layers, fallbacks and wiring validation
+
 ## [0.2.1](https://github.com/zen-rs/skyzen/compare/v0.2.0...v0.2.1) - 2026-08-29
 
 ### Added
