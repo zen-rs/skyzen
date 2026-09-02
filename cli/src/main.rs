@@ -5,6 +5,7 @@ mod cli;
 mod dev;
 mod environment;
 mod migrate;
+mod openapi;
 mod output;
 mod project;
 mod providers;
@@ -67,6 +68,17 @@ fn run() -> Result<()> {
             providers::provision(&cli.manifest, cli.provider, cli.env.as_deref(), cli.dry_run)
         }
         Command::Doctor => providers::doctor(&cli.manifest, cli.provider, cli.env.as_deref()),
+        Command::OpenApi {
+            json,
+            print,
+            no_open,
+        } => openapi::run(&openapi::Request {
+            manifest: &cli.manifest,
+            json: json.as_deref(),
+            print: *print,
+            no_open: *no_open,
+            dry_run: cli.dry_run,
+        }),
         // `migrate` is the one action with two genuinely different implementations rather than two
         // renderings of one plan: the Cloudflare path shells out to wrangler and is planned like
         // everything else, while the native path opens a connection and applies the files itself.
@@ -139,6 +151,7 @@ fn action_for(command: &Command) -> Result<Action> {
         | Command::Provision
         | Command::Doctor
         | Command::Migrate { .. }
+        | Command::OpenApi { .. }
         | Command::Completions { .. } => {
             unreachable!("handled before dispatch")
         }

@@ -32,6 +32,9 @@ dotenvy = "0.15"
 flate2 = "1.1"
 ignore = "0.4"
 notify-debouncer-full = "0.4"
+# `skyzen openapi` hands the rendered page to the user's browser. The page is a local file, so
+# this is the whole of the CLI's involvement with a browser: no server, no port.
+open = "5"
 pathdiff = "0.2"
 regex = "1"
 # The Azure app settings are read and written over ARM, which has no Rust SDK for the Web Apps
@@ -40,6 +43,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# For `OPENAPI_DUMP_ENV`, the contract between `skyzen openapi` and a running application.
+# Naming it from the crate that defines it is what keeps the two halves from drifting.
+skyzen-core.workspace = true
 skyzen-manifest.workspace = true
 # `skyzen migrate --provider native` applies migrations itself rather than shelling out, so the CLI
 # links the same runner and the same sqlx drivers the application would use. `runtime-tokio-rustls`

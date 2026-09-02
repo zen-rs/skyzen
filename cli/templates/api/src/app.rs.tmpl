@@ -72,7 +72,8 @@ pub fn router() -> Router {
         "/greet".route(("/{name}".at(greet),)),
     ))
     // Serves the interactive Scalar reference at `/api-docs`, built from whatever
-    // `#[skyzen::openapi]` documented. `skyzen openapi` opens the same document without a server.
+    // `#[skyzen::openapi]` documented, titled after this crate. `skyzen openapi` opens the same
+    // document without running a server.
     .enable_api_doc()
     .build()
 }

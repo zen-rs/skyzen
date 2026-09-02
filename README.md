@@ -870,6 +870,8 @@ skyzen add redis postgres             # `cargo add` the crates a capability need
 skyzen doctor                         # toolchain, wasm target, manifest, bindings, auth
 skyzen dev                            # native, restarts on change
 skyzen dev --provider cloudflare      # workerd, rebuilding the wasm on change
+skyzen openapi                        # open the API reference in a browser
+skyzen openapi --print                # the raw document, for a client generator
 skyzen build --provider cloudflare    # artifacts only; prints raw and gzipped wasm size
 skyzen provision                      # create the KV/D1 resources the manifest has no id for
 skyzen migrate                        # apply pending SQL migrations
@@ -883,6 +885,43 @@ skyzen completions fish
 
 `--env <name>` selects a `[cloudflare.env.<name>]` overlay, `--dry-run` prints the plan without
 running it, and `--manifest` points at a `Skyzen.toml` elsewhere.
+
+### `skyzen openapi`
+
+Only the compiled application knows what `#[skyzen::openapi]` collected, so the document comes from
+running it: `SKYZEN_OPENAPI_DUMP` makes a Skyzen binary print its document and exit. That happens
+*before* it wires any service, which is what makes the command cheap to reach for — it needs no
+credentials, no reachable backend and no complete `.env`, and works in a project whose resources are
+not provisioned yet. It also never leaves a server running: the page is a local file, and Scalar
+renders an embedded document as happily as a fetched one.
+
+```sh
+skyzen openapi                  # render .skyzen/gen/openapi.html and open it
+skyzen openapi --json api.json  # write the document there, no browser
+skyzen openapi --print          # the document on stdout, for `| jq` or a generator
+skyzen openapi --no-open        # render the page, print its path
+```
+
+The rendered page loads Scalar from jsDelivr, so it wants a network; `--json` and `--print` do not.
+
+A document is titled after the application, and you pass nothing to get that. Skyzen cannot read
+`CARGO_PKG_NAME` on your behalf — `env!` expands where it is *written*, so asking inside skyzen would
+name skyzen in everyone's document — but `#[skyzen::main]` expands in *your* crate, so it registers
+your identity there, the same way `#[skyzen::openapi]` registers a handler. Nothing has to carry a
+name through the routing API:
+
+```rust
+Route::new((/* ... */))
+    .enable_api_doc()   // Scalar at /api-docs, titled after your crate
+    .build();
+
+// mounted where you choose, alongside the raw document for a client generator
+let docs = api.openapi();
+Route::new((api, docs.scalar_route("/docs"), docs.json_route("/openapi.json"))).build()
+```
+
+Override it with `OpenApi::with_info` when the API's public name is not the crate's — `orders-service`
+the crate, "Orders API" the product.
 
 ---
 

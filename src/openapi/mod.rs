@@ -426,9 +426,53 @@ impl RouteOpenApiEntry {
     }
 }
 
+/// Who the document is about: the application's own name, version and description.
+///
+/// Applications do not normally construct one. `#[skyzen::main]` expands in the application's
+/// crate, where `env!("CARGO_PKG_NAME")` reads the application rather than skyzen, and registers
+/// this there — so a document is titled correctly with nothing passed through the routing API.
+/// Build one by hand, or with [`app_info!`](crate::app_info), only to override that: see
+/// [`OpenApi::with_info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppInfo {
+    /// The application's package name, shown as the document title.
+    pub name: &'static str,
+    /// The application's package version.
+    pub version: &'static str,
+    /// The application's package description, if it declares one.
+    pub description: Option<&'static str>,
+}
+
+/// Build an [`AppInfo`] describing the crate this macro is written in.
+///
+/// `#[skyzen::main]` already does this for the application it is attached to, so this is for the
+/// cases that have no `#[skyzen::main]` to do it — a document built in a test, or an application
+/// embedding skyzen behind its own runtime:
+///
+/// ```rust
+/// # use skyzen::routing::{CreateRouteNode, Route};
+/// # async fn health() -> &'static str { "OK" }
+/// let api = Route::new(("/health".at(health),));
+/// let docs = api
+///     .openapi()
+///     .with_info(skyzen::app_info!())
+///     .scalar_route("/docs");
+/// ```
+#[macro_export]
+macro_rules! app_info {
+    () => {
+        $crate::openapi::AppInfo {
+            name: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+            description: option_env!("CARGO_PKG_DESCRIPTION"),
+        }
+    };
+}
+
 /// Minimal `OpenAPI` representation for Skyzen routers.
 #[derive(Clone, Default)]
 pub struct OpenApi {
+    info: Option<AppInfo>,
     #[cfg(feature = "openapi")]
     operations: Vec<OpenApiOperation>,
     #[cfg(feature = "openapi")]
@@ -499,6 +543,7 @@ impl OpenApi {
             .collect();
         let schemas = schema_defs.into_iter().collect();
         Self {
+            info: None,
             operations,
             schemas,
         }
@@ -509,7 +554,7 @@ impl OpenApi {
     #[must_use]
     #[allow(dead_code)]
     pub(crate) const fn from_entries(_: &[()]) -> Self {
-        Self {}
+        Self { info: None }
     }
 
     /// Inspect the registered operations.
@@ -565,9 +610,49 @@ impl OpenApi {
         ui_route(self.redoc(), mount_path.into())
     }
 
+    /// Convert the collected spec to an endpoint serving the raw `OpenAPI` JSON document.
+    ///
+    /// The counterpart to [`scalar`](Self::scalar): the same document, for a client generator or
+    /// another tool rather than a reader.
+    ///
+    /// # Panics
+    ///
+    /// If the document cannot be serialized, which would mean `utoipa` produced a structure serde
+    /// cannot write — a bug in a dependency rather than anything an application can cause.
+    #[must_use]
+    pub fn json(&self) -> OpenApiUiEndpoint {
+        self.rendered(JSON_CONTENT_TYPE, || {
+            serde_json::to_string(&self.to_utoipa_spec())
+                .expect("an OpenAPI document is always serializable")
+        })
+    }
+
+    /// Build a [`RouteNode`] serving the raw `OpenAPI` JSON document at `mount_path`.
+    ///
+    /// Unlike [`scalar_route`](Self::scalar_route) this mounts one exact path, not a subtree: a
+    /// specification is a single file, and `/openapi.json/anything` is not it.
+    #[must_use]
+    pub fn json_route(&self, mount_path: impl Into<String>) -> RouteNode {
+        RouteNode::new_endpoint(
+            mount_path.into(),
+            MethodFilter::Exact(Method::GET),
+            self.json(),
+            None,
+            Vec::new(),
+        )
+    }
+
     fn ui_endpoint(&self, html: impl FnOnce() -> String) -> OpenApiUiEndpoint {
+        self.rendered(HTML_CONTENT_TYPE, html)
+    }
+
+    fn rendered(
+        &self,
+        content_type: &'static str,
+        body: impl FnOnce() -> String,
+    ) -> OpenApiUiEndpoint {
         if self.is_enabled() {
-            OpenApiUiEndpoint::enabled(html())
+            OpenApiUiEndpoint::enabled(body(), content_type)
         } else {
             OpenApiUiEndpoint::disabled()
         }
@@ -577,14 +662,46 @@ impl OpenApi {
     #[must_use]
     pub fn to_utoipa_spec(&self) -> UtoipaSpec {
         UtoipaSpec::builder()
-            .info(Self::default_info())
+            .info(self.info())
             .paths(self.build_paths())
             .components(Some(self.build_components()))
             .build()
     }
 
-    fn default_info() -> Info {
-        Info::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    /// Name the application this document describes, overriding what `#[skyzen::main]` registered.
+    ///
+    /// Rarely needed: an application built the ordinary way is already titled after its own crate.
+    /// Reach for this when the API's public name is not the crate's — `orders-service` the crate,
+    /// "Orders API" the product — or when building a document outside an application entirely.
+    #[must_use]
+    pub const fn with_info(mut self, info: AppInfo) -> Self {
+        self.info = Some(info);
+        self
+    }
+
+    /// The application's identity: what [`with_info`](Self::with_info) was told, else what
+    /// `#[skyzen::main]` registered for this binary, else an anonymous placeholder.
+    ///
+    /// The placeholder is reached only by a document built outside an application — a library
+    /// under test, or a binary that embeds skyzen behind its own runtime. It is deliberately
+    /// anonymous rather than skyzen's own package metadata: a document announcing itself as
+    /// `skyzen 0.2.1` in every application is worse than one that admits it was never told.
+    fn info(&self) -> Info {
+        self.info
+            .or_else(|| registry::app_info().copied())
+            .map_or_else(
+                || Info::new("API", "0.0.0"),
+                |app| {
+                    let mut info = Info::new(app.name, app.version);
+                    // A package with no `description` still yields `Some("")` from `option_env!`, and
+                    // an empty description in the document is worse than none.
+                    info.description = app
+                        .description
+                        .filter(|text| !text.is_empty())
+                        .map(ToOwned::to_owned);
+                    info
+                },
+            )
     }
 
     fn build_paths(&self) -> Paths {
@@ -668,22 +785,33 @@ impl fmt::Debug for OpenApiOperation {
 }
 
 #[derive(Clone, Debug)]
-/// Endpoint that serves a pre-rendered `OpenAPI` documentation page.
+/// Endpoint that serves a pre-rendered `OpenAPI` document — a documentation page, or the raw
+/// specification.
+///
+/// The body is rendered once when the route is built, so serving it is a header and a `memcpy`.
 pub struct OpenApiUiEndpoint {
-    html: Option<Arc<String>>,
+    body: Option<Arc<String>>,
+    content_type: &'static str,
 }
 
 impl OpenApiUiEndpoint {
-    fn enabled(html: String) -> Self {
+    fn enabled(body: String, content_type: &'static str) -> Self {
         Self {
-            html: Some(Arc::new(html)),
+            body: Some(Arc::new(body)),
+            content_type,
         }
     }
 
     const fn disabled() -> Self {
-        Self { html: None }
+        Self {
+            body: None,
+            content_type: HTML_CONTENT_TYPE,
+        }
     }
 }
+
+const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
+const JSON_CONTENT_TYPE: &str = "application/json";
 
 http_error!(
     /// Error returned when OpenAPI support is disabled.
@@ -697,13 +825,14 @@ impl Endpoint for OpenApiUiEndpoint {
         &mut self,
         _request: &mut Request,
     ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
-        ready(self.html.as_ref().map_or_else(
+        let content_type = self.content_type;
+        ready(self.body.as_ref().map_or_else(
             || Err(OpenApiUiDisabledError::new()),
-            |html| {
-                let mut response = Response::new(Body::from(html.as_bytes().to_vec()));
+            |body| {
+                let mut response = Response::new(Body::from(body.as_bytes().to_vec()));
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
-                    header::HeaderValue::from_static("text/html; charset=utf-8"),
+                    header::HeaderValue::from_static(content_type),
                 );
                 Ok(response)
             },
@@ -1032,5 +1161,26 @@ fn doc_summary(docs: &str) -> Option<String> {
         None
     } else {
         Some(paragraph.join(" "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenApi;
+
+    #[test]
+    fn a_document_with_no_registered_identity_is_anonymous_rather_than_skyzen() {
+        // Reachable from a library under test or a binary that embeds skyzen behind its own
+        // runtime — anything with no `#[skyzen::main]` to register an identity. This crate's own
+        // test binary is exactly that case.
+        //
+        // `default_info` used to answer with skyzen's own `CARGO_PKG_*` here, which titled every
+        // application's document `skyzen 0.2.1`. Admitting it was never told is better than
+        // confidently naming the wrong crate. `tests/openapi_app_info.rs` covers the other side.
+        let spec = OpenApi::default().to_utoipa_spec();
+
+        assert_eq!(spec.info.title, "API");
+        assert_eq!(spec.info.version, "0.0.0");
+        assert_ne!(spec.info.title, env!("CARGO_PKG_NAME"));
     }
 }
