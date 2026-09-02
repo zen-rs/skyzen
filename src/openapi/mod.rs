@@ -513,17 +513,24 @@ impl OpenApi {
     }
 
     /// Inspect the registered operations.
+    ///
+    /// Empty without the `openapi` feature, which is the only thing that varies: the signature is
+    /// the same in every build, so calling code never has to be written twice.
     #[must_use]
-    #[cfg(feature = "openapi")]
+    // Deliberately not `const` in the feature-off arm. It could be, but then the two arms would
+    // differ in a way a caller can observe, and one signature everywhere is worth more than a
+    // `const fn` returning an empty slice.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn operations(&self) -> &[OpenApiOperation] {
-        &self.operations
-    }
+        #[cfg(feature = "openapi")]
+        {
+            &self.operations
+        }
 
-    /// Inspect the registered operations.
-    #[must_use]
-    #[cfg(not(feature = "openapi"))]
-    pub const fn operations(&self) -> &[OpenApiOperation] {
-        &[]
+        #[cfg(not(feature = "openapi"))]
+        {
+            &[]
+        }
     }
 
     /// Indicates whether `OpenAPI` instrumentation is active.
