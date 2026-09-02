@@ -10,7 +10,7 @@ use super::{
     join_path, BoxEndpoint, EndpointFactory, MethodFilter, NestedRouter, Params, Route, RouteNode,
     RouteNodeType,
 };
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
 use crate::{header, openapi::OpenApi, Body, Endpoint, Method, Request, Response, StatusCode};
 
@@ -102,7 +102,7 @@ pub struct Router {
     already_router_enabled: bool,
     /// Optional alarm handler for Durable Object alarm events.
     pub(crate) alarm_handler: Option<EndpointFactory>,
-    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
 }
 
@@ -117,7 +117,7 @@ impl Debug for Router {
             .field("has_method_not_allowed", &self.method_not_allowed.is_some())
             .field("already_router_enabled", &self.already_router_enabled)
             .field("has_alarm_handler", &self.alarm_handler.is_some());
-        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(feature = "openapi")]
         {
             debug_struct.field("openapi_entries", &self.openapi_entries.len());
         }
@@ -337,19 +337,19 @@ impl Router {
     /// Build an [`OpenApi`] definition containing every route registered on this router.
     #[must_use]
     pub fn openapi(&self) -> OpenApi {
-        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(feature = "openapi")]
         {
             OpenApi::from_entries(&self.openapi_entries)
         }
 
-        #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "openapi"))]
         {
             OpenApi::default()
         }
     }
 
     /// The `OpenAPI` entries this router was built from, for re-export by a router that mounts it.
-    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     pub(crate) fn openapi_entries(&self) -> &[RouteOpenApiEntry] {
         &self.openapi_entries
     }
@@ -548,9 +548,7 @@ fn flatten(
     path_prefix: &str,
     nodes: Vec<RouteNode>,
     buf: &mut FlattenBuf,
-    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))] openapi_entries: &mut Vec<
-        RouteOpenApiEntry,
-    >,
+    #[cfg(feature = "openapi")] openapi_entries: &mut Vec<RouteOpenApiEntry>,
 ) -> Result<(), RouteBuildError> {
     for node in nodes {
         let path = join_path(path_prefix, &node.path);
@@ -561,7 +559,7 @@ fn flatten(
                     &path,
                     route.into_mounted_nodes(),
                     buf,
-                    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+                    #[cfg(feature = "openapi")]
                     openapi_entries,
                 )?;
             }
@@ -576,7 +574,7 @@ fn flatten(
                     return Err(RouteBuildError::InvalidPath { path });
                 }
 
-                #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+                #[cfg(feature = "openapi")]
                 if let (Some(openapi), MethodFilter::Exact(exact)) = (openapi, &method) {
                     openapi_entries.push(RouteOpenApiEntry::new(
                         path.clone(),
@@ -584,7 +582,7 @@ fn flatten(
                         openapi,
                     ));
                 }
-                #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
+                #[cfg(not(feature = "openapi"))]
                 let _ = openapi;
 
                 buf.entry(path).or_default().push(FlatEndpoint {
@@ -604,7 +602,7 @@ fn flatten(
                     return Err(RouteBuildError::NestedPatternPrefix { path });
                 }
 
-                #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+                #[cfg(feature = "openapi")]
                 openapi_entries.extend(super::prefixed_openapi_entries(&path, &router));
 
                 let nested = NestedRouter::new(&path, router);
@@ -642,13 +640,13 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     } = route;
 
     let mut buf = FlattenBuf::new();
-    #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     let mut openapi_entries = Vec::new();
     flatten(
         "",
         nodes,
         &mut buf,
-        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(feature = "openapi")]
         &mut openapi_entries,
     )?;
 
@@ -686,7 +684,7 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
         routes: Arc::new(routes),
         already_router_enabled: false,
         alarm_handler: None,
-        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(feature = "openapi")]
         openapi_entries: Arc::new(openapi_entries),
     })
 }

@@ -117,7 +117,7 @@ async fn status_reports_the_set_as_fully_applied() {
         status.applied[0].checksum,
         MIGRATIONS.as_slice()[0].checksum_hex()
     );
-    assert!(!status.applied[0].applied_at.is_empty());
+    assert_ne!(status.applied[0].applied_at, "");
 }
 
 /// The attribute argument: the database a test receives is already migrated when the body starts.

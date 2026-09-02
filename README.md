@@ -842,8 +842,16 @@ fn router() -> Router {
 
 `Route::enable_api_doc()` mounts the same Scalar UI at `/api-docs`. `.redoc()` / `.redoc_route()` remain available if you want Redoc instead.
 
-*Schema generation is gated to debug builds and native targets, so release binaries and edge wasm
-bundles stay small.*
+The document is the same on every target — a native server, Lambda, Azure Functions and a
+Cloudflare Worker all serve what `#[skyzen::openapi]` collected, in release as in debug. The
+`openapi` cargo feature is the only switch, and it is on by default; a bundle that has no use for a
+schema turns it off with `skyzen = { version = "0.2", default-features = false, features = [...] }`
+and pays for nothing — no specs, no schema functions, no registration.
+
+*How the metadata is collected differs by target, and only in cost. Natively it is linker-section
+data, so nothing runs before `main`. WebAssembly has no such linker support, so there it rides one
+life-before-main constructor per documented handler — a few pointer pushes at isolate start, paid
+only on the edge. See `src/openapi/registry.rs`.*
 
 ---
 

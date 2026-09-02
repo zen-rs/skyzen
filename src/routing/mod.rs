@@ -131,7 +131,7 @@
 
 use std::{fmt, sync::Arc};
 
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "ws")]
 use crate::websocket::{MaybeSend, MaybeSync, WebSocket};
@@ -432,14 +432,14 @@ impl Route {
     /// Generate an [`OpenApi`] document describing this route tree.
     #[must_use]
     pub fn openapi(&self) -> OpenApi {
-        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(feature = "openapi")]
         {
             let mut entries = Vec::new();
             collect_openapi_entries("", &self.nodes, &mut entries);
             OpenApi::from_entries(&entries)
         }
 
-        #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "openapi"))]
         {
             OpenApi::default()
         }
@@ -943,7 +943,7 @@ pub(crate) fn join_path(prefix: &str, segment: &str) -> String {
     collapsed
 }
 
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 fn collect_openapi_entries(
     path_prefix: &str,
     nodes: &[RouteNode],
@@ -971,7 +971,7 @@ fn collect_openapi_entries(
 }
 
 /// A mounted router's operations, re-pathed under the prefix it is mounted at.
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 pub(crate) fn prefixed_openapi_entries(prefix: &str, router: &Router) -> Vec<RouteOpenApiEntry> {
     router
         .openapi_entries()

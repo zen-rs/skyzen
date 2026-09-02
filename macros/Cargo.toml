@@ -21,6 +21,17 @@ quote = "1"
 skyzen-manifest.workspace = true
 syn = { version = "2", features = ["full"] }
 
+[features]
+# Whether `#[skyzen::openapi]` emits handler metadata at all.
+#
+# The metadata has to be gated where the decision is actually visible. Macro output expands in
+# the *downstream* crate, so a `#[cfg(feature = "openapi")]` in the expansion would ask about the
+# application's features, not skyzen's. Asking here instead — at expansion time, in this crate's
+# own compilation — is the only place the answer is right, so `skyzen/openapi` turns this on and
+# a `default-features = false` build emits no specs, no schema functions and no registrations on
+# any target.
+openapi = []
+
 [dev-dependencies]
 
 [lints]
