@@ -824,6 +824,22 @@ fn check_cloudflare_manifest(manifest: &Manifest, environment: Option<&str>) -> 
         }
     }
 
+    if let Some(config) = config {
+        match compatibility_date_problem(config.compatibility_date.as_deref()) {
+            None => output::ok(format!(
+                "cloudflare: compatibility_date is within what this CLI targets ({})",
+                crate::scaffold::COMPATIBILITY_DATE
+            )),
+            Some(problem) => {
+                // A warning, not a failure: a newer date is exactly right for someone running a
+                // newer wrangler than this CLI was released against, and doctor cannot ask
+                // workerd what it supports. Saying so beats either staying silent until
+                // `wrangler dev` fails, or refusing a configuration that may be correct.
+                output::warn(format!("cloudflare: {problem}"));
+            }
+        }
+    }
+
     match Project::load(manifest.root_dir())
         .and_then(|project| cloudflare::build::check_wasm_bindgen_agreement(&project))
     {
@@ -838,6 +854,27 @@ fn check_cloudflare_manifest(manifest: &Manifest, environment: Option<&str>) -> 
     }
 
     failures
+}
+
+/// Say whether a project's `compatibility_date` is likely to outrun the local Workers runtime.
+///
+/// `workerd` refuses a date newer than its own binary knows, and reports that as a startup failure
+/// naming wrangler rather than the manifest. Nothing here can ask workerd what it supports, so the
+/// comparison is against the date this CLI is released against — a date beyond it is not wrong,
+/// but it is the shape of the configuration that fails, and worth saying before `wrangler dev`
+/// says it less clearly.
+///
+/// ISO-8601 dates compare correctly as strings, so this needs no date library — and the CLI no
+/// longer carries one now that `skyzen new` stamps a pinned date rather than reading the clock.
+fn compatibility_date_problem(declared: Option<&str>) -> Option<String> {
+    let declared = declared?;
+    let targeted = crate::scaffold::COMPATIBILITY_DATE;
+    (declared > targeted).then(|| {
+        format!(
+            "compatibility_date {declared} is newer than the {targeted} this CLI targets; if \
+             `wrangler dev` refuses to start, that is why \u{2014} lower it, or update wrangler"
+        )
+    })
 }
 
 /// The runtime variables one provider needs, resolved, plus the environment its child gets.
@@ -926,6 +963,28 @@ fn ensure_declared_secret(manifest: &SkyzenManifest, name: &VarName) -> Result<(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_compatibility_date_within_what_the_cli_targets_is_not_reported() {
+        use super::compatibility_date_problem;
+        assert!(compatibility_date_problem(None).is_none());
+        assert!(compatibility_date_problem(Some(crate::scaffold::COMPATIBILITY_DATE)).is_none());
+        assert!(compatibility_date_problem(Some("2024-01-01")).is_none());
+    }
+
+    #[test]
+    fn a_compatibility_date_beyond_it_says_why_wrangler_would_refuse_to_start() {
+        use super::compatibility_date_problem;
+        // The shape of #51: a date past what the local runtime knows, which workerd rejects with
+        // an error naming its own binary rather than the manifest.
+        let problem = compatibility_date_problem(Some("2099-01-01")).expect("should be reported");
+        assert!(problem.contains("2099-01-01"), "{problem}");
+        assert!(
+            problem.contains(crate::scaffold::COMPATIBILITY_DATE),
+            "{problem}"
+        );
+        assert!(problem.contains("wrangler dev"), "{problem}");
+    }
     use super::{Action, CommandPlan, CommandStdin};
     use crate::cli::Provider;
     use skyzen_manifest::VarName;
