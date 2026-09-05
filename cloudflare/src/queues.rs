@@ -69,15 +69,23 @@ fn bytes_content_type_options() -> Result<js_sys::Object, QueueError> {
     Ok(options)
 }
 
+/// The message as the value `Queue.send` accepts for `"bytes"`.
+///
+/// `workerd` checks the body with `tryCast<JsArrayBufferView>()` and refuses
+/// a bare `ArrayBuffer` with "requires a value of type `ArrayBufferView`",
+/// even though the consumer still receives an `ArrayBuffer`.
+/// `Uint8Array::from` copies into an exactly sized buffer, so the view holds
+/// precisely the message bytes.
+fn bytes_view(message: &[u8]) -> js_sys::Uint8Array {
+    js_sys::Uint8Array::from(message)
+}
+
 impl MessageQueue for CfQueue {
     async fn send(&self, message: &[u8]) -> Result<(), QueueError> {
-        // `Uint8Array::from` copies into an exactly sized buffer, so the
-        // ArrayBuffer holds precisely the message bytes.
-        let buffer = js_sys::Uint8Array::from(message).buffer();
         let options = bytes_content_type_options()?;
         let promise = self
             .queue
-            .send(buffer.into(), options.into())
+            .send(bytes_view(message).into(), options.into())
             .map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
@@ -109,10 +117,9 @@ impl MessageQueue for CfQueue {
             .map_err(js_err)?;
         }
 
-        let buffer = js_sys::Uint8Array::from(message).buffer();
         let promise = self
             .queue
-            .send(buffer.into(), js_options.into())
+            .send(bytes_view(message).into(), js_options.into())
             .map_err(js_err)?;
         JsFuture::from(promise).into_send().await.map_err(js_err)?;
         Ok(())
@@ -123,9 +130,8 @@ impl MessageQueue for CfQueue {
         #[allow(clippy::cast_possible_truncation)]
         let batch = js_sys::Array::new_with_length(messages.len() as u32);
         for (i, msg) in messages.iter().enumerate() {
-            let buffer = js_sys::Uint8Array::from(msg.as_slice()).buffer();
             let item = js_sys::Object::new();
-            js_sys::Reflect::set(&item, &"body".into(), &buffer).map_err(js_err)?;
+            js_sys::Reflect::set(&item, &"body".into(), &bytes_view(msg)).map_err(js_err)?;
             js_sys::Reflect::set(&item, &"contentType".into(), &"bytes".into()).map_err(js_err)?;
             #[allow(clippy::cast_possible_truncation)]
             batch.set(i as u32, item.into());
