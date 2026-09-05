@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-s3"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "S3-compatible ObjectStorage implementation for the Skyzen framework"
 license = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ keywords = ["s3", "object-storage", "skyzen", "services"]
 categories = ["web-programming::http-server", "database"]
 
 [dependencies]
-skyzen-services = { path = "../services", version = "0.2.0" }
+skyzen-services = { path = "../services", version = "0.2.1" }
 # Disable the SDK default `rustls` feature: it pulls the legacy `tls-rustls` connector
 # (rustls 0.21 / hyper-rustls 0.24), which is redundant with the modern `default-https-client`
 # (rustls-aws-lc) and carries unpatched RustSec advisories. The default HTTPS client is unaffected.

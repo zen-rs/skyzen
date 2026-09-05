@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-aws"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "AWS service implementations for the Skyzen framework"
 license = "MIT OR Apache-2.0"
@@ -10,8 +10,8 @@ keywords = ["aws", "dynamodb", "sqs", "skyzen", "services"]
 categories = ["web-programming::http-server", "database"]
 
 [dependencies]
-skyzen-services = { path = "../services", version = "0.2.0" }
-skyzen-s3 = { path = "../s3", version = "0.2.0", optional = true }
+skyzen-services = { path = "../services", version = "0.2.1" }
+skyzen-s3 = { path = "../s3", version = "0.2.1", optional = true }
 aws-config = "1"
 # Disable the SDK default `rustls` feature: it pulls the legacy `tls-rustls` connector
 # (rustls 0.21 / hyper-rustls 0.24), which is redundant with the modern `default-https-client`

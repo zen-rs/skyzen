@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-manifest"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Typed Skyzen.toml schema shared by the Skyzen CLI and the Skyzen procedural macros"
 license = "MIT OR Apache-2.0"
