@@ -5,6 +5,7 @@
 //! a bespoke parser has to reimplement one at a time.
 
 use clap::{Parser, Subcommand, ValueEnum};
+use skyzen_manifest::VarName;
 use std::path::PathBuf;
 
 /// Unified local emulation and deployment CLI for Skyzen.
@@ -80,6 +81,26 @@ pub enum Command {
     },
 
     /// Build and deploy the project.
+    /// Open the application's API reference in a browser.
+    ///
+    /// Runs the application so it prints its own `OpenAPI` document and exits — before it wires any
+    /// service, so this needs no credentials and no reachable backend — then renders a Scalar page
+    /// around it as a local file. Nothing is served and no port is used.
+    // clap would derive `open-api` from the variant name; the command is one word.
+    #[command(name = "openapi")]
+    OpenApi {
+        /// Write the document here instead of rendering a page.
+        #[arg(long, value_name = "PATH", conflicts_with = "print")]
+        json: Option<PathBuf>,
+
+        /// Write the document to standard output instead of rendering a page.
+        #[arg(long, conflicts_with = "no_open")]
+        print: bool,
+
+        /// Render the page but print its path instead of opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     Deploy,
 
     /// Create the cloud resources the manifest declares but has no id for.
@@ -108,7 +129,7 @@ pub enum Command {
         wrangler_args: Vec<String>,
     },
 
-    /// Manage the deployed Worker's secrets.
+    /// Manage the deployed application's secrets, on Cloudflare, AWS or Azure.
     Secret {
         /// The secret operation to perform.
         #[command(subcommand)]
@@ -138,14 +159,26 @@ pub enum MigrateCommand {
 }
 
 /// The `skyzen secret` operations.
+///
+/// Every one of them works on a name the manifest declares as `[[secret]]`: the CLI has no notion
+/// of a secret the application does not read, and a typo is refused rather than uploaded.
+///
+/// All three work on every cloud provider — `wrangler` on Cloudflare, the function environment on
+/// AWS, the application settings on Azure — and none of them puts a value on a command line. See
+/// `docs/skyzen-toml-reference.md#secrets`.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum SecretCommand {
-    /// Set a secret, reading its value from stdin.
+    /// Set one secret, reading its value from this command's standard input.
     Set {
-        /// The secret's name, as seen from `env` in the Worker.
-        name: String,
+        /// The secret's name, as declared by a `[[secret]]` entry.
+        name: VarName,
     },
-    /// List the secrets the deployed Worker has.
+    /// Deliver every declared secret's local value to the deployment.
+    ///
+    /// The same delivery `skyzen deploy` performs, without rebuilding: the values come from the
+    /// process environment and the project's `.env` files, and a missing one is refused.
+    Push,
+    /// List the names the deployment has. Never a value: no command prints one.
     List,
 }
 
@@ -291,6 +324,44 @@ mod tests {
     }
 
     #[test]
+    fn the_openapi_command_is_one_word() {
+        // clap derives `open-api` from the variant name, which is not what any documentation says.
+        let Command::OpenApi {
+            json,
+            print,
+            no_open,
+        } = parse(&["skyzen", "openapi"]).command
+        else {
+            panic!("expected the openapi command");
+        };
+        assert_eq!(json, None);
+        assert!(!print);
+        assert!(!no_open);
+    }
+
+    #[test]
+    fn openapi_output_destinations_are_mutually_exclusive() {
+        // Each of these asks for the document in a different place; taking two silently would mean
+        // honouring one and dropping the other.
+        for args in [
+            vec!["skyzen", "openapi", "--print", "--json", "spec.json"],
+            vec!["skyzen", "openapi", "--print", "--no-open"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn openapi_writes_the_document_where_asked() {
+        let Command::OpenApi { json, .. } =
+            parse(&["skyzen", "openapi", "--json", "spec.json"]).command
+        else {
+            panic!("expected the openapi command");
+        };
+        assert_eq!(json, Some(std::path::PathBuf::from("spec.json")));
+    }
+
+    #[test]
     fn a_global_flag_after_a_var_arg_subcommand_is_still_a_global_flag() {
         // `skyzen dev --provider cloudflare` is written throughout the docs; a var-arg that
         // swallowed it would silently run the native path instead.
@@ -377,6 +448,31 @@ mod tests {
     fn an_unknown_migrate_subcommand_is_rejected() {
         Cli::try_parse_from(["skyzen", "migrate", "rollback"])
             .expect_err("there is no rollback; migrations are forward-only");
+    }
+
+    #[test]
+    fn a_secret_is_named_by_an_environment_variable_name_or_it_is_not_named() {
+        let parsed = parse(&["skyzen", "secret", "set", "STRIPE_KEY"]);
+        let Command::Secret { command } = parsed.command else {
+            panic!("expected `secret`");
+        };
+        assert_eq!(
+            command,
+            super::SecretCommand::Set {
+                name: "STRIPE_KEY".parse().expect("a name")
+            }
+        );
+
+        // The manifest's rule, applied by the parser: a name an operating system would not accept
+        // is refused before anything is read from standard input.
+        Cli::try_parse_from(["skyzen", "secret", "set", "STRIPE-KEY"])
+            .expect_err("not an environment variable name");
+
+        let push = parse(&["skyzen", "secret", "push"]);
+        let Command::Secret { command } = push.command else {
+            panic!("expected `secret`");
+        };
+        assert_eq!(command, super::SecretCommand::Push);
     }
 
     #[test]

@@ -47,8 +47,23 @@ pub use server::Server;
 mod net;
 #[cfg(feature = "std")]
 pub use net::{error_response, log_endpoint_error, panic_message, MissingRemoteAddr, PeerAddr};
+#[cfg(feature = "std")]
+mod secret;
+#[cfg(feature = "std")]
+pub use secret::Secret;
 #[cfg(feature = "openapi")]
 pub mod openapi;
+
+/// Asks a Skyzen binary to print its `OpenAPI` document to this path — or to standard output, when
+/// the value is `-` — and exit without serving anything.
+///
+/// The contract between `skyzen openapi` and `#[skyzen::main]`, defined here because it is the one
+/// crate both the runtime and the CLI depend on; neither gets to spell it independently.
+///
+/// An environment variable rather than a command-line flag for the same reason
+/// `AWS_LAMBDA_RUNTIME_API` and `FUNCTIONS_CUSTOMHANDLER_PORT` are: the application owns its argv,
+/// and a flag skyzen reserved could collide with one the application already defines.
+pub const OPENAPI_DUMP_ENV: &str = "SKYZEN_OPENAPI_DUMP";
 
 pub use http_kit::{
     endpoint, header, method, uri, version, Body, BodyError, Endpoint, Extensions, Method, Request,

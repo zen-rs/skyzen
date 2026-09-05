@@ -151,13 +151,26 @@ pub fn into_js_response(response: crate::Response) -> Result<Response, JsValue> 
         ));
     }
 
+    let status = response.status();
     let init = web_sys::ResponseInit::new();
-    init.set_status(response.status().as_u16());
-    init.set_status_text(response.status().canonical_reason().unwrap_or("OK"));
+    init.set_status(status.as_u16());
+    init.set_status_text(status.canonical_reason().unwrap_or("OK"));
     init.set_headers_headers(&headers_into_js(response.headers())?);
 
-    let body = body_into_js_stream(response.into_body());
-    Response::new_with_opt_readable_stream_and_init(Some(&body), &init)
+    if status_forbids_body(status) {
+        Response::new_with_opt_readable_stream_and_init(None, &init)
+    } else {
+        let body = body_into_js_stream(response.into_body());
+        Response::new_with_opt_readable_stream_and_init(Some(&body), &init)
+    }
+}
+
+/// The Fetch `Response` constructor rejects a body for these HTTP statuses.
+const fn status_forbids_body(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
+    )
 }
 
 /// Build the `101` response that hands a socket back to the client.
@@ -347,3 +360,18 @@ impl fmt::Display for WasmBodyStreamError {
 }
 
 impl StdError for WasmBodyStreamError {}
+
+#[cfg(test)]
+mod tests {
+    use super::status_forbids_body;
+    use crate::StatusCode;
+
+    #[test]
+    fn fetch_null_body_statuses_are_named_exhaustively() {
+        assert!(status_forbids_body(StatusCode::NO_CONTENT));
+        assert!(status_forbids_body(StatusCode::RESET_CONTENT));
+        assert!(status_forbids_body(StatusCode::NOT_MODIFIED));
+        assert!(!status_forbids_body(StatusCode::OK));
+        assert!(!status_forbids_body(StatusCode::PARTIAL_CONTENT));
+    }
+}

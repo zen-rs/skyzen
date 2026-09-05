@@ -28,6 +28,7 @@ use utoipa::openapi::{
     Deprecated, OpenApi as UtoipaSpec, RefOr, Required,
 };
 use utoipa_redoc::Redoc;
+use utoipa_scalar::Scalar;
 
 /// `OpenAPI` schema reference type alias.
 pub type SchemaRef = RefOr<Schema>;
@@ -104,15 +105,7 @@ impl fmt::Debug for ResponseSchema {
 /// Function type that collects `OpenAPI` schemas into a definitions map.
 pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
 
-// Re-exported for macro-generated registrations without requiring downstream crates to depend on
-// `linkme` directly.
-//
-// NOTE: this and the `HANDLER_SPECS`/`HandlerSpec` items below are deliberately *not* gated on
-// the `openapi` feature: `#[skyzen::openapi]`-generated code in downstream crates references them
-// under `cfg(all(debug_assertions, not(target_arch = "wasm32")))` — a condition that cannot
-// depend on skyzen's features, because it is evaluated against the downstream crate.
-#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
-pub use linkme;
+pub mod registry;
 
 mod builtins;
 pub use builtins::IgnoreOpenApi;
@@ -209,13 +202,6 @@ where
     }
 }
 
-#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
-/// Distributed registry containing handler specifications discovered via `#[skyzen::openapi]`.
-#[linkme::distributed_slice]
-#[linkme(crate = ::skyzen::openapi::linkme)]
-pub static HANDLER_SPECS: [HandlerSpec] = [..];
-
-#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
 #[derive(Debug, Clone, Copy)]
 /// Metadata captured for every handler annotated with `#[skyzen::openapi]`.
 pub struct HandlerSpec {
@@ -237,11 +223,9 @@ pub struct HandlerSpec {
     pub schemas: &'static [SchemaCollector],
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 fn find_handler_spec(type_name: &str) -> Option<&'static HandlerSpec> {
-    HANDLER_SPECS
-        .iter()
-        .find(|spec| spec.type_name == type_name)
+    registry::iter().find(|spec| spec.type_name == type_name)
 }
 
 #[cfg(feature = "openapi")]
@@ -371,7 +355,7 @@ where
     }
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, SchemaRef>) {
     for collector in collectors {
         collector(defs);
@@ -381,19 +365,19 @@ fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, S
 /// Handler metadata attached to each endpoint.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteHandlerDoc {
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     type_name: &'static str,
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     spec: Option<&'static HandlerSpec>,
 }
 
 impl RouteHandlerDoc {
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     const fn new(type_name: &'static str, spec: Option<&'static HandlerSpec>) -> Self {
         Self { type_name, spec }
     }
 
-    #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
+    #[cfg(not(feature = "openapi"))]
     const fn new() -> Self {
         Self {}
     }
@@ -403,21 +387,21 @@ impl RouteHandlerDoc {
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
 pub fn describe_handler<H: 'static>() -> RouteHandlerDoc {
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     {
         let type_name = std::any::type_name::<H>();
         let spec = find_handler_spec(type_name);
         RouteHandlerDoc::new(type_name, spec)
     }
 
-    #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
+    #[cfg(not(feature = "openapi"))]
     {
         let _ = ::core::marker::PhantomData::<H>;
         RouteHandlerDoc::new()
     }
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 #[derive(Debug, Clone)]
 /// Route metadata stored when `OpenAPI` instrumentation is enabled.
 pub struct RouteOpenApiEntry {
@@ -429,7 +413,7 @@ pub struct RouteOpenApiEntry {
     pub handler: RouteHandlerDoc,
 }
 
-#[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 impl RouteOpenApiEntry {
     #[must_use]
     /// Construct a new entry describing a route + handler pair.
@@ -442,12 +426,56 @@ impl RouteOpenApiEntry {
     }
 }
 
+/// Who the document is about: the application's own name, version and description.
+///
+/// Applications do not normally construct one. `#[skyzen::main]` expands in the application's
+/// crate, where `env!("CARGO_PKG_NAME")` reads the application rather than skyzen, and registers
+/// this there — so a document is titled correctly with nothing passed through the routing API.
+/// Build one by hand, or with [`app_info!`](crate::app_info), only to override that: see
+/// [`OpenApi::with_info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppInfo {
+    /// The application's package name, shown as the document title.
+    pub name: &'static str,
+    /// The application's package version.
+    pub version: &'static str,
+    /// The application's package description, if it declares one.
+    pub description: Option<&'static str>,
+}
+
+/// Build an [`AppInfo`] describing the crate this macro is written in.
+///
+/// `#[skyzen::main]` already does this for the application it is attached to, so this is for the
+/// cases that have no `#[skyzen::main]` to do it — a document built in a test, or an application
+/// embedding skyzen behind its own runtime:
+///
+/// ```rust
+/// # use skyzen::routing::{CreateRouteNode, Route};
+/// # async fn health() -> &'static str { "OK" }
+/// let api = Route::new(("/health".at(health),));
+/// let docs = api
+///     .openapi()
+///     .with_info(skyzen::app_info!())
+///     .scalar_route("/docs");
+/// ```
+#[macro_export]
+macro_rules! app_info {
+    () => {
+        $crate::openapi::AppInfo {
+            name: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+            description: option_env!("CARGO_PKG_DESCRIPTION"),
+        }
+    };
+}
+
 /// Minimal `OpenAPI` representation for Skyzen routers.
 #[derive(Clone, Default)]
 pub struct OpenApi {
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    info: Option<AppInfo>,
+    #[cfg(feature = "openapi")]
     operations: Vec<OpenApiOperation>,
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     schemas: Vec<(String, SchemaRef)>,
 }
 
@@ -462,7 +490,7 @@ impl Debug for OpenApi {
 
 impl OpenApi {
     /// Build an [`OpenApi`] instance from the collected route metadata.
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     #[must_use]
     pub(crate) fn from_entries(entries: &[RouteOpenApiEntry]) -> Self {
         let mut schema_defs = BTreeMap::new();
@@ -515,73 +543,165 @@ impl OpenApi {
             .collect();
         let schemas = schema_defs.into_iter().collect();
         Self {
+            info: None,
             operations,
             schemas,
         }
     }
 
     /// Build an empty `OpenAPI` definition when `OpenAPI` support is disabled.
-    #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
+    #[cfg(not(feature = "openapi"))]
     #[must_use]
     #[allow(dead_code)]
     pub(crate) const fn from_entries(_: &[()]) -> Self {
-        Self {}
+        Self { info: None }
     }
 
     /// Inspect the registered operations.
+    ///
+    /// Empty without the `openapi` feature, which is the only thing that varies: the signature is
+    /// the same in every build, so calling code never has to be written twice.
     #[must_use]
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    // Deliberately not `const` in the feature-off arm. It could be, but then the two arms would
+    // differ in a way a caller can observe, and one signature everywhere is worth more than a
+    // `const fn` returning an empty slice.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn operations(&self) -> &[OpenApiOperation] {
-        &self.operations
-    }
+        #[cfg(feature = "openapi")]
+        {
+            &self.operations
+        }
 
-    /// Inspect the registered operations.
-    #[must_use]
-    #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
-    pub const fn operations(&self) -> &[OpenApiOperation] {
-        &[]
+        #[cfg(not(feature = "openapi"))]
+        {
+            &[]
+        }
     }
 
     /// Indicates whether `OpenAPI` instrumentation is active.
     #[must_use]
     pub const fn is_enabled(&self) -> bool {
-        cfg!(all(
-            debug_assertions,
-            feature = "openapi",
-            not(target_arch = "wasm32")
-        ))
+        cfg!(feature = "openapi")
     }
 
+    /// Convert the collected spec to a [`Scalar`](utoipa_scalar::Scalar) endpoint.
+    ///
+    /// This is the recommended interactive documentation UI.
     #[must_use]
-    /// Convert the collected spec to a [`Redoc`](utoipa_redoc::Redoc) endpoint.
-    pub fn redoc(&self) -> OpenApiRedocEndpoint {
-        if !self.is_enabled() {
-            return OpenApiRedocEndpoint::disabled();
-        }
-
-        let html = Redoc::new(self.to_utoipa_spec()).to_html();
-        OpenApiRedocEndpoint::enabled(html)
+    pub fn scalar(&self) -> OpenApiUiEndpoint {
+        self.ui_endpoint(|| Scalar::new(self.to_utoipa_spec()).to_html())
     }
 
-    /// Build a [`RouteNode`] that serves the generated `OpenAPI` document at the provided mount path.
+    /// Build a [`RouteNode`] that serves the generated `OpenAPI` document via Scalar at `mount_path`.
+    #[must_use]
+    pub fn scalar_route(&self, mount_path: impl Into<String>) -> RouteNode {
+        ui_route(self.scalar(), mount_path.into())
+    }
+
+    /// Convert the collected spec to a [`Redoc`](utoipa_redoc::Redoc) endpoint.
+    #[must_use]
+    pub fn redoc(&self) -> OpenApiUiEndpoint {
+        self.ui_endpoint(|| Redoc::new(self.to_utoipa_spec()).to_html())
+    }
+
+    /// Build a [`RouteNode`] that serves the generated `OpenAPI` document via Redoc at `mount_path`.
     #[must_use]
     pub fn redoc_route(&self, mount_path: impl Into<String>) -> RouteNode {
-        let endpoint = self.redoc();
-        redoc_route(endpoint, mount_path.into())
+        ui_route(self.redoc(), mount_path.into())
+    }
+
+    /// Convert the collected spec to an endpoint serving the raw `OpenAPI` JSON document.
+    ///
+    /// The counterpart to [`scalar`](Self::scalar): the same document, for a client generator or
+    /// another tool rather than a reader.
+    ///
+    /// # Panics
+    ///
+    /// If the document cannot be serialized, which would mean `utoipa` produced a structure serde
+    /// cannot write — a bug in a dependency rather than anything an application can cause.
+    #[must_use]
+    pub fn json(&self) -> OpenApiUiEndpoint {
+        self.rendered(JSON_CONTENT_TYPE, || {
+            serde_json::to_string(&self.to_utoipa_spec())
+                .expect("an OpenAPI document is always serializable")
+        })
+    }
+
+    /// Build a [`RouteNode`] serving the raw `OpenAPI` JSON document at `mount_path`.
+    ///
+    /// Unlike [`scalar_route`](Self::scalar_route) this mounts one exact path, not a subtree: a
+    /// specification is a single file, and `/openapi.json/anything` is not it.
+    #[must_use]
+    pub fn json_route(&self, mount_path: impl Into<String>) -> RouteNode {
+        RouteNode::new_endpoint(
+            mount_path.into(),
+            MethodFilter::Exact(Method::GET),
+            self.json(),
+            None,
+            Vec::new(),
+        )
+    }
+
+    fn ui_endpoint(&self, html: impl FnOnce() -> String) -> OpenApiUiEndpoint {
+        self.rendered(HTML_CONTENT_TYPE, html)
+    }
+
+    fn rendered(
+        &self,
+        content_type: &'static str,
+        body: impl FnOnce() -> String,
+    ) -> OpenApiUiEndpoint {
+        if self.is_enabled() {
+            OpenApiUiEndpoint::enabled(body(), content_type)
+        } else {
+            OpenApiUiEndpoint::disabled()
+        }
     }
 
     /// Convert collected operations to a fully hydrated [`utoipa::openapi::OpenApi`] document.
     #[must_use]
     pub fn to_utoipa_spec(&self) -> UtoipaSpec {
         UtoipaSpec::builder()
-            .info(Self::default_info())
+            .info(self.info())
             .paths(self.build_paths())
             .components(Some(self.build_components()))
             .build()
     }
 
-    fn default_info() -> Info {
-        Info::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    /// Name the application this document describes, overriding what `#[skyzen::main]` registered.
+    ///
+    /// Rarely needed: an application built the ordinary way is already titled after its own crate.
+    /// Reach for this when the API's public name is not the crate's — `orders-service` the crate,
+    /// "Orders API" the product — or when building a document outside an application entirely.
+    #[must_use]
+    pub const fn with_info(mut self, info: AppInfo) -> Self {
+        self.info = Some(info);
+        self
+    }
+
+    /// The application's identity: what [`with_info`](Self::with_info) was told, else what
+    /// `#[skyzen::main]` registered for this binary, else an anonymous placeholder.
+    ///
+    /// The placeholder is reached only by a document built outside an application — a library
+    /// under test, or a binary that embeds skyzen behind its own runtime. It is deliberately
+    /// anonymous rather than skyzen's own package metadata: a document announcing itself as
+    /// `skyzen 0.2.1` in every application is worse than one that admits it was never told.
+    fn info(&self) -> Info {
+        self.info
+            .or_else(|| registry::app_info().copied())
+            .map_or_else(
+                || Info::new("API", "0.0.0"),
+                |app| {
+                    let mut info = Info::new(app.name, app.version);
+                    // A package with no `description` still yields `Some("")` from `option_env!`, and
+                    // an empty description in the document is worse than none.
+                    info.description = app
+                        .description
+                        .filter(|text| !text.is_empty())
+                        .map(ToOwned::to_owned);
+                    info
+                },
+            )
     }
 
     fn build_paths(&self) -> Paths {
@@ -601,7 +721,7 @@ impl OpenApi {
             .build()
     }
 
-    #[cfg(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32")))]
+    #[cfg(feature = "openapi")]
     fn build_components(&self) -> utoipa::openapi::schema::Components {
         self.schemas
             .iter()
@@ -612,7 +732,7 @@ impl OpenApi {
             .build()
     }
 
-    #[cfg(not(all(debug_assertions, feature = "openapi", not(target_arch = "wasm32"))))]
+    #[cfg(not(feature = "openapi"))]
     #[allow(clippy::unused_self)]
     fn build_components(&self) -> utoipa::openapi::schema::Components {
         ComponentsBuilder::new().build()
@@ -665,42 +785,54 @@ impl fmt::Debug for OpenApiOperation {
 }
 
 #[derive(Clone, Debug)]
-/// Endpoint that renders the `OpenAPI` document via Redoc.
-pub struct OpenApiRedocEndpoint {
-    html: Option<Arc<String>>,
+/// Endpoint that serves a pre-rendered `OpenAPI` document — a documentation page, or the raw
+/// specification.
+///
+/// The body is rendered once when the route is built, so serving it is a header and a `memcpy`.
+pub struct OpenApiUiEndpoint {
+    body: Option<Arc<String>>,
+    content_type: &'static str,
 }
 
-impl OpenApiRedocEndpoint {
-    fn enabled(html: String) -> Self {
+impl OpenApiUiEndpoint {
+    fn enabled(body: String, content_type: &'static str) -> Self {
         Self {
-            html: Some(Arc::new(html)),
+            body: Some(Arc::new(body)),
+            content_type,
         }
     }
 
     const fn disabled() -> Self {
-        Self { html: None }
+        Self {
+            body: None,
+            content_type: HTML_CONTENT_TYPE,
+        }
     }
 }
 
+const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
+const JSON_CONTENT_TYPE: &str = "application/json";
+
 http_error!(
     /// Error returned when OpenAPI support is disabled.
-    pub OpenApiRedocDisabledError, StatusCode::NOT_IMPLEMENTED, "OpenAPI support is disabled for this build");
+    pub OpenApiUiDisabledError, StatusCode::NOT_IMPLEMENTED, "OpenAPI support is disabled for this build");
 
-impl Endpoint for OpenApiRedocEndpoint {
-    type Error = OpenApiRedocDisabledError;
+impl Endpoint for OpenApiUiEndpoint {
+    type Error = OpenApiUiDisabledError;
     // The document is rendered at build time, so the future is ready on creation rather than an
     // `async` block with nothing to await.
     fn respond(
         &mut self,
         _request: &mut Request,
     ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
-        ready(self.html.as_ref().map_or_else(
-            || Err(OpenApiRedocDisabledError::new()),
-            |html| {
-                let mut response = Response::new(Body::from(html.as_bytes().to_vec()));
+        let content_type = self.content_type;
+        ready(self.body.as_ref().map_or_else(
+            || Err(OpenApiUiDisabledError::new()),
+            |body| {
+                let mut response = Response::new(Body::from(body.as_bytes().to_vec()));
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
-                    header::HeaderValue::from_static("text/html; charset=utf-8"),
+                    header::HeaderValue::from_static(content_type),
                 );
                 Ok(response)
             },
@@ -708,7 +840,7 @@ impl Endpoint for OpenApiRedocEndpoint {
     }
 }
 
-fn redoc_route(endpoint: OpenApiRedocEndpoint, mount_path: String) -> RouteNode {
+fn ui_route(endpoint: OpenApiUiEndpoint, mount_path: String) -> RouteNode {
     let wildcard_suffix = "/{*path}";
     let route = Route::new((
         RouteNode::new_endpoint(
@@ -730,12 +862,12 @@ fn redoc_route(endpoint: OpenApiRedocEndpoint, mount_path: String) -> RouteNode 
     RouteNode::new_route(mount_path, route)
 }
 
-/// Default mount path for the generated Redoc API documentation page.
+/// Default mount path for the generated API documentation page.
 pub const DEFAULT_API_DOCS_MOUNT: &str = "/api-docs";
 
-impl IntoRouteNode for OpenApiRedocEndpoint {
+impl IntoRouteNode for OpenApiUiEndpoint {
     fn into_route_node(self) -> RouteNode {
-        redoc_route(self, DEFAULT_API_DOCS_MOUNT.to_string())
+        ui_route(self, DEFAULT_API_DOCS_MOUNT.to_string())
     }
 }
 
@@ -1029,5 +1161,26 @@ fn doc_summary(docs: &str) -> Option<String> {
         None
     } else {
         Some(paragraph.join(" "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenApi;
+
+    #[test]
+    fn a_document_with_no_registered_identity_is_anonymous_rather_than_skyzen() {
+        // Reachable from a library under test or a binary that embeds skyzen behind its own
+        // runtime — anything with no `#[skyzen::main]` to register an identity. This crate's own
+        // test binary is exactly that case.
+        //
+        // `default_info` used to answer with skyzen's own `CARGO_PKG_*` here, which titled every
+        // application's document `skyzen 0.2.1`. Admitting it was never told is better than
+        // confidently naming the wrong crate. `tests/openapi_app_info.rs` covers the other side.
+        let spec = OpenApi::default().to_utoipa_spec();
+
+        assert_eq!(spec.info.title, "API");
+        assert_eq!(spec.info.version, "0.0.0");
+        assert_ne!(spec.info.title, env!("CARGO_PKG_NAME"));
     }
 }

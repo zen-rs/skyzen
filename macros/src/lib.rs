@@ -8,7 +8,7 @@ use quote::{format_ident, quote};
 use skyzen_manifest::{
     AzureQueueTrigger, DatabaseEntry, DatabaseType, Manifest, NativeDatabaseSection,
     NativeQueueConsumer, NativeServiceSection, RdsEngine, ServiceEntry, ServiceType,
-    SkyzenManifest,
+    SkyzenManifest, VarName,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -99,8 +99,12 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         .as_ref()
         .map_or_else(|| quote! { || async {} }, |path| quote! { || #path() });
 
+    let register_app_info = app_info_registration();
+
     let output = quote! {
         ::skyzen::import_config!();
+
+        #register_app_info
 
         #function
 
@@ -108,6 +112,13 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(clippy::redundant_clone)]
         fn main() {
             #init_logging
+            // Answers `SKYZEN_OPENAPI_DUMP` before anything binds or connects. The document is
+            // built from the router the entry function returns, ahead of the service wiring the
+            // factory does, so `skyzen openapi` works in a project whose backends do not exist
+            // yet.
+            if ::skyzen::runtime::native::dump_openapi_if_requested(|| async { #entry_call }) {
+                return;
+            }
             ::skyzen::runtime::native::launch(
                 ::skyzen::runtime::native::LaunchOptions {
                     listen: ::skyzen::runtime::native::apply_cli_overrides(::std::env::args()),
@@ -231,6 +242,22 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
 /// namespaces declared, only `Cache` and `Sessions` are injected and a handler asking for a bare
 /// `Kv` gets its `KvNotConfigured` error (HTTP 500) rather than one namespace chosen arbitrarily.
 /// Name the binding you mean.
+///
+/// # Secrets
+///
+/// Every `[[secret]]` entry generates the same newtype around [`skyzen::Secret`], with its name
+/// converted from `SCREAMING_SNAKE_CASE`: `name = "STRIPE_KEY"` generates `pub struct
+/// StripeKey(Secret)`. There is no bare `Secret` to fall back on — the type names a value rather
+/// than a capability — so a handler always asks for the entry by name:
+///
+/// ```ignore
+/// async fn handler(stripe: StripeKey) -> Result<&'static str> {
+///     charge(stripe.expose()).await?;              // `Deref` reaches `Secret::expose`
+///     Ok("ok")
+/// }
+/// ```
+///
+/// [`skyzen::Secret`]: https://docs.rs/skyzen/latest/skyzen/struct.Secret.html
 #[proc_macro]
 pub fn import_config(input: TokenStream) -> TokenStream {
     if !input.is_empty() {
@@ -756,37 +783,40 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         fn_ident.to_string().to_uppercase()
     );
 
-    // All generated items are gated on `debug_assertions` + native targets only. The condition
-    // must not mention any cargo feature: these `cfg`s are evaluated against the *user's* crate
-    // features, and downstream crates have no feature named `openapi`. The referenced
-    // `::skyzen::openapi` symbols exist whenever skyzen itself is compiled for a native debug
-    // build, independent of skyzen's `openapi` feature.
+    // Whether to emit any of this is decided *here*, in this crate's own compilation, because
+    // this is the only place the question can be answered correctly. The expansion lands in the
+    // user's crate, so a `#[cfg(feature = "openapi")]` inside it would ask about the application's
+    // features rather than skyzen's — which is why this used to ride on `debug_assertions` as a
+    // stand-in switch, and why a release build had no document. `skyzen/openapi` turns on this
+    // crate's own `openapi` feature instead, so the real switch is finally readable.
+    if !cfg!(feature = "openapi") {
+        return Ok(quote! { #function }.into());
+    }
+
+    // Nothing below mentions a target: `__register_handler_spec!` owns that split, so a handler
+    // documents itself identically whether it is compiled for a server or for an isolate.
     Ok(quote! {
         #function
 
-        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         const _: fn() = || {
             #(#assertions)*
         };
 
-        #(
-            #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
-            #schema_collector_defs
-        )*
+        #(#schema_collector_defs)*
 
-        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
-        #[::skyzen::openapi::linkme::distributed_slice(::skyzen::openapi::HANDLER_SPECS)]
-        #[linkme(crate = ::skyzen::openapi::linkme)]
-        static #spec_ident: ::skyzen::openapi::HandlerSpec = ::skyzen::openapi::HandlerSpec {
-            type_name: #type_name_literal,
-            operation_name: #operation_name_literal,
-            docs: #doc_tokens,
-            deprecated: #deprecated,
-            parameters: #schema_array,
-            parameter_names: #parameter_names_array,
-            response: #response_schema_fn,
-            schemas: #schema_collectors,
-        };
+        ::skyzen::__register_handler_spec!(
+            #spec_ident,
+            ::skyzen::openapi::HandlerSpec {
+                type_name: #type_name_literal,
+                operation_name: #operation_name_literal,
+                docs: #doc_tokens,
+                deprecated: #deprecated,
+                parameters: #schema_array,
+                parameter_names: #parameter_names_array,
+                response: #response_schema_fn,
+                schemas: #schema_collectors,
+            }
+        );
     }
     .into())
 }
@@ -2349,13 +2379,56 @@ fn service_wrapper_path(service_type: ServiceType) -> proc_macro2::TokenStream {
     }
 }
 
+/// The application's identity, registered exactly as `#[skyzen::openapi]` registers a handler.
+///
+/// `env!` expands in the application's crate, which is the only place it reads the application's
+/// own name rather than skyzen's — and registering it there means no document, and no routing call
+/// that builds one, has to carry the name as an argument. One per binary, because `#[skyzen::main]`
+/// is what defines a binary; emitted at item level rather than inside `main` so the wasm build,
+/// which has no `main`, registers it too.
+fn app_info_registration() -> proc_macro2::TokenStream {
+    if !cfg!(feature = "openapi") {
+        return quote! {};
+    }
+
+    quote! {
+        ::skyzen::__register_app_info!(
+            __SKYZEN_APP_INFO,
+            ::skyzen::openapi::AppInfo {
+                name: env!("CARGO_PKG_NAME"),
+                version: env!("CARGO_PKG_VERSION"),
+                description: option_env!("CARGO_PKG_DESCRIPTION"),
+            }
+        );
+    }
+}
+
 fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
     let manifest = load_manifest()?.unwrap_or_default();
+    let generated_items = import_config_items(&manifest)?;
+    let manifest_tracking = manifest_tracking_tokens();
+
+    Ok(quote! {
+        #manifest_tracking
+
+        #[doc(hidden)]
+        pub mod __skyzen_config {
+            #(#generated_items)*
+        }
+
+        pub use __skyzen_config::*;
+    })
+}
+
+/// One generated newtype per `[[service]]`, `[[database]]` and `[[secret]]` entry.
+fn import_config_items(manifest: &SkyzenManifest) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let services = &manifest.service;
     let databases = &manifest.database;
-    let mut generated_items = Vec::with_capacity(services.len() + databases.len());
-    // Services and databases land in the same module, so one set catches a collision between
-    // kinds — a service named `main-db` and a database named `main` both normalize to `MainDb`.
+    let secrets = &manifest.secret;
+    let mut generated_items = Vec::with_capacity(services.len() + databases.len() + secrets.len());
+    // Services, databases and secrets land in the same module, so one set catches a collision
+    // between kinds — a service named `main-db` and a database named `main` both normalize to
+    // `MainDb`.
     let mut seen_idents = HashSet::new();
 
     for service in services {
@@ -2397,18 +2470,26 @@ fn expand_import_config() -> syn::Result<proc_macro2::TokenStream> {
         ));
     }
 
-    let manifest_tracking = manifest_tracking_tokens();
-
-    Ok(quote! {
-        #manifest_tracking
-
-        #[doc(hidden)]
-        pub mod __skyzen_config {
-            #(#generated_items)*
+    for secret in secrets {
+        let ident = secret_ident_from_name(&secret.name)?;
+        if !seen_idents.insert(ident.to_string()) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!("duplicate secret type name after normalization: `{ident}`"),
+            ));
         }
 
-        pub use __skyzen_config::*;
-    })
+        generated_items.push(named_binding_tokens(
+            &ident,
+            &quote! { ::skyzen::Secret },
+            &format!(
+                "secret `{}` not configured. Ensure Skyzen.toml secret wiring is installed.",
+                secret.name
+            ),
+        ));
+    }
+
+    Ok(generated_items)
 }
 
 /// Generate the named newtype for one `[[service]]` or `[[database]]` entry.
@@ -2525,23 +2606,37 @@ struct PortableWiring {
 }
 
 fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
-    let empty = PortableWiring {
+    let Some(document) = load_manifest_document()? else {
+        return Ok(empty_portable_wiring());
+    };
+
+    portable_wiring(&document)
+}
+
+/// Nothing to bind: the endpoint is launched exactly as the entry function built it.
+fn empty_portable_wiring() -> PortableWiring {
+    PortableWiring {
         steps: Vec::new(),
         consumers: quote! { () },
-    };
+    }
+}
 
-    let Some(manifest) = load_manifest()? else {
-        return Ok(empty);
-    };
-
+/// The binding statements one resolved manifest expands to.
+///
+/// The whole document is taken rather than only its base data because a secret's *kind* of
+/// Cloudflare backing has to agree across every environment, which is a question only the
+/// overlays can answer.
+fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
+    let manifest = document.data();
     let services = &manifest.service;
     let databases = &manifest.database;
-    if services.is_empty() && databases.is_empty() {
-        return Ok(empty);
+    let secrets = &manifest.secret;
+    if services.is_empty() && databases.is_empty() && secrets.is_empty() {
+        return Ok(empty_portable_wiring());
     }
     let default_database = default_database_index(databases)?;
 
-    let mut steps = Vec::with_capacity(services.len() + databases.len() + 1);
+    let mut steps = Vec::with_capacity(services.len() + databases.len() + secrets.len() + 1);
     let service_type_counts = service_type_counts(services);
     let mut service_bindings = HashMap::new();
 
@@ -2552,8 +2647,8 @@ fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
     for service in services {
         let ident = service_ident_from_name(&service.name)?;
         let binding = service_binding_ident(&ident);
-        let native_init = generate_native_service_init(service, &manifest);
-        let cloudflare_init = generate_cloudflare_service_init(service, &manifest);
+        let native_init = generate_native_service_init(service, manifest);
+        let cloudflare_init = generate_cloudflare_service_init(service, manifest);
         // The bare `Kv`/`Storage`/`Queue` extractor names whichever service of that type is the
         // only one, so it is injected exactly when the type is unambiguous.
         let inject_bare = service_type_counts[&service.service_type] == 1;
@@ -2570,8 +2665,8 @@ fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
     for (index, database) in databases.iter().enumerate() {
         let ident = database_ident_from_name(&database.name)?;
         let binding = service_binding_ident(&ident);
-        let native_init = generate_native_database_init(database, &manifest);
-        let cloudflare_init = generate_cloudflare_database_init(database, &manifest);
+        let native_init = generate_native_database_init(database, manifest);
+        let cloudflare_init = generate_cloudflare_database_init(database, manifest);
         let inject_bare = default_database == Some(index);
         steps.push(named_injection_tokens(
             &binding,
@@ -2582,7 +2677,23 @@ fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
         ));
     }
 
-    let consumers = queue_consumer_tokens(&manifest, &service_bindings)?;
+    for secret in secrets {
+        let ident = secret_ident_from_name(&secret.name)?;
+        let binding = secret_binding_ident(&ident);
+        let native_init = generate_native_secret_init(&secret.name);
+        let cloudflare_init = generate_cloudflare_secret_init(document, &secret.name)?;
+        // There is no unambiguous bare secret: `Secret` names a value, not a capability, so a
+        // single `[[secret]]` is still reached through its own generated type.
+        steps.push(named_injection_tokens(
+            &binding,
+            &ident,
+            &native_init,
+            &cloudflare_init,
+            false,
+        ));
+    }
+
+    let consumers = queue_consumer_tokens(manifest, &service_bindings)?;
 
     Ok(PortableWiring { steps, consumers })
 }
@@ -2594,6 +2705,14 @@ fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
 /// enqueued through the injected `Queue` would never reach the consumer polling "the same" queue.
 fn service_binding_ident(ident: &proc_macro2::Ident) -> proc_macro2::Ident {
     format_ident!("__skyzen_service_{}", ident.to_string().to_lowercase())
+}
+
+/// The local binding that holds one `[[secret]]` for the length of the factory.
+///
+/// Separate from [`service_binding_ident`] so that a service and a secret whose names normalize
+/// to the same lowercase text cannot name the same local.
+fn secret_binding_ident(ident: &proc_macro2::Ident) -> proc_macro2::Ident {
+    format_ident!("__skyzen_secret_{}", ident.to_string().to_lowercase())
 }
 
 /// Build the `QueueConsumers` value for every `[[native.queue_consumer]]` entry.
@@ -2900,8 +3019,12 @@ fn native_database_wiring<'a>(
 ///
 /// Every native backend that takes a URL, a bucket or a connection string reads it this way, so
 /// the lookup and its failure message are written once here rather than in each arm.
-fn env_value_expr(kind: &str, entry: &str, variable: &str) -> proc_macro2::TokenStream {
-    let variable_lit = LitStr::new(variable, proc_macro2::Span::call_site());
+fn env_value_expr(
+    kind: &str,
+    entry: &str,
+    variable: &skyzen_manifest::VarName,
+) -> proc_macro2::TokenStream {
+    let variable_lit = LitStr::new(variable.as_str(), proc_macro2::Span::call_site());
     let missing_message = LitStr::new(
         &format!("portable {kind} `{entry}` missing native env var `{variable}`"),
         proc_macro2::Span::call_site(),
@@ -3091,7 +3214,10 @@ fn native_queue_tokens(
         NativeServiceSection::StorageQueue(storage_queue) => {
             // The signed URL *is* the credential, so the constructor is handed the variable's name
             // and reports it itself rather than being handed a value read here.
-            let variable = LitStr::new(&storage_queue.sas_url_env, proc_macro2::Span::call_site());
+            let variable = LitStr::new(
+                storage_queue.sas_url_env.as_str(),
+                proc_macro2::Span::call_site(),
+            );
             let failure = connect_failure_lit(
                 name,
                 &format!(
@@ -3309,6 +3435,79 @@ fn generate_cloudflare_database_init(
     }
 }
 
+/// Whether `[cloudflare.secret.<NAME>]` backs this secret with a Cloudflare Secrets Store.
+///
+/// Wiring is read from the base document, as it is for services, so a backing declared only in an
+/// overlay would generate the classic-secret reader for an environment wrangler binds through the
+/// store. One Worker cannot read a name two ways, so the disagreement is refused here rather than
+/// discovered on the first request in that environment.
+fn secret_is_store_backed(document: &Manifest, name: &VarName) -> syn::Result<bool> {
+    let backed_in = |environment: Option<&str>| {
+        document
+            .cloudflare(environment)
+            .ok()
+            .flatten()
+            .is_some_and(|cloudflare| cloudflare.secret.contains_key(name))
+    };
+
+    if backed_in(None) {
+        return Ok(true);
+    }
+
+    for environment in document.environment_names() {
+        if backed_in(Some(environment)) {
+            return Err(Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "secret `{name}` is backed by a Cloudflare Secrets Store in environment \
+                     `{environment}` but not in the base manifest: declare \
+                     `[cloudflare.secret.{name}]` at the top level, since the Worker reads one \
+                     kind of binding in every environment"
+                ),
+            ));
+        }
+    }
+
+    Ok(false)
+}
+
+/// Read one `[[secret]]` from the process environment at startup.
+fn generate_native_secret_init(name: &VarName) -> proc_macro2::TokenStream {
+    let value = env_value_expr("secret", name.as_str(), name);
+    quote! { ::skyzen::Secret::new(#value) }
+}
+
+/// Read one `[[secret]]` from the Worker environment at factory time.
+fn generate_cloudflare_secret_init(
+    document: &Manifest,
+    name: &VarName,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let store_backed = secret_is_store_backed(document, name)?;
+    let name_lit = LitStr::new(name.as_str(), proc_macro2::Span::call_site());
+    let binding_kind = if store_backed {
+        "Secrets Store binding"
+    } else {
+        "secret binding"
+    };
+    let failure_message = LitStr::new(
+        &format!("portable secret `{name}` failed to resolve Cloudflare {binding_kind} `{name}`"),
+        proc_macro2::Span::call_site(),
+    );
+
+    Ok(if store_backed {
+        quote! {{
+            ::skyzen_cloudflare::CfSecret::from_store(&__skyzen_wasm_env, #name_lit)
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", #failure_message))
+        }}
+    } else {
+        quote! {{
+            ::skyzen_cloudflare::CfSecret::classic(&__skyzen_wasm_env, #name_lit)
+                .unwrap_or_else(|error| panic!("{}: {error}", #failure_message))
+        }}
+    })
+}
+
 fn compile_error_block(message: &str) -> proc_macro2::TokenStream {
     let message = LitStr::new(message, proc_macro2::Span::call_site());
     quote! {{
@@ -3363,6 +3562,34 @@ fn database_ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
 
 fn service_ident_from_name(name: &str) -> syn::Result<proc_macro2::Ident> {
     pascal_ident_from_name(name, "", "service")
+}
+
+/// Turn a `[[secret]]` name into a type name: `STRIPE_KEY` becomes `StripeKey`.
+///
+/// A secret is named in `SCREAMING_SNAKE_CASE` because that is the name its value is read under
+/// natively, so the tail of every `_`-separated segment is lowered. [`pascal_ident_from_name`]
+/// deliberately does not do this — lowering there would rename the type generated for an existing
+/// `myCache` service — which is why secrets get their own conversion rather than a shared one.
+fn secret_ident_from_name(name: &VarName) -> syn::Result<proc_macro2::Ident> {
+    let name = name.as_str();
+    let mut normalized = String::with_capacity(name.len());
+
+    for segment in name.split('_').filter(|segment| !segment.is_empty()) {
+        // `VarName` is validated as ASCII, so the first byte is the first character.
+        let (first, rest) = segment.split_at(1);
+        normalized.push_str(&first.to_ascii_uppercase());
+        normalized.push_str(&rest.to_ascii_lowercase());
+    }
+
+    syn::parse_str::<proc_macro2::Ident>(&normalized).map_err(|_| {
+        Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "secret `{name}` normalizes to `{normalized}`, which is not a usable Rust type \
+                 name: rename the secret"
+            ),
+        )
+    })
 }
 
 fn default_database_index(databases: &[DatabaseEntry]) -> syn::Result<Option<usize>> {
@@ -3997,10 +4224,12 @@ mod tests {
 
     /// Parse a manifest through the same shared schema the macros use at compile time.
     fn manifest(source: &str) -> SkyzenManifest {
-        Manifest::parse(source, "Skyzen.toml", ".")
-            .expect("valid manifest")
-            .data()
-            .clone()
+        document(source).data().clone()
+    }
+
+    /// The same parse, keeping the `[cloudflare.env.<name>]` overlays `#[skyzen::main]` reads.
+    fn document(source: &str) -> Manifest {
+        Manifest::parse(source, "Skyzen.toml", ".").expect("valid manifest")
     }
 
     #[test]
@@ -4522,6 +4751,143 @@ binding = "DB"
             "_9lives"
         );
         assert!(service_ident_from_name("---").is_err());
+    }
+
+    #[test]
+    fn a_secret_name_becomes_a_pascal_case_type_name() {
+        use super::secret_ident_from_name;
+        use skyzen_manifest::VarName;
+
+        for (name, expected) in [
+            ("STRIPE_KEY", "StripeKey"),
+            ("JWT_SIGNING_KEY", "JwtSigningKey"),
+            ("API_KEY_V2", "ApiKeyV2"),
+            ("TOKEN", "Token"),
+        ] {
+            assert_eq!(
+                secret_ident_from_name(&VarName::from_static(name))
+                    .unwrap()
+                    .to_string(),
+                expected,
+                "{name}"
+            );
+        }
+
+        // A name that normalizes to a keyword, or to nothing at all, is refused rather than
+        // panicking inside `Ident::new` with no mention of the manifest entry that caused it.
+        assert!(secret_ident_from_name(&VarName::from_static("SELF")).is_err());
+        assert!(secret_ident_from_name(&VarName::from_static("_")).is_err());
+    }
+
+    #[test]
+    fn a_secret_generates_a_named_extractor_wrapping_the_redacting_type() {
+        use super::import_config_items;
+
+        let generated = import_config_items(&manifest("[[secret]]\nname = \"STRIPE_KEY\"\n"))
+            .expect("generated")
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+
+        assert!(
+            generated.contains("pub struct StripeKey (:: skyzen :: Secret)"),
+            "{generated}"
+        );
+        assert!(generated.contains("impl :: skyzen :: extract :: Extractor for StripeKey"));
+        assert!(generated.contains("impl :: skyzen :: middleware :: Middleware for StripeKey"));
+        assert!(generated.contains("pub StripeKeyNotConfigured"));
+    }
+
+    #[test]
+    fn a_secret_and_a_service_that_normalize_alike_collide_at_compile_time() {
+        use super::import_config_items;
+
+        // `stripe_key` and `STRIPE_KEY` both become `StripeKey`; two types of that name in one
+        // module is a much worse error than naming the clash here.
+        let manifest = manifest(
+            "[[service]]\nname = \"stripe_key\"\ntype = \"kv\"\n\n\
+             [[secret]]\nname = \"STRIPE_KEY\"\n",
+        );
+
+        let error = import_config_items(&manifest).expect_err("collision");
+        assert!(error.to_string().contains("StripeKey"), "{error}");
+    }
+
+    #[test]
+    fn a_secret_reads_its_env_var_natively_and_is_never_injected_bare() {
+        use super::portable_wiring;
+
+        let wiring =
+            portable_wiring(&document("[[secret]]\nname = \"STRIPE_KEY\"\n")).expect("wiring");
+        assert_eq!(wiring.steps.len(), 1);
+
+        let step = wiring.steps[0].to_string();
+        assert!(step.contains(":: skyzen :: Secret :: new"), "{step}");
+        assert!(step.contains("\"STRIPE_KEY\""), "{step}");
+        assert!(
+            step.contains("portable secret `STRIPE_KEY` missing native env var `STRIPE_KEY`"),
+            "{step}"
+        );
+        assert!(step.contains("StripeKey :: new"), "{step}");
+        // `Secret` names a value rather than a capability, so there is no bare wrapper to inject
+        // even when the manifest declares exactly one secret.
+        assert_eq!(step.matches("with_middleware").count(), 1, "{step}");
+    }
+
+    #[test]
+    fn a_store_backed_secret_awaits_the_store_and_a_classic_one_does_not() {
+        use super::generate_cloudflare_secret_init;
+        use skyzen_manifest::VarName;
+
+        let name = VarName::from_static("STRIPE_KEY");
+
+        let classic = generate_cloudflare_secret_init(
+            &document("[[secret]]\nname = \"STRIPE_KEY\"\n"),
+            &name,
+        )
+        .expect("classic")
+        .to_string();
+        assert!(classic.contains("CfSecret :: classic"), "{classic}");
+        assert!(!classic.contains("await"), "{classic}");
+
+        let backed = generate_cloudflare_secret_init(
+            &document(
+                "[[secret]]\nname = \"STRIPE_KEY\"\n\n\
+                 [cloudflare.secret.STRIPE_KEY]\n\
+                 store_id = \"0c2a3f\"\nsecret_name = \"stripe-key\"\n",
+            ),
+            &name,
+        )
+        .expect("store backed")
+        .to_string();
+        assert!(backed.contains("CfSecret :: from_store"), "{backed}");
+        assert!(backed.contains(". await"), "{backed}");
+        assert!(backed.contains("Secrets Store binding"), "{backed}");
+    }
+
+    #[test]
+    fn a_store_backing_declared_only_in_an_overlay_is_a_compile_error() {
+        use super::generate_cloudflare_secret_init;
+        use skyzen_manifest::VarName;
+
+        // The Worker is generated once, from the base document, so it would read `STRIPE_KEY` as a
+        // classic secret while wrangler binds it through the store in `staging`.
+        let error = generate_cloudflare_secret_init(
+            &document(
+                "[[secret]]\nname = \"STRIPE_KEY\"\n\n\
+                 [cloudflare.env.staging.secret.STRIPE_KEY]\n\
+                 store_id = \"0c2a3f\"\nsecret_name = \"stripe-key\"\n",
+            ),
+            &VarName::from_static("STRIPE_KEY"),
+        )
+        .expect_err("overlay-only backing");
+
+        let message = error.to_string();
+        assert!(message.contains("staging"), "{message}");
+        assert!(
+            message.contains("[cloudflare.secret.STRIPE_KEY]"),
+            "{message}"
+        );
     }
 
     #[test]

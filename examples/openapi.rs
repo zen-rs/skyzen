@@ -164,17 +164,17 @@ fn write_openapi_document(spec: &OpenApi) {
 
 #[skyzen::main]
 fn main() -> Router {
-    let redoc_endpoint = Route::new(("/hello".at(hello),)).openapi().redoc();
+    let scalar_endpoint = Route::new(("/hello".at(hello),)).openapi().scalar();
     let router = Route::new((
         "/hello".at(hello),
         "/projects/{project_id}/tasks".at(create_task),
-        // Serve interactive docs at GET /docs via utoipa-redoc.
-        "/docs".endpoint(Method::GET, redoc_endpoint),
+        // Serve interactive docs at GET /docs via Scalar.
+        "/docs".endpoint(Method::GET, scalar_endpoint),
     ))
     .build();
     let openapi = router.openapi();
     tracing::info!("OpenAPI enabled: {}", openapi.is_enabled());
-    tracing::info!("ReDoc endpoint mounted at GET /docs");
+    tracing::info!("Scalar endpoint mounted at GET /docs");
     log_openapi(&openapi);
     router
 }

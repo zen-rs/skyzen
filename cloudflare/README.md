@@ -22,7 +22,7 @@ Cloudflare Workers service implementations for the Skyzen framework.
 | `CfD1` | `DbBackend` + raw D1 API | [D1](https://developers.cloudflare.com/d1/), with `execute_batch` as its atomic unit |
 | `CfCache` | raw Cache API | [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) |
 | `CfDurableDb`, `CfDurableKv`, `CfAlarm` | the `durable` backends | [Durable Objects storage](https://developers.cloudflare.com/durable-objects/api/storage-api/) |
-| `CfSecretStore` | — | [Secrets Store](https://developers.cloudflare.com/secrets-store/) bindings |
+| `CfSecret` | — | Classic Worker secrets and [Secrets Store](https://developers.cloudflare.com/secrets-store/) bindings, read as `skyzen::Secret` |
 | `CfService`, `CfAssets` | — | [Service bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/) and the static-assets binding |
 | `CfFetch` | — | Outbound `fetch` with Cloudflare's own request options |
 
@@ -31,6 +31,12 @@ The Worker events Cloudflare documents are covered too: `fetch` from `#[skyzen::
 `CfEmailMessage`, `TailTraceItem`), and the Durable Object `alarm` from `Route::on_alarm`.
 `CfProperties` (`skyzen::runtime`) carries the `request.cf` metadata, and `WorkerContext` carries
 `waitUntil`.
+
+A handler normally does not name `CfSecret`: `import_config!` generates a named type per
+`[[secret]]` manifest entry and calls the right reader for it, so the binding name is checked
+against the manifest rather than repeated as a string literal. Declaring a secret, backing one with
+a Secrets Store entry and getting its value to the deployment are in
+[Secrets](https://github.com/zen-rs/skyzen/blob/main/docs/skyzen-toml-reference.md#secrets).
 
 ## Usage
 

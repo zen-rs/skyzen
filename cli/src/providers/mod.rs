@@ -7,24 +7,28 @@ pub mod aws;
 pub mod azure;
 pub mod cloudflare;
 mod native;
+pub mod secrets;
 
 use crate::{
     capabilities,
-    cli::{Provider, SecretCommand},
-    environment, output,
+    cli::Provider,
+    environment::{self, ResolvedVariables, RuntimeVariable, VariableKind},
+    output,
     project::{Project, WASM_TARGET},
 };
 use anyhow::{Context, Result};
-use skyzen_manifest::Manifest;
+use secrecy::{ExposeSecret as _, SecretString};
+use skyzen_manifest::{Manifest, SkyzenManifest, VarName};
 use std::{
     fmt::Debug,
+    io::Write as _,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 
 /// What the user asked the CLI to do, once `new`, `add` and `completions` — which need no
 /// provider — have been handled.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Action {
     /// Produce deployment artifacts and stop.
     Build {
@@ -44,7 +48,7 @@ pub enum Action {
         wrangler_args: Vec<String>,
     },
     /// Manage the deployed application's secrets.
-    Secret(SecretCommand),
+    Secret(SecretAction),
     /// Apply pending SQL migrations, or report which are still pending.
     Migrate {
         /// Act on the local emulator rather than the deployed database.
@@ -52,6 +56,26 @@ pub enum Action {
         /// Report what is applied and what is pending instead of applying anything.
         status: bool,
     },
+}
+
+/// One `skyzen secret` operation, carrying the value the user piped in when there is one.
+///
+/// `main` reads the value from the CLI's own standard input before any provider is asked for a
+/// plan: every provider then sees the same thing, and no provider has to know how a terminal
+/// prompts.
+#[derive(Debug)]
+pub enum SecretAction {
+    /// Set one secret's value.
+    Set {
+        /// The secret's name, checked against the manifest's `[[secret]]` entries before dispatch.
+        name: VarName,
+        /// The value to deliver.
+        value: SecretString,
+    },
+    /// Deliver every declared secret's local value, without rebuilding anything.
+    Push,
+    /// List the secrets the deployment has.
+    List,
 }
 
 impl Action {
@@ -75,7 +99,7 @@ impl Action {
 }
 
 /// One external process to run.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CommandPlan {
     /// The program to launch.
     pub program: String,
@@ -83,10 +107,15 @@ pub struct CommandPlan {
     pub args: Vec<String>,
     /// The directory to launch it in.
     pub cwd: Option<PathBuf>,
+    /// What the process reads on its standard input.
+    pub stdin: CommandStdin,
 }
 
 impl CommandPlan {
     /// A copy-pasteable rendering, for progress output and `--dry-run`.
+    ///
+    /// The standard input is deliberately not part of it: a value delivered there is the one thing
+    /// about a command that must never reach a terminal or a log.
     pub fn display(&self) -> String {
         let command = if self.args.is_empty() {
             self.program.clone()
@@ -98,20 +127,110 @@ impl CommandPlan {
             None => command,
         }
     }
+
+    /// The same command, with `value` written to its standard input.
+    #[must_use]
+    pub fn with_stdin(mut self, value: SecretString) -> Self {
+        self.stdin = CommandStdin::Secret(value);
+        self
+    }
 }
 
-/// The artifact build one provider performs before its commands run.
+/// What an external process reads on its standard input.
 ///
-/// Each provider's build is a different pipeline — wasm-bindgen glue for Cloudflare, a Linux
-/// cross-compile staged into a bundle for Azure — and only the provider knows what its own
-/// pipeline is, so the plan carries one of these rather than one provider's build plan standing in
-/// for all of them. A provider whose build is just a command (AWS runs `cargo lambda build`) uses
-/// a [`CommandPlan`] instead, where `--dry-run` can print it verbatim.
-pub trait ArtifactBuild: Debug + Send {
+/// The reason it is a field rather than a convention: a value handed to wrangler travels here and
+/// nowhere else, so [`CommandPlan::display`] can print every part of a command it *does* carry.
+#[derive(Debug, Default)]
+pub enum CommandStdin {
+    /// The CLI's own standard input, so a tool that prompts stays usable.
+    #[default]
+    Inherit,
+    /// A value written to the process, after which the pipe is closed.
+    Secret(SecretString),
+}
+
+impl CommandStdin {
+    /// How the child's standard input is wired up.
+    fn stdio(&self) -> Stdio {
+        match self {
+            Self::Inherit => Stdio::inherit(),
+            Self::Secret(_) => Stdio::piped(),
+        }
+    }
+
+    /// Write the value to a spawned child, closing the pipe afterwards.
+    ///
+    /// On a thread of its own, because a value larger than the pipe buffer would otherwise
+    /// deadlock: the parent blocks writing while the child waits for input the parent is not
+    /// getting round to sending. The value is copied into the thread as another [`SecretString`],
+    /// so the copy is zeroized when the writer is done with it.
+    fn write_to(&self, child: &mut Child) -> Result<()> {
+        let Self::Secret(value) = self else {
+            return Ok(());
+        };
+        let mut pipe = child
+            .stdin
+            .take()
+            .context("the process was started without a standard input pipe")?;
+        let value = environment::duplicate(value);
+        std::thread::spawn(move || {
+            if let Err(error) = pipe.write_all(value.expose_secret().as_bytes()) {
+                output::warn(format!(
+                    "failed to write a value to the process's standard input: {error}"
+                ));
+            }
+        });
+        Ok(())
+    }
+}
+
+/// One piece of work in a provider's plan.
+#[derive(Debug)]
+pub enum Step {
+    /// An external process to run.
+    Command(CommandPlan),
+    /// Work the CLI performs itself.
+    Task(Box<dyn Task>),
+}
+
+impl Step {
+    /// A one-line description, for progress output and `--dry-run`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Command(command) => command.display(),
+            Self::Task(task) => task.describe(),
+        }
+    }
+
+    /// Perform it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the process cannot be launched, when it exits non-zero, or when the task does.
+    pub fn run(&self, child_env: &[(String, String)]) -> Result<()> {
+        match self {
+            Self::Command(command) => run_command(command, child_env),
+            Self::Task(task) => {
+                output::step(task.describe());
+                task.run()
+            }
+        }
+    }
+}
+
+/// Work the CLI does itself rather than by launching a process.
+///
+/// An artifact build is one — wasm-bindgen glue for Cloudflare, a Linux cross-compile staged into
+/// a bundle for Azure — and so is anything whose next command depends on what the previous one
+/// answered, such as seeding a Secrets Store entry whose id is only known after listing the store.
+/// A step that is just a process uses a [`CommandPlan`] instead, where `--dry-run` prints it
+/// verbatim.
+pub trait Task: Debug + Send {
     /// A one-line description for progress output and `--dry-run`.
     fn describe(&self) -> String;
 
-    /// Produce the artifacts.
+    /// Do the work.
     ///
     /// # Errors
     ///
@@ -120,12 +239,25 @@ pub trait ArtifactBuild: Debug + Send {
 }
 
 /// A file the CLI generates before running anything.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GeneratedFile {
     /// Where it goes.
     pub path: PathBuf,
     /// What goes in it.
-    pub contents: String,
+    pub contents: FileContents,
+}
+
+/// What a generated file holds, and therefore what `--dry-run` may print.
+///
+/// A generated `wrangler.toml` or `host.json` is configuration a user should be able to read
+/// before it is written; a `.dev.vars` is values. Making the distinction a type rather than a
+/// convention means a new generated file has to say which it is, and a printer cannot forget.
+#[derive(Debug)]
+pub enum FileContents {
+    /// Configuration, printed verbatim by `--dry-run`.
+    Public(String),
+    /// Values, never printed and written with owner-only permissions.
+    Secret(SecretString),
 }
 
 /// How the supervised process and the build relate while `dev` is running.
@@ -144,12 +276,15 @@ pub enum RunMode {
 /// What one provider decided to do.
 #[derive(Debug, Default)]
 pub struct ProviderPlan {
-    /// External processes to run, in order.
-    pub commands: Vec<CommandPlan>,
+    /// The work to perform after the build, in order.
+    pub steps: Vec<Step>,
     /// Files to write first.
     pub generated_files: Vec<GeneratedFile>,
     /// The artifact build to perform, when the action needs artifacts.
-    pub build: Option<Box<dyn ArtifactBuild>>,
+    ///
+    /// Separate from [`steps`](Self::steps) because it is the *supervised* build: `skyzen dev`
+    /// re-runs this one on every source change, and nothing else.
+    pub build: Option<Box<dyn Task>>,
     /// How to supervise the commands.
     pub run_mode: RunMode,
     /// Environment to hand the supervised process, never applied to the CLI's own environment.
@@ -161,6 +296,90 @@ pub struct ProviderPlan {
     /// `deploy --dry-run` maps onto `wrangler deploy --dry-run`, which validates the real bundle,
     /// so its plan runs for real and only the upload is skipped. Everything else prints instead.
     pub execute_despite_dry_run: bool,
+}
+
+impl ProviderPlan {
+    /// The steps a supervised run performs first, and the process it then supervises.
+    ///
+    /// The supervised process is the last step, and everything before it is a preamble that has to
+    /// have happened by the time it starts — seeding wrangler's local Secrets Store before
+    /// `wrangler dev` reads it, for one.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the plan ends in something other than a command, which would mean supervising
+    /// nothing while silently skipping the work that was planned.
+    pub fn supervised(&self) -> Result<(&[Step], &CommandPlan)> {
+        let (last, preamble) = self
+            .steps
+            .split_last()
+            .context("a supervised run needs a command to supervise")?;
+        let Step::Command(command) = last else {
+            anyhow::bail!(
+                "a supervised run must end in the process to supervise, not `{}`",
+                last.describe()
+            );
+        };
+        Ok((preamble, command))
+    }
+}
+
+/// Run every step in order, or report what they would have been.
+///
+/// # Errors
+///
+/// Fails on the first step that does, naming it.
+pub fn run_steps(steps: &[Step], simulate: bool, child_env: &[(String, String)]) -> Result<()> {
+    for step in steps {
+        if simulate {
+            output::dry_run(step.describe());
+            continue;
+        }
+        step.run(child_env)?;
+    }
+    Ok(())
+}
+
+/// Run one external command to completion.
+///
+/// # Errors
+///
+/// Fails when the program cannot be launched or exits non-zero.
+pub fn run_command(command: &CommandPlan, child_env: &[(String, String)]) -> Result<()> {
+    let display = command.display();
+    output::step(&display);
+    let mut child = spawn_command(command, child_env)?;
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for {}", command.program))?;
+    if !status.success() {
+        anyhow::bail!("command failed with status {status}: {display}");
+    }
+    Ok(())
+}
+
+/// Start one external command, handing it whatever its standard input carries.
+///
+/// # Errors
+///
+/// Fails when the program cannot be launched.
+pub fn spawn_command(command: &CommandPlan, child_env: &[(String, String)]) -> Result<Child> {
+    let mut process = Command::new(&command.program);
+    process
+        .args(&command.args)
+        .envs(child_env.iter().map(|(key, value)| (key, value)))
+        .stdin(command.stdin.stdio())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(cwd) = &command.cwd {
+        process.current_dir(cwd);
+    }
+
+    let mut child = process
+        .spawn()
+        .with_context(|| format!("failed to launch {}", command.program))?;
+    command.stdin.write_to(&mut child)?;
+    Ok(child)
 }
 
 /// Build the plan for one action.
@@ -185,6 +404,9 @@ pub fn prepare(
     }
 
     let manifest = load_or_empty(manifest_path)?;
+    if let Action::Secret(SecretAction::Set { name, .. }) = action {
+        ensure_declared_secret(manifest.data(), name)?;
+    }
     let project = Project::load(manifest.root_dir())?;
     capabilities::ensure_present(manifest.data(), &project)?;
 
@@ -205,7 +427,7 @@ pub fn prepare(
 /// had one. An empty manifest declares no capabilities and no environment variables, which is
 /// exactly right for the native path; the Cloudflare path then fails with "missing [cloudflare]
 /// section", which says what to do, rather than with a file-not-found.
-fn load_or_empty(manifest_path: &Path) -> Result<Manifest> {
+pub fn load_or_empty(manifest_path: &Path) -> Result<Manifest> {
     if manifest_path.exists() {
         return environment::load_manifest(manifest_path);
     }
@@ -516,38 +738,61 @@ fn check_manifest(
 /// project is diagnosed on is routinely not the one holding the production connection strings.
 /// `skyzen dev` is where an unset variable is an error, because that is where it would panic.
 fn report_native_wiring(manifest: &Manifest) {
-    let Some(native) = manifest.data().native.as_ref() else {
-        return;
-    };
-    if native.service.is_empty() && native.database.is_empty() {
-        return;
-    }
-
-    for (name, service) in &native.service {
-        output::ok(format!(
-            "native: service `{name}` is backed by `{}`",
-            service.backend().as_str()
-        ));
-    }
-    for (name, database) in &native.database {
-        output::ok(format!(
-            "native: database `{name}` is backed by `{}`",
-            database.backend().as_str()
-        ));
-    }
-
-    let dotenv = environment::load_dotenv_files(manifest.root_dir()).unwrap_or_else(|error| {
-        output::warn(format!("native: {error:#}"));
-        std::collections::BTreeMap::new()
-    });
-    for variable in environment::required_variables(manifest.data()) {
-        if dotenv.contains_key(&variable.name) || std::env::var_os(&variable.name).is_some() {
-            continue;
+    if let Some(native) = manifest.data().native.as_ref() {
+        for (name, service) in &native.service {
+            output::ok(format!(
+                "native: service `{name}` is backed by `{}`",
+                service.backend().as_str()
+            ));
         }
-        output::warn(format!(
-            "native: {} is set nowhere (declared by {}); `skyzen dev` will refuse to start",
-            variable.name, variable.declared_by
-        ));
+        for (name, database) in &native.database {
+            output::ok(format!(
+                "native: database `{name}` is backed by `{}`",
+                database.backend().as_str()
+            ));
+        }
+    }
+
+    report_runtime_variables(manifest, VariableKind::ALL, "native", "skyzen dev");
+}
+
+/// Report the runtime variables one provider is responsible for, and which of them have a value
+/// here.
+///
+/// A warning rather than a failure, and it counts none: `doctor` is not a run, and the machine a
+/// project is diagnosed on is routinely not the one holding the production connection strings. The
+/// command named in `refused_by` is where an unset variable *is* an error, because that is where
+/// it would either panic or ship a half-configured deployment.
+pub fn report_runtime_variables(
+    manifest: &Manifest,
+    kinds: &[VariableKind],
+    label: &str,
+    refused_by: &str,
+) {
+    let variables = environment::runtime_variables_of(manifest.data(), kinds);
+    if variables.is_empty() {
+        return;
+    }
+    let loaded = environment::Environment::load(manifest.root_dir()).unwrap_or_else(|error| {
+        output::warn(format!("{label}: {error:#}"));
+        environment::Environment::default()
+    });
+    for variable in variables {
+        match loaded.get(variable.name.as_str()) {
+            Ok(Some(_)) => output::ok(format!(
+                "{label}: {} {} is set (declared by {})",
+                variable.kind.label(),
+                variable.name,
+                variable.declared_by
+            )),
+            Ok(None) => output::warn(format!(
+                "{label}: {} {} is set nowhere (declared by {}); `{refused_by}` will refuse to run",
+                variable.kind.label(),
+                variable.name,
+                variable.declared_by
+            )),
+            Err(error) => output::warn(format!("{label}: {} {error}", variable.name)),
+        }
     }
 }
 
@@ -579,6 +824,22 @@ fn check_cloudflare_manifest(manifest: &Manifest, environment: Option<&str>) -> 
         }
     }
 
+    if let Some(config) = config {
+        match compatibility_date_problem(config.compatibility_date.as_deref()) {
+            None => output::ok(format!(
+                "cloudflare: compatibility_date is within what this CLI targets ({})",
+                crate::scaffold::COMPATIBILITY_DATE
+            )),
+            Some(problem) => {
+                // A warning, not a failure: a newer date is exactly right for someone running a
+                // newer wrangler than this CLI was released against, and doctor cannot ask
+                // workerd what it supports. Saying so beats either staying silent until
+                // `wrangler dev` fails, or refusing a configuration that may be correct.
+                output::warn(format!("cloudflare: {problem}"));
+            }
+        }
+    }
+
     match Project::load(manifest.root_dir())
         .and_then(|project| cloudflare::build::check_wasm_bindgen_agreement(&project))
     {
@@ -595,22 +856,138 @@ fn check_cloudflare_manifest(manifest: &Manifest, environment: Option<&str>) -> 
     failures
 }
 
-/// Load the project's `.env` files and check every variable the manifest declares is available.
+/// Say whether a project's `compatibility_date` is likely to outrun the local Workers runtime.
+///
+/// `workerd` refuses a date newer than its own binary knows, and reports that as a startup failure
+/// naming wrangler rather than the manifest. Nothing here can ask workerd what it supports, so the
+/// comparison is against the date this CLI is released against — a date beyond it is not wrong,
+/// but it is the shape of the configuration that fails, and worth saying before `wrangler dev`
+/// says it less clearly.
+///
+/// ISO-8601 dates compare correctly as strings, so this needs no date library — and the CLI no
+/// longer carries one now that `skyzen new` stamps a pinned date rather than reading the clock.
+fn compatibility_date_problem(declared: Option<&str>) -> Option<String> {
+    let declared = declared?;
+    let targeted = crate::scaffold::COMPATIBILITY_DATE;
+    (declared > targeted).then(|| {
+        format!(
+            "compatibility_date {declared} is newer than the {targeted} this CLI targets; if \
+             `wrangler dev` refuses to start, that is why \u{2014} lower it, or update wrangler"
+        )
+    })
+}
+
+/// The runtime variables one provider needs, resolved, plus the environment its child gets.
+#[derive(Debug, Default)]
+pub struct ChildEnvironment {
+    /// Every variable of the requested kinds, with the value found for it.
+    ///
+    /// A provider that delivers variables to a deployed function reads these; one that only runs
+    /// the application locally needs nothing beyond the resolution having succeeded. The
+    /// Cloudflare sinks resolve through [`resolve_variables`] instead, because what they deliver
+    /// is not what their child process runs with.
+    pub resolved: ResolvedVariables,
+    /// What to add to the child process's inherited environment.
+    pub child_env: Vec<(String, String)>,
+}
+
+/// Resolve the runtime variables of the given kinds, and say what a child process should be
+/// started with.
+///
+/// The child gets only the dotenv entries the CLI's own environment does not already hold, so a
+/// one-off `CACHE_URL=... skyzen dev` beats `.env` rather than the other way round.
 ///
 /// # Errors
 ///
 /// Fails when a dotenv file cannot be read, or when a declared variable is set nowhere.
-pub fn prepare_child_environment(manifest: &Manifest) -> Result<Vec<(String, String)>> {
-    let dotenv = environment::load_dotenv_files(manifest.root_dir())
+pub fn prepare_child_environment(
+    manifest: &Manifest,
+    kinds: &[VariableKind],
+) -> Result<ChildEnvironment> {
+    let loaded = environment::Environment::load(manifest.root_dir())
         .context("failed to load the project's .env files")?;
-    environment::ensure_available(&environment::required_variables(manifest.data()), &dotenv)?;
-    Ok(dotenv.into_iter().collect())
+    let resolved = loaded.resolve(&environment::runtime_variables_of(manifest.data(), kinds))?;
+    Ok(ChildEnvironment {
+        resolved,
+        child_env: loaded.child_overrides(),
+    })
+}
+
+/// Resolve the runtime variables of the given kinds that `wanted` accepts.
+///
+/// The filter is what lets a provider leave out a variable it must not demand: a Cloudflare
+/// deployment binds a Secrets Store secret rather than uploading it, so requiring the value
+/// locally would refuse a deployment whose configuration is complete.
+///
+/// # Errors
+///
+/// Fails when a dotenv file cannot be read, or when a wanted variable is set nowhere.
+pub fn resolve_variables(
+    manifest: &Manifest,
+    kinds: &[VariableKind],
+    wanted: impl Fn(&RuntimeVariable) -> bool,
+) -> Result<ResolvedVariables> {
+    let loaded = environment::Environment::load(manifest.root_dir())
+        .context("failed to load the project's .env files")?;
+    let mut variables = environment::runtime_variables_of(manifest.data(), kinds);
+    variables.retain(wanted);
+    loaded.resolve(&variables)
+}
+
+/// Refuse a `secret set` for a name the manifest does not declare.
+///
+/// A name is what the application reads through its generated `Secret` extractor, so a name
+/// nothing declares would upload a value no code can reach — and the typo would only show up as a
+/// missing secret at cold start.
+fn ensure_declared_secret(manifest: &SkyzenManifest, name: &VarName) -> Result<()> {
+    if manifest.secret.iter().any(|entry| entry.name == *name) {
+        return Ok(());
+    }
+
+    let declared = manifest
+        .secret
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    if declared.is_empty() {
+        anyhow::bail!(
+            "`{name}` is not a declared secret: Skyzen.toml has no [[secret]] entries. Add one \
+             (`[[secret]]` with `name = \"{name}\"`) so the application can read it."
+        );
+    }
+    anyhow::bail!(
+        "`{name}` is not a declared secret; Skyzen.toml declares: {}",
+        declared.join(", ")
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, CommandPlan};
+
+    #[test]
+    fn a_compatibility_date_within_what_the_cli_targets_is_not_reported() {
+        use super::compatibility_date_problem;
+        assert!(compatibility_date_problem(None).is_none());
+        assert!(compatibility_date_problem(Some(crate::scaffold::COMPATIBILITY_DATE)).is_none());
+        assert!(compatibility_date_problem(Some("2024-01-01")).is_none());
+    }
+
+    #[test]
+    fn a_compatibility_date_beyond_it_says_why_wrangler_would_refuse_to_start() {
+        use super::compatibility_date_problem;
+        // The shape of #51: a date past what the local runtime knows, which workerd rejects with
+        // an error naming its own binary rather than the manifest.
+        let problem = compatibility_date_problem(Some("2099-01-01")).expect("should be reported");
+        assert!(problem.contains("2099-01-01"), "{problem}");
+        assert!(
+            problem.contains(crate::scaffold::COMPATIBILITY_DATE),
+            "{problem}"
+        );
+        assert!(problem.contains("wrangler dev"), "{problem}");
+    }
+    use super::{Action, CommandPlan, CommandStdin};
     use crate::cli::Provider;
+    use skyzen_manifest::VarName;
     use std::path::PathBuf;
 
     #[test]
@@ -675,7 +1052,7 @@ mod tests {
             false,
         )
         .expect("native dev needs no manifest");
-        assert!(plan.commands[0].display().contains("cargo run"));
+        assert!(plan.steps[0].describe().contains("cargo run"));
 
         // The Cloudflare path still fails, but with the message that says what to add.
         let error = super::prepare(
@@ -695,7 +1072,60 @@ mod tests {
             program: "wrangler".to_owned(),
             args: vec!["dev".to_owned()],
             cwd: Some(PathBuf::from("/tmp/app")),
+            stdin: CommandStdin::Inherit,
         };
         assert_eq!(plan.display(), "(cd /tmp/app && wrangler dev)");
+    }
+
+    #[test]
+    fn what_a_command_carries_on_standard_input_is_not_part_of_its_rendering() {
+        // The whole reason values travel on standard input: `--dry-run` and every progress line
+        // print a command in full, and neither may print a secret.
+        let plan = CommandPlan {
+            program: "wrangler".to_owned(),
+            args: vec!["secret".to_owned(), "bulk".to_owned()],
+            cwd: None,
+            stdin: CommandStdin::Inherit,
+        }
+        .with_stdin(secrecy::SecretString::from(
+            r#"{"STRIPE_KEY":"sk_live_123"}"#,
+        ));
+
+        assert_eq!(plan.display(), "wrangler secret bulk");
+        assert!(!plan.display().contains("sk_live_123"));
+        assert!(!super::Step::Command(plan)
+            .describe()
+            .contains("sk_live_123"));
+    }
+
+    #[test]
+    fn a_secret_no_entry_declares_is_refused_with_the_names_that_are() {
+        let manifest = skyzen_manifest::Manifest::parse(
+            "[[secret]]\nname = \"STRIPE_KEY\"\n\n[[secret]]\nname = \"JWT_SIGNING_KEY\"\n",
+            "Skyzen.toml",
+            "/tmp/app",
+        )
+        .expect("valid manifest");
+        let name = |text: &str| VarName::try_from(text.to_owned()).expect("a name");
+
+        super::ensure_declared_secret(manifest.data(), &name("STRIPE_KEY")).expect("declared");
+
+        let error = super::ensure_declared_secret(manifest.data(), &name("STRIPE_KEYY"))
+            .expect_err("a typo must not upload a value no code can read");
+        let rendered = error.to_string();
+        assert!(rendered.contains("STRIPE_KEY"), "{rendered}");
+        assert!(rendered.contains("JWT_SIGNING_KEY"), "{rendered}");
+    }
+
+    #[test]
+    fn a_project_declaring_no_secrets_says_how_to_declare_one() {
+        let manifest =
+            skyzen_manifest::Manifest::parse("", "Skyzen.toml", "/tmp/app").expect("empty");
+        let error = super::ensure_declared_secret(
+            manifest.data(),
+            &VarName::try_from("STRIPE_KEY".to_owned()).expect("a name"),
+        )
+        .expect_err("nothing is declared");
+        assert!(error.to_string().contains("[[secret]]"), "{error}");
     }
 }

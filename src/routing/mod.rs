@@ -131,7 +131,7 @@
 
 use std::{fmt, sync::Arc};
 
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "ws")]
 use crate::websocket::{MaybeSend, MaybeSync, WebSocket};
@@ -171,17 +171,34 @@ pub use nest::{NestedPathError, NestedRouter};
 pub trait ServedRoutes {
     /// Every `(method, path)` pair this endpoint answers, in `matchit` path syntax.
     fn served_routes(&self) -> &[(MethodFilter, String)];
+
+    /// The `OpenAPI` document these routes describe.
+    ///
+    /// Defaulted so that a hand-written implementation — a test stub standing in for a router —
+    /// does not have to invent one. [`Router`] and every wrapper the framework puts around one
+    /// override it, so an ordinary application always gets the real document.
+    fn openapi_document(&self) -> OpenApi {
+        OpenApi::default()
+    }
 }
 
 impl ServedRoutes for Router {
     fn served_routes(&self) -> &[(MethodFilter, String)] {
         self.routes()
     }
+
+    fn openapi_document(&self) -> OpenApi {
+        self.openapi()
+    }
 }
 
 impl<E: ServedRoutes> ServedRoutes for crate::middleware::Layered<E> {
     fn served_routes(&self) -> &[(MethodFilter, String)] {
         self.endpoint().served_routes()
+    }
+
+    fn openapi_document(&self) -> OpenApi {
+        self.endpoint().openapi_document()
     }
 }
 
@@ -432,25 +449,31 @@ impl Route {
     /// Generate an [`OpenApi`] document describing this route tree.
     #[must_use]
     pub fn openapi(&self) -> OpenApi {
-        #[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+        #[cfg(feature = "openapi")]
         {
             let mut entries = Vec::new();
             collect_openapi_entries("", &self.nodes, &mut entries);
             OpenApi::from_entries(&entries)
         }
 
-        #[cfg(not(all(feature = "openapi", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "openapi"))]
         {
             OpenApi::default()
         }
     }
 
-    /// Enable the Redoc API documentation endpoint at `/api-docs`.
+    /// Enable the Scalar API documentation endpoint at `/api-docs`.
+    ///
+    /// The document is titled after the application, which it learns from what `#[skyzen::main]`
+    /// registered rather than from an argument — see [`AppInfo`](openapi::AppInfo). Override that
+    /// with [`OpenApi::with_info`](openapi::OpenApi::with_info) and
+    /// [`scalar_route`](openapi::OpenApi::scalar_route) when the API's public name is not the
+    /// crate's.
     #[must_use]
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.openapi();
         self.nodes
-            .push(openapi.redoc_route(openapi::DEFAULT_API_DOCS_MOUNT));
+            .push(openapi.scalar_route(openapi::DEFAULT_API_DOCS_MOUNT));
         self
     }
 }
@@ -508,13 +531,15 @@ impl RouteWithAlarm {
         router
     }
 
-    /// Enable the Redoc API documentation endpoint at `/api-docs`.
+    /// Enable the Scalar API documentation endpoint at `/api-docs`.
+    ///
+    /// Titled the same way [`Route::enable_api_doc`] is.
     #[must_use]
     pub fn enable_api_doc(mut self) -> Self {
         let openapi = self.route.openapi();
         self.route
             .nodes
-            .push(openapi.redoc_route(openapi::DEFAULT_API_DOCS_MOUNT));
+            .push(openapi.scalar_route(openapi::DEFAULT_API_DOCS_MOUNT));
         self
     }
 }
@@ -943,7 +968,7 @@ pub(crate) fn join_path(prefix: &str, segment: &str) -> String {
     collapsed
 }
 
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 fn collect_openapi_entries(
     path_prefix: &str,
     nodes: &[RouteNode],
@@ -971,7 +996,7 @@ fn collect_openapi_entries(
 }
 
 /// A mounted router's operations, re-pathed under the prefix it is mounted at.
-#[cfg(all(feature = "openapi", not(target_arch = "wasm32")))]
+#[cfg(feature = "openapi")]
 pub(crate) fn prefixed_openapi_entries(prefix: &str, router: &Router) -> Vec<RouteOpenApiEntry> {
     router
         .openapi_entries()

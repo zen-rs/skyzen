@@ -117,7 +117,7 @@ pub struct BuildPlan {
     pub optimize: bool,
 }
 
-impl crate::providers::ArtifactBuild for BuildPlan {
+impl crate::providers::Task for BuildPlan {
     /// A one-line description for progress output and `--dry-run`.
     fn describe(&self) -> String {
         format!(

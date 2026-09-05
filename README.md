@@ -48,6 +48,7 @@ async fn order(Path(id): Path<u64>, kv: Kv, db: Db) -> Result<Json<Order>> {
 - [Static Files & SPA Support](#static-files--spa-support)
 - [OpenAPI & Documentation](#openapi--documentation)
 - [Skyzen CLI](#skyzen-cli)
+- [GitHub Secrets and `.env`](#github-secrets-and-env)
 - [Crates Overview](#crates-overview)
 - [Guides & Examples](#guides--examples)
 - [License](#license)
@@ -834,13 +835,23 @@ async fn get_item(Path(id): Path<u64>) -> Result<Json<Item>> {
 
 fn router() -> Router {
     let routes = Route::new(("/items/{id}".get(get_item),));
-    let redoc = routes.openapi().redoc();     // interactive ReDoc page
-    Route::new((routes, "/docs".get(redoc))).build()
+    let docs = routes.openapi().scalar_route("/docs"); // interactive Scalar page
+    Route::new((routes, docs)).build()
 }
 ```
 
-*Schema generation is gated to debug builds and native targets, so release binaries and edge wasm
-bundles stay small.*
+`Route::enable_api_doc()` mounts the same Scalar UI at `/api-docs`. `.redoc()` / `.redoc_route()` remain available if you want Redoc instead.
+
+The document is the same on every target — a native server, Lambda, Azure Functions and a
+Cloudflare Worker all serve what `#[skyzen::openapi]` collected, in release as in debug. The
+`openapi` cargo feature is the only switch, and it is on by default; a bundle that has no use for a
+schema turns it off with `skyzen = { version = "0.2", default-features = false, features = [...] }`
+and pays for nothing — no specs, no schema functions, no registration.
+
+*How the metadata is collected differs by target, and only in cost. Natively it is linker-section
+data, so nothing runs before `main`. WebAssembly has no such linker support, so there it rides one
+life-before-main constructor per documented handler — a few pointer pushes at isolate start, paid
+only on the edge. See `src/openapi/registry.rs`.*
 
 ---
 
@@ -859,6 +870,8 @@ skyzen add redis postgres             # `cargo add` the crates a capability need
 skyzen doctor                         # toolchain, wasm target, manifest, bindings, auth
 skyzen dev                            # native, restarts on change
 skyzen dev --provider cloudflare      # workerd, rebuilding the wasm on change
+skyzen openapi                        # open the API reference in a browser
+skyzen openapi --print                # the raw document, for a client generator
 skyzen build --provider cloudflare    # artifacts only; prints raw and gzipped wasm size
 skyzen provision                      # create the KV/D1 resources the manifest has no id for
 skyzen migrate                        # apply pending SQL migrations
@@ -866,11 +879,119 @@ skyzen migrate status                 # what is applied, what is pending
 skyzen deploy --provider cloudflare   # or aws, or azure — same application, no code changes
 skyzen logs --env staging             # stream the deployed application's logs
 skyzen secret set API_KEY             # value read from stdin
+skyzen secret push                    # deliver every declared [[secret]]
 skyzen completions fish
 ```
 
 `--env <name>` selects a `[cloudflare.env.<name>]` overlay, `--dry-run` prints the plan without
 running it, and `--manifest` points at a `Skyzen.toml` elsewhere.
+
+### `skyzen openapi`
+
+Only the compiled application knows what `#[skyzen::openapi]` collected, so the document comes from
+running it: `SKYZEN_OPENAPI_DUMP` makes a Skyzen binary print its document and exit. That happens
+*before* it wires any service, which is what makes the command cheap to reach for — it needs no
+credentials, no reachable backend and no complete `.env`, and works in a project whose resources are
+not provisioned yet. It also never leaves a server running: the page is a local file, and Scalar
+renders an embedded document as happily as a fetched one.
+
+```sh
+skyzen openapi                  # render .skyzen/gen/openapi.html and open it
+skyzen openapi --json api.json  # write the document there, no browser
+skyzen openapi --print          # the document on stdout, for `| jq` or a generator
+skyzen openapi --no-open        # render the page, print its path
+```
+
+The rendered page loads Scalar from jsDelivr, so it wants a network; `--json` and `--print` do not.
+
+A document is titled after the application, and you pass nothing to get that. Skyzen cannot read
+`CARGO_PKG_NAME` on your behalf — `env!` expands where it is *written*, so asking inside skyzen would
+name skyzen in everyone's document — but `#[skyzen::main]` expands in *your* crate, so it registers
+your identity there, the same way `#[skyzen::openapi]` registers a handler. Nothing has to carry a
+name through the routing API:
+
+```rust
+Route::new((/* ... */))
+    .enable_api_doc()   // Scalar at /api-docs, titled after your crate
+    .build();
+
+// mounted where you choose, alongside the raw document for a client generator
+let docs = api.openapi();
+Route::new((api, docs.scalar_route("/docs"), docs.json_route("/openapi.json"))).build()
+```
+
+Override it with `OpenApi::with_info` when the API's public name is not the crate's — `orders-service`
+the crate, "Orders API" the product.
+
+---
+
+## GitHub Secrets and `.env`
+
+Values that must not live in git go in `.env` locally and in GitHub Actions secrets in CI. The CLI
+reads them when it loads `Skyzen.toml`; `#[skyzen::main]` does not, so `cargo build` never depends
+on a secret the compiler does not have.
+
+There are three different environments. They are not interchangeable:
+
+| Where | What it is |
+|---|---|
+| `url_env = "CACHE_URL"` | The **name** of a variable the native process reads after it starts |
+| `id = "${CACHE_NAMESPACE_ID}"` | A **deploy-time** placeholder. The CLI expands it before generating `wrangler.toml` |
+| `[[secret]] name = "API_KEY"` | A **portable secret**. `skyzen deploy` delivers it, and `import_config!` generates the `ApiKey` type a handler asks for. `[cloudflare.vars]` is plaintext and committed; do not put credentials there |
+
+### GitHub Actions
+
+Skyzen does not need a workflow that maps every secret into individual `env:` variables. Keep the
+same file you use locally in **one** repository secret, write it onto the runner, and deploy:
+
+```yaml
+name: Deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Skyzen CLI
+        run: cargo install skyzen-cli
+
+      - name: Write environment file
+        run: printf '%s\n' "$DEPLOY_ENV" > .env
+        env:
+          DEPLOY_ENV: ${{ secrets.DEPLOY_ENV }}
+
+      - name: Deploy to Cloudflare
+        run: skyzen deploy --provider cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+```
+
+`DEPLOY_ENV` is the body of `.env` (multi-line), not a single key. `CLOUDFLARE_API_TOKEN` is
+wrangler's own credential rather than one of the application's: export it in the job's `env:`.
+
+To target a named environment overlay (e.g. `[cloudflare.env.staging]`), pair GitHub Actions
+Environments with the `--env` flag:
+
+```yaml
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      # ... checkout, toolchain, install CLI, write .env ...
+      - run: skyzen deploy --provider cloudflare --env staging
+```
+
+Declaring a secret, where a value is looked up, what each provider delivers and what the CLI
+refuses to load are all in [Secrets](docs/skyzen-toml-reference.md#secrets) and
+[Deploy-time interpolation](docs/skyzen-toml-reference.md#deploy-time-interpolation).
 
 ---
 
@@ -879,8 +1000,8 @@ running it, and `--manifest` points at a `Skyzen.toml` elsewhere.
 | Crate | Path | Description |
 |---|---|---|
 | [`skyzen`](.) | Root | Routing, extractors, responders, middleware, static files, WebSockets, runtime |
-| [`skyzen-core`](core/) | `core/` | `Extractor`, `Responder`, `Middleware`, `Server`, the error types; `no_std`-capable |
-| [`skyzen-macros`](macros/) | `macros/` | `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::test]`, `embed_migrations!`, … |
+| [`skyzen-core`](core/) | `core/` | `Extractor`, `Responder`, `Middleware`, `Server`, `Secret`, the error types; `no_std`-capable |
+| [`skyzen-macros`](macros/) | `macros/` | `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::test]`, `import_config!` (services, databases and `[[secret]]` types), `embed_migrations!`, … |
 | [`skyzen-manifest`](manifest/) | `manifest/` | The one typed `Skyzen.toml` schema, shared by the macros and the CLI |
 | [`skyzen-services`](services/) | `services/` | The portable capabilities: `Kv`, `Storage`, `Queue`, `Db`, migrations, durable variants |
 | [`skyzen-test`](test/) | `test/` | `TestClient`, `TestContext`, in-memory backends, assertions, `insta` snapshots |
@@ -888,11 +1009,11 @@ running it, and `--manifest` points at a `Skyzen.toml` elsewhere.
 | [`skyzen-lambda`](lambda/) | `lambda/` | AWS Lambda adapter — HTTP invocations and SQS batches (root crate's `lambda` feature) |
 | [`skyzen-redis`](redis/) | `redis/` | Redis `KeyValueStore` |
 | [`skyzen-s3`](s3/) | `s3/` | S3-compatible `ObjectStorage` |
-| [`skyzen-cloudflare`](cloudflare/) | `cloudflare/` | Workers KV, R2, Queues, D1, Durable Objects, secrets store, `request.cf` (*wasm32 only*) |
-| [`skyzen-cloudflare-admin`](cloudflare-admin/) | `cloudflare-admin/` | Cloudflare REST client, used by `skyzen provision` |
+| [`skyzen-cloudflare`](cloudflare/) | `cloudflare/` | Workers KV, R2, Queues, D1, Durable Objects, `CfSecret`, `request.cf` (*wasm32 only*) |
+| [`skyzen-cloudflare-admin`](cloudflare-admin/) | `cloudflare-admin/` | Shared Cloudflare API response envelopes and token-source types for tools that call the control-plane API |
 | [`skyzen-aws`](aws/) | `aws/` | `DynamoKv`, `SqsQueue`, `RdsDataDb`, and `S3Storage` re-exported |
 | [`skyzen-azure`](azure/) | `azure/` | `CosmosKv`, `AzureBlob`, `ServiceBusQueue`, `AzureStorageQueue`, `AzureSqlDb` |
-| [`skyzen-cli`](cli/) | `cli/` | The `skyzen` binary: scaffolding, local emulation, provisioning, migrations, deployment |
+| [`skyzen-cli`](cli/) | `cli/` | The `skyzen` binary: scaffolding, local emulation, provisioning, migrations, secret delivery, deployment |
 
 ---
 

@@ -1,8 +1,11 @@
 //! Keep local secret files out of git.
 //!
-//! `.env`, `.env.local` and wrangler's `.dev.vars` hold credentials. Scaffolded `.gitignore`
-//! lists them; this module fails the CLI load when git is already tracking one (a 100% leak)
-//! and warns when a path is not ignored (`git add .` would stage it).
+//! `.env` and `.env.local` hold credentials. Scaffolded `.gitignore` lists them; this module
+//! fails the CLI load when git is already tracking one (a 100% leak) and warns when a path is not
+//! ignored (`git add .` would stage it).
+//!
+//! Not `.dev.vars`: it is generated into `.skyzen/gen/`, which is ignored whole, and nothing puts
+//! one in the project root any more.
 
 use anyhow::Result;
 use std::{
@@ -11,7 +14,7 @@ use std::{
 };
 
 /// Files that must not be committed.
-pub const SECRET_FILES: &[&str] = &[".env", ".env.local", ".dev.vars"];
+pub const SECRET_FILES: &[&str] = &[".env", ".env.local"];
 
 /// Inspect `root` for secret files git would commit.
 ///
@@ -107,11 +110,7 @@ mod tests {
     fn a_gitignored_env_file_is_ok() {
         let dir = tempfile::tempdir().expect("temp dir");
         git_init(dir.path());
-        fs::write(
-            dir.path().join(".gitignore"),
-            ".env\n.env.local\n.dev.vars\n",
-        )
-        .expect("gitignore");
+        fs::write(dir.path().join(".gitignore"), ".env\n.env.local\n").expect("gitignore");
         fs::write(dir.path().join(".env"), "TOKEN=aaaa\n").expect("write");
         let warnings = ensure(dir.path()).expect("ignored");
         assert!(warnings.is_empty(), "{warnings:?}");

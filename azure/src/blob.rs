@@ -983,7 +983,7 @@ mod tests {
             .expect("an account key should sign");
 
         assert_eq!(request.method, http::Method::GET);
-        assert!(request.headers.is_empty());
+        assert!(request.headers.is_empty(), "{:?}", request.headers);
         assert!(request.url.contains("sig="), "{}", request.url);
     }
 }

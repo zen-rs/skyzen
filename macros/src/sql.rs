@@ -307,7 +307,7 @@ mod tests {
     fn doubled_braces_are_literal_text() {
         let (sql, captures) = split("SELECT '{{\"kind\":\"email\"}}'::jsonb");
         assert_eq!(sql, "SELECT '{\"kind\":\"email\"}'::jsonb");
-        assert!(captures.is_empty());
+        assert_eq!(captures, Vec::<String>::new());
     }
 
     #[test]

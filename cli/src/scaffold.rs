@@ -17,7 +17,6 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
-use time::{macros::format_description, OffsetDateTime};
 
 /// The values every scaffold template substitutes.
 #[derive(Debug)]
@@ -262,6 +261,24 @@ pub struct ScaffoldRequest<'a> {
     pub install_dependencies: bool,
 }
 
+/// The Workers compatibility date `skyzen new` writes into a generated project.
+///
+/// Pinned, not "today". `workerd` refuses any date newer than the one its own binary knows, so
+/// stamping `now_utc()` here made a freshly scaffolded project fail the first time it ran unless
+/// the user's wrangler happened to be released that same day — on the `skyzen new` → `skyzen dev`
+/// path, with an error naming wrangler's binary rather than the file skyzen wrote.
+///
+/// This is the newest date the wrangler generation this CLI targets is known to accept: wrangler
+/// 4.110.0's `workerd` reports it as the newest it supports. Bump it alongside a release, exactly
+/// as `wasm-bindgen` is pinned to the generator this binary embeds — the same class of value, and
+/// the same reason for pinning it.
+///
+/// A fixed date is also the more honest semantic. `compatibility_date` records the behaviour a
+/// project was *written against*, not the day its skeleton happened to be generated; deriving it
+/// from the clock additionally meant two `skyzen new` runs on different days produced different
+/// projects from identical inputs.
+pub const COMPATIBILITY_DATE: &str = "2026-07-15";
+
 /// Generate a project.
 ///
 /// # Errors
@@ -277,9 +294,7 @@ pub fn create_project(request: &ScaffoldRequest<'_>) -> Result<()> {
     let ctx = ScaffoldContext {
         worker_name: package_name.replace('_', "-"),
         package_name,
-        compatibility_date: OffsetDateTime::now_utc()
-            .format(&format_description!("[year]-[month]-[day]"))
-            .context("failed to format the Workers compatibility date")?,
+        compatibility_date: COMPATIBILITY_DATE.to_owned(),
         wasm_bindgen_version: embedded_wasm_bindgen_version(),
     };
 

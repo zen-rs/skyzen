@@ -12,12 +12,161 @@
 //! rejected where it is written rather than ignored: `backend = "memory"` with a stray `url_env`
 //! is a parse error, and a required key is missing at parse time rather than at macro expansion.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
+    ffi::OsStr,
+    fmt::{Display, Formatter},
     num::{NonZeroU32, NonZeroUsize},
+    str::FromStr,
     time::Duration,
 };
+
+/// The name of an environment variable, validated as `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// Every place the manifest names a variable — a `[[secret]]`, a wiring's `url_env` — holds one of
+/// these rather than a `String`, so the name a consumer reads is a name an operating system will
+/// accept. It is also what rejects `url_env = "${FOO}"`: deploy-time interpolation expands the
+/// *CLI's* view of the document, while `#[skyzen::main]` bakes in the text as written, so a
+/// placeholder in a variable name is two consumers disagreeing about what the variable is called.
+/// The rule catches it at parse time instead, naming the key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct VarName(Cow<'static, str>);
+
+impl VarName {
+    /// A name written as a literal, checked while the constant is evaluated.
+    ///
+    /// An invalid literal is a compile error rather than a startup panic:
+    ///
+    /// ```compile_fail
+    /// const BAD: skyzen_manifest::VarName = skyzen_manifest::VarName::from_static("bad-name");
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// When `name` is not `[A-Za-z_][A-Za-z0-9_]*`. In a `const` or `static` — the only place this
+    /// constructor is meant to be used — that panic is a build failure.
+    #[must_use]
+    pub const fn from_static(name: &'static str) -> Self {
+        assert!(
+            Self::is_valid(name),
+            "an environment variable name must match [A-Za-z_][A-Za-z0-9_]*"
+        );
+        Self(Cow::Borrowed(name))
+    }
+
+    /// The name as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `name` is a well-formed environment variable name.
+    ///
+    /// The one implementation of the rule: the schema validates names with it, the interpolator
+    /// validates `${NAME}` with it, and the secret scanner recognizes a placeholder with it.
+    pub(crate) const fn is_valid(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() {
+            return false;
+        }
+        if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+            return false;
+        }
+        let mut index = 1;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if !(byte.is_ascii_alphanumeric() || byte == b'_') {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+}
+
+/// A string that is not a well-formed environment variable name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "`{name}` is not an environment variable name: it must match [A-Za-z_][A-Za-z0-9_]*. A \
+     `${{NAME}}` placeholder cannot be used here — the compile-time reader does not expand it, so \
+     the variable the application reads and the one the CLI checks would be different."
+)]
+pub struct InvalidVarName {
+    /// The rejected text.
+    pub name: String,
+}
+
+impl TryFrom<String> for VarName {
+    type Error = InvalidVarName;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if Self::is_valid(&name) {
+            Ok(Self(Cow::Owned(name)))
+        } else {
+            Err(InvalidVarName { name })
+        }
+    }
+}
+
+impl FromStr for VarName {
+    type Err = InvalidVarName;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::try_from(name.to_owned())
+    }
+}
+
+impl Display for VarName {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for VarName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<OsStr> for VarName {
+    fn as_ref(&self) -> &OsStr {
+        OsStr::new(self.as_str())
+    }
+}
+
+impl PartialEq<str> for VarName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for VarName {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl Serialize for VarName {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// The manifest tables whose keys are **plaintext** platform variables, not secrets.
+///
+/// A key here is uploaded as written and is visible in the provider's console, which is why a
+/// `[[secret]]` may not also be one of them and why the secret scanner warns about a secret-named
+/// key in one. Written once so the schema rule and the scanner cannot disagree about the list.
+pub const PLAINTEXT_VARIABLE_TABLES: &[&str] = &[CLOUDFLARE_VARS_TABLE, AWS_ENV_TABLE];
+
+/// `[cloudflare.vars]`, as an overlay-free TOML path.
+pub const CLOUDFLARE_VARS_TABLE: &str = "cloudflare.vars";
+
+/// `[aws.env]`, as a TOML path.
+pub const AWS_ENV_TABLE: &str = "aws.env";
 
 /// A parsed `Skyzen.toml` document.
 ///
@@ -35,6 +184,9 @@ pub struct SkyzenManifest {
     /// `[[database]]` — logical portable SQL databases.
     #[serde(default)]
     pub database: Vec<DatabaseEntry>,
+    /// `[[secret]]` — values delivered to the deployed application at runtime.
+    #[serde(default)]
+    pub secret: Vec<SecretEntry>,
     /// `[native]` — how the portable capabilities are backed on native targets.
     #[serde(default)]
     pub native: Option<NativeSection>,
@@ -58,6 +210,19 @@ pub struct ServiceEntry {
     /// Which portable service trait this entry provides.
     #[serde(rename = "type")]
     pub service_type: ServiceType,
+}
+
+/// One `[[secret]]` entry — a value the deployment delivers to the running application.
+///
+/// One portable concept per target: the name is the environment variable a native, Lambda or
+/// Functions process reads, and the binding name a Worker resolves. `[cloudflare.secret.<NAME>]`
+/// backs one with a Secrets Store entry instead of a classic Worker secret; the name is the same
+/// either way, so nothing in the application knows which it got.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretEntry {
+    /// The secret's name, which is also the name the application reads it under.
+    pub name: VarName,
 }
 
 /// The portable service kinds a `[[service]]` entry can declare.
@@ -218,14 +383,14 @@ const fn default_retry_delay() -> Duration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WiringEnvVar<'a> {
     /// The variable's name.
-    pub name: &'a str,
+    pub name: &'a VarName,
     /// The manifest key that named it, when the wiring chooses the name.
     pub key: Option<&'static str>,
 }
 
 impl<'a> WiringEnvVar<'a> {
     /// A variable the manifest names through `key`.
-    const fn declared(key: &'static str, name: &'a str) -> Self {
+    const fn declared(key: &'static str, name: &'a VarName) -> Self {
         Self {
             name,
             key: Some(key),
@@ -233,28 +398,28 @@ impl<'a> WiringEnvVar<'a> {
     }
 
     /// A variable the backend's constructor fixes the name of.
-    const fn fixed(name: &'static str) -> Self {
+    const fn fixed(name: &'static VarName) -> Self {
         Self { name, key: None }
     }
 }
 
 /// The account endpoint `CosmosKv::from_env` reads. Fixed by that constructor, which is the only
 /// public one that authenticates with an account key.
-const COSMOS_ENDPOINT_ENV: &str = "AZURE_COSMOS_ENDPOINT";
+static COSMOS_ENDPOINT_ENV: VarName = VarName::from_static("AZURE_COSMOS_ENDPOINT");
 
 /// The account key `CosmosKv::from_env` reads.
-const COSMOS_KEY_ENV: &str = "AZURE_COSMOS_KEY";
+static COSMOS_KEY_ENV: VarName = VarName::from_static("AZURE_COSMOS_KEY");
 
 /// The four variables `RdsDataDb::from_env` reads, in the order that constructor reads them.
 ///
 /// Read only by the wiring that names none of the four values itself; one that names all four is
 /// built through `RdsDataDb::from_parts` and reads nothing. Their names are fixed by the
 /// constructor, so a wiring can replace them wholesale but cannot rename them.
-const RDS_ENV_VARS: [&str; 4] = [
-    "RDS_RESOURCE_ARN",
-    "RDS_SECRET_ARN",
-    "RDS_DATABASE",
-    "RDS_ENGINE",
+static RDS_ENV_VARS: [VarName; 4] = [
+    VarName::from_static("RDS_RESOURCE_ARN"),
+    VarName::from_static("RDS_SECRET_ARN"),
+    VarName::from_static("RDS_DATABASE"),
+    VarName::from_static("RDS_ENGINE"),
 ];
 
 /// The manifest keys an [`RdsDataWiring`] names its four values with, in the order they are
@@ -336,8 +501,8 @@ impl NativeServiceSection {
                 vec![WiringEnvVar::declared("sas_url_env", &wiring.sas_url_env)]
             }
             Self::Cosmos(_) => vec![
-                WiringEnvVar::fixed(COSMOS_ENDPOINT_ENV),
-                WiringEnvVar::fixed(COSMOS_KEY_ENV),
+                WiringEnvVar::fixed(&COSMOS_ENDPOINT_ENV),
+                WiringEnvVar::fixed(&COSMOS_KEY_ENV),
             ],
             Self::DynamoDb(_) | Self::Memory(_) => Vec::new(),
         }
@@ -349,7 +514,7 @@ impl NativeServiceSection {
 #[serde(deny_unknown_fields)]
 pub struct RedisWiring {
     /// Environment variable holding the connection URL (`redis://host:port`).
-    pub url_env: String,
+    pub url_env: VarName,
 }
 
 /// `backend = "dynamodb"`.
@@ -389,7 +554,7 @@ pub struct CosmosWiring {
 #[serde(deny_unknown_fields)]
 pub struct S3Wiring {
     /// Environment variable holding the bucket name.
-    pub bucket_env: String,
+    pub bucket_env: VarName,
 }
 
 /// `backend = "blob"`.
@@ -400,12 +565,12 @@ pub struct BlobWiring {
     pub container: String,
     /// Environment variable holding the storage account connection string.
     #[serde(default = "default_azure_storage_connection_env")]
-    pub connection_env: String,
+    pub connection_env: VarName,
 }
 
 /// The variable `AzureBlob::from_env` reads, and this wiring's default.
-fn default_azure_storage_connection_env() -> String {
-    "AZURE_STORAGE_CONNECTION_STRING".to_owned()
+const fn default_azure_storage_connection_env() -> VarName {
+    VarName::from_static("AZURE_STORAGE_CONNECTION_STRING")
 }
 
 /// `backend = "sqs"`.
@@ -414,7 +579,7 @@ fn default_azure_storage_connection_env() -> String {
 pub struct SqsWiring {
     /// Environment variable holding the queue URL. It must name a standard queue: a FIFO queue
     /// needs a message group on every send, and is wired in code with `SqsQueue::fifo`.
-    pub url_env: String,
+    pub url_env: VarName,
 }
 
 /// `backend = "servicebus"`.
@@ -425,12 +590,12 @@ pub struct ServiceBusWiring {
     pub queue: String,
     /// Environment variable holding the namespace's connection string.
     #[serde(default = "default_servicebus_connection_env")]
-    pub connection_env: String,
+    pub connection_env: VarName,
 }
 
 /// The variable `ServiceBusQueue::from_env` reads, and this wiring's default.
-fn default_servicebus_connection_env() -> String {
-    "SERVICEBUS_CONNECTION_STRING".to_owned()
+const fn default_servicebus_connection_env() -> VarName {
+    VarName::from_static("SERVICEBUS_CONNECTION_STRING")
 }
 
 /// `backend = "storage-queue"`.
@@ -441,7 +606,7 @@ pub struct StorageQueueWiring {
     ///
     /// The whole URL is the credential, which is why it is read from the environment rather than
     /// split into a queue name and a secret.
-    pub sas_url_env: String,
+    pub sas_url_env: VarName,
 }
 
 pub use fieldless::MemoryWiring;
@@ -718,7 +883,7 @@ impl NativeDatabaseSection {
     /// answers — the variable an `azure-sql` wiring names is still reported by
     /// [`env_vars`](Self::env_vars), so `skyzen dev` and `.env.example` cover it like any other.
     #[must_use]
-    pub fn url_env(&self) -> Option<&str> {
+    pub const fn url_env(&self) -> Option<&VarName> {
         match self {
             Self::Postgres(wiring) | Self::Mysql(wiring) | Self::Sqlite(wiring) => {
                 Some(&wiring.url_env)
@@ -744,7 +909,7 @@ impl NativeDatabaseSection {
             // somehow did, naming the variables is the answer that fails loudly rather than
             // starting an application with half its configuration missing.
             Self::RdsData(wiring) if matches!(wiring.parts(), Ok(Some(_))) => Vec::new(),
-            Self::RdsData(_) => RDS_ENV_VARS.map(WiringEnvVar::fixed).to_vec(),
+            Self::RdsData(_) => RDS_ENV_VARS.iter().map(WiringEnvVar::fixed).collect(),
         }
     }
 }
@@ -763,7 +928,7 @@ pub struct SqlUrlWiring {
     /// A connection URL for `postgres`, `mysql` and `sqlite`; the ADO.NET connection string for
     /// `azure-sql`, where `AZURE_SQL_CONNECTION_STRING` — the name `AzureSqlConfig::from_env`
     /// reads — is the conventional choice.
-    pub url_env: String,
+    pub url_env: VarName,
 }
 
 /// The native backends a portable database can be wired to.
@@ -875,9 +1040,10 @@ pub struct CloudflareSection {
     /// `[cloudflare.assets]` — static assets served alongside the Worker.
     #[serde(default)]
     pub assets: Option<CfAssets>,
-    /// `[[cloudflare.secrets_store_secrets]]`.
+    /// `[cloudflare.secret.<NAME>]` — the `[[secret]]` entries backed by a Secrets Store entry
+    /// rather than by a classic Worker secret, keyed by the secret's name.
     #[serde(default)]
-    pub secrets_store_secrets: Vec<CfSecretsStoreSecret>,
+    pub secret: BTreeMap<VarName, CloudflareSecretSection>,
     /// `[cloudflare.raw]` — an escape hatch merged verbatim into the generated `wrangler.toml`.
     ///
     /// Anything wrangler accepts but Skyzen does not model goes here. The table is deep-merged
@@ -1231,6 +1397,16 @@ pub struct AzureSection {
     /// The Function App to publish to, as `func azure functionapp publish` names it.
     #[serde(default)]
     pub app_name: Option<String>,
+    /// The Azure subscription the Function App lives in.
+    ///
+    /// Required by `skyzen deploy` and by every `skyzen secret` action: the application settings a
+    /// deployment delivers its runtime variables through are addressed by the resource's full ARM
+    /// id, which the Function App's name alone does not determine.
+    #[serde(default)]
+    pub subscription_id: Option<String>,
+    /// The resource group the Function App lives in, the second half of that ARM id.
+    #[serde(default)]
+    pub resource_group: Option<String>,
     /// The Rust target triple to build the handler for.
     ///
     /// A Function App runs Linux, so a handler built on macOS or Windows cannot be published as
@@ -1382,14 +1558,17 @@ impl AzureSection {
     }
 }
 
-/// One `[[cloudflare.secrets_store_secrets]]` entry.
+/// `[cloudflare.secret.<NAME>]` — one `[[secret]]` backed by Cloudflare Secrets Store.
+///
+/// The map key is the `[[secret]]` name, which is also the binding the Worker resolves; a secret
+/// with no section here is a classic Worker secret, pushed by `skyzen secret push`. A Secrets
+/// Store entry is externally managed: the deployment binds it, and only `skyzen secret set` writes
+/// its value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CfSecretsStoreSecret {
-    /// Binding name, as seen from `env`.
-    pub binding: String,
+pub struct CloudflareSecretSection {
     /// The secrets store the secret lives in.
     pub store_id: String,
-    /// The secret's name within that store.
+    /// The secret's name within that store, which need not match the binding.
     pub secret_name: String,
 }

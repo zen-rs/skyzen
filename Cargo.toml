@@ -83,6 +83,7 @@ http = "1.4"
 # crate happening to switch it on.
 utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 utoipa-redoc = "6.0"
+utoipa-scalar = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-tungstenite = { version = "0.33.0", optional = true }
@@ -134,6 +135,9 @@ futures-lite = "2.6"
 serial_test = "3.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# The wasm half of the OpenAPI handler registry; see `src/openapi/registry.rs` for why
+# native uses `linkme` and only wasm pays for `inventory`.
+inventory = "0.3"
 wasm-bindgen = { version = "0.2.110", features = ["spans"] }
 wasm-bindgen-futures = "0.4.60"
 js-sys = "0.3.87"
@@ -168,7 +172,7 @@ optional = true
 
 [features]
 default = ["json", "form", "query", "multipart", "sse", "rt", "openapi", "ws", "static-files", "runtime-async-std-native-tls"]
-openapi = ["skyzen-core/openapi"]
+openapi = ["skyzen-core/openapi", "skyzen-macros/openapi"]
 auth = []
 jwt = ["auth", "dep:jsonwebtoken"]
 json = ["http-kit/json"]

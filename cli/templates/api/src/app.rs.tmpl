@@ -23,6 +23,12 @@ async fn health() -> &'static str {
     "OK"
 }
 
+/// Greet a caller by name, remembering whether they have been greeted before.
+///
+/// `#[skyzen::openapi]` reads this doc comment, the extractor types and the responder type, and
+/// registers the operation the `/api-docs` page below renders. It costs nothing at runtime on a
+/// server and works the same inside a Worker isolate.
+///
 /// Skyzen.toml declares `[[service]] name = "cache"` and `[[database]] name = "journal"`, so
 /// `#[skyzen::main]` generates a `Cache` extractor around the portable `Kv`, a `JournalDb`
 /// extractor around the portable `Db`, and injects both into every request.
@@ -30,6 +36,7 @@ async fn health() -> &'static str {
 /// This handler is the whole point of the framework: it runs unchanged against the in-process mock
 /// and SQLite during `skyzen dev`, and against a Cloudflare KV namespace and a D1 database after
 /// `skyzen deploy`. Changing backends is a Skyzen.toml edit, never a code edit.
+#[skyzen::openapi]
 async fn greet(cache: Cache, journal: JournalDb, params: Params) -> Result<Json<Greeting>> {
     let name = params.get("name")?.to_owned();
     // `Cache` derefs to `Kv`, so every `Kv` method is reachable through it.
@@ -64,5 +71,9 @@ pub fn router() -> Router {
         "/health".at(health),
         "/greet".route(("/{name}".at(greet),)),
     ))
+    // Serves the interactive Scalar reference at `/api-docs`, built from whatever
+    // `#[skyzen::openapi]` documented, titled after this crate. `skyzen openapi` opens the same
+    // document without running a server.
+    .enable_api_doc()
     .build()
 }

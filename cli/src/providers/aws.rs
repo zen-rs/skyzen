@@ -7,13 +7,24 @@
 //!
 //! The application itself needs no AWS-specific code: built with the `lambda` feature, the same
 //! binary notices `AWS_LAMBDA_RUNTIME_API` and serves invocations instead of binding a port.
+//!
+//! The one thing `cargo lambda` is *not* asked to do is carry the function's environment: a
+//! `--env-var NAME=value` flag is printed by every progress line and visible in the process table,
+//! so the variables are delivered afterwards through the SDK instead. See [`lambda_env`].
+
+mod lambda_env;
 
 use crate::{
+    environment::VariableKind,
     output,
     project::Project,
-    providers::{prepare_child_environment, Action, CommandPlan, ProviderPlan, RunMode},
+    providers::{
+        prepare_child_environment, secrets::Delivery, Action, CommandPlan, CommandStdin,
+        ProviderPlan, RunMode, SecretAction, Step,
+    },
 };
 use anyhow::Result;
+use lambda_env::{LambdaEnvironment, LambdaEnvironmentNames};
 use skyzen_manifest::{AwsSection, Manifest};
 
 /// The feature the application must be built with for a Lambda deployment to serve anything.
@@ -29,23 +40,46 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
     let config = manifest.data().aws.clone().unwrap_or_default();
     let root_dir = manifest.root_dir().to_path_buf();
     let binary = project.binary_target_name()?.to_owned();
+    let function = function_name(&config, &binary);
 
     ensure_lambda_feature(project);
     if matches!(action, Action::Deploy) {
-        report_event_source(manifest, config.function_name.as_deref().unwrap_or(&binary));
+        report_event_source(manifest, &function);
     }
 
-    let commands = match action {
-        Action::Build { release } => vec![build_command(&config, &root_dir, *release)],
+    // `cargo lambda deploy` reads AWS credentials from the environment, and a `.env` entry the
+    // shell does not already hold is part of that environment.
+    let mut child_env = Vec::new();
+
+    let steps = match action {
+        Action::Build { release } => {
+            vec![Step::Command(build_command(&config, &root_dir, *release))]
+        }
         // A deploy always builds optimized first: `cargo lambda deploy` uploads whatever is in
         // `target/lambda`, so deploying without building would ship the previous build.
-        Action::Deploy => vec![
-            build_command(&config, &root_dir, true),
-            deploy_command(&config, &root_dir, &binary),
-        ],
-        Action::Logs { wrangler_args } => {
-            vec![logs_command(&config, &root_dir, &binary, wrangler_args)]
+        Action::Deploy => {
+            let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
+            child_env = prepared.child_env;
+            let mut steps = vec![
+                Step::Command(build_command(&config, &root_dir, true)),
+                Step::Command(deploy_command(&config, &root_dir, &binary)),
+            ];
+            let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
+            if !delivery.is_empty() {
+                steps.push(Step::Task(Box::new(LambdaEnvironment::new(
+                    function, delivery,
+                ))));
+            }
+            steps
         }
+        Action::Logs { wrangler_args } => {
+            vec![Step::Command(logs_command(
+                &root_dir,
+                &function,
+                wrangler_args,
+            ))]
+        }
+        Action::Secret(secret) => vec![secret_step(secret, manifest, &config, function)?],
         other => anyhow::bail!(
             "`skyzen {}` has no AWS implementation{}",
             super::action_name(other),
@@ -54,20 +88,62 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
     };
 
     Ok(ProviderPlan {
-        commands,
+        steps,
         generated_files: Vec::new(),
         build: None,
         run_mode: RunMode::Once,
-        // `cargo lambda deploy` reads AWS credentials from the environment, and the manifest's own
-        // declared variables are what the function will run with.
-        child_env: if matches!(action, Action::Deploy) {
-            prepare_child_environment(manifest)?
-        } else {
-            Vec::new()
-        },
+        child_env,
         watch_root: None,
         execute_despite_dry_run: false,
     })
+}
+
+/// The one step a `skyzen secret` action performs.
+///
+/// Every one of them is the same `UpdateFunctionConfiguration` call: Lambda has no secret store of
+/// its own, so a function's environment *is* where its values live, and delivering one is
+/// delivering all of them merged over what is already there.
+///
+/// # Errors
+///
+/// Fails when a declared variable is set nowhere, or when there is nothing at all to push.
+fn secret_step(
+    action: &SecretAction,
+    manifest: &Manifest,
+    config: &AwsSection,
+    function: String,
+) -> Result<Step> {
+    let delivery = match action {
+        SecretAction::Set { name, value } => Delivery::one(name.as_str(), value),
+        SecretAction::Push => {
+            let resolved = prepare_child_environment(manifest, VariableKind::ALL)?.resolved;
+            let delivery = Delivery::from_resolved(&resolved).with_defaults(&config.env);
+            if delivery.is_empty() {
+                anyhow::bail!(
+                    "there is nothing to push: Skyzen.toml declares no [[secret]], no native \
+                     wiring variable and no [aws.env] entry"
+                );
+            }
+            delivery
+        }
+        SecretAction::List => {
+            return Ok(Step::Task(Box::new(LambdaEnvironmentNames::new(function))))
+        }
+    };
+    Ok(Step::Task(Box::new(LambdaEnvironment::new(
+        function, delivery,
+    ))))
+}
+
+/// The function a deploy acts on: the manifest's name, or the binary's own.
+///
+/// The same rule `cargo lambda deploy` applies to the positional argument it is given, computed
+/// once so the upload, the log tail and the environment delivery cannot name different functions.
+fn function_name(config: &AwsSection, binary: &str) -> String {
+    config
+        .function_name
+        .clone()
+        .unwrap_or_else(|| binary.to_owned())
 }
 
 /// What to suggest when an action has no AWS counterpart.
@@ -75,10 +151,6 @@ const fn unsupported_hint(action: &Action) -> &'static str {
     match action {
         Action::Dev { .. } => {
             ": run it as an ordinary server with `skyzen dev`, or invoke it with `cargo lambda watch`"
-        }
-        Action::Secret(_) => {
-            ": Lambda has no secret store of its own — put values in [aws.env], or read them from \
-             Secrets Manager or SSM at startup"
         }
         Action::Migrate { .. } => {
             ": point `skyzen migrate` at the database directly rather than through the function"
@@ -109,10 +181,11 @@ fn build_command(config: &AwsSection, root_dir: &std::path::Path, release: bool)
         program: "cargo".to_owned(),
         args,
         cwd: Some(root_dir.to_path_buf()),
+        stdin: CommandStdin::Inherit,
     }
 }
 
-/// `cargo lambda deploy`, carrying the sizing, environment and URL the manifest declares.
+/// `cargo lambda deploy`, carrying the sizing and the URL the manifest declares.
 fn deploy_command(config: &AwsSection, root_dir: &std::path::Path, binary: &str) -> CommandPlan {
     let mut args = vec!["lambda".to_owned(), "deploy".to_owned()];
 
@@ -127,10 +200,8 @@ fn deploy_command(config: &AwsSection, root_dir: &std::path::Path, binary: &str)
         args.push("--timeout".to_owned());
         args.push(timeout.as_secs().to_string());
     }
-    for (key, value) in &config.env {
-        args.push("--env-var".to_owned());
-        args.push(format!("{key}={value}"));
-    }
+    // No `--env-var`: `[aws.env]` and every declared variable are delivered by the SDK step that
+    // follows, so no value reaches this command line.
     // Named in both directions: turning `url` off should *remove* the URL rather than leave the
     // one an earlier deploy created still serving the internet.
     args.push(
@@ -152,6 +223,7 @@ fn deploy_command(config: &AwsSection, root_dir: &std::path::Path, binary: &str)
         program: "cargo".to_owned(),
         args,
         cwd: Some(root_dir.to_path_buf()),
+        stdin: CommandStdin::Inherit,
     }
 }
 
@@ -159,13 +231,7 @@ fn deploy_command(config: &AwsSection, root_dir: &std::path::Path, binary: &str)
 ///
 /// `cargo lambda` has no `logs` subcommand — it covers building, deploying and invoking — so this
 /// is the AWS CLI's log tail against the log group Lambda creates for the function.
-fn logs_command(
-    config: &AwsSection,
-    root_dir: &std::path::Path,
-    binary: &str,
-    extra: &[String],
-) -> CommandPlan {
-    let function = config.function_name.as_deref().unwrap_or(binary);
+fn logs_command(root_dir: &std::path::Path, function: &str, extra: &[String]) -> CommandPlan {
     let mut args = vec![
         "logs".to_owned(),
         "tail".to_owned(),
@@ -178,6 +244,7 @@ fn logs_command(
         program: "aws".to_owned(),
         args,
         cwd: Some(root_dir.to_path_buf()),
+        stdin: CommandStdin::Inherit,
     }
 }
 
@@ -199,6 +266,10 @@ fn ensure_lambda_feature(project: &Project) {
 
 /// Report what `skyzen doctor --provider aws` can tell from the manifest alone.
 pub fn check_manifest(manifest: &Manifest) -> usize {
+    // The Lambda binary is the native binary, so a deploy delivers both kinds — and, unlike
+    // `[aws.env]`, they have to have a value here for the deploy to run at all.
+    super::report_runtime_variables(manifest, VariableKind::ALL, "aws", "skyzen deploy");
+
     let Some(config) = manifest.data().aws.as_ref() else {
         output::warn("Skyzen.toml has no [aws] section; the defaults deploy an arm64 function with a Function URL");
         return 0;
@@ -257,8 +328,9 @@ fn event_source_hint(function: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{event_source_hint, prepare};
-    use crate::providers::{Action, CommandPlan};
-    use skyzen_manifest::Manifest;
+    use crate::providers::{Action, SecretAction, Step};
+    use secrecy::SecretString;
+    use skyzen_manifest::{Manifest, VarName};
 
     fn manifest(source: &str) -> Manifest {
         Manifest::parse(source, "Skyzen.toml", "/tmp/app").expect("valid manifest")
@@ -273,9 +345,9 @@ mod tests {
     fn planned(action: &Action, source: &str) -> Vec<String> {
         prepare(action, &manifest(source), &project())
             .expect("plan")
-            .commands
+            .steps
             .iter()
-            .map(CommandPlan::display)
+            .map(Step::describe)
             .collect()
     }
 
@@ -307,7 +379,7 @@ mod tests {
              [aws.env]\nRUST_LOG = \"info\"\n",
         );
 
-        assert_eq!(planned.len(), 2, "{planned:?}");
+        assert_eq!(planned.len(), 3, "{planned:?}");
         assert!(planned[0].contains("cargo lambda build"), "{planned:?}");
 
         let deploy = &planned[1];
@@ -316,9 +388,118 @@ mod tests {
         assert!(deploy.contains("--memory 512"), "{deploy}");
         // humantime in, seconds out: that is the unit Lambda takes.
         assert!(deploy.contains("--timeout 45"), "{deploy}");
-        assert!(deploy.contains("--env-var RUST_LOG=info"), "{deploy}");
         assert!(deploy.contains("--enable-function-url"), "{deploy}");
         assert!(deploy.ends_with("skyzen-api)"), "{deploy}");
+    }
+
+    #[test]
+    fn nothing_a_deploy_runs_carries_a_value_on_its_command_line() {
+        // The whole reason `[aws.env]` no longer reaches `cargo lambda deploy`: its command line
+        // is printed by every progress line and by `--dry-run`, and is visible in the process
+        // table of whatever machine runs the deploy.
+        let planned = planned(&Action::Deploy, "[aws]\n\n[aws.env]\nRUST_LOG = \"info\"\n");
+
+        for step in &planned {
+            assert!(!step.contains("--env-var"), "{planned:?}");
+            assert!(!step.contains("info"), "{planned:?}");
+        }
+    }
+
+    #[test]
+    fn a_deploy_ends_by_delivering_the_variables_it_names_and_no_values() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join(".env"), "STRIPE_KEY=sk_live_123\n").expect("write .env");
+        let manifest = Manifest::parse(
+            "[[secret]]\nname = \"STRIPE_KEY\"\n\n[aws]\nfunction_name = \"skyzen-api\"\n\n\
+             [aws.env]\nRUST_LOG = \"info\"\n",
+            dir.path().join("Skyzen.toml"),
+            dir.path(),
+        )
+        .expect("valid manifest");
+
+        let plan = prepare(&Action::Deploy, &manifest, &project()).expect("plan");
+        let last = plan
+            .steps
+            .last()
+            .expect("a deploy delivers its environment");
+        let described = last.describe();
+
+        assert!(matches!(last, Step::Task(_)), "{described}");
+        assert!(described.contains("skyzen-api"), "{described}");
+        assert!(described.contains("RUST_LOG"), "{described}");
+        assert!(described.contains("STRIPE_KEY"), "{described}");
+        assert!(!described.contains("sk_live_123"), "{described}");
+        assert!(!described.contains("info"), "{described}");
+    }
+
+    #[test]
+    fn a_deploy_refuses_when_a_declared_variable_is_set_nowhere() {
+        let error = prepare(
+            &Action::Deploy,
+            &manifest(
+                "[[secret]]\nname = \"SKYZEN_TEST_AWS_UNSET_SECRET\"\n\n\
+                 [[service]]\nname = \"cache\"\ntype = \"kv\"\n\n\
+                 [native.service.cache]\nbackend = \"redis\"\n\
+                 url_env = \"SKYZEN_TEST_AWS_UNSET_URL\"\n",
+            ),
+            &project(),
+        )
+        .expect_err("the deployed function would panic at cold start");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("SKYZEN_TEST_AWS_UNSET_SECRET"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("SKYZEN_TEST_AWS_UNSET_URL"), "{rendered}");
+    }
+
+    #[test]
+    fn setting_one_secret_delivers_that_pair_and_names_no_value() {
+        let plan = prepare(
+            &Action::Secret(SecretAction::Set {
+                name: VarName::try_from("STRIPE_KEY".to_owned()).expect("a name"),
+                value: SecretString::from("sk_live_123"),
+            }),
+            &manifest(
+                "[[secret]]\nname = \"STRIPE_KEY\"\n\n[aws]\nfunction_name = \"skyzen-api\"\n",
+            ),
+            &project(),
+        )
+        .expect("plan");
+
+        let described = plan.steps[0].describe();
+        assert!(described.contains("STRIPE_KEY"), "{described}");
+        assert!(described.contains("skyzen-api"), "{described}");
+        assert!(!described.contains("sk_live_123"), "{described}");
+    }
+
+    #[test]
+    fn listing_reads_the_deployed_functions_own_environment() {
+        let plan = prepare(
+            &Action::Secret(SecretAction::List),
+            &manifest("[aws]\nfunction_name = \"skyzen-api\"\n"),
+            &project(),
+        )
+        .expect("plan");
+
+        assert!(
+            plan.steps[0].describe().contains("skyzen-api"),
+            "{:?}",
+            plan.steps[0]
+        );
+    }
+
+    #[test]
+    fn pushing_with_nothing_declared_says_so_rather_than_calling_aws() {
+        let error = prepare(
+            &Action::Secret(SecretAction::Push),
+            &manifest("[aws]\n"),
+            &project(),
+        )
+        .expect_err("there is nothing to deliver");
+
+        assert!(format!("{error:#}").contains("nothing to push"), "{error}");
     }
 
     #[test]
