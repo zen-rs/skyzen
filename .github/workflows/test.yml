@@ -45,8 +45,10 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace ${{ matrix.targets }} ${{ matrix.features }} -- -D warnings
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Run tests
-        run: cargo test --workspace ${{ matrix.targets }} ${{ matrix.features }}
+        run: cargo nextest run --workspace ${{ matrix.targets }} ${{ matrix.features }}
 
   wasm-build:
     name: WASM Build Check
