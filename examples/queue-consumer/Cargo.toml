@@ -21,6 +21,10 @@ serde = { version = "1", features = ["derive"] }
 utoipa = "5"
 tracing = "0.1"
 
+[package.metadata.dist]
+# A runnable example, not a published binary: never a dist announcement target.
+dist = false
+
 [package.metadata.cargo-machete]
 # `utoipa` is reached only through what `#[derive(ToSchema)]` EXPANDS to — `::utoipa::…` paths —
 # so no source line names the crate and machete cannot see the use. The dependency is load-bearing
