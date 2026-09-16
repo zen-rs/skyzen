@@ -12,6 +12,9 @@ jobs:
       contents: write
       pull-requests: read
       id-token: write
+      # The dispatch below creates a workflow_dispatch on binaries.yml; tag
+      # pushes made under GITHUB_TOKEN do not cascade-trigger it on their own.
+      actions: write
     concurrency:
       group: release-plz-release
       cancel-in-progress: false
@@ -32,11 +35,25 @@ jobs:
         id: crates-io-auth
       - name: Publish releases
         uses: release-plz/action@v0.5
+        id: release-plz
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+      # A `skyzen-cli` release needs its cargo-dist binaries built on the tag
+      # release-plz just pushed; GITHUB_TOKEN tag pushes do not trigger
+      # binaries.yml, so dispatch it explicitly.
+      - name: Dispatch binary builds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          echo "${RELEASES:-[]}" | jq -r '.[] | select(.package_name == "skyzen-cli") | .tag // ("skyzen-cli-v" + .version)' |
+          while read -r tag; do
+            gh workflow run binaries.yml -f "tag=$tag"
+          done
 
   release-pr:
     name: Prepare release pull request
