@@ -197,6 +197,13 @@ version = "0.2.16"
 optional = true
 
 
+# The worker example exports a Durable Object, and `#[skyzen::durable_object]` expands to the
+# Cloudflare class wrapper, which lives in `skyzen-cloudflare`. A dev-dependency is the one
+# direction the cycle is allowed in: the platform crate depends on this one, and only the
+# example reaches back.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+skyzen-cloudflare = { path = "cloudflare" }
+
 [features]
 default = ["json", "form", "query", "multipart", "sse", "rt", "openapi", "ws", "static-files", "runtime-async-std-native-tls"]
 openapi = ["skyzen-core/openapi", "skyzen-macros/openapi"]

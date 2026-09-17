@@ -719,7 +719,7 @@ use skyzen_services::durable::DurableDb;
 struct ChatRoom;
 
 impl DurableObject for ChatRoom {
-    fn fetch(&mut self) -> Router {
+    fn fetch(&self) -> Router {
         Route::new(("/messages".get(get_messages),)).build()
     }
 }

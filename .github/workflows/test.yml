@@ -134,6 +134,15 @@ jobs:
           cf=$(curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/where-am-i)
           echo "request.cf decoded as: $cf"
           echo "$cf" | grep -q '^colo='
+          # Exercises a Durable Object against the real runtime. The object counts the events
+          # it has seen in memory (`PERSIST = false`, nothing stored), so the count climbing
+          # across three requests to one name proves the runtime keeps one object per instance
+          # and delivers every event to it, and a fresh name starting at one proves the count
+          # is the instance's rather than the isolate's.
+          for expected in 1 2 3; do
+            curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/visits/lobby | grep -x "$expected"
+          done
+          curl -sSf http://127.0.0.1:8787/visits/annex | grep -x 1
 
       - name: Shutdown wrangler
         if: always()
