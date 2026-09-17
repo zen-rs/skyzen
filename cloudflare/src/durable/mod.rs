@@ -38,10 +38,7 @@ pub mod state;
 pub mod websocket;
 
 pub use alarm::CfAlarm;
-pub use glue::{
-    invoke_alarm, invoke_websocket_close, invoke_websocket_error, invoke_websocket_message,
-    DurableObjectRuntime,
-};
+pub use glue::DurableObjectRuntime;
 pub use kv::{CfDurableKv, DurableWriteOptions};
 pub use namespace::{CfDurableNamespace, CfDurableObjectStub, CfJurisdiction};
 pub use sql::{CfDurableDb, CfSqlCursor};

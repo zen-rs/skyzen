@@ -12,3 +12,13 @@ fallthrough = true
 type = "CompiledWasm"
 globs = ["**/*.wasm"]
 fallthrough = false
+
+# The worker example's Durable Object; `VisitsObject` is the class `#[skyzen::durable_object]`
+# exports for `Visits`, re-exported by name from `worker.mjs`.
+[[durable_objects.bindings]]
+name = "VISITS"
+class_name = "VisitsObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VisitsObject"]
