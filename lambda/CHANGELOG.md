@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/zen-rs/skyzen/compare/lambda-v0.1.0...lambda-v0.1.1) - 2026-09-05
+
+### Other
+
+- updated the following local packages: skyzen-core, skyzen-services
+
 ## [0.1.0](https://github.com/zen-rs/skyzen/releases/tag/lambda-v0.1.0) - 2026-08-27
 
 ### Added

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/skyzen/compare/skyzen-cli-v0.2.1...skyzen-cli-v0.3.0) - 2026-09-05
+
+### Added
+
+- *(cli)* [**breaking**] deliver runtime variables to Azure app settings
+- *(cli)* deliver runtime variables to Lambda through the SDK
+- *(cli)* deliver [[secret]] values to Cloudflare over stdin
+- *(manifest)* [**breaking**] make secrets a portable capability with `[[secret]]`
+
+### Fixed
+
+- *(cli)* pin the scaffolded compatibility_date instead of reading the clock
+
+### Other
+
+- Merge pull request #50 from zen-rs/feat/skyzen-openapi-command
+- Merge pull request #48 from zen-rs/feat/openapi-on-wasm
+- *(cli)* join the wrangler config path the way the plan does
+- describe the unified secret system
+- *(cli)* plans are ordered steps with typed stdin
+- *(cli)* resolve runtime variables through one Environment
+
 ## [0.2.1](https://github.com/zen-rs/skyzen/compare/skyzen-cli-v0.2.0...skyzen-cli-v0.2.1) - 2026-08-29
 
 ### Added

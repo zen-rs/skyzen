@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-cloudflare-admin"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Shared Cloudflare API response envelope types and token-source configuration for building Cloudflare control-plane tooling"
 license = "MIT OR Apache-2.0"

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/skyzen/compare/skyzen-cloudflare-admin-v0.2.0...skyzen-cloudflare-admin-v0.3.0) - 2026-09-05
+
+### Added
+
+- *(cli)* add `skyzen openapi`, and title documents by registration
+- *(openapi)* [**breaking**] serve the same document on every target
+- *(openapi)* [**breaking**] serve Scalar as the default API docs UI
+
+### Other
+
+- Merge pull request #41 from zen-rs/feat/unified-secrets
+- *(readme)* add GitHub Secrets and .env integration
+
 ## [0.2.0](https://github.com/zen-rs/skyzen/compare/skyzen-cloudflare-admin-v0.1.1...skyzen-cloudflare-admin-v0.2.0) - 2026-08-27
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-redis"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Redis implementation of KeyValueStore for the Skyzen framework"
 license = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ keywords = ["redis", "key-value", "skyzen", "services"]
 categories = ["web-programming::http-server", "database"]
 
 [dependencies]
-skyzen-services = { path = "../services", version = "0.2.0" }
+skyzen-services = { path = "../services", version = "0.2.1" }
 # `script` is what `compare_and_swap` runs on: Redis has no compare-and-swap command, and a
 # GET/SET pair is not atomic. It brings in `sha1_smol` for the EVALSHA cache key.
 redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "script"], optional = true }

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/skyzen/compare/skyzen-azure-v0.2.0...skyzen-azure-v0.3.0) - 2026-09-05
+
+### Fixed
+
+- *(azure)* [**breaking**] speak the Service Bus REST API directly, dropping legacy azure_core
+
 ## [0.2.0](https://github.com/zen-rs/skyzen/compare/skyzen-azure-v0.1.0...skyzen-azure-v0.2.0) - 2026-08-27
 
 ### Added
