@@ -1,5 +1,10 @@
 [workspace]
 pr_draft = false
+# The next version is decided by the conventional commits alone. release-plz would also run
+# cargo-semver-checks, which builds the published baseline crate afresh under `RUSTC_BOOTSTRAP`;
+# that baseline resolves rustix 0.37, whose `rustc_*` layout attributes the current stable
+# refuses, so the check cannot build and took the whole release with it on 2026-09-17.
+semver_check = false
 pr_labels = ["release"]
 git_release_name = "{{ package }}-v{{ version }}"
 publish = true
