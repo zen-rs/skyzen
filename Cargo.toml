@@ -41,6 +41,33 @@ clippy.nursery = "warn"
 clippy.cargo = "warn"
 clippy.multiple_crate_versions = { level = "allow", priority = 1 }
 
+# `skyzen-cli` is the installable toolchain, and a source `cargo install` costs
+# ~20 minutes of compile per consumer (CI runners included). cargo-dist builds
+# per-target binaries on every `skyzen-cli-v*` tag and attaches them to the
+# GitHub Release, so `cargo binstall skyzen-cli` and the shell/powershell
+# installers resolve to a download instead.
+#
+# `dist generate` emits `.github/workflows/release.yml`; that path belongs to
+# release-plz (the crates.io trusted publisher binds the filename), so the
+# generated file is checked in as `.github/workflows/binaries.yml` and `ci` is
+# marked allow-dirty — dist's freshness check would otherwise fail every run on
+# the deliberate rename. To regenerate: drop the `allow-dirty` line, run
+# `dist generate`, rename the emitted file to `binaries.yml`, restore the line.
+[workspace.metadata.dist]
+cargo-dist-version = "0.30.2"
+ci = ["github"]
+installers = ["shell", "powershell"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+precise-builds = true
+pr-run-mode = "plan"
+allow-dirty = ["ci"]
+
 [package]
 name = "skyzen"
 version = "0.3.0"
@@ -169,6 +196,13 @@ optional = true
 version = "0.2.16"
 optional = true
 
+
+# The worker example exports a Durable Object, and `#[skyzen::durable_object]` expands to the
+# Cloudflare class wrapper, which lives in `skyzen-cloudflare`. A dev-dependency is the one
+# direction the cycle is allowed in: the platform crate depends on this one, and only the
+# example reaches back.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+skyzen-cloudflare = { path = "cloudflare" }
 
 [features]
 default = ["json", "form", "query", "multipart", "sse", "rt", "openapi", "ws", "static-files", "runtime-async-std-native-tls"]

@@ -13,14 +13,21 @@ use crate::routing::Router;
 ///
 /// # Design
 ///
-/// - **Struct IS the state**: Your struct must be `Serialize + DeserializeOwned + Default`.
-///   On first creation, `Default::default()` produces the initial state.
-///   On subsequent activations, the struct is deserialized from storage.
-///   After each event, it is re-serialized.
-///   See [`PERSIST`](Self::PERSIST) for where that model stops scaling and how to opt out.
+/// - **One value per instance**: the platform constructs a Durable Object instance once and
+///   delivers every event to it until it is evicted, and the struct follows the same lifetime.
+///   It is built on the instance's first event — from storage when it [persists](Self::PERSIST),
+///   from `Default` otherwise — and every later event on that instance sees the same value, so a
+///   field set by one event is there for the next.
 ///
-/// - **`&mut self` everywhere**: Durable Objects have single-threaded serial execution.
-///   No locks needed.
+/// - **`&self` everywhere**: events on one instance interleave at every `await` — the platform
+///   serializes them only around storage operations — so a handler holds the object shared, never
+///   exclusively. State an event changes lives behind interior mutability, and [`fetch`](Self::fetch)
+///   hands handlers what they need as `State<…>` clones of the object's own handles.
+///
+/// - **Struct IS the state**, when it persists: a type with the default
+///   [`PERSIST`](Self::PERSIST) must be `Serialize + DeserializeOwned + Default`, is read from
+///   storage when the instance first receives an event, and is written back after every
+///   successful event whose serialization changed.
 ///
 /// - **Two methods**: `fetch` for HTTP (returns a [`Router`]),
 ///   `websocket` for all hibernation WS events.
@@ -28,17 +35,20 @@ use crate::routing::Router;
 /// # Example
 ///
 /// ```ignore
+/// use std::sync::atomic::{AtomicU64, Ordering};
+///
 /// use serde::{Serialize, Deserialize};
 /// use skyzen::durable::*;
 /// use skyzen::routing::{CreateRouteNode, Route, Router};
 ///
 /// #[derive(Serialize, Deserialize, Default)]
 /// struct Counter {
-///     count: u64,
+///     count: AtomicU64,
 /// }
 ///
 /// impl DurableObject for Counter {
-///     fn fetch(&mut self) -> Router {
+///     fn fetch(&self) -> Router {
+///         self.count.fetch_add(1, Ordering::Relaxed);
 ///         Route::new((
 ///             "/increment".at(increment),
 ///         ))
@@ -51,15 +61,16 @@ use crate::routing::Router;
 /// }
 /// ```
 pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'static {
-    /// Whether the framework loads and stores `Self` around every event.
+    /// Whether the framework loads `Self` from storage and stores it back.
     ///
     /// # What `true` costs
     ///
-    /// With the default, the whole object is read from one storage value and JSON-parsed before
-    /// **every** event — each fetch, each alarm, each websocket message — and serialized again
-    /// afterwards. For a counter that is nothing. For a chat room holding a message history it is
-    /// a full parse and a full serialize per websocket frame, and the object lives in a single
-    /// storage value, so it is bounded by the per-value limit rather than by the storage size.
+    /// With the default, the whole object is read from one storage value and JSON-parsed on the
+    /// instance's first event, and serialized again after **every** event — each fetch, each
+    /// alarm, each websocket message — to see whether it changed. For a counter that is nothing.
+    /// For a chat room holding a message history it is a full serialize per websocket frame, and
+    /// the object lives in a single storage value, so it is bounded by the per-value limit rather
+    /// than by the storage size.
     ///
     /// # Setting it to `false`
     ///
@@ -67,8 +78,9 @@ pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'stati
     /// [`DurableKv`](skyzen_services::durable::DurableKv) or
     /// [`DurableDb`](skyzen_services::durable::DurableDb) extractors — has nothing for the
     /// framework to serialize, and setting `PERSIST = false` skips the load/parse/serialize/save
-    /// round trip entirely. The struct then holds only per-activation scratch, and
-    /// `Default::default()` produces it on every event.
+    /// round trip entirely. The struct then holds only what the instance keeps in memory —
+    /// caches, subscriptions, handles a held stream waits on — and `Default::default()` produces
+    /// it once, on the instance's first event.
     ///
     /// This is the path to take for anything that grows: `DurableDb` is backed by the `SQLite`
     /// storage Cloudflare now provisions for new Durable Object classes, so rows are read and
@@ -82,7 +94,7 @@ pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'stati
     ///     // Messages live in SQLite via `DurableDb`; there is no blob to round-trip.
     ///     const PERSIST: bool = false;
     ///
-    ///     fn fetch(&mut self) -> Router { /* … */ }
+    ///     fn fetch(&self) -> Router { /* … */ }
     /// }
     /// ```
     const PERSIST: bool = true;
@@ -92,7 +104,7 @@ pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'stati
     ///
     /// Services (`DurableKv`, `DurableDb`, `Alarm`, `DurableConnections`)
     /// are available as extractors in the handlers.
-    fn fetch(&mut self) -> Router;
+    fn fetch(&self) -> Router;
 
     /// Handle all WebSocket Hibernation events.
     ///
@@ -101,7 +113,7 @@ pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'stati
     ///
     /// Default: no-op. DOs without WebSocket don't need to implement this.
     fn websocket(
-        &mut self,
+        &self,
         _ws: &WebSocketConnection,
         _event: WebSocketEvent,
         _ctx: &DurableContext,

@@ -508,7 +508,7 @@ impl skyzen_core::Extractor for ForwardedRequest {
 struct RelayObject;
 
 impl skyzen::durable::DurableObject for RelayObject {
-    fn fetch(&mut self) -> skyzen::routing::Router {
+    fn fetch(&self) -> skyzen::routing::Router {
         Route::new((
             "/relay".at(join_relay),
             "/authenticated".at(join_authenticated),
@@ -519,7 +519,7 @@ impl skyzen::durable::DurableObject for RelayObject {
     // Relaying a frame is a synchronous fan-out over the connection registry, so the future is
     // ready on creation rather than an `async` block with nothing to await.
     fn websocket(
-        &mut self,
+        &self,
         connection: &skyzen::durable::WebSocketConnection,
         event: skyzen::durable::WebSocketEvent,
         context: &skyzen::durable::DurableContext,

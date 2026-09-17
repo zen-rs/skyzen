@@ -6,7 +6,6 @@ use core::future::{ready, Future};
 use std::{
     collections::{BTreeMap, HashMap},
     hash::{Hash, Hasher},
-    marker::PhantomData,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
@@ -39,36 +38,39 @@ const ALARM_REQUEST_PATH: &str = "/__skyzen_alarm";
 /// Process-local namespace for simulating Durable Objects on native targets.
 #[derive(Debug)]
 pub struct NativeDurableNamespace<T> {
-    inner: Arc<NativeDurableNamespaceInner>,
-    marker: PhantomData<fn() -> T>,
+    inner: Arc<NativeDurableNamespaceInner<T>>,
 }
 
 impl<T> Clone for NativeDurableNamespace<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            marker: PhantomData,
         }
     }
 }
 
 #[derive(Debug)]
-struct NativeDurableNamespaceInner {
+struct NativeDurableNamespaceInner<T> {
     type_name: &'static str,
     next_id: AtomicU64,
-    instances: RwLock<HashMap<String, Arc<NativeDurableInstance>>>,
+    instances: RwLock<HashMap<String, Arc<NativeDurableInstance<T>>>>,
 }
 
+/// One simulated instance: the object the platform would keep alive, and its storage.
 #[derive(Debug)]
-struct NativeDurableInstance {
-    slot: Mutex<NativeDurableSlot>,
+struct NativeDurableInstance<T> {
+    slot: Mutex<NativeDurableSlot<T>>,
     /// Serializes handler dispatch per object id, upholding the serial-execution promise
     /// documented on [`DurableObject`].
     dispatch: Mutex<()>,
 }
 
 #[derive(Debug)]
-struct NativeDurableSlot {
+struct NativeDurableSlot<T> {
+    /// The object, once the instance has received its first event. Shared by handle so an
+    /// event runs against it without holding the slot.
+    object: Option<Arc<T>>,
+    /// The framework state blob as last written, for a type that persists.
     state: Option<Vec<u8>>,
     kv: NativeDurableKvStore,
     db: SqliteDurableDb,
@@ -76,9 +78,13 @@ struct NativeDurableSlot {
     connections: NativeDurableConnections,
 }
 
-impl NativeDurableSlot {
+impl<T> NativeDurableSlot<T>
+where
+    T: DurableObject + Send + Sync,
+{
     async fn new() -> Result<Self, DurableObjectError> {
         Ok(Self {
+            object: None,
             state: None,
             kv: NativeDurableKvStore::default(),
             db: SqliteDurableDb::in_memory()
@@ -89,34 +95,28 @@ impl NativeDurableSlot {
         })
     }
 
-    /// Restore the user's object, or produce a fresh one when the type opted out of
-    /// framework-managed persistence.
+    /// The instance's object, built on the first event and kept for the rest.
     ///
     /// The simulator honours [`DurableObject::PERSIST`] for the same reason the Cloudflare runtime
     /// does: an object that stores its own state must behave identically on both, or a bug only
-    /// shows up after deployment.
-    fn load_object<T>(&self) -> Result<T, DurableObjectError>
-    where
-        T: DurableObject,
-    {
-        if !T::PERSIST {
-            return Ok(T::default());
+    /// shows up after deployment. A type that persists is restored from the state blob when
+    /// there is one; every type starts from `Default` otherwise.
+    fn object(&mut self) -> Result<Arc<T>, DurableObjectError> {
+        if let Some(object) = &self.object {
+            return Ok(Arc::clone(object));
         }
-
-        self.state
-            .as_deref()
-            .map(|bytes| {
-                serde_json::from_slice(bytes)
-                    .map_err(|error| DurableObjectError::Serialization(error.to_string()))
-            })
-            .transpose()?
-            .map_or_else(|| Ok(T::default()), Ok)
+        let object = match self.state.as_deref().filter(|_| T::PERSIST) {
+            Some(bytes) => serde_json::from_slice(bytes)
+                .map_err(|error| DurableObjectError::Serialization(error.to_string()))?,
+            None => T::default(),
+        };
+        let object = Arc::new(object);
+        self.object = Some(Arc::clone(&object));
+        Ok(object)
     }
 
-    fn save_object<T>(&mut self, object: &T) -> Result<(), DurableObjectError>
-    where
-        T: DurableObject,
-    {
+    /// Write the object back to the state blob after an event, for a type that persists.
+    fn save_object(&mut self, object: &T) -> Result<(), DurableObjectError> {
         if !T::PERSIST {
             return Ok(());
         }
@@ -131,7 +131,7 @@ impl NativeDurableSlot {
 
 impl<T> Default for NativeDurableNamespace<T>
 where
-    T: DurableObject + Send,
+    T: DurableObject + Send + Sync,
 {
     fn default() -> Self {
         Self::new()
@@ -140,7 +140,7 @@ where
 
 impl<T> NativeDurableNamespace<T>
 where
-    T: DurableObject + Send,
+    T: DurableObject + Send + Sync,
 {
     /// Create a new in-process Durable Object namespace.
     #[must_use]
@@ -151,7 +151,6 @@ where
                 next_id: AtomicU64::new(1),
                 instances: RwLock::new(HashMap::new()),
             }),
-            marker: PhantomData,
         }
     }
 
@@ -230,7 +229,7 @@ where
     async fn slot_for(
         &self,
         id: &DurableObjectId,
-    ) -> Result<Arc<NativeDurableInstance>, DurableObjectError> {
+    ) -> Result<Arc<NativeDurableInstance<T>>, DurableObjectError> {
         let existing_instance = {
             self.inner
                 .instances
@@ -296,10 +295,7 @@ where
                 }
 
                 let Some(inner) = weak.upgrade() else { return };
-                let namespace = Self {
-                    inner,
-                    marker: PhantomData,
-                };
+                let namespace = Self { inner };
                 if let Err(error) = smol::block_on(namespace.alarm(&object_id)) {
                     tracing::error!(%error, "native durable alarm handler failed");
                 }
@@ -320,8 +316,8 @@ where
         // platform's serial input semantics.
         let _dispatch = instance.dispatch.lock().await;
 
-        let mut object = {
-            let slot = instance.slot.lock().await;
+        let object = {
+            let mut slot = instance.slot.lock().await;
             inject_durable_extensions(&mut request, &slot, id.clone());
             #[cfg(feature = "ws")]
             {
@@ -341,7 +337,7 @@ where
                         }
                     }));
             }
-            slot.load_object::<T>()?
+            slot.object()?
         };
 
         // Capture the request identity before `respond` takes the request mutably, so the error
@@ -370,8 +366,8 @@ where
         // See `fetch`: alarm dispatch participates in the same per-object serialization.
         let _dispatch = instance.dispatch.lock().await;
 
-        let guard = instance.slot.lock().await;
-        let mut object = guard.load_object::<T>()?;
+        let mut guard = instance.slot.lock().await;
+        let object = guard.object()?;
 
         // `fetch()` returns a `Router`, which exposes the alarm handler registered via
         // `Route::on_alarm` directly — no runtime downcast required.
@@ -406,10 +402,10 @@ where
         let instance = self.slot_for(id).await?;
         let _dispatch = instance.dispatch.lock().await;
 
-        let (mut object, context) = {
-            let slot = instance.slot.lock().await;
+        let (object, context) = {
+            let mut slot = instance.slot.lock().await;
             (
-                slot.load_object::<T>()?,
+                slot.object()?,
                 super::DurableContext::new(
                     DurableKv::new(slot.kv.clone()),
                     DurableDb::new(slot.db.clone()),
@@ -540,7 +536,7 @@ impl<T> Clone for NativeDurableObjectStub<T> {
 
 impl<T> NativeDurableObjectStub<T>
 where
-    T: DurableObject + Send,
+    T: DurableObject + Send + Sync,
 {
     /// The target Durable Object ID.
     #[must_use]
@@ -583,7 +579,11 @@ where
     }
 }
 
-fn inject_durable_extensions(request: &mut Request, slot: &NativeDurableSlot, id: DurableObjectId) {
+fn inject_durable_extensions<T>(
+    request: &mut Request,
+    slot: &NativeDurableSlot<T>,
+    id: DurableObjectId,
+) {
     request
         .extensions_mut()
         .insert(DurableKv::new(slot.kv.clone()));
@@ -1045,7 +1045,7 @@ mod tests {
     struct CounterObject;
 
     impl DurableObject for CounterObject {
-        fn fetch(&mut self) -> crate::routing::Router {
+        fn fetch(&self) -> crate::routing::Router {
             Route::new((
                 "/increment".post(increment),
                 "/slow_increment".post(slow_increment),
@@ -1178,30 +1178,28 @@ mod tests {
     /// serializes the whole object after each one.
     #[derive(Default, Serialize, Deserialize)]
     struct BlobCounter {
-        hits: u64,
+        hits: AtomicU64,
     }
 
     impl DurableObject for BlobCounter {
-        fn fetch(&mut self) -> crate::routing::Router {
-            self.hits += 1;
-            let hits = self.hits;
+        fn fetch(&self) -> crate::routing::Router {
+            let hits = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
             Route::new(("/hits".at(move || async move { hits.to_string() }),)).build()
         }
     }
 
-    /// The same shape with `PERSIST = false`: nothing is stored, so every event starts from
-    /// `Default` and the count never climbs past one.
+    /// The same shape with `PERSIST = false`: nothing is stored, but the object lives for the
+    /// instance, so the count climbs all the same — in memory rather than in the blob.
     #[derive(Default, Serialize, Deserialize)]
     struct ScratchCounter {
-        hits: u64,
+        hits: AtomicU64,
     }
 
     impl DurableObject for ScratchCounter {
         const PERSIST: bool = false;
 
-        fn fetch(&mut self) -> crate::routing::Router {
-            self.hits += 1;
-            let hits = self.hits;
+        fn fetch(&self) -> crate::routing::Router {
+            let hits = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
             Route::new(("/hits".at(move || async move { hits.to_string() }),)).build()
         }
     }
@@ -1222,8 +1220,10 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
     }
 
+    /// The object lives for the instance whether or not it persists: three events on one id see
+    /// one value counting up, and another id starts its own.
     #[tokio::test]
-    async fn persist_false_skips_the_framework_state_round_trip() {
+    async fn an_object_lives_for_its_instance() {
         let blob = NativeDurableNamespace::<BlobCounter>::new();
         let stub = blob.get_by_name("blob").expect("blob object");
         for expected in ["1", "2", "3"] {
@@ -1236,14 +1236,56 @@ mod tests {
 
         let scratch = NativeDurableNamespace::<ScratchCounter>::new();
         let stub = scratch.get_by_name("scratch").expect("scratch object");
-        for _ in 0..3u32 {
+        for expected in ["1", "2", "3"] {
             let response = stub
                 .fetch(request(Method::GET, "/hits"))
                 .await
                 .expect("scratch hit");
-            // Nothing was saved, so the object is rebuilt from `Default` on every event.
-            assert_eq!(response_text(response).await, "1");
+            assert_eq!(response_text(response).await, expected);
         }
+        let other = scratch.get_by_name("other").expect("another object");
+        let response = other
+            .fetch(request(Method::GET, "/hits"))
+            .await
+            .expect("other hit");
+        assert_eq!(
+            response_text(response).await,
+            "1",
+            "another id is another instance with its own object"
+        );
+    }
+
+    /// What a persisted type gets on an instance's first event: the blob, when there is one.
+    #[tokio::test]
+    async fn a_persisted_object_is_restored_from_its_blob_once() {
+        let mut slot = NativeDurableSlot::<BlobCounter>::new()
+            .await
+            .expect("a slot");
+        slot.state = Some(br#"{"hits":5}"#.to_vec());
+
+        let object = slot.object().expect("restored");
+        assert_eq!(object.hits.load(Ordering::Relaxed), 5);
+        object.hits.fetch_add(1, Ordering::Relaxed);
+        let again = slot.object().expect("the same object");
+        assert_eq!(
+            again.hits.load(Ordering::Relaxed),
+            6,
+            "the second event sees the first event's change, not the blob"
+        );
+
+        slot.save_object(&again).expect("saved");
+        assert_eq!(slot.state.as_deref(), Some(br#"{"hits":6}"#.as_slice()));
+
+        let mut scratch = NativeDurableSlot::<ScratchCounter>::new()
+            .await
+            .expect("a slot");
+        scratch.state = Some(br#"{"hits":5}"#.to_vec());
+        let object = scratch.object().expect("built");
+        assert_eq!(
+            object.hits.load(Ordering::Relaxed),
+            0,
+            "a type that does not persist ignores the blob"
+        );
     }
 
     #[tokio::test]

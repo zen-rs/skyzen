@@ -1,6 +1,14 @@
 //! Runtime glue for driving Skyzen Durable Objects on Cloudflare Workers.
+//!
+//! One [`DurableObjectRuntime`] is the Rust side of one Durable Object instance: the class wrapper
+//! `#[skyzen::durable_object]` exports constructs it once, when the platform constructs the JS
+//! instance, and forwards every event on that instance to it. The user's object is built on the
+//! first event — from the state blob when the type [persists](DurableObject::PERSIST), from
+//! `Default` otherwise — and lives until the platform evicts the instance, so a field set by one
+//! event is there for the next.
 
-use std::marker::PhantomData;
+use std::cell::{OnceCell, RefCell};
+use std::rc::Rc;
 
 use skyzen::durable::{DurableObject, DurableObjectError, WebSocketConnection, WebSocketEvent};
 use skyzen::runtime::wasm::{from_js_request, into_js_response};
@@ -18,33 +26,69 @@ use super::STATE_KEY as SKYZEN_STATE_KEY;
 
 const ALARM_REQUEST_PATH: &str = "/__skyzen_alarm";
 
-/// A Durable Object loaded from storage together with the serialized bytes it
-/// was restored from, so an unchanged object can skip the storage write.
-struct LoadedObject<T> {
-    object: T,
-    snapshot: Option<Vec<u8>>,
+/// The Rust side of one Durable Object instance.
+///
+/// Cloning yields another handle on the same instance — the wrapper hands one to every event's
+/// future — so the object and the snapshot it was last written from are shared, never copied.
+pub struct DurableObjectRuntime<T> {
+    state: worker_sys::DurableObjectState,
+    env: JsValue,
+    instance: Rc<Instance<T>>,
 }
 
-/// Cloudflare runtime adapter for a Skyzen Durable Object type.
-#[derive(Debug)]
-pub struct DurableObjectRuntime<T>(PhantomData<T>);
+/// What lives for the instance: the object, and the bytes it was last loaded from or saved as.
+struct Instance<T> {
+    object: OnceCell<Rc<T>>,
+    /// The serialization storage holds, so a read-only event does not write it back.
+    snapshot: RefCell<Option<Vec<u8>>>,
+}
+
+impl<T> Clone for DurableObjectRuntime<T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: clone_state(&self.state),
+            env: self.env.clone(),
+            instance: Rc::clone(&self.instance),
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for DurableObjectRuntime<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableObjectRuntime")
+            .field("loaded", &self.instance.object.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
 
 impl<T> DurableObjectRuntime<T>
 where
     T: DurableObject,
 {
+    /// The runtime for the instance the platform just constructed.
+    ///
+    /// Nothing is read here: the constructor is synchronous, so the object is loaded by the
+    /// first event.
+    #[must_use]
+    pub fn new(state: worker_sys::DurableObjectState, env: JsValue) -> Self {
+        Self {
+            state,
+            env,
+            instance: Rc::new(Instance {
+                object: OnceCell::new(),
+                snapshot: RefCell::new(None),
+            }),
+        }
+    }
+
     /// Handle a Durable Object `fetch` event.
     ///
     /// # Errors
     ///
     /// Returns `JsValue` when state I/O or request/response conversion fails.
-    pub async fn fetch(
-        state: worker_sys::DurableObjectState,
-        env: JsValue,
-        request: web_sys::Request,
-    ) -> Result<web_sys::Response, JsValue> {
-        let mut loaded = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state), env.clone());
+    pub async fn fetch(&self, request: web_sys::Request) -> Result<web_sys::Response, JsValue> {
+        let object = self.object().await?;
+        let durable_state = CfDurableState::new(clone_state(&self.state), self.env.clone());
 
         let mut request = from_js_request(&request).map_err(annotate_conversion)?;
         durable_state
@@ -60,7 +104,7 @@ where
         // websocket and alarm paths.
         let (response, succeeded) = {
             let mut endpoint =
-                skyzen::runtime::wasm::with_current_env(env, || loaded.object.fetch());
+                skyzen::runtime::wasm::with_current_env(self.env.clone(), || object.fetch());
             match endpoint.respond(&mut request).await {
                 Ok(response) => (response, true),
                 Err(error) => {
@@ -73,7 +117,7 @@ where
         };
 
         if succeeded {
-            save_state(&state, &loaded).await?;
+            self.save(&object).await?;
         }
         into_js_response(response).map_err(annotate_conversion)
     }
@@ -83,62 +127,47 @@ where
     /// # Errors
     ///
     /// Returns `JsValue` when state I/O, alarm dispatch, or persistence fails.
-    pub async fn alarm(state: worker_sys::DurableObjectState, env: JsValue) -> Result<(), JsValue> {
-        let mut loaded = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state), env.clone());
+    pub async fn alarm(&self) -> Result<(), JsValue> {
+        let object = self.object().await?;
+        let durable_state = CfDurableState::new(clone_state(&self.state), self.env.clone());
 
-        {
-            // `fetch()` returns a `Router`, which exposes the alarm handler registered via
-            // `Route::on_alarm` directly — no runtime downcast required.
-            let router = skyzen::runtime::wasm::with_current_env(env, || loaded.object.fetch());
+        // `fetch()` returns a `Router`, which exposes the alarm handler registered via
+        // `Route::on_alarm` directly — no runtime downcast required.
+        let router = skyzen::runtime::wasm::with_current_env(self.env.clone(), || object.fetch());
 
-            let mut alarm_endpoint = router.alarm_endpoint().ok_or_else(|| {
-                JsValue::from_str("No alarm handler registered. Use Route::on_alarm(handler).")
-            })?;
+        let mut alarm_endpoint = router.alarm_endpoint().ok_or_else(|| {
+            JsValue::from_str("No alarm handler registered. Use Route::on_alarm(handler).")
+        })?;
 
-            let mut request = alarm_request()?;
-            durable_state
-                .inject_request_extensions(&mut request)
-                .map_err(to_js)?;
+        let mut request = alarm_request()?;
+        durable_state
+            .inject_request_extensions(&mut request)
+            .map_err(to_js)?;
 
-            alarm_endpoint
-                .respond(&mut request)
-                .await
-                .map_err(|error| JsValue::from_str(&format!("alarm handler failed: {error}")))?;
-        }
+        alarm_endpoint
+            .respond(&mut request)
+            .await
+            .map_err(|error| JsValue::from_str(&format!("alarm handler failed: {error}")))?;
 
-        save_state(&state, &loaded).await
+        self.save(&object).await
     }
 
     /// Handle a Durable Object `webSocketMessage` event.
+    ///
+    /// `message` is the payload as the platform delivers it: a string, or an `ArrayBuffer`.
     ///
     /// # Errors
     ///
     /// Returns `JsValue` when state I/O, message decoding, handler execution,
     /// or persistence fails.
     pub async fn websocket_message(
-        state: worker_sys::DurableObjectState,
-        env: JsValue,
+        &self,
         websocket: web_sys::WebSocket,
-        event: web_sys::MessageEvent,
+        message: JsValue,
     ) -> Result<(), JsValue> {
-        let mut loaded = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state), env);
-        let context = durable_state.context().map_err(to_js)?;
-        let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
-            websocket,
-            clone_state(&state),
-        )));
-        let data = event.data();
-        let message = decode_websocket_message(&data).map_err(to_js)?;
-
-        loaded
-            .object
-            .websocket(&connection, WebSocketEvent::Message(message), &context)
+        let message = decode_websocket_message(&message).map_err(to_js)?;
+        self.websocket_event(websocket, WebSocketEvent::Message(message))
             .await
-            .map_err(to_js)?;
-
-        save_state(&state, &loaded).await
     }
 
     /// Handle a Durable Object `webSocketClose` event.
@@ -147,36 +176,21 @@ where
     ///
     /// Returns `JsValue` when state I/O, handler execution, or persistence fails.
     pub async fn websocket_close(
-        state: worker_sys::DurableObjectState,
-        env: JsValue,
+        &self,
         websocket: web_sys::WebSocket,
         code: u16,
         reason: String,
         was_clean: bool,
     ) -> Result<(), JsValue> {
-        let mut loaded = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state), env);
-        let context = durable_state.context().map_err(to_js)?;
-        let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
+        self.websocket_event(
             websocket,
-            clone_state(&state),
-        )));
-
-        loaded
-            .object
-            .websocket(
-                &connection,
-                WebSocketEvent::Close {
-                    code,
-                    reason,
-                    was_clean,
-                },
-                &context,
-            )
-            .await
-            .map_err(to_js)?;
-
-        save_state(&state, &loaded).await
+            WebSocketEvent::Close {
+                code,
+                reason,
+                was_clean,
+            },
+        )
+        .await
     }
 
     /// Handle a Durable Object `webSocketError` event.
@@ -185,140 +199,90 @@ where
     ///
     /// Returns `JsValue` when state I/O, handler execution, or persistence fails.
     pub async fn websocket_error(
-        state: worker_sys::DurableObjectState,
-        env: JsValue,
+        &self,
         websocket: web_sys::WebSocket,
         error: JsValue,
     ) -> Result<(), JsValue> {
-        let mut loaded = load_state::<T>(&state).await?;
-        let durable_state = CfDurableState::new(clone_state(&state), env);
+        self.websocket_event(websocket, WebSocketEvent::Error(format!("{error:?}")))
+            .await
+    }
+
+    async fn websocket_event(
+        &self,
+        websocket: web_sys::WebSocket,
+        event: WebSocketEvent,
+    ) -> Result<(), JsValue> {
+        let object = self.object().await?;
+        let durable_state = CfDurableState::new(clone_state(&self.state), self.env.clone());
         let context = durable_state.context().map_err(to_js)?;
         let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
             websocket,
-            clone_state(&state),
+            clone_state(&self.state),
         )));
 
-        loaded
-            .object
-            .websocket(
-                &connection,
-                WebSocketEvent::Error(format!("{error:?}")),
-                &context,
-            )
+        object
+            .websocket(&connection, event, &context)
             .await
             .map_err(to_js)?;
 
-        save_state(&state, &loaded).await
+        self.save(&object).await
+    }
+
+    /// The instance's object, loaded on the first call.
+    ///
+    /// The load is a storage read, and the platform delivers no other event to the instance
+    /// while one is in progress, so the first event's load is the only one.
+    async fn object(&self) -> Result<Rc<T>, JsValue> {
+        if let Some(object) = self.instance.object.get() {
+            return Ok(Rc::clone(object));
+        }
+        let (object, snapshot) = load_state::<T>(&self.state).await?;
+        *self.instance.snapshot.borrow_mut() = snapshot;
+        Ok(Rc::clone(
+            self.instance.object.get_or_init(|| Rc::new(object)),
+        ))
+    }
+
+    /// Persist the object's serialized state, skipping the storage write when the bytes are
+    /// identical to the last load or save (read-only events would otherwise write on every
+    /// invocation), and skipping it entirely for an object that opted out with `PERSIST = false`.
+    async fn save(&self, object: &T) -> Result<(), JsValue> {
+        if !T::PERSIST {
+            return Ok(());
+        }
+
+        let bytes = serde_json::to_vec(object).map_err(|error| {
+            JsValue::from_str(&format!(
+                "failed to serialize durable state '{SKYZEN_STATE_KEY}': {error}"
+            ))
+        })?;
+        if self.instance.snapshot.borrow().as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+        let kv = DurableKv::new(CfDurableKv::from_state(&self.state).map_err(|error| {
+            JsValue::from_str(&format!(
+                "failed to initialize durable kv for state save: {error}"
+            ))
+        })?);
+        kv.put(SKYZEN_STATE_KEY, &bytes).await.map_err(|error| {
+            JsValue::from_str(&format!("failed to persist durable state: {error}"))
+        })?;
+        *self.instance.snapshot.borrow_mut() = Some(bytes);
+        Ok(())
     }
 }
 
-/// Invoke a Skyzen Durable Object alarm handler from an external runtime wrapper.
-///
-/// # Errors
-///
-/// Returns `JsValue` when state I/O, alarm dispatch, or persistence fails.
-pub async fn invoke_alarm<T>(
-    state: worker_sys::DurableObjectState,
-    env: JsValue,
-) -> Result<(), JsValue>
-where
-    T: DurableObject,
-{
-    DurableObjectRuntime::<T>::alarm(state, env).await
-}
-
-/// Invoke a Skyzen Durable Object websocket message handler from an external runtime wrapper.
-///
-/// # Errors
-///
-/// Returns `JsValue` when state I/O, handler execution, or persistence fails.
-pub async fn invoke_websocket_message<T>(
-    state: worker_sys::DurableObjectState,
-    env: JsValue,
-    websocket: web_sys::WebSocket,
-    message: skyzen::http_kit::ws::WebSocketMessage,
-) -> Result<(), JsValue>
-where
-    T: DurableObject,
-{
-    let mut loaded = load_state::<T>(&state).await?;
-    let durable_state = CfDurableState::new(clone_state(&state), env);
-    let context = durable_state.context().map_err(to_js)?;
-    let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
-        websocket,
-        clone_state(&state),
-    )));
-
-    loaded
-        .object
-        .websocket(&connection, WebSocketEvent::Message(message), &context)
-        .await
-        .map_err(to_js)?;
-
-    save_state(&state, &loaded).await
-}
-
-/// Invoke a Skyzen Durable Object websocket close handler from an external runtime wrapper.
-///
-/// # Errors
-///
-/// Returns `JsValue` when state I/O, handler execution, or persistence fails.
-pub async fn invoke_websocket_close<T>(
-    state: worker_sys::DurableObjectState,
-    env: JsValue,
-    websocket: web_sys::WebSocket,
-    code: u16,
-    reason: String,
-    was_clean: bool,
-) -> Result<(), JsValue>
-where
-    T: DurableObject,
-{
-    DurableObjectRuntime::<T>::websocket_close(state, env, websocket, code, reason, was_clean).await
-}
-
-/// Invoke a Skyzen Durable Object websocket error handler from an external runtime wrapper.
-///
-/// # Errors
-///
-/// Returns `JsValue` when state I/O, handler execution, or persistence fails.
-pub async fn invoke_websocket_error<T>(
-    state: worker_sys::DurableObjectState,
-    env: JsValue,
-    websocket: web_sys::WebSocket,
-    error: String,
-) -> Result<(), JsValue>
-where
-    T: DurableObject,
-{
-    let mut loaded = load_state::<T>(&state).await?;
-    let durable_state = CfDurableState::new(clone_state(&state), env);
-    let context = durable_state.context().map_err(to_js)?;
-    let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
-        websocket,
-        clone_state(&state),
-    )));
-
-    loaded
-        .object
-        .websocket(&connection, WebSocketEvent::Error(error), &context)
-        .await
-        .map_err(to_js)?;
-
-    save_state(&state, &loaded).await
-}
-
-async fn load_state<T>(state: &worker_sys::DurableObjectState) -> Result<LoadedObject<T>, JsValue>
+/// Build the object from storage, together with the bytes it was restored from.
+async fn load_state<T>(
+    state: &worker_sys::DurableObjectState,
+) -> Result<(T, Option<Vec<u8>>), JsValue>
 where
     T: DurableObject,
 {
     // An object that keeps its state in storage itself has no blob to restore, so the read and the
     // parse are skipped rather than performed and discarded.
     if !T::PERSIST {
-        return Ok(LoadedObject {
-            object: T::default(),
-            snapshot: None,
-        });
+        return Ok((T::default(), None));
     }
 
     let kv = DurableKv::new(CfDurableKv::from_state(state).map_err(|error| {
@@ -338,43 +302,7 @@ where
             ))
         })?,
     };
-    Ok(LoadedObject {
-        object,
-        snapshot: maybe_bytes,
-    })
-}
-
-/// Persist the object's serialized state, skipping the storage write when the
-/// bytes are identical to what [`load_state`] read (read-only events would
-/// otherwise write on every invocation), and skipping it entirely for an object
-/// that opted out with `PERSIST = false`.
-async fn save_state<T>(
-    state: &worker_sys::DurableObjectState,
-    loaded: &LoadedObject<T>,
-) -> Result<(), JsValue>
-where
-    T: DurableObject,
-{
-    if !T::PERSIST {
-        return Ok(());
-    }
-
-    let bytes = serde_json::to_vec(&loaded.object).map_err(|error| {
-        JsValue::from_str(&format!(
-            "failed to serialize durable state '{SKYZEN_STATE_KEY}': {error}"
-        ))
-    })?;
-    if loaded.snapshot.as_deref() == Some(bytes.as_slice()) {
-        return Ok(());
-    }
-    let kv = DurableKv::new(CfDurableKv::from_state(state).map_err(|error| {
-        JsValue::from_str(&format!(
-            "failed to initialize durable kv for state save: {error}"
-        ))
-    })?);
-    kv.put(SKYZEN_STATE_KEY, &bytes)
-        .await
-        .map_err(|error| JsValue::from_str(&format!("failed to persist durable state: {error}")))
+    Ok((object, maybe_bytes))
 }
 
 fn decode_websocket_message(

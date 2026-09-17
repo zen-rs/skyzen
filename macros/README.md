@@ -126,7 +126,7 @@ The first argument is either `CfTailEvent` (the raw batch) or `Vec<TailTraceItem
 
 ### `#[skyzen::durable_object]`
 
-Applied to a `DurableObject` impl block, this exports a Cloudflare Durable Object class wrapper that forwards `fetch`, `alarm`, and hibernation websocket events into Skyzen's `DurableObjectRuntime`.
+Applied to a `DurableObject` struct, this exports a Cloudflare Durable Object class wrapper that owns one `DurableObjectRuntime` per instance and forwards `fetch`, `alarm`, and hibernation websocket events to it, so the struct lives as long as the instance does.
 
 ### `#[skyzen::openapi]`
 

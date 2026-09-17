@@ -42,7 +42,7 @@ use skyzen_services::durable::DurableDb;
 struct Room;
 
 impl DurableObject for Room {
-    fn fetch(&mut self) -> Router {
+    fn fetch(&self) -> Router {
         Route::new((
             "/join".post(join_room),
             "/members".get(list_members),
