@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/zen-rs/skyzen/compare/core-v0.2.0...core-v0.2.1) - 2026-09-05
+
+### Added
+
+- *(cli)* add `skyzen openapi`, and title documents by registration
+- *(core)* add the redacting Secret type
+
 ## [0.2.0](https://github.com/zen-rs/skyzen/compare/core-v0.1.1...core-v0.2.0) - 2026-08-27
 
 ### Added

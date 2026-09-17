@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/skyzen/compare/v0.2.1...v0.3.0) - 2026-09-05
+
+### Added
+
+- *(openapi)* [**breaking**] serve Scalar as the default API docs UI
+
+### Fixed
+
+- *(cloudflare)* send queue messages as a Uint8Array view
+- *(wasm)* omit bodies for null-body responses
+- *(azure)* [**breaking**] speak the Service Bus REST API directly, dropping legacy azure_core
+
+### Other
+
+- Merge pull request #50 from zen-rs/feat/skyzen-openapi-command
+- Merge pull request #48 from zen-rs/feat/openapi-on-wasm
+- Merge pull request #38 from zen-rs/fix/issue-37-null-body-response
+- Merge pull request #41 from zen-rs/feat/unified-secrets
+- *(readme)* add GitHub Secrets and .env integration
+- Revert "docs(readme): add GitHub Secrets and .env integration"
+- *(readme)* add GitHub Secrets and .env integration
+
 ## [0.2.1](https://github.com/zen-rs/skyzen/compare/v0.2.0...v0.2.1) - 2026-08-29
 
 ### Added
