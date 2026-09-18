@@ -9,16 +9,25 @@ jobs:
     name: Publish prepared releases
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: read
+      contents: read
       id-token: write
-      # The dispatch below creates a workflow_dispatch on binaries.yml; tag
-      # pushes made under GITHUB_TOKEN do not cascade-trigger it on their own.
+      # The dispatch below creates a workflow_dispatch on binaries.yml.
       actions: write
     concurrency:
       group: release-plz-release
       cancel-in-progress: false
     steps:
+      # release-plz acts as the release GitHub App, not as GITHUB_TOKEN: a
+      # tag, branch or pull request made under GITHUB_TOKEN triggers no
+      # workflow, so the version pull request would carry no checks and the
+      # tag would build no binaries. The installation token is minted per
+      # run from the App's private key and expires with the job.
+      - uses: actions/create-github-app-token@v2
+        id: release-app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - name: Checkout main
         uses: actions/checkout@v4
         with:
@@ -39,12 +48,11 @@ jobs:
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.release-app.outputs.token }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
       # A `skyzen-cli` release needs its cargo-dist binaries built on the tag
-      # release-plz just pushed; GITHUB_TOKEN tag pushes do not trigger
-      # binaries.yml, so dispatch it explicitly.
+      # release-plz just pushed; binaries.yml takes the tag by dispatch.
       - name: Dispatch binary builds
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -59,12 +67,17 @@ jobs:
     name: Prepare release pull request
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     concurrency:
       group: release-plz-pr
       cancel-in-progress: false
     steps:
+      - uses: actions/create-github-app-token@v2
+        id: release-app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - name: Checkout main
         uses: actions/checkout@v4
         with:
@@ -79,5 +92,5 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.release-app.outputs.token }}
 
