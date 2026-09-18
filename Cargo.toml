@@ -68,6 +68,12 @@ precise-builds = true
 pr-run-mode = "plan"
 allow-dirty = ["ci"]
 
+# The profile `dist build` compiles with; without it every binaries job
+# fails with "profile `dist` is not defined".
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [package]
 name = "skyzen"
 version = "0.4.0"
