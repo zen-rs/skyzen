@@ -11,7 +11,14 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
+use notify_debouncer_full::{
+    new_debouncer,
+    notify::{
+        event::{AccessKind, AccessMode},
+        EventKind, RecursiveMode,
+    },
+    DebounceEventResult, DebouncedEvent,
+};
 use std::{
     path::{Path, PathBuf},
     process::Child,
@@ -242,16 +249,77 @@ fn has_relevant_change(result: DebounceEventResult, ignore: &Gitignore) -> bool 
         }
     };
 
-    events.iter().flat_map(|event| &event.paths).any(|path| {
-        !ignore
-            .matched_path_or_any_parents(path, path.is_dir())
-            .is_ignore()
-    })
+    events
+        .iter()
+        .filter(|event| !is_read(event))
+        .flat_map(|event| &event.paths)
+        .any(|path| {
+            !ignore
+                .matched_path_or_any_parents(path, path.is_dir())
+                .is_ignore()
+        })
+}
+
+/// Whether an event reports a read rather than a change.
+///
+/// Linux inotify reports every `open()` of a watched file or directory (`IN_OPEN`, surfaced as
+/// `EventKind::Access`), including the rebuild's own reads of `Cargo.toml` and `src/`, so acting
+/// on those events would re-trigger the build forever. `FSEvents` and `ReadDirectoryChangesW`
+/// never report reads, which is why the loop only shows on Linux. Closing a file that was open
+/// for writing (`IN_CLOSE_WRITE`) is the one access that is a change: a `MAP_SHARED` write
+/// produces no `IN_MODIFY`, so it is the only event such a write leaves behind.
+fn is_read(event: &DebouncedEvent) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Access(kind) if kind != AccessKind::Close(AccessMode::Write)
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ignore_matcher, watch_paths};
+    use super::{build_ignore_matcher, has_relevant_change, watch_paths};
+    use notify_debouncer_full::{
+        notify::{
+            event::{AccessKind, AccessMode, ModifyKind},
+            Event, EventKind,
+        },
+        DebouncedEvent,
+    };
+    use std::time::Instant;
+
+    #[test]
+    fn reads_of_watched_files_are_not_changes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        let ignore = build_ignore_matcher(root).expect("ignore matcher");
+        let source = root.join("src/main.rs");
+
+        let open = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+            .add_path(source.clone());
+        let opened_dir = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+            .add_path(root.join("src"));
+        assert!(!has_relevant_change(
+            Ok(vec![
+                DebouncedEvent::new(open, Instant::now()),
+                DebouncedEvent::new(opened_dir, Instant::now()),
+            ]),
+            &ignore
+        ));
+
+        let modify = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(source.clone());
+        assert!(has_relevant_change(
+            Ok(vec![DebouncedEvent::new(modify, Instant::now())]),
+            &ignore
+        ));
+
+        // The only trace a shared-mapping write leaves is the close of a writable descriptor.
+        let close_write =
+            Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write))).add_path(source);
+        assert!(has_relevant_change(
+            Ok(vec![DebouncedEvent::new(close_write, Instant::now())]),
+            &ignore
+        ));
+    }
 
     #[test]
     fn generated_and_vendored_directories_are_ignored() {
