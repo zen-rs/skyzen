@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/skyzen/compare/v0.3.0...v0.4.0) - 2026-09-18
+
+### Added
+
+- [**breaking**] keep a Durable Object's struct alive for the instance
+
+### Fixed
+
+- *(ci)* let the PR source gate admit release-plz pull requests
+- *(release)* decide versions from commits alone, without cargo-semver-checks
+
+### Other
+
+- Merge pull request #65 from zen-rs/fix/release-without-semver-checks
+- ship prebuilt skyzen-cli binaries via cargo-dist
+- run tests with cargo nextest ([#59](https://github.com/zen-rs/skyzen/pull/59))
+- publish to crates.io via OIDC trusted publishing ([#57](https://github.com/zen-rs/skyzen/pull/57))
+- gate pull requests into main so only dev may merge ([#58](https://github.com/zen-rs/skyzen/pull/58))
+
 ## [0.3.0](https://github.com/zen-rs/skyzen/compare/v0.2.1...v0.3.0) - 2026-09-05
 
 ### Added
