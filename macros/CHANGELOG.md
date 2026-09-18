@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/skyzen/compare/macros-v0.3.0...macros-v0.4.0) - 2026-09-18
+
+### Added
+
+- [**breaking**] keep a Durable Object's struct alive for the instance
+
+### Other
+
+- Merge main back into dev after the v0.3.0 release
+
 ## [0.3.0](https://github.com/zen-rs/skyzen/compare/macros-v0.2.1...macros-v0.3.0) - 2026-09-05
 
 ### Added
