@@ -24,10 +24,16 @@ jobs:
             echo "::error::Pull requests into 'main' must come from this repository, not a fork."
             exit 1
           fi
-          if [ "${HEAD_REF}" != "dev" ]; then
-            echo "::error::Pull requests into 'main' are only allowed from 'dev'. Retarget this pull request at 'dev' instead."
-            exit 1
-          fi
+          # release-plz opens its version pull request straight at main (its
+          # commit reaches dev by the merge-back after the release), so its
+          # branches are the one source besides dev that main accepts.
+          case "${HEAD_REF}" in
+            dev | release-plz-*) ;;
+            *)
+              echo "::error::Pull requests into 'main' are only allowed from 'dev' or a release-plz branch. Retarget this pull request at 'dev' instead."
+              exit 1
+              ;;
+          esac
           echo "'${HEAD_REF}' -> 'main': source branch allowed."
 
       # This check doubles as the single required check on main: instead of
