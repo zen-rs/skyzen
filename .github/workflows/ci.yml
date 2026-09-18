@@ -72,7 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
-      - uses: crate-ci/typos@master
+      - uses: crate-ci/typos@v1
 
   audit:
     name: Security Audit
