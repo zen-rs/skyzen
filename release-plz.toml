@@ -11,10 +11,27 @@ publish = true
 git_tag_enable = true
 changelog_update = true
 
+# The framework, its macros, the Cloudflare crates and the CLI are one version line: the CLI
+# emulates and deploys the framework it is built against, and a fix anywhere in the line ships a
+# CLI whose prebuilt binaries carry it. Without the group a fix outside `cli/` bumps only the
+# crate it touched, and no skyzen-cli tag — so no binaries build — follows.
 [[package]]
 name = "skyzen"
+version_group = "skyzen"
 git_release_name = "v{{ version }}"
 git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "skyzen-cli"
+version_group = "skyzen"
+
+[[package]]
+name = "skyzen-cloudflare"
+version_group = "skyzen"
+
+[[package]]
+name = "skyzen-cloudflare-admin"
+version_group = "skyzen"
 
 [[package]]
 name = "skyzen-core"
@@ -30,6 +47,7 @@ git_tag_name = "lambda-v{{ version }}"
 
 [[package]]
 name = "skyzen-macros"
+version_group = "skyzen"
 git_tag_name = "macros-v{{ version }}"
 
 # A runnable example, not a published crate: it must not get a version bump, a tag or a changelog.
