@@ -562,9 +562,11 @@ fn wire_workspace_crates(path: &Path, template: Template) {
         if spec.name.starts_with("skyzen") {
             dependencies[spec.name] = path_dependency(&crate_dir(spec.name), spec.features);
         } else {
-            // Third-party crates come from the registry, as they would for a real project.
+            // Third-party crates come from the registry, as they would for a real project —
+            // including the version requirement `cargo add` would write, since a spec that
+            // constrains one (like `utoipa`'s) is the whole point of declaring it.
             let mut dependency = InlineTable::new();
-            dependency.insert("version", Value::from("*"));
+            dependency.insert("version", Value::from(spec.version.unwrap_or("*")));
             if !spec.features.is_empty() {
                 let mut array = toml_edit::Array::new();
                 for feature in spec.features {
