@@ -36,6 +36,11 @@ pub struct ScaffoldContext {
 pub struct DependencySpec {
     /// The crate name.
     pub name: &'static str,
+    /// The version requirement `cargo add` writes, when one is needed. Most crates take whatever
+    /// cargo resolves, but a crate the generated code must agree with `skyzen` on — `utoipa`,
+    /// whose derive expands to `::utoipa::…` paths — has to land on the same major line `skyzen`
+    /// re-exports, or the derive implements a different major's trait than the bound names.
+    pub version: Option<&'static str>,
     /// Features to enable.
     pub features: &'static [&'static str],
 }
@@ -43,7 +48,11 @@ pub struct DependencySpec {
 impl DependencySpec {
     /// The `cargo add` arguments for this dependency.
     pub fn cargo_add_args(&self) -> Vec<String> {
-        let mut args = vec!["add".to_owned(), self.name.to_owned()];
+        let package = self.version.map_or_else(
+            || self.name.to_owned(),
+            |version| format!("{}@{version}", self.name),
+        );
+        let mut args = vec!["add".to_owned(), package];
         if !self.features.is_empty() {
             args.push("--features".to_owned());
             args.push(self.features.join(","));
@@ -165,42 +174,54 @@ template_set!(
 pub const fn dependencies(template: Template) -> &'static [DependencySpec] {
     const SKYZEN: DependencySpec = DependencySpec {
         name: "skyzen",
+        version: None,
         features: &[],
     };
     const SKYZEN_WS: DependencySpec = DependencySpec {
         name: "skyzen",
+        version: None,
         features: &["ws"],
     };
     const SERVICES: DependencySpec = DependencySpec {
         name: "skyzen-services",
+        version: None,
         features: &[],
     };
     const TEST: DependencySpec = DependencySpec {
         name: "skyzen-test",
+        version: None,
         features: &[],
     };
     const CLOUDFLARE: DependencySpec = DependencySpec {
         name: "skyzen-cloudflare",
+        version: None,
         features: &[],
     };
     const SERDE: DependencySpec = DependencySpec {
         name: "serde",
+        version: None,
         features: &["derive"],
     };
     const TRACING: DependencySpec = DependencySpec {
         name: "tracing",
+        version: None,
         features: &[],
     };
     const FUTURES: DependencySpec = DependencySpec {
         name: "futures-util",
+        version: None,
         features: &[],
     };
     /// A payload carried by `Json`, `Form` or `Query` has to implement `ToSchema`, and utoipa's
     /// derive expands to `::utoipa::…` paths — so the crate that writes `#[derive(ToSchema)]`
     /// needs the dependency itself. `skyzen::ToSchema` re-exports the trait, which is what the
-    /// bound is written against; it cannot re-export the crate the expansion names.
+    /// bound is written against; it cannot re-export the crate the expansion names. The version
+    /// pins the same major line `skyzen`'s `utoipa` requirement does (`5.4` in the workspace
+    /// manifest): an unconstrained `cargo add utoipa` resolves the newest major and the derived
+    /// impl no longer satisfies `skyzen::ToSchema`. Bump this when `skyzen`'s requirement does.
     const UTOIPA: DependencySpec = DependencySpec {
         name: "utoipa",
+        version: Some("5.4"),
         features: &[],
     };
 
