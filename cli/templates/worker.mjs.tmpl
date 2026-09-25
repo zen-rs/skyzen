@@ -1,8 +1,55 @@
 import init, * as wasmExports from "./{{ bindings_name }}";
 import wasmUrl from "./{{ wasm_name }}";
-{%- for export in durable_exports %}
-export { {{ export.bindings_export_name }} as {{ export.public_name }} } from "./{{ bindings_name }}";
-{%- endfor %}
+
+Error.stackTraceLimit = 100;
+
+// Abort recovery, the way workers-rs' worker-build shim does it: a hard abort
+// (OOM, panic under panic=abort, an `unreachable` trap) poisons the wasm
+// instance and every later request on the isolate fails with error 1101 until
+// Cloudflare recycles it. Any WebAssembly.RuntimeError escaping an export call
+// — caught at a call boundary or reported through the global error events —
+// marks the instance dead, and the next entrypoint call re-creates it via
+// wasm-bindgen's `__wbg_reset_state` (emitted because the build passes
+// `--experimental-reset-state-function`); the bump of `instanceId` makes
+// proxies holding pre-abort objects rebuild them lazily.
+let criticalError = false;
+function registerPanicHook() {
+  if (wasmExports.setPanicHook)
+    wasmExports.setPanicHook(function (message) {
+      const panicError = new Error("Rust panic: " + message);
+      console.error('Critical', panicError);
+      // panic=abort: a panic always traps, so the instance is already dead.
+      criticalError = true;
+    });
+}
+
+let instanceId = 0;
+function checkReinitialize() {
+  if (criticalError) {
+    console.log("Reinitializing Wasm application");
+    wasmExports.__wbg_reset_state();
+    criticalError = false;
+    // The reset instance has no panic callback registered, and the `worker`
+    // crate's hook consumes its callback on the first panic anyway.
+    registerPanicHook();
+    instanceId++;
+  }
+}
+
+addEventListener('error', (e) => {
+  handleMaybeCritical(e.error);
+});
+
+addEventListener('unhandledrejection', (e) => {
+  handleMaybeCritical(e.reason);
+});
+
+function handleMaybeCritical(e) {
+  if (e instanceof WebAssembly.RuntimeError) {
+    console.error('Critical', e);
+    criticalError = true;
+  }
+}
 
 let initPromise;
 
@@ -17,19 +64,113 @@ function ensureInitialized() {
 // runs, so the wasm module must be ready at module load. Workers ESM supports
 // top-level await; the awaits inside each handler are a safety net.
 await ensureInitialized();
+// The hook forwards into the instance, so it can only be registered once wasm
+// is instantiated.
+registerPanicHook();
 
 export default {
   async fetch(request, env, ctx) {
     await ensureInitialized();
-    return wasmExports.fetch(request, env, ctx);
+    checkReinitialize();
+    try {
+      return await wasmExports.fetch(request, env, ctx);
+    } catch (e) {
+      handleMaybeCritical(e);
+      throw e;
+    }
   },
 {%- for member in event_members %}
   async {{ member.name }}({{ member.args }}) {
     await ensureInitialized();
+    checkReinitialize();
     if (typeof wasmExports.{{ member.name }} !== "function") {
       throw new Error("Skyzen.toml declares a {{ member.name }} handler but the wasm module does not export one; annotate a Rust handler with {{ member.macro_hint }}");
     }
-    return wasmExports.{{ member.name }}({{ member.args }});
+    try {
+      return await wasmExports.{{ member.name }}({{ member.args }});
+    } catch (e) {
+      handleMaybeCritical(e);
+      throw e;
+    }
   },
 {%- endfor %}
 };
+{% if !durable_exports.is_empty() %}
+// Durable Object classes exported through the proxy below behave like the
+// Worker default export: construction and every method call reinitialize a
+// dead instance first, and an instance created before an abort is rebuilt on
+// its next property access, since its wasm-side state is gone.
+const instanceProxyHooks = {
+  set: (target, prop, value, receiver) => Reflect.set(target.instance, prop, value, receiver),
+  has: (target, prop) => Reflect.has(target.instance, prop),
+  deleteProperty: (target, prop) => Reflect.deleteProperty(target.instance, prop),
+  apply: (target, thisArg, args) => Reflect.apply(target.instance, thisArg, args),
+  construct: (target, args, newTarget) => Reflect.construct(target.instance, args, newTarget),
+  getPrototypeOf: (target) => Reflect.getPrototypeOf(target.instance),
+  setPrototypeOf: (target, proto) => Reflect.setPrototypeOf(target.instance, proto),
+  isExtensible: (target) => Reflect.isExtensible(target.instance),
+  preventExtensions: (target) => Reflect.preventExtensions(target.instance),
+  getOwnPropertyDescriptor: (target, prop) => Reflect.getOwnPropertyDescriptor(target.instance, prop),
+  defineProperty: (target, prop, descriptor) => Reflect.defineProperty(target.instance, prop, descriptor),
+  ownKeys: (target) => Reflect.ownKeys(target.instance),
+};
+
+const classProxyHooks = {
+  construct(ctor, args, newTarget) {
+    try {
+      checkReinitialize();
+      const instance = {
+        instance: Reflect.construct(ctor, args, newTarget),
+        instanceId,
+        ctor,
+        args,
+        newTarget
+      };
+      return new Proxy(instance, {
+        ...instanceProxyHooks,
+        get(target, prop, receiver) {
+          if (target.instanceId !== instanceId) {
+            target.instance = Reflect.construct(target.ctor, target.args, target.newTarget);
+            target.instanceId = instanceId;
+          }
+          const original = Reflect.get(target.instance, prop, receiver);
+          if (typeof original !== 'function') return original;
+          if (original.constructor === Function) {
+            return new Proxy(original, {
+              apply(target, thisArg, argArray) {
+                checkReinitialize();
+                try {
+                  return target.apply(thisArg, argArray);
+                } catch (e) {
+                  handleMaybeCritical(e);
+                  throw e;
+                }
+              }
+            });
+          } else {
+            return new Proxy(original, {
+              async apply(target, thisArg, argArray) {
+                checkReinitialize();
+                try {
+                  return await target.apply(thisArg, argArray);
+                } catch (e) {
+                  handleMaybeCritical(e);
+                  throw e;
+                }
+              }
+            });
+          }
+        }
+      });
+    } catch (e) {
+      criticalError = true;
+      throw e;
+    }
+  }
+};
+
+{%- for export in durable_exports %}
+const {{ export.public_name }} = new Proxy(wasmExports.{{ export.bindings_export_name }}, classProxyHooks);
+export { {{ export.public_name }} };
+{%- endfor %}
+{%- endif %}

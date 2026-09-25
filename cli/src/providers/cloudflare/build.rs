@@ -253,6 +253,12 @@ fn generate_wasm_bindings(plan: &BuildPlan) -> Result<()> {
         .out_name(&plan.bindgen_out_name)
         .web(true)
         .context("failed to configure wasm-bindgen output mode")?
+        // `--experimental-reset-state-function`: emit `__wbg_reset_state` and the
+        // instance-id tracking so the generated shim can rebuild the wasm
+        // instance after a hard abort rather than leaving the isolate to error
+        // 1101 until Cloudflare recycles it. The worker-build shim consumes the
+        // same mechanism the same way.
+        .reset_state_function(true)
         .typescript(false);
     bindgen.generate(&plan.output_dir).with_context(|| {
         format!(
@@ -495,22 +501,50 @@ mod tests {
 
         assert!(rendered.contains("import init, * as wasmExports from \"./worker_bg.js\";"));
         assert!(rendered.contains("import wasmUrl from \"./worker_bg.wasm\";"));
-        assert!(
-            rendered.contains("export { SchedulerObject as Scheduler } from \"./worker_bg.js\";")
-        );
-        assert!(rendered.contains("export { RoomObject as Room } from \"./worker_bg.js\";"));
+        // Durable Object classes are re-exported behind the recovery proxy so a
+        // pre-abort instance rebuilds itself on the next access.
+        assert!(rendered.contains(
+            "const Scheduler = new Proxy(wasmExports.SchedulerObject, classProxyHooks);\nexport { Scheduler };"
+        ));
+        assert!(rendered.contains(
+            "const Room = new Proxy(wasmExports.RoomObject, classProxyHooks);\nexport { Room };"
+        ));
         // Durable Object classes must be usable in a fresh isolate before the first fetch event,
-        // so the shim initializes wasm at module load.
-        assert!(rendered.contains("await ensureInitialized();\n\nexport default {"));
+        // so the shim initializes wasm (and the panic hook that forwards into it) at module load.
+        assert!(rendered.contains(
+            "await ensureInitialized();\n// The hook forwards into the instance, so it can only be registered once wasm\n// is instantiated.\nregisterPanicHook();\n\nexport default {"
+        ));
     }
 
     #[test]
     fn the_shim_omits_what_the_manifest_does_not_declare() {
         let rendered = shim(&[], &[]);
         assert!(!rendered.contains(" as Scheduler }"));
+        assert!(!rendered.contains("classProxyHooks"));
         assert!(rendered.contains("export default {"));
         assert!(!rendered.contains("async queue("));
         assert!(!rendered.contains("async scheduled("));
+    }
+
+    #[test]
+    fn the_shim_recovers_the_wasm_instance_after_a_hard_abort() {
+        // A panic under panic=abort, an OOM or an unreachable trap poisons the
+        // instance: every entrypoint forwards behind a check that resets it
+        // through wasm-bindgen's `__wbg_reset_state`, and a RuntimeError
+        // escaping through any channel marks the instance for reinit.
+        for rendered in [shim(&[], &[]), shim(&[], &[QUEUE, SCHEDULED])] {
+            assert!(rendered.contains("checkReinitialize();"), "{rendered}");
+            assert!(
+                rendered.contains("wasmExports.__wbg_reset_state();"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("e instanceof WebAssembly.RuntimeError"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("criticalError = true"), "{rendered}");
+            assert!(rendered.contains("addEventListener('error'"), "{rendered}");
+        }
     }
 
     #[test]
@@ -527,7 +561,7 @@ mod tests {
                 "{rendered}"
             );
             assert!(
-                rendered.contains(&format!("return wasmExports.{name}({args});")),
+                rendered.contains(&format!("return await wasmExports.{name}({args});")),
                 "{rendered}"
             );
             assert!(rendered.contains(hint), "{rendered}");
