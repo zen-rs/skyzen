@@ -1,176 +1,158 @@
-import init, * as wasmExports from "./{{ bindings_name }}";
+import { createBindings } from "./{{ bindings_name }}";
 import wasmUrl from "./{{ wasm_name }}";
 
-Error.stackTraceLimit = 100;
-
-// Abort recovery, the way workers-rs' worker-build shim does it: a hard abort
-// (OOM, panic under panic=abort, an `unreachable` trap) poisons the wasm
-// instance and every later request on the isolate fails with error 1101 until
-// Cloudflare recycles it. Any WebAssembly.RuntimeError escaping an export call
-// — caught at a call boundary or reported through the global error events —
-// marks the instance dead, and the next entrypoint call re-creates it via
-// wasm-bindgen's `__wbg_reset_state` (emitted because the build passes
-// `--experimental-reset-state-function`); the bump of `instanceId` makes
-// proxies holding pre-abort objects rebuild them lazily.
-let criticalError = false;
-function registerPanicHook() {
-  if (wasmExports.setPanicHook)
-    wasmExports.setPanicHook(function (message) {
-      const panicError = new Error("Rust panic: " + message);
-      console.error('Critical', panicError);
-      // panic=abort: a panic always traps, so the instance is already dead.
-      criticalError = true;
+// Share compiled code, never an invocation's Rust heap or executor. A cancelled
+// microtask or an uncatchable CPU kill must not strand another request behind
+// wasm-bindgen-futures' is_scheduled flag. Resetting a shared instance also
+// invalidates the closures of every healthy request still awaiting I/O.
+function application() {
+  let failed = false;
+  const onError = error => {
+    if (error instanceof WebAssembly.RuntimeError) failed = true;
+  };
+  const exports = createBindings(wasmUrl, onError);
+  if (exports.setPanicHook) {
+    exports.setPanicHook(message => {
+      failed = true;
+      console.error("Rust panic: " + message);
     });
-}
-
-let instanceId = 0;
-function checkReinitialize() {
-  if (criticalError) {
-    console.log("Reinitializing Wasm application");
-    wasmExports.__wbg_reset_state();
-    criticalError = false;
-    // The reset instance has no panic callback registered, and the `worker`
-    // crate's hook consumes its callback on the first panic anyway.
-    registerPanicHook();
-    instanceId++;
   }
+  return { exports, onError, get failed() { return failed; } };
 }
 
-addEventListener('error', (e) => {
-  handleMaybeCritical(e.error);
-});
+// One warm spare per isolate. Isolation needs two properties — no two live
+// invocations share an instance, and an instance whose invocation trapped,
+// panicked or was killed is never reused — not a fresh instance per request.
+// A taken spare serves exactly one invocation until released; applications
+// created under a concurrent burst are dropped on release while the slot is
+// occupied, never queued beside it.
+let spare = null;
 
-addEventListener('unhandledrejection', (e) => {
-  handleMaybeCritical(e.reason);
-});
-
-function handleMaybeCritical(e) {
-  if (e instanceof WebAssembly.RuntimeError) {
-    console.error('Critical', e);
-    criticalError = true;
+// Leases one application to one invocation and returns its result. The handler
+// sees a ctx whose waitUntil records every promise it is given (all other
+// members pass through unchanged), and the lease ends only once the handler's
+// promise, the response body and every recorded promise have all settled; a
+// healthy application then goes back into the spare slot if it is still empty.
+// An invocation killed by the runtime (CPU limit, V8 termination) never runs
+// this function to completion, so its instance is dropped with it rather than
+// reused half-poisoned.
+async function invoke(ctx, run) {
+  const app = spare ?? application();
+  spare = null;
+  const pending = [];
+  let released = false;
+  const release = async () => {
+    if (released) return;
+    released = true;
+    for (let i = 0; i < pending.length; i++) {
+      try {
+        await pending[i];
+      } catch {
+        // The runtime reports a failed waitUntil itself.
+      }
+    }
+    if (!app.failed && spare === null) spare = app;
+  };
+  if (ctx != null && typeof ctx.waitUntil === "function") {
+    ctx = new Proxy(ctx, {
+      get(target, prop) {
+        if (prop === "waitUntil") {
+          return promise => {
+            pending.push(Promise.resolve(promise).then(() => {}, () => {}));
+            return target.waitUntil(promise);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
   }
-}
-
-let initPromise;
-
-function ensureInitialized() {
-  if (!initPromise) {
-    initPromise = init({ module_or_path: wasmUrl });
+  let result;
+  try {
+    result = await run(app.exports, ctx);
+  } catch (error) {
+    app.onError(error);
+    release();
+    throw error;
   }
-  return initPromise;
+  if (result instanceof Response && result.body !== null) {
+    // The body may run invocation code until it finishes or is cancelled, so
+    // the lease outlives the handler's return. IdentityTransformStream is the
+    // runtime's native byte pipe — no JS hop per chunk — and the pipeTo promise
+    // settles on finish, error, or client cancel; all three settle the lease.
+    // Passing the original response as init keeps status, statusText, headers
+    // and the webSocket/cf fields the runtime copies; bodyless responses (101
+    // upgrades, 204/304) never reach this branch and pass through untouched.
+    const { readable, writable } = new IdentityTransformStream();
+    result.body.pipeTo(writable).then(release, release);
+    return new Response(readable, result);
+  }
+  release();
+  return result;
 }
-
-// Durable Object classes are constructed by the runtime before any handler
-// runs, so the wasm module must be ready at module load. Workers ESM supports
-// top-level await; the awaits inside each handler are a safety net.
-await ensureInitialized();
-// The hook forwards into the instance, so it can only be registered once wasm
-// is instantiated.
-registerPanicHook();
 
 export default {
   async fetch(request, env, ctx) {
-    await ensureInitialized();
-    checkReinitialize();
-    try {
-      return await wasmExports.fetch(request, env, ctx);
-    } catch (e) {
-      handleMaybeCritical(e);
-      throw e;
-    }
+    return invoke(ctx, (exports, ctx) => exports.fetch(request, env, ctx));
   },
 {%- for member in event_members %}
   async {{ member.name }}({{ member.args }}) {
-    await ensureInitialized();
-    checkReinitialize();
-    if (typeof wasmExports.{{ member.name }} !== "function") {
-      throw new Error("Skyzen.toml declares a {{ member.name }} handler but the wasm module does not export one; annotate a Rust handler with {{ member.macro_hint }}");
-    }
-    try {
-      return await wasmExports.{{ member.name }}({{ member.args }});
-    } catch (e) {
-      handleMaybeCritical(e);
-      throw e;
-    }
+    return invoke(ctx, (exports, ctx) => {
+      if (typeof exports.{{ member.name }} !== "function") {
+        throw new Error("Skyzen.toml declares a {{ member.name }} handler but the wasm module does not export one; annotate a Rust handler with {{ member.macro_hint }}");
+      }
+      return exports.{{ member.name }}({{ member.args }});
+    });
   },
 {%- endfor %}
 };
 {% if !durable_exports.is_empty() %}
-// Durable Object classes exported through the proxy below behave like the
-// Worker default export: construction and every method call reinitialize a
-// dead instance first, and an instance created before an abort is rebuilt on
-// its next property access, since its wasm-side state is gone.
-const instanceProxyHooks = {
-  set: (target, prop, value, receiver) => Reflect.set(target.instance, prop, value, receiver),
-  has: (target, prop) => Reflect.has(target.instance, prop),
-  deleteProperty: (target, prop) => Reflect.deleteProperty(target.instance, prop),
-  apply: (target, thisArg, args) => Reflect.apply(target.instance, thisArg, args),
-  construct: (target, args, newTarget) => Reflect.construct(target.instance, args, newTarget),
-  getPrototypeOf: (target) => Reflect.getPrototypeOf(target.instance),
-  setPrototypeOf: (target, proto) => Reflect.setPrototypeOf(target.instance, proto),
-  isExtensible: (target) => Reflect.isExtensible(target.instance),
-  preventExtensions: (target) => Reflect.preventExtensions(target.instance),
-  getOwnPropertyDescriptor: (target, prop) => Reflect.getOwnPropertyDescriptor(target.instance, prop),
-  defineProperty: (target, prop, descriptor) => Reflect.defineProperty(target.instance, prop, descriptor),
-  ownKeys: (target) => Reflect.ownKeys(target.instance),
-};
-
-const classProxyHooks = {
-  construct(ctor, args, newTarget) {
-    try {
-      checkReinitialize();
-      const instance = {
-        instance: Reflect.construct(ctor, args, newTarget),
-        instanceId,
-        ctor,
-        args,
-        newTarget
-      };
-      return new Proxy(instance, {
-        ...instanceProxyHooks,
-        get(target, prop, receiver) {
-          if (target.instanceId !== instanceId) {
-            target.instance = Reflect.construct(target.ctor, target.args, target.newTarget);
-            target.instanceId = instanceId;
-          }
-          const original = Reflect.get(target.instance, prop, receiver);
-          if (typeof original !== 'function') return original;
-          if (original.constructor === Function) {
-            return new Proxy(original, {
-              apply(target, thisArg, argArray) {
-                checkReinitialize();
-                try {
-                  return target.apply(thisArg, argArray);
-                } catch (e) {
-                  handleMaybeCritical(e);
-                  throw e;
-                }
-              }
-            });
-          } else {
-            return new Proxy(original, {
-              async apply(target, thisArg, argArray) {
-                checkReinitialize();
-                try {
-                  return await target.apply(thisArg, argArray);
-                } catch (e) {
-                  handleMaybeCritical(e);
-                  throw e;
-                }
-              }
-            });
-          }
+// A Durable Object owns persistent in-memory state, so its instance belongs to
+// the object, not an individual method call. Other objects and Worker events
+// never share its bindings — the spare slot is for the Worker's invocations
+// only. Recovery replaces only this object's application.
+function durableClass(name) {
+  return class {
+    constructor(...args) {
+      let app;
+      let instance;
+      function current() {
+        if (!app || app.failed) {
+          app = application();
+          instance = new app.exports[name](...args);
         }
+        return instance;
+      }
+      current();
+      return new Proxy(this, {
+        get(_target, prop) {
+          const value = Reflect.get(current(), prop, instance);
+          if (typeof value !== 'function') return value;
+          return (...methodArgs) => {
+            const receiver = current();
+            const owner = app;
+            try {
+              const result = Reflect.apply(Reflect.get(receiver, prop), receiver, methodArgs);
+              // wasm-bindgen's async exports are ordinary JS functions returning
+              // Promises. Checking Function vs AsyncFunction misses rejections.
+              if (result && typeof result.then === 'function') {
+                return result.catch(error => { owner.onError(error); throw error; });
+              }
+              return result;
+            } catch (error) {
+              owner.onError(error);
+              throw error;
+            }
+          };
+        },
+        set(_target, prop, value) { return Reflect.set(current(), prop, value); },
+        has(_target, prop) { return Reflect.has(current(), prop); },
       });
-    } catch (e) {
-      criticalError = true;
-      throw e;
     }
-  }
-};
-
+  };
+}
 {%- for export in durable_exports %}
-const {{ export.public_name }} = new Proxy(wasmExports.{{ export.bindings_export_name }}, classProxyHooks);
+const {{ export.public_name }} = durableClass("{{ export.bindings_export_name }}");
 export { {{ export.public_name }} };
 {%- endfor %}
 {%- endif %}
