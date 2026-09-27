@@ -1,8 +1,12 @@
-//! Give each invocation its own wasm-bindgen module state.
+//! Give each application its own wasm-bindgen module state and count its live
+//! JS→wasm transitions.
 //!
 //! The pinned web generator emits one-line imports and export declarations. Keep
 //! imports at module scope and put its mutable glue, classes, and Wasm instance
-//! in a factory. This is a build-time transform, not runtime eval.
+//! in a factory. This is a build-time transform, not runtime eval. The factory
+//! also wraps the instance's exports with a depth counter so the worker shim can
+//! tell a terminated invocation (which never ran its `finally`) apart from a
+//! suspended one.
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -48,9 +52,43 @@ pub(super) fn invocation_factory(source: &str) -> Result<String> {
     let mut output = format!(
         "{imports}\nexport function createBindings(module, onError = () => {{}}) {{\n\
          // Each executor callback belongs to this instance, including its errors.\n\
-         const queueMicrotask = callback => globalThis.queueMicrotask(() => {{\n\
+         // A posted callback decrements back to zero before the next event\n\
+         // runs; a positive count at an event entry means a queued callback\n\
+         // never ran — dropped, or killed while pending — which strands the\n\
+         // wasm-bindgen executor's scheduling flag, so it is poison.\n\
+     let stranded = 0;\n\
+     const queueMicrotask = callback => {{\n\
+         stranded += 1;\n\
+         globalThis.queueMicrotask(() => {{\n\
+             stranded -= 1;\n\
              try {{ callback(); }} catch (error) {{ onError(error); throw error; }}\n\
-         }});\n{body}\ninitSync({{ module }});\nreturn {{\n"
+         }});\n\
+     }};\n{body}\ninitSync({{ module }});\n\
+     // Every JS→wasm transition goes through this proxy: plain export calls,\n\
+     // wasm-bindgen closure invocations and the executor's queued microtasks\n\
+     // alike resolve `wasm.<name>` here. `depth` is the number of calls still\n\
+     // inside wasm. A V8 termination (the CPU limit) is uncatchable and skips\n\
+     // `finally`, so it leaves `depth` above zero — the worker shim reads it\n\
+     // at each event entry to detect a poisoned application.\n\
+     // The exports object is a frozen module namespace, so a Proxy cannot\n\
+     // return wrapped functions for it (non-configurable data properties).\n\
+     // Copy it instead: function exports get the depth-counting wrapper,\n\
+     // memory, tables and globals are shared by reference.\n\
+     const live = wasm;\n\
+     let depth = 0;\n\
+     const copy = {{}};\n\
+     for (const prop of Object.keys(live)) {{\n\
+         const value = live[prop];\n\
+         copy[prop] = typeof value === \"function\" ? (...args) => {{\n\
+             depth += 1;\n\
+             try {{\n\
+                 return Reflect.apply(value, live, args);\n\
+             }} finally {{\n\
+                 depth -= 1;\n\
+             }}\n\
+         }} : value;\n\
+     }}\n\
+     wasm = copy;\nreturn {{\nget depth() {{ return depth; }},\nget stranded() {{ return stranded; }},\n"
     );
     for (local, public) in exports {
         // Names, including quoted JS export names, are emitted by wasm-bindgen.
