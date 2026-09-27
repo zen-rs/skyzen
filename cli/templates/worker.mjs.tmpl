@@ -1,10 +1,10 @@
 import { createBindings } from "./{{ bindings_name }}";
 import wasmUrl from "./{{ wasm_name }}";
 
-// Share compiled code, never an invocation's Rust heap or executor. A cancelled
-// microtask or an uncatchable CPU kill must not strand another request behind
-// wasm-bindgen-futures' is_scheduled flag. Resetting a shared instance also
-// invalidates the closures of every healthy request still awaiting I/O.
+// One application per isolate, shared by every invocation — the same cost as
+// the pre-0.4.3 shim. It is replaced only when poisoned, and never reset:
+// invocations still in flight on the old one keep their references and finish
+// or fail on their own, so `__wbg_reset_state` is never called.
 function application() {
   let failed = false;
   const onError = error => {
@@ -17,107 +17,80 @@ function application() {
       console.error("Rust panic: " + message);
     });
   }
-  return { exports, onError, get failed() { return failed; } };
+  return {
+    exports,
+    onError,
+    get failed() {
+      return failed;
+    },
+    get depth() {
+      return exports.depth ?? 0;
+    },
+    get stranded() {
+      return exports.stranded ?? 0;
+    },
+  };
 }
 
-// One warm spare per isolate. Isolation needs two properties — no two live
-// invocations share an instance, and an instance whose invocation trapped,
-// panicked or was killed is never reused — not a fresh instance per request.
-// A taken spare serves exactly one invocation until released; applications
-// created under a concurrent burst are dropped on release while the slot is
-// occupied, never queued beside it.
-let spare = null;
+let current = null;
 
-// Leases one application to one invocation and returns its result. The handler
-// sees a ctx whose waitUntil records every promise it is given (all other
-// members pass through unchanged), and the lease ends only once the handler's
-// promise, the response body and every recorded promise have all settled; a
-// healthy application then goes back into the spare slot if it is still empty.
-// An invocation killed by the runtime (CPU limit, V8 termination) never runs
-// this function to completion, so its instance is dropped with it rather than
-// reused half-poisoned.
-async function invoke(ctx, run) {
-  const app = spare ?? application();
-  spare = null;
-  const pending = [];
-  let released = false;
-  const release = async () => {
-    if (released) return;
-    released = true;
-    for (let i = 0; i < pending.length; i++) {
-      try {
-        await pending[i];
-      } catch {
-        // The runtime reports a failed waitUntil itself.
-      }
-    }
-    if (!app.failed && spare === null) spare = app;
-  };
-  if (ctx != null && typeof ctx.waitUntil === "function") {
-    ctx = new Proxy(ctx, {
-      get(target, prop) {
-        if (prop === "waitUntil") {
-          return promise => {
-            pending.push(Promise.resolve(promise).then(() => {}, () => {}));
-            return target.waitUntil(promise);
-          };
-        }
-        const value = Reflect.get(target, prop, target);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
+// Returns the isolate's application, switching generations when the current
+// one is poisoned. A non-zero `depth` at an event boundary means a wasm call
+// never ran its `finally`: the runtime terminated it (an uncatchable CPU kill
+// skips the decrement). A non-zero `stranded` means a microtask the executor
+// posted never ran — it was dropped or killed while pending, and the
+// executor's scheduling flag stays set forever, starving every future on the
+// instance. A WebAssembly.RuntimeError through `onError` or a Rust panic
+// through the panic hook marks it `failed`; a thrown or rejected handler error
+// is routed through `onError` too, so only a real wasm trap poisons — an
+// ordinary Error keeps the shared application. In every poisoned case a fresh
+// application serves this and every later invocation; the shim drops its
+// reference to the old one, which in-flight invocations already captured.
+function entry() {
+  if (current === null || current.depth !== 0 || current.stranded !== 0 || current.failed) {
+    current = application();
   }
-  let result;
-  try {
-    result = await run(app.exports, ctx);
-  } catch (error) {
-    app.onError(error);
-    release();
-    throw error;
-  }
-  if (result instanceof Response && result.body !== null) {
-    // The body may run invocation code until it finishes or is cancelled, so
-    // the lease outlives the handler's return. IdentityTransformStream is the
-    // runtime's native byte pipe — no JS hop per chunk — and the pipeTo promise
-    // settles on finish, error, or client cancel; all three settle the lease.
-    // Passing the original response as init keeps status, statusText, headers
-    // and the webSocket/cf fields the runtime copies; bodyless responses (101
-    // upgrades, 204/304) never reach this branch and pass through untouched.
-    const { readable, writable } = new IdentityTransformStream();
-    result.body.pipeTo(writable).then(release, release);
-    return new Response(readable, result);
-  }
-  release();
-  return result;
+  return current;
 }
 
 export default {
   async fetch(request, env, ctx) {
-    return invoke(ctx, (exports, ctx) => exports.fetch(request, env, ctx));
+    const app = entry();
+    try {
+      return await app.exports.fetch(request, env, ctx);
+    } catch (error) {
+      app.onError(error);
+      throw error;
+    }
   },
 {%- for member in event_members %}
   async {{ member.name }}({{ member.args }}) {
-    return invoke(ctx, (exports, ctx) => {
-      if (typeof exports.{{ member.name }} !== "function") {
-        throw new Error("Skyzen.toml declares a {{ member.name }} handler but the wasm module does not export one; annotate a Rust handler with {{ member.macro_hint }}");
-      }
-      return exports.{{ member.name }}({{ member.args }});
-    });
+    const app = entry();
+    if (typeof app.exports.{{ member.name }} !== "function") {
+      throw new Error("Skyzen.toml declares a {{ member.name }} handler but the wasm module does not export one; annotate a Rust handler with {{ member.macro_hint }}");
+    }
+    try {
+      return await app.exports.{{ member.name }}({{ member.args }});
+    } catch (error) {
+      app.onError(error);
+      throw error;
+    }
   },
 {%- endfor %}
 };
 {% if !durable_exports.is_empty() %}
-// A Durable Object owns persistent in-memory state, so its instance belongs to
-// the object, not an individual method call. Other objects and Worker events
-// never share its bindings — the spare slot is for the Worker's invocations
-// only. Recovery replaces only this object's application.
+// A Durable Object owns persistent in-memory state, so its application belongs
+// to the object, not an individual method call. Other objects and Worker events
+// never share its bindings — the shared `current` is for the Worker's
+// invocations only. The same poison check applies on every method entry, so a
+// killed or trapped method replaces only this object's application.
 function durableClass(name) {
   return class {
     constructor(...args) {
       let app;
       let instance;
       function current() {
-        if (!app || app.failed) {
+        if (!app || app.failed || app.depth !== 0 || app.stranded !== 0) {
           app = application();
           instance = new app.exports[name](...args);
         }
