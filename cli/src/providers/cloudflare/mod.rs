@@ -1,5 +1,6 @@
 //! The Cloudflare Workers provider.
 
+mod bindings;
 pub mod build;
 pub mod ids;
 pub mod provision;

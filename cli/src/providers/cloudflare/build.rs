@@ -253,12 +253,6 @@ fn generate_wasm_bindings(plan: &BuildPlan) -> Result<()> {
         .out_name(&plan.bindgen_out_name)
         .web(true)
         .context("failed to configure wasm-bindgen output mode")?
-        // `--experimental-reset-state-function`: emit `__wbg_reset_state` and the
-        // instance-id tracking so the generated shim can rebuild the wasm
-        // instance after a hard abort rather than leaving the isolate to error
-        // 1101 until Cloudflare recycles it. The worker-build shim consumes the
-        // same mechanism the same way.
-        .reset_state_function(true)
         .typescript(false);
     bindgen.generate(&plan.output_dir).with_context(|| {
         format!(
@@ -279,6 +273,10 @@ fn generate_wasm_bindings(plan: &BuildPlan) -> Result<()> {
     let bindings_source = fs::read_to_string(&plan.bindings_js_path)
         .with_context(|| format!("failed to read {}", plan.bindings_js_path.display()))?;
     verify_durable_exports(&bindings_source, &plan.durable_exports)?;
+    fs::write(
+        &plan.bindings_js_path,
+        super::bindings::invocation_factory(&bindings_source)?,
+    )?;
 
     let bindings_name = file_name(&plan.bindings_js_path)?;
     let wasm_name = file_name(&plan.wasm_output_path)?;
@@ -499,52 +497,67 @@ mod tests {
             &[],
         );
 
-        assert!(rendered.contains("import init, * as wasmExports from \"./worker_bg.js\";"));
-        assert!(rendered.contains("import wasmUrl from \"./worker_bg.wasm\";"));
-        // Durable Object classes are re-exported behind the recovery proxy so a
-        // pre-abort instance rebuilds itself on the next access.
-        assert!(rendered.contains(
-            "const Scheduler = new Proxy(wasmExports.SchedulerObject, classProxyHooks);\nexport { Scheduler };"
-        ));
-        assert!(rendered.contains(
-            "const Room = new Proxy(wasmExports.RoomObject, classProxyHooks);\nexport { Room };"
-        ));
-        // Durable Object classes must be usable in a fresh isolate before the first fetch event,
-        // so the shim initializes wasm (and the panic hook that forwards into it) at module load.
-        assert!(rendered.contains(
-            "await ensureInitialized();\n// The hook forwards into the instance, so it can only be registered once wasm\n// is instantiated.\nregisterPanicHook();\n\nexport default {"
-        ));
+        assert!(rendered.contains("import { createBindings } from \"./worker_bg.js\";"));
+        assert!(rendered.contains("const Scheduler = durableClass(\"SchedulerObject\");"));
+        assert!(rendered.contains("const Room = durableClass(\"RoomObject\");"));
     }
 
     #[test]
     fn the_shim_omits_what_the_manifest_does_not_declare() {
         let rendered = shim(&[], &[]);
-        assert!(!rendered.contains(" as Scheduler }"));
-        assert!(!rendered.contains("classProxyHooks"));
-        assert!(rendered.contains("export default {"));
+        assert!(!rendered.contains("durableClass"));
         assert!(!rendered.contains("async queue("));
         assert!(!rendered.contains("async scheduled("));
     }
 
     #[test]
-    fn the_shim_recovers_the_wasm_instance_after_a_hard_abort() {
-        // A panic under panic=abort, an OOM or an unreachable trap poisons the
-        // instance: every entrypoint forwards behind a check that resets it
-        // through wasm-bindgen's `__wbg_reset_state`, and a RuntimeError
-        // escaping through any channel marks the instance for reinit.
+    fn the_shim_leases_a_single_warm_spare_to_invocations() {
         for rendered in [shim(&[], &[]), shim(&[], &[QUEUE, SCHEDULED])] {
-            assert!(rendered.contains("checkReinitialize();"), "{rendered}");
-            assert!(
-                rendered.contains("wasmExports.__wbg_reset_state();"),
-                "{rendered}"
-            );
-            assert!(
-                rendered.contains("e instanceof WebAssembly.RuntimeError"),
-                "{rendered}"
-            );
-            assert!(rendered.contains("criticalError = true"), "{rendered}");
-            assert!(rendered.contains("addEventListener('error'"), "{rendered}");
+            assert!(rendered.contains("let spare = null;"));
+            assert!(rendered.contains("const app = spare ?? application();"));
+            assert!(rendered.contains("invoke(ctx,"));
+            assert!(!rendered.contains("__wbg_reset_state"));
+            assert!(!rendered.contains("addEventListener"));
         }
+    }
+
+    #[test]
+    fn concurrent_invocations_and_durable_recovery_in_javascript() {
+        let dir = tempfile::tempdir().unwrap();
+        let rendered = render_worker_shim(
+            "bindings.mjs",
+            "module.mjs",
+            &[DurableObjectExport {
+                public_name: "Room".to_owned(),
+                bindings_export_name: "RoomObject".to_owned(),
+            }],
+            &[QUEUE, SCHEDULED],
+        )
+        .unwrap();
+        for (name, contents) in [
+            ("worker.mjs", rendered.as_str()),
+            ("module.mjs", "export default {};"),
+            (
+                "bindings.mjs",
+                include_str!("../../../tests/fixtures/invocation-bindings.mjs"),
+            ),
+            (
+                "test.mjs",
+                include_str!("../../../tests/fixtures/invocation-test.mjs"),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), contents).unwrap();
+        }
+        let output = std::process::Command::new("node")
+            .arg(dir.path().join("test.mjs"))
+            .output()
+            .expect("Node.js is required to test the generated Worker shim");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -561,7 +574,7 @@ mod tests {
                 "{rendered}"
             );
             assert!(
-                rendered.contains(&format!("return await wasmExports.{name}({args});")),
+                rendered.contains(&format!("return exports.{name}({args});")),
                 "{rendered}"
             );
             assert!(rendered.contains(hint), "{rendered}");
