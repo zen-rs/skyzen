@@ -511,12 +511,14 @@ mod tests {
     }
 
     #[test]
-    fn the_shim_leases_a_single_warm_spare_to_invocations() {
+    fn the_shim_shares_one_instance_until_it_is_poisoned() {
         for rendered in [shim(&[], &[]), shim(&[], &[QUEUE, SCHEDULED])] {
-            assert!(rendered.contains("let spare = null;"));
-            assert!(rendered.contains("const app = spare ?? application();"));
-            assert!(rendered.contains("invoke(ctx,"));
-            assert!(!rendered.contains("__wbg_reset_state"));
+            assert!(rendered.contains("let current = null;"));
+            assert!(rendered.contains("current.stranded !== 0 || current.failed"));
+            assert!(rendered.contains("current = application();"));
+            assert!(rendered.contains("app.onError(error);"));
+            assert!(!rendered.contains(".fail()"));
+            assert!(!rendered.contains("__wbg_reset_state()"));
             assert!(!rendered.contains("addEventListener"));
         }
     }
@@ -574,7 +576,7 @@ mod tests {
                 "{rendered}"
             );
             assert!(
-                rendered.contains(&format!("return exports.{name}({args});")),
+                rendered.contains(&format!("return await app.exports.{name}({args});")),
                 "{rendered}"
             );
             assert!(rendered.contains(hint), "{rendered}");
