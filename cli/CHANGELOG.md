@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/zen-rs/skyzen/compare/skyzen-cli-v0.4.1...skyzen-cli-v0.4.2) - 2026-09-25
+
+### Fixed
+
+- *(scaffold)* pin the generated project's utoipa to skyzen's major line
+- *(cloudflare)* recover the wasm instance after a hard abort
+- *(cli)* ignore read events in the dev watcher
+
 ## [0.4.0](https://github.com/zen-rs/skyzen/compare/skyzen-cli-v0.3.0...skyzen-cli-v0.4.0) - 2026-09-18
 
 ### Added
