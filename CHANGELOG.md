@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/zen-rs/skyzen/compare/v0.4.2...v0.4.3) - 2026-09-27
+
+### Fixed
+
+- *(cloudflare)* never share a wasm instance between live invocations ([#88](https://github.com/zen-rs/skyzen/pull/88))
+
+### Other
+
+- merge main back into dev after the 0.4.2 release
+
 ## [0.4.2](https://github.com/zen-rs/skyzen/compare/v0.4.1...v0.4.2) - 2026-09-25
 
 ### Fixed
