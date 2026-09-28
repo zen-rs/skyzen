@@ -143,6 +143,14 @@ jobs:
             curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/visits/lobby | grep -x "$expected"
           done
           curl -sSf http://127.0.0.1:8787/visits/annex | grep -x 1
+          # `Content-Encoding` marks a body as already encoded, so the conversion sets
+          # `encodeBody: "manual"` and workerd serves the bytes verbatim: one client-side
+          # decode reads the greeting. Without it the runtime compresses the body a second
+          # time and `--compressed` leaves gzip bytes.
+          curl --compressed --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/gzipped | grep -Fx "Hello from the encoded side!"
+          # A response without `Content-Encoding` keeps `encodeBody: "automatic"`: the
+          # platform may compress it on the wire and the client still decodes once to JSON.
+          curl --compressed --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/json | grep -F '"encoding":"platform"'
 
       - name: Shutdown wrangler
         if: always()
