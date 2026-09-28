@@ -41,7 +41,11 @@ pub enum Action {
         runner_args: Vec<String>,
     },
     /// Build and upload.
-    Deploy,
+    Deploy {
+        /// Upload the version without deploying it (`wrangler versions upload`), for a rollout
+        /// driven outside the CLI.
+        upload_only: bool,
+    },
     /// Stream logs from the deployed application.
     Logs {
         /// Arguments forwarded verbatim to the provider's log command.
@@ -93,7 +97,7 @@ impl Action {
     const fn requires_cloud(&self) -> bool {
         matches!(
             self,
-            Self::Deploy | Self::Logs { .. } | Self::Secret(_) | Self::Migrate { .. }
+            Self::Deploy { .. } | Self::Logs { .. } | Self::Secret(_) | Self::Migrate { .. }
         )
     }
 }
@@ -402,6 +406,13 @@ pub fn prepare(
             action_name(action)
         );
     }
+    // `versions upload` is a Cloudflare notion: AWS and Azure deployments do not have an
+    // undeployed artifact to leave behind.
+    if provider != Provider::Cloudflare && matches!(action, Action::Deploy { upload_only: true }) {
+        anyhow::bail!(
+            "`skyzen deploy --upload-only` is only implemented by the Cloudflare provider"
+        );
+    }
 
     let manifest = load_or_empty(manifest_path)?;
     if let Action::Secret(SecretAction::Set { name, .. }) = action {
@@ -489,7 +500,7 @@ const fn action_name(action: &Action) -> &'static str {
     match action {
         Action::Build { .. } => "build",
         Action::Dev { .. } => "dev",
-        Action::Deploy => "deploy",
+        Action::Deploy { .. } => "deploy",
         Action::Logs { .. } => "logs",
         Action::Secret(_) => "secret",
         Action::Migrate { status: true, .. } => "migrate status",
@@ -999,7 +1010,10 @@ mod tests {
             .default_provider(),
             Provider::Native
         );
-        assert_eq!(Action::Deploy.default_provider(), Provider::Cloudflare);
+        assert_eq!(
+            Action::Deploy { upload_only: false }.default_provider(),
+            Provider::Cloudflare
+        );
         assert_eq!(
             Action::Build { release: true }.default_provider(),
             Provider::Cloudflare
@@ -1008,7 +1022,7 @@ mod tests {
 
     #[test]
     fn the_cloud_only_actions_are_the_ones_that_talk_to_an_account() {
-        assert!(Action::Deploy.requires_cloud());
+        assert!(Action::Deploy { upload_only: false }.requires_cloud());
         assert!(Action::Logs {
             wrangler_args: Vec::new()
         }
@@ -1056,7 +1070,7 @@ mod tests {
 
         // The Cloudflare path still fails, but with the message that says what to add.
         let error = super::prepare(
-            &Action::Deploy,
+            &Action::Deploy { upload_only: false },
             &missing,
             Some(Provider::Cloudflare),
             None,

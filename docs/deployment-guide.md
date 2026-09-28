@@ -196,6 +196,11 @@ skyzen deploy --provider cloudflare --dry-run
 build and passes `--dry-run` to wrangler, so it validates the actual bundle rather than skipping
 the work. A binding with no provisioned id is refused here rather than being invented.
 
+`skyzen deploy --upload-only` runs `wrangler versions upload` instead: the new version is uploaded
+but not deployed, so an external rollout can shift traffic onto it gradually with
+`wrangler versions deploy`. Declared secrets travel in the same upload as the code
+(`--secrets-file`), so the version a canary serves already carries them.
+
 ### Environments
 
 `[cloudflare.env.<name>]` overlays the base configuration; `--env <name>` selects it and forwards

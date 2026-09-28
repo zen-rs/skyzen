@@ -101,7 +101,13 @@ pub enum Command {
         #[arg(long)]
         no_open: bool,
     },
-    Deploy,
+    /// Build and deploy.
+    Deploy {
+        /// Upload the new version without deploying it, so traffic can be shifted onto it
+        /// gradually (`wrangler versions upload`; Cloudflare only).
+        #[arg(long)]
+        upload_only: bool,
+    },
 
     /// Create the cloud resources the manifest declares but has no id for.
     Provision,
@@ -259,7 +265,10 @@ mod tests {
         ]);
         assert_eq!(parsed.provider, Some(Provider::Cloudflare));
         assert_eq!(parsed.manifest, std::path::PathBuf::from("custom.toml"));
-        assert!(matches!(parsed.command, Command::Deploy));
+        assert!(matches!(
+            parsed.command,
+            Command::Deploy { upload_only: false }
+        ));
 
         let short = parse(&["skyzen", "-p", "native", "dev"]);
         assert_eq!(short.provider, Some(Provider::Native));

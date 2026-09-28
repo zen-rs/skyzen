@@ -3,7 +3,7 @@
 use super::{DurableDbBackend, DurableDbError};
 use crate::{Db, DbExecResult, DbValue, JsonRow};
 
-/// A real in-memory SQLite implementation of Durable Object SQL storage.
+/// A real in-memory `SQLite` implementation of Durable Object SQL storage.
 ///
 /// Each instance owns an isolated single-connection database, so schema and rows remain available
 /// for the lifetime of the simulated Durable Object or test fixture.
@@ -13,11 +13,11 @@ pub struct SqliteDurableDb {
 }
 
 impl SqliteDurableDb {
-    /// Open a new isolated in-memory SQLite database.
+    /// Open a new isolated in-memory `SQLite` database.
     ///
     /// # Errors
     ///
-    /// Returns an error when SQLite cannot initialize the database.
+    /// Returns an error when `SQLite` cannot initialize the database.
     pub async fn in_memory() -> Result<Self, DurableDbError> {
         Ok(Self {
             db: Db::connect_sqlite_memory()

@@ -99,7 +99,7 @@ impl SecretDelivery<'_> {
         vec!["--config".to_owned(), self.config_path.to_owned()]
     }
 
-    /// `wrangler secret bulk`, reading `{"NAME":"value"}` on its standard input.
+    /// The `{"NAME":"value"}` document every bulk delivery is built from.
     ///
     /// `None` when there is nothing to deliver, because an empty document is an error to wrangler
     /// and a project with no classic secrets has nothing to say about them.
@@ -107,24 +107,32 @@ impl SecretDelivery<'_> {
     /// # Errors
     ///
     /// Fails only when the values cannot be encoded as JSON.
-    pub fn bulk_step(&self, resolved: &ResolvedVariables) -> Result<Option<CommandPlan>> {
+    fn bulk_payload(resolved: &ResolvedVariables) -> Result<Option<SecretString>> {
         if resolved.is_empty() {
             return Ok(None);
         }
 
         // The one place these values are exposed: from here they go to wrangler's standard input
-        // and nowhere else.
+        // or to a file it reads, and nowhere else.
         let payload: BTreeMap<&str, &str> = resolved
             .iter()
             .map(|(name, value)| (name.as_str(), environment::expose(value)))
             .collect();
-        let json = serde_json::to_string(&payload)
-            .context("failed to encode the secrets for `wrangler secret bulk`")?;
+        serde_json::to_string(&payload)
+            .map(|json| Some(SecretString::from(json)))
+            .context("failed to encode the secrets for a bulk delivery")
+    }
 
-        Ok(Some(
+    /// `wrangler secret bulk`, reading `{"NAME":"value"}` on its standard input.
+    ///
+    /// # Errors
+    ///
+    /// Fails only when the values cannot be encoded as JSON.
+    pub fn bulk_step(&self, resolved: &ResolvedVariables) -> Result<Option<CommandPlan>> {
+        Ok(Self::bulk_payload(resolved)?.map(|json| {
             self.wrangler(&["secret", "bulk"], self.config_args)
-                .with_stdin(SecretString::from(json)),
-        ))
+                .with_stdin(json)
+        }))
     }
 
     /// The work `skyzen secret set NAME` performs.
@@ -212,6 +220,27 @@ impl SecretDelivery<'_> {
             value: environment::duplicate(value),
         }
     }
+}
+
+/// The `{"NAME":"value"}` document at a path, for `wrangler versions upload --secrets-file`.
+///
+/// `versions upload` takes the secrets in the upload that carries the code, so the version a
+/// gradual deployment shifts traffic onto already has them; `secret bulk` would mint a second
+/// version on top of the uploaded one.
+///
+/// # Errors
+///
+/// Fails only when the values cannot be encoded as JSON.
+pub fn upload_secrets_file(
+    resolved: &ResolvedVariables,
+    path: PathBuf,
+) -> Result<Option<GeneratedFile>> {
+    Ok(
+        SecretDelivery::bulk_payload(resolved)?.map(|json| GeneratedFile {
+            path,
+            contents: FileContents::Secret(json),
+        }),
+    )
 }
 
 /// Which Secrets Store a task writes to.

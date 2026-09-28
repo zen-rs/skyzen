@@ -130,7 +130,9 @@ fn action_for(command: &Command) -> Result<Action> {
         Command::Dev { runner_args } => Action::Dev {
             runner_args: runner_args.clone(),
         },
-        Command::Deploy => Action::Deploy,
+        Command::Deploy { upload_only } => Action::Deploy {
+            upload_only: *upload_only,
+        },
         Command::Logs { wrangler_args } => Action::Logs {
             wrangler_args: wrangler_args.clone(),
         },
