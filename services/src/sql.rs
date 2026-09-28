@@ -1662,7 +1662,7 @@ async fn execute_postgres_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    let query = bind_query_values!(numeric, sqlx::query(query), params);
+    let query = bind_query_values!(numeric, sqlx::query(sqlx::AssertSqlSafe(query)), params);
     let result = query.execute(executor).await?;
     Ok(DbExecResult {
         rows: Vec::new(),
@@ -1689,7 +1689,7 @@ async fn execute_mysql_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
 {
-    let query = bind_query_values!(numeric, sqlx::query(query), params);
+    let query = bind_query_values!(numeric, sqlx::query(sqlx::AssertSqlSafe(query)), params);
     let result = query.execute(executor).await?;
     Ok(DbExecResult {
         rows: Vec::new(),
@@ -1716,7 +1716,11 @@ async fn execute_sqlite_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let query = bind_query_values!(decimal_text, sqlx::query(query), params);
+    let query = bind_query_values!(
+        decimal_text,
+        sqlx::query(sqlx::AssertSqlSafe(query)),
+        params
+    );
     let result = query.execute(executor).await?;
     Ok(DbExecResult {
         rows: Vec::new(),
@@ -1743,7 +1747,7 @@ async fn query_postgres_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    let query = bind_query_values!(numeric, sqlx::query(query), params);
+    let query = bind_query_values!(numeric, sqlx::query(sqlx::AssertSqlSafe(query)), params);
     let rows = query.fetch_all(executor).await?;
     let rows_json = rows
         .iter()
@@ -1774,7 +1778,7 @@ async fn query_mysql_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::MySql>,
 {
-    let query = bind_query_values!(numeric, sqlx::query(query), params);
+    let query = bind_query_values!(numeric, sqlx::query(sqlx::AssertSqlSafe(query)), params);
     let rows = query.fetch_all(executor).await?;
     let rows_json = rows
         .iter()
@@ -1805,7 +1809,11 @@ async fn query_sqlite_with<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let query = bind_query_values!(decimal_text, sqlx::query(query), params);
+    let query = bind_query_values!(
+        decimal_text,
+        sqlx::query(sqlx::AssertSqlSafe(query)),
+        params
+    );
     let rows = query.fetch_all(executor).await?;
     let rows_json = rows
         .iter()
@@ -2547,12 +2555,7 @@ mod fallback_tests {
     test,
     not(target_arch = "wasm32"),
     feature = "sqlite",
-    any(
-        feature = "runtime-tokio-native-tls",
-        feature = "runtime-tokio-rustls",
-        feature = "runtime-async-std-native-tls",
-        feature = "runtime-async-std-rustls"
-    )
+    any(feature = "runtime-tokio", feature = "runtime-async-std")
 ))]
 mod tests {
     use super::{BatchStatement, Db};

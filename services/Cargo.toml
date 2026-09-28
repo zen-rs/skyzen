@@ -28,24 +28,28 @@ tracing.workspace = true
 hex = "0.4"
 # The parameter types `DbValue` carries. These are named directly rather than through
 # `sqlx::types` because `DbValue` must exist on wasm32, where sqlx is not compiled at all; the
-# versions are the ones sqlx 0.8 re-exports, so cargo unifies them into one crate and a bound
+# versions are the ones sqlx 0.9 re-exports, so cargo unifies them into one crate and a bound
 # `DateTime`/`Uuid`/`BigDecimal` is the same type sqlx's `Encode` impls expect.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = "1"
 bigdecimal = "0.4"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-sqlx = { version = "0.8", default-features = false, features = ["json", "chrono", "uuid", "bigdecimal"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["json", "chrono", "uuid", "bigdecimal"], optional = true }
 
 [features]
 # All native sqlx drivers are enabled by default; disable default features and
 # pick individual drivers to trim compile times.
 default = ["postgres", "mysql", "sqlite"]
-# Runtime features - user selects in their application
-runtime-tokio-native-tls = ["sqlx/runtime-tokio-native-tls"]
-runtime-tokio-rustls = ["sqlx/runtime-tokio-rustls"]
-runtime-async-std-native-tls = ["sqlx/runtime-async-std-native-tls"]
-runtime-async-std-rustls = ["sqlx/runtime-async-std-rustls"]
+# Runtime features - user selects in their application. sqlx 0.9 splits the
+# runtime from the TLS stack, so each is picked independently; a backend needing
+# TLS (postgres, mysql) compiles only once a tls-* feature is on, while sqlite
+# needs no TLS at all.
+runtime-tokio = ["sqlx/runtime-tokio"]
+runtime-async-std = ["sqlx/runtime-async-std"]
+tls-native-tls = ["sqlx/tls-native-tls"]
+tls-rustls = ["sqlx/tls-rustls"]
+tls-none = ["sqlx/tls-none"]
 # Database backends (native targets only; each forwards to the sqlx driver)
 postgres = ["dep:sqlx", "sqlx/postgres"]
 mysql = ["dep:sqlx", "sqlx/mysql"]
