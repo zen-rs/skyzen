@@ -597,12 +597,7 @@ mod tests {
     test,
     not(target_arch = "wasm32"),
     feature = "sqlite",
-    any(
-        feature = "runtime-tokio-native-tls",
-        feature = "runtime-tokio-rustls",
-        feature = "runtime-async-std-native-tls",
-        feature = "runtime-async-std-rustls"
-    )
+    any(feature = "runtime-tokio", feature = "runtime-async-std")
 ))]
 mod runner_tests {
     use super::{AppliedMigration, Migration, Migrations};

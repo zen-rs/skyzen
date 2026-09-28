@@ -92,10 +92,9 @@ awaits promises through `worker::send::IntoSendFuture`. See
 ## Feature Flags
 
 ### Runtime Selection
-- `runtime-tokio-native-tls`: Use Tokio with `native-tls` for `sqlx`.
-- `runtime-tokio-rustls`: Use Tokio with `rustls` for `sqlx`.
-- `runtime-async-std-native-tls`: Use `async-std` with `native-tls` for `sqlx`.
-- `runtime-async-std-rustls`: Use `async-std` with `rustls` for `sqlx`.
+`sqlx` 0.9 splits the runtime from the TLS stack, so one of each is picked independently:
+- `runtime-tokio` or `runtime-async-std`: the async runtime `sqlx` drives I/O on.
+- `tls-native-tls`, `tls-rustls`, or `tls-none`: the TLS stack for `postgres`/`mysql` connections (`sqlite` needs none).
 
 ### Database Backends
 - `postgres`, `mysql`, `sqlite` (all on by default): the sqlx drivers `Db::connect_*` builds on. Disable default features and pick one to trim compile times.

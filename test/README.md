@@ -17,7 +17,7 @@ This crate provides platform-agnostic, in-memory implementations of the `skyzen-
 - **`InMemoryKv`**: A `DashMap`-based implementation of `KeyValueStore`, atomics included.
 - **`InMemoryStorage`**: In-memory `ObjectStorage` for file upload/download simulation, including the streaming, range and presign surface.
 - **`InMemoryQueue`**: In-memory `MessageQueue` for testing background workers, with the full `receive`/`ack`/`nack` lease behaviour.
-- **`InMemoryDb`**: SQLite in-memory database implementation (requires `runtime-tokio-native-tls` or `runtime-tokio-rustls` feature). `InMemoryDb::with_schema` takes raw DDL; `InMemoryDb::with_migrations` runs your real migration set through the production runner, so a migration that would fail on deploy fails in the test suite instead.
+- **`InMemoryDb`**: SQLite in-memory database implementation (requires the `runtime-tokio` feature). `InMemoryDb::with_schema` takes raw DDL; `InMemoryDb::with_migrations` runs your real migration set through the production runner, so a migration that would fail on deploy fails in the test suite instead.
 - **`InMemoryDurableKv`, `InMemoryDurableDb`, `InMemoryAlarm`**: the Durable Object surface, so a Workers application is testable on a plain native `cargo test`.
 
 ## HTTP Testing
@@ -81,8 +81,7 @@ let user: User = from_json_str(include_str!("../fixtures/user.json")).unwrap();
 
 ## Feature Flags
 
-- **`runtime-tokio-native-tls`**: Enables `InMemoryDb` (SQLite) using `tokio` and `native-tls`.
-- **`runtime-tokio-rustls`**: Enables `InMemoryDb` (SQLite) using `tokio` and `rustls`.
+- **`runtime-tokio`**: Enables `InMemoryDb` (SQLite) using `tokio` (SQLite needs no TLS, so none is selected).
 
 ## Full Example
 
