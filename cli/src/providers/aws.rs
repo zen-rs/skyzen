@@ -43,7 +43,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
     let function = function_name(&config, &binary);
 
     ensure_lambda_feature(project);
-    if matches!(action, Action::Deploy) {
+    if matches!(action, Action::Deploy { .. }) {
         report_event_source(manifest, &function);
     }
 
@@ -57,7 +57,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
         }
         // A deploy always builds optimized first: `cargo lambda deploy` uploads whatever is in
         // `target/lambda`, so deploying without building would ship the previous build.
-        Action::Deploy => {
+        Action::Deploy { .. } => {
             let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
             child_env = prepared.child_env;
             let mut steps = vec![
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn a_deploy_builds_first_and_then_carries_the_manifests_configuration() {
         let planned = planned(
-            &Action::Deploy,
+            &Action::Deploy { upload_only: false },
             "[aws]\nfunction_name = \"skyzen-api\"\nmemory_mb = 512\ntimeout = \"45s\"\n\n\
              [aws.env]\nRUST_LOG = \"info\"\n",
         );
@@ -397,7 +397,10 @@ mod tests {
         // The whole reason `[aws.env]` no longer reaches `cargo lambda deploy`: its command line
         // is printed by every progress line and by `--dry-run`, and is visible in the process
         // table of whatever machine runs the deploy.
-        let planned = planned(&Action::Deploy, "[aws]\n\n[aws.env]\nRUST_LOG = \"info\"\n");
+        let planned = planned(
+            &Action::Deploy { upload_only: false },
+            "[aws]\n\n[aws.env]\nRUST_LOG = \"info\"\n",
+        );
 
         for step in &planned {
             assert!(!step.contains("--env-var"), "{planned:?}");
@@ -417,7 +420,12 @@ mod tests {
         )
         .expect("valid manifest");
 
-        let plan = prepare(&Action::Deploy, &manifest, &project()).expect("plan");
+        let plan = prepare(
+            &Action::Deploy { upload_only: false },
+            &manifest,
+            &project(),
+        )
+        .expect("plan");
         let last = plan
             .steps
             .last()
@@ -435,7 +443,7 @@ mod tests {
     #[test]
     fn a_deploy_refuses_when_a_declared_variable_is_set_nowhere() {
         let error = prepare(
-            &Action::Deploy,
+            &Action::Deploy { upload_only: false },
             &manifest(
                 "[[secret]]\nname = \"SKYZEN_TEST_AWS_UNSET_SECRET\"\n\n\
                  [[service]]\nname = \"cache\"\ntype = \"kv\"\n\n\
@@ -504,7 +512,10 @@ mod tests {
 
     #[test]
     fn turning_the_url_off_removes_it_rather_than_leaving_the_old_one_serving() {
-        let planned = planned(&Action::Deploy, "[aws]\nurl = false\n");
+        let planned = planned(
+            &Action::Deploy { upload_only: false },
+            "[aws]\nurl = false\n",
+        );
 
         assert!(planned[1].contains("--disable-function-url"), "{planned:?}");
         assert!(!planned[1].contains("--enable-function-url"), "{planned:?}");

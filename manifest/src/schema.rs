@@ -850,7 +850,7 @@ pub enum NativeDatabaseSection {
     /// `MySQL`, through `skyzen-services`' `mysql` feature.
     #[serde(rename = "mysql")]
     Mysql(SqlUrlWiring),
-    /// SQLite, through `skyzen-services`' `sqlite` feature.
+    /// `SQLite`, through `skyzen-services`' `sqlite` feature.
     #[serde(rename = "sqlite")]
     Sqlite(SqlUrlWiring),
     /// Azure SQL, from `skyzen-azure`' `sql` feature.
@@ -941,7 +941,7 @@ pub enum NativeDatabaseBackend {
     Postgres,
     /// `MySQL`, through `skyzen-services`' `mysql` feature.
     Mysql,
-    /// SQLite, through `skyzen-services`' `sqlite` feature.
+    /// `SQLite`, through `skyzen-services`' `sqlite` feature.
     Sqlite,
     /// Azure SQL, from `skyzen-azure`' `sql` feature.
     AzureSql,
