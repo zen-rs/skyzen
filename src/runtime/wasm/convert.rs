@@ -21,7 +21,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::{
-    header::{HeaderMap, HeaderName, HeaderValue},
+    header::{HeaderMap, HeaderName, HeaderValue, CONTENT_ENCODING},
     Body, BodyError, Method, StatusCode, Uri,
 };
 
@@ -116,6 +116,12 @@ pub fn from_js_response(response: &Response) -> Result<crate::Response, JsValue>
 
 /// Render a Skyzen response as a `WinterCG` [`Response`], streaming its body.
 ///
+/// A body that carries `Content-Encoding` is already the encoded representation — the same
+/// semantics the native runtime applies — so it must be served verbatim. workerd's default
+/// `encodeBody: "automatic"` would instead treat the header as an instruction to compress the
+/// bytes again, and a client decoding once would still be holding encoded data. Responses
+/// without the header keep the default and the platform stays free to compress them.
+///
 /// # Errors
 ///
 /// Returns a `JsValue` error when a header is not something the runtime accepts or the response
@@ -156,6 +162,16 @@ pub fn into_js_response(response: crate::Response) -> Result<Response, JsValue> 
     init.set_status(status.as_u16());
     init.set_status_text(status.canonical_reason().unwrap_or("OK"));
     init.set_headers_headers(&headers_into_js(response.headers())?);
+
+    // `encodeBody` is a Workers extension with no `web_sys::ResponseInit` field, so it is
+    // attached reflectively the way `webSocket` is in `upgrade_response`.
+    if response.headers().contains_key(CONTENT_ENCODING) {
+        js_sys::Reflect::set(
+            init.as_ref(),
+            &JsValue::from_str("encodeBody"),
+            &JsValue::from_str("manual"),
+        )?;
+    }
 
     if status_forbids_body(status) {
         Response::new_with_opt_readable_stream_and_init(None, &init)

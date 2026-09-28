@@ -9,6 +9,7 @@ use skyzen::routing::{CreateRouteNode, Route, Router};
 #[cfg(target_arch = "wasm32")]
 use skyzen::runtime::CfProperties;
 use skyzen::runtime::WorkerContext;
+use skyzen::utils::Json;
 use skyzen::Result as SkyResult;
 
 async fn health() -> &'static str {
@@ -74,6 +75,33 @@ impl DurableObject for Visits {
     }
 }
 
+/// The greeting `/gzipped` serves pre-encoded; the CI lane greps for it after one decode.
+const GREETING: &str = "Hello from the encoded side!";
+
+/// Answer a body that is already the encoded representation: gzip bytes plus the
+/// `Content-Encoding` header naming them. The runtime has to serve those bytes untouched — a
+/// client decoding once gets the greeting back, not a second gzip stream.
+async fn gzipped() -> SkyResult<skyzen::Response> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder
+        .write_all(GREETING.as_bytes())
+        .map_err(skyzen::Error::new)?;
+    let body = encoder.finish().map_err(skyzen::Error::new)?;
+    let mut response = skyzen::Response::new(skyzen::Body::from_bytes(body));
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_ENCODING,
+        skyzen::header::HeaderValue::from_static("gzip"),
+    );
+    Ok(response)
+}
+
+/// A plain JSON answer carrying no `Content-Encoding` of its own, so the platform stays free to
+/// compress it for the wire — the case the manual-encode rule must leave alone.
+async fn plain_json() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "encoding": "platform" }))
+}
+
 /// A Durable Object failure is a server fault to the caller of this route.
 fn durable(error: skyzen::durable::DurableObjectError) -> skyzen::Error {
     skyzen::Error::new(error)
@@ -120,6 +148,8 @@ fn build_router() -> Router {
         "/readyz".at(|| async { "ready" }),
         "/track".at(accept_work),
         "/where-am-i".at(where_am_i),
+        "/gzipped".at(gzipped),
+        "/json".at(plain_json),
         "/visits".route(("/{name}".at(visit),)),
     ));
     // On Workers the namespace is a binding the handler reads from the environment; natively
