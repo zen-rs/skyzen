@@ -6,7 +6,10 @@ permissions:
 
 on:
   push:
-    branches: ["**"]
+    # Feature branches are covered by their pull_request run; pushing to a PR
+    # branch otherwise fires this whole workflow twice (the concurrency group
+    # cannot dedupe it: push refs/heads/<branch> vs pull refs/pull/<n>/merge).
+    branches: ["dev", "main"]
   pull_request:
     branches: ["**"]
 
@@ -29,6 +32,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
+          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # per run against a 10 GiB repo budget was evicting entries before
+          # the next run could restore them. Non-dev runs restore the
+          # default-branch entry (restore-only) instead of writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -43,6 +52,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
+          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # per run against a 10 GiB repo budget was evicting entries before
+          # the next run could restore them. Non-dev runs restore the
+          # default-branch entry (restore-only) instead of writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
       - run: cargo build -p skyzen --target wasm32-unknown-unknown
 
   coverage:
@@ -56,6 +71,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
+          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # per run against a 10 GiB repo budget was evicting entries before
+          # the next run could restore them. Non-dev runs restore the
+          # default-branch entry (restore-only) instead of writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
       - run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
@@ -72,6 +93,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
+          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # per run against a 10 GiB repo budget was evicting entries before
+          # the next run could restore them. Non-dev runs restore the
+          # default-branch entry (restore-only) instead of writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
       - uses: crate-ci/typos@v1
 
   audit:
@@ -85,6 +112,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
+          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # per run against a 10 GiB repo budget was evicting entries before
+          # the next run could restore them. Non-dev runs restore the
+          # default-branch entry (restore-only) instead of writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
       - name: Generate Lockfile
         run: cargo generate-lockfile
       - uses: rustsec/audit-check@v2
@@ -100,6 +133,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
+          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # per run against a 10 GiB repo budget was evicting entries before
+          # the next run could restore them. Non-dev runs restore the
+          # default-branch entry (restore-only) instead of writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
       - uses: taiki-e/install-action@cargo-machete
       - run: cargo machete
 
@@ -112,6 +151,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
+          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # per run against a 10 GiB repo budget was evicting entries before
+          # the next run could restore them. Non-dev runs restore the
+          # default-branch entry (restore-only) instead of writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
       - uses: taiki-e/install-action@cargo-hack
       # `--workspace` gives every member its own feature matrix; without it
       # cargo-hack drives the root package's features while cargo still builds

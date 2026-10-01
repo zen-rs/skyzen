@@ -41,6 +41,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-${{ matrix.os }}
+          # Only dev pushes save (see ci.yml); other runs restore the
+          # default-branch entry without writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
 
       - name: Run clippy
         run: cargo clippy --workspace ${{ matrix.targets }} ${{ matrix.features }} -- -D warnings
@@ -63,6 +67,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-wasm
+          # Only dev pushes save (see ci.yml); other runs restore the
+          # default-branch entry without writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
 
       - name: Check WASM build (minimal)
         run: cargo check -p skyzen --target wasm32-unknown-unknown --no-default-features --features json
@@ -83,6 +91,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-wasm
+          # Only dev pushes save (see ci.yml); other runs restore the
+          # default-branch entry without writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
 
       - name: Install wasm-bindgen CLI
         run: |
