@@ -117,6 +117,15 @@ let count: i64 = db
 
 This keeps SQL injection protection in place on both native and serverless targets.
 
+## Waiting for writes to be durable
+
+`db.sync()` awaits the storage layer's own durability barrier — not a statement.
+On Cloudflare it is `ctx.storage.sync()`, which resolves once every pending write
+the object issued is persisted; the in-memory `SQLite` backend resolves
+immediately, since it has no pending persistence I/O. Nothing on the request path
+calls it: it exists for code that must order or measure against native write
+confirmation rather than call completion.
+
 ## Running On Cloudflare
 
 On Cloudflare, your Durable Object is exported through `#[skyzen::durable_object]` and backed by `state.storage.sql`.

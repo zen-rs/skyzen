@@ -2,6 +2,7 @@
 
 use super::{DurableDbBackend, DurableDbError};
 use crate::{Db, DbExecResult, DbValue, JsonRow};
+use core::future::{ready, Future};
 
 /// A real in-memory `SQLite` implementation of Durable Object SQL storage.
 ///
@@ -79,6 +80,15 @@ impl DurableDbBackend for SqliteDurableDb {
         u64::try_from(bytes)
             .map_err(|_| DurableDbError::backend("SQLite database size was negative"))
     }
+
+    // An in-memory database has no pending persistence I/O: every statement is
+    // fully applied when its call returns. The state is volatile for the
+    // backend's own lifetime — nothing here claims durability across process
+    // or object eviction — so the barrier resolves immediately.
+    fn sync(&self) -> impl Future<Output = Result<(), DurableDbError>> + Send {
+        let _ = self;
+        ready(Ok(()))
+    }
 }
 
 #[cfg(test)]
@@ -109,5 +119,25 @@ mod tests {
             .expect("select should execute");
 
         assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn sync_resolves_after_writes() {
+        let db = DurableDb::new(
+            SqliteDurableDb::in_memory()
+                .await
+                .expect("in-memory SQLite should initialize"),
+        );
+
+        db.query("CREATE TABLE pending (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .expect("schema should execute");
+        db.query("INSERT INTO pending (value) VALUES (?)")
+            .bind(1_i64)
+            .execute()
+            .await
+            .expect("insert should execute");
+        db.sync().await.expect("sync should resolve");
     }
 }
