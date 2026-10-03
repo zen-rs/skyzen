@@ -97,6 +97,15 @@ pub trait DurableDbBackend: Send + Sync + Clone + 'static {
 
     /// Get the on-disk database size in bytes.
     fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send;
+
+    /// Resolve once every write the object issued is durable.
+    ///
+    /// This is the storage layer's own durability barrier, not a statement: on
+    /// Cloudflare it is `ctx.storage.sync()`, which settles after the runtime has
+    /// persisted all unconfirmed writes — and the runtime holds outgoing
+    /// messages that would reveal actor state until they are. A backend whose
+    /// writes are already durable when its calls return resolves immediately.
+    fn sync(&self) -> impl Future<Output = Result<(), DurableDbError>> + Send;
 }
 
 service_obj! {
@@ -112,6 +121,7 @@ service_obj! {
         params: &'a [DbValue],
     ) -> Result<DbExecResult, DurableDbError>;
     async fn database_size(&'_ self) -> Result<u64, DurableDbError>;
+    async fn sync(&'_ self) -> Result<(), DurableDbError>;
 }
 
 /// Type-erased Durable Object database extractor.
@@ -146,6 +156,20 @@ impl DurableDb {
     pub async fn database_size(&self) -> Result<u64, DurableDbError> {
         self.0.database_size().await
     }
+
+    /// Wait until every pending write the object issued is durable.
+    ///
+    /// The durability barrier on the underlying storage — see
+    /// [`DurableDbBackend::sync`]. Nothing on the request path calls this; it
+    /// exists for code that must bound its measurement or ordering by native
+    /// write confirmation rather than by call completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime's durability barrier fails.
+    pub async fn sync(&self) -> Result<(), DurableDbError> {
+        self.0.sync().await
+    }
 }
 
 /// The query builder returned by [`DurableDb::query`].
@@ -179,6 +203,7 @@ mod tests {
     use super::{DurableDb, DurableDbBackend, DurableDbError};
     use crate::sql::{DbExecResult, DbValue};
     use core::future::{ready, Future};
+    use tokio::sync::{broadcast, mpsc};
 
     #[derive(Debug, Clone, Default)]
     struct RecordingBackend;
@@ -204,6 +229,12 @@ mod tests {
 
         fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
             ready(Ok(0))
+        }
+
+        // A recorder writes nothing, so there is nothing to flush.
+        fn sync(&self) -> impl Future<Output = Result<(), DurableDbError>> + Send {
+            let _ = self;
+            ready(Ok(()))
         }
     }
 
@@ -233,5 +264,114 @@ mod tests {
             .execute()
             .await
             .expect("matching parameter count should execute");
+    }
+
+    /// A backend whose `sync` blocks on a release channel, so a test can prove
+    /// the erased wrapper holds the call pending and hands back the barrier's
+    /// own outcome rather than resolving early.
+    #[derive(Clone)]
+    struct GatedBackend {
+        entered: mpsc::UnboundedSender<()>,
+        release: broadcast::Sender<Result<(), String>>,
+    }
+
+    impl GatedBackend {
+        fn pair() -> (
+            Self,
+            mpsc::UnboundedReceiver<()>,
+            broadcast::Sender<Result<(), String>>,
+        ) {
+            let (entered, entered_rx) = mpsc::unbounded_channel();
+            let (release, _) = broadcast::channel(1);
+            (
+                Self {
+                    entered,
+                    release: release.clone(),
+                },
+                entered_rx,
+                release,
+            )
+        }
+    }
+
+    impl DurableDbBackend for GatedBackend {
+        fn query(
+            &self,
+            _query: &str,
+            _params: &[DbValue],
+        ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+            ready(Ok(DbExecResult::default()))
+        }
+
+        fn execute(
+            &self,
+            _query: &str,
+            _params: &[DbValue],
+        ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+            ready(Ok(DbExecResult::default()))
+        }
+
+        fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
+            ready(Ok(0))
+        }
+
+        // Subscribing before the `entered` signal means the release is always
+        // delivered, however the test's send races this call's progress.
+        async fn sync(&self) -> Result<(), DurableDbError> {
+            let mut rx = self.release.subscribe();
+            let _ = self.entered.send(());
+            let outcome = rx
+                .recv()
+                .await
+                .map_err(|error| DurableDbError::backend(format!("barrier release: {error}")))?;
+            outcome.map_err(DurableDbError::backend)
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_stays_pending_until_the_backend_barrier_resolves() {
+        let (backend, mut entered_rx, release_tx) = GatedBackend::pair();
+        let db = DurableDb::new(backend);
+        let handle = tokio::spawn(async move { db.sync().await });
+
+        entered_rx
+            .recv()
+            .await
+            .expect("the erased sync should reach the backend");
+        assert!(
+            !handle.is_finished(),
+            "sync resolved before the backend barrier released"
+        );
+
+        release_tx
+            .send(Ok(()))
+            .expect("release channel should be open");
+        handle
+            .await
+            .expect("sync task should not panic")
+            .expect("sync should resolve once the barrier releases");
+    }
+
+    #[tokio::test]
+    async fn sync_propagates_the_backend_failure() {
+        let (backend, mut entered_rx, release_tx) = GatedBackend::pair();
+        let handle = tokio::spawn(async move { DurableDb::new(backend).sync().await });
+
+        entered_rx
+            .recv()
+            .await
+            .expect("the erased sync should reach the backend");
+        release_tx
+            .send(Err("sentinel barrier failure".to_owned()))
+            .expect("release channel should be open");
+
+        let error = handle
+            .await
+            .expect("sync task should not panic")
+            .expect_err("sync should fail when the barrier does");
+        assert!(
+            error.to_string().contains("sentinel barrier failure"),
+            "sync should return the backend's own error, got: {error}"
+        );
     }
 }

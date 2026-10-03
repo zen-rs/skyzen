@@ -6,23 +6,30 @@ use skyzen_services::{
     durable::sql::{DurableDbBackend, DurableDbError},
     DbExecResult, DbValue,
 };
-use wasm_bindgen::JsValue;
-use worker_sys::{DurableObjectState, SqlStorage, SqlStorageCursor};
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+use worker::send::IntoSendFuture;
+use worker_sys::{DurableObjectState, DurableObjectStorage, SqlStorage, SqlStorageCursor};
 
 use crate::database_error::integer_to_js_number;
+use crate::ffi;
 
-/// Cloudflare Durable Object SQL store backed by `state.storage.sql`.
+/// Cloudflare Durable Object SQL store backed by `state.storage`.
+///
+/// The storage handle is the one source of truth: `storage.sql` is the SQL view
+/// every statement runs on, and `storage.sync()` is the durability barrier
+/// [`DurableDbBackend::sync`] awaits — both live on the same object.
 pub struct CfDurableDb {
-    sql: SqlStorage,
+    storage: DurableObjectStorage,
 }
 
-impl_js_handle_traits!(CfDurableDb { sql });
+impl_js_handle_traits!(CfDurableDb { storage });
 
 impl CfDurableDb {
-    /// Create from a raw SQL storage handle.
+    /// Create from a Durable Object storage handle.
     #[must_use]
-    pub const fn new(sql: SqlStorage) -> Self {
-        Self { sql }
+    pub const fn new(storage: DurableObjectStorage) -> Self {
+        Self { storage }
     }
 
     /// Create from Durable Object state.
@@ -32,7 +39,16 @@ impl CfDurableDb {
     /// Returns [`DurableDbError`] if `state.storage` cannot be read.
     pub fn from_state(state: &DurableObjectState) -> Result<Self, DurableDbError> {
         let storage = state.storage().map_err(js_err)?;
-        Ok(Self::new(storage.sql()))
+        Ok(Self::new(storage))
+    }
+
+    /// The `sql` view of this object's storage handle.
+    ///
+    /// `storage.sql` is a lazy-initialized property on the platform, so the getter
+    /// returns the same underlying `SqlStorage` every call — one property read per
+    /// statement, against the work `exec` does on it.
+    fn sql(&self) -> SqlStorage {
+        self.storage.sql()
     }
 }
 
@@ -47,7 +63,7 @@ impl CfDurableDb {
             bindings.push(&db_value_to_js(value)?);
         }
 
-        let cursor = self.sql.exec(query, bindings).map_err(js_err)?;
+        let cursor = self.sql().exec(query, bindings).map_err(js_err)?;
         let rows_array = cursor.to_array();
 
         let mut rows = Vec::with_capacity(rows_array.length() as usize);
@@ -91,7 +107,7 @@ impl CfDurableDb {
             bindings.push(&db_value_to_js(value)?);
         }
 
-        let cursor = self.sql.exec(query, bindings).map_err(js_err)?;
+        let cursor = self.sql().exec(query, bindings).map_err(js_err)?;
         Ok(CfSqlCursor { cursor })
     }
 }
@@ -206,7 +222,21 @@ impl DurableDbBackend for CfDurableDb {
     }
 
     fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
-        ready(f64_to_u64(self.sql.database_size(), "databaseSize"))
+        ready(f64_to_u64(self.sql().database_size(), "databaseSize"))
+    }
+
+    fn sync(&self) -> impl Future<Output = Result<(), DurableDbError>> + Send {
+        // `storage.sync()` is the documented durability barrier `worker-sys` does
+        // not bind; `DurableObjectStorageExt` is the same JS object, so the cast
+        // only exposes the missing declaration. The `JsValue` error is mapped
+        // here rather than across the await so the future stays `Send`.
+        let future = self
+            .storage
+            .unchecked_ref::<ffi::DurableObjectStorageExt>()
+            .sync()
+            .map(|promise| JsFuture::from(promise).into_send())
+            .map_err(js_err);
+        async move { future?.await.map(|_| ()).map_err(js_err) }
     }
 }
 
