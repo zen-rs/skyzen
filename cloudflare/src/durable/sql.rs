@@ -9,7 +9,7 @@ use skyzen_services::{
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use worker::send::IntoSendFuture;
-use worker_sys::{DurableObjectState, DurableObjectStorage, SqlStorageCursor};
+use worker_sys::{DurableObjectState, DurableObjectStorage, SqlStorage, SqlStorageCursor};
 
 use crate::database_error::integer_to_js_number;
 use crate::ffi;
@@ -41,6 +41,15 @@ impl CfDurableDb {
         let storage = state.storage().map_err(js_err)?;
         Ok(Self::new(storage))
     }
+
+    /// The `sql` view of this object's storage handle.
+    ///
+    /// `storage.sql` is a lazy-initialized property on the platform, so the getter
+    /// returns the same underlying `SqlStorage` every call — one property read per
+    /// statement, against the work `exec` does on it.
+    fn sql(&self) -> SqlStorage {
+        self.storage.sql()
+    }
 }
 
 impl CfDurableDb {
@@ -54,7 +63,7 @@ impl CfDurableDb {
             bindings.push(&db_value_to_js(value)?);
         }
 
-        let cursor = self.storage.sql().exec(query, bindings).map_err(js_err)?;
+        let cursor = self.sql().exec(query, bindings).map_err(js_err)?;
         let rows_array = cursor.to_array();
 
         let mut rows = Vec::with_capacity(rows_array.length() as usize);
@@ -98,7 +107,7 @@ impl CfDurableDb {
             bindings.push(&db_value_to_js(value)?);
         }
 
-        let cursor = self.storage.sql().exec(query, bindings).map_err(js_err)?;
+        let cursor = self.sql().exec(query, bindings).map_err(js_err)?;
         Ok(CfSqlCursor { cursor })
     }
 }
@@ -213,10 +222,7 @@ impl DurableDbBackend for CfDurableDb {
     }
 
     fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
-        ready(f64_to_u64(
-            self.storage.sql().database_size(),
-            "databaseSize",
-        ))
+        ready(f64_to_u64(self.sql().database_size(), "databaseSize"))
     }
 
     fn sync(&self) -> impl Future<Output = Result<(), DurableDbError>> + Send {
