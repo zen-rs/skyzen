@@ -102,6 +102,84 @@ async fn plain_json() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "encoding": "platform" }))
 }
 
+/// The bytes `/passthrough/body` answers with, which only ever exist as the upstream's JS stream.
+#[cfg(target_arch = "wasm32")]
+const PASSTHROUGH_BODY: &str = "Hello through the passthrough!";
+
+/// A JS error out of the conversion is a server fault to the caller of these routes. Takes
+/// ownership to match `Result<_, JsValue>::map_err`.
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::needless_pass_by_value)]
+fn js_error(error: wasm_bindgen::JsValue) -> skyzen::Error {
+    skyzen::Error::msg(format!("{error:?}"))
+}
+
+/// A response standing in for a fetched upstream: its body is a JS stream this worker never
+/// reads, under a status and header the client must still see.
+#[cfg(target_arch = "wasm32")]
+fn upstream_response() -> SkyResult<web_sys::Response> {
+    let headers = web_sys::Headers::new().map_err(js_error)?;
+    headers.append("x-upstream", "kept").map_err(js_error)?;
+    let init = web_sys::ResponseInit::new();
+    init.set_status(203);
+    init.set_headers_headers(&headers);
+    web_sys::Response::new_with_opt_str_and_init(Some(PASSTHROUGH_BODY), &init).map_err(js_error)
+}
+
+/// Proxy the upstream with its body handed to the runtime as the same JS stream, never copied
+/// through wasm; the CI lane reads the bytes, status and header on the client side.
+#[cfg(target_arch = "wasm32")]
+async fn passthrough_body() -> SkyResult<skyzen::Response> {
+    skyzen::runtime::wasm::passthrough_js_response(&upstream_response()?).map_err(js_error)
+}
+
+/// Check the conversion where only the runtime can: the rendered JS response carries the very
+/// stream object the upstream did, and a passthrough whose handler also wrote a body is refused.
+#[cfg(target_arch = "wasm32")]
+async fn passthrough_conversion() -> SkyResult<&'static str> {
+    use skyzen::runtime::wasm::{into_js_response, passthrough_js_response};
+
+    let upstream = upstream_response()?;
+    let stream = upstream
+        .body()
+        .ok_or_else(|| skyzen::Error::msg("the upstream response has no body stream"))?;
+    let rendered = into_js_response(passthrough_js_response(&upstream).map_err(js_error)?)
+        .map_err(js_error)?;
+    let rendered_stream = rendered
+        .body()
+        .ok_or_else(|| skyzen::Error::msg("the rendered response has no body stream"))?;
+    if !js_sys::Object::is(stream.as_ref(), rendered_stream.as_ref()) {
+        return Err(skyzen::Error::msg(
+            "the rendered response carries a different stream than the upstream",
+        ));
+    }
+    let header = rendered.headers().get("x-upstream").map_err(js_error)?;
+    if rendered.status() != 203 || header.as_deref() != Some("kept") {
+        return Err(skyzen::Error::msg(
+            "the rendered response lost the upstream status or header",
+        ));
+    }
+
+    let mut written = passthrough_js_response(&upstream_response()?).map_err(js_error)?;
+    *written.body_mut() = skyzen::Body::from_bytes(PASSTHROUGH_BODY);
+    if into_js_response(written).is_ok() {
+        return Err(skyzen::Error::msg(
+            "a passthrough with a written body was rendered",
+        ));
+    }
+    Ok("same stream; written body refused")
+}
+
+/// There is no JS response to pass through off `wasm32`; both passthrough routes say so rather
+/// than answering something that would read as the conversion having run.
+#[cfg(not(target_arch = "wasm32"))]
+async fn passthrough_body() -> &'static str {
+    "a JS body passthrough exists only on Workers and this build is not running there"
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+use passthrough_body as passthrough_conversion;
+
 /// A Durable Object failure is a server fault to the caller of this route.
 fn durable(error: skyzen::durable::DurableObjectError) -> skyzen::Error {
     skyzen::Error::new(error)
@@ -150,6 +228,10 @@ fn build_router() -> Router {
         "/where-am-i".at(where_am_i),
         "/gzipped".at(gzipped),
         "/json".at(plain_json),
+        "/passthrough".route((
+            "/body".at(passthrough_body),
+            "/conversion".at(passthrough_conversion),
+        )),
         "/visits".route(("/{name}".at(visit),)),
     ));
     // On Workers the namespace is a binding the handler reads from the environment; natively

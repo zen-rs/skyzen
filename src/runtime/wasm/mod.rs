@@ -11,7 +11,9 @@ use wasm_bindgen::prelude::*;
 
 mod convert;
 
-pub use convert::{from_js_request, from_js_response, into_js_request, into_js_response};
+pub use convert::{
+    from_js_request, from_js_response, into_js_request, into_js_response, passthrough_js_response,
+};
 
 /// Alias matching the `WinterCG` request object.
 pub type Request = web_sys::Request;
