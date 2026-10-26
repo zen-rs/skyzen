@@ -341,7 +341,7 @@ impl ListenAddr {
     /// Unix domain sockets do not exist on this platform, so a `unix:` path can only be a
     /// mistake — say so rather than misreading it as a TCP address.
     #[cfg(not(unix))]
-    fn unix(_path: &str) -> Result<Self, ListenAddrError> {
+    const fn unix(_path: &str) -> Result<Self, ListenAddrError> {
         Err(ListenAddrError::UnixUnsupported)
     }
 }
