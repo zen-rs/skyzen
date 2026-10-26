@@ -3,4 +3,8 @@ ignore = [
     # Pulled via optional sqlx-mysql in SeaORM graph; upstream has no fixed
     # version yet for this advisory.
     "RUSTSEC-2023-0071",
+    # Pulled via aws-sigv4 (AWS SDK chain), which constrains crypto-bigint to
+    # ^0.5; the only patched range is >=0.7.6 and upstream has not released a
+    # bump. Tracked in zen-rs/skyzen#117 until it does.
+    "RUSTSEC-2026-0387",
 ]
