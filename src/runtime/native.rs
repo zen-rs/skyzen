@@ -908,9 +908,14 @@ where
             });
             let outcome = serve_connections(executor, endpoint, consumers, incoming).await;
             // The socket file is ours: left behind it becomes the stale path the next bind
-            // has to probe, and a dead process gets no later chance to clean it up.
-            if let Err(error) = std::fs::remove_file(&path) {
-                warn!("Failed to remove unix socket {}: {error}", path.display());
+            // has to probe, and a dead process gets no later chance to clean it up. Already
+            // gone is not a failure — the cleanup goal is met either way.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!("Failed to remove unix socket {}: {error}", path.display());
+                }
             }
             outcome
         }
