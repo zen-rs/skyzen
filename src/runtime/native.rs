@@ -19,12 +19,14 @@ use crate::{
     Endpoint,
 };
 use async_channel::{bounded, Receiver, Sender};
+#[cfg(unix)]
+use async_net::unix::{UnixListener, UnixStream};
 use async_net::TcpListener;
 use core::convert::Infallible;
 use executor_core::{
     smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
 };
-use futures_util::{future::FutureExt, stream::MapOk, StreamExt, TryStreamExt};
+use futures_util::{future::FutureExt, stream::MapOk, Stream, StreamExt, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
 use http_kit::{
     error::BoxHttpError,
@@ -233,20 +235,136 @@ pub fn init_logging() {
     });
 }
 
+/// An address the native server can listen on.
+///
+/// One grammar everywhere — `--listen`, `--addr` and `SKYZEN_ADDRESS` all parse this:
+/// a `host:port` socket address is TCP, and a `unix:`-prefixed path is a filesystem unix
+/// domain socket. `unix:///abs/path` is accepted too; the empty authority is ignored.
+///
+/// A unix socket peer has no `SocketAddr`, so `PeerAddr` and `ClientIp` do not resolve on
+/// connections accepted that way — a fronting proxy reports its client through
+/// `Forwarded`/`X-Forwarded-For` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenAddr {
+    /// A TCP `host:port` address — the only kind every platform supports.
+    Tcp(SocketAddr),
+    /// A filesystem unix socket path, e.g. `unix:/run/app.sock`.
+    ///
+    /// The socket file belongs to the process while it runs: a path that is already a socket
+    /// is probed before binding (a live server keeps its socket; a dead one's leftover is
+    /// removed and rebound), and the file is unlinked when the server stops.
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+}
+
+/// Why a `--listen`/`SKYZEN_ADDRESS` value is not a [`ListenAddr`].
+#[derive(Debug)]
+pub enum ListenAddrError {
+    /// Neither a TCP `host:port` nor a `unix:` path.
+    NotAnAddress(std::net::AddrParseError),
+    /// `unix:` named no path.
+    EmptyUnixPath,
+    /// A `unix:` path on a platform that has no unix domain sockets.
+    #[cfg(not(unix))]
+    UnixUnsupported,
+}
+
+impl std::fmt::Display for ListenAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(addr) => write!(f, "{addr}"),
+            #[cfg(unix)]
+            Self::Unix(path) => write!(f, "unix:{}", path.display()),
+        }
+    }
+}
+
+impl std::fmt::Display for ListenAddrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnAddress(error) => {
+                write!(
+                    f,
+                    "not a `host:port` socket address or a `unix:` path: {error}"
+                )
+            }
+            Self::EmptyUnixPath => write!(f, "`unix:` names no socket path"),
+            #[cfg(not(unix))]
+            Self::UnixUnsupported => {
+                write!(f, "unix domain sockets do not exist on this platform")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ListenAddrError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotAnAddress(error) => Some(error),
+            Self::EmptyUnixPath => None,
+            #[cfg(not(unix))]
+            Self::UnixUnsupported => None,
+        }
+    }
+}
+
+/// The prefix a filesystem unix socket path carries in `--listen`/`SKYZEN_ADDRESS`.
+const UNIX_SCHEME: &str = "unix:";
+
+impl std::str::FromStr for ListenAddr {
+    type Err = ListenAddrError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some(path) = value.strip_prefix(UNIX_SCHEME) else {
+            return value
+                .parse()
+                .map(Self::Tcp)
+                .map_err(ListenAddrError::NotAnAddress);
+        };
+        Self::unix(path)
+    }
+}
+
+impl ListenAddr {
+    /// Interpret what follows `unix:` as a filesystem socket path.
+    #[cfg(unix)]
+    fn unix(path: &str) -> Result<Self, ListenAddrError> {
+        // `unix:///abs/path` carries an empty authority — drop it so `unix:rel`,
+        // `unix:/abs` and `unix:///abs` all mean what they look like.
+        let path = path.strip_prefix("//").unwrap_or(path);
+        if path.is_empty() {
+            return Err(ListenAddrError::EmptyUnixPath);
+        }
+        Ok(Self::Unix(std::path::PathBuf::from(path)))
+    }
+
+    /// Unix domain sockets do not exist on this platform, so a `unix:` path can only be a
+    /// mistake — say so rather than misreading it as a TCP address.
+    #[cfg(not(unix))]
+    fn unix(_path: &str) -> Result<Self, ListenAddrError> {
+        Err(ListenAddrError::UnixUnsupported)
+    }
+}
+
 /// A listener address a command-line flag asked for.
 ///
 /// Which flag it came from matters: a serverless host that dictates the port (Azure Functions
 /// does) outranks the defaults and outranks `--host`/`--port`, which only adjust them — but not an
 /// explicit `--listen`, where the operator named the whole socket and meant it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenOverride {
     /// The address to bind.
-    pub addr: SocketAddr,
+    pub addr: ListenAddr,
     /// Whether `--listen`/`--addr` named this socket outright.
     pub explicit: bool,
 }
 
 /// Parse CLI overrides such as `--addr`/`--port` and return the resulting listen address.
+///
+/// `--listen`/`--addr` name the whole socket outright — a TCP `host:port`, or `unix:/path`
+/// for a filesystem unix socket on unix platforms. `--host`/`--port` only adjust the TCP
+/// address [`server_addr`] produced, so a unix `SKYZEN_ADDRESS` cannot be mutated by them;
+/// they are ignored with a warning rather than silently switching transports.
 ///
 /// Returns `None` when no valid override was supplied; the caller then falls back to the
 /// `SKYZEN_ADDRESS` environment variable or the built-in default (see [`server_addr`]). Invalid
@@ -291,11 +409,11 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<Lis
     }
 
     if let Some(addr) = listen {
-        return match addr.parse::<SocketAddr>() {
-            Ok(socket) => {
-                info!("Configured listener address via CLI: {socket}");
+        return match addr.parse::<ListenAddr>() {
+            Ok(addr) => {
+                info!("Configured listener address via CLI: {addr}");
                 Some(ListenOverride {
-                    addr: socket,
+                    addr,
                     explicit: true,
                 })
             }
@@ -313,7 +431,13 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<Lis
     let mut candidate = server_addr();
     if let Some(host) = host {
         match host.parse::<IpAddr>() {
-            Ok(ip) => candidate.set_ip(ip),
+            Ok(ip) => match &mut candidate {
+                ListenAddr::Tcp(addr) => addr.set_ip(ip),
+                #[cfg(unix)]
+                ListenAddr::Unix(_) => {
+                    warn!("Ignoring --host `{host}`: SKYZEN_ADDRESS names a unix socket");
+                }
+            },
             Err(error) => {
                 warn!("Ignoring invalid --host `{host}`: {error}");
                 return None;
@@ -322,7 +446,13 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<Lis
     }
     if let Some(port) = port {
         match port.parse::<u16>() {
-            Ok(value) => candidate.set_port(value),
+            Ok(value) => match &mut candidate {
+                ListenAddr::Tcp(addr) => addr.set_port(value),
+                #[cfg(unix)]
+                ListenAddr::Unix(_) => {
+                    warn!("Ignoring --port `{port}`: SKYZEN_ADDRESS names a unix socket");
+                }
+            },
             Err(error) => {
                 warn!("Ignoring invalid --port `{port}`: {error}");
                 return None;
@@ -405,7 +535,7 @@ impl std::error::Error for RuntimeFailure {
 ///
 /// A struct rather than a widening argument list: what the runtime needs to know grows with every
 /// platform it learns to serve, and each of those is a compile-time fact read out of `Skyzen.toml`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
     /// The address a command-line flag asked for, if any.
     pub listen: Option<ListenOverride>,
@@ -575,7 +705,8 @@ impl std::error::Error for StartupError {}
 ///   binding a TCP port nothing inside Lambda can reach.
 /// - **Azure Functions** (`FUNCTIONS_CUSTOMHANDLER_PORT` is set) binds the port the host chose and
 ///   mounts the declared queue triggers ahead of the application's routes.
-/// - Anything else binds the address the flags, `SKYZEN_ADDRESS` or the default asked for.
+/// - Anything else binds the address the flags, `SKYZEN_ADDRESS` or the default asked for —
+///   a TCP `host:port`, or `unix:/path` for a filesystem unix socket on unix platforms.
 ///
 /// Under either serverless host the declared `[[native.queue_consumer]]` polling loops do *not*
 /// run: the platform owns delivery there, and a loop polling a queue inside a function that scales
@@ -640,7 +771,8 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
             Platform::Server => {
                 let addr = options
                     .listen
-                    .map_or_else(server_addr, |listen| listen.addr);
+                    .as_ref()
+                    .map_or_else(server_addr, |listen| listen.addr.clone());
                 run_server(executor, endpoint, consumers, addr).await
             }
             Platform::AzureFunctions { port } => {
@@ -728,22 +860,116 @@ impl ConsumerChannels {
     }
 }
 
+/// A connection the listener accepted, with the peer address the transport can report.
+///
+/// A unix socket peer has no `SocketAddr`, so `peer_addr` is `None` there and `PeerAddr` /
+/// `ClientIp` do not resolve — a fronting proxy reports its client through
+/// `Forwarded`/`X-Forwarded-For` instead.
+#[derive(Debug)]
+struct Accepted<C> {
+    stream: C,
+    peer_addr: Option<SocketAddr>,
+}
+
 async fn run_server<Exec, E, C>(
     executor: Exec,
     endpoint: E,
     consumers: C,
-    addr: SocketAddr,
+    addr: ListenAddr,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
     C: ConsumerSet,
 {
-    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    match addr {
+        ListenAddr::Tcp(addr) => {
+            let listener = TcpListener::bind(addr).await?;
+            let local_addr = listener.local_addr()?;
+            info!("Skyzen listening on http://{local_addr}");
+            let incoming = listener.incoming().map_ok(|stream| Accepted {
+                peer_addr: stream.peer_addr().ok(),
+                stream,
+            });
+            serve_connections(executor, endpoint, consumers, incoming).await
+        }
+        #[cfg(unix)]
+        ListenAddr::Unix(path) => {
+            let listener = bind_unix_listener(&path).await.map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not bind unix socket {}: {error}", path.display()),
+                )
+            })?;
+            info!("Skyzen listening on unix:{}", path.display());
+            let incoming = listener.incoming().map_ok(|stream| Accepted {
+                peer_addr: None,
+                stream,
+            });
+            let outcome = serve_connections(executor, endpoint, consumers, incoming).await;
+            // The socket file is ours: left behind it becomes the stale path the next bind
+            // has to probe, and a dead process gets no later chance to clean it up.
+            if let Err(error) = std::fs::remove_file(&path) {
+                warn!("Failed to remove unix socket {}: {error}", path.display());
+            }
+            outcome
+        }
+    }
+}
 
-    let listener = TcpListener::bind(addr).await?;
-    let local_addr = listener.local_addr()?;
-    info!("Skyzen listening on http://{}", local_addr);
+/// Bind a filesystem unix socket, removing a leftover only when nothing answers on it.
+///
+/// A path that is already a socket is not always a reason to stop: a process killed before it
+/// could clean up — SIGKILL, a panic past the shutdown path — leaves the file behind, and
+/// treating that as fatal means every `skyzen dev` restart needs a manual `rm`. So `AddrInUse`
+/// earns the path one probe: a peer that answers is a live server whose socket binding must
+/// not be stolen, while a refused connection means nothing is listening and the file is safe
+/// to remove. Any other outcome retries the bind unchanged — either the path raced away, or
+/// the probe proved nothing and the first error is the honest one.
+#[cfg(unix)]
+async fn bind_unix_listener(path: &std::path::Path) -> std::io::Result<UnixListener> {
+    use std::io::ErrorKind;
+
+    match UnixListener::bind(path) {
+        Err(bind_error) if bind_error.kind() == ErrorKind::AddrInUse => {
+            match UnixStream::connect(path).await {
+                Ok(_) => Err(std::io::Error::new(
+                    ErrorKind::AddrInUse,
+                    format!("a server is already listening on {}", path.display()),
+                )),
+                Err(connect_error) => match connect_error.kind() {
+                    ErrorKind::ConnectionRefused => {
+                        std::fs::remove_file(path)?;
+                        warn!("Removed a stale unix socket at {}", path.display());
+                        UnixListener::bind(path)
+                    }
+                    ErrorKind::NotFound => UnixListener::bind(path),
+                    _ => Err(bind_error),
+                },
+            }
+        }
+        result => result,
+    }
+}
+
+/// Serve every connection `incoming` yields until shutdown or a fatal consumer report.
+///
+/// The transport is invisible past this point: TCP and unix connections get the same
+/// protocol sniff, the same Hyper builders and the same drain accounting.
+async fn serve_connections<Exec, E, C, Conn, S>(
+    executor: Exec,
+    endpoint: E,
+    consumers: C,
+    mut incoming: S,
+) -> Result<Shutdown, RuntimeFailure>
+where
+    Exec: CoreExecutor + 'static,
+    E: Endpoint + Clone + Send + Sync + 'static,
+    C: ConsumerSet,
+    Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: Stream<Item = std::io::Result<Accepted<Conn>>> + Unpin,
+{
+    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
     let executor = Arc::new(executor);
     let hyper_executor = HyperExecutor(Arc::clone(&executor));
@@ -755,7 +981,6 @@ where
 
     let queue_consumers = ConsumerChannels::start(consumers, executor.as_ref(), &connection_guard);
 
-    let mut incoming = listener.incoming();
     let shutdown_rx = shutdown_signal();
     let shutdown = shutdown_rx.recv().fuse();
     futures_util::pin_mut!(shutdown);
@@ -780,11 +1005,11 @@ where
             }
             connection = incoming.next().fuse() => {
                 match connection {
-                    Some(Ok(stream)) => {
-                        let peer_addr = stream.peer_addr().map_or(None, |peer| {
+                    Some(Ok(accepted)) => {
+                        let Accepted { stream, peer_addr } = accepted;
+                        if let Some(peer) = peer_addr {
                             debug!("Accepted connection from {peer}");
-                            Some(peer)
-                        });
+                        }
                         let endpoint = endpoint.clone();
                         let shared_executor = shared_executor.clone();
                         let hyper_executor = hyper_executor.clone();
@@ -943,20 +1168,20 @@ where
     C: ConsumerSet,
 {
     let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let addr = match options.listen {
+    let addr = match &options.listen {
         Some(ListenOverride {
             addr,
             explicit: true,
-        }) if addr != host_addr => {
+        }) if *addr != ListenAddr::Tcp(host_addr) => {
             warn!(
                 requested = %addr,
                 functions_host = %host_addr,
                 "--listen overrides the port the Azure Functions host is waiting on; the host \
                  will not reach this process"
             );
-            addr
+            addr.clone()
         }
-        _ => host_addr,
+        _ => ListenAddr::Tcp(host_addr),
     };
 
     info!(
@@ -973,9 +1198,9 @@ where
     run_server(executor, endpoint, (), addr).await
 }
 
-fn server_addr() -> SocketAddr {
+fn server_addr() -> ListenAddr {
     std::env::var("SKYZEN_ADDRESS").map_or_else(
-        |_| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        |_| ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
         |addr| {
             // Use the provided address by default
             addr.parse()
@@ -1129,9 +1354,11 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::UnixListener;
     use super::{
-        apply_cli_overrides, drain_connections, server_addr, sniff_protocol, ListenOverride,
-        Platform, Prefixed, StartupError, LAMBDA_RUNTIME_API_ENV,
+        apply_cli_overrides, drain_connections, server_addr, sniff_protocol, ListenAddr,
+        ListenAddrError, ListenOverride, Platform, Prefixed, StartupError, LAMBDA_RUNTIME_API_ENV,
     };
     use crate::runtime::azure::CUSTOM_HANDLER_PORT_ENV;
     use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1260,7 +1487,7 @@ mod tests {
 
         assert_eq!(
             server_addr(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+            ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         );
     }
 
@@ -1271,7 +1498,19 @@ mod tests {
 
         assert_eq!(
             server_addr(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4012)
+            ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4012))
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn server_addr_accepts_a_unix_environment_value() {
+        let _guard = EnvGuard::set("unix:/tmp/skyzen-env.sock");
+
+        assert_eq!(
+            server_addr(),
+            ListenAddr::Unix(std::path::PathBuf::from("/tmp/skyzen-env.sock"))
         );
     }
 
@@ -1427,6 +1666,85 @@ mod tests {
             apply_cli_overrides(["skyzen".to_owned(), "--port=8080".to_owned()]),
             Some(ListenOverride {
                 addr: "127.0.0.1:8080".parse().unwrap(),
+                explicit: false,
+            })
+        );
+    }
+
+    #[test]
+    fn listen_addr_parses_tcp_and_rejects_garbage() {
+        assert_eq!(
+            "127.0.0.1:8080"
+                .parse::<ListenAddr>()
+                .expect("a valid socket address"),
+            ListenAddr::Tcp("127.0.0.1:8080".parse().unwrap())
+        );
+        assert!(matches!(
+            "not-an-address".parse::<ListenAddr>(),
+            Err(ListenAddrError::NotAnAddress(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn listen_addr_parses_every_unix_scheme_form() {
+        for (value, path) in [
+            ("unix:/tmp/app.sock", "/tmp/app.sock"),
+            ("unix:///tmp/app.sock", "/tmp/app.sock"),
+            ("unix:rel/app.sock", "rel/app.sock"),
+        ] {
+            assert_eq!(
+                value.parse::<ListenAddr>().expect("a valid unix path"),
+                ListenAddr::Unix(path.into()),
+                "{value}"
+            );
+        }
+        assert!(matches!(
+            "unix:".parse::<ListenAddr>(),
+            Err(ListenAddrError::EmptyUnixPath)
+        ));
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn listen_addr_refuses_unix_paths_where_they_do_not_exist() {
+        assert!(matches!(
+            "unix:/tmp/app.sock".parse::<ListenAddr>(),
+            Err(ListenAddrError::UnixUnsupported)
+        ));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn apply_cli_overrides_accepts_a_unix_listen_path() {
+        let _guard = EnvGuard::clear();
+
+        assert_eq!(
+            apply_cli_overrides([
+                "skyzen".to_owned(),
+                "--listen".to_owned(),
+                "unix:/tmp/app.sock".to_owned(),
+            ]),
+            Some(ListenOverride {
+                addr: ListenAddr::Unix("/tmp/app.sock".into()),
+                explicit: true,
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn tcp_flags_cannot_adjust_a_unix_base_address() {
+        let _guard = EnvGuard::set("unix:/tmp/env.sock");
+
+        // `--port` adjusts a TCP address; a unix `SKYZEN_ADDRESS` keeps its path and the
+        // flag is ignored with a warning rather than silently switching transports.
+        assert_eq!(
+            apply_cli_overrides(["skyzen".to_owned(), "--port=8080".to_owned()]),
+            Some(ListenOverride {
+                addr: ListenAddr::Unix("/tmp/env.sock".into()),
                 explicit: false,
             })
         );
@@ -1634,5 +1952,60 @@ mod tests {
 
         let restored = read_all(prefixed).await;
         assert_eq!(restored, payload);
+    }
+
+    /// A socket path no other test or run is using, short enough for the platform's limit.
+    #[cfg(unix)]
+    fn unique_socket_path() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("skyzen-test-{}-{nanos}.sock", std::process::id()))
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_unix_listener_takes_a_fresh_path() {
+        let path = unique_socket_path();
+
+        let listener = super::bind_unix_listener(&path)
+            .await
+            .expect("nothing is in the way");
+
+        drop(listener);
+        std::fs::remove_file(&path).expect("the test created the socket");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_unix_listener_reclaims_a_stale_socket() {
+        let path = unique_socket_path();
+        // A dead listener's socket file stays on the filesystem; connect refuses, so the
+        // bind must remove it and take the path rather than report `AddrInUse`.
+        drop(UnixListener::bind(&path).expect("bind"));
+
+        let listener = super::bind_unix_listener(&path)
+            .await
+            .expect("a stale socket is reclaimed");
+
+        drop(listener);
+        std::fs::remove_file(&path).expect("the test created the socket");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_unix_listener_never_steals_a_live_socket() {
+        let path = unique_socket_path();
+        let listener = UnixListener::bind(&path).expect("bind");
+
+        let error = super::bind_unix_listener(&path)
+            .await
+            .expect_err("a live server keeps its socket");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(path.exists(), "the live socket must not be unlinked");
+        drop(listener);
+        std::fs::remove_file(&path).expect("the test created the socket");
     }
 }

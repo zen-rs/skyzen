@@ -50,7 +50,7 @@ cargo build --release
 The binary is at `target/release/<your-app>`. It includes:
 - Pretty logging via `tracing` (controlled by `RUST_LOG`)
 - Graceful shutdown on `Ctrl+C`
-- CLI overrides: `--port`, `--host`, `--listen`
+- CLI overrides: `--port`, `--host`, `--listen` — `--listen`/`--addr` and `SKYZEN_ADDRESS` also accept `unix:/path` on unix platforms to serve over a filesystem unix socket instead of TCP
 
 ### Running
 
