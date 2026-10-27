@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-test"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Testing utilities and mock implementations for the Skyzen framework"
 license = "MIT OR Apache-2.0"
@@ -11,7 +11,7 @@ categories = ["web-programming::http-server", "development-tools::testing"]
 
 [dependencies]
 skyzen-core.workspace = true
-skyzen-services = { path = "../services", version = "0.2.1", default-features = false }
+skyzen-services = { path = "../services", version = "0.3.0", default-features = false }
 http-kit.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
