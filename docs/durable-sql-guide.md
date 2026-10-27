@@ -14,6 +14,13 @@ The important mental model is:
 - a `DurableObject` is identified by object ID or object name
 - each Durable Object instance gets its own `DurableDb`, `DurableKv`, alarms, and connection set
 
+`DurableObject::PERSIST` has no default because `true` is a commitment: it serializes the struct
+into the `__skyzen_do_state` blob and reads it back before the instance's first event (fetch,
+alarm, websocket), so every later version of the struct must deserialize what every earlier
+version stored. A change to the struct's serde shape makes the object fail on every event, and
+no route on it can run, including any reset route. An object keeping its state in `DurableDb` or
+`DurableKv` declares `false`, as the `Room` below does.
+
 ## When To Use DurableDb
 
 Use `DurableDb` when your data is naturally scoped to one object instance, for example:
@@ -42,6 +49,9 @@ use skyzen_services::durable::DurableDb;
 struct Room;
 
 impl DurableObject for Room {
+    // State lives in `DurableDb`; there is no blob to round-trip.
+    const PERSIST: bool = false;
+
     fn fetch(&self) -> Router {
         Route::new((
             "/join".post(join_room),

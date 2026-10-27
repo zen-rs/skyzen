@@ -24,10 +24,10 @@ use crate::routing::Router;
 ///   exclusively. State an event changes lives behind interior mutability, and [`fetch`](Self::fetch)
 ///   hands handlers what they need as `State<…>` clones of the object's own handles.
 ///
-/// - **Struct IS the state**, when it persists: a type with the default
-///   [`PERSIST`](Self::PERSIST) must be `Serialize + DeserializeOwned + Default`, is read from
-///   storage when the instance first receives an event, and is written back after every
-///   successful event whose serialization changed.
+/// - **Struct IS the state**, when it persists: a type whose [`PERSIST`](Self::PERSIST) is
+///   `true` must be `Serialize + DeserializeOwned + Default`, is read from storage when the
+///   instance first receives an event, and is written back after every successful event whose
+///   serialization changed.
 ///
 /// - **Two methods**: `fetch` for HTTP (returns a [`Router`]),
 ///   `websocket` for all hibernation WS events.
@@ -47,6 +47,8 @@ use crate::routing::Router;
 /// }
 ///
 /// impl DurableObject for Counter {
+///     const PERSIST: bool = true;
+///
 ///     fn fetch(&self) -> Router {
 ///         self.count.fetch_add(1, Ordering::Relaxed);
 ///         Route::new((
@@ -61,26 +63,30 @@ use crate::routing::Router;
 /// }
 /// ```
 pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'static {
-    /// Whether the framework loads `Self` from storage and stores it back.
+    /// Whether the framework loads `Self` from storage and stores it back. There is no default:
+    /// every implementation states the choice.
     ///
-    /// # What `true` costs
+    /// # What `true` means
     ///
-    /// With the default, the whole object is read from one storage value and JSON-parsed on the
-    /// instance's first event, and serialized again after **every** event — each fetch, each
-    /// alarm, each websocket message — to see whether it changed. For a counter that is nothing.
-    /// For a chat room holding a message history it is a full serialize per websocket frame, and
-    /// the object lives in a single storage value, so it is bounded by the per-value limit rather
-    /// than by the storage size.
+    /// The whole object is serialized into the `__skyzen_do_state` blob and read back before the
+    /// instance's first event — fetch, alarm or websocket — then serialized again after **every**
+    /// event to see whether it changed. Every later version of the struct must therefore
+    /// deserialize what every earlier version stored: a change to the struct's serde shape makes
+    /// the object fail on every event, and no route on it can run, including any reset route.
+    ///
+    /// For a counter the round trip is nothing. For a chat room holding a message history it is a
+    /// full serialize per websocket frame, and the object lives in a single storage value, so it
+    /// is bounded by the per-value limit rather than by the storage size.
     ///
     /// # Setting it to `false`
     ///
     /// An object that keeps its state in storage directly — through the
     /// [`DurableKv`](skyzen_services::durable::DurableKv) or
-    /// [`DurableDb`](skyzen_services::durable::DurableDb) extractors — has nothing for the
-    /// framework to serialize, and setting `PERSIST = false` skips the load/parse/serialize/save
-    /// round trip entirely. The struct then holds only what the instance keeps in memory —
-    /// caches, subscriptions, handles a held stream waits on — and `Default::default()` produces
-    /// it once, on the instance's first event.
+    /// [`DurableDb`](skyzen_services::durable::DurableDb) extractors — declares
+    /// `PERSIST = false` and skips the load/parse/serialize/save round trip entirely. The struct
+    /// then holds only what the instance keeps in memory — caches, subscriptions, handles a held
+    /// stream waits on — and `Default::default()` produces it once, on the instance's first
+    /// event.
     ///
     /// This is the path to take for anything that grows: `DurableDb` is backed by the `SQLite`
     /// storage Cloudflare now provisions for new Durable Object classes, so rows are read and
@@ -97,7 +103,7 @@ pub trait DurableObject: Serialize + DeserializeOwned + Default + Sized + 'stati
     ///     fn fetch(&self) -> Router { /* … */ }
     /// }
     /// ```
-    const PERSIST: bool = true;
+    const PERSIST: bool;
 
     /// Build the [`Router`] handling HTTP requests (and, via [`Route::on_alarm`](crate::routing::Route::on_alarm),
     /// alarm events).

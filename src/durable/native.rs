@@ -1045,6 +1045,8 @@ mod tests {
     struct CounterObject;
 
     impl DurableObject for CounterObject {
+        const PERSIST: bool = false;
+
         fn fetch(&self) -> crate::routing::Router {
             Route::new((
                 "/increment".post(increment),
@@ -1182,6 +1184,8 @@ mod tests {
     }
 
     impl DurableObject for BlobCounter {
+        const PERSIST: bool = true;
+
         fn fetch(&self) -> crate::routing::Router {
             let hits = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
             Route::new(("/hits".at(move || async move { hits.to_string() }),)).build()

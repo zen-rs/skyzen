@@ -13,6 +13,9 @@ pub struct Room {
 }
 
 impl DurableObject for Room {
+    // The count is in-memory bookkeeping; a blob round-trip per frame buys nothing here.
+    const PERSIST: bool = false;
+
     fn fetch(&self) -> Router {
         Route::new((
             "/".at(|| async { "room ready" }),
