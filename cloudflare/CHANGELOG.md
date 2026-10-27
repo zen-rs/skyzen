@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/zen-rs/skyzen/compare/skyzen-cloudflare-v0.4.4...skyzen-cloudflare-v0.5.0) - 2026-10-27
+
+### Added
+
+- *(services)* expose native durable storage sync ([#103](https://github.com/zen-rs/skyzen/pull/103))
+- [**breaking**] adopt sqlx 0.9 and stop forcing sqlx backends on leaf crates ([#99](https://github.com/zen-rs/skyzen/pull/99))
+
+### Fixed
+
+- *(cloudflare)* render a rejected fetch's JS error message, not its JsValue Debug ([#100](https://github.com/zen-rs/skyzen/pull/100))
+
+### Other
+
+- Merge main back into dev after 0.4.4
+
 ## [0.4.0](https://github.com/zen-rs/skyzen/compare/skyzen-cloudflare-v0.3.0...skyzen-cloudflare-v0.4.0) - 2026-09-18
 
 ### Added
