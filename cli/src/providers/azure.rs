@@ -60,7 +60,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
 
     let binary = project.binary_target_name()?.to_owned();
 
-    let needs_bundle = matches!(action, Action::Build { .. } | Action::Deploy);
+    let needs_bundle = matches!(action, Action::Build { .. } | Action::Deploy { .. });
     if !needs_bundle {
         return Ok(ProviderPlan {
             steps: vec![Step::Command(non_bundling_command(
@@ -78,13 +78,13 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
         target_directory: project.target_directory().to_path_buf(),
         staged_path: bundle_dir.join(&binary),
         // A `build` is for looking at what would be published; only a deploy has to run there.
-        require_linux: matches!(action, Action::Deploy),
+        require_linux: matches!(action, Action::Deploy { .. }),
     };
 
     let mut child_env = Vec::new();
     let steps = match action {
         Action::Build { .. } => Vec::new(),
-        Action::Deploy => {
+        Action::Deploy { .. } => {
             // Both are read before anything is built: a deploy that would have nowhere to deliver
             // its variables, or no value for one of them, must fail before it uploads a binary.
             let app = function_app(&config)?;
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn a_deploy_publishes_the_generated_bundle_and_builds_the_handler_first() {
         let plan = prepare(
-            &Action::Deploy,
+            &Action::Deploy { upload_only: false },
             &manifest(&format!(
                 "{ADDRESSED}target = \"x86_64-unknown-linux-musl\"\n"
             )),
@@ -517,8 +517,12 @@ mod tests {
 
     #[test]
     fn a_deploy_without_an_app_name_says_so_before_building_anything() {
-        let error = prepare(&Action::Deploy, &manifest("[azure]\n"), &project())
-            .expect_err("there is nothing to publish to");
+        let error = prepare(
+            &Action::Deploy { upload_only: false },
+            &manifest("[azure]\n"),
+            &project(),
+        )
+        .expect_err("there is nothing to publish to");
 
         assert!(error.to_string().contains("app_name"), "{error}");
     }
@@ -536,8 +540,12 @@ mod tests {
                 "resource_group",
             ),
         ] {
-            let error = prepare(&Action::Deploy, &manifest(source), &project())
-                .expect_err("the runtime variables would have nowhere to go");
+            let error = prepare(
+                &Action::Deploy { upload_only: false },
+                &manifest(source),
+                &project(),
+            )
+            .expect_err("the runtime variables would have nowhere to go");
             assert!(error.to_string().contains(missing), "{error}");
 
             let error = prepare(
@@ -561,7 +569,12 @@ mod tests {
         )
         .expect("valid manifest");
 
-        let plan = prepare(&Action::Deploy, &manifest, &project()).expect("plan");
+        let plan = prepare(
+            &Action::Deploy { upload_only: false },
+            &manifest,
+            &project(),
+        )
+        .expect("plan");
         let last = plan.steps.last().expect("a deploy delivers its settings");
         let described = last.describe();
 
@@ -581,7 +594,7 @@ mod tests {
     #[test]
     fn a_deploy_refuses_when_a_declared_variable_is_set_nowhere() {
         let error = prepare(
-            &Action::Deploy,
+            &Action::Deploy { upload_only: false },
             &manifest(&format!(
                 "[[secret]]\nname = \"SKYZEN_TEST_AZURE_UNSET_SECRET\"\n\n{ADDRESSED}"
             )),

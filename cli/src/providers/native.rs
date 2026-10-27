@@ -106,7 +106,8 @@ mod tests {
 
     #[test]
     fn a_cloud_only_action_is_refused_with_a_reason() {
-        let error = prepare(&Action::Deploy, &manifest("")).expect_err("native cannot deploy");
+        let error = prepare(&Action::Deploy { upload_only: false }, &manifest(""))
+            .expect_err("native cannot deploy");
         assert!(
             error.to_string().contains("no native implementation"),
             "{error}"

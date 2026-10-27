@@ -100,6 +100,13 @@ extern "C" {
         options: &JsValue,
     ) -> Result<Promise, JsValue>;
 
+    /// `sync()`, the durability barrier: resolves once every write the object has
+    /// issued is persisted to disk — the same point the runtime's output gate
+    /// waits on before it releases outgoing I/O. `worker-sys` does not bind it.
+    /// <https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#sync>
+    #[wasm_bindgen(method, catch, js_name = sync)]
+    pub fn sync(this: &DurableObjectStorageExt) -> Result<Promise, JsValue>;
+
     /// `DurableObjectNamespace`, seen through the methods missing from `worker-sys`.
     #[wasm_bindgen(extends = js_sys::Object)]
     pub type DurableObjectNamespaceExt;

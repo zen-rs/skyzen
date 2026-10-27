@@ -24,7 +24,7 @@ use std::{collections::BTreeMap, time::Duration};
 /// `cargo lambda deploy` returns as soon as Lambda has accepted the code, while the function's
 /// `LastUpdateStatus` is still `InProgress`; a second update during that window is rejected with a
 /// `ResourceConflictException`. Five minutes is the SDK's own default for this waiter.
-const UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
+const UPDATE_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Set a deployed function's environment to what the manifest and the local `.env` say.
 #[derive(Debug)]

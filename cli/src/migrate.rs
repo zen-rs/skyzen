@@ -404,7 +404,7 @@ mod tests {
     use skyzen_manifest::{Manifest, NativeDatabaseBackend, VarName};
     use std::{fs, path::Path};
 
-    /// A manifest wiring one SQLite database whose URL comes from `variable`.
+    /// A manifest wiring one `SQLite` database whose URL comes from `variable`.
     fn manifest_source(variable: &str) -> String {
         format!(
             "[[database]]\nname = \"main\"\ntype = \"sql\"\ndefault = true\n\n\

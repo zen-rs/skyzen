@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 skyzen = { path = "../.." }
-skyzen-services = { path = "../../services" }
+skyzen-services = { path = "../../services", default-features = false }
 # The `backend = "memory"` wiring in Skyzen.toml expands to `skyzen_test`'s in-process mock.
 skyzen-test = { path = "../../test" }
 serde = { version = "1", features = ["derive"] }

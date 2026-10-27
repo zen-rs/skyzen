@@ -8,6 +8,7 @@ mod secrets;
 pub mod wrangler;
 
 use crate::{
+    environment::ResolvedVariables,
     project::{Project, WASM_TARGET},
     providers::{
         Action, CommandPlan, CommandStdin, FileContents, GeneratedFile, ProviderPlan, RunMode,
@@ -57,7 +58,7 @@ pub fn prepare(
 
     let needs_artifacts = matches!(
         action,
-        Action::Build { .. } | Action::Dev { .. } | Action::Deploy
+        Action::Build { .. } | Action::Dev { .. } | Action::Deploy { .. }
     );
     if needs_artifacts {
         // Before `cargo build`, not after: a mismatch surfaces from wasm-bindgen as an opaque
@@ -95,7 +96,7 @@ pub fn prepare(
         root_dir: manifest.root_dir(),
         entry_js_path: &entry_js_path,
         wrangler_dir,
-        id_policy: if matches!(action, Action::Deploy) {
+        id_policy: if matches!(action, Action::Deploy { .. }) {
             IdPolicy::RequireProvisioned
         } else {
             IdPolicy::LocalPlaceholder
@@ -139,7 +140,7 @@ pub fn prepare(
         run_mode,
         child_env: Vec::new(),
         watch_root: matches!(action, Action::Dev { .. }).then(|| manifest.root_dir().to_path_buf()),
-        execute_despite_dry_run: matches!(action, Action::Deploy),
+        execute_despite_dry_run: matches!(action, Action::Deploy { .. }),
     })
 }
 
@@ -248,27 +249,31 @@ fn plan_work(request: &WorkRequest<'_>) -> Result<PlannedWork> {
                 })
                 .collect(),
         ),
-        Action::Deploy => {
+        Action::Deploy { upload_only } => {
             // Resolved before anything is uploaded, and under `--dry-run` too: a deployment that
             // ships half its configuration fails at cold start, where the message is a panic in a
             // log rather than a list of manifest entries.
             let resolved = secrets.classic()?;
-            let mut commands = vec![command(
-                &["deploy"],
-                &if request.dry_run {
-                    // Unlike every other command, `deploy --dry-run` runs the real build and hands
-                    // the real bundle to wrangler; only the upload is skipped.
-                    vec!["--dry-run".to_owned()]
-                } else {
-                    Vec::new()
-                },
-            )];
-            // Values are attached to the Worker the upload just created, so there is nothing to
-            // attach them to when nothing was uploaded.
-            if !request.dry_run {
-                commands.extend(secrets.bulk_step(&resolved)?);
+            if *upload_only {
+                upload_only_work(request, &resolved, command)?
+            } else {
+                let mut commands = vec![command(
+                    &["deploy"],
+                    &if request.dry_run {
+                        // Unlike every other command, `deploy --dry-run` runs the real build and
+                        // hands the real bundle to wrangler; only the upload is skipped.
+                        vec!["--dry-run".to_owned()]
+                    } else {
+                        Vec::new()
+                    },
+                )];
+                // Values are attached to the Worker the upload just created, so there is nothing
+                // to attach them to when nothing was uploaded.
+                if !request.dry_run {
+                    commands.extend(secrets.bulk_step(&resolved)?);
+                }
+                PlannedWork::from_commands(commands)
             }
-            PlannedWork::from_commands(commands)
         }
         Action::Logs { wrangler_args } => {
             PlannedWork::from_commands(vec![command(&["tail"], wrangler_args)])
@@ -294,6 +299,35 @@ fn plan_work(request: &WorkRequest<'_>) -> Result<PlannedWork> {
     Ok(work)
 }
 
+/// The plan for `deploy --upload-only`.
+///
+/// `wrangler versions upload` leaves the new version undeployed, so a rollout driven outside the
+/// CLI can shift traffic onto it gradually. The secrets travel in the same upload as the code —
+/// a `secret bulk` follow-up would mint a second version on top of it.
+///
+/// # Errors
+///
+/// Fails when the secrets cannot be encoded as JSON or a path is not UTF-8.
+fn upload_only_work(
+    request: &WorkRequest<'_>,
+    resolved: &ResolvedVariables,
+    command: impl Fn(&[&str], &[String]) -> CommandPlan,
+) -> Result<PlannedWork> {
+    let secrets_file = secrets::upload_secrets_file(resolved, request.upload_secrets_path())?;
+    let mut args = Vec::new();
+    if let Some(file) = &secrets_file {
+        args.push("--secrets-file".to_owned());
+        args.push(path_string(&file.path)?);
+    }
+    if request.dry_run {
+        args.push("--dry-run".to_owned());
+    }
+    Ok(PlannedWork {
+        steps: vec![Step::Command(command(&["versions", "upload"], &args))],
+        generated_files: secrets_file.into_iter().collect(),
+    })
+}
+
 impl WorkRequest<'_> {
     /// Where `wrangler dev` reads local values from.
     ///
@@ -305,6 +339,14 @@ impl WorkRequest<'_> {
             || ".dev.vars".to_owned(),
             |environment| format!(".dev.vars.{environment}"),
         ))
+    }
+
+    /// Where `wrangler versions upload --secrets-file` reads its document.
+    ///
+    /// Beside the generated configuration, which is where files the CLI generates and nothing
+    /// version-controls live.
+    fn upload_secrets_path(&self) -> PathBuf {
+        self.wrangler_dir.join("secrets.upload.json")
     }
 }
 
@@ -432,7 +474,10 @@ fn resolve_build_plan(
     }
 
     // Deploys ship optimized wasm; dev keeps fast debug builds.
-    let release = matches!(action, Action::Deploy | Action::Build { release: true });
+    let release = matches!(
+        action,
+        Action::Deploy { .. } | Action::Build { release: true }
+    );
     let wasm_artifact_path = project
         .target_directory()
         .join(WASM_TARGET)
@@ -512,7 +557,7 @@ mod tests {
     };
     use secrecy::SecretString;
     use skyzen_manifest::{Manifest, VarName};
-    use std::path::PathBuf;
+    use std::{ffi::OsStr, path::PathBuf};
     use tempfile::TempDir;
 
     fn manifest(source: &str) -> Manifest {
@@ -666,7 +711,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_deploy_becomes_a_wrangler_dry_run_rather_than_a_skipped_build() {
-        let deploy = rendered(&Action::Deploy, None, true);
+        let deploy = rendered(&Action::Deploy { upload_only: false }, None, true);
         assert!(deploy.contains("wrangler deploy"), "{deploy}");
         assert!(deploy.contains("--dry-run"), "{deploy}");
     }
@@ -751,7 +796,13 @@ mod tests {
     #[test]
     fn a_deploy_delivers_the_declared_secrets_after_the_upload() {
         let (_dir, manifest) = project(CLASSIC, "STRIPE_KEY=sk_live_123\n");
-        let planned = work(&Action::Deploy, &manifest, None, false).expect("plan");
+        let planned = work(
+            &Action::Deploy { upload_only: false },
+            &manifest,
+            None,
+            false,
+        )
+        .expect("plan");
 
         let commands = commands(&planned);
         assert_eq!(commands.len(), 2, "{planned:?}");
@@ -768,10 +819,71 @@ mod tests {
     }
 
     #[test]
+    fn an_upload_only_deploy_uploads_a_version_with_its_secrets_in_the_same_upload() {
+        let (_dir, manifest) = project(CLASSIC, "STRIPE_KEY=sk_live_123\n");
+        let planned = work(
+            &Action::Deploy { upload_only: true },
+            &manifest,
+            None,
+            false,
+        )
+        .expect("plan");
+
+        let commands = commands(&planned);
+        // One upload, and nothing that deploys or mints a second version on top of it.
+        assert_eq!(commands.len(), 1, "{planned:?}");
+        let upload = commands[0].display();
+        assert!(upload.contains("wrangler versions upload"), "{upload}");
+        assert!(upload.contains("--secrets-file"), "{upload}");
+        assert!(!upload.contains("secret bulk"), "{upload}");
+
+        // The file wrangler reads is generated as secret content: written 0600, never printed.
+        assert_eq!(planned.generated_files.len(), 1, "{planned:?}");
+        assert_eq!(
+            planned.generated_files[0].path.file_name(),
+            Some(OsStr::new("secrets.upload.json")),
+            "{planned:?}"
+        );
+        match &planned.generated_files[0].contents {
+            FileContents::Secret(value) => {
+                assert_eq!(
+                    environment::expose(value),
+                    r#"{"STRIPE_KEY":"sk_live_123"}"#
+                );
+            }
+            FileContents::Public(_) => panic!("a secrets document is not public"),
+        }
+    }
+
+    #[test]
+    fn an_upload_only_deploy_without_classic_secrets_has_no_secrets_file() {
+        let (_dir, manifest) = project(STORE_BACKED, "");
+        let planned = work(
+            &Action::Deploy { upload_only: true },
+            &manifest,
+            None,
+            false,
+        )
+        .expect("plan");
+
+        let commands = commands(&planned);
+        assert_eq!(commands.len(), 1, "{planned:?}");
+        let upload = commands[0].display();
+        assert!(upload.contains("wrangler versions upload"), "{upload}");
+        assert!(!upload.contains("--secrets-file"), "{upload}");
+        assert!(planned.generated_files.is_empty(), "{planned:?}");
+    }
+
+    #[test]
     fn a_deploy_refuses_when_a_declared_secret_is_set_nowhere() {
         let (_dir, manifest) = project(CLASSIC, "");
-        let error = work(&Action::Deploy, &manifest, None, false)
-            .expect_err("the value is set nowhere, and a Worker without it panics at cold start");
+        let error = work(
+            &Action::Deploy { upload_only: false },
+            &manifest,
+            None,
+            false,
+        )
+        .expect_err("the value is set nowhere, and a Worker without it panics at cold start");
         let rendered = format!("{error:#}");
         assert!(rendered.contains("STRIPE_KEY"), "{rendered}");
         assert!(rendered.contains("[[secret]] STRIPE_KEY"), "{rendered}");
@@ -786,7 +898,13 @@ mod tests {
              [native.database.main]\nbackend = \"postgres\"\nurl_env = \"JOURNAL_URL\"\n"
         );
         let (_dir, manifest) = project(&source, "");
-        let planned = work(&Action::Deploy, &manifest, None, false).expect("plan");
+        let planned = work(
+            &Action::Deploy { upload_only: false },
+            &manifest,
+            None,
+            false,
+        )
+        .expect("plan");
 
         let commands = commands(&planned);
         assert_eq!(commands.len(), 1, "nothing to deliver: {planned:?}");
@@ -796,7 +914,13 @@ mod tests {
     #[test]
     fn a_dry_run_deploy_uploads_nothing_and_so_delivers_nothing() {
         let (_dir, manifest) = project(CLASSIC, "STRIPE_KEY=sk_live_123\n");
-        let planned = work(&Action::Deploy, &manifest, None, true).expect("plan");
+        let planned = work(
+            &Action::Deploy { upload_only: false },
+            &manifest,
+            None,
+            true,
+        )
+        .expect("plan");
 
         let commands = commands(&planned);
         assert_eq!(commands.len(), 1, "{planned:?}");

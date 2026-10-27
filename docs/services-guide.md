@@ -531,7 +531,7 @@ Enable the required runtime and database features:
 
 ```toml
 [dependencies]
-skyzen-services = { version = "0.1", features = ["runtime-tokio-rustls", "postgres"] }
+skyzen-services = { version = "0.1", features = ["runtime-tokio", "tls-rustls", "postgres"] }
 ```
 
 Portable SQL is intentionally the minimum common surface. When you need provider-specific features such as Durable Object local SQLite or D1-specific metadata, drop down to the provider APIs explicitly.

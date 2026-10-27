@@ -2,7 +2,7 @@
 //!
 //! Azure SQL is the one managed SQL service Skyzen could not reach before this backend: sqlx has no
 //! T-SQL driver, so the [`Db`](skyzen_services::Db) API's native path covers `PostgreSQL`, `MySQL`
-//! and `SQLite` and stops there. Azure Database for PostgreSQL and for MySQL are already served by
+//! and `SQLite` and stops there. Azure Database for `PostgreSQL` and for `MySQL` are already served by
 //! that path — they speak the same wire protocols as anywhere else — and only Azure SQL, which
 //! speaks TDS, needed one of its own. This is it, built on [`tiberius`] behind a
 //! [`deadpool`](deadpool_tiberius::deadpool) connection pool.

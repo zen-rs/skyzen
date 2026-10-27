@@ -20,7 +20,7 @@ lambda_runtime = "1.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 skyzen-core.workspace = true
-skyzen-services.workspace = true
+skyzen-services = { path = "../services", version = "0.2.1", default-features = false }
 tokio = { version = "1.49", features = ["rt", "net", "time"] }
 tracing.workspace = true
 

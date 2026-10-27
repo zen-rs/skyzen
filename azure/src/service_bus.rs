@@ -1233,7 +1233,7 @@ mod tests {
         let delayed = queue
             .send_request(
                 encode_message(b"later"),
-                &SendOptions::new().with_delay(Duration::from_secs(60)),
+                &SendOptions::new().with_delay(Duration::from_mins(1)),
             )
             .expect("should build a send request");
         let scheduled = delayed

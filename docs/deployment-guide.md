@@ -50,7 +50,7 @@ cargo build --release
 The binary is at `target/release/<your-app>`. It includes:
 - Pretty logging via `tracing` (controlled by `RUST_LOG`)
 - Graceful shutdown on `Ctrl+C`
-- CLI overrides: `--port`, `--host`, `--listen`
+- CLI overrides: `--port`, `--host`, `--listen` — `--listen`/`--addr` and `SKYZEN_ADDRESS` also accept `unix:/path` on unix platforms to serve over a filesystem unix socket instead of TCP
 
 ### Running
 
@@ -195,6 +195,11 @@ skyzen deploy --provider cloudflare --dry-run
 `deploy` uses the same build pipeline before invoking `wrangler deploy`. `--dry-run` runs the real
 build and passes `--dry-run` to wrangler, so it validates the actual bundle rather than skipping
 the work. A binding with no provisioned id is refused here rather than being invented.
+
+`skyzen deploy --upload-only` runs `wrangler versions upload` instead: the new version is uploaded
+but not deployed, so an external rollout can shift traffic onto it gradually with
+`wrangler versions deploy`. Declared secrets travel in the same upload as the code
+(`--secrets-file`), so the version a canary serves already carries them.
 
 ### Environments
 

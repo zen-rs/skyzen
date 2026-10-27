@@ -508,6 +508,9 @@ impl skyzen_core::Extractor for ForwardedRequest {
 struct RelayObject;
 
 impl skyzen::durable::DurableObject for RelayObject {
+    // Stateless beyond the connection registry: there is nothing for the blob to hold.
+    const PERSIST: bool = false;
+
     fn fetch(&self) -> skyzen::routing::Router {
         Route::new((
             "/relay".at(join_relay),

@@ -156,7 +156,7 @@ skyzen-services.workspace = true
 # `InMemoryDb` — and therefore every `#[skyzen::test]` that takes a `Db` — needs a sqlx driver and
 # a sqlx runtime, which `skyzen-test` leaves to the consumer to choose. Picking one here is what
 # lets `cargo test -p skyzen` run the migration tests without a feature flag on the command line.
-skyzen-test = { workspace = true, features = ["runtime-tokio-rustls"] }
+skyzen-test = { workspace = true, features = ["runtime-tokio"] }
 # `tests/sql_rows.rs` binds and reads the parameter types `DbValue` carries, exactly as an
 # application does: the types are named from their own crates, at the versions `skyzen-services`
 # depends on, so cargo unifies them into the same ones the backends encode.
@@ -211,7 +211,7 @@ optional = true
 skyzen-cloudflare = { path = "cloudflare" }
 
 [features]
-default = ["json", "form", "query", "multipart", "sse", "rt", "openapi", "ws", "static-files", "runtime-async-std-native-tls"]
+default = ["json", "form", "query", "multipart", "sse", "rt", "openapi", "ws", "static-files", "runtime-async-std", "tls-native-tls"]
 openapi = ["skyzen-core/openapi", "skyzen-macros/openapi"]
 auth = []
 jwt = ["auth", "dep:jsonwebtoken"]
@@ -226,8 +226,11 @@ sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
 static-files = ["dep:headers", "dep:sha1", "dep:base64"]
 # `TypedHeader<H>` plus the `skyzen::headers` re-export.
 typed-header = ["dep:headers"]
-runtime-async-std-native-tls = ["skyzen-services/runtime-async-std-native-tls"]
-runtime-async-std-rustls = ["skyzen-services/runtime-async-std-rustls"]
+runtime-tokio = ["skyzen-services/runtime-tokio"]
+runtime-async-std = ["skyzen-services/runtime-async-std"]
+tls-native-tls = ["skyzen-services/tls-native-tls"]
+tls-rustls = ["skyzen-services/tls-rustls"]
+tls-none = ["skyzen-services/tls-none"]
 ws = [
     "json",
     "dep:futures-channel",

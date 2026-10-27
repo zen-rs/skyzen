@@ -21,7 +21,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::{
-    header::{HeaderMap, HeaderName, HeaderValue},
+    header::{HeaderMap, HeaderName, HeaderValue, CONTENT_ENCODING},
     Body, BodyError, Method, StatusCode, Uri,
 };
 
@@ -100,29 +100,63 @@ pub fn into_js_request(request: crate::Request) -> Result<Request, JsValue> {
 /// Returns a `JsValue` error when the status or a header is not something `http` accepts, or when
 /// a `101` arrives without the socket that has to accompany it.
 pub fn from_js_response(response: &Response) -> Result<crate::Response, JsValue> {
-    let status = StatusCode::from_u16(response.status())
-        .map_err(|error| JsValue::from_str(&format!("invalid response status: {error}")))?;
+    let mut sky_response = response_from_js_head(response, body_from_js_stream(response.body()))?;
 
-    let mut sky_response = crate::Response::new(body_from_js_stream(response.body()));
-    *sky_response.status_mut() = status;
-    *sky_response.headers_mut() = headers_from_js(&response.headers())?;
-
-    if status == StatusCode::SWITCHING_PROTOCOLS {
+    if sky_response.status() == StatusCode::SWITCHING_PROTOCOLS {
         attach_upgraded_socket(response, &mut sky_response)?;
     }
 
     Ok(sky_response)
 }
 
-/// Render a Skyzen response as a `WinterCG` [`Response`], streaming its body.
+/// Wrap a fetched JS response so its body reaches the client as the very
+/// `ReadableStream` workerd handed over.
+///
+/// Status and headers become the Skyzen response's, the body stays a JS
+/// object and never enters wasm. For proxying — a body copied chunk by
+/// chunk through wasm and back costs CPU in proportion to its size for no
+/// gain.
 ///
 /// # Errors
 ///
-/// Returns a `JsValue` error when a header is not something the runtime accepts or the response
-/// cannot be constructed.
+/// Returns a `JsValue` error when the status or a header is not something `http` accepts.
+pub fn passthrough_js_response(response: &Response) -> Result<crate::Response, JsValue> {
+    let mut sky_response = response_from_js_head(response, Body::empty())?;
+    if let Some(stream) = response.body() {
+        sky_response
+            .extensions_mut()
+            .insert(JsBodyPassthrough(stream));
+    }
+    Ok(sky_response)
+}
+
+/// The status and headers of a `WinterCG` [`Response`] as a Skyzen response over `body` — the
+/// head every body strategy shares.
+fn response_from_js_head(response: &Response, body: Body) -> Result<crate::Response, JsValue> {
+    let mut sky_response = crate::Response::new(body);
+    *sky_response.status_mut() = StatusCode::from_u16(response.status())
+        .map_err(|error| JsValue::from_str(&format!("invalid response status: {error}")))?;
+    *sky_response.headers_mut() = headers_from_js(&response.headers())?;
+    Ok(sky_response)
+}
+
+/// Render a Skyzen response as a `WinterCG` [`Response`], streaming its body.
+///
+/// A response built by [`passthrough_js_response`] answers with the JS stream it carries instead,
+/// so its bytes never pass through wasm.
+///
+/// A body that carries `Content-Encoding` is already the encoded representation — the same
+/// semantics the native runtime applies — so it must be served verbatim. workerd's default
+/// `encodeBody: "automatic"` would instead treat the header as an instruction to compress the
+/// bytes again, and a client decoding once would still be holding encoded data. Responses
+/// without the header keep the default and the platform stays free to compress them.
+///
+/// # Errors
+///
+/// Returns a `JsValue` error when a header is not something the runtime accepts, when a
+/// passthrough response also carries a non-empty Skyzen body, or when the response cannot be
+/// constructed.
 pub fn into_js_response(response: crate::Response) -> Result<Response, JsValue> {
-    // Only the websocket handling below needs mutable access.
-    #[cfg(feature = "ws")]
     let mut response = response;
 
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -157,13 +191,53 @@ pub fn into_js_response(response: crate::Response) -> Result<Response, JsValue> 
     init.set_status_text(status.canonical_reason().unwrap_or("OK"));
     init.set_headers_headers(&headers_into_js(response.headers())?);
 
+    // `encodeBody` is a Workers extension with no `web_sys::ResponseInit` field, so it is
+    // attached reflectively the way `webSocket` is in `upgrade_response`.
+    if response.headers().contains_key(CONTENT_ENCODING) {
+        js_sys::Reflect::set(
+            init.as_ref(),
+            &JsValue::from_str("encodeBody"),
+            &JsValue::from_str("manual"),
+        )?;
+    }
+
     if status_forbids_body(status) {
         Response::new_with_opt_readable_stream_and_init(None, &init)
     } else {
-        let body = body_into_js_stream(response.into_body());
+        let body = match response.extensions_mut().remove::<JsBodyPassthrough>() {
+            // A passthrough answers with the JS stream alone; a handler that also wrote a Skyzen
+            // body produced two answers to which bytes the client gets — a bug, so name it.
+            Some(passthrough) => {
+                if response.body().is_empty() != Some(true) {
+                    return Err(JsValue::from_str(
+                        "response carries a JS passthrough body and a non-empty body",
+                    ));
+                }
+                passthrough.0
+            }
+            None => body_into_js_stream(response.into_body()),
+        };
         Response::new_with_opt_readable_stream_and_init(Some(&body), &init)
     }
 }
+
+/// A `ReadableStream` carried through a Skyzen response untouched: [`into_js_response`] hands it
+/// to the runtime as the response body instead of streaming the [`Body`] back out. See
+/// [`passthrough_js_response`].
+#[derive(Clone)]
+struct JsBodyPassthrough(web_sys::ReadableStream);
+
+impl fmt::Debug for JsBodyPassthrough {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsBodyPassthrough").finish_non_exhaustive()
+    }
+}
+
+// SAFETY: WASM is single-threaded, so Send/Sync is safe for JS handle wrappers.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl Send for JsBodyPassthrough {}
+// SAFETY: `JsBodyPassthrough` is only read back by the single-threaded WASM runtime.
+unsafe impl Sync for JsBodyPassthrough {}
 
 /// The Fetch `Response` constructor rejects a body for these HTTP statuses.
 const fn status_forbids_body(status: StatusCode) -> bool {

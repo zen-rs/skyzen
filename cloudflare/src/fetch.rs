@@ -283,9 +283,18 @@ impl std::fmt::Display for CfFetchError {
 
 impl std::error::Error for CfFetchError {}
 
+/// A rejected `fetch` yields a JS `Error`: the text a caller stores or shows
+/// is its `.message` (`Network connection lost.`), not `JsValue`'s Debug
+/// (`JsValue(Error: msg\nError: msg)`). Primitive rejections render through
+/// `as_string`; anything else keeps the Debug form.
 #[allow(clippy::needless_pass_by_value)]
 fn js_err(error: JsValue) -> CfFetchError {
-    CfFetchError::Backend(format!("{error:?}"))
+    let message = error
+        .dyn_ref::<js_sys::Error>()
+        .map(|js| js.message().into())
+        .or_else(|| error.as_string())
+        .unwrap_or_else(|| format!("{error:?}"));
+    CfFetchError::Backend(message)
 }
 
 #[allow(clippy::needless_pass_by_value)]

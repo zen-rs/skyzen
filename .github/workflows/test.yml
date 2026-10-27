@@ -41,6 +41,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-${{ matrix.os }}
+          # Only dev pushes save (see ci.yml); other runs restore the
+          # default-branch entry without writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
 
       - name: Run clippy
         run: cargo clippy --workspace ${{ matrix.targets }} ${{ matrix.features }} -- -D warnings
@@ -63,6 +67,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-wasm
+          # Only dev pushes save (see ci.yml); other runs restore the
+          # default-branch entry without writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
 
       - name: Check WASM build (minimal)
         run: cargo check -p skyzen --target wasm32-unknown-unknown --no-default-features --features json
@@ -83,6 +91,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-wasm
+          # Only dev pushes save (see ci.yml); other runs restore the
+          # default-branch entry without writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
 
       - name: Install wasm-bindgen CLI
         run: |
@@ -143,6 +155,22 @@ jobs:
             curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/visits/lobby | grep -x "$expected"
           done
           curl -sSf http://127.0.0.1:8787/visits/annex | grep -x 1
+          # `Content-Encoding` marks a body as already encoded, so the conversion sets
+          # `encodeBody: "manual"` and workerd serves the bytes verbatim: one client-side
+          # decode reads the greeting. Without it the runtime compresses the body a second
+          # time and `--compressed` leaves gzip bytes.
+          curl --compressed --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/gzipped | grep -Fx "Hello from the encoded side!"
+          # A response without `Content-Encoding` keeps `encodeBody: "automatic"`: the
+          # platform may compress it on the wire and the client still decodes once to JSON.
+          curl --compressed --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/json | grep -F '"encoding":"platform"'
+          # A passthrough hands workerd the upstream's own JS stream as the response body: the
+          # client gets its bytes under the upstream's status and header, and the conversion
+          # check runs inside the isolate, where the stream objects can be compared.
+          passthrough=$(curl --retry 5 --retry-connrefused --retry-delay 1 -sSf -i http://127.0.0.1:8787/passthrough/body)
+          echo "$passthrough" | grep -E '^HTTP/[0-9.]+ 203'
+          echo "$passthrough" | grep -i '^x-upstream: kept'
+          echo "$passthrough" | grep -F "Hello through the passthrough!"
+          curl --retry 5 --retry-connrefused --retry-delay 1 -sSf http://127.0.0.1:8787/passthrough/conversion | grep -Fx "same stream; written body refused"
 
       - name: Shutdown wrangler
         if: always()

@@ -2,10 +2,10 @@
 
 pub mod alarm;
 pub mod kv;
-#[cfg(any(feature = "runtime-tokio-native-tls", feature = "runtime-tokio-rustls"))]
+#[cfg(feature = "runtime-tokio")]
 pub mod sql;
 
 pub use alarm::InMemoryAlarm;
 pub use kv::InMemoryDurableKv;
-#[cfg(any(feature = "runtime-tokio-native-tls", feature = "runtime-tokio-rustls"))]
+#[cfg(feature = "runtime-tokio")]
 pub use sql::InMemoryDurableDb;

@@ -9,7 +9,7 @@ Skyzen provides a dedicated testing crate (`skyzen-test`) with mock service impl
 skyzen-test = { version = "0.1" }
 
 # Enable a runtime feature for InMemoryDb (SQLite) support:
-# skyzen-test = { version = "0.1", features = ["runtime-tokio-rustls"] }
+# skyzen-test = { version = "0.1", features = ["runtime-tokio"] }
 ```
 
 ## Mock Services
@@ -96,7 +96,7 @@ than by sleeping.
 
 ### `InMemoryDb`
 
-SQLite in-memory database for SQL tests. Requires a runtime feature (`runtime-tokio-rustls` or `runtime-tokio-native-tls`).
+SQLite in-memory database for SQL tests. Requires the `runtime-tokio` feature.
 
 ```rust
 use skyzen_test::mock::InMemoryDb;
