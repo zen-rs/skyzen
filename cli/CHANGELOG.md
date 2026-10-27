@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/zen-rs/skyzen/compare/skyzen-cli-v0.4.3...skyzen-cli-v0.4.4) - 2026-09-27
+
+### Fixed
+
+- *(cloudflare)* share one wasm instance and replace it only when poisoned ([#93](https://github.com/zen-rs/skyzen/pull/93))
+
 ## [0.4.3](https://github.com/zen-rs/skyzen/compare/skyzen-cli-v0.4.2...skyzen-cli-v0.4.3) - 2026-09-27
 
 ### Fixed
