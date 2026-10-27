@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/zen-rs/skyzen/compare/v0.4.4...v0.5.0) - 2026-10-27
+
+### Added
+
+- *(durable)* [**breaking**] require every DurableObject to declare PERSIST
+- *(runtime)* serve HTTP over unix sockets via --listen unix:
+- *(wasm)* pass a fetched JS response body through untouched
+- *(services)* expose native durable storage sync ([#103](https://github.com/zen-rs/skyzen/pull/103))
+- [**breaking**] adopt sqlx 0.9 and stop forcing sqlx backends on leaf crates ([#99](https://github.com/zen-rs/skyzen/pull/99))
+- *(cli)* add deploy --upload-only for wrangler versions upload ([#98](https://github.com/zen-rs/skyzen/pull/98))
+
+### Fixed
+
+- *(runtime)* mark the non-unix ListenAddr fallback const
+- *(cloudflare)* render a rejected fetch's JS error message, not its JsValue Debug ([#100](https://github.com/zen-rs/skyzen/pull/100))
+- *(cloudflare)* serve Content-Encoding bodies with encodeBody: manual ([#97](https://github.com/zen-rs/skyzen/pull/97))
+
+### Other
+
+- Merge pull request #122 from zen-rs/ci/version-only-skip
+- skip the build and audit jobs on a version-only diff
+- Merge main back into dev after 0.4.4
+- ignore RUSTSEC-2026-0387 until the AWS SDK bumps crypto-bigint
+- *(runtime)* do not warn when the unix socket is already unlinked
+- dedupe push/PR runs and stop cache churn ([#101](https://github.com/zen-rs/skyzen/pull/101))
+
 ## [0.4.4](https://github.com/zen-rs/skyzen/compare/v0.4.3...v0.4.4) - 2026-09-27
 
 ### Fixed

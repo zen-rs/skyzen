@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/zen-rs/skyzen/compare/skyzen-cli-v0.4.4...skyzen-cli-v0.5.0) - 2026-10-27
+
+### Added
+
+- *(durable)* [**breaking**] require every DurableObject to declare PERSIST
+- [**breaking**] adopt sqlx 0.9 and stop forcing sqlx backends on leaf crates ([#99](https://github.com/zen-rs/skyzen/pull/99))
+- *(cli)* add deploy --upload-only for wrangler versions upload ([#98](https://github.com/zen-rs/skyzen/pull/98))
+
+### Other
+
+- Merge main back into dev after 0.4.4
+
 ## [0.4.4](https://github.com/zen-rs/skyzen/compare/skyzen-cli-v0.4.3...skyzen-cli-v0.4.4) - 2026-09-27
 
 ### Fixed

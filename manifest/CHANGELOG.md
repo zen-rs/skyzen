@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/zen-rs/skyzen/compare/skyzen-manifest-v0.2.0...skyzen-manifest-v0.2.1) - 2026-10-27
+
+### Added
+
+- *(cli)* add deploy --upload-only for wrangler versions upload ([#98](https://github.com/zen-rs/skyzen/pull/98))
+
 ## [0.2.0](https://github.com/zen-rs/skyzen/compare/skyzen-manifest-v0.1.1...skyzen-manifest-v0.2.0) - 2026-09-05
 
 ### Added
