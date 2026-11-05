@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/zen-rs/skyzen/compare/skyzen-cloudflare-admin-v0.5.1...skyzen-cloudflare-admin-v0.5.2) - 2026-11-05
+
+### Other
+
+- release
+
 ## [0.5.0](https://github.com/zen-rs/skyzen/compare/skyzen-cloudflare-admin-v0.4.4...skyzen-cloudflare-admin-v0.5.0) - 2026-10-27
 
 ### Added
