@@ -9,7 +9,9 @@ resolver = "2"
 skyzen-core = { path = "core", version = "0.2.1" }
 skyzen-macros = { path = "macros", version = "0.5.1" }
 skyzen-manifest = { path = "manifest", version = "0.2.1" }
-skyzen-services = { path = "services", version = "0.3.1" }
+# No default features: a database driver, sqlx runtime or TLS backend is reached only through the
+# feature of the crate that wants it, so an HTTP-only consumer compiles none of them.
+skyzen-services = { path = "services", version = "0.3.1", default-features = false }
 skyzen-test = { path = "test", version = "0.3.1" }
 skyzen-redis = { path = "redis", version = "0.3.1" }
 skyzen-s3 = { path = "s3", version = "0.3.1" }
@@ -211,7 +213,7 @@ optional = true
 skyzen-cloudflare = { path = "cloudflare" }
 
 [features]
-default = ["json", "form", "query", "multipart", "sse", "rt", "openapi", "ws", "static-files", "runtime-async-std", "tls-native-tls"]
+default = ["json", "form", "query", "multipart", "sse", "rt", "openapi", "ws", "static-files"]
 openapi = ["skyzen-core/openapi", "skyzen-macros/openapi"]
 auth = []
 jwt = ["auth", "dep:jsonwebtoken"]
@@ -226,6 +228,11 @@ sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
 static-files = ["dep:headers", "dep:sha1", "dep:base64"]
 # `TypedHeader<H>` plus the `skyzen::headers` re-export.
 typed-header = ["dep:headers"]
+# Database drivers, sqlx runtimes and TLS backends. None is on by default: an application picks
+# the ones it uses, and each forwards to the `skyzen-services` feature of the same name.
+postgres = ["skyzen-services/postgres"]
+mysql = ["skyzen-services/mysql"]
+sqlite = ["skyzen-services/sqlite"]
 runtime-tokio = ["skyzen-services/runtime-tokio"]
 runtime-async-std = ["skyzen-services/runtime-async-std"]
 tls-native-tls = ["skyzen-services/tls-native-tls"]
@@ -258,6 +265,15 @@ hyper = []
 [[example]]
 name = "embed_hyper"
 required-features = ["hyper"]
+
+# The native half of the example serves `NativeDurableNamespace`, which needs the `sqlite` driver.
+[[example]]
+name = "worker"
+required-features = ["sqlite"]
+
+[[test]]
+name = "hyper_websocket"
+required-features = ["sqlite"]
 
 [lints]
 workspace = true

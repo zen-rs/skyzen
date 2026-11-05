@@ -17,7 +17,9 @@ mod connections;
 mod context;
 mod error;
 mod id;
-#[cfg(not(target_arch = "wasm32"))]
+// The simulator keeps each object's SQL storage in an in-memory SQLite database, so it exists
+// only where `skyzen-services` has the `sqlite` driver.
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 mod native;
 mod object;
 mod websocket;
@@ -27,7 +29,7 @@ pub use connections::DurableConnectionsInner;
 pub use context::DurableContext;
 pub use error::DurableObjectError;
 pub use id::DurableObjectId;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 pub use native::{NativeDurableNamespace, NativeDurableObjectStub};
 pub use object::DurableObject;
 #[cfg(all(feature = "ws", target_arch = "wasm32"))]
