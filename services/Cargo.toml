@@ -56,7 +56,8 @@ mysql = ["dep:sqlx", "sqlx/mysql"]
 sqlite = ["dep:sqlx", "sqlx/sqlite"]
 
 [dev-dependencies]
-tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tempfile = "3.25"
 
 [lints]
 workspace = true

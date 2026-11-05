@@ -54,18 +54,18 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1 }
 # the deliberate rename. To regenerate: drop the `allow-dirty` line, run
 # `dist generate`, rename the emitted file to `binaries.yml`, restore the line.
 [workspace.metadata.dist]
-cargo-dist-version = "0.30.2"
+cargo-dist-version = "0.33.0"
 ci = ["github"]
 installers = ["shell", "powershell"]
 targets = [
     "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
 ]
 precise-builds = true
 pr-run-mode = "plan"
+github-attestations = true
 allow-dirty = ["ci"]
 
 # The profile `dist build` compiles with; without it every binaries job

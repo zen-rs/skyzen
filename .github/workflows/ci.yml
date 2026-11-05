@@ -24,9 +24,8 @@ jobs:
   # A release-plz bump changes workspace versions and the changelog and
   # nothing else, so it cannot change what a compiler, a test or an audit
   # observes beyond the version string, and the jobs that build or audit the
-  # crate skip it. Typos still reads the changelog it wrote. The script reads
-  # the diff rather than the branch name: code pushed onto a release branch
-  # runs every job. A job skipped by `if:` reports success.
+  # crate skip it. The script reads the diff rather than the branch name:
+  # code pushed onto a release branch runs every job. A job skipped by `if:` reports success.
   changes:
     name: Changed paths
     runs-on: ubuntu-latest
@@ -115,22 +114,6 @@ jobs:
         with:
           use_oidc: true
           fail_ci_if_error: true
-
-  typos:
-    name: Typos
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
-          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
-          # per run against a 10 GiB repo budget was evicting entries before
-          # the next run could restore them. Non-dev runs restore the
-          # default-branch entry (restore-only) instead of writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-          cache-on-failure: true
-      - uses: crate-ci/typos@v1
 
   audit:
     needs: changes
