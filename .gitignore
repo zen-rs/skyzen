@@ -3,6 +3,8 @@
 /target
 /*/target
 /*/Cargo.lock
+/ci/minimal-consumer/target
+/ci/minimal-consumer/Cargo.lock
 ci/workerd/.wrangler*
 ci/workerd/node_modules
 ci/workerd/worker.js
