@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/zen-rs/skyzen/compare/v0.5.0...v0.5.1) - 2026-11-05
+
+### Added
+
+- *(services)* build the SQLite backend from a caller-supplied pool
+
+### Fixed
+
+- *(services)* queue SQLite writes on one connection
+
+### Other
+
+- *(services)* open the contention databases by options, not a path-derived URL
+- Merge pull request #130 from zen-rs/ci/drop-typos
+- drop the typos check
+- drop x86_64-apple-darwin from dist release targets
+- attest release artifacts with build provenance
+
 ## [0.5.0](https://github.com/zen-rs/skyzen/compare/v0.4.4...v0.5.0) - 2026-10-27
 
 ### Added
