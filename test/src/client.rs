@@ -403,6 +403,8 @@ mod tests {
         assert_eq!(response.body_text(), "TRACE");
     }
 
+    // `InMemoryDurableDb` is SQLite over sqlx, which exists only with `runtime-tokio`.
+    #[cfg(feature = "runtime-tokio")]
     #[tokio::test]
     async fn durable_services_ride_the_context_into_the_request() {
         use skyzen_services::durable::{Alarm, DurableDb, DurableKv};

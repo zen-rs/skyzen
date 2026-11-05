@@ -241,6 +241,8 @@ impl std::fmt::Debug for NativeDurableObjectState {
 
 #[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
 impl NativeDurableObjectState {
+    // Only the native simulator builds one, and it needs the `sqlite` driver.
+    #[cfg(feature = "sqlite")]
     pub(crate) fn new<F, Fut>(accept_websocket: F) -> Self
     where
         F: Fn(crate::websocket::WebSocket, Vec<String>) -> Fut + Send + Sync + 'static,

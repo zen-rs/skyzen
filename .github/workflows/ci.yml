@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.bump.outputs.only != 'true' }}
+      edges: ${{ steps.edges.outputs.touched }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,6 +45,21 @@ jobs:
         run: |
           only=$(python3 -I .github/scripts/version-only.py "$(git merge-base "$BASE" "$HEAD")" "$HEAD")
           echo "only=$only" >> "$GITHUB_OUTPUT"
+      # The minimal-consumer job reads only manifests (the dependency edges and features it
+      # resolves), its own fixture and this workflow.
+      - name: Dependency edges touched
+        id: edges
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ] \
+            || git diff --name-only "$(git merge-base "$BASE" "$HEAD")" "$HEAD" \
+              | grep -Eq '(^|/)Cargo\.toml$|^ci/minimal-consumer/|^\.github/workflows/ci\.yml$'; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+          fi
 
   lint:
     needs: changes
@@ -185,6 +201,31 @@ jobs:
       # `skyzen` alone has 14 non-default features, so an unbounded powerset is
       # over 16k `cargo check` runs. Depth 2 covers every pair (~180 runs).
       - run: cargo hack check --workspace --feature-powerset --depth 2 --no-dev-deps
+
+  # An HTTP application that uses SQLite on tokio must not compile another database driver,
+  # async-std or native-tls: those come in only through the skyzen features that name them.
+  minimal-consumer:
+    needs: changes
+    if: needs.changes.outputs.edges == 'true'
+    name: Minimal consumer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ci/minimal-consumer
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
+      - name: Build
+        run: cargo build --manifest-path ci/minimal-consumer/Cargo.toml
+      - name: Dependency tree carries no other driver, runtime or TLS backend
+        run: |
+          tree=$(cargo tree --manifest-path ci/minimal-consumer/Cargo.toml -e all --target all --prefix none)
+          if echo "$tree" | grep -E '^(sqlx-mysql|sqlx-postgres|async-std|native-tls) '; then
+            echo "::error::the minimal consumer's tree carries a crate it did not ask for"
+            exit 1
+          fi
 
   test:
     needs: changes

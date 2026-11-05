@@ -107,7 +107,7 @@ jobs:
       - name: Build worker example
         # `-p skyzen` is required: without it cargo builds every default
         # workspace member, and the native-only ones do not compile for wasm32.
-        run: cargo build -p skyzen --example worker --release --target wasm32-unknown-unknown --no-default-features --features json,form
+        run: cargo build -p skyzen --example worker --release --target wasm32-unknown-unknown --no-default-features --features json,form,sqlite
 
       - name: Generate bindings
         run: |

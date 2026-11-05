@@ -1,0 +1,17 @@
+[package]
+name = "skyzen-minimal-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "The smallest application that serves HTTP and uses SQLite on tokio; CI asserts its dependency tree carries no other driver, runtime or TLS backend"
+
+# Not a member of the root workspace: the check resolves this tree on its own, so the root
+# workspace's feature unification (the CLI links every driver) cannot hide a leak.
+[workspace]
+
+[dependencies]
+skyzen = { path = "../..", default-features = false, features = ["hyper"] }
+skyzen-services = { path = "../../services", default-features = false, features = ["sqlite", "runtime-tokio"] }
+
+[package.metadata.dist]
+dist = false
