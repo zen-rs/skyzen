@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/zen-rs/skyzen/compare/skyzen-test-v0.3.1...skyzen-test-v0.3.2) - 2026-11-05
+
+### Fixed
+
+- reach database drivers, sqlx runtimes and TLS only through features
+
 ## [0.3.1](https://github.com/zen-rs/skyzen/compare/skyzen-test-v0.3.0...skyzen-test-v0.3.1) - 2026-11-05
 
 ### Other
