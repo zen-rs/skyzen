@@ -75,6 +75,8 @@ use uuid::Uuid;
 use crate::BoxFuture;
 
 mod row;
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+pub mod sqlite;
 
 use row::Scalar;
 pub use row::{ColumnEnum, ColumnError, FromColumn, FromRow, JsonRow, Row, RowError};
@@ -755,57 +757,71 @@ impl Db {
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
-    /// Connect to a `SQLite` database using `sqlx`.
+    /// Open a `SQLite` database by URL, such as `sqlite://./app.db?mode=rwc`.
+    ///
+    /// The URL is parsed into [`SqliteConnectOptions`](sqlite::SqliteConnectOptions) and opened
+    /// with [`connect_sqlite_with`](Self::connect_sqlite_with), which describes how statements
+    /// are spread over connections so that concurrent writers queue rather than failing with
+    /// `database is locked`.
     ///
     /// # Errors
     ///
-    /// Returns an error if `sqlx` cannot establish the connection.
+    /// Returns an error if the URL does not parse or the database cannot be opened.
     pub async fn connect_sqlite(url: &str) -> Result<Self, DbError> {
-        Ok(Self::from_sqlite_pool(
-            sqlite::SqlitePoolOptions::new().connect(url).await?,
-        ))
+        Self::connect_sqlite_with(url.parse()?).await
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
-    /// Connect to an in-memory `SQLite` database using a single connection.
+    /// Open a `SQLite` database with caller-chosen connection settings.
+    ///
+    /// `SQLite` admits one writer at a time, and a connection waiting for the write lock polls
+    /// with backoff instead of queueing, so writers on separate connections starve each other into
+    /// `database is locked`. This backend therefore holds exactly **one** read-write connection:
+    /// every transaction, every batch and every statement that may write takes its turn on it, in
+    /// the order it asked. Contention between writers in this process is a wait in that queue,
+    /// never a lock error.
+    ///
+    /// When the database is in WAL mode — set with
+    /// [`journal_mode(SqliteJournalMode::Wal)`](sqlite::SqliteConnectOptions::journal_mode), or a
+    /// file converted earlier, since WAL persists in the file — a standalone statement that
+    /// provably only reads (a `SELECT` or `VALUES` query, `WITH` included, with no
+    /// data-modifying part) runs instead on a pool of read-only connections, one per unit of the
+    /// host's available parallelism, alongside the writer and any transaction it holds. In any
+    /// other journal mode a reader can hold up a commit, so everything runs on the one connection.
+    ///
+    /// Everything else comes from `options`: the file, `create_if_missing`, pragmas, and
+    /// [`busy_timeout`](sqlite::SqliteConnectOptions::busy_timeout), which still bounds how long
+    /// a statement waits for a lock held by *another process*.
+    ///
+    /// Connection-local state — a `TEMP` table, an `ATTACH`, a `PRAGMA` issued as a statement —
+    /// lives on the writer and is invisible to the readers: use it inside a transaction, or set it
+    /// in `options`, which every connection applies. A task holding a transaction that runs a
+    /// standalone write on the same `Db` waits for its own transaction until the writer's 30 s
+    /// acquire timeout fails it; run the write on the transaction instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened.
+    pub async fn connect_sqlite_with(
+        options: sqlite::SqliteConnectOptions,
+    ) -> Result<Self, DbError> {
+        Ok(Self::new(NativeDbBackend::Sqlite(
+            sqlite::SqliteBackend::connect(options).await?,
+        )))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+    /// Open a fresh in-memory `SQLite` database, private to the returned `Db` and its clones.
+    ///
+    /// An in-memory database has no file another connection could read, so every statement runs
+    /// on its one connection, in order.
     ///
     /// # Errors
     ///
     /// Returns an error if `sqlx` cannot initialize the in-memory database.
     pub async fn connect_sqlite_memory() -> Result<Self, DbError> {
-        Ok(Self::from_sqlite_pool(
-            sqlite::SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await?,
-        ))
+        Self::connect_sqlite("sqlite::memory:").await
     }
-
-    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
-    /// Wrap a caller-built `SQLite` pool.
-    ///
-    /// [`connect_sqlite`](Self::connect_sqlite) builds its pool with sqlx's defaults, where every
-    /// pooled connection may write. `SQLite` allows one writer at a time and its busy handler
-    /// polls with backoff rather than queueing, so under concurrent writes an early waiter can
-    /// keep losing the lock until the busy timeout and fail with `database is locked`. Build the
-    /// pool yourself to change that: a pool with `max_connections(1)` hands its connection out
-    /// in FIFO order, so writers queue instead of polling, and
-    /// [`SqliteConnectOptions::busy_timeout`](sqlite::SqliteConnectOptions::busy_timeout) tunes
-    /// the timeout. The sqlx types are re-exported from [`sqlite`] at the version this crate
-    /// uses.
-    #[must_use]
-    pub fn from_sqlite_pool(pool: sqlite::SqlitePool) -> Self {
-        Self::new(NativeDbBackend::Sqlite(pool))
-    }
-}
-
-/// The sqlx `SQLite` types needed to build a pool for [`Db::from_sqlite_pool`], re-exported so
-/// they are guaranteed to be the version this crate wraps.
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
-pub mod sqlite {
-    pub use sqlx::sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
-    };
 }
 
 /// A type-erased database transaction.
@@ -1477,7 +1493,7 @@ enum NativeDbBackend {
     #[cfg(feature = "mysql")]
     MySql(sqlx::MySqlPool),
     #[cfg(feature = "sqlite")]
-    Sqlite(sqlx::SqlitePool),
+    Sqlite(sqlite::SqliteBackend),
 }
 
 #[cfg(all(
@@ -1516,7 +1532,7 @@ impl DbBackend for NativeDbBackend {
             #[cfg(feature = "mysql")]
             Self::MySql(pool) => query_mysql(pool, query, params).await,
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => query_sqlite(pool, query, params).await,
+            Self::Sqlite(backend) => query_sqlite(backend.pool_for(query), query, params).await,
         }
     }
 
@@ -1527,7 +1543,7 @@ impl DbBackend for NativeDbBackend {
             #[cfg(feature = "mysql")]
             Self::MySql(pool) => execute_mysql(pool, query, params).await,
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => execute_sqlite(pool, query, params).await,
+            Self::Sqlite(backend) => execute_sqlite(backend.pool_for(query), query, params).await,
         }
     }
 
@@ -1538,7 +1554,7 @@ impl DbBackend for NativeDbBackend {
             #[cfg(feature = "mysql")]
             Self::MySql(pool) => NativeDbTransaction::MySql(pool.begin().await?),
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => NativeDbTransaction::Sqlite(pool.begin().await?),
+            Self::Sqlite(backend) => NativeDbTransaction::Sqlite(backend.writer().begin().await?),
         };
         Ok(DbTransaction::new(tx))
     }
@@ -2584,75 +2600,287 @@ mod fallback_tests {
     any(feature = "runtime-tokio", feature = "runtime-async-std")
 ))]
 mod tests {
-    use super::{sqlite, BatchStatement, Db};
+    use std::time::{Duration, Instant};
 
-    async fn single_connection_wal_db(dir: &tempfile::TempDir) -> Db {
-        let options = sqlite::SqliteConnectOptions::new()
-            .filename(dir.path().join("pool.db"))
+    use sqlx::Connection as _;
+
+    use super::{
+        sqlite::{self, SqliteBackend},
+        BatchStatement, Db, DbError,
+    };
+
+    /// Settings for a new file database in `dir`, created in WAL mode.
+    fn wal_options(dir: &tempfile::TempDir) -> sqlite::SqliteConnectOptions {
+        sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("app.db"))
             .create_if_missing(true)
-            .journal_mode(sqlite::SqliteJournalMode::Wal);
-        let pool = sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("file database should open");
-        Db::from_sqlite_pool(pool)
+            .journal_mode(sqlite::SqliteJournalMode::Wal)
     }
 
-    #[tokio::test]
-    async fn from_sqlite_pool_runs_writes_and_reads() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = single_connection_wal_db(&dir).await;
+    async fn create_entries(db: &Db) {
         db.query("CREATE TABLE entries (value INTEGER NOT NULL)")
             .execute()
             .await
             .expect("schema should be created");
-        db.query("INSERT INTO entries (value) VALUES (?)")
-            .bind(7_i64)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reads_run_while_a_write_transaction_holds_the_writer_in_wal_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::connect_sqlite_with(wal_options(&dir))
+            .await
+            .expect("database should open");
+        create_entries(&db).await;
+        db.query("INSERT INTO entries (value) VALUES (1)")
             .execute()
             .await
             .expect("insert should succeed");
 
-        let value = db
-            .query("SELECT value FROM entries")
+        let mut tx = db.begin().await.expect("transaction should begin");
+        tx.query("INSERT INTO entries (value) VALUES (2)")
+            .execute()
+            .await
+            .expect("insert should succeed");
+
+        // `tx` holds the only read-write connection until it commits below, so a read that
+        // needed it would never finish inside the timeout.
+        let during = tokio::time::timeout(
+            Duration::from_secs(2),
+            db.query("SELECT COUNT(*) FROM entries")
+                .fetch_scalar::<i64>(),
+        )
+        .await
+        .expect("a read must not wait for the held writer")
+        .expect("read should succeed");
+        assert_eq!(during, 1, "a reader sees the last committed snapshot");
+
+        tx.commit().await.expect("transaction should commit");
+        let after = db
+            .query("SELECT COUNT(*) FROM entries")
             .fetch_scalar::<i64>()
             .await
-            .expect("select should succeed");
-        assert_eq!(value, 7);
+            .expect("read should succeed");
+        assert_eq!(after, 2, "a read after the commit sees it");
     }
 
     #[tokio::test]
-    async fn one_connection_pool_queues_concurrent_transactions() {
+    async fn a_reader_connection_refuses_writes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = single_connection_wal_db(&dir).await;
-        db.query("CREATE TABLE entries (value INTEGER NOT NULL)")
+        let backend = SqliteBackend::connect(wal_options(&dir))
+            .await
+            .expect("database should open");
+        sqlx::query("CREATE TABLE entries (value INTEGER NOT NULL)")
+            .execute(backend.writer())
+            .await
+            .expect("schema should be created");
+
+        let insert = "INSERT INTO entries (value) VALUES (1)";
+        assert!(std::ptr::eq(backend.pool_for(insert), backend.writer()));
+        let readers = backend.readers().expect("a WAL database gets readers");
+        assert!(std::ptr::eq(
+            backend.pool_for("SELECT value FROM entries"),
+            readers
+        ));
+
+        let error = sqlx::query(insert)
+            .execute(readers)
+            .await
+            .expect_err("a reader is opened read-only");
+        let code = error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .expect("the refusal is SQLite's own");
+        // SQLITE_READONLY: "attempt to write a readonly database".
+        assert_eq!(code, "8", "{error}");
+    }
+
+    #[tokio::test]
+    async fn without_wal_every_statement_runs_on_the_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rollback_journal = wal_options(&dir).journal_mode(sqlite::SqliteJournalMode::Delete);
+        let backend = SqliteBackend::connect(rollback_journal)
+            .await
+            .expect("database should open");
+        assert!(backend.readers().is_none());
+
+        let memory = SqliteBackend::connect(
+            "sqlite::memory:"
+                .parse()
+                .expect("in-memory URL should parse"),
+        )
+        .await
+        .expect("in-memory database should open");
+        assert!(memory.readers().is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_sqlite_with_applies_the_callers_busy_timeout() {
+        const BUSY_TIMEOUT: Duration = Duration::from_millis(200);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = wal_options(&dir).busy_timeout(BUSY_TIMEOUT);
+        let db = Db::connect_sqlite_with(options.clone())
+            .await
+            .expect("database should open");
+        create_entries(&db).await;
+
+        // A connection outside this `Db` stands in for another process holding the write lock.
+        let mut outsider = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("outside connection should open");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut outsider)
+            .await
+            .expect("outside connection should take the write lock");
+
+        let started = Instant::now();
+        let error = db
+            .query("INSERT INTO entries (value) VALUES (1)")
+            .execute()
+            .await
+            .expect_err("the write lock is held elsewhere");
+        let waited = started.elapsed();
+        assert!(error.to_string().contains("(code: 5)"), "{error}");
+        // sqlx's own default is 5 s; giving up well before that is the caller's 200 ms.
+        assert!(
+            waited >= BUSY_TIMEOUT && waited < Duration::from_secs(2),
+            "waited {waited:?}"
+        );
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut outsider)
+            .await
+            .expect("outside connection should roll back");
+    }
+
+    #[tokio::test]
+    async fn connect_sqlite_memory_keeps_one_private_database() {
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory database should open");
+        create_entries(&db).await;
+        // A `TEMP` table is connection-local, so seeing it again proves the same connection.
+        db.query("CREATE TEMP TABLE scratch (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .expect("temp table should be created");
+        db.execute_batch(vec![
+            BatchStatement::new("INSERT INTO entries (value) VALUES (?)").bind(1_i64),
+            BatchStatement::new("INSERT INTO scratch (value) VALUES (?)").bind(2_i64),
+        ])
+        .await
+        .expect("batch should commit");
+
+        let total = db
+            .query("SELECT (SELECT SUM(value) FROM entries) + (SELECT SUM(value) FROM scratch)")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("read should succeed");
+        assert_eq!(total, 3);
+
+        let other = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory database should open");
+        let tables = other
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'entries'")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("read should succeed");
+        assert_eq!(tables, 0, "each in-memory database is private");
+    }
+
+    /// Create a file database in `dir` with `journal_mode`, through a connection of its own, and
+    /// return the URL [`Db::connect_sqlite`] opens it by.
+    ///
+    /// WAL is a persistent property of the file, so a database created this way is in WAL mode
+    /// for every connection that opens it later, whatever that connection was configured with.
+    async fn file_database_url(
+        dir: &tempfile::TempDir,
+        journal_mode: sqlite::SqliteJournalMode,
+    ) -> String {
+        use sqlx::ConnectOptions as _;
+
+        let options = sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("app.db"))
+            .create_if_missing(true)
+            .journal_mode(journal_mode);
+        sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("file database should be created")
+            .close()
+            .await
+            .expect("setup connection should close");
+        options.to_url_lossy().into()
+    }
+
+    /// Sixteen writers, each committing ten transactions that hold the write lock for 50 ms before
+    /// committing — the contention that made `SQLite`'s polling busy handler starve early waiters
+    /// past the 5 s busy timeout. Every transaction must commit.
+    async fn assert_contended_writers_all_commit(db: &Db) {
+        const WRITERS: i64 = 16;
+        const ROUNDS: i64 = 10;
+
+        db.query("CREATE TABLE claims (writer INTEGER NOT NULL, round INTEGER NOT NULL)")
             .execute()
             .await
             .expect("schema should be created");
 
-        let write = |value: i64| {
-            let db = &db;
-            async move {
-                let mut tx = db.begin().await?;
-                tx.query("INSERT INTO entries (value) VALUES (?)")
-                    .bind(value)
-                    .execute()
-                    .await?;
-                // Hold the connection so the other writer has to wait for it.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                tx.commit().await
-            }
-        };
-        let (first, second) = tokio::join!(write(1), write(2));
-        first.expect("first transaction should commit");
-        second.expect("second transaction should wait, then commit");
+        let mut writers = tokio::task::JoinSet::new();
+        for writer in 0..WRITERS {
+            let db = db.clone();
+            writers.spawn(async move {
+                for round in 0..ROUNDS {
+                    let mut tx = db.begin().await?;
+                    tx.query("INSERT INTO claims (writer, round) VALUES (?, ?)")
+                        .bind(writer)
+                        .bind(round)
+                        .execute()
+                        .await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tx.commit().await?;
+                }
+                Ok::<(), DbError>(())
+            });
+        }
+        let failures = writers
+            .join_all()
+            .await
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "{} of {WRITERS} writers failed: {failures:?}",
+            failures.len()
+        );
 
         let count = db
-            .query("SELECT COUNT(*) FROM entries")
+            .query("SELECT COUNT(*) FROM claims")
             .fetch_scalar::<i64>()
             .await
             .expect("count should succeed");
-        assert_eq!(count, 2);
+        assert_eq!(count, WRITERS * ROUNDS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contended_writers_on_a_wal_database_all_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = file_database_url(&dir, sqlite::SqliteJournalMode::Wal).await;
+        let db = Db::connect_sqlite(&url)
+            .await
+            .expect("database should open");
+        assert_contended_writers_all_commit(&db).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contended_writers_on_a_rollback_journal_database_all_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = file_database_url(&dir, sqlite::SqliteJournalMode::Delete).await;
+        let db = Db::connect_sqlite(&url)
+            .await
+            .expect("database should open");
+        assert_contended_writers_all_commit(&db).await;
     }
 
     #[tokio::test]

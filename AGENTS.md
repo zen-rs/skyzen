@@ -137,6 +137,10 @@ remain Cloudflare-only, because nothing else has those events.
 - `Db` is one API over sqlx (Postgres/MySQL/SQLite), Cloudflare D1 and the Aurora Data API. `begin`
   is a real transaction on sqlx and the Data API; D1 has none, so `execute_batch` is its atomic unit
   and `begin` returns `DbError::TransactionsUnsupported` there rather than pretending.
+- Native SQLite (`services/src/sql/sqlite.rs`) holds exactly one read-write connection, so writers
+  queue in the pool's FIFO instead of starving in SQLite's polling busy handler; in WAL mode a
+  read-only pool takes the statements sqlparser proves are reads. No constructor accepts a
+  caller-built pool, because one with several writers brings `database is locked` back.
 - Migrations are `<version>_<name>.sql` files read by **one** reader, `skyzen-manifest`'s
   `migrations` module, so `embed_migrations!` (compile time) and `skyzen migrate` (deploy time)
   cannot disagree about which files count or how a checksum is computed. `Db::migrate` applies each
