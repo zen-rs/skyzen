@@ -761,9 +761,9 @@ impl Db {
     ///
     /// Returns an error if `sqlx` cannot establish the connection.
     pub async fn connect_sqlite(url: &str) -> Result<Self, DbError> {
-        Ok(Self::new(NativeDbBackend::Sqlite(
-            sqlx::sqlite::SqlitePoolOptions::new().connect(url).await?,
-        )))
+        Ok(Self::from_sqlite_pool(
+            sqlite::SqlitePoolOptions::new().connect(url).await?,
+        ))
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
@@ -773,13 +773,39 @@ impl Db {
     ///
     /// Returns an error if `sqlx` cannot initialize the in-memory database.
     pub async fn connect_sqlite_memory() -> Result<Self, DbError> {
-        Ok(Self::new(NativeDbBackend::Sqlite(
-            sqlx::sqlite::SqlitePoolOptions::new()
+        Ok(Self::from_sqlite_pool(
+            sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
                 .await?,
-        )))
+        ))
     }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+    /// Wrap a caller-built `SQLite` pool.
+    ///
+    /// [`connect_sqlite`](Self::connect_sqlite) builds its pool with sqlx's defaults, where every
+    /// pooled connection may write. `SQLite` allows one writer at a time and its busy handler
+    /// polls with backoff rather than queueing, so under concurrent writes an early waiter can
+    /// keep losing the lock until the busy timeout and fail with `database is locked`. Build the
+    /// pool yourself to change that: a pool with `max_connections(1)` hands its connection out
+    /// in FIFO order, so writers queue instead of polling, and
+    /// [`SqliteConnectOptions::busy_timeout`](sqlite::SqliteConnectOptions::busy_timeout) tunes
+    /// the timeout. The sqlx types are re-exported from [`sqlite`] at the version this crate
+    /// uses.
+    #[must_use]
+    pub fn from_sqlite_pool(pool: sqlite::SqlitePool) -> Self {
+        Self::new(NativeDbBackend::Sqlite(pool))
+    }
+}
+
+/// The sqlx `SQLite` types needed to build a pool for [`Db::from_sqlite_pool`], re-exported so
+/// they are guaranteed to be the version this crate wraps.
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+pub mod sqlite {
+    pub use sqlx::sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+    };
 }
 
 /// A type-erased database transaction.
@@ -2558,7 +2584,76 @@ mod fallback_tests {
     any(feature = "runtime-tokio", feature = "runtime-async-std")
 ))]
 mod tests {
-    use super::{BatchStatement, Db};
+    use super::{sqlite, BatchStatement, Db};
+
+    async fn single_connection_wal_db(dir: &tempfile::TempDir) -> Db {
+        let options = sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("pool.db"))
+            .create_if_missing(true)
+            .journal_mode(sqlite::SqliteJournalMode::Wal);
+        let pool = sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("file database should open");
+        Db::from_sqlite_pool(pool)
+    }
+
+    #[tokio::test]
+    async fn from_sqlite_pool_runs_writes_and_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = single_connection_wal_db(&dir).await;
+        db.query("CREATE TABLE entries (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .expect("schema should be created");
+        db.query("INSERT INTO entries (value) VALUES (?)")
+            .bind(7_i64)
+            .execute()
+            .await
+            .expect("insert should succeed");
+
+        let value = db
+            .query("SELECT value FROM entries")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("select should succeed");
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn one_connection_pool_queues_concurrent_transactions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = single_connection_wal_db(&dir).await;
+        db.query("CREATE TABLE entries (value INTEGER NOT NULL)")
+            .execute()
+            .await
+            .expect("schema should be created");
+
+        let write = |value: i64| {
+            let db = &db;
+            async move {
+                let mut tx = db.begin().await?;
+                tx.query("INSERT INTO entries (value) VALUES (?)")
+                    .bind(value)
+                    .execute()
+                    .await?;
+                // Hold the connection so the other writer has to wait for it.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tx.commit().await
+            }
+        };
+        let (first, second) = tokio::join!(write(1), write(2));
+        first.expect("first transaction should commit");
+        second.expect("second transaction should wait, then commit");
+
+        let count = db
+            .query("SELECT COUNT(*) FROM entries")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count should succeed");
+        assert_eq!(count, 2);
+    }
 
     #[tokio::test]
     async fn execute_batch_commits_every_statement_and_returns_selected_rows() {
