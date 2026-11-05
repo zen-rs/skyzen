@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-test"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Testing utilities and mock implementations for the Skyzen framework"
 license = "MIT OR Apache-2.0"
