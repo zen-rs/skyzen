@@ -2790,27 +2790,26 @@ mod tests {
     }
 
     /// Create a file database in `dir` with `journal_mode`, through a connection of its own, and
-    /// return the URL [`Db::connect_sqlite`] opens it by.
+    /// return options that open it naming only the file, as a plain URL would.
     ///
     /// WAL is a persistent property of the file, so a database created this way is in WAL mode
     /// for every connection that opens it later, whatever that connection was configured with.
-    async fn file_database_url(
+    async fn file_database(
         dir: &tempfile::TempDir,
         journal_mode: sqlite::SqliteJournalMode,
-    ) -> String {
-        use sqlx::ConnectOptions as _;
-
-        let options = sqlite::SqliteConnectOptions::new()
-            .filename(dir.path().join("app.db"))
+    ) -> sqlite::SqliteConnectOptions {
+        let path = dir.path().join("app.db");
+        let setup = sqlite::SqliteConnectOptions::new()
+            .filename(&path)
             .create_if_missing(true)
             .journal_mode(journal_mode);
-        sqlx::SqliteConnection::connect_with(&options)
+        sqlx::SqliteConnection::connect_with(&setup)
             .await
             .expect("file database should be created")
             .close()
             .await
             .expect("setup connection should close");
-        options.to_url_lossy().into()
+        sqlite::SqliteConnectOptions::new().filename(path)
     }
 
     /// Sixteen writers, each committing ten transactions that hold the write lock for 50 ms before
@@ -2866,8 +2865,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn contended_writers_on_a_wal_database_all_commit() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let url = file_database_url(&dir, sqlite::SqliteJournalMode::Wal).await;
-        let db = Db::connect_sqlite(&url)
+        let options = file_database(&dir, sqlite::SqliteJournalMode::Wal).await;
+        let db = Db::connect_sqlite_with(options)
             .await
             .expect("database should open");
         assert_contended_writers_all_commit(&db).await;
@@ -2876,8 +2875,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn contended_writers_on_a_rollback_journal_database_all_commit() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let url = file_database_url(&dir, sqlite::SqliteJournalMode::Delete).await;
-        let db = Db::connect_sqlite(&url)
+        let options = file_database(&dir, sqlite::SqliteJournalMode::Delete).await;
+        let db = Db::connect_sqlite_with(options)
             .await
             .expect("database should open");
         assert_contended_writers_all_commit(&db).await;
