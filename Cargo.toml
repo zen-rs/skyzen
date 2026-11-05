@@ -7,12 +7,12 @@ resolver = "2"
 
 [workspace.dependencies]
 skyzen-core = { path = "core", version = "0.2.1" }
-skyzen-macros = { path = "macros", version = "0.5.1" }
+skyzen-macros = { path = "macros", version = "0.5.2" }
 skyzen-manifest = { path = "manifest", version = "0.2.1" }
 # No default features: a database driver, sqlx runtime or TLS backend is reached only through the
 # feature of the crate that wants it, so an HTTP-only consumer compiles none of them.
 skyzen-services = { path = "services", version = "0.3.1", default-features = false }
-skyzen-test = { path = "test", version = "0.3.1" }
+skyzen-test = { path = "test", version = "0.3.2" }
 skyzen-redis = { path = "redis", version = "0.3.1" }
 skyzen-s3 = { path = "s3", version = "0.3.1" }
 
@@ -21,7 +21,7 @@ executor-core = { version = "0.7.1", default-features = false, features = ["std"
 skyzen-hyper = { path = "hyper", version = "0.2.1" }
 skyzen-lambda = { path = "lambda", version = "0.2.1" }
 tracing = "0.1.44"
-skyzen = { path = ".", version = "0.5.1" }
+skyzen = { path = ".", version = "0.5.2" }
 smol = "2.0"
 async-executor = "1.13"
 async-io = "2.6"
@@ -78,7 +78,7 @@ lto = "thin"
 
 [package]
 name = "skyzen"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "A fast, ergonomic HTTP framework that works everywhere"
 license = "MIT OR Apache-2.0"
