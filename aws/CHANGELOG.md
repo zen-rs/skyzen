@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/zen-rs/skyzen/compare/skyzen-aws-v0.3.0...skyzen-aws-v0.3.1) - 2026-11-05
+
+### Other
+
+- updated the following local packages: skyzen-services, skyzen-s3
+
 ## [0.3.0](https://github.com/zen-rs/skyzen/compare/skyzen-aws-v0.2.1...skyzen-aws-v0.3.0) - 2026-10-27
 
 ### Added
