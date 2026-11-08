@@ -615,29 +615,32 @@ mod tests {
         assert!(matches!(backend_error(io), KvError::Backend { .. }));
     }
 
-    /// `Client::open` is where a `rediss://` URL used to die — with a `tls-*`
-    /// feature on, the scheme parses to a TLS connection instead of failing.
+    /// `Client::open` is where a `rediss://` URL used to die — with `tls` on,
+    /// the scheme parses to a TLS connection instead of failing.
     #[test]
-    #[cfg(any(feature = "tls-tokio", feature = "tls-smol"))]
+    #[cfg(feature = "tls")]
     fn a_rediss_url_parses_with_tls_enabled() {
         assert!(redis::Client::open("rediss://user:password@127.0.0.1:6379/0").is_ok());
     }
 
-    /// The regression that needed a feature at all: without one, the scheme
+    /// The regression that needed a feature at all: without `tls` the scheme
     /// fails at parse time rather than at connect.
     #[test]
-    #[cfg(not(any(feature = "tls-tokio", feature = "tls-smol")))]
+    #[cfg(not(feature = "tls"))]
     fn a_rediss_url_fails_without_a_tls_feature() {
         assert!(redis::Client::open("rediss://127.0.0.1:6379/0").is_err());
     }
 
-    /// Parsing is not enough: `ClientConfig::builder()` is the exact call that
-    /// panics when rustls has no crypto provider, which is what `tls-rustls`-only
-    /// builds would hit at connect. The `tls-*` features pull `aws_lc_rs`, so a
-    /// process-default provider must exist.
+    /// Parsing is not enough: upstream `tls-rustls` enables no crypto provider,
+    /// so `ClientConfig::builder()` panicked at connect. `tls` pulls `aws_lc_rs`
+    /// — prove it by building a config against the provider itself, which also
+    /// holds when another dependency adds `ring` to the shared rustls (a bare
+    /// `builder()` could not pick a default then).
     #[test]
-    #[cfg(any(feature = "tls-tokio", feature = "tls-smol"))]
+    #[cfg(feature = "tls")]
     fn a_crypto_provider_is_installed_for_rediss() {
-        let _ = rustls::ClientConfig::builder();
+        let _ = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        );
     }
 }

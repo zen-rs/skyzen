@@ -29,14 +29,13 @@ default = ["runtime-tokio"]
 # selected this crate compiles to an empty shell instead of failing to build.
 runtime-tokio = ["dep:redis", "redis/tokio-comp"]
 runtime-smol = ["dep:redis", "redis/smol-comp"]
-# `rediss://` URLs negotiate TLS only through a `*-rustls-comp` feature, and
-# upstream's TLS method exists per-runtime — `tls-rustls` demands the comp of
-# EVERY enabled runtime. That is the rule here too: enabling `tls-smol` while
-# `runtime-tokio` (the default) is also on fails to compile, so with both
-# runtimes enabled take both `tls-*` features. rustls only, matching the rest
-# of the workspace; there is no `native-tls` variant.
-tls-tokio = ["runtime-tokio", "dep:rustls", "redis/tokio-rustls-comp"]
-tls-smol = ["runtime-smol", "dep:rustls", "redis/smol-rustls-comp"]
+# `rediss://` URLs negotiate TLS through rustls. Upstream's TLS method exists
+# per-runtime and `tls-rustls` demands the comp of EVERY enabled runtime — a
+# per-runtime split would leave combinations like `runtime-tokio`+`tls-smol`
+# unbuildable, so one `tls` feature pulls both comps; the `runtime-*` features
+# still pick which stack runs. rustls only, matching the rest of the workspace;
+# there is no `native-tls` variant.
+tls = ["dep:rustls", "redis/tokio-rustls-comp", "redis/smol-rustls-comp"]
 
 [lints]
 workspace = true

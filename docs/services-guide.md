@@ -352,11 +352,11 @@ let kv = Kv::new(Redis::connect("redis://localhost:6379").await?);
 let storage = Storage::new(S3Storage::from_env("my-bucket").await);
 ```
 
-A `rediss://` URL negotiates TLS through rustls once the matching runtime's
-feature is on `skyzen-redis` — `tls-tokio` or `tls-smol`; without one the scheme
-fails at `Client::open` before it can connect. The TLS feature of every enabled
-runtime must be on: enabling `tls-smol` while `runtime-tokio` (the default) is
-also enabled fails to compile, so with both runtimes take both `tls-*` features.
+A `rediss://` URL negotiates TLS through rustls once `skyzen-redis`'s `tls`
+feature is on; without it the scheme fails at `Client::open` before it can
+connect. `tls` pulls the rustls glue for both runtimes — upstream requires a
+TLS comp per enabled runtime, so a single feature is what keeps every feature
+combination buildable.
 
 ### Cloudflare Workers (KV + R2)
 
