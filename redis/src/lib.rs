@@ -630,4 +630,14 @@ mod tests {
     fn a_rediss_url_fails_without_a_tls_feature() {
         assert!(redis::Client::open("rediss://127.0.0.1:6379/0").is_err());
     }
+
+    /// Parsing is not enough: `ClientConfig::builder()` is the exact call that
+    /// panics when rustls has no crypto provider, which is what `tls-rustls`-only
+    /// builds would hit at connect. The `tls-*` features pull `aws_lc_rs`, so a
+    /// process-default provider must exist.
+    #[test]
+    #[cfg(any(feature = "tls-tokio", feature = "tls-smol"))]
+    fn a_crypto_provider_is_installed_for_rediss() {
+        let _ = rustls::ClientConfig::builder();
+    }
 }

@@ -14,6 +14,12 @@ skyzen-services = { path = "../services", version = "0.3.1", default-features = 
 # `script` is what `compare_and_swap` runs on: Redis has no compare-and-swap command, and a
 # GET/SET pair is not atomic. It brings in `sha1_smol` for the EVALSHA cache key.
 redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "script"], optional = true }
+# Upstream `tls-rustls` deliberately enables no crypto provider — `rustls/std` and
+# system roots only — so without this dep a `rediss://` URL parses but
+# `ClientConfig::builder()` panics at connect. Cargo feature unification hands
+# the provider to the same `rustls` package redis links; aws-lc-rs matches the
+# rest of the workspace.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "aws_lc_rs"] }
 
 [features]
 default = ["runtime-tokio"]
@@ -23,12 +29,14 @@ default = ["runtime-tokio"]
 # selected this crate compiles to an empty shell instead of failing to build.
 runtime-tokio = ["dep:redis", "redis/tokio-comp"]
 runtime-smol = ["dep:redis", "redis/smol-comp"]
-# `rediss://` URLs negotiate TLS only when a `*-comp` feature for the same runtime
-# carries `tls-rustls` in — the composition is per-runtime so a tokio application
-# does not pull smol's TLS glue and vice versa. rustls only, matching the rest of
-# the workspace; there is no `native-tls` variant.
-tls-tokio = ["runtime-tokio", "redis/tls-rustls", "redis/tokio-rustls-comp"]
-tls-smol = ["runtime-smol", "redis/tls-rustls", "redis/smol-rustls-comp"]
+# `rediss://` URLs negotiate TLS only through a `*-rustls-comp` feature, and
+# upstream's TLS method exists per-runtime — `tls-rustls` demands the comp of
+# EVERY enabled runtime. That is the rule here too: enabling `tls-smol` while
+# `runtime-tokio` (the default) is also on fails to compile, so with both
+# runtimes enabled take both `tls-*` features. rustls only, matching the rest
+# of the workspace; there is no `native-tls` variant.
+tls-tokio = ["runtime-tokio", "dep:rustls", "redis/tokio-rustls-comp"]
+tls-smol = ["runtime-smol", "dep:rustls", "redis/smol-rustls-comp"]
 
 [lints]
 workspace = true

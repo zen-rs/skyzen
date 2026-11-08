@@ -354,7 +354,9 @@ let storage = Storage::new(S3Storage::from_env("my-bucket").await);
 
 A `rediss://` URL negotiates TLS through rustls once the matching runtime's
 feature is on `skyzen-redis` — `tls-tokio` or `tls-smol`; without one the scheme
-fails at `Client::open` before it can connect.
+fails at `Client::open` before it can connect. The TLS feature of every enabled
+runtime must be on: enabling `tls-smol` while `runtime-tokio` (the default) is
+also enabled fails to compile, so with both runtimes take both `tls-*` features.
 
 ### Cloudflare Workers (KV + R2)
 
