@@ -23,6 +23,12 @@ default = ["runtime-tokio"]
 # selected this crate compiles to an empty shell instead of failing to build.
 runtime-tokio = ["dep:redis", "redis/tokio-comp"]
 runtime-smol = ["dep:redis", "redis/smol-comp"]
+# `rediss://` URLs negotiate TLS only when a `*-comp` feature for the same runtime
+# carries `tls-rustls` in — the composition is per-runtime so a tokio application
+# does not pull smol's TLS glue and vice versa. rustls only, matching the rest of
+# the workspace; there is no `native-tls` variant.
+tls-tokio = ["runtime-tokio", "redis/tls-rustls", "redis/tokio-rustls-comp"]
+tls-smol = ["runtime-smol", "redis/tls-rustls", "redis/smol-rustls-comp"]
 
 [lints]
 workspace = true

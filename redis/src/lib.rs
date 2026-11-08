@@ -110,7 +110,9 @@ impl Redis {
     ///
     /// Matches the `from_env` constructor every other Skyzen backend offers, so a deployment
     /// configures Redis the same way it configures S3 or `DynamoDB`. Credentials and TLS travel in
-    /// the URL, as `rediss://user:password@host:6379/0`.
+    /// the URL, as `rediss://user:password@host:6379/0` — a `rediss://` URL needs the matching
+    /// runtime's TLS feature (`tls-tokio` or `tls-smol`), which is what turns the scheme into an
+    /// actual rustls handshake.
     ///
     /// # Errors
     ///
@@ -611,5 +613,21 @@ mod tests {
 
         let io = RedisError::from((ErrorKind::Io, "connection reset"));
         assert!(matches!(backend_error(io), KvError::Backend { .. }));
+    }
+
+    /// `Client::open` is where a `rediss://` URL used to die — with a `tls-*`
+    /// feature on, the scheme parses to a TLS connection instead of failing.
+    #[test]
+    #[cfg(any(feature = "tls-tokio", feature = "tls-smol"))]
+    fn a_rediss_url_parses_with_tls_enabled() {
+        assert!(redis::Client::open("rediss://user:password@127.0.0.1:6379/0").is_ok());
+    }
+
+    /// The regression that needed a feature at all: without one, the scheme
+    /// fails at parse time rather than at connect.
+    #[test]
+    #[cfg(not(any(feature = "tls-tokio", feature = "tls-smol")))]
+    fn a_rediss_url_fails_without_a_tls_feature() {
+        assert!(redis::Client::open("rediss://127.0.0.1:6379/0").is_err());
     }
 }
