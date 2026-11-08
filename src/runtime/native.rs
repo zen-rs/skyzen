@@ -547,6 +547,35 @@ pub fn apply_tls_overrides(args: impl IntoIterator<Item = String>) -> Option<Tls
     }
 }
 
+/// `--http3`/`SKYZEN_HTTP3` — whether the native server also binds a UDP socket
+/// for HTTP/3.
+///
+/// One grammar like the other overrides: the bare flag turns it on,
+/// `--http3=<value>` sets it explicitly, and the env var takes the same values.
+/// Default off.
+#[must_use]
+pub fn apply_http3_overrides(args: impl IntoIterator<Item = String>) -> bool {
+    const ENV: &str = "SKYZEN_HTTP3";
+    fn truthy(value: &str) -> bool {
+        !matches!(value, "" | "0" | "false" | "no" | "off")
+    }
+
+    let mut enabled = std::env::var(ENV).is_ok_and(|value| truthy(&value));
+    let mut args = args.into_iter();
+    let _ = args.next(); // binary name
+    for arg in args {
+        if arg == "--http3" {
+            enabled = true;
+        } else if let Some(value) = arg.strip_prefix("--http3=") {
+            enabled = truthy(value);
+        }
+    }
+    if enabled {
+        info!("Configured HTTP/3 via CLI or {ENV}");
+    }
+    enabled
+}
+
 fn shutdown_signal() -> Receiver<()> {
     let (tx, rx) = bounded(1);
     if let Err(error) = ctrlc::set_handler(move || {
@@ -583,6 +612,8 @@ enum RuntimeFailure {
     Mount(azure::MountError),
     /// TLS was configured but cannot be provided on this listener or this build.
     Tls(TlsError),
+    /// HTTP/3 was configured but cannot be provided on this listener or this build.
+    Http3(Http3Error),
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -600,6 +631,7 @@ impl std::fmt::Display for RuntimeFailure {
             }
             Self::Mount(error) => write!(f, "{error}"),
             Self::Tls(error) => write!(f, "{error}"),
+            Self::Http3(error) => write!(f, "{error}"),
         }
     }
 }
@@ -611,6 +643,7 @@ impl std::error::Error for RuntimeFailure {
             Self::Mount(error) => Some(error),
             Self::QueueConsumer(_) => None,
             Self::Tls(error) => Some(error),
+            Self::Http3(error) => Some(error),
         }
     }
 }
@@ -824,16 +857,18 @@ fn build_server_tls(
     }
 }
 
-/// Load `files` and build the shared acceptor, advertising `h2` and `http/1.1` on
-/// ALPN so real HTTPS clients can negotiate HTTP/2.
-///
-/// The aws-lc-rs provider is the one the workspace already converged on — the
-/// AWS SDK's `default-https-client` uses it — and it is handed to the builder
-/// explicitly rather than installed as a process default.
+/// The certificate chain and private key a `TlsFiles` pair names — loaded once
+/// and shared by every transport that terminates TLS on this listener: TCP
+/// (`server-tls`) and QUIC (`http3`) alike.
 #[cfg(feature = "server-tls")]
-fn load_tls_acceptor(files: &TlsFiles) -> Result<futures_rustls::TlsAcceptor, TlsError> {
-    use futures_rustls::rustls;
+type TlsMaterial = (
+    Vec<futures_rustls::rustls::pki_types::CertificateDer<'static>>,
+    futures_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+);
 
+/// Read `files` into the `(certs, key)` pair both TLS stacks are built from.
+#[cfg(feature = "server-tls")]
+fn load_cert_key(files: &TlsFiles) -> Result<TlsMaterial, TlsError> {
     let cert_file = std::fs::File::open(&files.cert).map_err(|error| TlsError::Io {
         path: files.cert.clone(),
         error,
@@ -862,15 +897,162 @@ fn load_tls_acceptor(files: &TlsFiles) -> Result<futures_rustls::TlsAcceptor, Tl
         .ok_or_else(|| TlsError::NoPrivateKey {
             path: files.key.clone(),
         })?;
+    Ok((certs, key))
+}
 
-    let mut config = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()
-    .map_err(TlsError::Config)?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .map_err(TlsError::Config)?;
+/// The aws-lc-rs provider the whole workspace converged on — the AWS SDK's
+/// `default-https-client` uses it — handed to the builder explicitly rather
+/// than installed as a process default.
+#[cfg(feature = "server-tls")]
+fn rustls_provider() -> Arc<futures_rustls::rustls::crypto::CryptoProvider> {
+    futures_rustls::rustls::crypto::aws_lc_rs::default_provider().into()
+}
+
+/// The QUIC server config `build_http3` hands to `Http3Server::bind` — a
+/// newtype so the type exists only when the feature does; without it the enum
+/// is uninhabited and `Option<Http3Config>` can only be `None`.
+#[cfg(feature = "http3")]
+#[derive(Debug)]
+struct Http3Config(quinn::ServerConfig);
+
+#[cfg(not(feature = "http3"))]
+enum Http3Config {}
+
+#[cfg(feature = "http3")]
+use crate::runtime::http3::Http3Server;
+
+/// Without `http3` the type is uninhabited, which is what makes the `None` the
+/// launch path hands [`serve_connections`] a fact rather than a promise.
+#[cfg(not(feature = "http3"))]
+#[derive(Debug)]
+enum Http3Server {}
+
+/// Why the server cannot serve HTTP/3.
+#[derive(Debug)]
+enum Http3Error {
+    /// The binary was built without the `http3` feature.
+    #[cfg(not(feature = "http3"))]
+    FeatureMissing,
+    /// `--http3` was passed without a certificate; HTTP/3 has no cleartext form.
+    #[cfg(feature = "http3")]
+    TlsRequired,
+    /// The UDP socket could not be bound.
+    #[cfg(feature = "http3")]
+    Bind(std::io::Error),
+    /// The certificate/key pair did not form a usable rustls config.
+    #[cfg(feature = "http3")]
+    Config(futures_rustls::rustls::Error),
+    /// rustls found no QUIC-compatible cipher suite to build a session around.
+    #[cfg(feature = "http3")]
+    Quic(quinn::crypto::rustls::NoInitialCipherSuite),
+}
+
+impl std::fmt::Display for Http3Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(not(feature = "http3"))]
+            Self::FeatureMissing => write!(
+                f,
+                "HTTP/3 is configured, but this binary was built without skyzen's `http3` \
+                 feature; add `features = [\"http3\"]` to the skyzen dependency"
+            ),
+            #[cfg(feature = "http3")]
+            Self::TlsRequired => write!(
+                f,
+                "HTTP/3 requires TLS: pass --tls-cert/--tls-key or set \
+                 SKYZEN_TLS_CERT/SKYZEN_TLS_KEY (HTTP/3 has no cleartext form)"
+            ),
+            #[cfg(feature = "http3")]
+            Self::Bind(error) => write!(f, "could not bind the HTTP/3 UDP socket: {error}"),
+            #[cfg(feature = "http3")]
+            Self::Config(error) => {
+                write!(f, "the TLS certificate/key pair is not usable: {error}")
+            }
+            #[cfg(feature = "http3")]
+            Self::Quic(error) => write!(f, "the QUIC TLS setup is not usable: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for Http3Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "http3")]
+            Self::Bind(error) => Some(error),
+            #[cfg(feature = "http3")]
+            Self::Config(error) => Some(error),
+            #[cfg(feature = "http3")]
+            Self::Quic(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// `--http3` asked: build the QUIC server config from the same certificate the
+/// TCP listener terminates TLS with — TLS 1.3 only, ALPN `h3`. Nothing here
+/// binds a socket: the UDP bind needs the TCP listener's final address, which
+/// only exists inside [`run_server`].
+#[cfg(feature = "http3")]
+fn build_http3(
+    files: Option<&TlsFiles>,
+    enabled: bool,
+) -> Result<Option<Http3Config>, RuntimeFailure> {
+    use futures_rustls::rustls;
+
+    if !enabled {
+        return Ok(None);
+    }
+    let Some(files) = files else {
+        return Err(RuntimeFailure::Http3(Http3Error::TlsRequired));
+    };
+    let (certs, key) = load_cert_key(files).map_err(RuntimeFailure::Tls)?;
+
+    // QUIC speaks TLS 1.3 and nothing else — `with_protocol_versions` narrows
+    // the provider's list rather than trusting a default that still allows 1.2.
+    let mut tls = rustls::ServerConfig::builder_with_provider(rustls_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(Http3Error::Config)?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(Http3Error::Config)?;
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(Http3Error::Quic)?;
+    Ok(Some(Http3Config(quinn::ServerConfig::with_crypto(
+        Arc::new(quic),
+    ))))
+}
+
+impl From<Http3Error> for RuntimeFailure {
+    fn from(error: Http3Error) -> Self {
+        Self::Http3(error)
+    }
+}
+
+/// Without `http3` a configured flag refuses the start and names the feature to
+/// add; the alternative is silently serving TCP-only under a flag that asked
+/// for UDP.
+#[cfg(not(feature = "http3"))]
+fn build_http3(
+    _files: Option<&TlsFiles>,
+    enabled: bool,
+) -> Result<Option<Http3Config>, RuntimeFailure> {
+    match enabled {
+        true => Err(RuntimeFailure::Http3(Http3Error::FeatureMissing)),
+        false => Ok(None),
+    }
+}
+
+#[cfg(feature = "server-tls")]
+fn load_tls_acceptor(files: &TlsFiles) -> Result<futures_rustls::TlsAcceptor, TlsError> {
+    use futures_rustls::rustls;
+
+    let (certs, key) = load_cert_key(files)?;
+    let mut config = rustls::ServerConfig::builder_with_provider(rustls_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(TlsError::Config)?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(TlsError::Config)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(futures_rustls::TlsAcceptor::from(Arc::new(config)))
 }
@@ -887,6 +1069,9 @@ pub struct LaunchOptions {
     /// `--tls-cert`/`--tls-key` or `SKYZEN_TLS_CERT`/`SKYZEN_TLS_KEY`.
     /// `None` serves cleartext, as the runtime always has.
     pub tls: Option<TlsFiles>,
+    /// Whether `--http3`/`SKYZEN_HTTP3` asked for HTTP/3 over QUIC beside the
+    /// TCP listener. Requires `tls` — HTTP/3 has no cleartext form.
+    pub http3: bool,
     /// The `[[azure.queue_triggers]]` entries this application declares.
     ///
     /// Empty for everything that is not an Azure Functions app, which is the only case where they
@@ -1134,7 +1319,12 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
                     .as_ref()
                     .map_or_else(server_addr, |listen| listen.addr.clone());
                 match build_server_tls(options.tls.as_ref(), &addr) {
-                    Ok(tls) => run_server(executor, endpoint, consumers, addr, tls).await,
+                    Ok(tls) => match build_http3(options.tls.as_ref(), options.http3) {
+                        Ok(http3) => {
+                            run_server(executor, endpoint, consumers, addr, tls, http3).await
+                        }
+                        Err(error) => Err(error),
+                    },
                     Err(error) => Err(error),
                 }
             }
@@ -1240,6 +1430,7 @@ async fn run_server<Exec, E, C>(
     consumers: C,
     addr: ListenAddr,
     tls: Option<ServerTls>,
+    http3cfg: Option<Http3Config>,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
@@ -1250,13 +1441,29 @@ where
         ListenAddr::Tcp(addr) => {
             let listener = TcpListener::bind(addr).await?;
             let local_addr = listener.local_addr()?;
+            #[cfg(feature = "http3")]
+            let http3 = http3cfg
+                .map(|cfg| {
+                    crate::runtime::http3::Http3Server::bind(local_addr, cfg.0)
+                        .map_err(|error| RuntimeFailure::Http3(Http3Error::Bind(error)))
+                })
+                .transpose()?;
+            #[cfg(not(feature = "http3"))]
+            let http3: Option<Http3Server> = {
+                debug_assert!(http3cfg.is_none());
+                None
+            };
             let scheme = if tls.is_some() { "https" } else { "http" };
-            info!("Skyzen listening on {scheme}://{local_addr}");
+            if http3.is_some() {
+                info!("Skyzen listening on {scheme}://{local_addr} (+ h3 on udp)");
+            } else {
+                info!("Skyzen listening on {scheme}://{local_addr}");
+            }
             let incoming = listener.incoming().map_ok(|stream| Accepted {
                 peer_addr: stream.peer_addr().ok(),
                 stream,
             });
-            serve_connections(executor, endpoint, consumers, incoming, tls).await
+            serve_connections(executor, endpoint, consumers, incoming, tls, http3).await
         }
         #[cfg(unix)]
         ListenAddr::Unix(path) => {
@@ -1271,9 +1478,10 @@ where
                 peer_addr: None,
                 stream,
             });
-            // `tls` is always `None` here: `build_server_tls` refused a non-TCP
-            // listener before the bind.
-            let outcome = serve_connections(executor, endpoint, consumers, incoming, tls).await;
+            // `tls` and `http3cfg` are always `None` here: `build_server_tls`
+            // refused a non-TCP listener before the bind.
+            let outcome =
+                serve_connections(executor, endpoint, consumers, incoming, tls, None).await;
             // The socket file is ours: left behind it becomes the stale path the next bind
             // has to probe, and a dead process gets no later chance to clean it up. Already
             // gone is not a failure — the cleanup goal is met either way.
@@ -1361,7 +1569,7 @@ where
     // promised h2 and the bytes disagree, the connection is a violation, not an
     // HTTP/1 request.
     match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
-        Ok((stream, is_h2)) if negotiated_h2 && !is_h2 => {
+        Ok((_stream, is_h2)) if negotiated_h2 && !is_h2 => {
             debug!("ALPN negotiated h2 but the connection does not open with the preface");
             None
         }
@@ -1390,6 +1598,75 @@ where
     }
 }
 
+/// Wire the HTTP/3 accept loop beside the TCP one: hand back the `Alt-Svc`
+/// value TCP responses should advertise and the stopwatch whose drop tells
+/// every QUIC connection task to GOAWAY.
+#[cfg(feature = "http3")]
+fn start_http3<Exec, E>(
+    executor: &Arc<Exec>,
+    endpoint: &E,
+    http3: Option<Http3Server>,
+    guard: &Sender<Infallible>,
+) -> (Option<http::HeaderValue>, Sender<Infallible>)
+where
+    Exec: CoreExecutor + 'static,
+    E: Endpoint + Clone + Send + Sync + 'static,
+{
+    let (stop_tx, stop_rx) = bounded::<Infallible>(1);
+    let alt_svc =
+        http3.map(|server| spawn_http3(executor, endpoint.clone(), server, guard, stop_rx));
+    (alt_svc, stop_tx)
+}
+
+/// Without the feature `Option<Http3Server>` can only be `None`, so nothing is
+/// wired and the returned stopwatch is inert.
+#[cfg(not(feature = "http3"))]
+fn start_http3<Exec, E>(
+    _executor: &Arc<Exec>,
+    _endpoint: &E,
+    http3: Option<Http3Server>,
+    _guard: &Sender<Infallible>,
+) -> (Option<http::HeaderValue>, Sender<Infallible>) {
+    let (stop_tx, _stop_rx) = bounded::<Infallible>(1);
+    debug_assert!(http3.is_none());
+    (None, stop_tx)
+}
+
+/// Start the HTTP/3 accept loop beside the TCP one and hand back the `Alt-Svc`
+/// value TCP responses should advertise. `stop` is the connection tasks'
+/// GOAWAY trigger: the accept loop drops its sender when the TCP loop exits.
+#[cfg(feature = "http3")]
+fn spawn_http3<Exec, E>(
+    executor: &Arc<Exec>,
+    endpoint: E,
+    server: Http3Server,
+    guard: &Sender<Infallible>,
+    stop: Receiver<Infallible>,
+) -> http::HeaderValue
+where
+    Exec: CoreExecutor + 'static,
+    E: Endpoint + Clone + Send + Sync + 'static,
+{
+    let alt_svc = server.alt_svc();
+    executor
+        .spawn(server.serve(Arc::clone(executor), endpoint, guard.clone(), stop))
+        .detach();
+    alt_svc
+}
+
+/// `Http3Server` is uninhabited without the feature, so this is unreachable —
+/// `Option<Http3Server>` can only be `None` here.
+#[cfg(not(feature = "http3"))]
+fn spawn_http3<Exec, E>(
+    _executor: &Arc<Exec>,
+    _endpoint: E,
+    _server: Http3Server,
+    _guard: &Sender<Infallible>,
+    _stop: Receiver<Infallible>,
+) -> http::HeaderValue {
+    unreachable!("HTTP/3 is only bound when the `http3` feature is on")
+}
+
 /// Serve every connection `incoming` yields until shutdown or a fatal consumer report.
 ///
 /// The transport is invisible past this point: TCP and unix connections get the same
@@ -1400,6 +1677,7 @@ async fn serve_connections<Exec, E, C, Conn, S>(
     consumers: C,
     mut incoming: S,
     tls: Option<ServerTls>,
+    http3: Option<Http3Server>,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
@@ -1417,6 +1695,10 @@ where
     let (connection_guard, connections) = bounded::<Infallible>(1);
 
     let queue_consumers = ConsumerChannels::start(consumers, executor.as_ref(), &connection_guard);
+
+    // The h3 accept loop gets its own broadcast stopwatch: dropping the sender
+    // tells every QUIC connection task to GOAWAY while the drain window is open.
+    let (alt_svc, h3_stop_tx) = start_http3(&executor, &endpoint, http3, &connection_guard);
 
     let shutdown_rx = shutdown_signal();
     let shutdown = shutdown_rx.recv().fuse();
@@ -1452,6 +1734,7 @@ where
                         let hyper_executor = hyper_executor.clone();
                         let guard = connection_guard.clone();
                         let tls = tls.clone();
+                        let alt_svc = alt_svc.clone();
                         // A second token, handed to the request's `WorkerContext` so post-response
                         // work it spawns keeps shutdown waiting too — the connection's own token
                         // is released as soon as the connection closes.
@@ -1477,6 +1760,7 @@ where
                                     shared_executor,
                                     peer_addr,
                                     ShutdownGuard(guard_token),
+                                    alt_svc,
                                 );
                                 if is_h2 {
                                     let mut builder = http2::Builder::new(hyper_executor);
@@ -1511,9 +1795,11 @@ where
         }
     }
 
-    // Tell the consumers to stop polling, then release the accept loop's own handle so only live
-    // connections and in-flight batches keep the drain channel open.
+    // Tell the consumers to stop polling and the QUIC connections to GOAWAY, then release
+    // the accept loop's own handle so only live connections and in-flight batches keep the
+    // drain channel open.
     drop(queue_consumers);
+    drop(h3_stop_tx);
     drop(connection_guard);
     let severed = drain_connections(&connections, SHUTDOWN_GRACE_PERIOD).await;
 
@@ -1633,7 +1919,7 @@ where
     // pushes every message, so nothing here polls.
     // TLS is always `None` here — `launch` refuses a configured pair before this path runs,
     // since the Functions host speaks plaintext to its custom handler.
-    run_server(executor, endpoint, (), addr, None).await
+    run_server(executor, endpoint, (), addr, None, None).await
 }
 
 fn server_addr() -> ListenAddr {
@@ -1717,6 +2003,9 @@ struct IntoService<E> {
     /// A clone of the accept loop's drain token, so [`WorkerContext::wait_until`] can register
     /// post-response work with graceful shutdown.
     shutdown_guard: ShutdownGuard,
+    /// `h3=":<port>"` stamped on every response while the HTTP/3 UDP listener is
+    /// bound — how an h1/h2 HTTPS client learns the upgrade exists.
+    alt_svc: Option<http::HeaderValue>,
 }
 
 impl<E: Endpoint + Clone> IntoService<E> {
@@ -1725,12 +2014,14 @@ impl<E: Endpoint + Clone> IntoService<E> {
         executor: Arc<AnyExecutor>,
         peer_addr: Option<SocketAddr>,
         shutdown_guard: ShutdownGuard,
+        alt_svc: Option<http::HeaderValue>,
     ) -> Self {
         Self {
             endpoint,
             executor,
             peer_addr,
             shutdown_guard,
+            alt_svc,
         }
     }
 }
@@ -1748,6 +2039,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
         let mut endpoint = self.endpoint.clone();
         let executor = self.executor.clone();
         let peer_addr = self.peer_addr;
+        let alt_svc = self.alt_svc.clone();
         let context = WorkerContext::new(self.executor.clone(), self.shutdown_guard.clone());
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
@@ -1767,7 +2059,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
             }
 
             // Convert errors to HTTP responses at the runtime level
-            let response: crate::Response = match endpoint.respond(&mut request).await {
+            let mut response: crate::Response = match endpoint.respond(&mut request).await {
                 Ok(response) => {
                     info!(
                         method = method.as_str(),
@@ -1784,6 +2076,11 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                     skyzen_core::error_response(&err)
                 }
             };
+            if let Some(value) = alt_svc {
+                response
+                    .headers_mut()
+                    .insert(http::header::HeaderName::from_static("alt-svc"), value);
+            }
 
             Ok(response.map(|body| {
                 let body: MapOk<
@@ -2563,6 +2860,72 @@ mod tests {
         let _ = tls_overrides(&["app", "--tls-cert", "--tls-key", "k.pem"]);
     }
 
+    /// `apply_http3_overrides` through the same iterator shape `#[skyzen::main]`
+    /// hands it: a leading binary name followed by the real arguments.
+    fn http3_overrides(args: &[&str]) -> bool {
+        super::apply_http3_overrides(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    #[serial]
+    fn http3_overrides_unset_means_off() {
+        let _env = EnvGuard::clear_var("SKYZEN_HTTP3");
+        assert!(!http3_overrides(&["app"]));
+    }
+
+    #[test]
+    #[serial]
+    fn http3_overrides_reads_flag_and_env() {
+        let _env = EnvGuard::clear_var("SKYZEN_HTTP3");
+        assert!(http3_overrides(&["app", "--http3"]));
+        let _env = EnvGuard::set_var("SKYZEN_HTTP3", "1");
+        assert!(http3_overrides(&["app"]));
+    }
+
+    #[test]
+    #[serial]
+    fn http3_overrides_explicit_off_beats_env() {
+        let _env = EnvGuard::set_var("SKYZEN_HTTP3", "1");
+        assert!(!http3_overrides(&["app", "--http3=false"]));
+        let _env = EnvGuard::set_var("SKYZEN_HTTP3", "0");
+        assert!(!http3_overrides(&["app"]));
+    }
+
+    /// `--http3` without a certificate refuses at startup: HTTP/3 has no
+    /// cleartext form, so silently serving TCP-only would ignore the flag.
+    #[test]
+    #[cfg(feature = "http3")]
+    fn http3_without_tls_is_refused() {
+        match super::build_http3(None, true) {
+            Err(super::RuntimeFailure::Http3(super::Http3Error::TlsRequired)) => {}
+            other => panic!("expected the missing TLS pair to be refused, got {other:?}"),
+        }
+        assert!(super::build_http3(None, false).expect("off").is_none());
+    }
+
+    /// The real PEM path: the same `TlsFiles` the TCP listener loads builds a
+    /// QUIC server config.
+    #[test]
+    #[cfg(feature = "http3")]
+    fn http3_builds_a_quic_config_from_the_pem_pair() {
+        let (_dir, files, _der) = tls_material();
+        let config = super::build_http3(Some(&files), true)
+            .expect("a generated pair builds a config")
+            .expect("enabled means Some");
+        drop(config);
+    }
+
+    /// Without the `http3` feature a configured flag is refused and names the
+    /// feature — it must never degrade to TCP-only.
+    #[test]
+    #[cfg(not(feature = "http3"))]
+    fn http3_config_without_the_feature_is_refused() {
+        match super::build_http3(None, true) {
+            Err(super::RuntimeFailure::Http3(super::Http3Error::FeatureMissing)) => {}
+            other => panic!("expected the missing feature to be refused, got {other:?}"),
+        }
+    }
+
     /// Without `server-tls` a configured pair is refused at startup and names the
     /// feature — it must never degrade to cleartext.
     #[test]
@@ -2740,6 +3103,7 @@ mod tests {
                 Arc::new(AnyExecutor::new(Arc::new(SmolGlobal))),
                 None,
                 ShutdownGuard(guard_tx),
+                None,
             );
             http1::Builder::new()
                 .serve_connection(ConnectionWrapper(stream), service)

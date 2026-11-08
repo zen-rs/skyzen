@@ -23,6 +23,10 @@ pub mod consumer;
 #[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
 pub mod azure;
 
+/// The HTTP/3-over-QUIC half of the native server.
+#[cfg(all(not(target_arch = "wasm32"), feature = "rt", feature = "http3"))]
+mod http3;
+
 /// Native test runtime utilities used by `#[skyzen::test]`.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod testing;

@@ -86,6 +86,39 @@ clients get HTTP/2 over HTTPS where they support it. A few deliberate limits:
   terminates TLS stays a fully supported topology — just leave the TLS flags
   unset there.
 
+### HTTP/3
+
+With the `http3` feature on the `skyzen` dependency, `--http3` (or
+`SKYZEN_HTTP3`) binds a QUIC listener on the same port as the TCP one, speaking
+HTTP/3 on the same certificate:
+
+```sh
+./target/release/my-app --listen 0.0.0.0:8443 --tls-cert cert.pem --tls-key key.pem --http3
+# or
+SKYZEN_ADDRESS=0.0.0.0:8443 SKYZEN_TLS_CERT=cert.pem SKYZEN_TLS_KEY=key.pem SKYZEN_HTTP3=1 ./target/release/my-app
+```
+
+TLS TCP responses then carry `Alt-Svc: h3=":8443"`, so HTTP/1.1 and HTTP/2
+clients learn the upgrade path and HTTP/3-capable ones migrate to it on their
+next request. Everything a TCP request sees — extractors, `PeerAddr`,
+`ClientIp`, `WorkerContext::wait_until`, streaming bodies — works the same over
+HTTP/3.
+
+Deliberate limits, same shape as the TLS ones:
+
+- HTTP/3 has no cleartext form, so `--http3` without a certificate refuses to
+  start; so does `--http3` on a `unix:` listener, and a build without the
+  `http3` feature names it instead of silently serving TCP-only.
+- The QUIC transport is [quinn](https://github.com/quinn-rs/quinn) on the smol
+  runtime; the HTTP/3 layer is the [hyperium `h3`](https://github.com/hyperium/h3)
+  crate, which is still `0.0.x` and self-described experimental. The feature is
+  opt-in for exactly that reason — keep a proxy in front for internet-facing
+  traffic until the stack hardens. Skyzen pins the decoded-header budget
+  (`max_field_section_size`, 64 KiB) unconditionally, which is the
+  "Header Accordions" QPACK-amplification mitigation; do not lift it.
+- WebSocket over HTTP/3 (RFC 9220), WebTransport, 0-RTT and h3 datagrams are
+  out of scope; WebSocket routes stay on TCP.
+
 ### Docker
 
 ```dockerfile

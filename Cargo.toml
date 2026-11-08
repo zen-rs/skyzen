@@ -151,6 +151,16 @@ skyzen-lambda = { workspace = true, optional = true }
 # backend; `rustls-pemfile` loads the certificate/key pair.
 futures-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
+# HTTP/3 (`http3` feature): `quinn` supplies QUIC on `runtime-smol` — the native
+# runtime is smol, so the tokio runtime feature stays off — with rustls+aws-lc-rs
+# matching the workspace crypto provider. `h3` is the HTTP/3 layer (runtime-agnostic;
+# its tokio dep is only `tokio::io`/`tokio::sync::mpsc`), `h3-quinn` adapts quinn to it.
+quinn = { version = "0.11", optional = true, default-features = false, features = [
+    "runtime-smol",
+    "rustls-aws-lc-rs",
+] }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true, default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 async-tungstenite = { version = "0.33.0", features = ["tokio-runtime"] }
@@ -262,6 +272,11 @@ rt = []
 # `SKYZEN_TLS_KEY`) point the runtime at a PEM certificate chain and private key, and
 # `#[skyzen::main]` serves HTTPS on the bound listener with ALPN `h2, http/1.1`.
 server-tls = ["dep:futures-rustls", "dep:rustls-pemfile"]
+# Serve HTTP/3 over QUIC on the same port as the TLS TCP listener: `--http3` (or
+# `SKYZEN_HTTP3`) binds a UDP socket next to it, speaking h3 on the same
+# certificate, and TCP responses advertise it over Alt-Svc. HTTP/3 mandates TLS
+# 1.3, so it builds on `server-tls` and refuses to start without a certificate.
+http3 = ["server-tls", "dep:quinn", "dep:h3", "dep:h3-quinn"]
 # The `lambda` feature lets `#[skyzen::main]` serve AWS Lambda invocations.
 # Nothing in an application changes: the runtime detects `AWS_LAMBDA_RUNTIME_API` and hands over
 # to the adapter instead of binding a listener. Without it, a binary that finds itself inside
