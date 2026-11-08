@@ -144,6 +144,13 @@ skyzen-hyper.workspace = true
 jsonwebtoken = { version = "10", optional = true, features = ["aws_lc_rs"] }
 # The AWS Lambda adapter, which brings its own Tokio runtime; see the `lambda` feature.
 skyzen-lambda = { workspace = true, optional = true }
+# TLS termination (`server-tls` feature). `futures-rustls` speaks futures-io, which is
+# what `async-net` streams and `http-kit`'s `AsyncRead`/`AsyncWrite` already are — a
+# tokio-based acceptor would need adapters on both sides. Its default `aws-lc-rs`
+# provider matches the AWS SDK's TLS stack, so the workspace resolves one crypto
+# backend; `rustls-pemfile` loads the certificate/key pair.
+futures-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 async-tungstenite = { version = "0.33.0", features = ["tokio-runtime"] }
@@ -166,6 +173,8 @@ bigdecimal = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = "1"
 tempfile = "3.25"
+# Mints the self-signed certificate the `server-tls` tests hand the acceptor.
+rcgen = "0.14"
 futures-lite = "2.6"
 serial_test = "3.2"
 
@@ -249,6 +258,10 @@ ws = [
 # On native targets: provides logging, signal handling (ctrl+c), and serves HTTP via hyper+tokio.
 # On WASM targets: no-op (WASM already runs in a runtime and uses WinterCG APIs).
 rt = []
+# Terminate TLS in the native server: `--tls-cert`/`--tls-key` (or `SKYZEN_TLS_CERT`/
+# `SKYZEN_TLS_KEY`) point the runtime at a PEM certificate chain and private key, and
+# `#[skyzen::main]` serves HTTPS on the bound listener with ALPN `h2, http/1.1`.
+server-tls = ["dep:futures-rustls", "dep:rustls-pemfile"]
 # The `lambda` feature lets `#[skyzen::main]` serve AWS Lambda invocations.
 # Nothing in an application changes: the runtime detects `AWS_LAMBDA_RUNTIME_API` and hands over
 # to the adapter instead of binding a listener. Without it, a binary that finds itself inside

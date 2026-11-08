@@ -37,8 +37,10 @@ pub use service::{IntoService, SkyzenBody};
 /// HTTP/2 is detected by sniffing the client connection preface, so h2 support
 /// through the byte-stream [`Server`] trait is *prior-knowledge h2c only*: the
 /// client must speak cleartext HTTP/2 directly. There is no TLS/ALPN-based
-/// negotiation at this layer — terminate TLS in front of the server (or embed
-/// [`IntoService`] into your own hyper setup) if you need ALPN.
+/// negotiation at this layer — `skyzen`'s `server-tls` feature terminates TLS
+/// in the native runtime before streams reach `serve` (ALPN `h2`/`http/1.1`
+/// included), and embedding [`IntoService`] into your own hyper setup remains
+/// the way to customize TLS further.
 ///
 /// # Peer addresses
 ///

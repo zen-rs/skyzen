@@ -467,6 +467,84 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<Lis
     })
 }
 
+/// The PEM files the native server terminates TLS with.
+///
+/// One grammar everywhere — `--tls-cert`/`--tls-key` and the `SKYZEN_TLS_CERT`/
+/// `SKYZEN_TLS_KEY` environment variables name the same pair of files, and each
+/// flag wins over its variable independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsFiles {
+    /// PEM file holding the certificate chain, leaf certificate first.
+    pub cert: std::path::PathBuf,
+    /// PEM file holding the private key matching the leaf certificate.
+    pub key: std::path::PathBuf,
+}
+
+/// Parse `--tls-cert`/`--tls-key`, falling back per file to `SKYZEN_TLS_CERT`/
+/// `SKYZEN_TLS_KEY`.
+///
+/// Returns `None` when TLS is not configured at all; the server then serves
+/// cleartext, as it always has.
+///
+/// # Panics
+///
+/// A pair that is only half supplied — or that names an empty path — kills the
+/// process at startup, for the same reason an invalid `SKYZEN_ADDRESS` does:
+/// half a TLS setup is a configuration error, not a hint to serve plaintext
+/// under flags that promised encryption.
+#[must_use]
+pub fn apply_tls_overrides(args: impl IntoIterator<Item = String>) -> Option<TlsFiles> {
+    const CERT_ENV: &str = "SKYZEN_TLS_CERT";
+    const KEY_ENV: &str = "SKYZEN_TLS_KEY";
+
+    let mut args = args.into_iter();
+    let _ = args.next(); // binary name
+    let mut cert_flag = None;
+    let mut key_flag = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--tls-cert=") {
+            cert_flag = Some(value.to_owned());
+        } else if let Some(value) = arg.strip_prefix("--tls-key=") {
+            key_flag = Some(value.to_owned());
+        } else {
+            match arg.as_str() {
+                "--tls-cert" => {
+                    if let Some(value) = args.next() {
+                        cert_flag = Some(value);
+                    }
+                }
+                "--tls-key" => {
+                    if let Some(value) = args.next() {
+                        key_flag = Some(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let cert = cert_flag.or_else(|| std::env::var(CERT_ENV).ok());
+    let key = key_flag.or_else(|| std::env::var(KEY_ENV).ok());
+    match (cert, key) {
+        (None, None) => None,
+        (Some(cert), Some(key)) => {
+            assert!(!cert.is_empty(), "an empty path is not a TLS certificate");
+            assert!(!key.is_empty(), "an empty path is not a TLS key");
+            info!("Configured TLS certificate {cert} with key {key}");
+            Some(TlsFiles {
+                cert: cert.into(),
+                key: key.into(),
+            })
+        }
+        (Some(_), None) => panic!(
+            "a TLS certificate was configured without a key; pass --tls-key or set {KEY_ENV}"
+        ),
+        (None, Some(_)) => panic!(
+            "a TLS key was configured without a certificate; pass --tls-cert or set {CERT_ENV}"
+        ),
+    }
+}
+
 fn shutdown_signal() -> Receiver<()> {
     let (tx, rx) = bounded(1);
     if let Err(error) = ctrlc::set_handler(move || {
@@ -501,6 +579,8 @@ enum RuntimeFailure {
     QueueConsumer(ConsumerFatal),
     /// The Azure Functions triggers cannot be mounted over this application.
     Mount(azure::MountError),
+    /// TLS was configured but cannot be provided on this listener or this build.
+    Tls(TlsError),
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -517,6 +597,7 @@ impl std::fmt::Display for RuntimeFailure {
                 write!(f, "the queue consumer for `{queue}` cannot run: {reason}")
             }
             Self::Mount(error) => write!(f, "{error}"),
+            Self::Tls(error) => write!(f, "{error}"),
         }
     }
 }
@@ -527,8 +608,269 @@ impl std::error::Error for RuntimeFailure {
             Self::Listener(error) => Some(error),
             Self::Mount(error) => Some(error),
             Self::QueueConsumer(_) => None,
+            Self::Tls(error) => Some(error),
         }
     }
+}
+
+/// Why the server cannot terminate TLS.
+#[derive(Debug)]
+enum TlsError {
+    /// The binary was built without the `server-tls` feature.
+    #[cfg(not(feature = "server-tls"))]
+    FeatureMissing,
+    /// TLS was requested for a listener that has no transport to encrypt.
+    #[cfg(feature = "server-tls")]
+    NotTcp,
+    /// A certificate or key file could not be read.
+    #[cfg(feature = "server-tls")]
+    Io {
+        /// The file that could not be read.
+        path: std::path::PathBuf,
+        /// What went wrong reading it.
+        error: std::io::Error,
+    },
+    /// The certificate PEM held no certificates.
+    #[cfg(feature = "server-tls")]
+    NoCertificates {
+        /// The file that was empty of them.
+        path: std::path::PathBuf,
+    },
+    /// The key PEM held no private key.
+    #[cfg(feature = "server-tls")]
+    NoPrivateKey {
+        /// The file that was empty of one.
+        path: std::path::PathBuf,
+    },
+    /// The pair did not form a usable `rustls` configuration.
+    #[cfg(feature = "server-tls")]
+    Config(futures_rustls::rustls::Error),
+}
+
+impl std::fmt::Display for TlsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(not(feature = "server-tls"))]
+            Self::FeatureMissing => write!(
+                f,
+                "TLS is configured, but this binary was built without skyzen's `server-tls` \
+                 feature; add `features = [\"server-tls\"]` to the skyzen dependency"
+            ),
+            #[cfg(feature = "server-tls")]
+            Self::NotTcp => write!(
+                f,
+                "TLS needs a TCP listener; a unix socket has no transport to encrypt \
+                 (a fronting proxy terminates TLS for it instead)"
+            ),
+            #[cfg(feature = "server-tls")]
+            Self::Io { path, error } => {
+                write!(f, "could not read {}: {error}", path.display())
+            }
+            #[cfg(feature = "server-tls")]
+            Self::NoCertificates { path } => {
+                write!(f, "{} contains no PEM certificates", path.display())
+            }
+            #[cfg(feature = "server-tls")]
+            Self::NoPrivateKey { path } => {
+                write!(f, "{} contains no PEM private key", path.display())
+            }
+            #[cfg(feature = "server-tls")]
+            Self::Config(error) => write!(f, "the TLS certificate/key pair is not usable: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TlsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "server-tls")]
+            Self::Io { error, .. } => Some(error),
+            #[cfg(feature = "server-tls")]
+            Self::Config(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// The TLS acceptor shared by every connection the listener takes.
+#[cfg(feature = "server-tls")]
+#[derive(Clone)]
+struct ServerTls(futures_rustls::TlsAcceptor);
+
+#[cfg(feature = "server-tls")]
+impl std::fmt::Debug for ServerTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ServerTls").finish_non_exhaustive()
+    }
+}
+
+/// A freshly accepted connection after the optional TLS handshake: either the
+/// decrypted stream or the cleartext it always was.
+#[cfg(feature = "server-tls")]
+enum TlsOrPlain<C> {
+    /// TLS was terminated on this connection. Boxed: the rustls stream is
+    /// much larger than the plain variant.
+    Tls(Box<futures_rustls::server::TlsStream<C>>),
+    /// No TLS was configured; the raw stream serves directly.
+    Plain(C),
+}
+
+#[cfg(feature = "server-tls")]
+impl<C: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsOrPlain<C> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(feature = "server-tls")]
+impl<C: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsOrPlain<C> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_close(cx),
+            Self::Plain(stream) => Pin::new(stream).poll_close(cx),
+        }
+    }
+}
+
+/// Without `server-tls` the type is uninhabited, which is what makes the `None`
+/// the launch path hands [`serve_connections`] a fact rather than a promise.
+#[cfg(not(feature = "server-tls"))]
+#[derive(Debug, Clone)]
+enum ServerTls {}
+
+#[cfg(feature = "server-tls")]
+impl ServerTls {
+    /// Run the TLS handshake under [`HANDSHAKE_TIMEOUT`]: a client that connects
+    /// and never speaks TLS gets the same bound as one that never sends a preface.
+    async fn accept<C>(&self, stream: C) -> std::io::Result<futures_rustls::server::TlsStream<C>>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        use futures_util::future::{select, Either};
+
+        let accept = self.0.accept(stream);
+        futures_util::pin_mut!(accept);
+        let timer = async_io::Timer::after(HANDSHAKE_TIMEOUT);
+        futures_util::pin_mut!(timer);
+        match select(accept, timer).await {
+            Either::Left((result, _)) => result,
+            Either::Right((_deadline, _)) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out in TLS handshake",
+            )),
+        }
+    }
+}
+
+/// Turn the configured [`TlsFiles`] into the acceptor every connection shares, or
+/// refuse the start when they cannot become one.
+///
+/// A non-TCP listener is refused here: a filesystem socket has no transport to
+/// encrypt, so flags that produced `files` for it can only have been set by
+/// mistake.
+#[cfg(feature = "server-tls")]
+fn build_server_tls(
+    files: Option<&TlsFiles>,
+    addr: &ListenAddr,
+) -> Result<Option<ServerTls>, RuntimeFailure> {
+    match files {
+        None => Ok(None),
+        Some(_) if !matches!(addr, ListenAddr::Tcp(_)) => {
+            Err(RuntimeFailure::Tls(TlsError::NotTcp))
+        }
+        Some(files) => load_tls_acceptor(files)
+            .map(|acceptor| Some(ServerTls(acceptor)))
+            .map_err(RuntimeFailure::Tls),
+    }
+}
+
+/// Without `server-tls` a configured pair refuses the start and names the feature
+/// to add; the alternative is cleartext under settings that promised TLS.
+#[cfg(not(feature = "server-tls"))]
+fn build_server_tls(
+    files: Option<&TlsFiles>,
+    _addr: &ListenAddr,
+) -> Result<Option<ServerTls>, RuntimeFailure> {
+    match files {
+        None => Ok(None),
+        Some(_) => Err(RuntimeFailure::Tls(TlsError::FeatureMissing)),
+    }
+}
+
+/// Load `files` and build the shared acceptor, advertising `h2` and `http/1.1` on
+/// ALPN so real HTTPS clients can negotiate HTTP/2.
+///
+/// The aws-lc-rs provider is the one the workspace already converged on — the
+/// AWS SDK's `default-https-client` uses it — and it is handed to the builder
+/// explicitly rather than installed as a process default.
+#[cfg(feature = "server-tls")]
+fn load_tls_acceptor(files: &TlsFiles) -> Result<futures_rustls::TlsAcceptor, TlsError> {
+    use futures_rustls::rustls;
+
+    let cert_file = std::fs::File::open(&files.cert).map_err(|error| TlsError::Io {
+        path: files.cert.clone(),
+        error,
+    })?;
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| TlsError::Io {
+            path: files.cert.clone(),
+            error,
+        })?;
+    if certs.is_empty() {
+        return Err(TlsError::NoCertificates {
+            path: files.cert.clone(),
+        });
+    }
+
+    let key_file = std::fs::File::open(&files.key).map_err(|error| TlsError::Io {
+        path: files.key.clone(),
+        error,
+    })?;
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
+        .map_err(|error| TlsError::Io {
+            path: files.key.clone(),
+            error,
+        })?
+        .ok_or_else(|| TlsError::NoPrivateKey {
+            path: files.key.clone(),
+        })?;
+
+    let mut config = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .map_err(TlsError::Config)?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(TlsError::Config)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(futures_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
 /// Everything `#[skyzen::main]` settles before the runtime starts.
@@ -539,6 +881,10 @@ impl std::error::Error for RuntimeFailure {
 pub struct LaunchOptions {
     /// The address a command-line flag asked for, if any.
     pub listen: Option<ListenOverride>,
+    /// The TLS certificate/key pair the server terminates TLS with, from
+    /// `--tls-cert`/`--tls-key` or `SKYZEN_TLS_CERT`/`SKYZEN_TLS_KEY`.
+    /// `None` serves cleartext, as the runtime always has.
+    pub tls: Option<TlsFiles>,
     /// The `[[azure.queue_triggers]]` entries this application declares.
     ///
     /// Empty for everything that is not an Azure Functions app, which is the only case where they
@@ -747,6 +1093,18 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
         }
     };
 
+    // TLS is only meaningful on the path that owns a socket: both serverless hosts
+    // terminate it upstream, so a configured pair there can only be a leftover that
+    // would silently go dead. Refuse rather than start under flags that promise TLS.
+    if options.tls.is_some() && !matches!(platform, Platform::Server) {
+        error!(
+            "Skyzen cannot start: TLS is configured (--tls-cert/--tls-key or \
+             SKYZEN_TLS_CERT/SKYZEN_TLS_KEY), but this platform terminates TLS \
+             upstream; unset them or run where they apply"
+        );
+        std::process::exit(1);
+    }
+
     if platform == Platform::Lambda {
         // Lambda's runtime is Tokio's and the adapter owns it, so this path never touches the
         // executor, the listener or the shutdown drain below.
@@ -773,7 +1131,10 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
                     .listen
                     .as_ref()
                     .map_or_else(server_addr, |listen| listen.addr.clone());
-                run_server(executor, endpoint, consumers, addr).await
+                match build_server_tls(options.tls.as_ref(), &addr) {
+                    Ok(tls) => run_server(executor, endpoint, consumers, addr, tls).await,
+                    Err(error) => Err(error),
+                }
             }
             Platform::AzureFunctions { port } => {
                 serve_functions_host(executor, endpoint, consumers, &options, port).await
@@ -876,6 +1237,7 @@ async fn run_server<Exec, E, C>(
     endpoint: E,
     consumers: C,
     addr: ListenAddr,
+    tls: Option<ServerTls>,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
@@ -886,12 +1248,13 @@ where
         ListenAddr::Tcp(addr) => {
             let listener = TcpListener::bind(addr).await?;
             let local_addr = listener.local_addr()?;
-            info!("Skyzen listening on http://{local_addr}");
+            let scheme = if tls.is_some() { "https" } else { "http" };
+            info!("Skyzen listening on {scheme}://{local_addr}");
             let incoming = listener.incoming().map_ok(|stream| Accepted {
                 peer_addr: stream.peer_addr().ok(),
                 stream,
             });
-            serve_connections(executor, endpoint, consumers, incoming).await
+            serve_connections(executor, endpoint, consumers, incoming, tls).await
         }
         #[cfg(unix)]
         ListenAddr::Unix(path) => {
@@ -906,7 +1269,9 @@ where
                 peer_addr: None,
                 stream,
             });
-            let outcome = serve_connections(executor, endpoint, consumers, incoming).await;
+            // `tls` is always `None` here: `build_server_tls` refused a non-TCP
+            // listener before the bind.
+            let outcome = serve_connections(executor, endpoint, consumers, incoming, tls).await;
             // The socket file is ours: left behind it becomes the stale path the next bind
             // has to probe, and a dead process gets no later chance to clean it up. Already
             // gone is not a failure — the cleanup goal is met either way.
@@ -957,6 +1322,69 @@ async fn bind_unix_listener(path: &std::path::Path) -> std::io::Result<UnixListe
     }
 }
 
+/// Run the optional TLS handshake and work out which HTTP version the
+/// connection speaks, returning the stream to serve and whether it is h2.
+///
+/// `None` means the connection is already dead — a failed handshake or a client
+/// that never sent a byte — having been logged here rather than by the caller.
+#[cfg(feature = "server-tls")]
+async fn negotiated_stream<C>(
+    stream: C,
+    tls: Option<&ServerTls>,
+) -> Option<(Prefixed<TlsOrPlain<C>>, bool)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let (stream, negotiated_h2) = match tls {
+        Some(tls) => match tls.accept(stream).await {
+            Ok(stream) => {
+                // An ALPN `h2` is the client telling us the protocol outright, so
+                // the preface sniff is skipped; every other outcome — `http/1.1`,
+                // no ALPN — still gets sniffed.
+                let h2 = matches!(stream.get_ref().1.alpn_protocol(), Some(b"h2"));
+                (TlsOrPlain::Tls(Box::new(stream)), h2)
+            }
+            Err(error) => {
+                // TCP probes that connect and close, and plaintext clients
+                // knocking on an HTTPS port, are routine noise on a public
+                // listener — debug, not error.
+                debug!("TLS handshake failed: {error}");
+                return None;
+            }
+        },
+        None => (TlsOrPlain::Plain(stream), false),
+    };
+
+    if negotiated_h2 {
+        Some((Prefixed::new(stream, Vec::new()), true))
+    } else {
+        match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
+            Ok(result) => Some(result),
+            Err(error) => {
+                error!("Failed to read connection preface: {error}");
+                None
+            }
+        }
+    }
+}
+
+/// The cleartext-only counterpart: `ServerTls` is uninhabited, so there is never
+/// a handshake to run and the sniff decides the protocol as it always has.
+#[cfg(not(feature = "server-tls"))]
+async fn negotiated_stream<C>(stream: C, tls: Option<&ServerTls>) -> Option<(Prefixed<C>, bool)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let _ = tls;
+    match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
+        Ok(result) => Some(result),
+        Err(error) => {
+            error!("Failed to read connection preface: {error}");
+            None
+        }
+    }
+}
+
 /// Serve every connection `incoming` yields until shutdown or a fatal consumer report.
 ///
 /// The transport is invisible past this point: TCP and unix connections get the same
@@ -966,6 +1394,7 @@ async fn serve_connections<Exec, E, C, Conn, S>(
     endpoint: E,
     consumers: C,
     mut incoming: S,
+    tls: Option<ServerTls>,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
@@ -974,8 +1403,6 @@ where
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Stream<Item = std::io::Result<Accepted<Conn>>> + Unpin,
 {
-    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
     let executor = Arc::new(executor);
     let hyper_executor = HyperExecutor(Arc::clone(&executor));
     let shared_executor: Arc<AnyExecutor> = Arc::new(AnyExecutor::new(Arc::clone(&executor)));
@@ -1019,6 +1446,7 @@ where
                         let shared_executor = shared_executor.clone();
                         let hyper_executor = hyper_executor.clone();
                         let guard = connection_guard.clone();
+                        let tls = tls.clone();
                         // A second token, handed to the request's `WorkerContext` so post-response
                         // work it spawns keeps shutdown waiting too — the connection's own token
                         // is released as soon as the connection closes.
@@ -1032,14 +1460,12 @@ where
                                 // Held for the lifetime of the connection so the shutdown path
                                 // can tell when the last one has finished.
                                 let _guard = guard;
-                                let (stream, is_h2) =
-                                    match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
-                                        Ok(result) => result,
-                                        Err(error) => {
-                                            error!("Failed to read connection preface: {error}");
-                                            return;
-                                        }
-                                    };
+
+                                let Some((stream, is_h2)) =
+                                    negotiated_stream(stream, tls.as_ref()).await
+                                else {
+                                    return;
+                                };
 
                                 let service = IntoService::new(
                                     endpoint,
@@ -1200,7 +1626,9 @@ where
 
     // The consumer set moved into the mounted endpoint: under the Functions host the platform
     // pushes every message, so nothing here polls.
-    run_server(executor, endpoint, (), addr).await
+    // TLS is always `None` here — `launch` refuses a configured pair before this path runs,
+    // since the Functions host speaks plaintext to its custom handler.
+    run_server(executor, endpoint, (), addr, None).await
 }
 
 fn server_addr() -> ListenAddr {
@@ -1217,6 +1645,9 @@ fn server_addr() -> ListenAddr {
 /// How long a freshly accepted connection may take to send its protocol preface before the
 /// connection is dropped. Prevents idle clients from pinning per-connection tasks forever.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The HTTP/2 connection preface a prior-knowledge h2c client opens with.
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Run [`sniff_protocol`] with a handshake timeout so a client that connects but never sends
 /// any bytes cannot hold a connection task open indefinitely.
@@ -1365,9 +1796,16 @@ mod tests {
         apply_cli_overrides, drain_connections, server_addr, sniff_protocol, ListenAddr,
         ListenAddrError, ListenOverride, Platform, Prefixed, StartupError, LAMBDA_RUNTIME_API_ENV,
     };
+    #[cfg(feature = "server-tls")]
+    use super::{
+        http1, sniff_protocol_with_timeout, AnyExecutor, Arc, BoxHttpError, ConnectionWrapper,
+        Endpoint, Infallible, IntoService, ShutdownGuard, SmolGlobal,
+    };
     use crate::runtime::azure::CUSTOM_HANDLER_PORT_ENV;
     use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use serial_test::serial;
+    #[cfg(feature = "server-tls")]
+    use std::future::Future;
     use std::{
         io::{Cursor, Read},
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -2012,5 +2450,288 @@ mod tests {
         assert!(path.exists(), "the live socket must not be unlinked");
         drop(listener);
         std::fs::remove_file(&path).expect("the test created the socket");
+    }
+
+    /// `apply_tls_overrides` through the same iterator shape `#[skyzen::main]` hands it:
+    /// a leading binary name followed by the real arguments.
+    fn tls_overrides(args: &[&str]) -> Option<super::TlsFiles> {
+        super::apply_tls_overrides(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    #[serial]
+    fn tls_overrides_unset_means_cleartext() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        assert_eq!(tls_overrides(&["app"]), None);
+    }
+
+    #[test]
+    #[serial]
+    fn tls_overrides_reads_the_env_pair() {
+        let _cert = EnvGuard::set_var("SKYZEN_TLS_CERT", "cert.pem");
+        let _key = EnvGuard::set_var("SKYZEN_TLS_KEY", "key.pem");
+        assert_eq!(
+            tls_overrides(&["app"]),
+            Some(super::TlsFiles {
+                cert: "cert.pem".into(),
+                key: "key.pem".into(),
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn tls_overrides_flags_beat_env() {
+        let _cert = EnvGuard::set_var("SKYZEN_TLS_CERT", "env-cert.pem");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        assert_eq!(
+            tls_overrides(&["app", "--tls-cert", "flag.pem", "--tls-key=k.pem"]),
+            Some(super::TlsFiles {
+                cert: "flag.pem".into(),
+                key: "k.pem".into(),
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn tls_overrides_falls_back_per_file() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::set_var("SKYZEN_TLS_KEY", "env-key.pem");
+        assert_eq!(
+            tls_overrides(&["app", "--tls-cert=c.pem"]),
+            Some(super::TlsFiles {
+                cert: "c.pem".into(),
+                key: "env-key.pem".into(),
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "without a key")]
+    fn tls_overrides_cert_without_key_panics() {
+        let _cert = EnvGuard::set_var("SKYZEN_TLS_CERT", "cert.pem");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        let _ = tls_overrides(&["app"]);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "without a certificate")]
+    fn tls_overrides_key_without_cert_panics() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::set_var("SKYZEN_TLS_KEY", "key.pem");
+        let _ = tls_overrides(&["app"]);
+    }
+
+    /// Without `server-tls` a configured pair is refused at startup and names the
+    /// feature — it must never degrade to cleartext.
+    #[test]
+    #[cfg(not(feature = "server-tls"))]
+    fn tls_config_without_the_feature_is_refused() {
+        let files = super::TlsFiles {
+            cert: "cert.pem".into(),
+            key: "key.pem".into(),
+        };
+        let addr = ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+        match super::build_server_tls(Some(&files), &addr) {
+            Err(super::RuntimeFailure::Tls(super::TlsError::FeatureMissing)) => {}
+            other => panic!("expected the missing feature to be refused, got {other:?}"),
+        }
+    }
+
+    /// A self-signed leaf + key as PEM files in a fresh temporary directory.
+    /// The leaf's DER bytes come back too, so the client side can pin it as its root.
+    #[cfg(feature = "server-tls")]
+    fn tls_material() -> (tempfile::TempDir, super::TlsFiles, Vec<u8>) {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("rcgen");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, certified.cert.pem()).expect("write cert");
+        std::fs::write(&key, certified.signing_key.serialize_pem()).expect("write key");
+        (
+            dir,
+            super::TlsFiles { cert, key },
+            certified.cert.der().as_ref().to_vec(),
+        )
+    }
+
+    /// A TLS client verifying against the generated chain and offering one ALPN
+    /// protocol — the same real handshake rustls runs for any HTTPS client.
+    #[cfg(feature = "server-tls")]
+    fn tls_connector(der: &[u8], alpn: &[u8]) -> futures_rustls::TlsConnector {
+        use futures_rustls::rustls;
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(der.to_vec()))
+            .expect("the generated cert is a valid root");
+        let mut config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![alpn.to_vec()];
+        futures_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    #[cfg(feature = "server-tls")]
+    fn server_name() -> futures_rustls::rustls::pki_types::ServerName<'static> {
+        futures_rustls::rustls::pki_types::ServerName::try_from("localhost")
+            .expect("localhost is a DNS name")
+    }
+
+    #[test]
+    #[cfg(feature = "server-tls")]
+    fn tls_acceptor_loads_a_real_pem_pair() {
+        let (_dir, files, _der) = tls_material();
+        super::load_tls_acceptor(&files).expect("a generated pair builds an acceptor");
+    }
+
+    #[test]
+    #[cfg(feature = "server-tls")]
+    fn tls_acceptor_names_the_file_it_cannot_read() {
+        let files = super::TlsFiles {
+            cert: "/no/such/cert.pem".into(),
+            key: "/no/such/key.pem".into(),
+        };
+        match super::load_tls_acceptor(&files) {
+            Err(super::TlsError::Io { path, .. }) => {
+                assert_eq!(path, std::path::Path::new("/no/such/cert.pem"));
+            }
+            _ => panic!("expected an Io error naming the cert path"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "server-tls")]
+    fn tls_acceptor_rejects_a_pem_without_certificates() {
+        let (_dir, files, _der) = tls_material();
+        std::fs::write(&files.cert, "definitely not a PEM file\n").expect("write");
+        match super::load_tls_acceptor(&files) {
+            Err(super::TlsError::NoCertificates { path }) => {
+                assert_eq!(path, files.cert);
+            }
+            _ => panic!("expected NoCertificates"),
+        }
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "server-tls"))]
+    fn tls_on_a_unix_listener_is_refused() {
+        let files = super::TlsFiles {
+            cert: "cert.pem".into(),
+            key: "key.pem".into(),
+        };
+        let addr = ListenAddr::Unix("/tmp/skyzen-tls-test.sock".into());
+        match super::build_server_tls(Some(&files), &addr) {
+            Err(super::RuntimeFailure::Tls(super::TlsError::NotTcp)) => {}
+            other => panic!("expected the unix listener to refuse TLS, got {other:?}"),
+        }
+    }
+
+    /// The endpoint the TLS tests serve through the real `IntoService` machinery.
+    #[cfg(feature = "server-tls")]
+    #[derive(Clone)]
+    struct TlsEndpoint;
+
+    #[cfg(feature = "server-tls")]
+    impl Endpoint for TlsEndpoint {
+        type Error = BoxHttpError;
+
+        fn respond(
+            &mut self,
+            _request: &mut crate::Request,
+        ) -> impl Future<Output = Result<crate::Response, Self::Error>> + Send {
+            std::future::ready(Ok(crate::Response::new(crate::Body::from_bytes("tls-ok"))))
+        }
+    }
+
+    /// A real loopback handshake: the client verifies the generated chain, ALPN
+    /// comes back `h2` on both ends, then an `http/1.1` client gets an actual
+    /// HTTP response over the decrypted stream.
+    #[tokio::test]
+    #[cfg(feature = "server-tls")]
+    async fn tls_connection_serves_http1_and_negotiates_h2() {
+        let (_dir, files, der) = tls_material();
+        let acceptor =
+            super::ServerTls(super::load_tls_acceptor(&files).expect("the generated pair loads"));
+        let listener = async_net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        // An h2 client: ALPN decides the protocol, so both ends must see `h2`.
+        let client_stream = async_net::TcpStream::connect(addr).await.expect("connect");
+        let handshake = async {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            acceptor.accept(stream).await
+        };
+        let connect = tls_connector(&der, b"h2").connect(server_name(), client_stream);
+        let (server_tls, client_tls) = futures_util::future::join(handshake, connect).await;
+        let server_tls = server_tls.expect("server handshake");
+        let client_tls = client_tls.expect("client handshake");
+        assert_eq!(
+            server_tls.get_ref().1.alpn_protocol(),
+            Some(b"h2".as_slice())
+        );
+        assert_eq!(
+            client_tls.get_ref().1.alpn_protocol(),
+            Some(b"h2".as_slice())
+        );
+        drop((server_tls, client_tls));
+
+        // An http/1.1 client: the sniff still runs on the decrypted bytes, and
+        // the whole pipeline — accept, sniff, Hyper, IntoService — serves a
+        // real response.
+        let serve = async {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            let stream = acceptor.accept(stream).await.expect("server handshake");
+            let (stream, is_h2) = sniff_protocol_with_timeout(stream, HTTP2_PREFACE)
+                .await
+                .expect("sniff");
+            assert!(!is_h2, "http/1.1 ALPN must not read as h2");
+            let (guard_tx, _guard_rx) = async_channel::bounded::<Infallible>(1);
+            let service = IntoService::new(
+                TlsEndpoint,
+                Arc::new(AnyExecutor::new(Arc::new(SmolGlobal))),
+                None,
+                ShutdownGuard(guard_tx),
+            );
+            http1::Builder::new()
+                .serve_connection(ConnectionWrapper(stream), service)
+                .with_upgrades()
+                .await
+                .expect("h1 connection serves");
+        };
+        let request = async {
+            let client_stream = async_net::TcpStream::connect(addr).await.expect("connect");
+            let mut tls = tls_connector(&der, b"http/1.1")
+                .connect(server_name(), client_stream)
+                .await
+                .expect("client handshake");
+            tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write request");
+            let mut response = Vec::new();
+            tls.read_to_end(&mut response).await.expect("read response");
+            response
+        };
+        let ((), response) = futures_util::future::join(serve, request).await;
+        let response = String::from_utf8(response).expect("response is HTTP text");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "expected a 200 status line, got: {response}"
+        );
+        assert!(
+            response.contains("tls-ok"),
+            "expected the body, got: {response}"
+        );
     }
 }
