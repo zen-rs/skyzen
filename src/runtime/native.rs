@@ -467,6 +467,16 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<Lis
     })
 }
 
+/// A `--tls-cert`/`--tls-key` flag that reached us at all promised TLS; a
+/// missing value is not ignorable — swallowing it would serve cleartext under
+/// a flag that promised encryption, which is worse than any panic.
+fn flag_value(flag: &str, value: Option<String>) -> String {
+    match value {
+        Some(value) if !value.is_empty() && !value.starts_with('-') => value,
+        _ => panic!("{flag} expects a PEM path after it"),
+    }
+}
+
 /// The PEM files the native server terminates TLS with.
 ///
 /// One grammar everywhere — `--tls-cert`/`--tls-key` and the `SKYZEN_TLS_CERT`/
@@ -508,16 +518,8 @@ pub fn apply_tls_overrides(args: impl IntoIterator<Item = String>) -> Option<Tls
             key_flag = Some(value.to_owned());
         } else {
             match arg.as_str() {
-                "--tls-cert" => {
-                    if let Some(value) = args.next() {
-                        cert_flag = Some(value);
-                    }
-                }
-                "--tls-key" => {
-                    if let Some(value) = args.next() {
-                        key_flag = Some(value);
-                    }
-                }
+                "--tls-cert" => cert_flag = Some(flag_value("--tls-cert", args.next())),
+                "--tls-key" => key_flag = Some(flag_value("--tls-key", args.next())),
                 _ => {}
             }
         }
@@ -1338,9 +1340,6 @@ where
     let (stream, negotiated_h2) = match tls {
         Some(tls) => match tls.accept(stream).await {
             Ok(stream) => {
-                // An ALPN `h2` is the client telling us the protocol outright, so
-                // the preface sniff is skipped; every other outcome — `http/1.1`,
-                // no ALPN — still gets sniffed.
                 let h2 = matches!(stream.get_ref().1.alpn_protocol(), Some(b"h2"));
                 (TlsOrPlain::Tls(Box::new(stream)), h2)
             }
@@ -1355,15 +1354,21 @@ where
         None => (TlsOrPlain::Plain(stream), false),
     };
 
-    if negotiated_h2 {
-        Some((Prefixed::new(stream, Vec::new()), true))
-    } else {
-        match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
-            Ok(result) => Some(result),
-            Err(error) => {
-                error!("Failed to read connection preface: {error}");
-                None
-            }
+    // The bounded preface read runs even after ALPN negotiated `h2`: the preface
+    // is still the first thing a real h2 client sends, and without the bound a
+    // client could finish the TLS handshake and then pin the connection task
+    // and its shutdown guard forever. ALPN only settles the protocol — when it
+    // promised h2 and the bytes disagree, the connection is a violation, not an
+    // HTTP/1 request.
+    match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
+        Ok((stream, is_h2)) if negotiated_h2 && !is_h2 => {
+            debug!("ALPN negotiated h2 but the connection does not open with the preface");
+            None
+        }
+        Ok(result) => Some(result),
+        Err(error) => {
+            error!("Failed to read connection preface: {error}");
+            None
         }
     }
 }
@@ -1644,7 +1649,12 @@ fn server_addr() -> ListenAddr {
 
 /// How long a freshly accepted connection may take to send its protocol preface before the
 /// connection is dropped. Prevents idle clients from pinning per-connection tasks forever.
+#[cfg(not(test))]
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The same bound, shortened so tests can actually observe it.
+#[cfg(test)]
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The HTTP/2 connection preface a prior-knowledge h2c client opens with.
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -1798,8 +1808,8 @@ mod tests {
     };
     #[cfg(feature = "server-tls")]
     use super::{
-        http1, sniff_protocol_with_timeout, AnyExecutor, Arc, BoxHttpError, ConnectionWrapper,
-        Endpoint, Infallible, IntoService, ShutdownGuard, SmolGlobal,
+        http1, negotiated_stream, sniff_protocol_with_timeout, AnyExecutor, Arc, BoxHttpError,
+        ConnectionWrapper, Endpoint, Infallible, IntoService, ShutdownGuard, SmolGlobal,
     };
     use crate::runtime::azure::CUSTOM_HANDLER_PORT_ENV;
     use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -2526,6 +2536,33 @@ mod tests {
         let _ = tls_overrides(&["app"]);
     }
 
+    #[test]
+    #[serial]
+    #[should_panic(expected = "expects a PEM path")]
+    fn tls_overrides_cert_flag_without_a_value_panics() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        let _ = tls_overrides(&["app", "--tls-cert"]);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "expects a PEM path")]
+    fn tls_overrides_key_flag_without_a_value_panics() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        let _ = tls_overrides(&["app", "--tls-key"]);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "expects a PEM path")]
+    fn tls_overrides_flag_eating_another_flag_panics() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        let _ = tls_overrides(&["app", "--tls-cert", "--tls-key", "k.pem"]);
+    }
+
     /// Without `server-tls` a configured pair is refused at startup and names the
     /// feature — it must never degrade to cleartext.
     #[test]
@@ -2732,6 +2769,45 @@ mod tests {
         assert!(
             response.contains("tls-ok"),
             "expected the body, got: {response}"
+        );
+    }
+
+    /// An `h2` client still owes the connection its preface inside the same
+    /// bound a cleartext one gets: complete the handshake, then send nothing —
+    /// the server must drop the connection rather than wait forever.
+    #[tokio::test]
+    #[cfg(feature = "server-tls")]
+    async fn an_h2_client_that_never_sends_a_preface_is_dropped() {
+        let (_dir, files, der) = tls_material();
+        let acceptor =
+            super::ServerTls(super::load_tls_acceptor(&files).expect("the generated pair loads"));
+        let listener = async_net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let serve = async {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            negotiated_stream(stream, Some(&acceptor)).await
+        };
+        let client = async {
+            let stream = async_net::TcpStream::connect(addr).await.expect("connect");
+            let mut tls = tls_connector(&der, b"h2")
+                .connect(server_name(), stream)
+                .await
+                .expect("client handshake");
+            // Handshake done — now go silent. The server's deadline closes this.
+            let mut buf = [0u8; 8];
+            tls.read(&mut buf).await
+        };
+        let (prepared, read) = futures_util::future::join(serve, client).await;
+        assert!(
+            prepared.is_none(),
+            "a silent h2 connection must be dropped, not served"
+        );
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "the client must observe the close, got {read:?}"
         );
     }
 }
