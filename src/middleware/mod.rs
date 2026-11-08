@@ -41,6 +41,7 @@
 
 mod body_limit;
 mod cors;
+mod decompression;
 mod error_handling;
 #[cfg(not(target_arch = "wasm32"))]
 mod timeout;
@@ -59,6 +60,7 @@ use skyzen_core::{
 pub use body_limit::BodyLimit;
 pub use compression::{CompressionEncoding, CompressionLevel, CompressionMiddleware};
 pub use cors::{AllowOrigin, Cors, CorsConfigError};
+pub use decompression::{DecompressionEncoding, DecompressionMiddleware};
 pub use error_handling::ErrorHandlingMiddleware;
 #[doc(inline)]
 pub use skyzen_core::middleware::{

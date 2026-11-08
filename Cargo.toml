@@ -98,6 +98,12 @@ cookie = { version = "0.18.1", features = ["percent-encode"] }
 tracing.workspace = true
 smallvec = "1.15"
 flate2 = "1.1"
+# `brotli`/`ruzstd` are optional because each backs one `DecompressionMiddleware` coding
+# (`decompress-br`/`decompress-zstd`); both are pure Rust so the wasm32 build keeps all four
+# codings. `flate2` is already linked for `CompressionMiddleware`, so gzip and deflate decode
+# for free.
+brotli = { version = "9", optional = true, default-features = false, features = ["std"] }
+ruzstd = { version = "0.9", optional = true, default-features = false, features = ["std", "hash"] }
 bytes = "1.11"
 mime_guess = "2.0"
 include_dir = "0.7"
@@ -168,6 +174,8 @@ uuid = "1"
 tempfile = "3.25"
 futures-lite = "2.6"
 serial_test = "3.2"
+# The decompression tests encode their fixture zstd frames; `ruzstd` only decodes.
+zstd = { version = "0.13", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The wasm half of the OpenAPI handler registry; see `src/openapi/registry.rs` for why
@@ -213,7 +221,21 @@ optional = true
 skyzen-cloudflare = { path = "cloudflare" }
 
 [features]
-default = ["json", "form", "query", "multipart", "sse", "rt", "openapi", "ws", "static-files"]
+default = [
+    "json",
+    "form",
+    "query",
+    "multipart",
+    "sse",
+    "rt",
+    "openapi",
+    "ws",
+    "static-files",
+    "decompress-gzip",
+    "decompress-deflate",
+    "decompress-br",
+    "decompress-zstd",
+]
 openapi = ["skyzen-core/openapi", "skyzen-macros/openapi"]
 auth = []
 jwt = ["auth", "dep:jsonwebtoken"]
@@ -228,6 +250,13 @@ sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
 static-files = ["dep:headers", "dep:sha1", "dep:base64"]
 # `TypedHeader<H>` plus the `skyzen::headers` re-export.
 typed-header = ["dep:headers"]
+# Request-body decompression codings for `DecompressionMiddleware`, one feature per
+# `Content-Encoding` token it can decode. gzip and deflate ride on `flate2`, already linked
+# for response compression; `br` and `zstd` each pull their pure-Rust decoder.
+decompress-gzip = []
+decompress-deflate = []
+decompress-br = ["dep:brotli"]
+decompress-zstd = ["dep:ruzstd"]
 # Database drivers, sqlx runtimes and TLS backends. None is on by default: an application picks
 # the ones it uses, and each forwards to the `skyzen-services` feature of the same name.
 postgres = ["skyzen-services/postgres"]
