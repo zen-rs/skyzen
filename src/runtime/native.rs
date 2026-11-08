@@ -1361,7 +1361,7 @@ where
     // promised h2 and the bytes disagree, the connection is a violation, not an
     // HTTP/1 request.
     match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
-        Ok((stream, is_h2)) if negotiated_h2 && !is_h2 => {
+        Ok((_, is_h2)) if negotiated_h2 && !is_h2 => {
             debug!("ALPN negotiated h2 but the connection does not open with the preface");
             None
         }
