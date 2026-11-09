@@ -390,11 +390,15 @@ impl RateLimitStore for KvStore {
             let count = match self.kv.increment(&bucket, 1).await {
                 Ok(count) => count.max(0).cast_unsigned(),
                 // No atomic increment — the Cloudflare case — is a capability gap, not a
-                // transient outage; rejected credentials are just as permanent, and both
-                // fail closed because fail-open only exists for errors that can pass.
-                Err(error @ KvError::Unsupported(_)) | Err(error @ KvError::Unauthorized) => {
-                    return Err(HitError::Unsupported(Error::new(error)))
-                }
+                // transient outage; rejected credentials and an undecodable counter are
+                // just as permanent, and all of them fail closed because fail-open only
+                // exists for errors that can pass.
+                Err(
+                    error @ (KvError::Unsupported(_)
+                    | KvError::Unauthorized
+                    | KvError::Decode(_)
+                    | KvError::Serialization(_)),
+                ) => return Err(HitError::Unsupported(Error::new(error))),
                 // A counter hot enough to exhaust its CAS retries is by definition under a
                 // burst — admitting the request fail-open would let the burst slip the
                 // limit, so count it against a spent bucket the way at-capacity keys are.
@@ -408,9 +412,10 @@ impl RateLimitStore for KvStore {
             // surfaces as a capability error rather than a silent write.
             if let Err(error) = self.kv.expire(&bucket, window.saturating_mul(2)).await {
                 return Err(match error {
-                    error @ KvError::Unsupported(_) | error @ KvError::Unauthorized => {
-                        HitError::Unsupported(Error::new(error))
-                    }
+                    error @ (KvError::Unsupported(_)
+                    | KvError::Unauthorized
+                    | KvError::Decode(_)
+                    | KvError::Serialization(_)) => HitError::Unsupported(Error::new(error)),
                     other => HitError::Backend(Error::new(other)),
                 });
             }
