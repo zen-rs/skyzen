@@ -56,10 +56,15 @@ impl RequestId {
         Self::new().header(CF_RAY).trust_incoming(true)
     }
 
-    /// Reuse the AWS request id an API gateway or ALB forwards as `x-amzn-requestid`.
+    /// Reuse the Lambda invocation's request id, which the `skyzen-lambda` adapter records from
+    /// the invocation context. The `x-amzn-requestid` header a gateway forwards is the fallback,
+    /// then a minted id.
     #[must_use]
     pub fn lambda() -> RequestIdLayer {
-        Self::new().header(AWS_REQUEST_ID).trust_incoming(true)
+        Self::new()
+            .header(AWS_REQUEST_ID)
+            .trust_incoming(true)
+            .platform(true)
     }
 
     /// Reuse Azure's `x-ms-request-id`.
@@ -130,6 +135,9 @@ pub struct RequestIdLayer {
     header: HeaderName,
     trust_incoming: bool,
     max_len: usize,
+    /// Reuse the platform's own invocation id (`skyzen_core::PlatformRequestId`) when the
+    /// adapter recorded one — only the `lambda()` preset sets this.
+    platform: bool,
     inner: Option<Trace>,
 }
 
@@ -139,6 +147,7 @@ impl Default for RequestIdLayer {
             header: X_REQUEST_ID,
             trust_incoming: false,
             max_len: 128,
+            platform: false,
             inner: None,
         }
     }
@@ -166,6 +175,12 @@ impl RequestIdLayer {
         self
     }
 
+    /// Prefer the hosting platform's invocation id over both a minted id and the inbound header.
+    const fn platform(mut self, platform: bool) -> Self {
+        self.platform = platform;
+        self
+    }
+
     /// The `Trace` layer this id was bundled with by [`Trace::with_request_id`].
     pub(crate) fn with_trace(mut self, trace: Trace) -> Self {
         self.inner = Some(trace);
@@ -182,15 +197,26 @@ fn valid_incoming(value: &HeaderValue, max_len: usize) -> Option<String> {
 
 impl Middleware for RequestIdLayer {
     async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
-        let id = if self.trust_incoming {
-            request
-                .headers()
-                .get(&self.header)
-                .and_then(|value| valid_incoming(value, self.max_len))
-                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string())
-        } else {
-            uuid::Uuid::now_v7().to_string()
-        };
+        let platform_id = self
+            .platform
+            .then(|| {
+                request
+                    .extensions()
+                    .get::<skyzen_core::PlatformRequestId>()
+                    .map(|id| id.to_string())
+            })
+            .flatten();
+        let id = platform_id.unwrap_or_else(|| {
+            if self.trust_incoming {
+                request
+                    .headers()
+                    .get(&self.header)
+                    .and_then(|value| valid_incoming(value, self.max_len))
+                    .unwrap_or_else(|| uuid::Uuid::now_v7().to_string())
+            } else {
+                uuid::Uuid::now_v7().to_string()
+            }
+        });
         let value = HeaderValue::from_str(&id)
             .map_err(|_| Error::msg("generated request id is not a header value"))?;
         request.extensions_mut().insert(RequestId(id));
