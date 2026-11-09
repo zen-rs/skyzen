@@ -61,6 +61,13 @@ http_kit::http_error!(
     "No route matched this request"
 );
 
+/// The mount prefix accumulated across nested routers, pushed by `NestedRouter` before it
+/// dispatches into the mounted router. `dispatch_matched` composes it with the registered
+/// template so every `MatchedPath` is already the full route (`/api` + `/users/{id}`) at
+/// insertion time — inner handlers extract the complete template, not the inner fragment.
+#[derive(Debug, Clone)]
+pub struct MountPrefix(pub String);
+
 impl Extractor for MatchedPath {
     type Error = NoMatchedPath;
 
@@ -146,10 +153,9 @@ mod tests {
     async fn an_unmatched_path_reports_no_template() {
         let router = Route::new(("/known".at(|| async { Result::Ok("ok") }),))
             .fallback(|route: Option<MatchedPath>| async move {
-                Result::Ok(route.map_or_else(
-                    || "<unmatched>".to_owned(),
-                    |path| path.as_str().to_owned(),
-                ))
+                Result::Ok(
+                    route.map_or_else(|| "<unmatched>".to_owned(), |path| path.as_str().to_owned()),
+                )
             })
             .build();
 

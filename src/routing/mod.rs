@@ -157,6 +157,7 @@ mod router;
 pub use router::{build, AllowedMethods, NotFound, RouteBuildError, Router};
 
 mod matched_path;
+pub(crate) use matched_path::MountPrefix;
 pub use matched_path::{MatchedPath, NoMatchedPath};
 
 mod nest;

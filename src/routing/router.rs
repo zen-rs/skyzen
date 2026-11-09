@@ -7,8 +7,8 @@ use std::{
 };
 
 use super::{
-    join_path, BoxEndpoint, EndpointFactory, MatchedPath, MethodFilter, NestedRouter, Params,
-    Route, RouteNode, RouteNodeType,
+    join_path, BoxEndpoint, EndpointFactory, MatchedPath, MethodFilter, MountPrefix, NestedRouter,
+    Params, Route, RouteNode, RouteNodeType,
 };
 #[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
@@ -260,9 +260,8 @@ impl Router {
                 params,
                 path,
             } => {
-                request
-                    .extensions_mut()
-                    .insert(MatchedPath::new(Arc::clone(path)));
+                let matched = Self::matched_path(request, path);
+                request.extensions_mut().insert(matched);
                 request.extensions_mut().insert(Params::new(params));
                 let mut response = app.run(request).await?;
                 if head_fallback {
@@ -271,9 +270,8 @@ impl Router {
                 Ok(response)
             }
             RouteLookup::MethodNotAllowed { allow, path } => {
-                request
-                    .extensions_mut()
-                    .insert(MatchedPath::new(Arc::clone(path)));
+                let matched = Self::matched_path(request, path);
+                request.extensions_mut().insert(matched);
                 let allow = AllowedMethods(allow);
                 match &self.method_not_allowed {
                     Some(factory) => {
@@ -288,6 +286,22 @@ impl Router {
                 None => Ok(error_response(&NotFound::new())),
             },
         }
+    }
+
+    /// The `MatchedPath` to record for `path` — prefix-joined when the request reached this
+    /// router through a nested mount, so inner handlers extract the complete route template
+    /// (`/api` + `/users/{id}`), not the inner fragment.
+    fn matched_path(request: &Request, path: &Arc<str>) -> MatchedPath {
+        request.extensions().get::<MountPrefix>().map_or_else(
+            || MatchedPath::new(Arc::clone(path)),
+            |prefix| {
+                MatchedPath::new(if &**path == "/" {
+                    prefix.0.clone()
+                } else {
+                    join_path(&prefix.0, path)
+                })
+            },
+        )
     }
 
     async fn call(&self, request: &mut Request) -> Result<Response, Error> {
