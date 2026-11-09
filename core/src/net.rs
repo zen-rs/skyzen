@@ -179,10 +179,15 @@ pub fn error_response(error: &dyn HttpError) -> Response {
     };
 
     // Structured detail rides in the `source()` chain — the only channel `dyn HttpError`
-    // offers beyond `status` and `Display`.
-    let details = std::iter::successors(error.source(), |source| source.source())
-        .find_map(|source| source.downcast_ref::<ErrorDetails>())
-        .map(|details| details.0.clone());
+    // offers beyond `status` and `Display`. Server errors keep the same silence they have
+    // always kept: a detail node could expose internals the redaction exists to hide.
+    let details = (!status.is_server_error())
+        .then(|| {
+            std::iter::successors(error.source(), |source| source.source())
+                .find_map(|source| source.downcast_ref::<ErrorDetails>())
+                .map(|details| details.0.clone())
+        })
+        .flatten();
     let (payload, content_type) = match details {
         // An error that published machine-readable detail gets the RFC 9457 problem
         // document; the detail object's members merge in as extensions.
