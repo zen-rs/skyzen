@@ -8,7 +8,7 @@
 use core::fmt;
 use std::{any::TypeId, future::ready, ops::Deref};
 
-use super::error_handling::HandlesErrors;
+use super::error_handling::{DeferredHeaders, HandlesErrors};
 use super::trace::Trace;
 use http_kit::{
     header::{HeaderName, HeaderValue},
@@ -221,6 +221,10 @@ impl Middleware for RequestIdLayer {
         let value = HeaderValue::from_str(&id)
             .map_err(|_| Error::msg("generated request id is not a header value"))?;
         request.extensions_mut().insert(RequestId(id));
+        // So an ErrorHandlingMiddleware's response still carries the id.
+        request
+            .extensions_mut()
+            .insert(DeferredHeaders(vec![(self.header.clone(), value.clone())]));
 
         let result = match &self.inner {
             Some(trace) => trace.wrap(request, next).await,

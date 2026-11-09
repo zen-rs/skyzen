@@ -12,6 +12,12 @@ use skyzen_core::{
 #[derive(Debug, Clone, Copy)]
 pub struct HandlesErrors;
 
+/// Response headers a layer asked to keep on every response, stamped by
+/// [`ErrorHandlingMiddleware`] on the errors it renders — the error path is still a
+/// response.
+#[derive(Debug, Clone)]
+pub struct DeferredHeaders(pub Vec<(http_kit::header::HeaderName, http_kit::header::HeaderValue)>);
+
 /// Turn an endpoint error into a response with an asynchronous function.
 pub struct ErrorHandlingMiddleware<F> {
     f: Arc<F>,
@@ -63,6 +69,15 @@ where
                 (self.f)(error.into_boxed_http_error())
                     .await
                     .respond_to(request, &mut response)?;
+                // Headers a layer upstream asked to keep on every response.
+                if let Some(deferred) = request.extensions().get::<DeferredHeaders>() {
+                    for (name, value) in &deferred.0 {
+                        response
+                            .headers_mut()
+                            .entry(name.clone())
+                            .or_insert_with(|| value.clone());
+                    }
+                }
                 Ok(response)
             }
         }
