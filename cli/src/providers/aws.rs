@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result};
-use eventbridge::{EventBridgeSchedules, SuspendSchedules};
+use eventbridge::EventBridgeSchedules;
 use lambda_env::{LambdaEnvironment, LambdaEnvironmentNames};
 use skyzen_manifest::{AwsSection, Manifest};
 
@@ -82,34 +82,17 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
             child_env = prepared.child_env;
             let mut steps = vec![
                 Step::Command(build_command(&config, &root_dir, true)),
-                // Suspending sits between the build and the upload: a rule already enabled
-                // could fire the new code before its new environment exists, and a build
-                // that fails must not have already quieted them.
-                Step::Task(Box::new(SuspendSchedules::new(
-                    function.clone(),
-                    manifest.data().schedule.clone(),
-                    child_env.clone(),
-                ))),
                 Step::Command(deploy_command(&config, &root_dir, &binary)),
             ];
             let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
-            // Environment delivery goes first: an enabled rule can fire the function before
-            // its variables exist, and a tick in that window would run on stale configuration.
-            if !delivery.is_empty() {
-                steps.push(Step::Task(Box::new(LambdaEnvironment::new(
-                    function.clone(),
-                    delivery,
-                    child_env.clone(),
-                ))));
-            }
-            // Every `[[schedule]]` is an EventBridge rule pointed at the function — the one
-            // part of a deploy `cargo lambda` cannot express, created in process so the
-            // deployed function actually fires rather than just existing. The task also runs
-            // with an empty list: reconciling what the manifest no longer declares is how a
-            // removed schedule's rule stops firing.
+            // Suspension, environment delivery and rule wiring are one transaction: an
+            // enabled rule could otherwise fire the new code with stale configuration, and
+            // separate steps could leave suspended rules stranded on a failure — this task
+            // restores them before the error escapes.
             steps.push(Step::Task(Box::new(EventBridgeSchedules::new(
                 function,
                 manifest.data().schedule.clone(),
+                delivery,
                 child_env.clone(),
             ))));
             steps
@@ -433,13 +416,10 @@ mod tests {
              [aws.env]\nRUST_LOG = \"info\"\n",
         );
 
-        assert_eq!(planned.len(), 5, "{planned:?}");
+        assert_eq!(planned.len(), 3, "{planned:?}");
         assert!(planned[0].contains("cargo lambda build"), "{planned:?}");
-        // Suspending the rules runs between the build and the upload, so a failed build never
-        // leaves the schedules quiet.
-        assert!(planned[1].contains("suspend"), "{planned:?}");
 
-        let deploy = &planned[2];
+        let deploy = &planned[1];
         assert!(deploy.contains("cargo lambda deploy"), "{deploy}");
         assert!(deploy.contains("--binary-name demo"), "{deploy}");
         assert!(deploy.contains("--memory 512"), "{deploy}");
@@ -483,16 +463,15 @@ mod tests {
             &project(),
         )
         .expect("plan");
-        // Environment delivery must run before the EventBridge rules are enabled, so it is
-        // the last-but-one task — reconciliation is the deploy's final step.
-        let described: Vec<String> = plan.steps.iter().map(Step::describe).collect();
-        let delivery = described
-            .iter()
-            .position(|step| step.contains("environment"))
+        // Environment delivery rides inside the reconciliation task, which is the deploy's
+        // last step: suspension, delivery and rule wiring are one transaction there.
+        let described = plan
+            .steps
+            .last()
+            .map(Step::describe)
             .expect("a deploy delivers its environment");
-        assert_eq!(delivery, plan.steps.len() - 2, "{described:?}");
-        let described = &described[delivery];
 
+        assert!(described.contains("environment"), "{described}");
         assert!(described.contains("skyzen-api"), "{described}");
         assert!(described.contains("RUST_LOG"), "{described}");
         assert!(described.contains("STRIPE_KEY"), "{described}");
@@ -577,8 +556,8 @@ mod tests {
             "[aws]\nurl = false\n",
         );
 
-        assert!(planned[2].contains("--disable-function-url"), "{planned:?}");
-        assert!(!planned[2].contains("--enable-function-url"), "{planned:?}");
+        assert!(planned[1].contains("--disable-function-url"), "{planned:?}");
+        assert!(!planned[1].contains("--enable-function-url"), "{planned:?}");
     }
 
     #[test]

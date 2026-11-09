@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 /// The variables one delivery sets on a deployed function.
 ///
 /// Ordered by name, so a description and a request body list them the same way every run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Delivery(BTreeMap<String, SecretString>);
 
 impl Delivery {

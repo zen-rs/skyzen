@@ -360,20 +360,38 @@ async fn wrapped_response(response: Response) -> Response {
         Ok(text) => (text, false),
         Err(error) => (base64(&error.into_bytes()), true),
     };
-    // One name maps to every value it appeared with — a `Set-Cookie` pair is two values, not
-    // a second overwrite of the first. `Content-Length` is the host's to compute again: the
-    // wrapped body is not the bytes it was counted for.
+    // The host reads `res.headers` as name -> string — arrays come out as their serialized
+    // form, not the values. Repeated values join with ", " the way HTTP itself folds them;
+    // `Set-Cookie` is the one header that must not fold, and `res.cookies` carries each as
+    // its own object instead. `Content-Length` is the host's to compute again: the wrapped
+    // body is not the bytes it was counted for.
     let mut headers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut cookies: Vec<serde_json::Value> = Vec::new();
     for (name, value) in &parts.headers {
         if name.as_str().eq_ignore_ascii_case("content-length") {
             continue;
         }
-        if let Ok(value) = value.to_str() {
-            headers
-                .entry(name.as_str().to_owned())
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-                .as_array_mut()
-                .map(|values| values.push(value.into()));
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        if name.as_str().eq_ignore_ascii_case("set-cookie") {
+            let (cookie_name, cookie_value) = value.split_once('=').unwrap_or((value, ""));
+            cookies.push(serde_json::json!({
+                "name": cookie_name.trim(),
+                "value": cookie_value.trim(),
+            }));
+            continue;
+        }
+        match headers.entry(name.as_str().to_owned()) {
+            serde_json::map::Entry::Occupied(mut entry) => {
+                if let serde_json::Value::String(joined) = entry.get_mut() {
+                    joined.push_str(", ");
+                    joined.push_str(value);
+                }
+            }
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(value.into());
+            }
         }
     }
     let payload = serde_json::json!({
@@ -381,6 +399,7 @@ async fn wrapped_response(response: Response) -> Response {
             "res": {
                 "statusCode": status,
                 "headers": headers,
+                "cookies": cookies,
                 "body": body,
                 "isBase64Encoded": base64_encoded
             }

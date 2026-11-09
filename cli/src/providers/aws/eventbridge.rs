@@ -31,6 +31,8 @@ pub struct EventBridgeSchedules {
     function: String,
     /// The `[[schedule]]` entries to wire, each becoming one rule.
     schedules: Vec<ScheduleEntry>,
+    /// The environment to deliver while the rules are suspended — empty delivers nothing.
+    delivery: crate::providers::secrets::Delivery,
     /// The deploy's `child_env` — where `.env` AWS credentials ride to the SDK.
     env: Vec<(String, String)>,
 }
@@ -40,11 +42,13 @@ impl EventBridgeSchedules {
     pub const fn new(
         function: String,
         schedules: Vec<ScheduleEntry>,
+        delivery: crate::providers::secrets::Delivery,
         env: Vec<(String, String)>,
     ) -> Self {
         Self {
             function,
             schedules,
+            delivery,
             env,
         }
     }
@@ -59,126 +63,16 @@ impl EventBridgeSchedules {
     }
 }
 
-/// Quiet every managed rule for the length of a deploy.
-///
-/// `cargo lambda deploy` updates the code in place, so a rule already enabled can invoke the
-/// new function while its environment update is still in flight — a tick in that window reads
-/// stale configuration. Disabling every managed rule first and letting [`EventBridgeSchedules`]
-/// re-enable them last means no firing happens between the upload and the delivery.
-#[derive(Debug)]
-pub struct SuspendSchedules {
-    /// The rules' owner, reusing `EventBridgeSchedules`' naming and policy reading.
-    inner: EventBridgeSchedules,
-}
-
-impl SuspendSchedules {
-    /// The step that disables every rule `schedules` and the Lambda policy name for `function`.
-    pub const fn new(
-        function: String,
-        schedules: Vec<ScheduleEntry>,
-        env: Vec<(String, String)>,
-    ) -> Self {
-        Self {
-            inner: EventBridgeSchedules::new(function, schedules, env),
-        }
-    }
-}
-
-impl Task for SuspendSchedules {
-    fn describe(&self) -> String {
-        format!(
-            "suspend EventBridge schedules on Lambda function `{}` for the duration of the \
-             deploy",
-            self.inner.function
-        )
-    }
-
-    fn run(&self) -> Result<()> {
-        super::lambda_env::adopt_env(&self.inner.env);
-        block_on(async {
-            let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-            let lambda = aws_sdk_lambda::Client::new(&shared);
-            let events = aws_sdk_eventbridge::Client::new(&shared);
-
-            let mut names: std::collections::BTreeSet<String> = self
-                .inner
-                .schedules
-                .iter()
-                .map(|entry| entry.name.as_str().to_owned())
-                .collect();
-            // Rules surviving from names the manifest no longer declares matter as much —
-            // they are just as capable of firing during the upload.
-            if let Some(policy) = self.inner.policy(&lambda).await? {
-                if let Some(statements) = policy["Statement"].as_array() {
-                    for name in statements
-                        .iter()
-                        .filter_map(|entry| entry["Sid"].as_str()?.strip_prefix("skyzen-schedule-"))
-                    {
-                        names.insert(name.to_owned());
-                    }
-                }
-            }
-            for name in names {
-                let rule = self.inner.rule_name(&name);
-                // A same-named rule belonging to something else is not ours to quiet —
-                // `wire_one` applies the same test before it would change it.
-                let owned = match events.describe_rule().name(&rule).send().await {
-                    Ok(_) => {
-                        let listed = events
-                            .list_targets_by_rule()
-                            .rule(&rule)
-                            .send()
-                            .await
-                            .with_context(|| {
-                                format!("failed to list the targets of rule `{rule}`")
-                            })?;
-                        let lambda_arn = lambda
-                            .get_function_configuration()
-                            .function_name(&self.inner.function)
-                            .send()
-                            .await
-                            .with_context(|| {
-                                format!("could not read Lambda function `{}`", self.inner.function)
-                            })?
-                            .function_arn()
-                            .map(str::to_owned);
-                        lambda_arn.is_some_and(|arn| {
-                            listed.targets().iter().all(|target| target.arn() == arn)
-                        })
-                    }
-                    Err(_) => true,
-                };
-                if !owned {
-                    output::warn(format!(
-                        "leaving EventBridge rule `{rule}` alone: its targets are not Lambda \
-                         function `{}`",
-                        self.inner.function
-                    ));
-                    continue;
-                }
-                match events.disable_rule().name(&rule).send().await {
-                    Ok(_) => output::ok(format!("suspended EventBridge rule `{rule}`")),
-                    Err(error)
-                        if error.as_service_error().is_some_and(
-                            aws_sdk_eventbridge::operation::disable_rule::DisableRuleError::is_resource_not_found_exception,
-                        ) => {}
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("failed to suspend EventBridge rule `{rule}`")
-                        })
-                    }
-                }
-            }
-            Ok(())
-        })?
-    }
-}
-
 impl Task for EventBridgeSchedules {
     fn describe(&self) -> String {
+        let delivery = if self.delivery.is_empty() {
+            String::new()
+        } else {
+            format!(", and deliver its environment: {}", self.delivery.names())
+        };
         if self.schedules.is_empty() {
             return format!(
-                "reconcile `[[schedule]]` EventBridge rules of Lambda function `{}`",
+                "reconcile `[[schedule]]` EventBridge rules of Lambda function `{}`{delivery}",
                 self.function
             );
         }
@@ -189,7 +83,7 @@ impl Task for EventBridgeSchedules {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "wire {} EventBridge schedule(s) to Lambda function `{}`: {names}",
+            "wire {} EventBridge schedule(s) to Lambda function `{}`: {names}{delivery}",
             self.schedules.len(),
             self.function,
         )
@@ -238,32 +132,146 @@ impl Task for EventBridgeSchedules {
                 })?
                 .to_owned();
 
-            // arn:{partition}:lambda:{region}:{account}:function:{name} — the rule's ARN lives
-            // in the same partition, region and account, under the `events` service. The
-            // partition matters outside standard AWS: `aws-us-gov`, `aws-cn`.
-            let parts: Vec<&str> = arn.split(':').collect();
-            let (partition, region, account) = parts
-                .get(1)
-                .zip(parts.get(3))
-                .zip(parts.get(4))
-                .map(|((partition, region), account)| (*partition, *region, *account))
-                .with_context(|| {
-                    format!(
-                        "`{arn}` is not a Lambda function ARN EventBridge rules can be built from"
-                    )
-                })?;
-
-            for entry in &self.schedules {
-                self.wire_one(&events, &lambda, &arn, (partition, region, account), entry)
-                    .await?;
+            // The whole point of running as one task: `cargo lambda deploy` has already
+            // swapped the code, and until the environment is delivered an enabled rule can
+            // fire the new code with stale configuration. Suspend every managed rule first,
+            // then deliver, retire and wire — and whatever fails along the way puts the
+            // suspended rules back before the error escapes.
+            let mut suspended = Vec::new();
+            let result = self.reconcile(&events, &lambda, &arn, &mut suspended).await;
+            if let Err(error) = result {
+                for rule in &suspended {
+                    let _ = events.enable_rule().name(rule).send().await;
+                }
+                return Err(error);
             }
-            self.retire_stale(&events, &lambda, &arn).await?;
             Ok(())
         })?
     }
 }
 
 impl EventBridgeSchedules {
+    /// Suspend the managed rules, deliver the environment, then retire and re-wire them.
+    ///
+    /// `suspended` collects the rules this quiets so the caller can restore them on error —
+    /// a failed deployment must not leave schedules off indefinitely.
+    async fn reconcile(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+        lambda: &aws_sdk_lambda::Client,
+        arn: &str,
+        suspended: &mut Vec<String>,
+    ) -> Result<()> {
+        self.suspend(events, lambda, arn, suspended).await?;
+
+        if !self.delivery.is_empty() {
+            super::lambda_env::LambdaEnvironment::new(
+                self.function.clone(),
+                self.delivery.clone(),
+                self.env.clone(),
+            )
+            .deliver()
+            .await?;
+        }
+
+        // arn:{partition}:lambda:{region}:{account}:function:{name} — the rule's ARN lives
+        // in the same partition, region and account, under the `events` service. The
+        // partition matters outside standard AWS: `aws-us-gov`, `aws-cn`.
+        let parts: Vec<&str> = arn.split(':').collect();
+        let (partition, region, account) = parts
+            .get(1)
+            .zip(parts.get(3))
+            .zip(parts.get(4))
+            .map(|((partition, region), account)| (*partition, *region, *account))
+            .with_context(|| {
+                format!("`{arn}` is not a Lambda function ARN EventBridge rules can be built from")
+            })?;
+
+        for entry in &self.schedules {
+            self.wire_one(events, lambda, arn, (partition, region, account), entry)
+                .await?;
+        }
+        self.retire_stale(events, lambda, arn).await?;
+        Ok(())
+    }
+
+    /// Disable every managed rule, recording each in `suspended`.
+    ///
+    /// The names to quiet are the declared schedules plus every `skyzen-schedule-*` grant the
+    /// function's policy still carries — a rule surviving a removed schedule fires just the
+    /// same. A rule whose targets are not this Lambda is left alone: `wire_one` makes the
+    /// same ownership test before it would change the rule, and suspension is not exempt.
+    async fn suspend(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+        lambda: &aws_sdk_lambda::Client,
+        arn: &str,
+        suspended: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut names: std::collections::BTreeSet<String> = self
+            .schedules
+            .iter()
+            .map(|entry| entry.name.as_str().to_owned())
+            .collect();
+        if let Some(policy) = self.policy(lambda).await? {
+            if let Some(statements) = policy["Statement"].as_array() {
+                for name in statements
+                    .iter()
+                    .filter_map(|entry| entry["Sid"].as_str()?.strip_prefix("skyzen-schedule-"))
+                {
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+        for name in names {
+            let rule = self.rule_name(&name);
+            let owned = match events.describe_rule().name(&rule).send().await {
+                // Only "not there" means there is nothing to quiet — any other failure to
+                // look proves nothing about ownership, and disabling blind could quiet a
+                // rule that was never ours.
+                Err(error)
+                    if error.as_service_error().is_some_and(
+                        aws_sdk_eventbridge::operation::describe_rule::DescribeRuleError::is_resource_not_found_exception,
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to describe rule `{rule}`"));
+                }
+                Ok(_) => {
+                    let listed = events
+                        .list_targets_by_rule()
+                        .rule(&rule)
+                        .send()
+                        .await
+                        .with_context(|| {
+                            format!("failed to list the targets of rule `{rule}`")
+                        })?;
+                    listed.targets().iter().all(|target| target.arn() == arn)
+                }
+            };
+            if !owned {
+                output::warn(format!(
+                    "leaving EventBridge rule `{rule}` alone: its targets are not Lambda \
+                     function `{}`",
+                    self.function
+                ));
+                continue;
+            }
+            events
+                .disable_rule()
+                .name(&rule)
+                .send()
+                .await
+                .with_context(|| format!("failed to suspend EventBridge rule `{rule}`"))?;
+            suspended.push(rule.clone());
+            output::ok(format!("suspended EventBridge rule `{rule}`"));
+        }
+        Ok(())
+    }
+
     /// Remove rules — and their invoke permissions — that a previous deploy created and the
     /// manifest no longer declares.
     ///

@@ -62,6 +62,49 @@ impl LambdaEnvironment {
             env,
         }
     }
+
+    /// Wait out the in-flight update, then write the merged environment — the work `run`
+    /// drives, exposed so the schedule task can perform the same delivery inside its own
+    /// suspend/reconcile transaction.
+    pub(super) async fn deliver(&self) -> Result<()> {
+        let client = client().await;
+
+        // The deploy that just ran leaves an update in progress, and Lambda refuses a second
+        // one until it has settled.
+        client
+            .wait_until_function_updated_v2()
+            .function_name(&self.function)
+            .wait(UPDATE_TIMEOUT)
+            .await
+            .with_context(|| {
+                format!(
+                    "Lambda function `{}` did not finish updating within {} seconds",
+                    self.function,
+                    UPDATE_TIMEOUT.as_secs()
+                )
+            })?;
+
+        let merged = self
+            .delivery
+            .merged_over(existing_variables(&client, &self.function).await?);
+        client
+            .update_function_configuration()
+            .function_name(&self.function)
+            .environment(
+                Environment::builder()
+                    .set_variables(Some(merged.into_iter().collect()))
+                    .build(),
+            )
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to set the environment of Lambda function `{}`",
+                    self.function
+                )
+            })?;
+        Ok(())
+    }
 }
 
 impl Task for LambdaEnvironment {
@@ -75,45 +118,7 @@ impl Task for LambdaEnvironment {
 
     fn run(&self) -> Result<()> {
         adopt_env(&self.env);
-        block_on(async {
-            let client = client().await;
-
-            // The deploy that just ran leaves an update in progress, and Lambda refuses a second
-            // one until it has settled.
-            client
-                .wait_until_function_updated_v2()
-                .function_name(&self.function)
-                .wait(UPDATE_TIMEOUT)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Lambda function `{}` did not finish updating within {} seconds",
-                        self.function,
-                        UPDATE_TIMEOUT.as_secs()
-                    )
-                })?;
-
-            let merged = self
-                .delivery
-                .merged_over(existing_variables(&client, &self.function).await?);
-            client
-                .update_function_configuration()
-                .function_name(&self.function)
-                .environment(
-                    Environment::builder()
-                        .set_variables(Some(merged.into_iter().collect()))
-                        .build(),
-                )
-                .send()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to set the environment of Lambda function `{}`",
-                        self.function
-                    )
-                })?;
-            Ok(())
-        })?
+        block_on(self.deliver())?
     }
 }
 
