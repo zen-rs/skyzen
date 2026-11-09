@@ -16,9 +16,10 @@
 //! - **SQS** — a payload whose `Records` carry `eventSource: "aws:sqs"` is decoded into the
 //!   portable `QueueBatch` and driven through the application's `#[skyzen::queue]` handler. The
 //!   reply is a [partial batch response], so only the messages the handler failed are redelivered.
-//! - **Scheduled** — an `EventBridge` rule's `cron(...)` or an `EventBridge` Scheduler schedule,
-//!   decoded into the portable `ScheduledTick` and driven through the application's
-//!   `#[skyzen::scheduled]` handler.
+//! - **Scheduled** — an `EventBridge` rule's `cron(...)`, decoded into the portable
+//!   `ScheduledTick` and driven through the application's `#[skyzen::scheduled]` handler. An
+//!   `EventBridge` Scheduler event is refused by name: its payload carries no cron for the
+//!   tick to report.
 //!
 //! An event that is none of these is refused by name rather than guessed at.
 //!
@@ -76,7 +77,7 @@ mod dispatch;
 pub mod eventbridge;
 pub mod sqs;
 
-pub use dispatch::{NoQueueHandler, QueueDispatch, ScheduledDispatch};
+pub use dispatch::{NoQueueHandler, QueueDispatch};
 pub use lambda_runtime::Error;
 
 use core::{
@@ -119,7 +120,7 @@ where
     Factory: FnOnce() -> Fut,
     Fut: Future<Output = (E, D)>,
     E: Endpoint + Clone + Send + Sync + 'static,
-    D: QueueDispatch + ScheduledDispatch,
+    D: QueueDispatch,
 {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -128,8 +129,8 @@ where
     runtime.block_on(async move {
         let (endpoint, dispatch) = factory().await;
         info!(
-            queue_handler = <D as QueueDispatch>::DECLARED,
-            scheduled_handler = <D as ScheduledDispatch>::DECLARED,
+            queue_handler = D::DECLARED,
+            scheduled_handler = D::SCHEDULED_DECLARED,
             "Skyzen starting on AWS Lambda"
         );
         lambda_runtime::run(Invocation {
@@ -167,7 +168,7 @@ struct RecordKind<'a> {
 impl<E, D> Service<LambdaEvent<Box<RawValue>>> for Invocation<E, D>
 where
     E: Endpoint + Clone + Send + Sync + 'static,
-    D: QueueDispatch + ScheduledDispatch,
+    D: QueueDispatch,
 {
     type Response = serde_json::Value;
     type Error = Error;
@@ -230,6 +231,13 @@ fn classify(payload: &str) -> Result<EventShape, Error> {
     let eventbridge: eventbridge::EventBridgeKind<'_> = serde_json::from_str(payload)?;
     if eventbridge::is_scheduled(&eventbridge) {
         return Ok(EventShape::Scheduled);
+    }
+    if eventbridge::is_scheduler(&eventbridge) {
+        return Err(Error::from(
+            "this Lambda received an EventBridge Scheduler event, which Skyzen does not decode — \
+             its payload carries no cron; point an EventBridge rule with a `cron(...)` schedule \
+             at the function instead, which `skyzen deploy` provisions for every `[[schedule]]`",
+        ));
     }
 
     let kind: EventKind<'_> = serde_json::from_str(payload)?;
@@ -534,22 +542,6 @@ mod tests {
             // An `async` block, so a panicking decision panics inside the future the caller polls
             // — which is where the runtime's guard is.
             async move { (self.decide)() }
-        }
-    }
-
-    impl super::ScheduledDispatch for Canned {
-        const DECLARED: bool = false;
-
-        #[allow(clippy::manual_async_fn)]
-        fn dispatch(
-            &self,
-            _tick: skyzen_services::ScheduledTick,
-        ) -> impl Future<Output = Result<(), BoxError>> + Send {
-            async move {
-                Err(BoxError::from(
-                    "this test dispatcher declares no scheduled handler",
-                ))
-            }
         }
     }
 

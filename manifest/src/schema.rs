@@ -362,9 +362,24 @@ impl CronExpr {
         if text.split_whitespace().count() != 5 {
             return false;
         }
-        text.parse::<saffron::Cron>().is_ok_and(|cron| cron.any())
+        text.split([' ', ',', '-', '/']).all(|atom| {
+            atom.is_empty()
+                || atom == "*"
+                || atom.chars().all(|c| c.is_ascii_digit())
+                || PORTABLE_CRON_NAMES.contains(&atom.to_uppercase().as_str())
+        }) && text.parse::<saffron::Cron>().is_ok_and(|cron| cron.any())
     }
 }
+
+/// The month and weekday names the portable cron grammar keeps.
+///
+/// Saffron parses the Cloudflare extensions — `L`, `W`, `#`, `?` — which the other providers
+/// cannot read. The portable syntax keeps only these names, digits and the `*`, `,`, `-`, `/`
+/// operators.
+const PORTABLE_CRON_NAMES: [&str; 19] = [
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC", "SUN",
+    "MON", "TUE", "WED", "THU", "FRI", "SAT",
+];
 
 /// A string that is not a valid portable cron expression.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -409,30 +424,102 @@ impl PartialEq<str> for CronExpr {
     }
 }
 
-/// Why two `[[schedule]]` entries cannot coexist.
+/// Why a `[[schedule]]` entry cannot be used.
+///
+/// Checked when the manifest is parsed, so `#[skyzen::main]` reports it as a compile error and
+/// the CLI reports it before generating anything — one rule, both consumers.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("[[schedule]] declares `{name}` twice; each entry is a distinct schedule")]
-pub struct DuplicateSchedule {
-    /// The name declared more than once.
-    pub name: String,
+pub enum ScheduleError {
+    /// The name is the one the catch-all HTTP function already uses.
+    #[error(
+        "[[schedule]] `{name}` is the name Skyzen gives the catch-all HTTP function; a schedule \
+         with that name would replace it, leaving the application with no HTTP surface"
+    )]
+    Reserved {
+        /// The rejected name.
+        name: String,
+    },
+    /// Two entries claim one name, and therefore one Functions directory, one `EventBridge`
+    /// rule and one native loop.
+    #[error("[[schedule]] declares `{name}` twice; each entry is a distinct schedule")]
+    Duplicate {
+        /// The name declared more than once.
+        name: String,
+    },
+    /// Two entries claim one cron.
+    ///
+    /// On Cloudflare two entries sharing a cron collapse to a single trigger — Cloudflare fires
+    /// per cron, not per schedule — while the other targets would still fire both. Rejecting the
+    /// duplicate keeps one cron meaning one schedule on every target.
+    #[error(
+        "[[schedule]] declares the cron `{cron}` twice; on Cloudflare that would be a single \
+         trigger firing once where the other targets fire twice — give the second schedule its \
+         own expression or merge the entries"
+    )]
+    DuplicateCron {
+        /// The cron declared more than once.
+        cron: String,
+    },
+    /// A schedule names a function a queue trigger already owns on Azure.
+    #[error(
+        "[[schedule]] `{name}` shares its name with the `[[azure.queue_triggers]]` function of \
+         the same name; on Azure both would write the same `function.json`"
+    )]
+    TriggerCollision {
+        /// The colliding name.
+        name: String,
+    },
 }
 
 impl SkyzenManifest {
-    /// Check that no two `[[schedule]]` entries claim the same name.
+    /// Check the `[[schedule]]` entries against each other and the reserved names.
     ///
     /// The name is a Functions function on Azure and an `EventBridge` rule on AWS — one name is
-    /// one schedule everywhere, so a duplicate fails the parse rather than one provider's
-    /// shadowing the other.
+    /// one schedule everywhere, so a duplicate name, a duplicate cron or a collision with the
+    /// platform's own function names fails the parse rather than one provider's shadowing the
+    /// other.
     ///
     /// # Errors
     ///
-    /// [`DuplicateSchedule`] naming the first name declared twice.
-    pub fn validate_schedules(&self) -> Result<(), DuplicateSchedule> {
-        let mut claimed = std::collections::BTreeSet::new();
+    /// [`ScheduleError`] naming the first entry that cannot be used.
+    pub fn validate_schedules(&self) -> Result<(), ScheduleError> {
+        let mut claimed_names = std::collections::BTreeSet::new();
+        let mut claimed_crons = std::collections::BTreeSet::new();
+        let queue_functions: std::collections::BTreeSet<String> = self
+            .azure
+            .as_ref()
+            .map(|azure| {
+                azure
+                    .queue_triggers
+                    .iter()
+                    .map(|trigger| trigger.function.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         for entry in &self.schedule {
-            if !claimed.insert(entry.name.as_str()) {
-                return Err(DuplicateSchedule {
-                    name: entry.name.to_string(),
+            let name = entry.name.as_str();
+            // Case-insensitive, for the same reason `validate_queue_triggers` is: the Functions
+            // bundle is a directory tree, which a case-insensitive filesystem collides on.
+            let lower = name.to_ascii_lowercase();
+            if lower == HTTP_FUNCTION_NAME {
+                return Err(ScheduleError::Reserved {
+                    name: name.to_owned(),
+                });
+            }
+            if !claimed_names.insert(lower.clone()) {
+                return Err(ScheduleError::Duplicate {
+                    name: name.to_owned(),
+                });
+            }
+            if queue_functions.contains(&lower) {
+                return Err(ScheduleError::TriggerCollision {
+                    name: name.to_owned(),
+                });
+            }
+            if !claimed_crons.insert(entry.cron.as_str().to_owned()) {
+                return Err(ScheduleError::DuplicateCron {
+                    cron: entry.cron.as_str().to_owned(),
                 });
             }
         }

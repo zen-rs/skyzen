@@ -287,13 +287,13 @@ impl FunctionJson {
     }
 }
 
-/// The NCRONTAB form of a portable cron: a leading seconds `0`, and Sunday spelled the way
-/// NCRONTAB numbers it.
+/// The NCRONTAB form of a portable cron: a leading seconds `0`, and day-of-week renumbered the
+/// way NCRONTAB counts it.
 ///
-/// NCRONTAB numbers Sunday `0` and treats `7` as invalid, where the portable grammar follows
-/// Cloudflare in accepting `7` as an alias. So `7` becomes `0`, and `7` at the *end* of a range
-/// (`1-7`, "Monday to Sunday") becomes `6` — the same set of days, numbered for the host.
-/// Names (`SUN`) and `*`/`?`/lists need no remapping: NCRONTAB speaks them already.
+/// The portable grammar numbers days `1`–`7` Sunday through Saturday (Cloudflare's convention);
+/// NCRONTAB numbers them `0`–`6`. Every numeric item in the field — single values, range ends,
+/// and lists — shifts down by one. Names (`SUN`) and `*` need no remapping: both dialects speak
+/// them already.
 fn ncrontab(cron: &str) -> String {
     let fields: Vec<&str> = cron.split_whitespace().collect();
     let dow = fields.get(4).map_or_else(
@@ -301,10 +301,14 @@ fn ncrontab(cron: &str) -> String {
         |field| {
             field
                 .split(',')
-                .map(|item| match item.split_once('-') {
-                    Some((start, "7")) => format!("{start}-6"),
-                    None if item == "7" => "0".to_owned(),
-                    _ => item.to_owned(),
+                .map(|item| {
+                    item.split('-')
+                        .map(|part| {
+                            part.parse::<u8>()
+                                .map_or_else(|_| part.to_owned(), |number| (number - 1).to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("-")
                 })
                 .collect::<Vec<_>>()
                 .join(",")
@@ -496,10 +500,16 @@ mod tests {
     }
 
     #[test]
-    fn a_sunday_spelled_seven_is_renumbered_for_ncrontab() {
-        assert_eq!(super::ncrontab("0 9 * * 7"), "0 0 9 * * 0");
-        assert_eq!(super::ncrontab("0 9 * * 1-7"), "0 0 9 * * 1-6");
+    fn every_numeric_weekday_shifts_down_one_for_ncrontab() {
+        // Portable `1`–`7` is Sunday–Saturday (saffron/Cloudflare); NCRONTAB is `0`–`6`.
+        assert_eq!(super::ncrontab("0 9 * * 1"), "0 0 9 * * 0");
+        assert_eq!(super::ncrontab("0 9 * * 7"), "0 0 9 * * 6");
+        assert_eq!(super::ncrontab("0 9 * * 2-6"), "0 0 9 * * 1-5");
+        assert_eq!(super::ncrontab("0 9 * * 1-7"), "0 0 9 * * 0-6");
+        assert_eq!(super::ncrontab("0 9 * * 1,4,7"), "0 0 9 * * 0,3,6");
         assert_eq!(super::ncrontab("0 9 * * SUN"), "0 0 9 * * SUN");
+        assert_eq!(super::ncrontab("0 9 * * MON-FRI"), "0 0 9 * * MON-FRI");
+        assert_eq!(super::ncrontab("0 9 * * */2"), "0 0 9 * * */2");
     }
 
     #[test]

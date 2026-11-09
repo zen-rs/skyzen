@@ -1695,8 +1695,9 @@ where
 struct LambdaHandlers<C, S>(C, S);
 
 #[cfg(feature = "lambda")]
-impl<C: ConsumerSet, S> skyzen_lambda::QueueDispatch for LambdaHandlers<C, S> {
+impl<C: ConsumerSet, S: ScheduleSet> skyzen_lambda::QueueDispatch for LambdaHandlers<C, S> {
     const DECLARED: bool = C::DECLARES_HANDLER;
+    const SCHEDULED_DECLARED: bool = S::DECLARES_HANDLER;
 
     fn dispatch(
         &self,
@@ -1706,13 +1707,8 @@ impl<C: ConsumerSet, S> skyzen_lambda::QueueDispatch for LambdaHandlers<C, S> {
     > + Send {
         self.0.dispatch(batch)
     }
-}
 
-#[cfg(feature = "lambda")]
-impl<C, S: ScheduleSet> skyzen_lambda::ScheduledDispatch for LambdaHandlers<C, S> {
-    const DECLARED: bool = S::DECLARES_HANDLER;
-
-    fn dispatch(
+    fn dispatch_scheduled(
         &self,
         tick: skyzen_services::ScheduledTick,
     ) -> impl Future<Output = Result<(), skyzen_services::BoxError>> + Send {

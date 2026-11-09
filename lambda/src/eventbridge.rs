@@ -1,21 +1,22 @@
 //! Decoding `EventBridge` scheduled events into the portable `ScheduledTick`.
 //!
-//! An `EventBridge` rule's `cron(...)` and an `EventBridge` Scheduler schedule both land here as
-//! an invocation whose `detail-type` is `Scheduled Event` and whose `source` is `aws.events` or
-//! `aws.scheduler`. Neither shape reports the cron that produced it — the rule's own name is the
-//! closest thing — so the CLI also stamps the portable expression into `detail.cron` when it
-//! provisions the trigger, and the tick's `cron` prefers that marker.
+//! An `EventBridge` rule's `cron(...)` lands here as an invocation whose `detail-type` is
+//! `Scheduled Event` and whose `source` is `aws.events`. The platform's own event reports
+//! neither the cron nor the schedule's name, so the CLI stamps the portable expression into
+//! `detail.cron` when it provisions the rule — and that marker is *required*: a payload that
+//! lacks it did not come through this mechanism, and reporting a rule's name in `cron`'s place
+//! would silently violate what the field promises.
 //!
 //! The tick's `scheduled_time_ms` is the event's `time` field — the instant the schedule was
-//! due, which is also what a retried or delayed invocation still names.
-
-use std::time::{SystemTime, UNIX_EPOCH};
+//! due, which is also what a retried or delayed invocation still names. A missing or malformed
+//! `time` is refused for the same reason: inventing "now" would report an instant the schedule
+//! never meant.
 
 use lambda_runtime::Error;
 use serde::Deserialize;
 use skyzen_services::ScheduledTick;
 
-use crate::ScheduledDispatch;
+use crate::QueueDispatch;
 
 /// Just enough of an event to recognize a scheduled one.
 #[derive(Debug, Deserialize)]
@@ -23,63 +24,61 @@ pub struct EventBridgeKind<'a> {
     /// `Scheduled Event` for every scheduled invocation.
     #[serde(default, rename = "detail-type", borrow)]
     pub detail_type: Option<&'a str>,
-    /// `aws.events` for a rule's `cron(...)`, `aws.scheduler` for an `EventBridge` Scheduler
-    /// schedule — either means the platform, not a custom event bus producer.
+    /// `aws.events` for a rule's `cron(...)`; `aws.scheduler` marks an `EventBridge` Scheduler
+    /// schedule, whose payload this module does not decode.
     #[serde(default, borrow)]
     pub source: Option<&'a str>,
 }
 
-/// Whether the event is a scheduled one.
+/// Whether the event is a scheduled one this module decodes.
 #[must_use]
 pub fn is_scheduled(kind: &EventBridgeKind<'_>) -> bool {
-    kind.detail_type == Some("Scheduled Event")
-        && matches!(kind.source, Some("aws.events" | "aws.scheduler"))
+    kind.detail_type == Some("Scheduled Event") && kind.source == Some("aws.events")
+}
+
+/// Whether the event is an `EventBridge` Scheduler invocation — a scheduled shape this module
+/// deliberately does not decode, worth refusing by name rather than misreading as HTTP.
+#[must_use]
+pub fn is_scheduler(kind: &EventBridgeKind<'_>) -> bool {
+    kind.detail_type == Some("Scheduled Event") && kind.source == Some("aws.scheduler")
 }
 
 /// Turn the event payload into the portable tick the handler is given.
 ///
 /// # Errors
 ///
-/// Fails when the event carries neither a `detail.cron` marker nor a `resources` entry to name
-/// the rule from — a scheduled event must carry one, so its absence means the payload was not
-/// produced by the mechanism this decodes.
+/// Fails when `detail.cron` is absent — the marker the provisioned rule always stamps, without
+/// which the handler's `cron` has no honest value — or when `time` is missing or malformed,
+/// since the tick's `scheduled_time_ms` must be the instant the schedule was due.
 pub fn tick(event: &serde_json::Value) -> Result<ScheduledTick, Error> {
     let cron = event
         .get("detail")
         .and_then(|detail| detail.get("cron"))
         .and_then(serde_json::Value::as_str)
-        .map_or_else(
-            || rule_name(event).map(ToOwned::to_owned),
-            |cron| Ok(cron.to_owned()),
-        )?;
+        .filter(|cron| !cron.is_empty())
+        .ok_or_else(|| {
+            Error::from(
+                "a scheduled event carries no `detail.cron` marker; the rule was not provisioned \
+                 by `skyzen deploy`, which stamps the portable cron there",
+            )
+        })?
+        .to_owned();
 
     let scheduled_time_ms = event
         .get("time")
         .and_then(serde_json::Value::as_str)
-        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
-        .map_or_else(now_ms, |time| time.timestamp_millis());
+        .ok_or_else(|| Error::from("a scheduled event carries no `time` field"))
+        .and_then(|time| {
+            chrono::DateTime::parse_from_rfc3339(time)
+                .map(|parsed| parsed.timestamp_millis())
+                .map_err(|error| {
+                    Error::from(format!(
+                        "a scheduled event's `time` is not RFC 3339: {error}"
+                    ))
+                })
+        })?;
 
     Ok(ScheduledTick::new(cron, scheduled_time_ms))
-}
-
-/// The rule's name, out of its ARN in `resources[0]`.
-///
-/// `EventBridge` ARNs look like `arn:aws:events:{region}:{account}:rule/{name}` — the name is
-/// everything after the last slash, and it is what the CLI sets the rule's name to anyway.
-fn rule_name(event: &serde_json::Value) -> Result<&str, Error> {
-    event
-        .get("resources")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|resources| resources.first())
-        .and_then(serde_json::Value::as_str)
-        .and_then(|arn| arn.rsplit('/').next())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            Error::from(
-                "a scheduled event carries neither a `detail.cron` marker nor a rule ARN in \
-                 `resources`; the handler has no cron to report",
-            )
-        })
 }
 
 /// Drive the application's scheduled handler for one pushed tick.
@@ -91,11 +90,11 @@ fn rule_name(event: &serde_json::Value) -> Result<&str, Error> {
 ///
 /// [`Error`] when the application declares no `#[skyzen::scheduled]` handler, when the event is
 /// not a decodable scheduled one, or when the handler itself fails or panics.
-pub async fn handle_scheduled<D: ScheduledDispatch>(
+pub async fn handle_scheduled<D: QueueDispatch>(
     event: &serde_json::Value,
     dispatch: &D,
 ) -> Result<serde_json::Value, Error> {
-    if !D::DECLARED {
+    if !D::SCHEDULED_DECLARED {
         return Err(Error::from(
             "this Lambda received a scheduled event, but the application declares no \
              #[skyzen::scheduled] handler; annotate one, or point the EventBridge rule at a \
@@ -109,7 +108,7 @@ pub async fn handle_scheduled<D: ScheduledDispatch>(
         "handling a pushed scheduled tick"
     );
 
-    let handled = std::panic::AssertUnwindSafe(dispatch.dispatch(tick.clone()));
+    let handled = std::panic::AssertUnwindSafe(dispatch.dispatch_scheduled(tick.clone()));
     futures_util::FutureExt::catch_unwind(handled)
         .await
         .map_or_else(
@@ -132,13 +131,4 @@ pub async fn handle_scheduled<D: ScheduledDispatch>(
                 Ok(serde_json::Value::Null)
             },
         )
-}
-
-/// Now, in epoch milliseconds.
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since_epoch| {
-            i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
-        })
 }

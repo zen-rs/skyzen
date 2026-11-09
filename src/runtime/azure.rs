@@ -370,7 +370,9 @@ where
     /// Drive the scheduled handler for one invocation and answer the host.
     ///
     /// A timer trigger has no retry of its own to honor: `Err` is only ever reported to the
-    /// invocation log, the way an `Err` return reads on Cloudflare.
+    /// invocation log, the way an `Err` return reads on Cloudflare. A panic is reported the
+    /// same way — the same outcome both the native loop and Lambda give a panicking handler,
+    /// so one handler reads identically on all four targets.
     async fn invoke_scheduled(
         &self,
         trigger: &ScheduledTrigger,
@@ -394,9 +396,13 @@ where
             "handling a timer trigger invocation"
         );
 
-        match self.schedules.dispatch(tick).await {
-            Ok(()) => succeeded(),
-            Err(error) => {
+        let handled = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            self.schedules.dispatch(tick),
+        ))
+        .await;
+        match handled {
+            Ok(Ok(())) => succeeded(),
+            Ok(Err(error)) => {
                 error!(
                     function = trigger.function,
                     cron = trigger.cron,
@@ -404,6 +410,15 @@ where
                     "the scheduled handler failed"
                 );
                 failed("the scheduled handler failed")
+            }
+            Err(panic) => {
+                error!(
+                    function = trigger.function,
+                    cron = trigger.cron,
+                    panic = skyzen_core::panic_message(panic.as_ref()),
+                    "the scheduled handler panicked"
+                );
+                failed("the scheduled handler panicked")
             }
         }
     }
@@ -845,7 +860,9 @@ mod tests {
         let error = mount(
             Routes::new(&["/process", "/health"]),
             consumers(),
+            (),
             &[TRIGGER],
+            &[],
         )
         .expect_err("the route and the trigger cannot both own /process");
 
@@ -859,7 +876,9 @@ mod tests {
         mount(
             Routes::new(&["/health", "/jobs/{id}"]),
             consumers(),
+            (),
             &[TRIGGER],
+            &[],
         )
         .expect("nothing collides");
     }
@@ -868,7 +887,7 @@ mod tests {
     fn a_parameterized_route_that_would_also_match_is_a_warning_not_a_refusal() {
         // `/{name}` still serves every other name; only this one path is taken over.
         check_route_collision(
-            &TRIGGER,
+            TRIGGER.function,
             &[(MethodFilter::Exact(Method::GET), "/{name}".to_owned())],
         )
         .expect("a partial overlap is not a refusal");
@@ -876,7 +895,7 @@ mod tests {
 
     #[test]
     fn a_trigger_declared_twice_refuses_to_mount() {
-        let error = mount(Routes::new(&[]), consumers(), &[TRIGGER, TRIGGER])
+        let error = mount(Routes::new(&[]), consumers(), (), &[TRIGGER, TRIGGER], &[])
             .expect_err("two functions cannot share a name");
 
         assert!(matches!(error, MountError::DuplicateFunction { .. }));
@@ -884,7 +903,7 @@ mod tests {
 
     #[test]
     fn a_trigger_with_no_queue_handler_refuses_to_mount() {
-        let error = mount(Routes::new(&[]), (), &[TRIGGER])
+        let error = mount(Routes::new(&[]), (), (), &[TRIGGER], &[])
             .expect_err("there is nothing to hand the message to");
 
         assert!(matches!(error, MountError::NoQueueHandler { .. }));
@@ -896,12 +915,12 @@ mod tests {
 
     #[test]
     fn an_application_with_no_triggers_mounts_and_changes_nothing() {
-        mount(Routes::new(&["/health"]), (), &[]).expect("nothing to mount");
+        mount(Routes::new(&["/health"]), (), (), &[], &[]).expect("nothing to mount");
     }
 
     /// Send one request through a mounted application and read back what answered it.
     fn respond(method: Method, path: &str, body: &'static str) -> (StatusCode, String) {
-        let mut host = mount(Routes::new(&["/health"]), consumers(), &[TRIGGER])
+        let mut host = mount(Routes::new(&["/health"]), consumers(), (), &[TRIGGER], &[])
             .expect("nothing collides with `process`");
         let mut request: Request = http::Request::builder()
             .method(method)

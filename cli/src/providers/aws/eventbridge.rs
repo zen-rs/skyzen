@@ -107,12 +107,91 @@ impl Task for EventBridgeSchedules {
                 self.wire_one(&events, &lambda, &arn, (region, account), entry)
                     .await?;
             }
+            self.retire_stale(&events, &lambda).await?;
             Ok(())
         })?
     }
 }
 
 impl EventBridgeSchedules {
+    /// Remove rules — and their invoke permissions — that a previous deploy created and the
+    /// manifest no longer declares.
+    ///
+    /// Skyzen's rules are exactly the ones named `{function}-*`, so the manifest's own set is
+    /// the diff: a rule in the prefix but not in the manifest belonged to a `[[schedule]]`
+    /// that was renamed or removed, and leaving it would keep firing a schedule the application
+    /// no longer has.
+    async fn retire_stale(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+        lambda: &aws_sdk_lambda::Client,
+    ) -> Result<()> {
+        let prefix = format!("{}-", self.function);
+        let declared: std::collections::BTreeSet<String> = self
+            .schedules
+            .iter()
+            .map(|entry| self.rule_name(entry.name.as_str()))
+            .collect();
+
+        let mut request = events.list_rules().name_prefix(&prefix);
+        loop {
+            let listed = request
+                .send()
+                .await
+                .with_context(|| format!("failed to list EventBridge rules under `{prefix}`"))?;
+            for rule in listed.rules() {
+                let Some(name) = rule.name() else { continue };
+                if declared.contains(name) {
+                    continue;
+                }
+                events
+                    .remove_targets()
+                    .rule(name)
+                    .ids(name)
+                    .send()
+                    .await
+                    .with_context(|| format!("failed to clear targets of stale rule `{name}`"))?;
+                events
+                    .delete_rule()
+                    .name(name)
+                    .send()
+                    .await
+                    .with_context(|| format!("failed to delete stale EventBridge rule `{name}`"))?;
+                // The permission statement was named after the schedule, which is everything
+                // after the function prefix; a rule that outlived the deploy that made it may
+                // not have one, so a missing statement is not a failure.
+                let schedule = &name[prefix.len()..];
+                match lambda
+                    .remove_permission()
+                    .function_name(&self.function)
+                    .statement_id(format!("skyzen-schedule-{schedule}"))
+                    .send()
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error)
+                        if error.as_service_error().is_some_and(
+                            aws_sdk_lambda::operation::remove_permission::RemovePermissionError::is_resource_not_found_exception,
+                        ) => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to drop the invoke permission of `{name}` on `{}`",
+                                self.function
+                            )
+                        });
+                    }
+                }
+                output::ok(format!("removed stale EventBridge rule `{name}`"));
+            }
+            let Some(token) = listed.next_token() else {
+                break;
+            };
+            request = events.list_rules().name_prefix(&prefix).next_token(token);
+        }
+        Ok(())
+    }
+
     /// Create one `[[schedule]]`'s rule, permission and target.
     async fn wire_one(
         &self,
@@ -139,31 +218,37 @@ impl EventBridgeSchedules {
             .await
             .with_context(|| format!("failed to create EventBridge rule `{rule}`"))?;
 
+        // The statement already exists only when a previous deploy made it, so `get_policy`
+        // decides whether `add_permission` is needed at all: `ResourceConflictException` is
+        // ambiguous between "already granted" and "an update is in progress", and swallowing
+        // the second case would leave the rule unable to invoke.
         let rule_arn = format!("arn:aws:events:{region}:{account}:rule/{rule}");
         let statement = format!("skyzen-schedule-{}", entry.name);
-        match lambda
-            .add_permission()
-            .function_name(&self.function)
-            .action(INVOKE_ACTION)
-            .principal(EVENTS_PRINCIPAL)
-            .source_arn(&rule_arn)
-            .statement_id(&statement)
-            .send()
+        if !self
+            .has_statement(lambda, &statement, &rule_arn)
             .await
+            .with_context(|| {
+                format!(
+                    "failed to read the invoke policy of Lambda function `{}`",
+                    self.function
+                )
+            })?
         {
-            Ok(_) => {}
-            Err(error)
-                if error.as_service_error().is_some_and(
-                    aws_sdk_lambda::operation::add_permission::AddPermissionError::is_resource_conflict_exception,
-                ) => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
+            lambda
+                .add_permission()
+                .function_name(&self.function)
+                .action(INVOKE_ACTION)
+                .principal(EVENTS_PRINCIPAL)
+                .source_arn(&rule_arn)
+                .statement_id(&statement)
+                .send()
+                .await
+                .with_context(|| {
                     format!(
                         "failed to let `{rule}` invoke Lambda function `{}`",
                         self.function
                     )
-                });
-            }
+                })?;
         }
 
         let transformer = InputTransformer::builder()
@@ -172,7 +257,7 @@ impl EventBridgeSchedules {
             .input_template(event_template(entry.cron.as_str()))
             .build()
             .with_context(|| format!("could not build the input transform for `{rule}`"))?;
-        events
+        let put = events
             .put_targets()
             .rule(&rule)
             .targets(
@@ -188,12 +273,59 @@ impl EventBridgeSchedules {
             .send()
             .await
             .with_context(|| format!("failed to point EventBridge rule `{rule}` at `{arn}`"))?;
+        // `PutTargets` can answer 200 and still reject entries per target — the failed list is
+        // the only place that shows up, and printing "wired" over it would lie about the deploy.
+        let failures = put.failed_entries();
+        anyhow::ensure!(
+            failures.is_empty(),
+            "EventBridge refused the target of rule `{rule}`: {:?}",
+            failures
+                .first()
+                .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
+        );
 
         output::ok(format!(
             "wired `[[schedule]] {name}` to EventBridge rule `{rule}` ({expression})",
             name = entry.name
         ));
         Ok(())
+    }
+
+    /// Whether the function's policy already grants `statement` for `source_arn`.
+    ///
+    /// `GetPolicy` answers 404 (`ResourceNotFoundException`) when the function has no
+    /// resource policy at all, which is the common first deploy: no statements, no grants.
+    async fn has_statement(
+        &self,
+        lambda: &aws_sdk_lambda::Client,
+        statement: &str,
+        source_arn: &str,
+    ) -> Result<bool> {
+        let policy = match lambda
+            .get_policy()
+            .function_name(&self.function)
+            .send()
+            .await
+        {
+            Ok(response) => response.policy().unwrap_or_default().to_owned(),
+            Err(error)
+                if error.as_service_error().is_some_and(
+                    aws_sdk_lambda::operation::get_policy::GetPolicyError::is_resource_not_found_exception,
+                ) =>
+            {
+                return Ok(false)
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let parsed: serde_json::Value = serde_json::from_str(&policy)
+            .with_context(|| format!("the policy of `{}` is not JSON", self.function))?;
+        Ok(parsed["Statement"].as_array().is_some_and(|statements| {
+            statements.iter().any(|entry| {
+                entry["Sid"] == statement
+                    && entry["Condition"]["ArnLike"]["AWS:SourceArn"] == source_arn
+            })
+        }))
     }
 }
 
@@ -212,9 +344,9 @@ fn event_template(cron: &str) -> String {
 /// The `cron(...)` schedule expression `EventBridge` wants for a portable 5-field cron.
 ///
 /// `EventBridge` uses AWS's own cron grammar: six fields (the portable five plus a year, always
-/// `*`), `?` required in whichever of day-of-month and day-of-week is unconstrained, and `0/n`
-/// steps rather than `*/n`. A portable entry constraining *both* day fields has no `EventBridge`
-/// form, and fails here naming the entry rather than silently picking one.
+/// `*`), `?` required in whichever of day-of-month and day-of-week is unconstrained, and
+/// `start/n` steps rather than `*/n`. A portable entry constraining *both* day fields has no
+/// `EventBridge` form, and fails here naming the entry rather than silently picking one.
 ///
 /// # Errors
 ///
@@ -234,18 +366,26 @@ fn aws_cron_expression(cron: &str) -> Result<String> {
         (false, true) => ("?".to_owned(), dow.to_owned()),
     };
 
-    let rendered = [minute, hour, &dom, month, &dow]
-        .into_iter()
-        .map(aws_field)
-        .collect::<Vec<_>>();
+    // `*/n` becomes `{MIN}/n`: AWS steps read as `start/step`, and `0` is not a valid start for
+    // the day-of-month, month or day-of-week fields — `*/2` of days is `1/2`, not `0/2`.
+    let rendered = [
+        aws_field(minute, "0"),
+        aws_field(hour, "0"),
+        aws_field(&dom, "1"),
+        aws_field(month, "1"),
+        aws_field(&dow, "1"),
+    ];
     Ok(format!("cron({} *)", rendered.join(" ")))
 }
 
-/// One AWS cron field: the portable text, with `*/n` spelled `0/n`.
-fn aws_field(field: &str) -> String {
+/// One AWS cron field: the portable text, with `*/n` spelled `{min}/n`.
+///
+/// Day-of-week numbers pass through unchanged: portable `1`–`7` is Sunday–Saturday, which is
+/// AWS's numbering too.
+fn aws_field(field: &str, min: &str) -> String {
     field
         .strip_prefix("*/")
-        .map_or_else(|| field.to_owned(), |step| format!("0/{step}"))
+        .map_or_else(|| field.to_owned(), |step| format!("{min}/{step}"))
 }
 
 #[cfg(test)]
@@ -273,6 +413,35 @@ mod tests {
         assert_eq!(
             aws_cron_expression("30 12 * * MON-FRI").expect("translatable"),
             "cron(30 12 ? * MON-FRI *)"
+        );
+    }
+
+    #[test]
+    fn steps_start_at_each_fields_minimum_not_zero() {
+        assert_eq!(
+            aws_cron_expression("0 0 */2 * *").expect("translatable"),
+            "cron(0 0 1/2 * ? *)"
+        );
+        assert_eq!(
+            aws_cron_expression("0 0 * */3 */2").expect("translatable"),
+            "cron(0 0 ? 1/3 1/2 *)"
+        );
+        assert_eq!(
+            aws_cron_expression("*/15 */3 * * *").expect("translatable"),
+            "cron(0/15 0/3 * * ? *)"
+        );
+    }
+
+    #[test]
+    fn numeric_weekdays_keep_their_meaning() {
+        // Portable and AWS both count Sunday–Saturday as `1`–`7`.
+        assert_eq!(
+            aws_cron_expression("0 9 * * 2-6").expect("translatable"),
+            "cron(0 9 ? * 2-6 *)"
+        );
+        assert_eq!(
+            aws_cron_expression("0 9 * * 1,4,7").expect("translatable"),
+            "cron(0 9 ? * 1,4,7 *)"
         );
     }
 

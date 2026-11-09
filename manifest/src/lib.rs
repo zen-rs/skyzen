@@ -61,11 +61,11 @@ pub use schema::{
     CfDurableObjects, CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer,
     CfQueueProducer, CfQueues, CfR2Bucket, CfServiceBinding, CfTriggers, CloudflareDatabaseSection,
     CloudflareSecretSection, CloudflareSection, CloudflareServiceSection, CosmosWiring, CronExpr,
-    DatabaseEntry, DatabaseType, DuplicateSchedule, DynamoDbWiring, InvalidCronExpr,
-    InvalidScheduleName, InvalidVarName, LambdaArchitecture, MemoryWiring, NativeDatabaseBackend,
-    NativeDatabaseSection, NativeQueueConsumer, NativeSection, NativeServiceBackend,
-    NativeServiceSection, PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring,
-    RdsEngine, RedisWiring, S3Wiring, ScheduleEntry, ScheduleName, SecretEntry, ServiceBusWiring,
+    DatabaseEntry, DatabaseType, DynamoDbWiring, InvalidCronExpr, InvalidScheduleName,
+    InvalidVarName, LambdaArchitecture, MemoryWiring, NativeDatabaseBackend, NativeDatabaseSection,
+    NativeQueueConsumer, NativeSection, NativeServiceBackend, NativeServiceSection,
+    PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring, RdsEngine, RedisWiring,
+    S3Wiring, ScheduleEntry, ScheduleError, ScheduleName, SecretEntry, ServiceBusWiring,
     ServiceEntry, ServiceType, SkyzenManifest, SqlUrlWiring, SqsWiring, StorageQueueWiring,
     VarName, WiringEnvVar, HTTP_FUNCTION_NAME, PLAINTEXT_VARIABLE_TABLES,
 };
@@ -125,13 +125,13 @@ pub enum ManifestError {
         /// What is wrong with the entry.
         source: schema::QueueTriggerError,
     },
-    /// Two `[[schedule]]` entries declare the same name.
+    /// A `[[schedule]]` entry cannot be used.
     #[error("{path}: [[schedule]] {source}")]
     Schedule {
         /// The manifest path.
         path: PathBuf,
         /// What is wrong with the entries.
-        source: schema::DuplicateSchedule,
+        source: schema::ScheduleError,
     },
     /// A `[native.database.<name>]` RDS Data API wiring names some of its four values, not all.
     #[error("{path}: [native.database.{database}] {source}")]
@@ -683,16 +683,34 @@ mod tests {
         assert!(parse("[[schedule]]\nname = \"\"\ncron = \"* * * * *\"\n").is_err());
         assert!(parse("[[schedule]]\nname = \"bad name\"\ncron = \"* * * * *\"\n").is_err());
 
-        // Six fields (seconds), `?`, `L`, and a cron that can never fire.
+        // Six fields (seconds), `?`, `L`, `W`, `#` — and a cron that can never fire.
         assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"0 */10 * * * *\"\n").is_err());
         assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"* * ? * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"0 9 L * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"0 9 15W * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"0 9 * * 5#2\"\n").is_err());
         assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"* * 32 * *\"\n").is_err());
         assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"* * 31 2 *\"\n").is_err());
 
-        // One logical schedule, one name.
+        // One logical schedule, one name — and one cron, which Cloudflare would otherwise
+        // collapse to a single trigger while the other targets fire both.
         assert!(parse(
             "[[schedule]]\nname = \"tick\"\ncron = \"* * * * *\"\n\n\
              [[schedule]]\nname = \"tick\"\ncron = \"0 * * * *\"\n"
+        )
+        .is_err());
+        assert!(parse(
+            "[[schedule]]\nname = \"tick\"\ncron = \"*/5 * * * *\"\n\n\
+             [[schedule]]\nname = \"tock\"\ncron = \"*/5 * * * *\"\n"
+        )
+        .is_err());
+
+        // `http` is Skyzen's own catch-all function name, and a queue trigger's function name
+        // shares the Functions directory namespace.
+        assert!(parse("[[schedule]]\nname = \"http\"\ncron = \"* * * * *\"\n").is_err());
+        assert!(parse(
+            "[azure]\n\n[[azure.queue_triggers]]\nfunction = \"process\"\nqueue = \"jobs\"\n\n\
+             [[schedule]]\nname = \"process\"\ncron = \"* * * * *\"\n"
         )
         .is_err());
     }
