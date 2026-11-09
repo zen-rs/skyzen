@@ -94,7 +94,7 @@ http-kit.workspace = true
 matchit = "0.9.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-cookie = { version = "0.18.1", features = ["percent-encode"] }
+cookie = { version = "0.18.1", features = ["percent-encode", "signed", "private", "key-expansion"] }
 tracing.workspace = true
 smallvec = "1.15"
 flate2 = "1.1"
@@ -191,6 +191,9 @@ zstd = { version = "0.13", default-features = false }
 # The wasm half of the OpenAPI handler registry; see `src/openapi/registry.rs` for why
 # native uses `linkme` and only wasm pays for `inventory`.
 inventory = "0.3"
+# `Key::generate()` (signed/private cookies) reaches WebCrypto through getrandom's js backend;
+# without it the call would panic on a Worker.
+getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen = { version = "0.2.110", features = ["spans"] }
 wasm-bindgen-futures = "0.4.60"
 js-sys = "0.3.87"
