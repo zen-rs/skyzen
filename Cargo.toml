@@ -273,8 +273,10 @@ sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
 # The static file server emits and honours `ETag`, `Last-Modified` and `Range`, which it parses
 # and renders with the `headers` crate rather than by hand.
 static-files = ["dep:sha1", "dep:base64"]
-# `TypedHeader<H>` plus the `skyzen::headers` re-export.
-typed-header = ["dep:headers"]
+# `TypedHeader<H>` plus the `skyzen::headers` re-export. `headers` itself is a required
+# dependency — the conditional-request types use it unconditionally — so the feature only
+# marks the API surface.
+typed-header = []
 # `Valid<E>` — `garde` validation on decoded payloads.
 validate = ["dep:garde"]
 # Request-body decompression codings for `DecompressionMiddleware`, one feature per
