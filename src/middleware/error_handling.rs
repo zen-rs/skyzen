@@ -1,12 +1,20 @@
 use std::{fmt::Debug, future::Future, sync::Arc};
 
-use http_kit::{error::BoxHttpError, Body, Request, Response};
+use http_kit::{
+    error::BoxHttpError,
+    header::{HeaderName, HeaderValue},
+    Body, Request, Response,
+};
 use skyzen_core::{
     middleware::{Middleware, Next},
     Error, Responder,
 };
 
-use super::security_headers::DeferredHeaders;
+/// Response headers a layer asked to keep on every response, stamped by
+/// [`ErrorHandlingMiddleware`] on the errors it renders — the error path is still a
+/// response.
+#[derive(Debug, Clone)]
+pub struct DeferredHeaders(pub Vec<(HeaderName, HeaderValue)>);
 
 /// Request extension [`ErrorHandlingMiddleware`] inserts before running downstream — its
 /// presence tells a layer that error responses are already being produced somewhere and the

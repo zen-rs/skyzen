@@ -160,11 +160,7 @@ fn value(text: &str) -> HeaderValue {
     HeaderValue::try_from(text).expect("a hardcoded policy is a valid header value")
 }
 
-/// The headers [`SecurityHeaders`] stamps, published on the request before it runs so layers
-/// that materialize error responses downstream — [`ErrorHandlingMiddleware`] in particular —
-/// can keep the protections on those responses too.
-#[derive(Debug, Clone)]
-pub struct DeferredHeaders(pub Vec<(HeaderName, HeaderValue)>);
+use super::error_handling::DeferredHeaders;
 
 impl Middleware for SecurityHeaders {
     fn handle(
