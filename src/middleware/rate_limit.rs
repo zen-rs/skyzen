@@ -238,12 +238,13 @@ impl Middleware for RateLimit {
                 }
             };
             // Length-prefixed name — `("a:b", "c")` and `("a", "b:c")` would collide at the
-            // same store key under plain concatenation.
+            // same store key under plain concatenation — and every component is %XX-escaped
+            // so a name or client key carrying `/ ? # \` survives Cosmos document ids.
             let key = format!(
                 "rate:{}:{}:{}",
-                self.name.len(),
-                self.name,
-                (self.key)(request).await?
+                encode_key_component(&self.name).len(),
+                encode_key_component(&self.name),
+                encode_key_component(&(self.key)(request).await?),
             );
             match store.hit(&key, self.window).await {
                 Ok(hit) if hit.count <= self.limit => next.run(request).await,
@@ -316,6 +317,16 @@ where
             kv: kv.as_durable_kv().clone(),
         }) as Arc<dyn RateLimitStore>)
     })
+}
+
+/// Escape `key` for store backends that take the bucket name as a document id: `%` itself
+/// goes first so the mapping stays injective, then the characters Cosmos forbids in ids.
+fn encode_key_component(key: &str) -> String {
+    key.replace('%', "%25")
+        .replace('/', "%2F")
+        .replace('\\', "%5C")
+        .replace('?', "%3F")
+        .replace('#', "%23")
 }
 
 /// Milliseconds since the Unix epoch, on every target.
