@@ -376,26 +376,30 @@ struct DurableKvRateStore {
 impl RateLimitStore for DurableKvRateStore {
     fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
         Box::pin(async move {
+            // One record per limiter key — `{count}:{reset_ms}` — updated in place. Window
+            // rollover resets the counter where it sits, so storage stays proportional to the
+            // client space instead of accumulating one dead key per window.
             let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
             let now = now_ms();
-            let index = now / window_ms;
-            let bucket = format!("rl:{key}:{index}");
-            let reset = (index + 1) * window_ms;
-            let count = match self
+            let bucket = format!("rl:{key}");
+            let stored = self
                 .kv
                 .get(&bucket)
                 .await
-                .map_err(|error| HitError::Backend(Error::new(error)))?
-            {
-                Some(raw) => {
-                    let text = String::from_utf8_lossy(&raw);
-                    text.split(':')
-                        .next()
-                        .and_then(|count| count.parse::<u64>().ok())
-                        .unwrap_or(0)
-                }
-                None => 0,
-            } + 1;
+                .map_err(|error| HitError::Backend(Error::new(error)))?;
+            let (count, reset) = stored
+                .as_deref()
+                .and_then(|raw| {
+                    let text = std::str::from_utf8(raw).ok()?;
+                    let (count, reset) = text.split_once(':')?;
+                    Some((count.parse::<u64>().ok()?, reset.parse::<u64>().ok()?))
+                })
+                .filter(|(_, reset)| now < *reset)
+                .map_or(
+                    (0, ((now / window_ms) + 1) * window_ms),
+                    |(count, reset)| (count, reset),
+                );
+            let count = count + 1;
             self.kv
                 .put(&bucket, format!("{count}:{reset}").as_bytes())
                 .await
