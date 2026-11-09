@@ -209,3 +209,5 @@ mod csrf;
 pub use csrf::{Csrf, CsrfRejected};
 mod auto_etag;
 pub use auto_etag::AutoETag;
+mod security_headers;
+pub use security_headers::SecurityHeaders;

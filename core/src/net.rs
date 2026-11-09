@@ -106,7 +106,17 @@ pub struct PendingResponseHeaders(pub header::HeaderMap);
 pub fn apply_pending_headers(request: &Request, response: &mut Response) {
     if let Some(pending) = request.extensions().get::<PendingResponseHeaders>() {
         for (name, value) in &pending.0 {
-            response.headers_mut().append(name.clone(), value.clone());
+            // Multi-value headers (`Set-Cookie`) must append — each carries its own
+            // directive and a first-value-wins rule would silently drop one. Everything
+            // else is a default: a response that set its own wins.
+            if *name == header::SET_COOKIE {
+                response.headers_mut().append(name.clone(), value.clone());
+            } else {
+                response
+                    .headers_mut()
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
         }
     }
 }
