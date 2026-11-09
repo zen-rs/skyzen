@@ -145,12 +145,23 @@ impl TrustedProxies {
         }
 
         if let Some(addrs) = forwarded_chain(request) {
-            return Some(trusted_client(&addrs, self, peer));
+            return self.anchored_client(&addrs, peer);
         }
         if let Some(addrs) = x_forwarded_for_chain(request) {
-            return Some(trusted_client(&addrs, self, peer));
+            return self.anchored_client(&addrs, peer);
         }
         None
+    }
+
+    /// The client from a recorded chain, or `None` when nothing anchors it to trusted
+    /// infrastructure. A recorded peer is the anchor; a serverless host has none, so there the
+    /// chain itself must contain a trusted hop — otherwise every entry is client-supplied and
+    /// honoring it is an IP-spoofing hole.
+    fn anchored_client(&self, addrs: &[IpAddr], peer: Option<IpAddr>) -> Option<IpAddr> {
+        if peer.is_none() && !addrs.iter().any(|addr| self.trusts(addr)) {
+            return None;
+        }
+        Some(trusted_client(addrs, self, peer))
     }
 }
 
@@ -518,6 +529,21 @@ mod tests {
 
         let ip = ClientIp::extract(&mut request).await.unwrap();
         assert_eq!(ip.0, IpAddr::from([198, 51, 100, 1]));
+    }
+
+    #[tokio::test]
+    async fn no_peer_rejects_a_fabricated_chain() {
+        // Serverless with no anchor in the chain: every entry is client-supplied, so the
+        // header cannot vouch for anything.
+        let mut request = with_header(
+            Request::new(Body::empty()),
+            "x-forwarded-for",
+            "198.51.100.1, 198.51.100.2",
+        );
+        request.extensions_mut().insert(trusted(&["10.0.0.0/8"]));
+
+        let error = ClientIp::extract(&mut request).await.unwrap_err();
+        assert!(matches!(error, ClientIpError::MissingRemoteAddr));
     }
 
     #[tokio::test]
