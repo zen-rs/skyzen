@@ -284,6 +284,26 @@ impl Session {
     }
 }
 
+/// The encrypted cookie payload: the session map plus the server-side expiry the
+/// client cannot alter, so a captured cookie cannot be replayed past `ttl`.
+#[derive(Serialize, serde::Deserialize)]
+struct CookiePayload {
+    #[serde(rename = "e")]
+    expires: f64,
+    #[serde(rename = "d")]
+    data: SessionData,
+}
+
+impl CookiePayload {
+    /// Wrap `data` with an expiry `ttl` from now — sliding, matching the cookie's Max-Age.
+    fn wrap(data: SessionData, ttl: Duration) -> Self {
+        Self {
+            expires: ttl.as_secs_f64().mul_add(1000.0, now_ms()),
+            data,
+        }
+    }
+}
+
 /// The cookie's signed or encrypted payload for `name`, trying the fallback key when the
 /// primary rejects it.
 fn cookie_value(
@@ -337,7 +357,9 @@ impl Session {
 
         let session = if config.in_cookie {
             let data = cookie_value(&jar, &keys, true, config.cookie_name)
-                .and_then(|value| serde_json::from_str::<SessionData>(&value).ok());
+                .and_then(|value| serde_json::from_str::<CookiePayload>(&value).ok())
+                .filter(|payload| payload.expires > now_ms())
+                .map(|payload| payload.data);
             Self {
                 inner: Arc::new(Mutex::new(SessionInner {
                     id: mint_id(),
@@ -523,7 +545,7 @@ impl SessionsLayer {
                     },
                 };
                 if self.in_cookie {
-                    let encoded = serde_json::to_string(&data)
+                    let encoded = serde_json::to_string(&CookiePayload::wrap(data, self.ttl))
                         .map_err(|e| SessionError::encode("session", e))?;
                     let mut cookie = Cookie::new(self.cookie_name, encoded);
                     set_session_cookie_flags(&mut cookie, self.ttl, keys.secure());
@@ -543,7 +565,7 @@ impl SessionsLayer {
                     // Nothing stored server-side; only re-emit when the cookie held data so an
                     // anonymous visitor is not issued an empty session.
                     if let SessionCache::Ready(Some(data)) = loaded {
-                        let encoded = serde_json::to_string(&data)
+                        let encoded = serde_json::to_string(&CookiePayload::wrap(data, self.ttl))
                             .map_err(|e| SessionError::encode("session", e))?;
                         let mut cookie = Cookie::new(self.cookie_name, encoded);
                         set_session_cookie_flags(&mut cookie, self.ttl, keys.secure());
