@@ -141,6 +141,12 @@ impl RateLimit {
     }
 
     fn new(limit: u64, window: Duration, resolve: Resolver) -> Self {
+        // A sub-millisecond window cannot index a bucket — `now / window_ms` divides by
+        // zero. Reject the configuration where it is built rather than panic per-request.
+        assert!(
+            window.as_millis() > 0,
+            "rate limit window must be at least 1ms"
+        );
         Self {
             limit,
             window,
@@ -337,7 +343,9 @@ impl RateLimitStore for MemoryStore {
     #[allow(clippy::significant_drop_tightening)]
     fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
         Box::pin(std::future::ready({
-            let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+            // `hit` can be called on a store directly, outside the layer's assertion —
+            // treat a sub-millisecond window as 1ms rather than divide by zero.
+            let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
             let now = now_ms();
             let index = now / window_ms;
             let bucket = format!("rl:{key}:{index}");
