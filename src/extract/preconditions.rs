@@ -1,8 +1,8 @@
-//! `Preconditions` — write-side `If-Match`/`If-Unmodified-Since` evaluation.
+//! `Preconditions` — write-side `If-Match`/`If-None-Match`/`If-Unmodified-Since` evaluation.
 
 use std::time::SystemTime;
 
-use headers::{HeaderMapExt, IfMatch, IfUnmodifiedSince};
+use headers::{HeaderMapExt, IfMatch, IfNoneMatch, IfUnmodifiedSince};
 use http_kit::{http_error, Request, StatusCode};
 use skyzen_core::Extractor;
 
@@ -38,11 +38,17 @@ http_error!(
 #[derive(Debug, Clone)]
 pub struct Preconditions {
     if_match: Option<IfMatch>,
+    if_none_match: Option<IfNoneMatch>,
     if_unmodified_since: Option<IfUnmodifiedSince>,
 }
 
 impl Preconditions {
-    /// `true` when the current `etag` satisfies `If-Match`; otherwise `412`.
+    /// `true` when the current `etag` satisfies `If-Match` *and* `If-None-Match`;
+    /// otherwise `412`.
+    ///
+    /// `If-None-Match` matters on writes too: `If-None-Match: *` is create-only
+    /// semantics — it fails as soon as the resource exists, which is exactly what
+    /// `check`ing the current etag implies.
     ///
     /// `If-Unmodified-Since` is not consulted here — reach for
     /// [`check_modified`][Self::check_modified] when the entity has a timestamp to compare.
@@ -54,6 +60,13 @@ impl Preconditions {
     pub fn check(&self, etag: &EntityTag) -> Result<(), PreconditionFailed> {
         if let Some(if_match) = &self.if_match {
             if !if_match.precondition_passes(etag.etag()) {
+                return Err(PreconditionFailed::new());
+            }
+        }
+        // A present `If-None-Match` whose precondition fails means the current state already
+        // matches — `*` fails on any existing resource.
+        if let Some(if_none_match) = &self.if_none_match {
+            if !if_none_match.precondition_passes(etag.etag()) {
                 return Err(PreconditionFailed::new());
             }
         }
@@ -107,6 +120,7 @@ impl Extractor for Preconditions {
     ) -> impl core::future::Future<Output = Result<Self, Self::Error>> + Send {
         let preconditions = Self {
             if_match: request.headers().typed_get::<IfMatch>(),
+            if_none_match: request.headers().typed_get::<IfNoneMatch>(),
             if_unmodified_since: request.headers().typed_get::<IfUnmodifiedSince>(),
         };
         std::future::ready(Ok(preconditions))

@@ -205,6 +205,21 @@ mod tests {
         assert_eq!(error.status(), StatusCode::PRECONDITION_FAILED);
     }
 
+    #[tokio::test]
+    async fn if_none_match_star_rejects_a_write_over_an_existing_resource() {
+        let router = Route::new(("/thing".post(update),)).build();
+
+        // `If-None-Match: *` is create-only semantics — the resource exists, so 412.
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = http_kit::Method::POST;
+        *request.uri_mut() = "/thing".parse().unwrap();
+        request
+            .headers_mut()
+            .insert(IF_NONE_MATCH, "*".parse().unwrap());
+        let error = router.go(request).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
     async fn hello() -> &'static str {
         "hello"
     }
