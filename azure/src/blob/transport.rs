@@ -87,13 +87,15 @@ impl HttpTransport for ZenwaveTransport {
             {
                 parts.method = Method::GET;
                 body = Buffer::default();
+                // The body is gone; a streamed replay could not restate the original length
+                // anyway, and a stale one would now be wrong.
+                parts.headers.remove(header::CONTENT_LENGTH);
             }
             if parts.uri.scheme() != next_uri.scheme()
                 || parts.uri.authority() != next_uri.authority()
             {
                 parts.headers.remove(header::AUTHORIZATION);
             }
-            parts.headers.remove(header::CONTENT_LENGTH);
             parts.uri = next_uri;
         };
 
