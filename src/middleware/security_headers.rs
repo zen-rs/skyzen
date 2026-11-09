@@ -159,6 +159,12 @@ fn value(text: &str) -> HeaderValue {
     HeaderValue::try_from(text).expect("a hardcoded policy is a valid header value")
 }
 
+/// The headers [`SecurityHeaders`] stamps, published on the request before it runs so layers
+/// that materialize error responses downstream — [`ErrorHandlingMiddleware`] in particular —
+/// can keep the protections on those responses too.
+#[derive(Debug, Clone)]
+pub struct DeferredHeaders(pub Vec<(HeaderName, HeaderValue)>);
+
 impl Middleware for SecurityHeaders {
     fn handle(
         &self,
@@ -167,13 +173,13 @@ impl Middleware for SecurityHeaders {
     ) -> impl Future<Output = Result<Response, Error>> + Send {
         let headers = self.headers.clone();
         async move {
-            // An `Err` from inside is materialized here rather than propagated: the default
-            // conversion builds the same `error_response`, and propagating would send error
-            // responses out with none of these headers.
-            let mut response = match next.run(request).await {
-                Ok(response) => response,
-                Err(error) => skyzen_core::error_response(error.into_boxed_http_error().as_ref()),
-            };
+            // The configured set also rides in the request extensions, so an
+            // `ErrorHandlingMiddleware` — whichever side of this layer it runs — stamps
+            // error responses it produces rather than letting them go out bare.
+            request
+                .extensions_mut()
+                .insert(DeferredHeaders(headers.clone()));
+            let mut response = next.run(request).await?;
             for (name, value) in headers {
                 response
                     .headers_mut()
