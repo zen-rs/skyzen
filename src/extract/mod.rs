@@ -27,3 +27,5 @@ mod valid;
 pub use valid::{
     FieldViolation, Valid, ValidContext, ValidRejection, ValidatePayload, ValidationRejection,
 };
+mod preconditions;
+pub use preconditions::{PreconditionFailed, PreconditionRequired, Preconditions};

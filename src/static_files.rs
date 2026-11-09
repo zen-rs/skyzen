@@ -22,10 +22,7 @@ use std::{
 };
 
 use base64::Engine;
-use headers::{
-    AcceptRanges, ContentRange, ETag, HeaderMapExt, IfModifiedSince, IfNoneMatch, LastModified,
-    Range as RangeHeader,
-};
+use headers::{AcceptRanges, ContentRange, ETag, HeaderMapExt, LastModified, Range as RangeHeader};
 use include_dir::{Dir, File};
 use sha1::{Digest, Sha1};
 
@@ -254,18 +251,10 @@ fn negotiate(
     last_modified: Option<SystemTime>,
     len: u64,
 ) -> Disposition {
-    if let (Some(if_none_match), Some(etag)) = (headers.typed_get::<IfNoneMatch>(), etag) {
-        if !if_none_match.precondition_passes(etag) {
-            return Disposition::NotModified;
-        }
-    } else if let (Some(if_modified_since), Some(modified)) =
-        (headers.typed_get::<IfModifiedSince>(), last_modified)
-    {
-        // `If-Modified-Since` is only consulted when the stronger validator did not settle it,
-        // which is what RFC 9110 prescribes.
-        if !if_modified_since.is_modified(modified) {
-            return Disposition::NotModified;
-        }
+    // `If-None-Match`/`If-Modified-Since` precedence lives in one shared evaluator —
+    // `Conditional`, `Preconditions` and `AutoETag` follow the same rule.
+    if crate::utils::conditional::fresh(headers, etag, last_modified) {
+        return Disposition::NotModified;
     }
 
     let Some(range) = headers.typed_get::<RangeHeader>() else {

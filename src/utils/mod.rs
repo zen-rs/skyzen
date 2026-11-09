@@ -16,6 +16,7 @@ pub use multipart::{Field, Multipart, MultipartBoundaryError, MultipartError};
 pub mod state;
 pub use state::State;
 
+pub mod conditional;
 pub mod cookie;
 pub use cookie::{
     Cookie, CookieJar, CookieJarError, CookieKeys, CookieKeysError, CookieKeysLayer, Key,
