@@ -76,3 +76,84 @@ impl Extractor for MatchedPath {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MatchedPath;
+    use crate::{
+        middleware::{from_fn, Next},
+        routing::{CreateRouteNode, Route},
+        Body, Request, Result,
+    };
+    use std::sync::{Arc, Mutex};
+
+    fn get(path: &str) -> Request {
+        let mut request = Request::new(Body::empty());
+        *request.uri_mut() = path.parse().expect("valid path");
+        request
+    }
+
+    async fn route_name(route: MatchedPath) -> Result<String> {
+        Result::Ok(route.as_str().to_owned())
+    }
+
+    #[tokio::test]
+    async fn reports_the_template_not_the_concrete_path() {
+        let router = Route::new(("/users/{id}".at(route_name),)).build();
+        let response = router.go(get("/users/42")).await.unwrap();
+        assert_eq!(
+            response.into_body().into_string().await.unwrap(),
+            "/users/{id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_mounts_report_the_full_template() {
+        let inner = Route::new(("/users/{id}".at(route_name),));
+        let router = Route::new(("/api".nest(inner.build()),)).build();
+        let response = router.go(get("/api/users/42")).await.unwrap();
+        assert_eq!(
+            response.into_body().into_string().await.unwrap(),
+            "/api/users/{id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_path_inside_a_nest_leaves_no_matched_path() {
+        // The post-route value an outer layer (e.g. `Trace`) reads: `Option<MatchedPath>`
+        // inside the inner fallback still sees the mount template, but after the mount
+        // returns nothing user-visible matched and the extension is gone.
+        let seen: Arc<Mutex<Option<MatchedPath>>> = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&seen);
+        let inner = Route::new(("/users/{id}".at(|| async { Result::Ok("u") }),));
+        let router = Route::new(("/api".nest(inner.build()),))
+            .layer(from_fn(move |request: &mut Request, next: Next<'_>| {
+                let captured = Arc::clone(&captured);
+                Box::pin(async move {
+                    let result = next.run(request).await;
+                    *captured.lock().unwrap() = request.extensions().get::<MatchedPath>().cloned();
+                    result
+                })
+            }))
+            .build();
+
+        let response = router.go(get("/api/nope")).await.unwrap();
+        assert_eq!(response.status(), crate::StatusCode::NOT_FOUND);
+        assert!(seen.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_path_reports_no_template() {
+        let router = Route::new(("/known".at(|| async { Result::Ok("ok") }),))
+            .fallback(|route: Option<MatchedPath>| async move {
+                Result::Ok(route.map_or("<unmatched>".to_owned(), |path| path.as_str().to_owned()))
+            })
+            .build();
+
+        let response = router.go(get("/nope")).await.unwrap();
+        assert_eq!(
+            response.into_body().into_string().await.unwrap(),
+            "<unmatched>"
+        );
+    }
+}

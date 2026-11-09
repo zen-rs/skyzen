@@ -89,6 +89,28 @@ impl core::ops::Deref for PlatformRequestId {
     }
 }
 
+/// Response headers that must survive an endpoint error.
+///
+/// Middleware like `skyzen::middleware::RequestId` puts headers here when the client needs
+/// them even when the endpoint returns `Err` — a request id is the motivating case. The
+/// backend renders an `Err` into a fresh response with [`error_response`], outside any
+/// middleware's reach, so the headers travel on the request instead and every backend merges
+/// them at its error boundary with [`apply_pending_headers`].
+#[derive(Debug, Default, Clone)]
+pub struct PendingResponseHeaders(pub header::HeaderMap);
+
+/// Copy [`PendingResponseHeaders`] from `request` onto `response`.
+///
+/// Backends call this where they turn an endpoint `Err` into a response — alongside
+/// [`error_response`] — so headers middleware marked as must-deliver survive errors.
+pub fn apply_pending_headers(request: &Request, response: &mut Response) {
+    if let Some(pending) = request.extensions().get::<PendingResponseHeaders>() {
+        for (name, value) in &pending.0 {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,

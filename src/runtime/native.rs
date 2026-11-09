@@ -1828,7 +1828,9 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                     // Log and render through the shared helpers so every backend emits the same
                     // fields and applies the same 4xx/5xx redaction policy.
                     skyzen_core::log_endpoint_error(&err, &method, path.as_str());
-                    skyzen_core::error_response(&err)
+                    let mut response = skyzen_core::error_response(&err);
+                    skyzen_core::apply_pending_headers(&request, &mut response);
+                    response
                 }
             };
 

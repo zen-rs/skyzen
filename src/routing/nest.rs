@@ -66,10 +66,13 @@ impl Endpoint for NestedRouter {
         *request.uri_mut() = original;
         // An inner match overwrote the outer router's `MatchedPath`; rejoin it onto the mount
         // prefix so the template describes the full route (`/api` + `/users/{id}`). One that
-        // survived untouched means the inner router's fallback answered, and the mount's own
-        // template stays the honest report.
+        // survived untouched means the inner router's fallback answered — nothing
+        // user-visible matched, so the mount's internal catch-all template is dropped and
+        // the request reports `<unmatched>` in the trace.
         if let Some(matched) = request.extensions().get::<MatchedPath>() {
-            if Some(matched) != outer_match.as_ref() {
+            if Some(matched) == outer_match.as_ref() {
+                request.extensions_mut().remove::<MatchedPath>();
+            } else {
                 let inner = matched.as_str().to_owned();
                 let joined = if inner == "/" {
                     self.prefix.to_string()

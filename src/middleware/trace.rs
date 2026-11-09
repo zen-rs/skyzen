@@ -13,12 +13,12 @@ use http_kit::{
 };
 use skyzen_core::{
     middleware::{Middleware, Next},
-    Error, ErrorChain, Extractor,
+    Error, ErrorChain, PeerAddr,
 };
 use tracing::{field, Instrument, Level};
 
 use super::RequestId;
-use crate::{extract::ClientIp, routing::MatchedPath};
+use crate::routing::MatchedPath;
 
 // `tracing` puts the level inside a `static` callsite, so `span!`/`event!` only take a
 // statically-known `Level`. Dispatching on the configured level keeps a `Level` builder knob
@@ -188,7 +188,6 @@ impl Default for Trace {
 impl Middleware for Trace {
     async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
         let started = now();
-        let client_ip = ClientIp::extract(request).await.ok();
 
         let span = span_at!(
             self.level,
@@ -201,8 +200,10 @@ impl Middleware for Trace {
             client.address = field::Empty,
             headers = field::Empty,
         );
-        if let Some(client_ip) = client_ip {
-            span.record("client.address", field::display(client_ip.0));
+        // The socket peer, not `Forwarded`/XFF: those headers are client-controlled and a
+        // spoofed `client.address` in the span is worse than none.
+        if let Some(peer) = request.extensions().get::<PeerAddr>() {
+            span.record("client.address", field::display(peer.0.ip()));
         }
         let allow_listed = render_headers(request.headers(), &self.include_headers);
         if !allow_listed.is_empty() {
@@ -225,7 +226,9 @@ impl Middleware for Trace {
         }
         let latency_ms = elapsed_ms(started);
 
-        match &mut result {
+        // Events are emitted inside the span's scope so they are its children, not
+        // siblings — `instrument` only made the span current while `next.run` was polled.
+        span.in_scope(|| match &mut result {
             Ok(response) => {
                 let status = response.status();
                 span.record("http.response.status_code", i64::from(status.as_u16()));
@@ -254,13 +257,13 @@ impl Middleware for Trace {
                     event_at!(
                         level,
                         status = error.status().as_u16(),
-                        error = %ErrorChain(error),
+                        error = %ErrorChain(&*error),
                         latency_ms,
                         "request failed"
                     );
                 }
             }
-        }
+        });
 
         result
     }
@@ -273,7 +276,9 @@ impl Middleware for Trace {
     }
 }
 
-/// The allow-listed request headers rendered as `name=value` pairs for the `headers` field.
+/// The allow-listed request headers rendered for the `headers` field. Values are quoted
+/// with `{:?}` so delimiters inside a header (`;`, `=`, control escapes) cannot forge a
+/// second `name=value` field in the rendered text.
 fn render_headers(headers: &HeaderMap, names: &[HeaderName]) -> String {
     names
         .iter()
@@ -281,26 +286,169 @@ fn render_headers(headers: &HeaderMap, names: &[HeaderName]) -> String {
             headers
                 .get(name)
                 .and_then(|value| value.to_str().ok())
-                .map(|value| format!("{name}={value}"))
+                .map(|value| format!("{name}={value:?}"))
         })
         .collect::<Vec<_>>()
-        .join("; ")
+        .join(", ")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Trace;
+    use super::{render_headers, Trace};
     use crate::{
         middleware::RequestId,
         routing::{CreateRouteNode, MatchedPath, Route},
         Body, Error, Request, Result, StatusCode,
     };
-    use http_kit::HttpError as _;
+    use http_kit::{
+        header::{HeaderMap, HeaderName},
+        HttpError as _,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+    use tracing::{
+        field::{Field, Visit},
+        span::{Attributes, Id, Record},
+        Event, Subscriber,
+    };
+    use tracing_subscriber::{
+        layer::{Context, Layer, SubscriberExt},
+        Registry,
+    };
 
     fn get(path: &str) -> Request {
         let mut request = Request::new(Body::empty());
         *request.uri_mut() = path.parse().expect("valid path");
         request
+    }
+
+    /// A [`Layer`] that records the `request` span's finished fields and whether each event
+    /// was emitted inside that span — the observability contract `Trace` exists to keep.
+    #[derive(Clone, Default)]
+    struct Capture {
+        spans: Arc<Mutex<Vec<HashMap<String, String>>>>,
+        events: Arc<Mutex<Vec<(String, bool)>>>,
+    }
+
+    struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
+
+    impl Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+    }
+
+    impl<S> Layer<S> for Capture
+    where
+        S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+            if attrs.metadata().name() != "request" {
+                return;
+            }
+            let mut fields = HashMap::new();
+            attrs.record(&mut FieldVisitor(&mut fields));
+            ctx.span(id).unwrap().extensions_mut().insert(fields);
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+            let span = ctx.span(id).unwrap();
+            if span.name() == "request" {
+                values.record(&mut FieldVisitor(
+                    span.extensions_mut()
+                        .get_mut::<HashMap<String, String>>()
+                        .unwrap(),
+                ));
+            }
+        }
+
+        fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+            let span = ctx.span(&id).unwrap();
+            if span.name() == "request" {
+                self.spans.lock().unwrap().push(
+                    span.extensions()
+                        .get::<HashMap<String, String>>()
+                        .unwrap()
+                        .clone(),
+                );
+            }
+        }
+
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            let in_request_span = ctx
+                .event_scope(event)
+                .is_some_and(|scope| scope.from_root().any(|span| span.name() == "request"));
+            let mut fields = HashMap::new();
+            event.record(&mut FieldVisitor(&mut fields));
+            self.events.lock().unwrap().push((
+                fields.get("message").cloned().unwrap_or_default(),
+                in_request_span,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_span_carries_route_status_and_id_and_events_are_its_children() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(capture.clone()));
+
+        let router = Route::new(("/users/{id}".at(|| async { Result::Ok("u") }),))
+            .layer(Trace::new().with_request_id())
+            .build();
+        let response = router.go(get("/users/42")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(_guard);
+
+        let spans = capture.spans.lock().unwrap();
+        let span = spans.first().expect("the request span was recorded");
+        assert_eq!(span["http.route"], "/users/{id}");
+        assert_eq!(span["http.response.status_code"], "200");
+        assert_eq!(span["http.request.method"], "GET");
+        assert_eq!(span["request_id"].len(), 36);
+        drop(spans);
+
+        let events = capture.events.lock().unwrap();
+        let response_event = events
+            .iter()
+            .find(|(message, _)| message == "response")
+            .expect("the response event fired");
+        assert!(response_event.1, "events are children of the request span");
+    }
+
+    #[tokio::test]
+    async fn unmatched_requests_record_route_as_unmatched() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(capture.clone()));
+
+        let router = Route::new(("/known".at(|| async { Result::Ok("ok") }),))
+            .layer(Trace::new())
+            .build();
+        let response = router.go(get("/nope")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        drop(_guard);
+
+        let span = capture.spans.lock().unwrap();
+        assert_eq!(span[0]["http.route"], "<unmatched>");
+        assert_eq!(span[0]["http.response.status_code"], "404");
+    }
+
+    #[test]
+    fn allow_listed_headers_are_quoted_so_delimiters_cannot_forge_fields() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tag", "ok; admin=true".parse().unwrap());
+        let rendered = render_headers(&headers, &[HeaderName::from_static("x-tag")]);
+        assert_eq!(rendered, "x-tag=\"ok; admin=true\"");
     }
 
     #[tokio::test]

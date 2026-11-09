@@ -351,7 +351,9 @@ where
                 Ok(response) => response,
                 Err(error) => {
                     skyzen_core::log_endpoint_error(&error, &method, path.as_str());
-                    skyzen_core::error_response(&error)
+                    let mut response = skyzen_core::error_response(&error);
+                    skyzen_core::apply_pending_headers(&request, &mut response);
+                    response
                 }
             }
         };

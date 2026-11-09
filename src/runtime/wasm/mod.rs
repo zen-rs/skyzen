@@ -188,7 +188,9 @@ where
             // Log and render through the shared helpers so every backend emits the same fields
             // and applies the same 4xx/5xx redaction policy.
             skyzen_core::log_endpoint_error(&error, &method, path.as_str());
-            skyzen_core::error_response(&error)
+            let mut response = skyzen_core::error_response(&error);
+            skyzen_core::apply_pending_headers(&sky_request, &mut response);
+            response
         }
     };
 

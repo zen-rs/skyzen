@@ -18,7 +18,7 @@ use http_kit::{
 };
 use skyzen_core::{
     middleware::{Middleware, Next},
-    Error, Extractor, PlatformRequestId, Requirement,
+    Error, Extractor, PendingResponseHeaders, PlatformRequestId, Requirement,
 };
 
 /// The header a request id is read from and echoed back on, unless configured otherwise.
@@ -149,8 +149,19 @@ impl RequestId {
 
     /// Pick the id this request carries — the first trusted inbound value, else a fresh
     /// `UUIDv7` — and store it in the request extensions for downstream extraction.
+    ///
+    /// The id also goes into [`PendingResponseHeaders`] so a backend-rendered error
+    /// response — built after the endpoint's `Err` left the middleware chain — echoes it too.
     pub(crate) fn provide(&self, request: &mut Request) -> Arc<str> {
         let id = self.resolve(request);
+        if let Ok(value) = HeaderValue::from_str(&id) {
+            let mut pending = request
+                .extensions_mut()
+                .remove::<PendingResponseHeaders>()
+                .unwrap_or_default();
+            pending.0.insert(self.header.clone(), value);
+            request.extensions_mut().insert(pending);
+        }
         request.extensions_mut().insert(Self {
             id: Arc::clone(&id),
             ..self.clone()
@@ -159,11 +170,13 @@ impl RequestId {
     }
 
     /// Write `id` onto `response`'s request-id header.
+    ///
+    /// A platform-supplied id that is not a valid header value is skipped rather than
+    /// panicking the request — every minted or validated id takes the `Ok` arm.
     pub(crate) fn stamp(&self, response: &mut Response, id: &str) {
-        response.headers_mut().insert(
-            self.header.clone(),
-            HeaderValue::from_str(id).expect("a request id is always a valid header value"),
-        );
+        if let Ok(value) = HeaderValue::from_str(id) {
+            response.headers_mut().insert(self.header.clone(), value);
+        }
     }
 
     /// The first trusted inbound id that is present and valid, or a new `UUIDv7`.
@@ -187,12 +200,17 @@ impl RequestId {
                         .get(HeaderName::from_static("traceparent"))
                         .and_then(|value| value.to_str().ok())
                         .and_then(trace_id)
+                        .filter(|id| self.valid_inbound(id))
                     {
                         return Arc::from(id);
                     }
                 }
                 Inbound::Platform => {
-                    if let Some(id) = request.extensions().get::<PlatformRequestId>() {
+                    if let Some(id) = request
+                        .extensions()
+                        .get::<PlatformRequestId>()
+                        .filter(|id| self.valid_inbound(&id.0))
+                    {
                         return Arc::from(&*id.0);
                     }
                 }
@@ -273,14 +291,27 @@ impl Extractor for RequestId {
     }
 }
 
-/// The `trace-id` segment of a `traceparent` value: `version-traceid-spanid-flags`.
+/// The `trace-id` segment of a `traceparent` value: `version-traceid-parentid-flags`.
+///
+/// Only a well-formed W3C `traceparent` yields an id — four hex segments, a 32-digit
+/// trace-id and 16-digit parent-id, neither all zero — so a truncated or malformed header
+/// falls back to minting rather than smuggling an arbitrary string into `http.route`'s
+/// sibling field.
 fn trace_id(traceparent: &str) -> Option<&str> {
-    let mut segments = traceparent.split('-');
-    let version = segments.next()?;
-    let trace_id = segments.next()?;
-    if version.is_empty()
+    let is_hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+    let segments: Vec<&str> = traceparent.split('-').collect();
+    let [version, trace_id, parent_id, _flags] = segments.as_slice() else {
+        return None;
+    };
+    if version.len() != 2
+        || *version == "ff"
+        || !is_hex(version)
         || trace_id.len() != 32
-        || !trace_id.bytes().all(|b| b.is_ascii_hexdigit())
+        || !is_hex(trace_id)
+        || trace_id.bytes().all(|b| b == b'0')
+        || parent_id.len() != 16
+        || !is_hex(parent_id)
+        || parent_id.bytes().all(|b| b == b'0')
     {
         return None;
     }
@@ -295,7 +326,7 @@ mod tests {
         Body, Request, Result, StatusCode,
     };
     use http_kit::HttpError as _;
-    use skyzen_core::{Extractor, PlatformRequestId};
+    use skyzen_core::{Extractor, PendingResponseHeaders, PlatformRequestId};
 
     fn get(path: &str) -> Request {
         let mut request = Request::new(Body::empty());
@@ -468,5 +499,74 @@ mod tests {
         );
         assert_eq!(trace_id("garbage"), None);
         assert_eq!(trace_id("00-nope-00f067aa0ba902b7-01"), None);
+        // Truncated, all-zero, and forbidden-version values are not ids.
+        assert_eq!(trace_id("00-4bf92f3577b34da6a3ce929d0e0e4736"), None);
+        assert_eq!(
+            trace_id("00-00000000000000000000000000000000-00f067aa0ba902b7-01"),
+            None
+        );
+        assert_eq!(
+            trace_id("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"),
+            None
+        );
+        assert_eq!(
+            trace_id("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_platform_id_failing_validation_is_replaced() {
+        let router = Route::new(("/echo".at(echo),))
+            .layer(RequestId::lambda())
+            .build();
+
+        let mut request = get("/echo");
+        request
+            .extensions_mut()
+            .insert(PlatformRequestId("bad\tid".to_owned()));
+        let response = router.go(request).await.unwrap();
+        assert_eq!(response.into_body().into_string().await.unwrap().len(), 36);
+    }
+
+    #[tokio::test]
+    async fn platform_ids_over_max_len_are_replaced() {
+        let router = Route::new(("/echo".at(echo),))
+            .layer(RequestId::lambda().max_len(8))
+            .build();
+
+        let mut request = get("/echo");
+        request
+            .extensions_mut()
+            .insert(PlatformRequestId("a-valid-but-too-long-id".to_owned()));
+        let response = router.go(request).await.unwrap();
+        assert_eq!(response.into_body().into_string().await.unwrap().len(), 36);
+    }
+
+    #[tokio::test]
+    async fn the_id_is_queued_for_backend_rendered_error_responses() {
+        let middleware = RequestId::new();
+        let mut request = get("/echo");
+        let id = middleware.provide(&mut request);
+
+        let pending = request
+            .extensions()
+            .get::<PendingResponseHeaders>()
+            .expect("the id is queued for error rendering");
+        assert_eq!(
+            pending.0.get("x-request-id").unwrap().to_str().unwrap(),
+            &*id
+        );
+    }
+
+    #[tokio::test]
+    async fn the_id_is_echoed_on_the_404_too() {
+        let router = Route::new(("/known".at(|| async { Result::Ok("ok") }),))
+            .layer(RequestId::new())
+            .build();
+
+        let response = router.go(get("/missing")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get("x-request-id").is_some());
     }
 }
