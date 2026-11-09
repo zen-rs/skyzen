@@ -975,13 +975,20 @@ impl SessionStore for MemorySessionStore {
 
     fn touch<'a>(&'a self, id: &'a str, ttl: Duration) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
-            if let Some((expires, _)) = self
-                .entries
-                .lock()
-                .expect("memory store")
-                .get_mut(&store_key(id))
-            {
-                *expires = ttl.as_secs_f64().mul_add(1000.0, now_ms());
+            let now = now_ms();
+            let mut entries = self.entries.lock().expect("memory store");
+            // Refreshing a dead record would resurrect it — an expired entry is dropped
+            // outright, same as `load`, so a stale signed cookie cannot revive a session.
+            match entries.get(&store_key(id)).map(|(expires, _)| *expires) {
+                Some(expires) if expires > now => {
+                    if let Some((expires, _)) = entries.get_mut(&store_key(id)) {
+                        *expires = ttl.as_secs_f64().mul_add(1000.0, now);
+                    }
+                }
+                Some(_) => {
+                    entries.remove(&store_key(id));
+                }
+                None => {}
             }
             Ok(())
         })
