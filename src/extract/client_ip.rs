@@ -194,35 +194,38 @@ fn trusted_client(addrs: &[IpAddr], proxies: &TrustedProxies, peer: Option<IpAdd
         .unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST))
 }
 
-/// The `for=` chain of a `Forwarded` header, leftmost first. `None` when no `for=` is present.
+/// The `for=` chain of every `Forwarded` header field, leftmost first — each header
+/// instance contributes in received order, exactly as a comma-join of them would
+/// (RFC 7230 §3.2.2). `None` when no `for=` is present.
 fn forwarded_chain(request: &Request) -> Option<Vec<IpAddr>> {
-    let value = request.headers().get(header::FORWARDED)?;
     let mut addrs = Vec::new();
-    for entry in value.as_bytes().split(|b| *b == b',') {
-        for pair in entry.split(|b| *b == b';') {
-            let Some((mut key, value)) = split_once(pair, b'=') else {
-                continue;
-            };
-            trim(&mut key);
-            if !key.eq_ignore_ascii_case(b"for") {
-                continue;
-            }
-            if let Ok(addr) = parse_forwarded_for_value(value) {
-                addrs.push(addr);
+    for value in request.headers().get_all(header::FORWARDED).iter() {
+        for entry in value.as_bytes().split(|b| *b == b',') {
+            for pair in entry.split(|b| *b == b';') {
+                let Some((mut key, value)) = split_once(pair, b'=') else {
+                    continue;
+                };
+                trim(&mut key);
+                if !key.eq_ignore_ascii_case(b"for") {
+                    continue;
+                }
+                if let Ok(addr) = parse_forwarded_for_value(value) {
+                    addrs.push(addr);
+                }
             }
         }
     }
     (!addrs.is_empty()).then_some(addrs)
 }
 
-/// The address list of an `X-Forwarded-For` header, leftmost first.
+/// The address list of every `X-Forwarded-For` header field, leftmost first — each
+/// instance's entries extend the list in received order.
 fn x_forwarded_for_chain(request: &Request) -> Option<Vec<IpAddr>> {
-    let value = request
+    let addrs: Vec<IpAddr> = request
         .headers()
-        .get(HeaderName::from_static("x-forwarded-for"))?;
-    let addrs: Vec<IpAddr> = value
-        .as_bytes()
-        .split(|b| *b == b',')
+        .get_all(HeaderName::from_static("x-forwarded-for"))
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|b| *b == b','))
         .filter_map(|mut raw| {
             trim(&mut raw);
             std::str::from_utf8(raw)
