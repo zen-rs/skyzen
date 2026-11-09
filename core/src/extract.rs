@@ -109,6 +109,14 @@ pub trait Extractor: Sized + Send + Sync + 'static {
         None
     }
 
+    /// Error responses the extractor can produce — e.g. `Valid`'s `422` problem document —
+    /// merged into the operation's documented responses.
+    #[cfg(feature = "openapi")]
+    #[must_use]
+    fn openapi_responses() -> Option<Vec<crate::openapi::ResponseSchema>> {
+        None
+    }
+
     /// Register dependent schemas into the `OpenAPI` components map.
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(_defs: &mut BTreeMap<String, SchemaRef>) {}
@@ -154,7 +162,13 @@ macro_rules! impl_tuple_extractor {
                 }
             }
 
-            impl <$($ty: Extractor),+>core::error::Error for TupleExtractorError<$($ty),+> {}
+            impl <$($ty: Extractor),+>core::error::Error for TupleExtractorError<$($ty),+> {
+                fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+                    match self {
+                        $(TupleExtractorError::$ty(e) => Some(e),)+
+                    }
+                }
+            }
 
             impl <$($ty: Extractor),+>http_kit::HttpError for TupleExtractorError<$($ty),+> {
                 fn status(&self) -> http_kit::StatusCode {

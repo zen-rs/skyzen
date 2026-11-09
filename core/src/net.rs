@@ -116,6 +116,23 @@ struct ErrorBody<'a> {
     error: &'a str,
 }
 
+/// Machine-readable detail an error carries in its `source()` chain.
+///
+/// [`error_response`] upgrades a body carrying one to an RFC 9457 problem document
+/// (`application/problem+json`), merging the value's members in as extensions. An error
+/// reports one by storing it as its `source()`; it is not itself an `HttpError`, so it never
+/// sets the status.
+#[derive(Debug)]
+pub struct ErrorDetails(pub serde_json::Value);
+
+impl core::fmt::Display for ErrorDetails {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("error details")
+    }
+}
+
+impl core::error::Error for ErrorDetails {}
+
 /// Emit the endpoint-error log line that every Skyzen backend shares.
 ///
 /// Server (5xx) errors log at `error`, everything else at `warn`, and both carry the request's
@@ -161,16 +178,50 @@ pub fn error_response(error: &dyn HttpError) -> Response {
         error.to_string()
     };
 
-    let payload = serde_json::to_vec(&ErrorBody {
-        error: &body_message,
-    })
-    .unwrap_or_else(|_| br#"{"error":"Internal server error"}"#.to_vec());
+    // Structured detail rides in the `source()` chain — the only channel `dyn HttpError`
+    // offers beyond `status` and `Display`. Server errors keep the same silence they have
+    // always kept: a detail node could expose internals the redaction exists to hide.
+    let details = (!status.is_server_error())
+        .then(|| {
+            std::iter::successors(error.source(), |source| source.source())
+                .find_map(|source| source.downcast_ref::<ErrorDetails>())
+                .map(|details| details.0.clone())
+        })
+        .flatten();
+    let (payload, content_type) = match details {
+        // An error that published machine-readable detail gets the RFC 9457 problem
+        // document; the detail object's members merge in as extensions.
+        Some(mut details) => {
+            let mut problem = serde_json::json!({
+                "type": "about:blank",
+                "title": status.canonical_reason(),
+                "status": status.as_u16(),
+                "detail": body_message,
+            });
+            if let (Some(problem), Some(details)) =
+                (problem.as_object_mut(), details.as_object_mut())
+            {
+                problem.append(details);
+            }
+            (
+                serde_json::to_vec(&problem).unwrap_or_else(|_| br#"{"title":"error"}"#.to_vec()),
+                "application/problem+json",
+            )
+        }
+        None => (
+            serde_json::to_vec(&ErrorBody {
+                error: &body_message,
+            })
+            .unwrap_or_else(|_| br#"{"error":"Internal server error"}"#.to_vec()),
+            "application/json",
+        ),
+    };
 
     let mut response = Response::new(Body::from(payload));
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/json"),
+        header::HeaderValue::from_static(content_type),
     );
     response
 }

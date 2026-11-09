@@ -47,8 +47,8 @@ pub use server::Server;
 mod net;
 #[cfg(feature = "std")]
 pub use net::{
-    apply_pending_headers, error_response, log_endpoint_error, panic_message, MissingRemoteAddr,
-    PeerAddr, PendingResponseHeaders, PlatformRequestId,
+    apply_pending_headers, error_response, log_endpoint_error, panic_message, ErrorDetails,
+    MissingRemoteAddr, PeerAddr, PendingResponseHeaders, PlatformRequestId,
 };
 #[cfg(feature = "std")]
 mod secret;
