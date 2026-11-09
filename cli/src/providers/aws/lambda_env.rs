@@ -103,6 +103,22 @@ impl LambdaEnvironment {
                     self.function
                 )
             })?;
+
+        // The update is in flight until Lambda says otherwise — a version published or a rule
+        // enabled before it settles would carry the previous variables.
+        client
+            .wait_until_function_updated_v2()
+            .function_name(&self.function)
+            .wait(UPDATE_TIMEOUT)
+            .await
+            .with_context(|| {
+                format!(
+                    "Lambda function `{}` did not finish applying its environment within {} \
+                     seconds",
+                    self.function,
+                    UPDATE_TIMEOUT.as_secs()
+                )
+            })?;
         Ok(())
     }
 }

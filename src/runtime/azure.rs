@@ -343,6 +343,60 @@ fn base64(bytes: &[u8]) -> String {
     encoded
 }
 
+/// The cookie's own name, from `name=value; attrs`.
+fn cookie_name(header: &str) -> &str {
+    header
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .split('=')
+        .next()
+        .unwrap_or_default()
+        .trim()
+}
+
+/// The cookie's own value, from `name=value; attrs`.
+fn cookie_value(header: &str) -> &str {
+    header
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .split_once('=')
+        .map_or("", |(_, value)| value.trim())
+}
+
+/// The `CookieOptions` the tuple's third member carries: every attribute after the first
+/// `name=value` segment, parsed the way `Set-Cookie` spells them.
+fn cookie_options(header: &str) -> serde_json::Value {
+    let mut options = serde_json::json!({});
+    for attribute in header.split(';').skip(1) {
+        let (name, value) = attribute
+            .split_once('=')
+            .map_or((attribute.trim(), ""), |(name, value)| {
+                (name.trim(), value.trim())
+            });
+        match name.to_ascii_lowercase().as_str() {
+            "secure" => options["Secure"] = true.into(),
+            "httponly" => options["HttpOnly"] = true.into(),
+            "samesite" => {
+                options["SameSite"] = match value.to_ascii_lowercase().as_str() {
+                    "lax" => 1.into(),
+                    "strict" => 2.into(),
+                    _ => 0.into(),
+                };
+            }
+            "path" => options["Path"] = value.into(),
+            "domain" => options["Domain"] = value.into(),
+            "expires" => options["Expires"] = value.into(),
+            "max-age" => {
+                options["MaxAge"] = format!("{value}:00:00").into();
+            }
+            _ => {}
+        }
+    }
+    options
+}
+
 /// Serialize the application's response into the `Outputs.res` the `http` output binding
 /// declares — the shape the host turns back into the client's HTTP response.
 async fn wrapped_response(response: Response) -> Response {
@@ -375,10 +429,13 @@ async fn wrapped_response(response: Response) -> Response {
             continue;
         };
         if name.as_str().eq_ignore_ascii_case("set-cookie") {
-            let (cookie_name, cookie_value) = value.split_once('=').unwrap_or((value, ""));
+            // The host reads `res.cookies` as (name, value, CookieOptions) tuples — the
+            // attributes carry the security properties, so `Secure; HttpOnly` inside the
+            // value would never become them.
             cookies.push(serde_json::json!({
-                "name": cookie_name.trim(),
-                "value": cookie_value.trim(),
+                "Item1": cookie_name(&value),
+                "Item2": cookie_value(&value),
+                "Item3": cookie_options(&value),
             }));
             continue;
         }
