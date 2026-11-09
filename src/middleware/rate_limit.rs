@@ -132,6 +132,11 @@ impl RateLimit {
     /// counter whose single-writer reads-modify-writes are atomic, unlike the KV `increment`
     /// Workers lacks entirely. `S` is the durable binding resolved from extensions — the bare
     /// `DurableKv` the runtime injects or a typed `Deref` wrapper, either through `AsDurableKv`.
+    ///
+    /// Use this inside a `#[skyzen::durable_object]` handler — `DurableKv` exists only in the
+    /// object's own context. On an ordinary Worker route the binding never resolves, and a
+    /// missing binding is answered fail-closed: every request gets `RateLimitUnavailable`
+    /// rather than passing uncounted.
     pub fn durable<S>(limit: u64, window: Duration) -> Self
     where
         S: Extractor + AsDurableKv,
@@ -225,13 +230,8 @@ impl Middleware for RateLimit {
             let store = match (self.resolve)(request).await {
                 Ok(store) => store,
                 // A missing binding is a permanent misconfiguration, not an outage —
-                // log it even while failing open so the limiter never silently dies.
-                Err(error) if self.fail_open => {
-                    tracing::warn!(
-                        "rate limit store could not resolve, admitting request: {error}"
-                    );
-                    return next.run(request).await;
-                }
+                // fail-open exists for transient backend errors, and a limiter that can
+                // never resolve its store must fail closed every request.
                 Err(error) => {
                     tracing::warn!("rate limit store could not resolve: {error}");
                     return Err(Error::from(RateLimitUnavailable::new()));
