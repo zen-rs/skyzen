@@ -207,3 +207,5 @@ mod tests {
 
 mod csrf;
 pub use csrf::{Csrf, CsrfRejected};
+mod auto_etag;
+pub use auto_etag::AutoETag;
