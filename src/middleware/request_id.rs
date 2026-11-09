@@ -8,6 +8,7 @@
 use core::fmt;
 use std::{any::TypeId, future::ready, ops::Deref};
 
+use super::error_handling::HandlesErrors;
 use super::trace::Trace;
 use http_kit::{
     header::{HeaderName, HeaderValue},
@@ -229,7 +230,11 @@ impl Middleware for RequestIdLayer {
         let mut response = match result {
             Ok(response) => response,
             // Rendering the error inside the layer is what lets the id reach a response the
-            // server edge would otherwise build without it.
+            // server edge would otherwise build without it — unless an
+            // `ErrorHandlingMiddleware` already claims the error path.
+            Err(error) if request.extensions().get::<HandlesErrors>().is_some() => {
+                return Err(error);
+            }
             Err(error) => skyzen_core::error_response(&*error.into_boxed_http_error()),
         };
         response.headers_mut().insert(self.header.clone(), value);

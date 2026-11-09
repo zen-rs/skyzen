@@ -6,6 +6,12 @@ use skyzen_core::{
     Error, Responder,
 };
 
+/// Request extension [`ErrorHandlingMiddleware`] inserts before running downstream — its
+/// presence tells a layer that error responses are already being produced somewhere and the
+/// layer should propagate `Err` rather than materialize a default one itself.
+#[derive(Debug, Clone, Copy)]
+pub struct HandlesErrors;
+
 /// Turn an endpoint error into a response with an asynchronous function.
 pub struct ErrorHandlingMiddleware<F> {
     f: Arc<F>,
@@ -44,6 +50,9 @@ where
     Res: Responder,
 {
     async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        // Tell upstream middleware the error path is handled — layers that would otherwise
+        // materialize a default error response propagate `Err` when this marker is present.
+        request.extensions_mut().insert(HandlesErrors);
         match next.run(request).await {
             Ok(response) => Ok(response),
             Err(error) => {
