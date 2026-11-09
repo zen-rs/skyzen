@@ -492,15 +492,23 @@ impl DurableKvRateStore {
             let Some(text) = std::str::from_utf8(raw).ok() else {
                 continue;
             };
-            // Every record's deadline is its last colon segment — `{count}:{reset}` for
-            // counters and markers, `{key}::{reset}` for cursors — so a stale marker or
-            // cursor dies with its own window instead of piling up forever.
-            if text
-                .rsplit(':')
-                .next()
-                .and_then(|reset| reset.parse::<u64>().ok())
-                .is_some_and(|reset| reset <= now)
-            {
+            // Only keys the limiter itself wrote may die: a counter lives under
+            // `rl:counter:` and is exactly `{count}:{reset}`, while a sweep cursor or
+            // done-marker carries its deadline as the last colon segment. Anything else
+            // sharing the `rl:` prefix is application data and is left alone.
+            let deadline = if key.starts_with("rl:counter:") {
+                text.split_once(':').and_then(|(count, reset)| {
+                    count.parse::<u64>().ok()?;
+                    reset.parse::<u64>().ok()
+                })
+            } else if key.starts_with("rl:sweep:") || key.starts_with("rl:swept:") {
+                text.rsplit(':')
+                    .next()
+                    .and_then(|reset| reset.parse::<u64>().ok())
+            } else {
+                None
+            };
+            if deadline.is_some_and(|reset| reset <= now) {
                 dead.push(key.as_str());
             }
         }
@@ -538,7 +546,7 @@ impl RateLimitStore for DurableKvRateStore {
             // client space instead of accumulating one dead key per window.
             let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
             let now = now_ms();
-            let bucket = format!("rl:{key}");
+            let bucket = format!("rl:counter:{key}");
             let stored = self
                 .kv
                 .get(&bucket)
