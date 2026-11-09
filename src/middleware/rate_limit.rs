@@ -238,13 +238,16 @@ impl Middleware for RateLimit {
                 }
             };
             // Length-prefixed name — `("a:b", "c")` and `("a", "b:c")` would collide at the
-            // same store key under plain concatenation — and every component is %XX-escaped
-            // so a name or client key carrying `/ ? # \` survives Cosmos document ids.
+            // same store key under plain concatenation — every component is %XX-escaped so
+            // a name or client key carrying `/ ? # \` survives Cosmos document ids, and any
+            // component over the bound collapses to a digest so a caller-supplied key can
+            // never outgrow a document-id limit and fail open.
+            let name = bound_key_component(&self.name);
             let key = format!(
                 "rate:{}:{}:{}",
-                encode_key_component(&self.name).len(),
-                encode_key_component(&self.name),
-                encode_key_component(&(self.key)(request).await?),
+                name.len(),
+                name,
+                bound_key_component(&(self.key)(request).await?),
             );
             match store.hit(&key, self.window).await {
                 Ok(hit) if hit.count <= self.limit => next.run(request).await,
@@ -317,6 +320,28 @@ where
             kv: kv.as_durable_kv().clone(),
         }) as Arc<dyn RateLimitStore>)
     })
+}
+
+/// The most a single bucket-key component may occupy — the digest fallback below keeps the
+/// whole `rate:` key under a fraction of the tightest document-id limit (Cosmos: 1,023).
+const MAX_KEY_COMPONENT: usize = 128;
+
+/// A bucket-key component that stays inside document-id bounds: escaped like
+/// [`encode_key_component`] when short enough, else its sha256 hex — still injective, so a
+/// distinct name or client key still lands on a distinct bucket.
+fn bound_key_component(key: &str) -> String {
+    let escaped = encode_key_component(key);
+    if escaped.len() <= MAX_KEY_COMPONENT {
+        return escaped;
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use core::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Escape `key` for store backends that take the bucket name as a document id: `%` itself
