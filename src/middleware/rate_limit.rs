@@ -37,6 +37,7 @@ use skyzen_core::{
 };
 use skyzen_services::{Kv, KvError};
 
+use super::error_handling::{DeferredHeaders, HandlesErrors};
 use crate::extract::ClientIp;
 
 http_error!(
@@ -205,6 +206,19 @@ impl Middleware for RateLimit {
             match store.hit(&key, self.window).await {
                 Ok(hit) if hit.count <= self.limit => next.run(request).await,
                 Ok(hit) => {
+                    // A 429 goes through the shared error contract: when an error handler
+                    // claims the path the error propagates and the wait rides the request as
+                    // a deferred header; otherwise the layer renders the shared body itself.
+                    if request.extensions().get::<HandlesErrors>().is_some() {
+                        let retry = HeaderValue::from(hit.retry_after.max(1));
+                        let extensions = request.extensions_mut();
+                        if let Some(deferred) = extensions.get_mut::<DeferredHeaders>() {
+                            deferred.0.push((RETRY_AFTER, retry));
+                        } else {
+                            extensions.insert(DeferredHeaders(vec![(RETRY_AFTER, retry)]));
+                        }
+                        return Err(Error::from(RateLimited::new()));
+                    }
                     let mut response = skyzen_core::error_response(&RateLimited::new());
                     response
                         .headers_mut()

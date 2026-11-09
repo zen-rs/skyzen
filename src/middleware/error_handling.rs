@@ -1,10 +1,26 @@
 use std::{fmt::Debug, future::Future, sync::Arc};
 
-use http_kit::{error::BoxHttpError, Body, Request, Response};
+use http_kit::{
+    error::BoxHttpError,
+    header::{HeaderName, HeaderValue},
+    Body, Request, Response,
+};
 use skyzen_core::{
     middleware::{Middleware, Next},
     Error, Responder,
 };
+
+/// Response headers a layer asked to keep on every response, stamped by
+/// [`ErrorHandlingMiddleware`] on the errors it renders — the error path is still a
+/// response.
+#[derive(Debug, Clone)]
+pub struct DeferredHeaders(pub Vec<(HeaderName, HeaderValue)>);
+
+/// Request extension [`ErrorHandlingMiddleware`] inserts before running downstream — its
+/// presence tells a layer that error responses are already being produced somewhere and the
+/// layer should propagate `Err` rather than materialize a default one itself.
+#[derive(Debug, Clone, Copy)]
+pub struct HandlesErrors;
 
 /// Turn an endpoint error into a response with an asynchronous function.
 pub struct ErrorHandlingMiddleware<F> {
@@ -44,6 +60,9 @@ where
     Res: Responder,
 {
     async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        // Tell upstream middleware the error path is handled — layers that would otherwise
+        // materialize a default error response propagate `Err` when this marker is present.
+        request.extensions_mut().insert(HandlesErrors);
         match next.run(request).await {
             Ok(response) => Ok(response),
             Err(error) => {
