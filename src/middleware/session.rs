@@ -77,7 +77,9 @@ pub trait SessionStore: Send + Sync + 'static {
     ///
     /// Returns whether the server-side deadline actually moved: a backend that cannot touch
     /// atomically reports `false`, and the caller then leaves the browser's deadline alone
-    /// too — expiring together beats sliding on one side only.
+    /// too — expiring together beats sliding on one side only. Stores that do not touch at
+    /// all keep the default `false` — claiming a renewal that never happened would renew the
+    /// cookie while the record keeps its deadline.
     fn touch<'a>(
         &'a self,
         id: &'a str,
@@ -85,7 +87,7 @@ pub trait SessionStore: Send + Sync + 'static {
         expected: Option<&'a SessionData>,
     ) -> BoxFuture<'a, Result<bool, SessionError>> {
         let _ = (id, ttl, expected);
-        Box::pin(async { Ok(true) })
+        Box::pin(async { Ok(false) })
     }
 }
 
@@ -873,7 +875,9 @@ impl SessionStore for KvSessionStore {
         Box::pin(async move {
             let key = store_key(id);
             match self.kv.expire(&key, ttl).await {
-                Ok(_) => Ok(true),
+                // `expire` reports whether a record was there to renew — a missing one is no
+                // slide, so its `false` reaches the caller unchanged.
+                Ok(existed) => Ok(existed),
                 // A backend without native expiry (Cloudflare KV) could slide the deadline
                 // only by rewriting the record — but verify-then-write cannot close the
                 // window where a concurrent delete lands, so a revoked session could be
