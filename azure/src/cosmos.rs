@@ -357,7 +357,10 @@ impl CosmosKv {
     ///
     /// The tag is optional here so a plain [`KeyValueStore::get`] never depends on it; the
     /// conditional paths ask for it through [`read_for_swap`](Self::read_for_swap).
-    async fn read(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>, KvError> {
+    async fn read(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, Option<String>, Option<i32>)>, KvError> {
         match self
             .container
             .read_item(self.layout.partition_value(key).to_owned(), key, None)
@@ -366,7 +369,7 @@ impl CosmosKv {
             Ok(response) => {
                 let etag = response.headers().etag().map(ToString::to_string);
                 let document: StoredValue = response.into_model().map_err(cosmos_error)?;
-                Ok(Some((decode_value(&document.value)?, etag)))
+                Ok(Some((decode_value(&document.value)?, etag, document.ttl)))
             }
             Err(error) if is_absent(&error) => Ok(None),
             Err(error) => Err(cosmos_error(error)),
@@ -377,8 +380,11 @@ impl CosmosKv {
     ///
     /// A document Cosmos returned without an `_etag` cannot be swapped safely, and reporting that
     /// is the difference between refusing the write and applying one that guards nothing.
-    async fn read_for_swap(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, KvError> {
-        let Some((value, etag)) = self.read(key).await? else {
+    async fn read_for_swap(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, String, Option<i32>)>, KvError> {
+        let Some((value, etag, ttl)) = self.read(key).await? else {
             return Ok(None);
         };
 
@@ -389,7 +395,7 @@ impl CosmosKv {
             ))
         })?;
 
-        Ok(Some((value, etag)))
+        Ok(Some((value, etag, ttl)))
     }
 
     /// Create a document, reporting whether it was created or already existed.
@@ -418,13 +424,14 @@ impl CosmosKv {
         key: &str,
         value: &[u8],
         etag: &str,
+        ttl: Option<i32>,
     ) -> Result<bool, KvError> {
         match self
             .container
             .replace_item(
                 self.layout.partition_value(key).to_owned(),
                 key,
-                self.layout.document(key, value, None),
+                self.layout.document(key, value, ttl),
                 Some(ItemWriteOptions::default().with_precondition(Precondition::if_match(etag))),
             )
             .await
@@ -472,6 +479,10 @@ fn account_endpoint(endpoint: &str) -> Result<AccountEndpoint, KvError> {
 struct StoredValue {
     /// The base64-encoded value.
     value: String,
+    /// The document's per-item TTL in seconds — carried through conditional writes so an
+    /// `expire` set earlier is not dropped by a replace.
+    #[serde(default)]
+    ttl: Option<i32>,
 }
 
 /// Encode bytes to base64 for Cosmos DB storage.
@@ -563,7 +574,7 @@ fn cosmos_error(error: CosmosError) -> KvError {
 
 impl KeyValueStore for CosmosKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
-        Ok(self.read(key).await?.map(|(value, _)| value))
+        Ok(self.read(key).await?.map(|(value, ..)| value))
     }
 
     async fn put(&self, key: &str, value: &[u8]) -> Result<(), KvError> {
@@ -606,7 +617,7 @@ impl KeyValueStore for CosmosKv {
             return self.create(key, value, None).await;
         };
 
-        let Some((stored, etag)) = self.read_for_swap(key).await? else {
+        let Some((stored, etag, ttl)) = self.read_for_swap(key).await? else {
             return Ok(false);
         };
 
@@ -614,7 +625,7 @@ impl KeyValueStore for CosmosKv {
             return Ok(false);
         }
 
-        self.replace_if_unchanged(key, value, &etag).await
+        self.replace_if_unchanged(key, value, &etag, ttl).await
     }
 
     /// Add `delta` to the decimal counter stored under `key`.
@@ -633,7 +644,7 @@ impl KeyValueStore for CosmosKv {
                         .await?
                         .then_some(next)
                 }
-                Some((stored, etag)) => {
+                Some((stored, etag, ttl)) => {
                     let next =
                         counter_value(key, &stored)?
                             .checked_add(delta)
@@ -643,7 +654,7 @@ impl KeyValueStore for CosmosKv {
                              integer"
                         ))
                             })?;
-                    self.replace_if_unchanged(key, next.to_string().as_bytes(), &etag)
+                    self.replace_if_unchanged(key, next.to_string().as_bytes(), &etag, ttl)
                         .await?
                         .then_some(next)
                 }
