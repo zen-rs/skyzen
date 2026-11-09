@@ -427,7 +427,13 @@ const fn install_tls_provider(_client: &redis::Client) {}
 /// context would silently get tokio. `runtime-smol` is the only selection
 /// that differs from upstream's auto-detect under a tokio host, so pin it
 /// once; `prefer_smol` refuses to override a preference the app already set.
-#[cfg(all(feature = "runtime-smol", not(feature = "runtime-tokio")))]
+/// The preference API itself exists only when upstream compiles both runtimes
+/// — exactly the ambiguity this resolves.
+#[cfg(all(
+    feature = "runtime-smol",
+    not(feature = "runtime-tokio"),
+    feature = "tls"
+))]
 fn pin_runtime() {
     static PIN: std::sync::Once = std::sync::Once::new();
     PIN.call_once(|| {
@@ -435,7 +441,11 @@ fn pin_runtime() {
     });
 }
 
-#[cfg(not(all(feature = "runtime-smol", not(feature = "runtime-tokio"))))]
+#[cfg(not(all(
+    feature = "runtime-smol",
+    not(feature = "runtime-tokio"),
+    feature = "tls"
+)))]
 const fn pin_runtime() {}
 
 #[cfg(test)]
