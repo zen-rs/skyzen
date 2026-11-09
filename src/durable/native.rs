@@ -12,6 +12,7 @@ use std::{
     },
 };
 
+use executor_core::Executor as _;
 use futures_util::lock::Mutex;
 #[cfg(feature = "ws")]
 use futures_util::{FutureExt as _, StreamExt as _};
@@ -272,34 +273,36 @@ where
             let alarm_state = Arc::clone(&alarm_state);
             let generation = Arc::clone(&generation);
 
-            std::thread::spawn(move || {
-                let now = current_unix_ms();
-                if scheduled_time_ms > now {
-                    let delta = u64::try_from(scheduled_time_ms - now).unwrap_or(0);
-                    std::thread::sleep(std::time::Duration::from_millis(delta));
-                }
+            executor_core::DefaultExecutor
+                .spawn(async move {
+                    let now = current_unix_ms();
+                    if scheduled_time_ms > now {
+                        let delta = u64::try_from(scheduled_time_ms - now).unwrap_or(0);
+                        async_io::Timer::after(std::time::Duration::from_millis(delta)).await;
+                    }
 
-                // A newer `set_alarm`/`delete_alarm` supersedes this timer.
-                if generation.load(Ordering::SeqCst) != expected_generation {
-                    return;
-                }
-                // Clear the stored alarm before dispatch (platform semantics: a fired alarm
-                // no longer shows up via `get_alarm`).
-                {
-                    let Ok(mut stored) = alarm_state.write() else {
-                        return;
-                    };
-                    if stored.take().is_none() {
+                    // A newer `set_alarm`/`delete_alarm` supersedes this timer.
+                    if generation.load(Ordering::SeqCst) != expected_generation {
                         return;
                     }
-                }
+                    // Clear the stored alarm before dispatch (platform semantics: a fired alarm
+                    // no longer shows up via `get_alarm`).
+                    {
+                        let Ok(mut stored) = alarm_state.write() else {
+                            return;
+                        };
+                        if stored.take().is_none() {
+                            return;
+                        }
+                    }
 
-                let Some(inner) = weak.upgrade() else { return };
-                let namespace = Self { inner };
-                if let Err(error) = smol::block_on(namespace.alarm(&object_id)) {
-                    tracing::error!(%error, "native durable alarm handler failed");
-                }
-            });
+                    let Some(inner) = weak.upgrade() else { return };
+                    let namespace = Self { inner };
+                    if let Err(error) = namespace.alarm(&object_id).await {
+                        tracing::error!(%error, "native durable alarm handler failed");
+                    }
+                })
+                .detach();
         }));
     }
 
@@ -1350,6 +1353,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_alarm_scheduler_fires_scheduled_alarm() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let namespace = NativeDurableNamespace::<CounterObject>::new();
         let stub = namespace.get_by_name("timer-alarm").expect("alarm object");
 
