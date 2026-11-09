@@ -612,6 +612,12 @@ impl SessionsLayer {
                     }
                 } else if loaded_id.is_some() {
                     store.touch(&id, self.ttl).await?;
+                    // Sliding expiry is two-sided: touching the record alone leaves the
+                    // browser's Max-Age ticking toward the original deadline, so a clean
+                    // session re-emits its cookie alongside the server-side refresh.
+                    let mut cookie = Cookie::new(self.cookie_name, id.clone());
+                    set_session_cookie_flags(&mut cookie, self.ttl, keys.secure());
+                    jar.signed_mut(keys.key()).add(cookie);
                 }
             }
         }
