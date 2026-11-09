@@ -35,7 +35,10 @@ use skyzen_core::{
     middleware::{Middleware, Next},
     Error, Extractor, PendingResponseHeaders,
 };
-use skyzen_services::{durable::DurableKv, Kv, KvError};
+use skyzen_services::{
+    durable::{AsDurableKv, DurableKv},
+    Kv, KvError,
+};
 
 use crate::extract::ClientIp;
 
@@ -127,10 +130,11 @@ impl RateLimit {
 
     /// `limit` hits per `window` against a Durable Object's co-located storage — the Cloudflare
     /// counter whose single-writer reads-modify-writes are atomic, unlike the KV `increment`
-    /// Workers lacks entirely. `S` is the typed durable binding resolved from extensions.
+    /// Workers lacks entirely. `S` is the durable binding resolved from extensions — the bare
+    /// `DurableKv` the runtime injects or a typed `Deref` wrapper, either through `AsDurableKv`.
     pub fn durable<S>(limit: u64, window: Duration) -> Self
     where
-        S: Extractor + core::ops::Deref<Target = DurableKv>,
+        S: Extractor + AsDurableKv,
         S::Error: fmt::Debug,
     {
         Self::new(limit, window, Arc::new(durable_resolver::<S>))
@@ -294,14 +298,16 @@ fn durable_resolver<S>(
     request: &mut Request,
 ) -> BoxFuture<'_, Result<Arc<dyn RateLimitStore>, Error>>
 where
-    S: Extractor + core::ops::Deref<Target = DurableKv>,
+    S: Extractor + AsDurableKv,
     S::Error: fmt::Debug,
 {
     Box::pin(async move {
         let kv = S::extract(request)
             .await
             .map_err(|error| Error::msg(format!("rate limit durable binding: {error:?}")))?;
-        Ok(Arc::new(DurableKvRateStore { kv: (*kv).clone() }) as Arc<dyn RateLimitStore>)
+        Ok(Arc::new(DurableKvRateStore {
+            kv: kv.as_durable_kv().clone(),
+        }) as Arc<dyn RateLimitStore>)
     })
 }
 
