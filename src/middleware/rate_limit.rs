@@ -373,7 +373,7 @@ mod tests {
         routing::{CreateRouteNode, Route, Router},
         Body, Request, StatusCode,
     };
-    use http_kit::header::{HeaderValue, RETRY_AFTER};
+    use http_kit::header::HeaderValue;
     use std::time::Duration;
 
     async fn hello() -> &'static str {
