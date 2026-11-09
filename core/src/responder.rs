@@ -5,12 +5,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::Infallible;
-use core::pin::Pin;
 use http_kit::error::BoxHttpError;
 use http_kit::header::{HeaderMap, HeaderName, HeaderValue};
 use http_kit::HttpError;
 use http_kit::{
-    utils::{AsyncBufRead, ByteStr, Bytes},
+    utils::{ByteStr, Bytes},
     Body, Request, Response, StatusCode,
 };
 
@@ -144,14 +143,6 @@ macro_rules! impl_tuple_responder {
 tuples!(impl_tuple_responder);
 
 impl_base_responder![Bytes, Vec<u8>, Body, &'static [u8], Cow<'static, [u8]>];
-
-impl Responder for Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>> {
-    type Error = core::convert::Infallible;
-    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
-        *response.body_mut() = Body::from_reader(self, None);
-        Ok(())
-    }
-}
 
 impl_base_utf8_responder![ByteStr, String, &'static str, Cow<'static, str>];
 

@@ -24,6 +24,7 @@ use crate::{
     header::{HeaderMap, HeaderName, HeaderValue, CONTENT_ENCODING},
     Body, BodyError, Method, StatusCode, Uri,
 };
+use http_kit::DataStream;
 
 use super::{Request, Response};
 
@@ -351,7 +352,11 @@ fn body_from_js_stream(stream: Option<web_sys::ReadableStream>) -> Body {
 
 /// Expose a Skyzen [`Body`] to JS as a `ReadableStream`.
 fn body_into_js_stream(body: Body) -> web_sys::ReadableStream {
-    wasm_streams::ReadableStream::from_stream(BodyReadableStream { body }).into_raw()
+    // A JS `ReadableStream` carries bytes only: trailers have nowhere to go.
+    wasm_streams::ReadableStream::from_stream(BodyReadableStream {
+        body: body.into_data_stream(),
+    })
+    .into_raw()
 }
 
 #[derive(Debug)]
@@ -380,7 +385,7 @@ impl Stream for JsReadableBody {
 
 #[derive(Debug)]
 struct BodyReadableStream {
-    body: Body,
+    body: DataStream,
 }
 
 impl Stream for BodyReadableStream {

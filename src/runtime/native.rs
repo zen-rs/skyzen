@@ -26,15 +26,15 @@ use core::convert::Infallible;
 use executor_core::{
     smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
 };
-use futures_util::{future::FutureExt, stream::MapOk, Stream, StreamExt, TryStreamExt};
-use http_body_util::{BodyDataStream, StreamBody};
+use futures_util::{future::FutureExt, Stream, StreamExt, TryStreamExt};
+use http_body_util::BodyDataStream;
 use http_kit::{
     error::BoxHttpError,
     utils::{AsyncRead, AsyncReadExt, AsyncWrite},
     BodyError,
 };
 use hyper::{
-    body::{Frame, Incoming},
+    body::Incoming,
     server::conn::{http1, http2},
     service::Service,
 };
@@ -1785,9 +1785,9 @@ impl<E: Endpoint + Clone> IntoService<E> {
 impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
     for IntoService<E>
 {
-    type Response = hyper::Response<
-        StreamBody<MapOk<crate::Body, fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>>>,
-    >;
+    // `Body` is an `http_body::Body`: data and trailers pass through, and a file region is read
+    // out into data frames, since hyper cannot send a file.
+    type Response = hyper::Response<crate::Body>;
     type Error = BoxHttpError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
@@ -1834,13 +1834,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 }
             };
 
-            Ok(response.map(|body| {
-                let body: MapOk<
-                    crate::Body,
-                    fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>,
-                > = body.map_ok(Frame::data);
-                StreamBody::new(body)
-            }))
+            Ok(response)
         };
 
         Box::pin(fut)

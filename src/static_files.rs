@@ -446,24 +446,17 @@ async fn serve_static(
     Ok(response)
 }
 
-/// Stream `length` bytes of `path` starting at `start`, without buffering the file.
+/// A body of `length` bytes of `path` starting at `start`: a file region, which a server can hand
+/// to the kernel and any other backend reads out without buffering the file.
 #[cfg(not(target_arch = "wasm32"))]
 async fn file_body(path: &Path, start: u64, length: u64) -> Result<Body, StaticDirError> {
-    use http_kit::utils::io::{AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
-
-    let mut file = async_fs::File::open(path)
+    let path = path.to_path_buf();
+    let file = blocking::unblock(move || std::fs::File::open(path))
         .await
         .map_err(StaticDirError::IoError)?;
-    if start > 0 {
-        file.seek(SeekFrom::Start(start))
-            .await
-            .map_err(StaticDirError::IoError)?;
-    }
-    let reader = BufReader::new(file.take(length));
-    Ok(Body::from_reader(
-        reader,
-        usize::try_from(length).unwrap_or(usize::MAX),
-    ))
+    Ok(Body::from_file_region(http_kit::FileRegion::new(
+        file, start, length,
+    )))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
