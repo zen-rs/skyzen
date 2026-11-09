@@ -33,8 +33,9 @@ runtime-smol = ["dep:redis", "redis/smol-comp"]
 # per-runtime and `tls-rustls` demands the comp of EVERY enabled runtime — a
 # per-runtime split would leave combinations like `runtime-tokio`+`tls-smol`
 # unbuildable, so one `tls` feature pulls both comps; the `runtime-*` features
-# still pick which stack runs. rustls only, matching the rest of the workspace;
-# there is no `native-tls` variant.
+# still pick which stack runs (a `runtime-smol`-only build pins `prefer_smol`
+# at first connect). rustls only, matching the rest of the workspace; there is
+# no `native-tls` variant.
 tls = ["dep:rustls", "redis/tokio-rustls-comp", "redis/smol-rustls-comp"]
 
 [dev-dependencies]
@@ -43,6 +44,11 @@ tls = ["dep:rustls", "redis/tokio-rustls-comp", "redis/smol-rustls-comp"]
 # where a bare `ClientConfig::builder()` panics without an installed default.
 # `--no-dev-deps` builds are unaffected.
 rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.14"
+tokio = { version = "1", features = ["macros", "time", "rt-multi-thread"] }
+# `tls-rustls-insecure` lets the handshake test accept a self-signed peer via
+# `rediss://…#insecure`; verification stays on for every other URL.
+redis = { version = "1", features = ["tls-rustls-insecure"] }
 
 [lints]
 workspace = true
