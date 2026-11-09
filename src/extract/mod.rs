@@ -20,3 +20,10 @@ pub use client_ip::{ClientIp, PeerAddr};
 pub mod auth;
 #[cfg(feature = "auth")]
 pub use auth::BearerToken;
+
+#[cfg(feature = "validate")]
+mod valid;
+#[cfg(feature = "validate")]
+pub use valid::{
+    FieldViolation, Valid, ValidContext, ValidRejection, ValidatePayload, ValidationRejection,
+};
