@@ -74,14 +74,18 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Refresh `id`'s idle expiry without rewriting it. `expected` is the data this request
     /// loaded — a store that slides a TTL only by rewriting must check the record still holds
     /// those bytes first, or a concurrent write it never saw gets resurrected under it.
+    ///
+    /// Returns whether the server-side deadline actually moved: a backend that cannot touch
+    /// atomically reports `false`, and the caller then leaves the browser's deadline alone
+    /// too — expiring together beats sliding on one side only.
     fn touch<'a>(
         &'a self,
         id: &'a str,
         ttl: Duration,
         expected: Option<&'a SessionData>,
-    ) -> BoxFuture<'a, Result<(), SessionError>> {
+    ) -> BoxFuture<'a, Result<bool, SessionError>> {
         let _ = (id, ttl, expected);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(true) })
     }
 }
 
@@ -627,13 +631,15 @@ impl SessionsLayer {
                         SessionCache::Ready(Some(data)) => Some(data),
                         _ => None,
                     };
-                    store.touch(&id, self.ttl, expected).await?;
-                    // Sliding expiry is two-sided: touching the record alone leaves the
-                    // browser's Max-Age ticking toward the original deadline, so a clean
-                    // session re-emits its cookie alongside the server-side refresh.
-                    let mut cookie = Cookie::new(self.cookie_name, id.clone());
-                    set_session_cookie_flags(&mut cookie, self.ttl, keys.secure());
-                    jar.signed_mut(keys.key()).add(cookie);
+                    // Sliding expiry is two-sided or neither: a cookie renewed while the
+                    // record kept its deadline would promise a session the store already
+                    // plans to drop — so the fresh cookie goes out only when the server side
+                    // actually moved.
+                    if store.touch(&id, self.ttl, expected).await? {
+                        let mut cookie = Cookie::new(self.cookie_name, id.clone());
+                        set_session_cookie_flags(&mut cookie, self.ttl, keys.secure());
+                        jar.signed_mut(keys.key()).add(cookie);
+                    }
                 }
             }
         }
@@ -863,37 +869,17 @@ impl SessionStore for KvSessionStore {
         id: &'a str,
         ttl: Duration,
         expected: Option<&'a SessionData>,
-    ) -> BoxFuture<'a, Result<(), SessionError>> {
+    ) -> BoxFuture<'a, Result<bool, SessionError>> {
         Box::pin(async move {
             let key = store_key(id);
             match self.kv.expire(&key, ttl).await {
-                Ok(_) => Ok(()),
-                // A backend without native expiry (Cloudflare KV) slides a deadline only by
-                // rewriting the record — safe here because a clean session's bytes are
-                // unchanged, so the rewrite restores exactly what was read.
-                Err(KvError::Unsupported(_)) => {
-                    let Some(data) = self.kv.get(&key).await.map_err(SessionError::store)? else {
-                        return Ok(());
-                    };
-                    // The record changed since this request read it — a rotation or logout
-                    // wrote (or deleted) something newer, and rewriting would resurrect it.
-                    // `expected == None` means this session never loaded, so there is nothing
-                    // to check against and nothing safe to write.
-                    let still_same = expected
-                        .and_then(|expected| {
-                            serde_json::from_slice::<SessionData>(&data)
-                                .ok()
-                                .map(|stored| stored == *expected)
-                        })
-                        .unwrap_or(false);
-                    if still_same {
-                        self.kv
-                            .put_with_ttl(&key, &data, ttl)
-                            .await
-                            .map_err(SessionError::store)?;
-                    }
-                    Ok(())
-                }
+                Ok(_) => Ok(true),
+                // A backend without native expiry (Cloudflare KV) could slide the deadline
+                // only by rewriting the record — but verify-then-write cannot close the
+                // window where a concurrent delete lands, so a revoked session could be
+                // resurrected. Better not to slide at all: the record keeps its deadline
+                // and the caller keeps the cookie's — both sides expire together.
+                Err(KvError::Unsupported(_)) => Ok(false),
                 Err(other) => Err(SessionError::store(other)),
             }
         })
@@ -1037,7 +1023,7 @@ impl SessionStore for MemorySessionStore {
         id: &'a str,
         ttl: Duration,
         _expected: Option<&'a SessionData>,
-    ) -> BoxFuture<'a, Result<(), SessionError>> {
+    ) -> BoxFuture<'a, Result<bool, SessionError>> {
         Box::pin(async move {
             let now = now_ms();
             let mut entries = self.entries.lock().expect("memory store");
@@ -1048,13 +1034,14 @@ impl SessionStore for MemorySessionStore {
                     if let Some((expires, _)) = entries.get_mut(&store_key(id)) {
                         *expires = ttl.as_secs_f64().mul_add(1000.0, now);
                     }
+                    Ok(true)
                 }
                 Some(_) => {
                     entries.remove(&store_key(id));
+                    Ok(false)
                 }
-                None => {}
+                None => Ok(false),
             }
-            Ok(())
         })
     }
 }
