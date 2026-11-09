@@ -133,7 +133,10 @@ impl TrustedProxies {
     /// Resolve the client from the proxy headers, walking the chains back from the trusted peer
     /// and skipping every hop that is itself trusted.
     fn forwarded_client(&self, request: &Request, peer: Option<IpAddr>) -> Option<IpAddr> {
-        if self.cf_connecting_ip {
+        // `CF-Connecting-IP` is edge-written only where a Cloudflare peer removed the
+        // client's own — on any other host it is just a client header, so it is honored
+        // only when a recorded peer is itself in the trusted (Cloudflare) range.
+        if self.cf_connecting_ip && peer.is_some_and(|peer| self.trusts(&peer)) {
             if let Some(addr) = request
                 .headers()
                 .get(CF_CONNECTING_IP)
