@@ -83,8 +83,16 @@ impl Csrf {
         let headers = request.headers();
 
         // Fetch metadata wins: browsers always send it and it cannot be spoofed by a page.
+        // Only `same-origin` and `none` pass on this signal alone — `same-site` still covers
+        // sibling origins (potentially hostile tenants on a shared parent domain), so it
+        // falls through to the explicit allow-list.
         if let Some(site) = header_str(headers, &SEC_FETCH_SITE) {
-            return !site.eq_ignore_ascii_case("cross-site");
+            if site.eq_ignore_ascii_case("cross-site") {
+                return false;
+            }
+            if site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none") {
+                return true;
+            }
         }
 
         if let Some(origin) = header_str(headers, &ORIGIN) {
@@ -221,12 +229,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_site_fetch_metadata_passes() {
+    async fn same_site_falls_through_to_the_origin_allow_list() {
+        // `same-site` alone admits nothing — a hostile sibling tenant could send it.
         let mut request = post();
         request
             .headers_mut()
             .insert(&FETCH_SITE, HeaderValue::from_static("same-site"));
-        let response = router(Csrf::new(Vec::<&str>::new()))
+        let error = router(Csrf::new(Vec::<&str>::new()))
+            .go(request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+
+        // But a same-site request that also proves an allowed Origin passes.
+        let mut request = post();
+        request
+            .headers_mut()
+            .insert(&FETCH_SITE, HeaderValue::from_static("same-site"));
+        request
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("https://app.example.com"));
+        let response = router(Csrf::new(["https://app.example.com"]))
             .go(request)
             .await
             .unwrap();
