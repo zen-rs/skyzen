@@ -494,9 +494,10 @@ struct MemoryStore {
 #[derive(Debug, Default)]
 struct MemoryInner {
     buckets: HashMap<String, (u64, u64)>,
-    /// When the last full expiry sweep ran — retained once per window at most, so a
-    /// churned key space past the cap cannot make every request rescan the whole map.
-    last_sweep_ms: u64,
+    /// The window index the last full expiry sweep ran for — one sweep per index, so a
+    /// churned key space past the cap cannot make every request rescan the map, and the
+    /// boundary rollover always gets a fresh pass where dead buckets actually die.
+    last_sweep_index: Option<u64>,
 }
 
 /// The map sweep threshold — past it a `hit` first drops expired buckets so an unbounded
@@ -518,11 +519,10 @@ impl RateLimitStore for MemoryStore {
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if inner.buckets.len() > MAX_MEMORY_BUCKETS
-                    && now.saturating_sub(inner.last_sweep_ms) >= window_ms
+                if inner.buckets.len() > MAX_MEMORY_BUCKETS && inner.last_sweep_index != Some(index)
                 {
                     inner.buckets.retain(|_, (_, reset)| *reset > now);
-                    inner.last_sweep_ms = now;
+                    inner.last_sweep_index = Some(index);
                 }
                 if inner.buckets.len() > MAX_MEMORY_BUCKETS && !inner.buckets.contains_key(&bucket)
                 {
