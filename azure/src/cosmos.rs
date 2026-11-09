@@ -368,7 +368,9 @@ impl CosmosKv {
         {
             Ok(response) => {
                 let etag = response.headers().etag().map(ToString::to_string);
-                let document: StoredValue = response.into_model().map_err(cosmos_error)?;
+                let document: StoredValue = response.into_model().map_err(|error| {
+                    KvError::Decode(format!("stored document did not decode: {error}"))
+                })?;
                 Ok(Some((decode_value(&document.value)?, etag, document.ttl)))
             }
             Err(error) if is_absent(&error) => Ok(None),
