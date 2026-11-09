@@ -893,6 +893,10 @@ impl SessionStore for CookieSessionStore {
     }
 }
 
+/// The map sweep threshold — past it a `save` first drops expired records, then evicts the
+/// soonest-expiring ones, so abandoned sessions cannot grow memory without bound.
+const MAX_MEMORY_SESSIONS: usize = 8192;
+
 /// An in-process store for `Sessions::memory` — a map with lazy expiry sweeps.
 #[derive(Default)]
 struct MemorySessionStore {
@@ -954,11 +958,27 @@ impl SessionStore for MemorySessionStore {
         ttl: Duration,
     ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
-            let expires = ttl.as_secs_f64().mul_add(1000.0, now_ms());
-            self.entries
-                .lock()
-                .expect("memory store")
-                .insert(store_key(id), (expires, data.clone()));
+            let now = now_ms();
+            let expires = ttl.as_secs_f64().mul_add(1000.0, now);
+            let mut entries = self.entries.lock().expect("memory store");
+            entries.insert(store_key(id), (expires, data.clone()));
+            if entries.len() > MAX_MEMORY_SESSIONS {
+                entries.retain(|_, (expires, _)| *expires > now);
+            }
+            if entries.len() > MAX_MEMORY_SESSIONS {
+                // Still over — abandoned sessions outnumber the live sweep. Evict the ones
+                // closest to their own expiry first: bounding the map outweighs retiring
+                // a session a few minutes early.
+                let overflow = entries.len() - MAX_MEMORY_SESSIONS;
+                let mut expiries: Vec<(String, f64)> = entries
+                    .iter()
+                    .map(|(key, (expires, _))| (key.clone(), *expires))
+                    .collect();
+                expiries.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+                for (key, _) in expiries.into_iter().take(overflow) {
+                    entries.remove(&key);
+                }
+            }
             Ok(())
         })
     }
