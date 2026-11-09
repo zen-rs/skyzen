@@ -23,13 +23,17 @@ use std::{
 
 use cookie::{Cookie, CookieJar as RawCookieJar};
 use futures_core::future::BoxFuture;
-use http_kit::{header, header::HeaderValue, HttpError, Request, Response, StatusCode};
+use http_kit::{
+    header,
+    header::{HeaderMap, HeaderValue},
+    HttpError, Request, Response, StatusCode,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Value};
 use sha2::Digest;
 use skyzen_core::{
     middleware::{Middleware, Next},
-    Error, Extractor, Requirement,
+    Error, Extractor, PendingResponseHeaders, Requirement,
 };
 use skyzen_services::kv::{Kv, KvError};
 
@@ -535,6 +539,29 @@ impl SessionsLayer {
                 inner.pending,
             )
         };
+        for cookie in self
+            .jar_for(store, keys, (id, loaded_id, loaded, pending))
+            .await?
+            .delta()
+        {
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::try_from(cookie.encoded().to_string())
+                    .map_err(|_| SessionError::CookieHeader)?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Build the cookies the session's pending state calls for — store writes and deletions
+    /// happen here too, so this runs for both the normal `Set-Cookie` path and the error
+    /// path's deferred headers.
+    async fn jar_for(
+        &self,
+        store: &dyn SessionStore,
+        keys: &CookieKeys,
+        (id, loaded_id, loaded, pending): (String, Option<String>, SessionCache, Pending),
+    ) -> Result<RawCookieJar, SessionError> {
         let mut jar = RawCookieJar::new();
         match pending {
             Pending::Destroyed => {
@@ -588,24 +615,18 @@ impl SessionsLayer {
                 }
             }
         }
-        for cookie in jar.delta() {
-            response.headers_mut().append(
-                header::SET_COOKIE,
-                HeaderValue::try_from(cookie.encoded().to_string())
-                    .map_err(|_| SessionError::CookieHeader)?,
-            );
-        }
-        Ok(())
+        Ok(jar)
     }
 
-    /// Store-side effects of a mutated session, without the cookie — run when the chain
-    /// failed and there is no response to stamp onto. `destroy` still deletes, a rotated id
-    /// still writes its record; cookie-mode keeps its whole payload in the cookie, so there
-    /// is nothing store-side to save there, and a clean session is not renewed on failure.
+    /// A failed chain still owes the session's side effects — a `destroy` must expire the
+    /// cookie, a rotation must deliver the new id — so the cookies ride the request's
+    /// `PendingResponseHeaders` for whichever boundary renders the error.
     async fn persist(
         &self,
         store: &dyn SessionStore,
+        keys: &CookieKeys,
         slot: &SessionSlot,
+        request: &mut Request,
     ) -> Result<(), SessionError> {
         let (id, loaded_id, loaded, pending) = {
             let inner = slot.0.lock().expect("session lock");
@@ -616,26 +637,25 @@ impl SessionsLayer {
                 inner.pending,
             )
         };
-        match pending {
-            Pending::Destroyed => {
-                if let Some(loaded_id) = loaded_id {
-                    store.delete(&loaded_id).await?;
-                }
+        let jar = self
+            .jar_for(store, keys, (id, loaded_id, loaded, pending))
+            .await?;
+        let extensions = request.extensions_mut();
+        let pending_headers = match extensions.get_mut::<PendingResponseHeaders>() {
+            Some(pending) => pending,
+            None => {
+                extensions.insert(PendingResponseHeaders(HeaderMap::new()));
+                extensions
+                    .get_mut::<PendingResponseHeaders>()
+                    .expect("pending headers just inserted")
             }
-            Pending::Dirty if !self.in_cookie => {
-                let data = match loaded {
-                    SessionCache::Ready(data) => data.unwrap_or_default(),
-                    SessionCache::Unloaded => match &loaded_id {
-                        Some(old) => store.load(old).await?.unwrap_or_default(),
-                        None => SessionData::new(),
-                    },
-                };
-                store.save(&id, &data, self.ttl).await?;
-                if let Some(old) = loaded_id.filter(|old| *old != id) {
-                    store.delete(&old).await?;
-                }
-            }
-            _ => {}
+        };
+        for cookie in jar.delta() {
+            pending_headers.0.append(
+                header::SET_COOKIE,
+                HeaderValue::try_from(cookie.encoded().to_string())
+                    .map_err(|_| SessionError::CookieHeader)?,
+            );
         }
         Ok(())
     }
@@ -675,10 +695,11 @@ impl Middleware for SessionsLayer {
                     .await?;
                 Ok(response)
             }
-            // The chain failed — a response will be built at the edge, too late for a cookie
-            // — but a destroyed or rotated session must still reach the store.
+            // The chain failed — a response will be built at the edge — but the session's
+            // side effects still apply: store writes here, Set-Cookie deferred onto whatever
+            // response the error becomes.
             Err(error) => {
-                self.persist(&*store, &slot).await?;
+                self.persist(&*store, &keys, &slot, request).await?;
                 Err(error)
             }
         }
