@@ -114,6 +114,9 @@ include_dir = "0.7"
 skyzen-macros.workspace = true
 base64 = { version = "0.22", optional = true }
 sha1 = { version = "0.10", optional = true }
+sha2 = "0.10"
+# Session ids are 128 random bits; getrandom's `js` backend (wasm32 section) reaches WebCrypto.
+getrandom = "0.2"
 futures-util = { version = "0.3.32" }
 futures-core = { version = "0.3.32" }
 # The websocket session plumbing needs oneshot/mpsc channels on every target: wasm converts the
