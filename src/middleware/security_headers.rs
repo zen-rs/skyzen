@@ -167,7 +167,13 @@ impl Middleware for SecurityHeaders {
     ) -> impl Future<Output = Result<Response, Error>> + Send {
         let headers = self.headers.clone();
         async move {
-            let mut response = next.run(request).await?;
+            // An `Err` from inside is materialized here rather than propagated: the default
+            // conversion builds the same `error_response`, and propagating would send error
+            // responses out with none of these headers.
+            let mut response = match next.run(request).await {
+                Ok(response) => response,
+                Err(error) => skyzen_core::error_response(error.into_boxed_http_error().as_ref()),
+            };
             for (name, value) in headers {
                 response
                     .headers_mut()
