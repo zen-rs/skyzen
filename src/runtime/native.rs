@@ -1337,39 +1337,53 @@ async fn negotiated_stream<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let (stream, negotiated_h2) = match tls {
-        Some(tls) => match tls.accept(stream).await {
-            Ok(stream) => {
-                let h2 = matches!(stream.get_ref().1.alpn_protocol(), Some(b"h2"));
-                (TlsOrPlain::Tls(Box::new(stream)), h2)
-            }
+    let Some(tls) = tls else {
+        // Cleartext: the preface sniff decides, exactly as it always has.
+        return match sniff_protocol_with_timeout(TlsOrPlain::Plain(stream), HTTP2_PREFACE).await {
+            Ok(result) => Some(result),
             Err(error) => {
-                // TCP probes that connect and close, and plaintext clients
-                // knocking on an HTTPS port, are routine noise on a public
-                // listener — debug, not error.
-                debug!("TLS handshake failed: {error}");
-                return None;
+                error!("Failed to read connection preface: {error}");
+                None
             }
-        },
-        None => (TlsOrPlain::Plain(stream), false),
+        };
     };
 
-    // The bounded preface read runs even after ALPN negotiated `h2`: the preface
-    // is still the first thing a real h2 client sends, and without the bound a
-    // client could finish the TLS handshake and then pin the connection task
-    // and its shutdown guard forever. ALPN only settles the protocol — when it
-    // promised h2 and the bytes disagree, the connection is a violation, not an
-    // HTTP/1 request.
-    match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
-        Ok((_, is_h2)) if negotiated_h2 && !is_h2 => {
-            debug!("ALPN negotiated h2 but the connection does not open with the preface");
-            None
-        }
-        Ok(result) => Some(result),
+    let stream = match tls.accept(stream).await {
+        Ok(stream) => stream,
         Err(error) => {
-            error!("Failed to read connection preface: {error}");
-            None
+            // TCP probes that connect and close, and plaintext clients
+            // knocking on an HTTPS port, are routine noise on a public
+            // listener — debug, not error.
+            debug!("TLS handshake failed: {error}");
+            return None;
         }
+    };
+
+    // RFC 9113 §3.3: over TLS the protocol comes from ALPN alone — an `h2`
+    // promise still owes the real preface inside the bound (without it an idle
+    // client pins the connection task and its shutdown guard forever), and any
+    // other negotiated outcome is served HTTP/1.1 whatever bytes the client
+    // sends. There is no h2c-by-sniffing on a TLS connection.
+    match stream.get_ref().1.alpn_protocol() {
+        Some(b"h2") => {
+            match sniff_protocol_with_timeout(TlsOrPlain::Tls(Box::new(stream)), HTTP2_PREFACE)
+                .await
+            {
+                Ok((prefixed, true)) => Some((prefixed, true)),
+                Ok(_) => {
+                    debug!("ALPN negotiated h2 but the connection does not open with the preface");
+                    None
+                }
+                Err(error) => {
+                    error!("Failed to read connection preface: {error}");
+                    None
+                }
+            }
+        }
+        _ => Some((
+            Prefixed::new(TlsOrPlain::Tls(Box::new(stream)), Vec::new()),
+            false,
+        )),
     }
 }
 
@@ -2809,5 +2823,41 @@ mod tests {
             matches!(read, Ok(0) | Err(_)),
             "the client must observe the close, got {read:?}"
         );
+    }
+
+    /// RFC 9113 §3.3: over TLS the protocol is ALPN's, not the bytes'. An
+    /// `http/1.1` client that sends the HTTP/2 preface anyway must still be
+    /// served HTTP/1 — cleartext keeps its sniff, TLS does not get one.
+    #[tokio::test]
+    #[cfg(feature = "server-tls")]
+    async fn an_h1_alpn_client_sending_the_h2_preface_stays_h1() {
+        let (_dir, files, der) = tls_material();
+        let acceptor =
+            super::ServerTls(super::load_tls_acceptor(&files).expect("the generated pair loads"));
+        let listener = async_net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let serve = async {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            negotiated_stream(stream, Some(&acceptor)).await
+        };
+        let request = async {
+            let stream = async_net::TcpStream::connect(addr).await.expect("connect");
+            let mut tls = tls_connector(&der, b"http/1.1")
+                .connect(server_name(), stream)
+                .await
+                .expect("client handshake");
+            tls.write_all(HTTP2_PREFACE).await.expect("write preface");
+            tls
+        };
+        let (prepared, _tls) = futures_util::future::join(serve, request).await;
+        let (mut stream, is_h2) = prepared.expect("the connection is still served");
+        assert!(!is_h2, "an http/1.1 ALPN must never serve h2");
+        // The preface bytes reach the HTTP/1 layer as (invalid) request bytes,
+        // unread — hyper's parser rejects them on its own.
+        let mut restored = Vec::new();
+        let _ = stream.read(&mut restored).await;
     }
 }
