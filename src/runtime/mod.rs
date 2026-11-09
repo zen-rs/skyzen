@@ -19,6 +19,10 @@ pub mod native;
 #[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
 pub mod consumer;
 
+/// The native scheduler runtime that drives `#[skyzen::scheduled]` off the edge.
+#[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
+pub mod scheduler;
+
 /// The Azure Functions custom-handler integration.
 #[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
 pub mod azure;

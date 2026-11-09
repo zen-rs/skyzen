@@ -11,6 +11,9 @@
 //!   envelope. Nothing in a router would recognize that, so [`mount`] wraps the application's
 //!   endpoint in one that intercepts exactly the declared function names and drives the
 //!   `#[skyzen::queue]` handler with them.
+//! - A **timer trigger** arrives through the same `POST /{functionName}` envelope shape, its
+//!   `Data` carrying the `TimerInfo` the `timerTrigger` binding declared. [`mount`] intercepts
+//!   it the same way and drives the `#[skyzen::scheduled]` handler.
 //!
 //! The interception is live *only* under `FUNCTIONS_CUSTOMHANDLER_PORT`: the same binary run
 //! locally serves those paths from the router like any other, because nothing else is POSTing
@@ -26,14 +29,15 @@ use std::{
 
 use http_kit::{Body, Endpoint, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use skyzen_services::queue::{
-    envelope, QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition,
+use skyzen_services::{
+    queue::{envelope, QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition},
+    ScheduledTick,
 };
 use tracing::{debug, error, info, warn};
 
 use crate::{
     routing::{MethodFilter, ServedRoutes},
-    runtime::consumer::ConsumerSet,
+    runtime::{consumer::ConsumerSet, scheduler::ScheduleSet},
 };
 
 /// The environment variable the Functions host sets, and the signal that we are running under it.
@@ -51,6 +55,20 @@ pub struct QueueTrigger {
     pub queue: &'static str,
 }
 
+/// One `[[schedule]]` entry, as the Azure Functions host drives it.
+///
+/// Every declared schedule is a `timerTrigger` function of its own: `function` is both the
+/// Functions name and the path the host POSTs its ticks to, and `cron` is the portable
+/// expression the manifest wrote — reported to the handler as [`ScheduledTick::cron`] so it
+/// reads the same on every target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledTrigger {
+    /// The Function name, which is the path the host POSTs the tick to.
+    pub function: &'static str,
+    /// The portable 5-field cron expression, reported to the handler as [`ScheduledTick::cron`].
+    pub cron: &'static str,
+}
+
 /// Why an application cannot be served under the Functions host.
 ///
 /// Every variant is a wiring mistake that no request will fix, so the runtime refuses to start
@@ -59,6 +77,12 @@ pub struct QueueTrigger {
 pub enum MountError {
     /// The manifest declares a queue trigger but the application has no handler for it.
     NoQueueHandler {
+        /// The first offending function, named so the error points somewhere.
+        function: String,
+    },
+    /// The manifest declares a `[[schedule]]` but the application has no
+    /// `#[skyzen::scheduled]` handler for it.
+    NoScheduledHandler {
         /// The first offending function, named so the error points somewhere.
         function: String,
     },
@@ -84,10 +108,15 @@ impl core::fmt::Display for MountError {
                 "[[azure.queue_triggers]] declares the function `{function}`, but this application \
                  has no #[skyzen::queue] handler to give its messages to"
             ),
+            Self::NoScheduledHandler { function } => write!(
+                f,
+                "[[schedule]] declares `{function}`, but this application has no \
+                 #[skyzen::scheduled] handler to give its ticks to"
+            ),
             Self::DuplicateFunction { function } => write!(
                 f,
-                "[[azure.queue_triggers]] declares the function `{function}` twice; every \
-                 Functions name is a distinct URL path, so one would shadow the other"
+                "the manifest declares the function `{function}` twice; every Functions name is \
+                 a distinct URL path, so one would shadow the other"
             ),
             Self::RouteCollision { function, route } => write!(
                 f,
@@ -101,23 +130,30 @@ impl core::fmt::Display for MountError {
 
 impl std::error::Error for MountError {}
 
-/// Wrap `endpoint` so the declared queue triggers are answered before it sees them.
+/// Wrap `endpoint` so the declared triggers are answered before it sees them.
+///
+/// Queue and timer triggers share one table of function names — a Functions app cannot declare
+/// two functions with one name — so a name claimed in either list is a [`MountError`], whether
+/// it collides with its own kind or the other.
 ///
 /// # Errors
 ///
 /// [`MountError`] when a trigger has no handler behind it, when two triggers share a name, or when
 /// a trigger's path is one the application already serves as a literal route.
-pub fn mount<E, C>(
+pub fn mount<E, C, S>(
     endpoint: E,
     consumers: C,
-    triggers: &'static [QueueTrigger],
-) -> Result<FunctionsHost<E, C>, MountError>
+    schedules: S,
+    queue_triggers: &'static [QueueTrigger],
+    scheduled_triggers: &'static [ScheduledTrigger],
+) -> Result<FunctionsHost<E, C, S>, MountError>
 where
     E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     let mut seen = BTreeMap::new();
-    for trigger in triggers {
+    for trigger in queue_triggers {
         if !C::DECLARES_HANDLER {
             return Err(MountError::NoQueueHandler {
                 function: trigger.function.to_owned(),
@@ -128,7 +164,7 @@ where
                 function: trigger.function.to_owned(),
             });
         }
-        check_route_collision(trigger, endpoint.served_routes())?;
+        check_route_collision(trigger.function, endpoint.served_routes())?;
         info!(
             function = trigger.function,
             queue = trigger.queue,
@@ -136,11 +172,32 @@ where
             trigger.function
         );
     }
+    for trigger in scheduled_triggers {
+        if !S::DECLARES_HANDLER {
+            return Err(MountError::NoScheduledHandler {
+                function: trigger.function.to_owned(),
+            });
+        }
+        if seen.insert(trigger.function, trigger.cron).is_some() {
+            return Err(MountError::DuplicateFunction {
+                function: trigger.function.to_owned(),
+            });
+        }
+        check_route_collision(trigger.function, endpoint.served_routes())?;
+        info!(
+            function = trigger.function,
+            cron = trigger.cron,
+            "serving an Azure Functions timer trigger at POST /{}",
+            trigger.function
+        );
+    }
 
     Ok(FunctionsHost {
         endpoint,
         consumers: Arc::new(consumers),
-        triggers,
+        schedules: Arc::new(schedules),
+        queue_triggers,
+        scheduled_triggers,
     })
 }
 
@@ -151,10 +208,10 @@ where
 /// catch-all route merely loses one of the many paths it matches — which is sometimes exactly what
 /// the author intended, and is never silent.
 fn check_route_collision(
-    trigger: &QueueTrigger,
+    function: &str,
     routes: &[(MethodFilter, String)],
 ) -> Result<(), MountError> {
-    let path = format!("/{}", trigger.function);
+    let path = format!("/{function}");
     let mut table = matchit::Router::new();
     for (_, route) in routes {
         // A path registered for several methods is one path here, and two routes that `matchit`
@@ -168,13 +225,13 @@ fn check_route_collision(
 
     if shadowed.value == &path {
         return Err(MountError::RouteCollision {
-            function: trigger.function.to_owned(),
+            function: function.to_owned(),
             route: shadowed.value.clone(),
         });
     }
 
     warn!(
-        function = trigger.function,
+        function,
         route = shadowed.value.as_str(),
         "an Azure Functions queue trigger takes precedence over a route that would also match \
          its path; that path no longer reaches the route while running under the Functions host"
@@ -182,48 +239,70 @@ fn check_route_collision(
     Ok(())
 }
 
-/// An application wrapped for the Functions host: queue triggers first, then everything else.
+/// An application wrapped for the Functions host: declared triggers first, then everything else.
 ///
-/// Cloned once per connection like any other endpoint, which is why the consumer set — built once,
-/// and holding the application's one queue handler — sits behind an [`Arc`] rather than being
-/// required to clone itself.
+/// Cloned once per connection like any other endpoint, which is why the event sets — built once,
+/// and holding the application's one handler each — sit behind [`Arc`]s rather than being
+/// required to clone themselves.
 #[derive(Debug)]
-pub struct FunctionsHost<E, C> {
+pub struct FunctionsHost<E, C, S> {
     endpoint: E,
     consumers: Arc<C>,
-    triggers: &'static [QueueTrigger],
+    schedules: Arc<S>,
+    queue_triggers: &'static [QueueTrigger],
+    scheduled_triggers: &'static [ScheduledTrigger],
 }
 
-impl<E: Clone, C> Clone for FunctionsHost<E, C> {
+impl<E: Clone, C, S> Clone for FunctionsHost<E, C, S> {
     fn clone(&self) -> Self {
         Self {
             endpoint: self.endpoint.clone(),
             consumers: Arc::clone(&self.consumers),
-            triggers: self.triggers,
+            schedules: Arc::clone(&self.schedules),
+            queue_triggers: self.queue_triggers,
+            scheduled_triggers: self.scheduled_triggers,
         }
     }
 }
 
-impl<E, C> FunctionsHost<E, C> {
+/// The kind of trigger a `POST /{function}` is invoking.
+enum Trigger {
+    /// A Storage queue trigger, dispatched to the `#[skyzen::queue]` handler.
+    Queue(&'static QueueTrigger),
+    /// A timer trigger, dispatched to the `#[skyzen::scheduled]` handler.
+    Scheduled(&'static ScheduledTrigger),
+}
+
+impl<E, C, S> FunctionsHost<E, C, S> {
     /// The trigger this request is for, if it is for one at all.
     ///
     /// Matched on `POST /{function}` exactly: the host uses no other method or shape for a queue
-    /// invocation, and matching more loosely would swallow a `GET` the router should answer.
-    fn trigger_for(&self, request: &Request) -> Option<&'static QueueTrigger> {
+    /// or timer invocation, and matching more loosely would swallow a `GET` the router should
+    /// answer. Queue names win when both kinds somehow claim one — `mount` has already refused
+    /// to build that host, so this arm only orders the ordinary case.
+    fn trigger_for(&self, request: &Request) -> Option<Trigger> {
         if request.method() != Method::POST {
             return None;
         }
         let path = request.uri().path().strip_prefix('/')?;
-        self.triggers
+        self.queue_triggers
             .iter()
             .find(|trigger| trigger.function == path)
+            .map(Trigger::Queue)
+            .or_else(|| {
+                self.scheduled_triggers
+                    .iter()
+                    .find(|trigger| trigger.function == path)
+                    .map(Trigger::Scheduled)
+            })
     }
 }
 
-impl<E, C> Endpoint for FunctionsHost<E, C>
+impl<E, C, S> Endpoint for FunctionsHost<E, C, S>
 where
     E: Endpoint + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     type Error = E::Error;
 
@@ -232,17 +311,21 @@ where
             return self.endpoint.respond(request).await;
         };
 
-        Ok(self.invoke(trigger, request).await)
+        Ok(match trigger {
+            Trigger::Queue(trigger) => self.invoke_queue(trigger, request).await,
+            Trigger::Scheduled(trigger) => self.invoke_scheduled(trigger, request).await,
+        })
     }
 }
 
-impl<E, C> FunctionsHost<E, C>
+impl<E, C, S> FunctionsHost<E, C, S>
 where
     E: Endpoint + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     /// Drive the queue handler for one invocation and answer the host.
-    async fn invoke(&self, trigger: &QueueTrigger, request: &mut Request) -> Response {
+    async fn invoke_queue(&self, trigger: &QueueTrigger, request: &mut Request) -> Response {
         let batch = match read_batch(trigger, request).await {
             Ok(batch) => batch,
             Err(error) => {
@@ -280,6 +363,47 @@ where
                     "the queue handler failed; the host will redeliver the message"
                 );
                 failed("the queue handler failed")
+            }
+        }
+    }
+
+    /// Drive the scheduled handler for one invocation and answer the host.
+    ///
+    /// A timer trigger has no retry of its own to honor: `Err` is only ever reported to the
+    /// invocation log, the way an `Err` return reads on Cloudflare.
+    async fn invoke_scheduled(
+        &self,
+        trigger: &ScheduledTrigger,
+        request: &mut Request,
+    ) -> Response {
+        let tick = match read_tick(trigger, request).await {
+            Ok(tick) => tick,
+            Err(error) => {
+                error!(
+                    function = trigger.function,
+                    error = %error,
+                    "could not read the Functions timer envelope; the invocation fails"
+                );
+                return failed(&error.to_string());
+            }
+        };
+
+        debug!(
+            function = trigger.function,
+            cron = trigger.cron,
+            "handling a timer trigger invocation"
+        );
+
+        match self.schedules.dispatch(tick).await {
+            Ok(()) => succeeded(),
+            Err(error) => {
+                error!(
+                    function = trigger.function,
+                    cron = trigger.cron,
+                    error = %skyzen_core::ErrorChain(error.as_ref()),
+                    "the scheduled handler failed"
+                );
+                failed("the scheduled handler failed")
             }
         }
     }
@@ -350,6 +474,32 @@ fn failed(reason: &str) -> Response {
         http_kit::header::HeaderValue::from_static("application/json"),
     );
     response
+}
+
+/// Read one timer invocation into the portable tick the handler expects.
+///
+/// The `timerTrigger` binding's `Data` carries its `TimerInfo` under the name the generated
+/// `function.json` declares — always `timer` for a Skyzen function. [`ScheduledTick::cron`]
+/// comes from the manifest rather than the payload: the host reports the NCRONTAB the CLI
+/// translated, and the handler should read the portable expression it was written with.
+/// [`ScheduledTick::scheduled_time_ms`] is the `ScheduleStatus.Last` the host reports — the
+/// time this tick was scheduled for, which is also what a past-due firing still names — or the
+/// receive time when the invocation carries none (a manual `func` invoke, for example).
+async fn read_tick(
+    trigger: &ScheduledTrigger,
+    request: &mut Request,
+) -> Result<ScheduledTick, EnvelopeError> {
+    let body = request
+        .body_mut()
+        .take()
+        .map_err(|_| EnvelopeError::BodyUnavailable)?
+        .into_bytes()
+        .await
+        .map_err(|error| EnvelopeError::Unreadable(error.to_string()))?;
+    let envelope: InvokeRequest = serde_json::from_slice(&body)
+        .map_err(|error| EnvelopeError::Malformed(error.to_string()))?;
+
+    envelope.into_tick(trigger)
 }
 
 /// What can go wrong reading an invocation the host sent.
@@ -450,6 +600,50 @@ impl InvokeRequest {
                 body: decode_message(&value)?,
             }],
         })
+    }
+
+    /// Turn one timer invocation into the portable tick the handler is given.
+    ///
+    /// # Errors
+    ///
+    /// [`EnvelopeError::UnexpectedBindings`] when `Data` does not hold the `timer` binding — the
+    /// only one a timer trigger can carry.
+    fn into_tick(self, trigger: &ScheduledTrigger) -> Result<ScheduledTick, EnvelopeError> {
+        if self.data.len() != 1 {
+            return Err(EnvelopeError::UnexpectedBindings(
+                self.data.keys().cloned().collect(),
+            ));
+        }
+        let (binding, value) = self
+            .data
+            .into_iter()
+            .next()
+            .expect("the map holds exactly one entry");
+        if binding != "timer" {
+            return Err(EnvelopeError::UnexpectedBindings(vec![binding]));
+        }
+
+        // `ScheduleStatus.Last` is when the host last ran the schedule; for the invocation it
+        // is delivering right now, that is the scheduled time of this tick. An ISO-8601 it
+        // cannot parse — or a manual invocation carrying no TimerInfo at all — falls back to
+        // the receive time, the same report a pull-based backend makes.
+        let scheduled_time_ms = value
+            .get("ScheduleStatus")
+            .and_then(|status| status.get("Last"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|last| chrono::DateTime::parse_from_rfc3339(last).ok())
+            .map_or_else(now_ms, |last| last.timestamp_millis());
+
+        debug!(
+            function = trigger.function,
+            cron = trigger.cron,
+            "decoded a Functions timer invocation"
+        );
+
+        Ok(ScheduledTick::new(
+            trigger.cron.to_owned(),
+            scheduled_time_ms,
+        ))
     }
 }
 

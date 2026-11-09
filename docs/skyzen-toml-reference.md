@@ -664,11 +664,48 @@ crons = ["0 * * * *", "*/15 * * * *"]
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `crons` | string[] | Cron expressions, in Cloudflare's own syntax, that invoke the `scheduled` handler |
+| `crons` | string[] | Cloudflare-only cron expressions that invoke the `scheduled` handler |
 
-Declaring any cron makes the generated Worker shim export a `scheduled` member, which requires a
-Rust handler annotated `#[skyzen::scheduled]`. `skyzen dev --provider cloudflare -- --test-scheduled`
-fires it on demand rather than waiting for the schedule.
+Declaring any cron — here, or portably through [`[[schedule]]`](#schedules) — makes the generated
+Worker shim export a `scheduled` member, which requires a Rust handler annotated
+`#[skyzen::scheduled]`. `skyzen dev --provider cloudflare -- --test-scheduled` fires it on demand
+rather than waiting for the schedule. Prefer `[[schedule]]` for anything the application should
+also run natively or on the other platforms; `crons` stays the escape hatch for schedules that
+only ever live on the edge.
+
+### Schedules
+
+```toml
+[[schedule]]
+name = "tick"
+cron = "*/10 * * * *"
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | string | **Required.** Schedule name — an ASCII letter followed by letters, digits, `-` or `_` — which also names the Azure function and the EventBridge rule |
+| `cron` | string | **Required.** A portable 5-field cron expression (minute, hour, day-of-month, month, day-of-week). No seconds/year fields, no `?`, `L`, `W` or `#`, and the expression must be able to fire |
+
+Each `[[schedule]]` drives the application's single `#[skyzen::scheduled]` handler with a
+`ScheduledTick` carrying the cron and the time it was due. Per target:
+
+- **Native** — `src/runtime/scheduler.rs` runs a timer loop per entry; ticks are sequential
+  per schedule, missed wall-clock ticks are skipped rather than queued. `skyzen dev --
+  --test-scheduled` fires every schedule once on startup.
+- **Cloudflare** — the crons join `[cloudflare.triggers] crons` in the generated `wrangler.toml`
+  (duplicates removed).
+- **AWS Lambda** — `skyzen deploy` creates an EventBridge rule `{function}-{name}` per entry
+  (translating the cron to AWS's `cron(...)` form: `?` in the unconstrained day field, `0/n` for
+  `*/n` steps; constraining *both* day fields is refused because AWS cannot express it).
+- **Azure Functions** — each entry becomes a `timerTrigger` function named `<name>` with an
+  NCRONTAB schedule (`0` seconds + the portable fields, Sunday renumbered 7→0).
+
+Azure-only tuning goes in `[azure.schedule.<NAME>]`:
+
+```toml
+[azure.schedule.tick]
+run_on_startup = true
+```
 
 ### Service Bindings
 

@@ -6,7 +6,9 @@
 use crate::providers::{FileContents, GeneratedFile};
 use anyhow::{Context, Result};
 use serde::Serialize;
-use skyzen_manifest::{AzureQueueTrigger, AzureSection, HTTP_FUNCTION_NAME};
+use skyzen_manifest::{
+    AzureQueueTrigger, AzureScheduleSection, AzureSection, ScheduleEntry, HTTP_FUNCTION_NAME,
+};
 use std::{collections::BTreeMap, path::Path};
 
 /// The `function.json` schema version every Functions app declares.
@@ -28,6 +30,7 @@ const EXTENSION_BUNDLE_VERSION: &str = "[4.0.0, 5.0.0)";
 /// longer describe JSON.
 pub fn render(
     config: &AzureSection,
+    schedules: &[ScheduleEntry],
     binary: &str,
     bundle_dir: &Path,
 ) -> Result<Vec<GeneratedFile>> {
@@ -53,6 +56,18 @@ pub fn render(
         files.push(GeneratedFile {
             path: bundle_dir.join(&trigger.function).join("function.json"),
             contents: FileContents::Public(to_json(&FunctionJson::queue(trigger))?),
+        });
+    }
+
+    for schedule in schedules {
+        files.push(GeneratedFile {
+            path: bundle_dir
+                .join(schedule.name.as_str())
+                .join("function.json"),
+            contents: FileContents::Public(to_json(&FunctionJson::timer(
+                schedule,
+                config.schedule.get(schedule.name.as_str()),
+            ))?),
         });
     }
 
@@ -208,6 +223,8 @@ impl FunctionJson {
                     ),
                     queue_name: None,
                     connection: None,
+                    schedule: None,
+                    run_on_startup: None,
                 },
                 Binding {
                     kind: "http",
@@ -218,6 +235,8 @@ impl FunctionJson {
                     methods: None,
                     queue_name: None,
                     connection: None,
+                    schedule: None,
+                    run_on_startup: None,
                 },
             ],
         }
@@ -238,9 +257,67 @@ impl FunctionJson {
                 methods: None,
                 queue_name: Some(trigger.queue.clone()),
                 connection: Some(trigger.connection_env.clone()),
+                schedule: None,
+                run_on_startup: None,
             }],
         }
     }
+
+    /// One `[[schedule]]`, as a Functions `timerTrigger`.
+    ///
+    /// The binding name is `timer` — the key the invocation's `Data` carries, which is what the
+    /// runtime reads the `TimerInfo` out of. The schedule is NCRONTAB, the six-field form the
+    /// host wants: the portable five-field expression with a leading seconds `0`, and Sunday
+    /// renumbered 7→0 where the user spelled it numerically.
+    fn timer(schedule: &ScheduleEntry, azure: Option<&AzureScheduleSection>) -> Self {
+        Self {
+            bindings: vec![Binding {
+                kind: "timerTrigger",
+                direction: "in",
+                name: "timer",
+                auth_level: None,
+                route: None,
+                methods: None,
+                queue_name: None,
+                connection: None,
+                schedule: Some(ncrontab(schedule.cron.as_str())),
+                run_on_startup: azure.and_then(|section| section.run_on_startup.then_some(true)),
+            }],
+        }
+    }
+}
+
+/// The NCRONTAB form of a portable cron: a leading seconds `0`, and Sunday spelled the way
+/// NCRONTAB numbers it.
+///
+/// NCRONTAB numbers Sunday `0` and treats `7` as invalid, where the portable grammar follows
+/// Cloudflare in accepting `7` as an alias. So `7` becomes `0`, and `7` at the *end* of a range
+/// (`1-7`, "Monday to Sunday") becomes `6` — the same set of days, numbered for the host.
+/// Names (`SUN`) and `*`/`?`/lists need no remapping: NCRONTAB speaks them already.
+fn ncrontab(cron: &str) -> String {
+    let fields: Vec<&str> = cron.split_whitespace().collect();
+    let dow = fields.get(4).map_or_else(
+        || "?".to_owned(),
+        |field| {
+            field
+                .split(',')
+                .map(|item| match item.split_once('-') {
+                    Some((start, "7")) => format!("{start}-6"),
+                    None if item == "7" => "0".to_owned(),
+                    _ => item.to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+
+    format!(
+        "0 {minute} {hour} {dom} {month} {dow}",
+        minute = fields.first().copied().unwrap_or("*"),
+        hour = fields.get(1).copied().unwrap_or("*"),
+        dom = fields.get(2).copied().unwrap_or("*"),
+        month = fields.get(3).copied().unwrap_or("*"),
+    )
 }
 
 /// One entry of a function's `bindings` array.
@@ -264,6 +341,10 @@ struct Binding {
     queue_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     connection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule: Option<String>,
+    #[serde(rename = "runOnStartup", skip_serializing_if = "Option::is_none")]
+    run_on_startup: Option<bool>,
 }
 
 #[cfg(test)]
@@ -282,8 +363,10 @@ mod tests {
     }
 
     fn rendered(source: &str) -> Vec<(PathBuf, serde_json::Value)> {
+        let manifest = Manifest::parse(source, "Skyzen.toml", "/tmp/app").expect("valid manifest");
         render(
             &config(source),
+            &manifest.data().schedule,
             "demo",
             Path::new("/tmp/app/.skyzen/gen/azure"),
         )
@@ -395,6 +478,39 @@ mod tests {
         // Exactly one binding, which is what lets the runtime read the message without agreeing
         // on its name.
         assert_eq!(queue["bindings"].as_array().expect("bindings").len(), 1);
+    }
+
+    #[test]
+    fn a_schedule_gets_its_own_timer_function() {
+        let files = rendered(
+            "[azure]\n\n[[schedule]]\nname = \"tick\"\ncron = \"*/10 9-17 * * MON-FRI\"\n",
+        );
+
+        let timer = document(&files, "tick/function.json");
+        let binding = &timer["bindings"][0];
+        assert_eq!(binding["type"], "timerTrigger");
+        assert_eq!(binding["name"], "timer");
+        // NCRONTAB: a leading seconds `0`, the portable fields carried over.
+        assert_eq!(binding["schedule"], "0 */10 9-17 * * MON-FRI");
+        assert!(binding["runOnStartup"].is_null());
+    }
+
+    #[test]
+    fn a_sunday_spelled_seven_is_renumbered_for_ncrontab() {
+        assert_eq!(super::ncrontab("0 9 * * 7"), "0 0 9 * * 0");
+        assert_eq!(super::ncrontab("0 9 * * 1-7"), "0 0 9 * * 1-6");
+        assert_eq!(super::ncrontab("0 9 * * SUN"), "0 0 9 * * SUN");
+    }
+
+    #[test]
+    fn run_on_startup_is_emitted_when_the_manifest_asks() {
+        let files = rendered(
+            "[azure]\n\n[[schedule]]\nname = \"warm\"\ncron = \"0 * * * *\"\n\n\
+             [azure.schedule.warm]\nrun_on_startup = true\n",
+        );
+
+        let timer = document(&files, "warm/function.json");
+        assert_eq!(timer["bindings"][0]["runOnStartup"], true);
     }
 
     #[test]

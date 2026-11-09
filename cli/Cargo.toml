@@ -21,6 +21,11 @@ askama = "0.16"
 # one HTTP stack: the SDK default `rustls` feature pulls the legacy connector (rustls 0.21 /
 # hyper-rustls 0.24) alongside the modern `default-https-client`, and carries unpatched advisories.
 aws-config = "1"
+# EventBridge rules are what a `[[schedule]]` deploys to on Lambda; see `providers::aws`.
+aws-sdk-eventbridge = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-sdk-lambda = { version = "1", default-features = false, features = [
     "default-https-client",
     "rt-tokio",

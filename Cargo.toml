@@ -152,6 +152,10 @@ smol.workspace = true
 async-channel = "2.5"
 async-lock = "3"
 ctrlc.workspace = true
+# The cron parser Cloudflare runs Cron Triggers with: `runtime::scheduler` asks it for the next
+# fire time of a `[[schedule]]` entry, so the native loop means exactly what the edge does.
+saffron = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 http-body-util = "0.1.3"
 # Optional native dependencies

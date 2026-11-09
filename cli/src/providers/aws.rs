@@ -12,6 +12,7 @@
 //! `--env-var NAME=value` flag is printed by every progress line and visible in the process table,
 //! so the variables are delivered afterwards through the SDK instead. See [`lambda_env`].
 
+mod eventbridge;
 mod lambda_env;
 
 use crate::{
@@ -24,6 +25,7 @@ use crate::{
     },
 };
 use anyhow::Result;
+use eventbridge::EventBridgeSchedules;
 use lambda_env::{LambdaEnvironment, LambdaEnvironmentNames};
 use skyzen_manifest::{AwsSection, Manifest};
 
@@ -67,7 +69,17 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
             let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
             if !delivery.is_empty() {
                 steps.push(Step::Task(Box::new(LambdaEnvironment::new(
-                    function, delivery,
+                    function.clone(),
+                    delivery,
+                ))));
+            }
+            if !manifest.data().schedule.is_empty() {
+                // Every `[[schedule]]` is an EventBridge rule pointed at the function — the one
+                // part of a deploy `cargo lambda` cannot express, created in process so the
+                // deployed function actually fires rather than just existing.
+                steps.push(Step::Task(Box::new(EventBridgeSchedules::new(
+                    function,
+                    manifest.data().schedule.clone(),
                 ))));
             }
             steps

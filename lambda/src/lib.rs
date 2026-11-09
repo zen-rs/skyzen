@@ -16,8 +16,11 @@
 //! - **SQS** — a payload whose `Records` carry `eventSource: "aws:sqs"` is decoded into the
 //!   portable `QueueBatch` and driven through the application's `#[skyzen::queue]` handler. The
 //!   reply is a [partial batch response], so only the messages the handler failed are redelivered.
+//! - **Scheduled** — an `EventBridge` rule's `cron(...)` or an `EventBridge` Scheduler schedule,
+//!   decoded into the portable `ScheduledTick` and driven through the application's
+//!   `#[skyzen::scheduled]` handler.
 //!
-//! An event that is neither is refused by name rather than guessed at.
+//! An event that is none of these is refused by name rather than guessed at.
 //!
 //! [partial batch response]: https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-errorhandling.html
 //!
@@ -70,9 +73,10 @@
 
 mod convert;
 mod dispatch;
+pub mod eventbridge;
 pub mod sqs;
 
-pub use dispatch::{NoQueueHandler, QueueDispatch};
+pub use dispatch::{NoQueueHandler, QueueDispatch, ScheduledDispatch};
 pub use lambda_runtime::Error;
 
 use core::{
@@ -115,7 +119,7 @@ where
     Factory: FnOnce() -> Fut,
     Fut: Future<Output = (E, D)>,
     E: Endpoint + Clone + Send + Sync + 'static,
-    D: QueueDispatch,
+    D: QueueDispatch + ScheduledDispatch,
 {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -123,7 +127,11 @@ where
 
     runtime.block_on(async move {
         let (endpoint, dispatch) = factory().await;
-        info!(queue_handler = D::DECLARED, "Skyzen starting on AWS Lambda");
+        info!(
+            queue_handler = <D as QueueDispatch>::DECLARED,
+            scheduled_handler = <D as ScheduledDispatch>::DECLARED,
+            "Skyzen starting on AWS Lambda"
+        );
         lambda_runtime::run(Invocation {
             endpoint,
             dispatch: Arc::new(dispatch),
@@ -159,7 +167,7 @@ struct RecordKind<'a> {
 impl<E, D> Service<LambdaEvent<Box<RawValue>>> for Invocation<E, D>
 where
     E: Endpoint + Clone + Send + Sync + 'static,
-    D: QueueDispatch,
+    D: QueueDispatch + ScheduledDispatch,
 {
     type Response = serde_json::Value;
     type Error = Error;
@@ -180,6 +188,10 @@ where
                     let event: SqsEvent = serde_json::from_str(payload.get())?;
                     let response = handle_sqs::<D>(&dispatch, event).await?;
                     Ok(serde_json::to_value(response)?)
+                }
+                EventShape::Scheduled => {
+                    let event: serde_json::Value = serde_json::from_str(payload.get())?;
+                    eventbridge::handle_scheduled::<D>(&event, dispatch.as_ref()).await
                 }
                 EventShape::Http => {
                     let request: LambdaRequest = serde_json::from_str(payload.get())?;
@@ -204,14 +216,22 @@ enum EventShape {
     Http,
     /// An SQS batch.
     Sqs,
+    /// An `EventBridge` scheduled event.
+    Scheduled,
 }
 
-/// Decide what an event is from its `Records`, if it has any.
+/// Decide what an event is from its envelope, if it has one.
 ///
-/// An event carrying records from some *other* service is named in the error rather than handed to
-/// the HTTP deserializer, whose "this is not an API Gateway event" message would be true but
-/// useless.
+/// An `EventBridge` scheduled event is recognized before records are consulted — it carries none —
+/// and an event carrying records from some *other* service is named in the error rather than
+/// handed to the HTTP deserializer, whose "this is not an API Gateway event" message would be
+/// true but useless.
 fn classify(payload: &str) -> Result<EventShape, Error> {
+    let eventbridge: eventbridge::EventBridgeKind<'_> = serde_json::from_str(payload)?;
+    if eventbridge::is_scheduled(&eventbridge) {
+        return Ok(EventShape::Scheduled);
+    }
+
     let kind: EventKind<'_> = serde_json::from_str(payload)?;
     let Some(first) = kind.records.first() else {
         return Ok(EventShape::Http);
@@ -221,7 +241,7 @@ fn classify(payload: &str) -> Result<EventShape, Error> {
         Some(sqs::SQS_EVENT_SOURCE) => Ok(EventShape::Sqs),
         Some(other) => Err(Error::from(format!(
             "this Lambda received a `{other}` event, which Skyzen does not handle; it serves HTTP \
-             events and SQS batches"
+             events, SQS batches and EventBridge scheduled events"
         ))),
         None => Err(Error::from(
             "this Lambda received an event whose records name no eventSource, so it cannot be \
@@ -240,7 +260,7 @@ async fn handle_sqs<D: QueueDispatch>(
     dispatch: &Arc<D>,
     event: SqsEvent,
 ) -> Result<aws_lambda_events::sqs::SqsBatchResponse, Error> {
-    if !D::DECLARED {
+    if !<D as QueueDispatch>::DECLARED {
         return Err(Error::from(
             "this Lambda received an SQS event, but the application declares no #[skyzen::queue] \
              handler; annotate one, or point the event source mapping at a function that has one",
@@ -514,6 +534,22 @@ mod tests {
             // An `async` block, so a panicking decision panics inside the future the caller polls
             // — which is where the runtime's guard is.
             async move { (self.decide)() }
+        }
+    }
+
+    impl super::ScheduledDispatch for Canned {
+        const DECLARED: bool = false;
+
+        #[allow(clippy::manual_async_fn)]
+        fn dispatch(
+            &self,
+            _tick: skyzen_services::ScheduledTick,
+        ) -> impl Future<Output = Result<(), BoxError>> + Send {
+            async move {
+                Err(BoxError::from(
+                    "this test dispatcher declares no scheduled handler",
+                ))
+            }
         }
     }
 

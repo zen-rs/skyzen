@@ -12,6 +12,9 @@ categories = ["config", "development-tools"]
 [dependencies]
 hex = "0.4"
 humantime-serde = "1.1"
+# The cron parser Cloudflare runs Cron Triggers with, so a `[[schedule]]` expression means the
+# same thing here as it does on the edge — and the native scheduler reuses it for fire times.
+saffron = "0.1"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"

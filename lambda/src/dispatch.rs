@@ -1,10 +1,10 @@
-//! What a Lambda does with an SQS batch it was handed.
+//! What a Lambda does with the platform-pushed events it was handed.
 
 use core::future::Future;
 
 use skyzen_services::{
     queue::{QueueBatch, QueueBatchDisposition},
-    BoxError,
+    BoxError, ScheduledTick,
 };
 
 /// Drives the application's `#[skyzen::queue]` handler for a batch the platform pushed.
@@ -54,6 +54,40 @@ impl QueueDispatch for NoQueueHandler {
         // the const and forget the method.
         core::future::ready(Err(BoxError::from(
             "this application declares no #[skyzen::queue] handler",
+        )))
+    }
+}
+
+/// Drives the application's `#[skyzen::scheduled]` handler for a tick the platform pushed.
+///
+/// `EventBridge` owns the timing on Lambda exactly as the native scheduler loop does at home
+/// and Cloudflare's Cron Triggers do on the edge; what reaches the function is the same
+/// [`ScheduledTick`] either way.
+pub trait ScheduledDispatch: Send + Sync + 'static {
+    /// Whether the application declares a scheduled handler at all.
+    ///
+    /// A const rather than a method, so a scheduled event that reaches a function with nothing
+    /// to give it to can be refused by name.
+    const DECLARED: bool;
+
+    /// Handle one pushed tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handler's own error, which fails the invocation. `EventBridge` retries failed
+    /// invocations the same way it retries any failed scheduled event — the handler's `Err` is
+    /// what "the tick failed" means here.
+    fn dispatch(&self, tick: ScheduledTick) -> impl Future<Output = Result<(), BoxError>> + Send;
+}
+
+impl ScheduledDispatch for NoQueueHandler {
+    const DECLARED: bool = false;
+
+    fn dispatch(&self, _tick: ScheduledTick) -> impl Future<Output = Result<(), BoxError>> + Send {
+        // Unreachable in practice: `run` refuses a scheduled event before it gets this far when
+        // `DECLARED` is false, the same as it does for SQS.
+        core::future::ready(Err(BoxError::from(
+            "this application declares no #[skyzen::scheduled] handler",
         )))
     }
 }

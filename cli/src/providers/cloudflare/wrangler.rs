@@ -9,7 +9,7 @@
 use crate::providers::cloudflare::ids;
 use anyhow::{Context, Result};
 use serde::Serialize;
-use skyzen_manifest::{deep_merge, CloudflareSection};
+use skyzen_manifest::{deep_merge, CloudflareSection, ScheduleEntry};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -34,6 +34,9 @@ pub enum IdPolicy {
 pub struct RenderRequest<'a> {
     /// The base `[cloudflare]` section.
     pub base: &'a CloudflareSection,
+    /// The portable `[[schedule]]` entries, whose crons join every environment's
+    /// `triggers.crons`.
+    pub schedules: &'a [ScheduleEntry],
     /// Each `[cloudflare.env.<name>]` overlay, already resolved against the base.
     pub environments: Vec<(String, &'a CloudflareSection)>,
     /// The project root, which `main` is made relative to.
@@ -61,6 +64,7 @@ pub fn render(request: &RenderRequest<'_>) -> Result<String> {
         &base_name,
         &main,
         request.id_policy,
+        request.schedules,
     )?)?;
     deep_merge(&mut document, request.base.raw.clone());
 
@@ -76,6 +80,7 @@ pub fn render(request: &RenderRequest<'_>) -> Result<String> {
                 &environment_name,
                 &main,
                 request.id_policy,
+                request.schedules,
             )?)?;
             deep_merge(&mut table, section.raw.clone());
             environments.insert(name.clone(), toml::Value::Table(table));
@@ -124,6 +129,7 @@ fn section_config(
     name: &str,
     main: &str,
     id_policy: IdPolicy,
+    schedules: &[ScheduleEntry],
 ) -> Result<WranglerConfig> {
     let compatibility_date = config
         .compatibility_date
@@ -147,9 +153,7 @@ fn section_config(
         route: config.route.clone(),
         zone_id: config.zone_id.clone(),
         vars: config.vars.clone(),
-        triggers: (!config.triggers.crons.is_empty()).then(|| WranglerTriggers {
-            crons: config.triggers.crons.clone(),
-        }),
+        triggers: merged_crons(config, schedules).map(|crons| WranglerTriggers { crons }),
         assets: config.assets.as_ref().map(assets_config),
         queues: queues_config(config),
         durable_objects: durable_objects_config(config),
@@ -178,6 +182,25 @@ fn section_config(
             .collect(),
         migrations: migrations_config(config),
     })
+}
+
+/// Every cron the Worker needs, portable first: the `[[schedule]]` crons followed by any
+/// Cloudflare-only ones `[cloudflare.triggers]` adds, with duplicates removed.
+///
+/// `None` when both are empty so `triggers` is omitted rather than emitted with no crons.
+fn merged_crons(config: &CloudflareSection, schedules: &[ScheduleEntry]) -> Option<Vec<String>> {
+    let crons: Vec<String> = schedules
+        .iter()
+        .map(|entry| entry.cron.as_str().to_owned())
+        .chain(config.triggers.crons.iter().cloned())
+        .fold(Vec::new(), |mut merged, cron| {
+            if !merged.contains(&cron) {
+                merged.push(cron);
+            }
+            merged
+        });
+
+    (!crons.is_empty()).then_some(crons)
 }
 
 fn assets_config(assets: &skyzen_manifest::CfAssets) -> WranglerAssets {
@@ -500,6 +523,7 @@ mod tests {
     ) -> RenderRequest<'a> {
         RenderRequest {
             base,
+            schedules: &[],
             environments,
             root_dir: Path::new("/tmp/app"),
             entry_js_path: Path::new("/tmp/app/dist/worker.js"),

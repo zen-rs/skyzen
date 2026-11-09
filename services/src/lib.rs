@@ -90,7 +90,7 @@ pub use sqlparser;
 pub use serde_json;
 
 pub use durable::{DurableDb, DurableDbBackend, DurableDbError, DurableDbQuery};
-pub use events::ScheduledTick;
+pub use events::{IntoScheduledOutcome, ScheduledHandler, ScheduledTick};
 pub use kv::{KeyValueStore, Kv, KvError, KvListOptions, KvListResult};
 pub use migrate::{AppliedMigration, Migration, MigrationReport, MigrationStatus, Migrations};
 pub use queue::{

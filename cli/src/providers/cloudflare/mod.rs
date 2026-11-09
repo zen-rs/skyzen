@@ -92,6 +92,7 @@ pub fn prepare(
         base: manifest
             .cloudflare(None)?
             .ok_or_else(|| anyhow::anyhow!("missing [cloudflare] section in Skyzen.toml"))?,
+        schedules: &manifest.data().schedule,
         environments,
         root_dir: manifest.root_dir(),
         entry_js_path: &entry_js_path,
