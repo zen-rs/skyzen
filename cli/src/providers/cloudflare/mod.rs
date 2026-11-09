@@ -67,7 +67,15 @@ pub fn prepare(
     }
 
     let build = needs_artifacts
-        .then(|| resolve_build_plan(action, manifest.root_dir(), project, config))
+        .then(|| {
+            resolve_build_plan(
+                action,
+                manifest.root_dir(),
+                project,
+                config,
+                &manifest.data().schedule,
+            )
+        })
         .transpose()?;
     // Kept typed for the entry path below, and boxed into the plan for the CLI to run.
     let boxed_build = build
@@ -453,6 +461,7 @@ fn resolve_build_plan(
     root_dir: &Path,
     project: &Project,
     config: &CloudflareSection,
+    schedules: &[skyzen_manifest::ScheduleEntry],
 ) -> Result<BuildPlan> {
     let target_name = project.cdylib_target_name()?;
     let entry_rel = entry_relative_path_checked(config)?;
@@ -495,7 +504,7 @@ fn resolve_build_plan(
         wasm_output_path: output_dir.join(format!("{entry_stem}_bg.wasm")),
         bindgen_out_name: entry_stem.to_owned(),
         durable_exports: collect_local_durable_exports(config),
-        event_members: build::event_members(config),
+        event_members: build::event_members(config, schedules),
         release,
         // Optimizing a debug build wastes the time it saves, so only released artifacts get it.
         optimize: release,

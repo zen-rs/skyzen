@@ -469,6 +469,18 @@ pub enum ScheduleError {
         /// The colliding name.
         name: String,
     },
+    /// An `[azure.schedule.<name>]` table names a schedule the manifest never declared.
+    ///
+    /// A typo here would be silently dropped by the bundle render — the override has to name a
+    /// real `[[schedule]]` to mean anything.
+    #[error(
+        "[azure.schedule.{name}] overrides a schedule the manifest never declares; rename the \
+         table or add [[schedule]] name = \"{name}\""
+    )]
+    UnknownOverride {
+        /// The unmatched override name.
+        name: String,
+    },
 }
 
 impl SkyzenManifest {
@@ -521,6 +533,15 @@ impl SkyzenManifest {
                 return Err(ScheduleError::DuplicateCron {
                     cron: entry.cron.as_str().to_owned(),
                 });
+            }
+        }
+        if let Some(azure) = &self.azure {
+            if let Some(name) = azure
+                .schedule
+                .keys()
+                .find(|name| !claimed_names.contains(&name.to_ascii_lowercase()))
+            {
+                return Err(ScheduleError::UnknownOverride { name: name.clone() });
             }
         }
         Ok(())

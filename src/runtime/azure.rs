@@ -298,6 +298,20 @@ impl<E, C, S> FunctionsHost<E, C, S> {
     }
 }
 
+/// Whether `body` is a forwarded HTTP request rather than a trigger invocation.
+///
+/// This is the non-spoofable boundary between the two: the Functions host wraps every
+/// forwarded request under `Data.req` and builds `Data` itself, so a client's body — however
+/// shaped — can only ever appear inside it, never as a top-level `Data.timer` or
+/// `Data.message`. A body without `Data.req` is an invocation envelope (or a malformed one,
+/// which the read path reports as a failure the host retries).
+fn is_forwarded_http(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|envelope| envelope.get("Data")?.get("req").map(|_| ()))
+        .is_some()
+}
+
 impl<E, C, S> Endpoint for FunctionsHost<E, C, S>
 where
     E: Endpoint + Clone + Send + Sync + 'static,
@@ -311,9 +325,27 @@ where
             return self.endpoint.respond(request).await;
         };
 
+        // A path match alone cannot decide what this POST is: the HTTP function forwards
+        // arbitrary client requests with their path intact, so `POST /tick` from the outside
+        // lands here too. The boundary the host guarantees is the envelope — its invocations
+        // carry the binding under `Data` (`timer`, `message`), while a forwarded request wraps
+        // the client body under `Data.req` and can never put a top-level binding there. Only
+        // an envelope-shaped body is an invocation; anything else is the router's to answer.
+        let Ok(body) = request.body_mut().take() else {
+            return self.endpoint.respond(request).await;
+        };
+        let Ok(body) = body.into_bytes().await else {
+            *request.body_mut() = Body::from(Vec::new());
+            return self.endpoint.respond(request).await;
+        };
+        if is_forwarded_http(&body) {
+            *request.body_mut() = Body::from(body.to_vec());
+            return self.endpoint.respond(request).await;
+        }
+
         Ok(match trigger {
-            Trigger::Queue(trigger) => self.invoke_queue(trigger, request).await,
-            Trigger::Scheduled(trigger) => self.invoke_scheduled(trigger, request).await,
+            Trigger::Queue(trigger) => self.invoke_queue(trigger, &body).await,
+            Trigger::Scheduled(trigger) => self.invoke_scheduled(trigger, &body).await,
         })
     }
 }
@@ -325,8 +357,8 @@ where
     S: ScheduleSet,
 {
     /// Drive the queue handler for one invocation and answer the host.
-    async fn invoke_queue(&self, trigger: &QueueTrigger, request: &mut Request) -> Response {
-        let batch = match read_batch(trigger, request).await {
+    async fn invoke_queue(&self, trigger: &QueueTrigger, body: &[u8]) -> Response {
+        let batch = match read_batch(trigger, body) {
             Ok(batch) => batch,
             Err(error) => {
                 error!(
@@ -373,12 +405,8 @@ where
     /// invocation log, the way an `Err` return reads on Cloudflare. A panic is reported the
     /// same way — the same outcome both the native loop and Lambda give a panicking handler,
     /// so one handler reads identically on all four targets.
-    async fn invoke_scheduled(
-        &self,
-        trigger: &ScheduledTrigger,
-        request: &mut Request,
-    ) -> Response {
-        let tick = match read_tick(trigger, request).await {
+    async fn invoke_scheduled(&self, trigger: &ScheduledTrigger, body: &[u8]) -> Response {
+        let tick = match read_tick(trigger, body) {
             Ok(tick) => tick,
             Err(error) => {
                 error!(
@@ -439,18 +467,8 @@ const fn acknowledged(disposition: &QueueBatchDisposition) -> bool {
 }
 
 /// Read one Functions invocation into the portable batch the handler expects.
-async fn read_batch(
-    trigger: &QueueTrigger,
-    request: &mut Request,
-) -> Result<QueueBatch<Vec<u8>>, EnvelopeError> {
-    let body = request
-        .body_mut()
-        .take()
-        .map_err(|_| EnvelopeError::BodyUnavailable)?
-        .into_bytes()
-        .await
-        .map_err(|error| EnvelopeError::Unreadable(error.to_string()))?;
-    let envelope: InvokeRequest = serde_json::from_slice(&body)
+fn read_batch(trigger: &QueueTrigger, body: &[u8]) -> Result<QueueBatch<Vec<u8>>, EnvelopeError> {
+    let envelope: InvokeRequest = serde_json::from_slice(body)
         .map_err(|error| EnvelopeError::Malformed(error.to_string()))?;
 
     envelope.into_batch(trigger)
@@ -497,21 +515,12 @@ fn failed(reason: &str) -> Response {
 /// `function.json` declares — always `timer` for a Skyzen function. [`ScheduledTick::cron`]
 /// comes from the manifest rather than the payload: the host reports the NCRONTAB the CLI
 /// translated, and the handler should read the portable expression it was written with.
-/// [`ScheduledTick::scheduled_time_ms`] is the `ScheduleStatus.Last` the host reports — the
-/// time this tick was scheduled for, which is also what a past-due firing still names — or the
-/// receive time when the invocation carries none (a manual `func` invoke, for example).
-async fn read_tick(
-    trigger: &ScheduledTrigger,
-    request: &mut Request,
-) -> Result<ScheduledTick, EnvelopeError> {
-    let body = request
-        .body_mut()
-        .take()
-        .map_err(|_| EnvelopeError::BodyUnavailable)?
-        .into_bytes()
-        .await
-        .map_err(|error| EnvelopeError::Unreadable(error.to_string()))?;
-    let envelope: InvokeRequest = serde_json::from_slice(&body)
+/// [`ScheduledTick::scheduled_time_ms`] is the `ScheduleStatus.Next` the host reports — the
+/// due instant this invocation fulfills, which is also what a past-due firing still names —
+/// or the receive time when the invocation carries none or fired early (a manual `func`
+/// invoke or `runOnStartup`).
+fn read_tick(trigger: &ScheduledTrigger, body: &[u8]) -> Result<ScheduledTick, EnvelopeError> {
+    let envelope: InvokeRequest = serde_json::from_slice(body)
         .map_err(|error| EnvelopeError::Malformed(error.to_string()))?;
 
     envelope.into_tick(trigger)
@@ -638,16 +647,24 @@ impl InvokeRequest {
             return Err(EnvelopeError::UnexpectedBindings(vec![binding]));
         }
 
-        // `ScheduleStatus.Last` is when the host last ran the schedule; for the invocation it
-        // is delivering right now, that is the scheduled time of this tick. An ISO-8601 it
-        // cannot parse — or a manual invocation carrying no TimerInfo at all — falls back to
-        // the receive time, the same report a pull-based backend makes.
+        // `ScheduleStatus` reports the occurrences on either side of this invocation:
+        // `Last` is the *previous* firing and `Next` is the one being delivered — the due
+        // instant this tick names. A `Next` still in the future means the host fired early
+        // (`runOnStartup`, a manual invoke), which is no scheduled occurrence at all; receive
+        // time reports those the way a pull-based backend does.
         let scheduled_time_ms = value
             .get("ScheduleStatus")
-            .and_then(|status| status.get("Last"))
+            .and_then(|status| status.get("Next"))
             .and_then(serde_json::Value::as_str)
-            .and_then(|last| chrono::DateTime::parse_from_rfc3339(last).ok())
-            .map_or_else(now_ms, |last| last.timestamp_millis());
+            .and_then(|next| chrono::DateTime::parse_from_rfc3339(next).ok())
+            .map_or_else(now_ms, |next| {
+                let due = next.timestamp_millis();
+                if due <= now_ms() {
+                    due
+                } else {
+                    now_ms()
+                }
+            });
 
         debug!(
             function = trigger.function,

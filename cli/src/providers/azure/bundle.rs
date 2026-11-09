@@ -71,7 +71,49 @@ pub fn render(
         });
     }
 
+    // The bundle directory persists between deploys, so a schedule or trigger removed from
+    // the manifest would keep deploying — and keep firing — forever. Everything this renderer
+    // produces lives in a `{function}/function.json`, so a directory holding one whose name is
+    // no longer declared is unambiguously stale; `func publish` never learns it should exist.
+    let declared: std::collections::BTreeSet<String> = files
+        .iter()
+        .filter_map(|file| {
+            (file.path.extension() == Some(std::ffi::OsStr::new("json"))
+                && file.path.file_name()? == "function.json")
+                .then(|| {
+                    file.path
+                        .parent()
+                        .and_then(|dir| dir.file_name())
+                        .and_then(std::ffi::OsStr::to_str)
+                        .map(ToOwned::to_owned)
+                })?
+        })
+        .collect();
+    retire_stale_functions(bundle_dir, &declared);
+
     Ok(files)
+}
+
+/// Remove generated function directories the manifest no longer declares.
+///
+/// Best-effort — a directory that cannot be listed or removed is left for the deploy to
+/// tolerate rather than failing on an artifact it did not make.
+fn retire_stale_functions(bundle_dir: &Path, declared: &std::collections::BTreeSet<String>) {
+    let Ok(entries) = std::fs::read_dir(bundle_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_function = path.is_dir() && path.join("function.json").is_file();
+        let stale = is_function
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| !declared.contains(name));
+        if stale {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 /// Serialize one document, with the trailing newline every generated file gets.

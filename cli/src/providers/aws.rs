@@ -75,11 +75,13 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
             steps.push(Step::Task(Box::new(EventBridgeSchedules::new(
                 function.clone(),
                 manifest.data().schedule.clone(),
+                child_env.clone(),
             ))));
             if !delivery.is_empty() {
                 steps.push(Step::Task(Box::new(LambdaEnvironment::new(
                     function,
                     delivery,
+                    child_env.clone(),
                 ))));
             }
             steps
@@ -128,22 +130,31 @@ fn secret_step(
     let delivery = match action {
         SecretAction::Set { name, value } => Delivery::one(name.as_str(), value),
         SecretAction::Push => {
-            let resolved = prepare_child_environment(manifest, VariableKind::ALL)?.resolved;
-            let delivery = Delivery::from_resolved(&resolved).with_defaults(&config.env);
+            let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
+            let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
             if delivery.is_empty() {
                 anyhow::bail!(
                     "there is nothing to push: Skyzen.toml declares no [[secret]], no native \
                      wiring variable and no [aws.env] entry"
                 );
             }
-            delivery
+            return Ok(Step::Task(Box::new(LambdaEnvironment::new(
+                function,
+                delivery,
+                prepared.child_env,
+            ))));
         }
         SecretAction::List => {
-            return Ok(Step::Task(Box::new(LambdaEnvironmentNames::new(function))))
+            return Ok(Step::Task(Box::new(LambdaEnvironmentNames::new(
+                function,
+                Vec::new(),
+            ))));
         }
     };
     Ok(Step::Task(Box::new(LambdaEnvironment::new(
-        function, delivery,
+        function,
+        delivery,
+        Vec::new(),
     ))))
 }
 

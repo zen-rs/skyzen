@@ -15,6 +15,7 @@
 use crate::{output, providers::Task, runtime::block_on};
 use anyhow::{Context, Result};
 use aws_sdk_eventbridge::types::{InputTransformer, RuleState, Target};
+use aws_sdk_lambda::client::Waiters as _;
 use skyzen_manifest::ScheduleEntry;
 
 /// The Lambda resource-based permission a rule needs to invoke the function.
@@ -30,20 +31,31 @@ pub struct EventBridgeSchedules {
     function: String,
     /// The `[[schedule]]` entries to wire, each becoming one rule.
     schedules: Vec<ScheduleEntry>,
+    /// The deploy's `child_env` — where `.env` AWS credentials ride to the SDK.
+    env: Vec<(String, String)>,
 }
 
 impl EventBridgeSchedules {
     /// The step that wires `schedules` to `function`.
-    pub const fn new(function: String, schedules: Vec<ScheduleEntry>) -> Self {
+    pub const fn new(
+        function: String,
+        schedules: Vec<ScheduleEntry>,
+        env: Vec<(String, String)>,
+    ) -> Self {
         Self {
             function,
             schedules,
+            env,
         }
     }
 
     /// The rule `name` becomes when pointed at this function.
+    ///
+    /// `skyzen-` namespaces the rule from anything an account made by hand or another tool,
+    /// and the double dash keeps the join unambiguous: `foo`/`bar-baz` and `foo-bar`/`baz`
+    /// name different rules.
     fn rule_name(&self, name: &str) -> String {
-        format!("{}-{name}", self.function)
+        format!("skyzen-{}--{name}", self.function)
     }
 }
 
@@ -69,14 +81,28 @@ impl Task for EventBridgeSchedules {
     }
 
     fn run(&self) -> Result<()> {
+        super::lambda_env::adopt_env(&self.env);
         block_on(async {
             let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let lambda = aws_sdk_lambda::Client::new(&shared);
             let events = aws_sdk_eventbridge::Client::new(&shared);
 
-            // The deploy that just ran leaves an update in progress, and reading the
-            // configuration settles it before the ARN is taken — the same wait the
+            // The deploy that just ran leaves an update in progress — `add_permission` meets
+            // it as `ResourceConflictException`. Settle the update first, the same wait the
             // environment-delivery step performs.
+            lambda
+                .wait_until_function_updated_v2()
+                .function_name(&self.function)
+                .wait(super::lambda_env::UPDATE_TIMEOUT)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Lambda function `{}` did not finish updating within {} seconds",
+                        self.function,
+                        super::lambda_env::UPDATE_TIMEOUT.as_secs()
+                    )
+                })?;
+
             let arn = lambda
                 .get_function_configuration()
                 .function_name(&self.function)
@@ -260,6 +286,50 @@ impl EventBridgeSchedules {
         Ok(Some(parsed))
     }
 
+    /// Refuse to touch `rule` when something else owns it.
+    ///
+    /// A rule with that name that already points at this function — or has no targets at all —
+    /// is one an earlier Skyzen deploy made, safe to put over. A rule carrying a target that
+    /// is not this Lambda is somebody else's, and `put_rule`/`put_targets` would silently
+    /// retarget it.
+    async fn own_the_rule(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+        arn: &str,
+        rule: &str,
+    ) -> Result<()> {
+        match events.describe_rule().name(rule).send().await {
+            Ok(_) => {}
+            Err(error)
+                if error.as_service_error().is_some_and(
+                    aws_sdk_eventbridge::operation::describe_rule::DescribeRuleError::is_resource_not_found_exception,
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read EventBridge rule `{rule}`"))
+            }
+        }
+
+        let listed = events
+            .list_targets_by_rule()
+            .rule(rule)
+            .send()
+            .await
+            .with_context(|| format!("failed to list the targets of EventBridge rule `{rule}`"))?;
+        if let Some(target) = listed.targets().iter().find(|target| target.arn() != arn) {
+            anyhow::bail!(
+                "EventBridge rule `{rule}` already exists and targets `{}`, not Lambda function \
+                 `{}`; rename the schedule or remove the foreign rule",
+                target.arn(),
+                self.function
+            );
+        }
+        Ok(())
+    }
+
     /// Create one `[[schedule]]`'s rule, permission and target.
     async fn wire_one(
         &self,
@@ -282,6 +352,8 @@ impl EventBridgeSchedules {
                 name = entry.name
             )
         })?;
+
+        self.own_the_rule(events, arn, &rule).await?;
 
         events
             .put_rule()

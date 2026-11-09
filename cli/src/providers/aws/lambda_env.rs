@@ -24,7 +24,23 @@ use std::{collections::BTreeMap, time::Duration};
 /// `cargo lambda deploy` returns as soon as Lambda has accepted the code, while the function's
 /// `LastUpdateStatus` is still `InProgress`; a second update during that window is rejected with a
 /// `ResourceConflictException`. Five minutes is the SDK's own default for this waiter.
-const UPDATE_TIMEOUT: Duration = Duration::from_mins(5);
+pub(super) const UPDATE_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Hand the SDK the AWS variables the project's `.env` supplied.
+///
+/// Command steps inherit `child_env` as their process environment; a `Task` runs in process,
+/// so `aws_config::load_defaults` would otherwise see only the CLI's own environment — an
+/// `AWS_PROFILE`, `AWS_REGION` or credential pair kept in `.env` would deploy successfully and
+/// then fail to authenticate here.
+pub(super) fn adopt_env(env: &[(String, String)]) {
+    for (key, value) in env {
+        if key.starts_with("AWS_") {
+            // Safety: steps run serially on the deploy thread, so nothing else is reading the
+            // process environment while it is updated.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+}
 
 /// Set a deployed function's environment to what the manifest and the local `.env` say.
 #[derive(Debug)]
@@ -33,12 +49,18 @@ pub struct LambdaEnvironment {
     function: String,
     /// What to deliver.
     delivery: Delivery,
+    /// The deploy's `child_env` — where `.env` AWS credentials ride to the SDK.
+    env: Vec<(String, String)>,
 }
 
 impl LambdaEnvironment {
     /// The step that delivers `delivery` to `function`.
-    pub const fn new(function: String, delivery: Delivery) -> Self {
-        Self { function, delivery }
+    pub const fn new(function: String, delivery: Delivery, env: Vec<(String, String)>) -> Self {
+        Self {
+            function,
+            delivery,
+            env,
+        }
     }
 }
 
@@ -52,6 +74,7 @@ impl Task for LambdaEnvironment {
     }
 
     fn run(&self) -> Result<()> {
+        adopt_env(&self.env);
         block_on(async {
             let client = client().await;
 
@@ -102,12 +125,14 @@ impl Task for LambdaEnvironment {
 pub struct LambdaEnvironmentNames {
     /// The function to read.
     function: String,
+    /// The deploy's `child_env` — where `.env` AWS credentials ride to the SDK.
+    env: Vec<(String, String)>,
 }
 
 impl LambdaEnvironmentNames {
     /// The step that lists `function`'s environment.
-    pub const fn new(function: String) -> Self {
-        Self { function }
+    pub const fn new(function: String, env: Vec<(String, String)>) -> Self {
+        Self { function, env }
     }
 }
 
@@ -120,6 +145,7 @@ impl Task for LambdaEnvironmentNames {
     }
 
     fn run(&self) -> Result<()> {
+        adopt_env(&self.env);
         block_on(async {
             let client = client().await;
             let variables = existing_variables(&client, &self.function).await?;

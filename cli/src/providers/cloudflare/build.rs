@@ -59,15 +59,19 @@ const TAIL: EventMember = EventMember {
 
 /// The event members the manifest asks the shim to export.
 ///
-/// A queue handler is implied by a consumer and a scheduled handler by a cron trigger. Email
+/// A queue handler is implied by a consumer and a scheduled handler by a cron trigger —
+/// portable `[[schedule]]` entries and Cloudflare-only `[cloudflare.triggers]` alike. Email
 /// routing and tail consumers are configured on the sending side, so those two are opted into
 /// explicitly with `[cloudflare.handlers]`.
-pub fn event_members(config: &CloudflareSection) -> Vec<EventMember> {
+pub fn event_members(
+    config: &CloudflareSection,
+    schedules: &[skyzen_manifest::ScheduleEntry],
+) -> Vec<EventMember> {
     let mut members = Vec::new();
     if !config.queues.consumers.is_empty() {
         members.push(QUEUE);
     }
-    if !config.triggers.crons.is_empty() {
+    if !schedules.is_empty() || !config.triggers.crons.is_empty() {
         members.push(SCHEDULED);
     }
     if config.handlers.email {
@@ -590,7 +594,7 @@ mod tests {
              [cloudflare.triggers]\ncrons = [\"* * * * *\"]\n\n\
              [[cloudflare.queues.consumers]]\nqueue = \"jobs\"\n",
         );
-        let names: Vec<_> = event_members(&inferred)
+        let names: Vec<_> = event_members(&inferred, &[])
             .into_iter()
             .map(|member| member.name)
             .collect();
@@ -600,11 +604,28 @@ mod tests {
             "[cloudflare]\ncompatibility_date = \"2025-02-01\"\n\n\
              [cloudflare.handlers]\nemail = true\ntail = true\n",
         );
-        let names: Vec<_> = event_members(&opted_in)
+        let names: Vec<_> = event_members(&opted_in, &[])
             .into_iter()
             .map(|member| member.name)
             .collect();
         assert_eq!(names, ["email", "tail"]);
+    }
+
+    #[test]
+    fn a_portable_schedule_implies_the_scheduled_export() {
+        let config = cloudflare("[cloudflare]\ncompatibility_date = \"2025-02-01\"\n");
+        let manifest = skyzen_manifest::Manifest::parse(
+            "[[schedule]]\nname = \"tick\"\ncron = \"*/10 * * * *\"\n",
+            "Skyzen.toml",
+            ".",
+        )
+        .expect("a valid manifest");
+
+        let names: Vec<_> = event_members(&config, &manifest.data().schedule)
+            .into_iter()
+            .map(|member| member.name)
+            .collect();
+        assert_eq!(names, ["scheduled"]);
     }
 
     #[test]
