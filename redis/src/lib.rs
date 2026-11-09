@@ -762,6 +762,10 @@ mod tests {
         let (port, _peer) = self_signed_peer();
         let url = format!("rediss://127.0.0.1:{port}/");
         let client = redis::Client::open(url).expect("parses");
+        // Same provider install `connect` performs — a `rediss://` client
+        // without it panics on `builder()` in a multi-provider world, which is
+        // the failure mode being prevented, not tested.
+        super::install_tls_provider(&client);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client.get_multiplexed_async_connection(),
