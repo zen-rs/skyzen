@@ -351,7 +351,7 @@ impl RateLimitStore for MemoryStore {
             let now = now_ms();
             let index = now / window_ms;
             let bucket = format!("rl:{key}:{index}");
-            let (count, reset) = {
+            let hit = {
                 let mut buckets = self
                     .buckets
                     .lock()
@@ -359,34 +359,36 @@ impl RateLimitStore for MemoryStore {
                 if buckets.len() > MAX_MEMORY_BUCKETS {
                     buckets.retain(|_, (_, reset)| *reset > now);
                 }
-                if buckets.len() > MAX_MEMORY_BUCKETS {
-                    // Still over cap — the key space outruns expiry (attacker-churned keys
-                    // inside one live window). Drop the buckets closest to expiring until
-                    // within bounds: bounding memory matters more than losing the oldest
-                    // window a little early.
-                    let overflow = buckets.len() - MAX_MEMORY_BUCKETS;
-                    let mut resets: Vec<(String, u64)> = buckets
-                        .iter()
-                        .map(|(bucket, (_, reset))| (bucket.clone(), *reset))
-                        .collect();
-                    resets.sort_unstable_by_key(|(_, reset)| *reset);
-                    for (bucket, _) in resets.into_iter().take(overflow) {
-                        buckets.remove(&bucket);
+                if buckets.len() > MAX_MEMORY_BUCKETS && !buckets.contains_key(&bucket) {
+                    // The key space outran the sweep — evicting a live bucket would hand the
+                    // churn an easy reset of someone's real quota. Refuse the never-counted
+                    // key instead: existing buckets keep their counters, and whether this
+                    // request fails open or closed stays the caller's policy decision.
+                    None
+                } else {
+                    let entry = buckets
+                        .entry(bucket)
+                        .or_insert((0, (index + 1) * window_ms));
+                    if now >= entry.1 {
+                        *entry = (0, (index + 1) * window_ms);
                     }
+                    entry.0 += 1;
+                    Some((entry.0, entry.1))
                 }
-                let entry = buckets
-                    .entry(bucket)
-                    .or_insert((0, (index + 1) * window_ms));
-                if now >= entry.1 {
-                    *entry = (0, (index + 1) * window_ms);
-                }
-                entry.0 += 1;
-                (entry.0, entry.1)
             };
-            Ok(Hit {
-                count,
-                retry_after: (reset - now) / 1000,
-            })
+            hit.map_or_else(
+                || {
+                    Err(HitError::Backend(Error::msg(
+                        "rate limit store at capacity",
+                    )))
+                },
+                |(count, reset)| {
+                    Ok(Hit {
+                        count,
+                        retry_after: (reset - now) / 1000,
+                    })
+                },
+            )
         }))
     }
 }
