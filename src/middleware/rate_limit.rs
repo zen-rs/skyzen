@@ -35,7 +35,7 @@ use skyzen_core::{
     middleware::{Middleware, Next},
     Error, Extractor, PendingResponseHeaders,
 };
-use skyzen_services::{Kv, KvError};
+use skyzen_services::{durable::DurableKv, Kv, KvError};
 
 use crate::extract::ClientIp;
 
@@ -123,6 +123,17 @@ impl RateLimit {
         S::Error: fmt::Debug,
     {
         Self::new(limit, window, Arc::new(kv_resolver::<S>))
+    }
+
+    /// `limit` hits per `window` against a Durable Object's co-located storage — the Cloudflare
+    /// counter whose single-writer reads-modify-writes are atomic, unlike the KV `increment`
+    /// Workers lacks entirely. `S` is the typed durable binding resolved from extensions.
+    pub fn durable<S>(limit: u64, window: Duration) -> Self
+    where
+        S: Extractor + core::ops::Deref<Target = DurableKv>,
+        S::Error: fmt::Debug,
+    {
+        Self::new(limit, window, Arc::new(durable_resolver::<S>))
     }
 
     /// `limit` hits per `window` counted in-process — the preset for a single binary or for
@@ -277,6 +288,23 @@ where
     })
 }
 
+/// Resolve a typed Durable Object binding into the counter backend, per request — the
+/// Cloudflare answer when exactness matters.
+fn durable_resolver<S>(
+    request: &mut Request,
+) -> BoxFuture<'_, Result<Arc<dyn RateLimitStore>, Error>>
+where
+    S: Extractor + core::ops::Deref<Target = DurableKv>,
+    S::Error: fmt::Debug,
+{
+    Box::pin(async move {
+        let kv = S::extract(request)
+            .await
+            .map_err(|error| Error::msg(format!("rate limit durable binding: {error:?}")))?;
+        Ok(Arc::new(DurableKvRateStore { kv: (*kv).clone() }) as Arc<dyn RateLimitStore>)
+    })
+}
+
 /// Milliseconds since the Unix epoch, on every target.
 fn now_ms() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -326,6 +354,49 @@ impl RateLimitStore for KvStore {
             Ok(Hit {
                 count,
                 retry_after: ((index + 1) * window_ms).saturating_sub(now) / 1000,
+            })
+        })
+    }
+}
+
+/// A `DurableKv`-backed counter: a Durable Object's storage is co-located and single-writer,
+/// so a read-modify-write there is atomic in a way Cloudflare KV's `increment` never could
+/// be. The bucket is a compact `{count}:{reset_ms}` record.
+#[derive(Debug)]
+struct DurableKvRateStore {
+    kv: DurableKv,
+}
+
+impl RateLimitStore for DurableKvRateStore {
+    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
+        Box::pin(async move {
+            let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+            let now = now_ms();
+            let index = now / window_ms;
+            let bucket = format!("rl:{key}:{index}");
+            let reset = (index + 1) * window_ms;
+            let count = match self
+                .kv
+                .get(&bucket)
+                .await
+                .map_err(|error| HitError::Backend(Error::new(error)))?
+            {
+                Some(raw) => {
+                    let text = String::from_utf8_lossy(&raw);
+                    text.split(':')
+                        .next()
+                        .and_then(|count| count.parse::<u64>().ok())
+                        .unwrap_or(0)
+                }
+                None => 0,
+            } + 1;
+            self.kv
+                .put(&bucket, format!("{count}:{reset}").as_bytes())
+                .await
+                .map_err(|error| HitError::Backend(Error::new(error)))?;
+            Ok(Hit {
+                count,
+                retry_after: reset.saturating_sub(now) / 1000,
             })
         })
     }
