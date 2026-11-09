@@ -401,9 +401,16 @@ impl RateLimitStore for KvStore {
                 Err(other) => return Err(HitError::Backend(Error::new(other))),
             };
             if count == 1 {
-                // First hit of the window — set the TTL once. A crash between increment and
-                // expire leaves a permanent counter; the window key still rolls forward.
-                let _ = self.kv.expire(&bucket, window.saturating_mul(2)).await;
+                // First hit of the window — set the TTL once. A backend that cannot expire
+                // (a Cosmos container without TTL enabled) would pile counters forever, so
+                // the gap surfaces as a capability error rather than a silent write.
+                match self.kv.expire(&bucket, window.saturating_mul(2)).await {
+                    Ok(_) => {}
+                    Err(error @ KvError::Unsupported(_)) => {
+                        return Err(HitError::Unsupported(Error::new(error)))
+                    }
+                    Err(other) => return Err(HitError::Backend(Error::new(other))),
+                }
             }
             Ok(Hit {
                 count,
