@@ -163,15 +163,13 @@ impl TrustedProxies {
             })
     }
 
-    /// The client from a recorded chain, or `None` when nothing anchors it to trusted
-    /// infrastructure. A recorded peer anchors the chain itself; a serverless host has none,
-    /// so there the chain must contain a trusted hop — otherwise every entry is
-    /// client-supplied and honoring it is an IP-spoofing hole.
+    /// The client from a recorded chain — but only when a recorded peer exists. With no
+    /// peer there is nothing to vouch for *any* entry: an attacker can forge a trusted hop
+    /// as easily as a client address, so peerless `Forwarded`/`X-Forwarded-For` are
+    /// unverifiable and never honored. (Platform headers like `cf-connecting-ip` answer
+    /// before this point — those the host itself supplies.)
     fn anchored_client(&self, addrs: &[IpAddr], peer: Option<IpAddr>) -> Option<IpAddr> {
-        if peer.is_none() && !addrs.iter().any(|addr| self.trusts(addr)) {
-            return None;
-        }
-        Some(trusted_client(addrs, self, peer))
+        peer.map(|peer| trusted_client(addrs, self, Some(peer)))
     }
 }
 
@@ -527,9 +525,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_peer_with_config_walks_the_recorded_chain() {
-        // A serverless host records no TCP peer; the fronting gateway's append is why the
-        // operator configured trust in the first place.
+    async fn no_peer_honors_no_forwarded_chain() {
+        // A serverless host records no TCP peer, so nothing vouches for any entry — even a
+        // "trusted" hop can be client-forged. Forwarded headers are unverifiable here; only
+        // platform-supplied headers (cf-connecting-ip et al.) count.
         let mut request = with_header(
             Request::new(Body::empty()),
             "x-forwarded-for",
@@ -537,8 +536,8 @@ mod tests {
         );
         request.extensions_mut().insert(trusted(&["10.0.0.0/8"]));
 
-        let ip = ClientIp::extract(&mut request).await.unwrap();
-        assert_eq!(ip.0, IpAddr::from([198, 51, 100, 1]));
+        let error = ClientIp::extract(&mut request).await.unwrap_err();
+        assert!(matches!(error, ClientIpError::MissingRemoteAddr));
     }
 
     #[tokio::test]
