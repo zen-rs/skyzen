@@ -44,6 +44,7 @@ mod cors;
 mod decompression;
 mod error_handling;
 mod request_id;
+mod session;
 #[cfg(not(target_arch = "wasm32"))]
 mod timeout;
 mod trace;
@@ -65,6 +66,9 @@ pub use cors::{AllowOrigin, Cors, CorsConfigError};
 pub use decompression::{DecompressionEncoding, DecompressionMiddleware};
 pub use error_handling::ErrorHandlingMiddleware;
 pub use request_id::{MissingRequestId, RequestId};
+pub use session::{
+    Session, SessionData, SessionError, SessionStore, Sessions, SessionsLayer, TypedSession,
+};
 #[doc(inline)]
 pub use skyzen_core::middleware::{
     apply, from_fn, BoxMiddleware, FromFn, Middleware, MiddlewareFn, Next,
