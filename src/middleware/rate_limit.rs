@@ -300,9 +300,11 @@ struct KvStore {
 impl RateLimitStore for KvStore {
     fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
         Box::pin(async move {
-            let window_secs = window.as_secs().max(1);
-            let now_secs = now_ms() / 1000;
-            let index = now_secs / window_secs;
+            // Millisecond indexing, same as the in-memory store — a sub-second window must
+            // not silently widen to a second on one backend and not the other.
+            let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+            let now = now_ms();
+            let index = now / window_ms;
             let bucket = format!("rl:{key}:{index}");
             let count = self
                 .kv
@@ -323,7 +325,7 @@ impl RateLimitStore for KvStore {
             }
             Ok(Hit {
                 count,
-                retry_after: (index + 1) * window_secs - now_secs,
+                retry_after: ((index + 1) * window_ms).saturating_sub(now) / 1000,
             })
         })
     }
