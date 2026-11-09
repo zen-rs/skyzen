@@ -254,6 +254,13 @@ impl Session {
         self.data().await?;
         {
             let mut inner = lock(&self.inner);
+            // A write that lands after destroy() must not resurrect the destroyed id —
+            // writing under it would recreate the record destroy just deleted. The session
+            // continues under a fresh id; loaded_id stays so write-back still drops the
+            // record the destroy meant to kill.
+            if inner.pending == Pending::Destroyed {
+                inner.id = mint_id();
+            }
             if let SessionCache::Ready(data) = &mut inner.data {
                 data.get_or_insert_with(SessionData::new)
                     .insert(key.to_owned(), value);
@@ -271,6 +278,9 @@ impl Session {
         self.data().await?;
         {
             let mut inner = lock(&self.inner);
+            if inner.pending == Pending::Destroyed {
+                inner.id = mint_id();
+            }
             if let SessionCache::Ready(Some(data)) = &mut inner.data {
                 data.remove(key);
             }
