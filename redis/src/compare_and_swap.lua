@@ -12,9 +12,9 @@
 -- Returns 1 when the swap was applied and 0 when the precondition no longer held. A lost race is
 -- the ordinary outcome of an optimistic update, so it is reported rather than raised as an error.
 --
--- The write is a plain SET, so the winner owns the key outright and any expiry the previous value
--- carried is cleared -- the same "a swap re-arms nothing" rule the in-memory and DynamoDB backends
--- follow.
+-- The write carries KEEPTTL so a swap replaces the value without dropping the deadline the
+-- record already carried -- the same "a swap keeps the key's expiry" rule the Cosmos,
+-- in-memory and DynamoDB backends follow.
 local current = redis.call('GET', KEYS[1])
 
 if ARGV[1] == '1' then
@@ -25,5 +25,5 @@ elseif current ~= false then
   return 0
 end
 
-redis.call('SET', KEYS[1], ARGV[3])
+redis.call('SET', KEYS[1], ARGV[3], 'KEEPTTL')
 return 1

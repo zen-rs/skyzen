@@ -357,7 +357,10 @@ impl CosmosKv {
     ///
     /// The tag is optional here so a plain [`KeyValueStore::get`] never depends on it; the
     /// conditional paths ask for it through [`read_for_swap`](Self::read_for_swap).
-    async fn read(&self, key: &str) -> Result<Option<(Vec<u8>, Option<String>)>, KvError> {
+    async fn read(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, Option<String>, Option<i32>)>, KvError> {
         match self
             .container
             .read_item(self.layout.partition_value(key).to_owned(), key, None)
@@ -365,8 +368,10 @@ impl CosmosKv {
         {
             Ok(response) => {
                 let etag = response.headers().etag().map(ToString::to_string);
-                let document: StoredValue = response.into_model().map_err(cosmos_error)?;
-                Ok(Some((decode_value(&document.value)?, etag)))
+                let document: StoredValue = response.into_model().map_err(|error| {
+                    KvError::Decode(format!("stored document did not decode: {error}"))
+                })?;
+                Ok(Some((decode_value(&document.value)?, etag, document.ttl)))
             }
             Err(error) if is_absent(&error) => Ok(None),
             Err(error) => Err(cosmos_error(error)),
@@ -377,8 +382,11 @@ impl CosmosKv {
     ///
     /// A document Cosmos returned without an `_etag` cannot be swapped safely, and reporting that
     /// is the difference between refusing the write and applying one that guards nothing.
-    async fn read_for_swap(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, KvError> {
-        let Some((value, etag)) = self.read(key).await? else {
+    async fn read_for_swap(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, String, Option<i32>)>, KvError> {
+        let Some((value, etag, ttl)) = self.read(key).await? else {
             return Ok(None);
         };
 
@@ -389,7 +397,7 @@ impl CosmosKv {
             ))
         })?;
 
-        Ok(Some((value, etag)))
+        Ok(Some((value, etag, ttl)))
     }
 
     /// Create a document, reporting whether it was created or already existed.
@@ -418,13 +426,14 @@ impl CosmosKv {
         key: &str,
         value: &[u8],
         etag: &str,
+        ttl: Option<i32>,
     ) -> Result<bool, KvError> {
         match self
             .container
             .replace_item(
                 self.layout.partition_value(key).to_owned(),
                 key,
-                self.layout.document(key, value, None),
+                self.layout.document(key, value, ttl),
                 Some(ItemWriteOptions::default().with_precondition(Precondition::if_match(etag))),
             )
             .await
@@ -434,6 +443,57 @@ impl CosmosKv {
             Err(error) if is_precondition_failed(&error) || is_absent(&error) => Ok(false),
             Err(error) => Err(cosmos_error(error)),
         }
+    }
+
+    /// The CAS loop behind [`increment`](KeyValueStore::increment) and
+    /// [`increment_with_ttl`](KeyValueStore::increment_with_ttl): `ttl_secs` arms the
+    /// document's `ttl` only when the counter is created — an existing document keeps the
+    /// deadline it already carries through `replace_if_unchanged`.
+    async fn increment_inner(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl_secs: Option<i32>,
+    ) -> Result<i64, KvError> {
+        for _ in 0..INCREMENT_ATTEMPTS {
+            let applied = match self.read_for_swap(key).await? {
+                None => {
+                    // An absent key counts as zero, and creating it is what makes the first
+                    // increment safe against a second caller doing the same — and what lets
+                    // a counter be born already carrying its deadline.
+                    let next = delta;
+                    self.create(key, next.to_string().as_bytes(), ttl_secs)
+                        .await?
+                        .then_some(next)
+                }
+                Some((stored, etag, ttl)) => {
+                    let current = counter_value(key, &stored)?;
+                    // `increment_with_ttl` counts from zero upward, so a stored negative
+                    // is corruption, not a count: it is refused here without a write and
+                    // keeps rejecting every hit until the record's deadline removes it.
+                    if ttl_secs.is_some() && current < 0 {
+                        return Err(KvError::Decode(format!(
+                            "counter under {key:?} holds the negative value {current}"
+                        )));
+                    }
+                    let next = current.checked_add(delta).ok_or_else(|| {
+                        KvError::Decode(format!(
+                            "incrementing the counter under {key:?} by {delta} overflows a 64-bit \
+                             integer"
+                        ))
+                    })?;
+                    self.replace_if_unchanged(key, next.to_string().as_bytes(), &etag, ttl)
+                        .await?
+                        .then_some(next)
+                }
+            };
+
+            if let Some(next) = applied {
+                return Ok(next);
+            }
+        }
+
+        Err(KvError::Conflict)
     }
 
     /// Store a value, with or without a per-document time-to-live.
@@ -472,6 +532,10 @@ fn account_endpoint(endpoint: &str) -> Result<AccountEndpoint, KvError> {
 struct StoredValue {
     /// The base64-encoded value.
     value: String,
+    /// The document's per-item TTL in seconds — carried through conditional writes so an
+    /// `expire` set earlier is not dropped by a replace.
+    #[serde(default)]
+    ttl: Option<i32>,
 }
 
 /// Encode bytes to base64 for Cosmos DB storage.
@@ -483,7 +547,7 @@ fn encode_value(data: &[u8]) -> String {
 fn decode_value(encoded: &str) -> Result<Vec<u8>, KvError> {
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|error| KvError::backend_with("base64 decode error", error))
+        .map_err(|error| KvError::Decode(format!("base64 decode error: {error}")))
 }
 
 /// Convert a TTL duration to whole seconds for Cosmos DB's `ttl` field.
@@ -516,7 +580,7 @@ fn counter_value(key: &str, value: &[u8]) -> Result<i64, KvError> {
         .ok()
         .and_then(|text| text.trim().parse::<i64>().ok())
         .ok_or_else(|| {
-            KvError::backend(format!(
+            KvError::Decode(format!(
                 "the value stored under {key:?} is not a decimal counter, so it cannot be \
                  incremented"
             ))
@@ -563,7 +627,7 @@ fn cosmos_error(error: CosmosError) -> KvError {
 
 impl KeyValueStore for CosmosKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
-        Ok(self.read(key).await?.map(|(value, _)| value))
+        Ok(self.read(key).await?.map(|(value, ..)| value))
     }
 
     async fn put(&self, key: &str, value: &[u8]) -> Result<(), KvError> {
@@ -606,7 +670,7 @@ impl KeyValueStore for CosmosKv {
             return self.create(key, value, None).await;
         };
 
-        let Some((stored, etag)) = self.read_for_swap(key).await? else {
+        let Some((stored, etag, ttl)) = self.read_for_swap(key).await? else {
             return Ok(false);
         };
 
@@ -614,7 +678,7 @@ impl KeyValueStore for CosmosKv {
             return Ok(false);
         }
 
-        self.replace_if_unchanged(key, value, &etag).await
+        self.replace_if_unchanged(key, value, &etag, ttl).await
     }
 
     /// Add `delta` to the decimal counter stored under `key`.
@@ -623,38 +687,26 @@ impl KeyValueStore for CosmosKv {
     /// guarded read-modify-write: a lost race is retried, and a key contended past
     /// [`INCREMENT_ATTEMPTS`] rounds reports [`KvError::Conflict`] rather than spinning.
     async fn increment(&self, key: &str, delta: i64) -> Result<i64, KvError> {
-        for _ in 0..INCREMENT_ATTEMPTS {
-            let applied = match self.read_for_swap(key).await? {
-                None => {
-                    // An absent key counts as zero, and creating it is what makes the first
-                    // increment safe against a second caller doing the same.
-                    let next = delta;
-                    self.create(key, next.to_string().as_bytes(), None)
-                        .await?
-                        .then_some(next)
-                }
-                Some((stored, etag)) => {
-                    let next =
-                        counter_value(key, &stored)?
-                            .checked_add(delta)
-                            .ok_or_else(|| {
-                                KvError::backend(format!(
-                            "incrementing the counter under {key:?} by {delta} overflows a 64-bit \
-                             integer"
-                        ))
-                            })?;
-                    self.replace_if_unchanged(key, next.to_string().as_bytes(), &etag)
-                        .await?
-                        .then_some(next)
-                }
-            };
+        self.increment_inner(key, delta, None).await
+    }
 
-            if let Some(next) = applied {
-                return Ok(next);
-            }
+    /// Add `delta` to the decimal counter stored under `key`, arming the document's `ttl`
+    /// field when the counter is created — an existing document keeps the deadline it
+    /// already carries through `replace_if_unchanged`.
+    async fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Duration,
+    ) -> Result<i64, KvError> {
+        if !self.layout.ttl_enabled {
+            return Err(KvError::Unsupported(
+                "this Cosmos container has time-to-live disabled, so a counter's ttl \
+                 field would not expire it; enable DefaultTimeToLive on the container",
+            ));
         }
-
-        Err(KvError::Conflict)
+        self.increment_inner(key, delta, Some(ttl_seconds(ttl)?))
+            .await
     }
 
     /// Set the document's `ttl` field, leaving its value alone.

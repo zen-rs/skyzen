@@ -215,3 +215,5 @@ mod auto_etag;
 pub use auto_etag::AutoETag;
 mod security_headers;
 pub use security_headers::SecurityHeaders;
+mod rate_limit;
+pub use rate_limit::{RateLimit, RateLimitUnavailable, RateLimited};

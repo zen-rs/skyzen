@@ -216,12 +216,14 @@ impl KeyValueStore for InMemoryKv {
         ready(self.take_injected_failure().map(|()| {
             let mut data = self.write_purged();
             data.get(key).map(|entry| entry.value.as_slice()) == expected && {
+                // A swap replaces the value, not the record: the deadline the entry already
+                // carried survives, as `replace_if_unchanged` does on Cosmos.
+                let expires_at = data.get(key).and_then(|entry| entry.expires_at);
                 data.insert(
                     key.to_owned(),
                     Entry {
                         value: new.to_vec(),
-                        // A swap re-arms nothing: the winner owns the key outright, as `SET` does.
-                        expires_at: None,
+                        expires_at,
                     },
                 );
                 true
@@ -242,6 +244,44 @@ impl KeyValueStore for InMemoryKv {
             // Keep whatever expiry the counter already had, so an incremented rate-limit
             // window still closes on schedule.
             let expires_at = data.get(key).and_then(|entry| entry.expires_at);
+            data.insert(
+                key.to_owned(),
+                Entry {
+                    value: updated.to_string().into_bytes(),
+                    expires_at,
+                },
+            );
+            drop(data);
+            Ok(updated)
+        }))
+    }
+
+    fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Duration,
+    ) -> impl Future<Output = Result<i64, KvError>> + Send {
+        ready(self.take_injected_failure().and_then(|()| {
+            let expires_at = self.expiry_for(ttl);
+            let mut data = self.write_purged();
+            let current = counter_value(data.get(key))?;
+            // The TTL counter counts from zero upward, so a stored negative is corruption,
+            // not a count: refuse it without a write, the way the real backends do.
+            if current < 0 {
+                return Err(KvError::Decode(format!(
+                    "counter under {key:?} holds the negative value {current}"
+                )));
+            }
+            let updated = current
+                .checked_add(delta)
+                .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
+            // A counter born under the limiter carries its deadline from the first write;
+            // one that already existed keeps whatever expiry it has.
+            let expires_at = data
+                .get(key)
+                .and_then(|entry| entry.expires_at)
+                .or(expires_at);
             data.insert(
                 key.to_owned(),
                 Entry {
