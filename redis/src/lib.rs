@@ -423,16 +423,29 @@ fn install_tls_provider(client: &redis::Client) {
 const fn install_tls_provider(_client: &redis::Client) {}
 
 /// `tls` compiles both runtime comps, so upstream picks the executor by
-/// tokio-handle detection — a `runtime-smol` consumer driven from a tokio
-/// context would silently get tokio. `runtime-smol` is the only selection
-/// that differs from upstream's auto-detect under a tokio host, so pin it
-/// once; `prefer_smol` refuses to override a preference the app already set.
-/// The preference API itself exists only when upstream compiles both runtimes
-/// — exactly the ambiguity this resolves.
+/// tokio-handle detection and the declared runtime can lose either way: a
+/// `runtime-smol` consumer driven from a tokio context gets tokio, and a
+/// `runtime-tokio` consumer outside any tokio context gets smol. Pin the
+/// declared preference once — `prefer_*` exists only when upstream compiles
+/// both runtimes (exactly the ambiguity this resolves) and refuses to
+/// override a preference the app already set. With both runtime features on,
+/// the selection is genuinely ambiguous, so nothing is pinned.
 #[cfg(all(
-    feature = "runtime-smol",
+    feature = "tls",
+    feature = "runtime-tokio",
+    not(feature = "runtime-smol")
+))]
+fn pin_runtime() {
+    static PIN: std::sync::Once = std::sync::Once::new();
+    PIN.call_once(|| {
+        let _ = redis::aio::prefer_tokio();
+    });
+}
+
+#[cfg(all(
+    feature = "tls",
     not(feature = "runtime-tokio"),
-    feature = "tls"
+    feature = "runtime-smol"
 ))]
 fn pin_runtime() {
     static PIN: std::sync::Once = std::sync::Once::new();
@@ -441,10 +454,17 @@ fn pin_runtime() {
     });
 }
 
-#[cfg(not(all(
-    feature = "runtime-smol",
-    not(feature = "runtime-tokio"),
-    feature = "tls"
+#[cfg(not(any(
+    all(
+        feature = "tls",
+        feature = "runtime-tokio",
+        not(feature = "runtime-smol")
+    ),
+    all(
+        feature = "tls",
+        not(feature = "runtime-tokio"),
+        feature = "runtime-smol"
+    )
 )))]
 const fn pin_runtime() {}
 
@@ -675,12 +695,19 @@ mod tests {
         assert!(redis::Client::open("rediss://user:password@127.0.0.1:6379/0").is_ok());
     }
 
-    /// The regression that needed a feature at all: without `tls` the scheme
-    /// fails at parse time rather than at connect.
+    /// Without `tls` the provider install is a no-op, so `builder()` — the
+    /// call upstream's connect path makes — still panics in this test's
+    /// dual-provider world. That is the disabled state, observable: `connect`
+    /// installs nothing the caller did not ask for.
     #[test]
     #[cfg(not(feature = "tls"))]
-    fn a_rediss_url_fails_without_a_tls_feature() {
-        assert!(redis::Client::open("rediss://127.0.0.1:6379/0").is_err());
+    fn without_tls_no_provider_is_installed() {
+        let client = redis::Client::open("rediss://127.0.0.1:6379/0").expect("parses");
+        super::install_tls_provider(&client);
+        assert!(
+            std::panic::catch_unwind(rustls::ClientConfig::builder).is_err(),
+            "builder() must still panic — no provider was installed"
+        );
     }
 
     /// `builder()` resolves through the process default — exactly what redis's

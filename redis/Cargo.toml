@@ -47,8 +47,15 @@ rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.14"
 tokio = { version = "1", features = ["macros", "time", "rt-multi-thread"] }
 # `tls-rustls-insecure` lets the handshake test accept a self-signed peer via
-# `rediss://…#insecure`; verification stays on for every other URL.
-redis = { version = "1", features = ["tls-rustls-insecure"] }
+# `rediss://…#insecure`; verification stays on for every other URL. The two
+# comps come along because upstream `tls-rustls` requires a rustls comp for
+# every enabled runtime — without them `cargo test` (no `tls`) would not
+# compile at all.
+redis = { version = "1", features = [
+    "tokio-rustls-comp",
+    "smol-rustls-comp",
+    "tls-rustls-insecure",
+] }
 
 [lints]
 workspace = true
