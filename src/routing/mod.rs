@@ -156,6 +156,9 @@ pub use param::{MissingParam, Params};
 mod router;
 pub use router::{build, AllowedMethods, NotFound, RouteBuildError, Router};
 
+mod matched_path;
+pub use matched_path::{MatchedPath, NoMatchedPath};
+
 mod nest;
 pub use nest::{NestedPathError, NestedRouter};
 

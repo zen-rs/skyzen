@@ -7,7 +7,7 @@ use http_kit::uri::PathAndQuery;
 
 use crate::{Endpoint, Request, Response, StatusCode, Uri};
 
-use super::Router;
+use super::{join_path, MatchedPath, Router};
 
 /// Serves a mounted [`Router`], with the mount prefix stripped from the request path.
 ///
@@ -59,10 +59,26 @@ impl Endpoint for NestedRouter {
             .ok_or_else(|| Box::new(NestedPathError(original.to_string())) as BoxHttpError)?;
 
         *request.uri_mut() = rewritten;
+        let outer_match = request.extensions().get::<MatchedPath>().cloned();
         let result = self.router.respond(request).await;
         // Put the path back so an outer layer that inspects the request after the inner router
         // returns still sees the URL the client asked for.
         *request.uri_mut() = original;
+        // An inner match overwrote the outer router's `MatchedPath`; rejoin it onto the mount
+        // prefix so the template describes the full route (`/api` + `/users/{id}`). One that
+        // survived untouched means the inner router's fallback answered, and the mount's own
+        // template stays the honest report.
+        if let Some(matched) = request.extensions().get::<MatchedPath>() {
+            if Some(matched) != outer_match.as_ref() {
+                let inner = matched.as_str().to_owned();
+                let joined = if inner == "/" {
+                    self.prefix.to_string()
+                } else {
+                    join_path(&self.prefix, &inner)
+                };
+                request.extensions_mut().insert(MatchedPath::new(joined));
+            }
+        }
         result
     }
 }

@@ -7,8 +7,8 @@ use std::{
 };
 
 use super::{
-    join_path, BoxEndpoint, EndpointFactory, MethodFilter, NestedRouter, Params, Route, RouteNode,
-    RouteNodeType,
+    join_path, BoxEndpoint, EndpointFactory, MatchedPath, MethodFilter, NestedRouter, Params,
+    Route, RouteNode, RouteNodeType,
 };
 #[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
@@ -52,6 +52,10 @@ struct MethodTable {
     entries: Vec<(Method, App)>,
     /// Handler registered with `.any`, answering whatever the exact entries do not.
     any: Option<App>,
+    /// The route template this table was registered under, e.g. `"/users/{id}"` —
+    /// `matchit` reports params but not the pattern that produced them, so the router
+    /// keeps it to expose as [`MatchedPath`].
+    path: Arc<str>,
 }
 
 /// Chain terminal that serves a request from a freshly built endpoint.
@@ -187,9 +191,15 @@ enum RouteLookup<'app> {
         app: &'app App,
         head_fallback: bool,
         params: Vec<(String, String)>,
+        /// The route template the matchit match came from.
+        path: &'app Arc<str>,
     },
     /// The path matched but no registered method did.
-    MethodNotAllowed(Vec<Method>),
+    MethodNotAllowed {
+        allow: Vec<Method>,
+        /// The route template the path match came from.
+        path: &'app Arc<str>,
+    },
     /// No route matched the path.
     Unmatched,
 }
@@ -221,7 +231,10 @@ impl Router {
             .or_else(|| value.any.as_ref().map(|app| (app, false)));
 
         found.map_or_else(
-            || RouteLookup::MethodNotAllowed(allowed_methods(&value.entries)),
+            || RouteLookup::MethodNotAllowed {
+                allow: allowed_methods(&value.entries),
+                path: &value.path,
+            },
             |(app, head_fallback)| RouteLookup::Endpoint {
                 app,
                 head_fallback,
@@ -229,6 +242,7 @@ impl Router {
                     .iter()
                     .map(|(key, value)| (key.to_owned(), percent_decode(value)))
                     .collect(),
+                path: &value.path,
             },
         )
     }
@@ -244,7 +258,11 @@ impl Router {
                 app,
                 head_fallback,
                 params,
+                path,
             } => {
+                request
+                    .extensions_mut()
+                    .insert(MatchedPath::new(Arc::clone(path)));
                 request.extensions_mut().insert(Params::new(params));
                 let mut response = app.run(request).await?;
                 if head_fallback {
@@ -252,7 +270,10 @@ impl Router {
                 }
                 Ok(response)
             }
-            RouteLookup::MethodNotAllowed(allow) => {
+            RouteLookup::MethodNotAllowed { allow, path } => {
+                request
+                    .extensions_mut()
+                    .insert(MatchedPath::new(Arc::clone(path)));
                 let allow = AllowedMethods(allow);
                 match &self.method_not_allowed {
                     Some(factory) => {
@@ -696,7 +717,10 @@ fn build_method_table(
     global_provisions: &HashSet<std::any::TypeId>,
     routes: &mut Vec<(MethodFilter, String)>,
 ) -> Result<MethodTable, RouteBuildError> {
-    let mut table = MethodTable::default();
+    let mut table = MethodTable {
+        path: Arc::from(path),
+        ..MethodTable::default()
+    };
     let mut seen = HashSet::new();
 
     for endpoint in endpoints {
