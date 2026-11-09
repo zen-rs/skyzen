@@ -133,7 +133,7 @@ linkme = "0.3"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 # Native-only dependencies (always available, not gated by features)
-executor-core = { workspace = true, features = ["smol"] }
+executor-core = { workspace = true, features = ["tokio", "smol"] }
 async-fs = "2.2.0"
 async-net.workspace = true
 async-io.workspace = true
@@ -287,7 +287,7 @@ ws = [
 # The `rt` feature enables the built-in runtime for `#[skyzen::main]`.
 # On native targets: provides logging, signal handling (ctrl+c), and serves HTTP via hyper+tokio.
 # On WASM targets: no-op (WASM already runs in a runtime and uses WinterCG APIs).
-rt = []
+rt = ["dep:tokio"]
 # Terminate TLS in the native server: `--tls-cert`/`--tls-key` (or `SKYZEN_TLS_CERT`/
 # `SKYZEN_TLS_KEY`) point the runtime at a PEM certificate chain and private key, and
 # `#[skyzen::main]` serves HTTPS on the bound listener with ALPN `h2, http/1.1`.

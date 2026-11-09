@@ -24,7 +24,7 @@ use async_net::unix::{UnixListener, UnixStream};
 use async_net::TcpListener;
 use core::convert::Infallible;
 use executor_core::{
-    smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
+    tokio::TokioGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
 };
 use futures_util::{future::FutureExt, stream::MapOk, Stream, StreamExt, TryStreamExt};
 use http_body_util::{BodyDataStream, StreamBody};
@@ -927,6 +927,16 @@ enum Platform {
 
 pub use skyzen_core::OPENAPI_DUMP_ENV;
 
+/// A short-lived single-thread runtime for the paths that run before `launch`
+/// builds the real one — currently only `--dump-openapi`, which needs one
+/// `factory()` pass and then exits.
+fn current_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the tokio runtime")
+}
+
 /// Print the application's `OpenAPI` document and report that the process should now exit, if
 /// [`OPENAPI_DUMP_ENV`] asked for it.
 ///
@@ -941,7 +951,7 @@ pub use skyzen_core::OPENAPI_DUMP_ENV;
 /// # Panics
 ///
 /// Never returns on a failure: an unwritable path or a build with the `openapi` feature off exits
-/// non-zero, because a caller asked for a document and a silent empty one is worse than no answer.
+/// with a non-zero, because a caller asked for a document and a silent empty one is worse than no answer.
 pub fn dump_openapi_if_requested<Fut, E>(factory: impl FnOnce() -> Fut) -> bool
 where
     Fut: Future<Output = E>,
@@ -951,7 +961,9 @@ where
         return false;
     };
 
-    let document = smol::block_on(factory()).openapi_document();
+    let document = current_thread_runtime()
+        .block_on(factory())
+        .openapi_document();
     if !document.is_enabled() {
         error!(
             "{OPENAPI_DUMP_ENV} was set, but this binary was built without skyzen's `openapi` \
@@ -1131,12 +1143,16 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
         std::process::exit(1);
     }
 
-    let executor = SmolGlobal;
+    let executor = TokioGlobal;
     if try_init_global_executor(executor).is_err() {
         debug!("Global executor already initialized; reusing existing instance");
     }
 
-    let failed = smol::block_on(async move {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the tokio runtime");
+    let failed = runtime.block_on(async move {
         tracing::info!("Skyzen application starting up");
 
         let (endpoint, consumers) = factory().await;
@@ -1856,9 +1872,11 @@ mod tests {
     #[cfg(feature = "server-tls")]
     use super::{
         http1, negotiated_stream, sniff_protocol_with_timeout, AnyExecutor, Arc, BoxHttpError,
-        ConnectionWrapper, Endpoint, Infallible, IntoService, ShutdownGuard, SmolGlobal,
+        ConnectionWrapper, Endpoint, Infallible, IntoService, ShutdownGuard,
     };
     use crate::runtime::azure::CUSTOM_HANDLER_PORT_ENV;
+    #[cfg(feature = "server-tls")]
+    use executor_core::smol::SmolGlobal;
     use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use serial_test::serial;
     #[cfg(feature = "server-tls")]
