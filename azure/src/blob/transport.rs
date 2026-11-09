@@ -11,7 +11,7 @@ use futures_util::TryStreamExt as _;
 use http::{Request, Response};
 use opendal::raw::{parse_content_encoding, parse_content_length};
 use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport, Result};
-use zenwave::{Body, Endpoint as _, Transport};
+use zenwave::{Body, DefaultClient, Endpoint as _, Transport};
 
 /// An [`HttpTransport`] that dispatches requests through `zenwave`.
 #[derive(Debug)]
@@ -39,9 +39,13 @@ impl HttpTransport for ZenwaveTransport {
         let (parts, body) = req.into_parts();
         let mut request = Request::from_parts(parts, Body::from_stream(body));
 
-        // Redirects are what `client_with` adds over the raw backend, and `HttpTransport` is
-        // documented to follow them.
-        let mut client = zenwave::client_with(self.transport.clone());
+        // The raw backend answers a 3xx as itself rather than replaying the request at a
+        // different URI: every request this transport fetches arrives already signed — the
+        // signature is bound to the URI it was minted for — so a hop could never be honored
+        // anyway. `HttpTransport` is documented to follow redirects, but zenwave's
+        // `FollowRedirect` currently rebuilds 307/308 hops with an empty body, and on a signed
+        // request the replay would fail even if it carried one.
+        let mut client = DefaultClient::raw(self.transport.clone());
         let response = client.respond(&mut request).await.map_err(|error| {
             Error::new(ErrorKind::Unexpected, "send http request")
                 .with_operation("zenwave::respond")
