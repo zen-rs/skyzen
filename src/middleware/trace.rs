@@ -79,6 +79,7 @@ pub struct Trace {
     on_failure: Level,
     on_client_error: Option<Level>,
     include_headers: Vec<HeaderName>,
+    include_query: bool,
 }
 
 impl Default for Trace {
@@ -89,6 +90,7 @@ impl Default for Trace {
             on_failure: Level::ERROR,
             on_client_error: None,
             include_headers: Vec::new(),
+            include_query: false,
         }
     }
 }
@@ -135,6 +137,14 @@ impl Trace {
     #[must_use]
     pub fn include_headers(mut self, headers: impl IntoIterator<Item = HeaderName>) -> Self {
         self.include_headers.extend(headers);
+        self
+    }
+
+    /// Also record the raw query string in the span's `url.query` field (off by default —
+    /// query strings habitually carry tokens, signatures and other secrets).
+    #[must_use]
+    pub const fn include_query(mut self) -> Self {
+        self.include_query = true;
         self
     }
 
@@ -240,7 +250,11 @@ impl Trace {
                     "request",
                     http.request.method = request.method().as_str(),
                     url.path = request.uri().path(),
-                    url.query = request.uri().query(),
+                    url.query = if self.include_query {
+                        request.uri().query()
+                    } else {
+                        None
+                    },
                     http.route = Empty,
                     http.response.status_code = Empty,
                     http.request.headers = tracing::field::display(&headers),
