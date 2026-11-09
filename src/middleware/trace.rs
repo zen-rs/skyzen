@@ -180,7 +180,10 @@ impl Trace {
         }
         let latency_ms = timer.elapsed_ms();
 
-        match result {
+        // `record` lands on the span object itself, but `event!` resolves the *current*
+        // span — the instrumented future is over by now, so re-enter before emitting or
+        // the response and failure events land outside the request's context.
+        span.in_scope(|| match result {
             Ok(response) => {
                 let status = response.status();
                 span.record("http.response.status_code", status.as_u16());
@@ -222,7 +225,7 @@ impl Trace {
                 }
                 Err(error)
             }
-        }
+        })
     }
 
     /// The span for `request`, with the static fields filled and the dynamic ones reserved.
