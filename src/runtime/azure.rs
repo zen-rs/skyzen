@@ -33,10 +33,10 @@ use skyzen_services::{
     queue::{envelope, QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition},
     ScheduledTick,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::{
-    routing::{MethodFilter, ServedRoutes},
+    routing::ServedRoutes,
     runtime::{consumer::ConsumerSet, scheduler::ScheduleSet},
 };
 
@@ -258,48 +258,89 @@ async fn forwarded_request(request: &mut Request) -> Option<Request> {
         return None;
     }
     let body = request.body_mut().take().ok()?.into_bytes().await.ok()?;
-    let req = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()?
-        .get("Data")?
-        .get("req")?
-        .clone();
+    let Some(req) = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|envelope| envelope.get("Data")?.get("req").cloned())
+    else {
+        // Not an envelope — the forwarding mode or a developer reached the handler directly,
+        // and the body the application reads has to go back before the router sees it.
+        *request.body_mut() = Body::from(body.to_vec());
+        return None;
+    };
+
+    // The host serializes its `HttpRequest` with the .NET property names: `Body`, `Method`,
+    // `Url`, `Headers`. The lowercase spellings are read as well so a host version that
+    // differs does not silently empty the request.
+    fn field<'a>(req: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+        req.get(name)
+            .or_else(|| req.get(name.to_ascii_lowercase().as_str()))
+    }
 
     let mut forwarded = Request::new(Body::from(
-        req.get("body")
+        field(&req, "Body")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .as_bytes()
             .to_vec(),
     ));
-    *forwarded.method_mut() = req
-        .get("method")
+    *forwarded.method_mut() = field(&req, "Method")
         .and_then(serde_json::Value::as_str)
         .and_then(|method| Method::from_bytes(method.as_bytes()).ok())
         .unwrap_or(Method::GET);
-    if let Some(url) = req.get("url").and_then(serde_json::Value::as_str) {
+    if let Some(url) = field(&req, "Url").and_then(serde_json::Value::as_str) {
         // The URL is absolute; `Uri` keeps its path and query, which is all routing reads.
         if let Ok(uri) = url.parse() {
             *forwarded.uri_mut() = uri;
         }
     }
-    if let Some(headers) = req.get("headers").and_then(serde_json::Value::as_object) {
+    if let Some(headers) = field(&req, "Headers").and_then(serde_json::Value::as_object) {
         for (name, value) in headers {
-            let values = value
+            // A header arrives as one string or an array of them; every value is kept.
+            let values: Vec<String> = value
                 .as_str()
-                .map(ToOwned::to_owned)
-                .or_else(|| value.as_array()?.first()?.as_str().map(ToOwned::to_owned));
-            let Some(value) = values else {
-                continue;
-            };
-            if let (Ok(name), Ok(value)) = (
-                http_kit::header::HeaderName::from_bytes(name.as_bytes()),
-                http_kit::header::HeaderValue::from_str(&value),
-            ) {
-                forwarded.headers_mut().insert(name, value);
+                .map(|value| vec![value.to_owned()])
+                .or_else(|| {
+                    value.as_array().map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            for value in values {
+                if let (Ok(name), Ok(value)) = (
+                    http_kit::header::HeaderName::from_bytes(name.as_bytes()),
+                    http_kit::header::HeaderValue::from_str(&value),
+                ) {
+                    forwarded.headers_mut().append(name, value);
+                }
             }
         }
     }
     Some(forwarded)
+}
+
+/// Standard base64, for binary `res.body` payloads.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut triple = [0u8; 3];
+        triple[..chunk.len()].copy_from_slice(chunk);
+        let n = u32::from_be_bytes([0, triple[0], triple[1], triple[2]]);
+        for (i, index) in [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63]
+            .into_iter()
+            .enumerate()
+        {
+            if i >= chunk.len() + 1 {
+                encoded.push('=');
+            } else {
+                encoded.push(ALPHABET[index as usize] as char);
+            }
+        }
+    }
+    encoded
 }
 
 /// Serialize the application's response into the `Outputs.res` the `http` output binding
@@ -307,20 +348,23 @@ async fn forwarded_request(request: &mut Request) -> Option<Request> {
 async fn wrapped_response(response: Response) -> Response {
     let (parts, body) = response.into_parts();
     let status = parts.status.as_u16();
-    let body = body
-        .into_bytes()
-        .await
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
-    let headers: serde_json::Map<String, serde_json::Value> = parts
-        .headers
-        .iter()
-        .filter_map(|(name, value)| {
-            serde_json::to_value(value.to_str().ok()?)
-                .ok()
-                .map(|v| (name.as_str().to_owned(), v))
-        })
-        .collect();
+    let bytes = body.into_bytes().await.unwrap_or_default();
+    // `res.body` carries a string — UTF-8 text goes verbatim, anything else goes base64 the
+    // way a binary payload has to be represented in the binding's JSON.
+    let body =
+        String::from_utf8(bytes.to_vec()).unwrap_or_else(|error| base64(&error.into_bytes()));
+    // One name maps to every value it appeared with — a `Set-Cookie` pair is two values, not
+    // a second overwrite of the first.
+    let mut headers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (name, value) in &parts.headers {
+        if let Ok(value) = value.to_str() {
+            headers
+                .entry(name.as_str().to_owned())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                .as_array_mut()
+                .map(|values| values.push(value.into()));
+        }
+    }
     let payload = serde_json::json!({
         "Outputs": { "res": { "statusCode": status, "headers": headers, "body": body } },
         "Logs": []

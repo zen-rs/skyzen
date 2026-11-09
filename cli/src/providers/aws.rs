@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result};
-use eventbridge::EventBridgeSchedules;
+use eventbridge::{EventBridgeSchedules, SuspendSchedules};
 use lambda_env::{LambdaEnvironment, LambdaEnvironmentNames};
 use skyzen_manifest::{AwsSection, Manifest};
 
@@ -81,6 +81,13 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
             let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
             child_env = prepared.child_env;
             let mut steps = vec![
+                // Suspending comes first: a rule already enabled could fire the new code
+                // before its new environment exists.
+                Step::Task(Box::new(SuspendSchedules::new(
+                    function.clone(),
+                    manifest.data().schedule.clone(),
+                    child_env.clone(),
+                ))),
                 Step::Command(build_command(&config, &root_dir, true)),
                 Step::Command(deploy_command(&config, &root_dir, &binary)),
             ];

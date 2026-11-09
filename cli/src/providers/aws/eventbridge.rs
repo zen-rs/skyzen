@@ -59,6 +59,85 @@ impl EventBridgeSchedules {
     }
 }
 
+/// Quiet every managed rule for the length of a deploy.
+///
+/// `cargo lambda deploy` updates the code in place, so a rule already enabled can invoke the
+/// new function while its environment update is still in flight — a tick in that window reads
+/// stale configuration. Disabling every managed rule first and letting [`EventBridgeSchedules`]
+/// re-enable them last means no firing happens between the upload and the delivery.
+#[derive(Debug)]
+pub struct SuspendSchedules {
+    /// The rules' owner, reusing `EventBridgeSchedules`' naming and policy reading.
+    inner: EventBridgeSchedules,
+}
+
+impl SuspendSchedules {
+    /// The step that disables every rule `schedules` and the Lambda policy name for `function`.
+    pub const fn new(
+        function: String,
+        schedules: Vec<ScheduleEntry>,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            inner: EventBridgeSchedules::new(function, schedules, env),
+        }
+    }
+}
+
+impl Task for SuspendSchedules {
+    fn describe(&self) -> String {
+        format!(
+            "suspend EventBridge schedules on Lambda function `{}` for the duration of the \
+             deploy",
+            self.inner.function
+        )
+    }
+
+    fn run(&self) -> Result<()> {
+        super::lambda_env::adopt_env(&self.inner.env);
+        block_on(async {
+            let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let lambda = aws_sdk_lambda::Client::new(&shared);
+            let events = aws_sdk_eventbridge::Client::new(&shared);
+
+            let mut names: std::collections::BTreeSet<String> = self
+                .inner
+                .schedules
+                .iter()
+                .map(|entry| entry.name.as_str().to_owned())
+                .collect();
+            // Rules surviving from names the manifest no longer declares matter as much —
+            // they are just as capable of firing during the upload.
+            if let Some(policy) = self.inner.policy(&lambda).await? {
+                if let Some(statements) = policy["Statement"].as_array() {
+                    for name in statements
+                        .iter()
+                        .filter_map(|entry| entry["Sid"].as_str()?.strip_prefix("skyzen-schedule-"))
+                    {
+                        names.insert(name.to_owned());
+                    }
+                }
+            }
+            for name in names {
+                let rule = self.inner.rule_name(&name);
+                match events.disable_rule().name(&rule).send().await {
+                    Ok(_) => output::ok(format!("suspended EventBridge rule `{rule}`")),
+                    Err(error)
+                        if error.as_service_error().is_some_and(
+                            aws_sdk_eventbridge::operation::disable_rule::DisableRuleError::is_resource_not_found_exception,
+                        ) => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to suspend EventBridge rule `{rule}`")
+                        })
+                    }
+                }
+            }
+            Ok(())
+        })?
+    }
+}
+
 impl Task for EventBridgeSchedules {
     fn describe(&self) -> String {
         if self.schedules.is_empty() {
