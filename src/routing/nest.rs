@@ -7,7 +7,7 @@ use http_kit::uri::PathAndQuery;
 
 use crate::{Endpoint, Request, Response, StatusCode, Uri};
 
-use super::Router;
+use super::{join_path, MatchedPath, MountPrefix, Router};
 
 /// Serves a mounted [`Router`], with the mount prefix stripped from the request path.
 ///
@@ -59,10 +59,26 @@ impl Endpoint for NestedRouter {
             .ok_or_else(|| Box::new(NestedPathError(original.to_string())) as BoxHttpError)?;
 
         *request.uri_mut() = rewritten;
+        // The mount's own template (`/api` or `/api/{*skyzen_nested}`) is an internal
+        // routing artifact, not a user route — drop it before the inner router runs so
+        // inner handlers and fallbacks extracting `Option<MatchedPath>` see `None` unless
+        // a real inner route matches. The accumulated mount prefix travels as an
+        // extension: `dispatch_matched` composes it into the full template
+        // (`/api` + `/users/{id}`) at insertion time, before the handler extracts it.
+        request.extensions_mut().remove::<MatchedPath>();
+        let accumulated = match request.extensions().get::<MountPrefix>() {
+            Some(parent) => join_path(&parent.0, &self.prefix),
+            None => self.prefix.to_string(),
+        };
+        let previous = request.extensions_mut().insert(MountPrefix(accumulated));
         let result = self.router.respond(request).await;
         // Put the path back so an outer layer that inspects the request after the inner router
         // returns still sees the URL the client asked for.
         *request.uri_mut() = original;
+        match previous {
+            Some(previous) => request.extensions_mut().insert(previous),
+            None => request.extensions_mut().remove::<MountPrefix>(),
+        };
         result
     }
 }

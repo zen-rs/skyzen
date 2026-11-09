@@ -85,7 +85,8 @@ use aws_lambda_events::sqs::SqsEvent;
 use futures_util::FutureExt as _;
 use http_kit::Endpoint;
 use lambda_http::{
-    request::LambdaRequest, Adapter, LambdaEvent, Request as LambdaHttpRequest, Response, Service,
+    request::LambdaRequest, Adapter, LambdaEvent, Request as LambdaHttpRequest, RequestExt,
+    Response, Service,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -332,7 +333,15 @@ where
         let mut endpoint = self.endpoint.clone();
 
         Box::pin(async move {
+            let request_id = request
+                .lambda_context_ref()
+                .map(|ctx| ctx.request_id.clone());
             let mut request: http_kit::Request = request.map(convert::into_skyzen_body);
+            if let Some(request_id) = request_id {
+                request
+                    .extensions_mut()
+                    .insert(skyzen_core::PlatformRequestId(request_id));
+            }
             let method = request.method().clone();
             let path = request.uri().path().to_owned();
 
@@ -348,7 +357,9 @@ where
                 }
                 Err(error) => {
                     skyzen_core::log_endpoint_error(&error, &method, path.as_str());
-                    skyzen_core::error_response(&error)
+                    let mut response = skyzen_core::error_response(&error);
+                    skyzen_core::apply_pending_headers(&request, &mut response);
+                    response
                 }
             };
 

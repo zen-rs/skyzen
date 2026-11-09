@@ -223,7 +223,9 @@ impl<E: Endpoint> RequestBuilder<E> {
             Ok(resp) => resp,
             Err(err) => {
                 skyzen_core::log_endpoint_error(&err, &method, path.as_str());
-                skyzen_core::error_response(&err)
+                let mut response = skyzen_core::error_response(&err);
+                skyzen_core::apply_pending_headers(&request, &mut response);
+                response
             }
         };
 

@@ -105,6 +105,10 @@ flate2 = "1.1"
 brotli = { version = "9", optional = true, default-features = false, features = ["std"] }
 ruzstd = { version = "0.9", optional = true, default-features = false, features = ["std", "hash"] }
 bytes = "1.11"
+# UUIDv7 request ids: `std` for `Timestamp::now`, and on wasm the `js` feature drives
+# `Date::now` + WebCrypto instead of `getrandom` (the `uuid` entry under the wasm32
+# target adds it).
+uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 mime_guess = "2.0"
 include_dir = "0.7"
 skyzen-macros.workspace = true
@@ -194,6 +198,9 @@ inventory = "0.3"
 # `Key::generate()` (signed/private cookies) reaches WebCrypto through getrandom's js backend;
 # without it the call would panic on a Worker.
 getrandom = { version = "0.2", features = ["js"] }
+# `js` makes `Uuid::now_v7` work on wasm32-unknown-unknown: `Date::now` for the
+# timestamp and `crypto.getRandomValues` for the random bits.
+uuid = { version = "1", default-features = false, features = ["std", "v7", "js"] }
 wasm-bindgen = { version = "0.2.110", features = ["spans"] }
 wasm-bindgen-futures = "0.4.60"
 js-sys = "0.3.87"

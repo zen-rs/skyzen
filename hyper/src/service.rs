@@ -15,7 +15,9 @@ use std::{
     task::{Context, Poll},
 };
 
-use skyzen_core::{error_response, log_endpoint_error, BodyError, Endpoint, PeerAddr};
+use skyzen_core::{
+    apply_pending_headers, error_response, log_endpoint_error, BodyError, Endpoint, PeerAddr,
+};
 
 type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
 type Bytes = http_kit::utils::Bytes;
@@ -134,7 +136,9 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 }
                 Err(error) => {
                     log_endpoint_error(&error, &method, path.as_str());
-                    error_response(&error)
+                    let mut response = error_response(&error);
+                    apply_pending_headers(&request, &mut response);
+                    response
                 }
             };
 

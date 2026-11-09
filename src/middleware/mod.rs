@@ -43,8 +43,10 @@ mod body_limit;
 mod cors;
 mod decompression;
 mod error_handling;
+mod request_id;
 #[cfg(not(target_arch = "wasm32"))]
 mod timeout;
+mod trace;
 
 pub mod auth;
 pub mod compression;
@@ -62,12 +64,14 @@ pub use compression::{CompressionEncoding, CompressionLevel, CompressionMiddlewa
 pub use cors::{AllowOrigin, Cors, CorsConfigError};
 pub use decompression::{DecompressionEncoding, DecompressionMiddleware};
 pub use error_handling::ErrorHandlingMiddleware;
+pub use request_id::{MissingRequestId, RequestId};
 #[doc(inline)]
 pub use skyzen_core::middleware::{
     apply, from_fn, BoxMiddleware, FromFn, Middleware, MiddlewareFn, Next,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use timeout::Timeout;
+pub use trace::Trace;
 
 /// An [`Endpoint`] wrapped in one [`Middleware`].
 ///

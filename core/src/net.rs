@@ -72,6 +72,45 @@ impl Extractor for PeerAddr {
     }
 }
 
+/// The identifier the hosting platform assigned to this invocation.
+///
+/// Serverless adapters insert it from the invocation context before the endpoint runs —
+/// `skyzen-lambda` copies `lambda_runtime::Context::request_id` — so a request-id layer can
+/// reuse the platform's own identifier instead of minting one no trace will ever join back
+/// to the invocation. Defining the type here lets any adapter populate it without depending
+/// on the top-level `skyzen` crate.
+#[derive(Debug, Clone)]
+pub struct PlatformRequestId(pub alloc::string::String);
+
+impl core::ops::Deref for PlatformRequestId {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Response headers that must survive an endpoint error.
+///
+/// Middleware like `skyzen::middleware::RequestId` puts headers here when the client needs
+/// them even when the endpoint returns `Err` — a request id is the motivating case. The
+/// backend renders an `Err` into a fresh response with [`error_response`], outside any
+/// middleware's reach, so the headers travel on the request instead and every backend merges
+/// them at its error boundary with [`apply_pending_headers`].
+#[derive(Debug, Default, Clone)]
+pub struct PendingResponseHeaders(pub header::HeaderMap);
+
+/// Copy [`PendingResponseHeaders`] from `request` onto `response`.
+///
+/// Backends call this where they turn an endpoint `Err` into a response — alongside
+/// [`error_response`] — so headers middleware marked as must-deliver survive errors.
+pub fn apply_pending_headers(request: &Request, response: &mut Response) {
+    if let Some(pending) = request.extensions().get::<PendingResponseHeaders>() {
+        for (name, value) in &pending.0 {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
