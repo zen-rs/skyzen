@@ -1,26 +1,10 @@
 use std::{fmt::Debug, future::Future, sync::Arc};
 
-use http_kit::{
-    error::BoxHttpError,
-    header::{HeaderName, HeaderValue},
-    Body, Request, Response,
-};
+use http_kit::{error::BoxHttpError, Body, Request, Response};
 use skyzen_core::{
     middleware::{Middleware, Next},
     Error, Responder,
 };
-
-/// Response headers a layer asked to keep on every response, stamped by
-/// [`ErrorHandlingMiddleware`] on the errors it renders — the error path is still a
-/// response.
-#[derive(Debug, Clone)]
-pub struct DeferredHeaders(pub Vec<(HeaderName, HeaderValue)>);
-
-/// Request extension [`ErrorHandlingMiddleware`] inserts before running downstream — its
-/// presence tells a layer that error responses are already being produced somewhere and the
-/// layer should propagate `Err` rather than materialize a default one itself.
-#[derive(Debug, Clone, Copy)]
-pub struct HandlesErrors;
 
 /// Turn an endpoint error into a response with an asynchronous function.
 pub struct ErrorHandlingMiddleware<F> {
@@ -60,10 +44,6 @@ where
     Res: Responder,
 {
     async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
-        // Tell upstream middleware the error path is handled — layers like
-        // `SecurityHeaders` propagate `Err` instead of producing a default body when this
-        // marker is present.
-        request.extensions_mut().insert(HandlesErrors);
         match next.run(request).await {
             Ok(response) => Ok(response),
             Err(error) => {
@@ -74,16 +54,9 @@ where
                 (self.f)(error.into_boxed_http_error())
                     .await
                     .respond_to(request, &mut response)?;
-                // Headers a layer upstream asked to keep on every response — the error path
-                // is still a response.
-                if let Some(deferred) = request.extensions().get::<DeferredHeaders>() {
-                    for (name, value) in &deferred.0 {
-                        response
-                            .headers_mut()
-                            .entry(name.clone())
-                            .or_insert_with(|| value.clone());
-                    }
-                }
+                // Headers a layer upstream marked as must-deliver survive the error path —
+                // the same stamp the backends apply at their own error boundary.
+                skyzen_core::apply_pending_headers(request, &mut response);
                 Ok(response)
             }
         }

@@ -4,7 +4,7 @@ use core::future::Future;
 use std::time::Duration;
 
 use http_kit::{
-    header::{HeaderName, HeaderValue},
+    header::{HeaderMap, HeaderName, HeaderValue},
     Request, Response,
 };
 use skyzen_core::{
@@ -12,7 +12,7 @@ use skyzen_core::{
     Error,
 };
 
-use super::error_handling::HandlesErrors;
+use skyzen_core::PendingResponseHeaders;
 
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
@@ -160,8 +160,6 @@ fn value(text: &str) -> HeaderValue {
     HeaderValue::try_from(text).expect("a hardcoded policy is a valid header value")
 }
 
-use super::error_handling::DeferredHeaders;
-
 impl Middleware for SecurityHeaders {
     fn handle(
         &self,
@@ -170,21 +168,26 @@ impl Middleware for SecurityHeaders {
     ) -> impl Future<Output = Result<Response, Error>> + Send {
         let headers = self.headers.clone();
         async move {
-            // The configured set also rides in the request extensions, so an
-            // `ErrorHandlingMiddleware` — whichever side of this layer it runs — stamps
-            // error responses it produces rather than letting them go out bare.
-            request
-                .extensions_mut()
-                .insert(DeferredHeaders(headers.clone()));
-            let mut response = match next.run(request).await {
-                Ok(response) => response,
-                // An error path that is handled somewhere stamps the deferred set itself;
-                // an unhandled one materializes here so the response never goes out bare.
-                Err(error) if request.extensions().get::<HandlesErrors>().is_some() => {
-                    return Err(error);
+            // The configured set also rides the request as `PendingResponseHeaders` — the
+            // shared mechanism every backend stamps at its error boundary and
+            // `ErrorHandlingMiddleware` stamps on the responses it renders — so the
+            // protections survive whichever path turns an `Err` into a response.
+            let extensions = request.extensions_mut();
+            match extensions.get_mut::<PendingResponseHeaders>() {
+                Some(pending) => {
+                    for (name, value) in headers.clone() {
+                        pending.0.append(name, value);
+                    }
                 }
-                Err(error) => skyzen_core::error_response(error.into_boxed_http_error().as_ref()),
-            };
+                None => {
+                    let mut map = HeaderMap::new();
+                    for (name, value) in headers.clone() {
+                        map.append(name, value);
+                    }
+                    extensions.insert(PendingResponseHeaders(map));
+                }
+            }
+            let mut response = next.run(request).await?;
             for (name, value) in headers {
                 response
                     .headers_mut()
