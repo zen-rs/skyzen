@@ -336,7 +336,10 @@ fn bound_key_component(key: &str) -> String {
     }
     use sha2::Digest;
     let digest = sha2::Sha256::digest(key.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
+    // The `sha256:` tag can never appear in escaped output — `:` itself is %3A there — so a
+    // short key that happens to equal a digest cannot claim a long key's bucket.
+    let mut out = String::with_capacity(7 + digest.len() * 2);
+    out.push_str("sha256:");
     for byte in digest {
         use core::fmt::Write;
         let _ = write!(out, "{byte:02x}");
@@ -352,6 +355,7 @@ fn encode_key_component(key: &str) -> String {
         .replace('\\', "%5C")
         .replace('?', "%3F")
         .replace('#', "%23")
+        .replace(':', "%3A")
 }
 
 /// Milliseconds since the Unix epoch, on every target.
