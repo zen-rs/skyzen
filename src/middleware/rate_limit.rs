@@ -387,6 +387,41 @@ impl RateLimitStore for KvStore {
             let now = now_ms();
             let index = now / window_ms;
             let bucket = format!("rl:{key}:{index}");
+            // Read before adding: a corrupted record must never see another increment —
+            // two concurrent hits on a stored -1 would otherwise return 0 and 1, and the
+            // second request reads as a fresh bucket no poison write can race ahead of.
+            // Left as-is, a negative value rejects itself on every read until the record's
+            // own TTL sweeps it, so nothing is written back on this path.
+            match self.kv.get(&bucket).await {
+                Ok(None) => {}
+                Ok(Some(bytes)) => {
+                    let stored = str::from_utf8(&bytes)
+                        .ok()
+                        .and_then(|text| text.parse::<i64>().ok());
+                    match stored {
+                        // A counter only ever grows by +1 from zero — a negative or
+                        // unparseable record is corruption, not a count, and fails closed.
+                        Some(count) if count < 0 => {
+                            return Err(HitError::Unsupported(Error::msg(format!(
+                                "rate-limit counter under {bucket:?} is not positive"
+                            ))))
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(HitError::Unsupported(Error::msg(format!(
+                                "rate-limit counter under {bucket:?} is not an integer"
+                            ))))
+                        }
+                    }
+                }
+                Err(
+                    error @ (KvError::Unsupported(_)
+                    | KvError::Unauthorized
+                    | KvError::Decode(_)
+                    | KvError::Serialization(_)),
+                ) => return Err(HitError::Unsupported(Error::new(error))),
+                Err(other) => return Err(HitError::Backend(Error::new(other))),
+            }
             // The counter is born already carrying its deadline — `increment_with_ttl`
             // arms the TTL in the same atomic write, so no record can exist without expiry
             // regardless of what fails afterwards. A backend that cannot do both (a Cosmos
