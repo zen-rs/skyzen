@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result};
-use eventbridge::EventBridgeSchedules;
+use eventbridge::{EventBridgeSchedules, MigrateSchedulesToAlias};
 use lambda_env::{LambdaEnvironment, LambdaEnvironmentNames};
 use skyzen_manifest::{AwsSection, Manifest};
 
@@ -82,6 +82,15 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
             child_env = prepared.child_env;
             let mut steps = vec![
                 Step::Command(build_command(&config, &root_dir, true)),
+                // Rules an earlier deploy made still invoke the unqualified function —
+                // the code swap would run new code on stale configuration before the
+                // reconciliation even started. Move them onto the alias first; the
+                // upload afterwards changes only the version the alias will repoint to.
+                Step::Task(Box::new(MigrateSchedulesToAlias::new(
+                    function.clone(),
+                    manifest.data().schedule.clone(),
+                    child_env.clone(),
+                ))),
                 Step::Command(deploy_command(&config, &root_dir, &binary)),
             ];
             let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
@@ -416,10 +425,10 @@ mod tests {
              [aws.env]\nRUST_LOG = \"info\"\n",
         );
 
-        assert_eq!(planned.len(), 3, "{planned:?}");
+        assert_eq!(planned.len(), 4, "{planned:?}");
         assert!(planned[0].contains("cargo lambda build"), "{planned:?}");
 
-        let deploy = &planned[1];
+        let deploy = &planned[2];
         assert!(deploy.contains("cargo lambda deploy"), "{deploy}");
         assert!(deploy.contains("--binary-name demo"), "{deploy}");
         assert!(deploy.contains("--memory 512"), "{deploy}");
@@ -556,8 +565,8 @@ mod tests {
             "[aws]\nurl = false\n",
         );
 
-        assert!(planned[1].contains("--disable-function-url"), "{planned:?}");
-        assert!(!planned[1].contains("--enable-function-url"), "{planned:?}");
+        assert!(planned[2].contains("--disable-function-url"), "{planned:?}");
+        assert!(!planned[2].contains("--enable-function-url"), "{planned:?}");
     }
 
     #[test]

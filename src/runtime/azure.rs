@@ -343,68 +343,6 @@ fn base64(bytes: &[u8]) -> String {
     encoded
 }
 
-/// The cookie's own name, from `name=value; attrs`.
-fn cookie_name(header: &str) -> &str {
-    header
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .split('=')
-        .next()
-        .unwrap_or_default()
-        .trim()
-}
-
-/// The cookie's own value, from `name=value; attrs`.
-fn cookie_value(header: &str) -> &str {
-    header
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .split_once('=')
-        .map_or("", |(_, value)| value.trim())
-}
-
-/// The `CookieOptions` the tuple's third member carries: every attribute after the first
-/// `name=value` segment, parsed the way `Set-Cookie` spells them.
-fn cookie_options(header: &str) -> serde_json::Value {
-    let mut options = serde_json::json!({});
-    for attribute in header.split(';').skip(1) {
-        let (name, value) = attribute
-            .split_once('=')
-            .map_or((attribute.trim(), ""), |(name, value)| {
-                (name.trim(), value.trim())
-            });
-        match name.to_ascii_lowercase().as_str() {
-            "secure" => options["Secure"] = true.into(),
-            "httponly" => options["HttpOnly"] = true.into(),
-            "samesite" => {
-                options["SameSite"] = match value.to_ascii_lowercase().as_str() {
-                    "lax" => 1.into(),
-                    "strict" => 2.into(),
-                    _ => 0.into(),
-                };
-            }
-            "path" => options["Path"] = value.into(),
-            "domain" => options["Domain"] = value.into(),
-            "expires" => options["Expires"] = value.into(),
-            "max-age" => {
-                // `Max-Age` counts seconds; the tuple carries a TimeSpan, spelled `h:mm:ss`.
-                let seconds = value.parse::<u64>().unwrap_or(0);
-                options["MaxAge"] = format!(
-                    "{}:{:02}:{:02}",
-                    seconds / 3600,
-                    seconds % 3600 / 60,
-                    seconds % 60
-                )
-                .into();
-            }
-            _ => {}
-        }
-    }
-    options
-}
-
 /// Serialize the application's response into the `Outputs.res` the `http` output binding
 /// declares — the shape the host turns back into the client's HTTP response.
 async fn wrapped_response(response: Response) -> Response {
@@ -416,11 +354,12 @@ async fn wrapped_response(response: Response) -> Response {
     let Ok(bytes) = bytes else {
         return failed("the application's response body could not be collected");
     };
-    // `res.body` carries a string — UTF-8 text goes verbatim, anything else goes base64 and
-    // says so, or the host would hand the client the encoded characters.
-    let (body, base64_encoded) = match String::from_utf8(bytes.to_vec()) {
-        Ok(text) => (text, false),
-        Err(error) => (base64(&error.into_bytes()), true),
+    // A `{"$binary": ...}` body is the one JSON shape the host's `ExpandoObject` conversion
+    // turns into bytes — `RawScriptResult` then hands it the `ByteArrayOutputFormatter`,
+    // which writes them raw. `isBase64Encoded` is an AWS convention the host never reads.
+    let body = match String::from_utf8(bytes.to_vec()) {
+        Ok(text) => serde_json::json!(text),
+        Err(error) => serde_json::json!({"$binary": base64(&error.into_bytes())}),
     };
     // The host reads `res.headers` as name -> string — arrays come out as their serialized
     // form, not the values. Repeated values join with ", " the way HTTP itself folds them;
@@ -428,7 +367,6 @@ async fn wrapped_response(response: Response) -> Response {
     // its own object instead. `Content-Length` is the host's to compute again: the wrapped
     // body is not the bytes it was counted for.
     let mut headers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    let mut cookies: Vec<serde_json::Value> = Vec::new();
     for (name, value) in &parts.headers {
         if name.as_str().eq_ignore_ascii_case("content-length") {
             continue;
@@ -437,14 +375,22 @@ async fn wrapped_response(response: Response) -> Response {
             continue;
         };
         if name.as_str().eq_ignore_ascii_case("set-cookie") {
-            // The host reads `res.cookies` as (name, value, CookieOptions) tuples — the
-            // attributes carry the security properties, so `Secure; HttpOnly` inside the
-            // value would never become them.
-            cookies.push(serde_json::json!({
-                "Item1": cookie_name(&value),
-                "Item2": cookie_value(&value),
-                "Item3": cookie_options(&value),
-            }));
+            // `res.cookies` deserializes through `ExpandoObject` — the (name, value,
+            // CookieOptions) tuples the host's `RawScriptResult` expects can never arrive
+            // that way, so a Set-Cookie survives only as a header. Joined into one the way
+            // HTTP folds repeated headers, it keeps its `; Secure; HttpOnly` attributes
+            // intact for the client even though the host can't re-parse them.
+            match headers.entry(name.as_str().to_owned()) {
+                serde_json::map::Entry::Occupied(mut entry) => {
+                    if let serde_json::Value::String(joined) = entry.get_mut() {
+                        joined.push_str(", ");
+                        joined.push_str(&value);
+                    }
+                }
+                serde_json::map::Entry::Vacant(entry) => {
+                    entry.insert(value.into());
+                }
+            }
             continue;
         }
         match headers.entry(name.as_str().to_owned()) {
@@ -464,9 +410,7 @@ async fn wrapped_response(response: Response) -> Response {
             "res": {
                 "statusCode": status,
                 "headers": headers,
-                "cookies": cookies,
                 "body": body,
-                "isBase64Encoded": base64_encoded
             }
         },
         "Logs": []

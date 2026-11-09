@@ -45,6 +45,11 @@ struct RuleSnapshot {
     /// The policy statement that let it invoke, if one existed — removal is reversible only
     /// when the grant comes back with the rule.
     statement: Option<String>,
+    /// The function (`fn` or `fn:skyzen`) the grant lived on — a legacy rule restores on
+    /// the unqualified name, not the alias.
+    owner: Option<String>,
+    /// Whether the deploy added the grant — a created permission is rollback's to remove.
+    granted: bool,
 }
 
 /// The rules that point `[[schedule]]` entries at a deployed function.
@@ -83,6 +88,58 @@ impl EventBridgeSchedules {
     /// name different rules.
     fn rule_name(&self, name: &str) -> String {
         format!("skyzen-{}--{name}", self.function)
+    }
+}
+
+/// Retarget managed rules at the `skyzen` alias before new code uploads.
+///
+/// An earlier deploy pointed every rule at the unqualified function, which fires the moment
+/// `cargo lambda deploy` swaps `$LATEST` — before the environment lands. This step publishes
+/// the *current* code and configuration as a version, points the alias at it and moves every
+/// managed rule's targets onto the alias. From then on the transition is the repoint inside
+/// [`EventBridgeSchedules`]; a build that fails afterwards still leaves every rule on a
+/// consistent old version.
+#[derive(Debug)]
+pub struct MigrateSchedulesToAlias {
+    /// The rules' owner, reusing `EventBridgeSchedules`' naming and policy reading.
+    inner: EventBridgeSchedules,
+}
+
+impl MigrateSchedulesToAlias {
+    /// The step that moves `schedules` plus every `skyzen-schedule-*` grant's rule.
+    pub fn new(
+        function: String,
+        schedules: Vec<ScheduleEntry>,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            inner: EventBridgeSchedules::new(
+                function,
+                schedules,
+                crate::providers::secrets::Delivery::default(),
+                env,
+            ),
+        }
+    }
+}
+
+impl Task for MigrateSchedulesToAlias {
+    fn describe(&self) -> String {
+        format!(
+            "point `[[schedule]]` EventBridge rules of Lambda function `{}` at the `{ALIAS}` \
+             alias",
+            self.inner.function
+        )
+    }
+
+    fn run(&self) -> Result<()> {
+        super::lambda_env::adopt_env(&self.inner.env);
+        block_on(async {
+            let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let lambda = aws_sdk_lambda::Client::new(&shared);
+            let events = aws_sdk_eventbridge::Client::new(&shared);
+            self.inner.migrate_to_alias(&events, &lambda).await
+        })?
     }
 }
 
@@ -251,72 +308,33 @@ impl EventBridgeSchedules {
             .await?;
         }
 
-        // The version captures the code and configuration $LATEST now holds; the rules
-        // target the alias, so nothing they invoke changes until the repoint below — the
-        // only barrier EventBridge propagation cannot undermine. When nothing changed
-        // since the last publish, `PublishVersion` refuses and the existing latest
-        // version serves.
-        let version = match lambda
-            .publish_version()
-            .function_name(&self.function)
-            .send()
-            .await
-        {
-            Ok(published) => published
-                .version()
-                .with_context(|| format!("`{}` published without a version", self.function))?
-                .to_owned(),
-            Err(error) => {
-                // `PreconditionFailedException` means $LATEST already equals the last
-                // version — reuse it rather than treat an unchanged function as a failure.
-                if !error.as_service_error().is_some_and(
-                    aws_sdk_lambda::operation::publish_version::PublishVersionError::is_precondition_failed_exception,
-                ) {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to publish a version of Lambda function `{}`",
-                            self.function
-                        )
-                    });
-                }
-                lambda
-                    .list_versions_by_function()
-                    .function_name(&self.function)
-                    .send()
-                    .await
-                    .with_context(|| format!("failed to list versions of `{}`", self.function))?
-                    .versions()
-                    .iter()
-                    .filter_map(|version| version.version())
-                    .filter(|version| *version != "$LATEST")
-                    .max_by_key(|version| version.parse::<u64>().unwrap_or(0))
-                    .with_context(|| {
-                        format!("`{}` has no published version to point at", self.function)
-                    })?
-                    .to_owned()
-            }
-        };
+        // The alias's own state is part of the transaction: a repoint that survives a
+        // failed deploy would move every schedule to code that was never meant to run.
         *alias = self.alias_snapshot(lambda).await?;
-        self.point_the_alias(lambda, &version).await?;
+        self.point_the_alias(lambda, &self.publish_or_reuse(lambda).await?)
+            .await?;
         let alias_arn = format!("{arn}:{ALIAS}");
         let qualified = format!("{}:{ALIAS}", self.function);
 
         for entry in &self.schedules {
             // Absent rules snapshot too: a rule the deploy creates belongs to the rollback,
             // or a failed deployment leaves enabled wiring behind.
-            let taken = self
+            let mut taken = self
                 .rule_snapshot(events, &self.rule_name(entry.name.as_str()))
                 .await?;
+            taken.statement = Some(format!("skyzen-schedule-{}", entry.name));
+            taken.owner = Some(qualified.clone());
+            taken.granted = self
+                .wire_one(
+                    events,
+                    lambda,
+                    &qualified,
+                    &alias_arn,
+                    (partition, region, account),
+                    entry,
+                )
+                .await?;
             snapshot.push(taken);
-            self.wire_one(
-                events,
-                lambda,
-                &qualified,
-                &alias_arn,
-                (partition, region, account),
-                entry,
-            )
-            .await?;
         }
         self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
             .await?;
@@ -345,6 +363,8 @@ impl EventBridgeSchedules {
                     enabled: false,
                     targets: Vec::new(),
                     statement: None,
+                    owner: None,
+                    granted: false,
                 })
             }
             Err(error) => {
@@ -370,6 +390,8 @@ impl EventBridgeSchedules {
             ),
             targets,
             statement: None,
+            owner: None,
+            granted: false,
         })
     }
 
@@ -410,6 +432,18 @@ impl EventBridgeSchedules {
                 .send()
                 .await
                 .with_context(|| format!("failed to remove rule `{}`", snapshot.name))?;
+            // The grant the wiring added goes with it — a failed deploy must not leave
+            // invoke permissions behind for a rule that never was.
+            if snapshot.granted {
+                if let Some(statement) = &snapshot.statement {
+                    let _ = lambda
+                        .remove_permission()
+                        .function_name(qualified)
+                        .statement_id(statement)
+                        .send()
+                        .await;
+                }
+            }
             return Ok(());
         }
         let mut put = events
@@ -444,26 +478,205 @@ impl EventBridgeSchedules {
             );
         }
         if let Some(statement) = &snapshot.statement {
-            lambda
-                .add_permission()
-                .function_name(qualified)
-                .action(INVOKE_ACTION)
-                .principal(EVENTS_PRINCIPAL)
-                .source_arn(rule_arn)
-                .statement_id(statement)
-                .send()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to restore the invoke permission of `{}`",
-                        snapshot.name
-                    )
-                })?;
+            // A grant the deploy added goes back away; one retirement removed comes back —
+            // on the resource it originally lived on, not wherever the wiring landed it.
+            if snapshot.granted {
+                let _ = lambda
+                    .remove_permission()
+                    .function_name(qualified)
+                    .statement_id(statement)
+                    .send()
+                    .await;
+            } else {
+                lambda
+                    .add_permission()
+                    .function_name(snapshot.owner.as_deref().unwrap_or(qualified))
+                    .action(INVOKE_ACTION)
+                    .principal(EVENTS_PRINCIPAL)
+                    .source_arn(rule_arn)
+                    .statement_id(statement)
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to restore the invoke permission of `{}`",
+                            snapshot.name
+                        )
+                    })?;
+            }
         }
         Ok(())
     }
 
-    /// Point the `skyzen` alias at `version`, creating the alias the first time.
+    /// Publish $LATEST as a version, reusing the newest existing one when nothing changed.
+    ///
+    /// `PublishVersion` refuses when `$LATEST` already equals the last version — an empty
+    /// delivery and an unchanged function land there, and both still need a version the
+    /// alias can point at. The list call paginates, so the newest is the maximum across
+    /// every page rather than the first.
+    async fn publish_or_reuse(&self, lambda: &aws_sdk_lambda::Client) -> Result<String> {
+        match lambda
+            .publish_version()
+            .function_name(&self.function)
+            .send()
+            .await
+        {
+            Ok(published) => published
+                .version()
+                .with_context(|| format!("`{}` published without a version", self.function))
+                .map(str::to_owned),
+            Err(error) => {
+                if !error.as_service_error().is_some_and(
+                    aws_sdk_lambda::operation::publish_version::PublishVersionError::is_precondition_failed_exception,
+                ) {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to publish a version of Lambda function `{}`",
+                            self.function
+                        )
+                    });
+                }
+                let mut newest: Option<String> = None;
+                let mut marker: Option<String> = None;
+                loop {
+                    let mut list = lambda
+                        .list_versions_by_function()
+                        .function_name(&self.function);
+                    if let Some(next) = &marker {
+                        list = list.marker(next);
+                    }
+                    let page = list.send().await.with_context(|| {
+                        format!("failed to list versions of `{}`", self.function)
+                    })?;
+                    for version in page.versions().iter().filter_map(|v| v.version()) {
+                        if version != "$LATEST" {
+                            let newer = newest
+                                .as_ref()
+                                .is_none_or(|newest: &String| version > newest.as_str());
+                            if newer {
+                                newest = Some(version.to_owned());
+                            }
+                        }
+                    }
+                    match page.next_marker() {
+                        Some(next) if !next.is_empty() => {
+                            marker = Some(next.to_owned());
+                        }
+                        _ => break,
+                    }
+                }
+                newest.with_context(|| {
+                    format!("`{}` has no published version to point at", self.function)
+                })
+            }
+        }
+    }
+
+    /// Every schedule name this module manages: the manifest's plus every grant the policies
+    /// — the alias's and the legacy unqualified function's — still carry.
+    async fn managed_names(
+        &self,
+        lambda: &aws_sdk_lambda::Client,
+        qualified: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let mut names: std::collections::BTreeSet<String> = self
+            .schedules
+            .iter()
+            .map(|entry| entry.name.as_str().to_owned())
+            .collect();
+        for owner in [qualified, self.function.as_str()] {
+            if let Some(policy) = self.policy(lambda, owner).await? {
+                if let Some(statements) = policy["Statement"].as_array() {
+                    for entry in statements {
+                        if let Some(name) = entry["Sid"]
+                            .as_str()
+                            .and_then(|sid| sid.strip_prefix("skyzen-schedule-"))
+                        {
+                            names.insert(name.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// Move every managed rule's unqualified target onto the `skyzen` alias.
+    ///
+    /// Rules an earlier deploy made fire the unqualified function, so the code swap alone
+    /// would run new code on stale configuration. Publishing the version the function was
+    /// running and pointing the alias at it moves every rule behind the atomic repoint —
+    /// and is itself idempotent: a second run finds the targets already moved.
+    async fn migrate_to_alias(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+        lambda: &aws_sdk_lambda::Client,
+    ) -> Result<()> {
+        let arn = lambda
+            .get_function_configuration()
+            .function_name(&self.function)
+            .send()
+            .await
+            .with_context(|| format!("could not read Lambda function `{}`", self.function))?
+            .function_arn()
+            .with_context(|| format!("`{}` reported no ARN", self.function))?
+            .to_owned();
+        let version = self.publish_or_reuse(lambda).await?;
+        self.point_the_alias(lambda, &version).await?;
+        let alias_arn = format!("{arn}:{ALIAS}");
+        let qualified = format!("{}:{ALIAS}", self.function);
+
+        for name in self.managed_names(lambda, &qualified).await? {
+            let rule = self.rule_name(&name);
+            let listed = match events.list_targets_by_rule().rule(&rule).send().await {
+                Ok(listed) => listed,
+                Err(error)
+                    if error.as_service_error().is_some_and(
+                        aws_sdk_eventbridge::operation::list_targets_by_rule::ListTargetsByRuleError::is_resource_not_found_exception,
+                    ) =>
+                {
+                    continue
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to list targets of `{rule}`"));
+                }
+            };
+            if !listed.targets().iter().any(|target| target.arn() == arn) {
+                continue;
+            }
+            let targets: Vec<Target> = listed
+                .targets()
+                .iter()
+                .map(|target| {
+                    let mut moved = target.clone();
+                    if moved.arn() == arn {
+                        moved.arn = alias_arn.clone();
+                    }
+                    moved
+                })
+                .collect();
+            let put = events
+                .put_targets()
+                .rule(&rule)
+                .set_targets(Some(targets))
+                .send()
+                .await
+                .with_context(|| format!("failed to retarget `{rule}` at the `{ALIAS}` alias"))?;
+            anyhow::ensure!(
+                put.failed_entries().is_empty(),
+                "EventBridge refused to retarget `{rule}`: {:?}",
+                put.failed_entries()
+                    .first()
+                    .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
+            );
+            output::ok(format!(
+                "retargeted EventBridge rule `{rule}` at the `{ALIAS}` alias"
+            ));
+        }
+        Ok(())
+    }
+
     /// The version the `skyzen` alias points at now, or `None` when it does not exist.
     async fn alias_snapshot(&self, lambda: &aws_sdk_lambda::Client) -> Result<Option<String>> {
         match lambda
@@ -552,49 +765,43 @@ impl EventBridgeSchedules {
 
         // Grants live on the alias now, but an earlier deploy put them on the unqualified
         // function — a schedule removed while upgrading still carries that statement, and
-        // its rule fires just the same. Both policies tell the whole story.
-        let mut statements = Vec::new();
-        for name in [qualified, &self.function] {
-            if let Some(policy) = self.policy(lambda, name).await? {
-                statements.push(policy);
-            }
-        }
-        if statements.is_empty() {
-            return Ok(());
-        }
-        let policies = statements;
+        // its rule fires just the same. Each stale name keeps the owner it was found on:
+        // rollback restores the grant where it actually lived.
+        let owners: [(String, String); 2] = [
+            (qualified.to_owned(), qualified.to_owned()),
+            (self.function.clone(), self.function.clone()),
+        ];
         let declared: std::collections::BTreeSet<&str> = self
             .schedules
             .iter()
             .map(|entry| entry.name.as_str())
             .collect();
-        let stale = {
-            let mut names = Vec::new();
-            for policy in &policies {
+        let mut stale: Vec<(String, String)> = Vec::new();
+        for (resource, owner) in &owners {
+            if let Some(policy) = self.policy(lambda, resource).await? {
                 if let Some(statements) = policy["Statement"].as_array() {
                     for entry in statements {
                         if let Some(name) = entry["Sid"]
                             .as_str()
                             .and_then(|sid| sid.strip_prefix(STATEMENT_PREFIX))
                         {
-                            if !declared.contains(name) && !names.contains(&name.to_owned()) {
-                                names.push(name.to_owned());
+                            if !declared.contains(name)
+                                && !stale.iter().any(|(stale, _)| stale == name)
+                            {
+                                stale.push((name.to_owned(), owner.clone()));
                             }
                         }
                     }
                 }
             }
-            Some(names)
-        };
-        let Some(stale) = stale else {
-            return Ok(());
-        };
+        }
 
-        for name in stale {
+        for (name, owner) in stale {
             let rule = self.rule_name(&name);
             // The delete is one-way — the rule's own record is what a failed deploy restores.
             let mut taken = self.rule_snapshot(events, &rule).await?;
             taken.statement = Some(format!("{STATEMENT_PREFIX}{name}"));
+            taken.owner = Some(owner);
             snapshot.push(taken);
             self.retire_rule(events, &[arn, alias_arn], &rule).await?;
             for owner in [qualified, self.function.as_str()] {
@@ -806,7 +1013,7 @@ impl EventBridgeSchedules {
         arn: &str,
         (partition, region, account): (&str, &str, &str),
         entry: &ScheduleEntry,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let rule = self.rule_name(entry.name.as_str());
         anyhow::ensure!(
             rule.len() <= 64,
@@ -841,10 +1048,11 @@ impl EventBridgeSchedules {
         // The statement already exists only when a previous deploy made it, so `get_policy`
         // decides whether `add_permission` is needed at all: `ResourceConflictException` is
         // ambiguous between "already granted" and "an update is in progress", and swallowing
-        // the second case would leave the rule unable to invoke.
+        // the second case would leave the rule unable to invoke. The caller records whether
+        // the grant is new — a failed deploy removes what it added.
         let rule_arn = format!("arn:{partition}:events:{region}:{account}:rule/{rule}");
         let statement = format!("skyzen-schedule-{}", entry.name);
-        if !self
+        let granted = !self
             .has_statement(lambda, qualified, &statement, &rule_arn)
             .await
             .with_context(|| {
@@ -852,8 +1060,8 @@ impl EventBridgeSchedules {
                     "failed to read the invoke policy of Lambda function `{}`",
                     self.function
                 )
-            })?
-        {
+            })?;
+        if granted {
             lambda
                 .add_permission()
                 .function_name(qualified)
@@ -917,7 +1125,7 @@ impl EventBridgeSchedules {
             "wired `[[schedule]] {name}` to EventBridge rule `{rule}` ({expression})",
             name = entry.name
         ));
-        Ok(())
+        Ok(granted)
     }
 
     /// Whether the function's policy already grants `statement` for `source_arn`.
