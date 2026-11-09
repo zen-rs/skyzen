@@ -237,7 +237,14 @@ impl Middleware for RateLimit {
                     return Err(Error::from(RateLimitUnavailable::new()));
                 }
             };
-            let key = format!("rate:{}:{}", self.name, (self.key)(request).await?);
+            // Length-prefixed name — `("a:b", "c")` and `("a", "b:c")` would collide at the
+            // same store key under plain concatenation.
+            let key = format!(
+                "rate:{}:{}:{}",
+                self.name.len(),
+                self.name,
+                (self.key)(request).await?
+            );
             match store.hit(&key, self.window).await {
                 Ok(hit) if hit.count <= self.limit => next.run(request).await,
                 Ok(hit) => {
