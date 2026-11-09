@@ -54,14 +54,30 @@ impl EntityTag {
     }
 }
 
-/// `ETag` opaque values are `etagc` — visible ASCII plus `obs-text`, no `"` (the delimiter)
-/// and no `\` (the escape). Anything else — control characters included — would produce a
-/// tag the parser rejects; drop them so construction never panics on hostile input.
+/// `ETag` opaque values are `etagc` — visible ASCII plus `obs-text`. Anything outside that
+/// charset is percent-encoded instead of dropped (`%` itself encodes first, so the mapping
+/// stays injective): `a"b` and `ab` produce distinct tags, never a panic on hostile input.
 fn sanitize(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| matches!(c, '!' | '\u{23}'..='\u{7e}' | '\u{80}'..='\u{ff}') && *c != '\\')
-        .collect()
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'!' | b'#'..=b'~' if byte != b'%' && byte != b'\\' => out.push(byte as char),
+            _ => {
+                out.push('%');
+                out.push(
+                    char::from_digit((byte >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((byte & 0xf) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Would a `GET`/`HEAD` reuse the client's cached copy? — `true` means emit `304`.
@@ -115,12 +131,16 @@ mod tests {
     }
 
     #[test]
-    fn quotes_are_dropped_from_tag_values() {
+    fn hostile_bytes_encode_into_tag_values_injectively() {
         use headers::HeaderMapExt;
         use http_kit::header::ETAG;
         let tag = EntityTag::strong("a\"b\\c");
         let mut map = HeaderMap::new();
         map.typed_insert(tag.etag().clone());
-        assert_eq!(map[ETAG].to_str().expect("ascii etag"), "\"abc\"");
+        assert_eq!(map[ETAG].to_str().expect("ascii etag"), "\"a%22b%5Cc\"");
+        // Injectivity: the encoded form must not collide with a literal that looks like it.
+        let mut other = HeaderMap::new();
+        other.typed_insert(EntityTag::strong("a%22b%5Cc").etag().clone());
+        assert_ne!(map[ETAG].to_str().unwrap(), other[ETAG].to_str().unwrap());
     }
 }
