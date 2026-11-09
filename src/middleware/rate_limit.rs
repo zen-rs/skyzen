@@ -373,6 +373,39 @@ struct DurableKvRateStore {
     kv: DurableKv,
 }
 
+impl DurableKvRateStore {
+    /// Delete every expired `rl:` record — at most once per window, marked by a tombstone
+    /// the sweep itself writes. Durable Object storage has no TTL, so without this the key
+    /// space grows forever.
+    async fn sweep_dead(&self, now: u64, reset: u64, window_ms: u64) {
+        let marker = format!("rl:swept:{}", now / window_ms);
+        if matches!(self.kv.get(&marker).await, Ok(Some(_))) {
+            return;
+        }
+        if let Ok(entries) = self
+            .kv
+            .list(skyzen_services::durable::DurableListOptions {
+                prefix: Some("rl:"),
+                ..Default::default()
+            })
+            .await
+        {
+            let dead: Vec<&str> = entries
+                .iter()
+                .filter_map(|(key, raw)| {
+                    let text = std::str::from_utf8(raw).ok()?;
+                    let (_, reset) = text.split_once(':')?;
+                    let reset = reset.parse::<u64>().ok()?;
+                    (reset <= now && !key.starts_with("rl:swept:")).then_some(key.as_str())
+                })
+                .collect();
+            let _ = self.kv.delete_multiple(&dead).await;
+        }
+        // The marker itself dies at the window boundary — storage stays bounded.
+        let _ = self.kv.put(&marker, format!("1:{reset}").as_bytes()).await;
+    }
+}
+
 impl RateLimitStore for DurableKvRateStore {
     fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
         Box::pin(async move {
@@ -404,6 +437,12 @@ impl RateLimitStore for DurableKvRateStore {
                 .put(&bucket, format!("{count}:{reset}").as_bytes())
                 .await
                 .map_err(|error| HitError::Backend(Error::new(error)))?;
+            // A window's first hit sweeps the store once — a marker keyed to the window
+            // index keeps it to once per window globally, not once per client key, and dead
+            // records of churned or abandoned keys go out with it.
+            if count == 1 {
+                self.sweep_dead(now, reset, window_ms).await;
+            }
             Ok(Hit {
                 count,
                 retry_after: reset.saturating_sub(now) / 1000,
