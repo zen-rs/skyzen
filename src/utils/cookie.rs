@@ -388,7 +388,8 @@ fn apply_defaults(cookie: &mut Cookie<'_>, secure: bool) {
     }
 }
 
-fn parse_request_jar(request: &Request) -> Result<cookie::CookieJar, CookieParseError> {
+/// Parse the request's `Cookie` headers into a raw jar, for the session extractor.
+pub(crate) fn parse_request_jar(request: &Request) -> Result<cookie::CookieJar, CookieParseError> {
     parse_jar(request).map(|jar| jar.0)
 }
 
@@ -431,7 +432,12 @@ impl SignedCookieJar {
             .fallback
             .as_ref()
             .and_then(|fallback| self.jar.signed(fallback).get(name))?;
-        self.jar.signed_mut(&self.keys.primary).add(cookie.clone());
+        // The request-parsed cookie carries name and value only — a browser never sends the
+        // attributes back — so the re-signed copy is rebuilt with the security defaults, or
+        // the response would ship a cookie stripped of them.
+        let mut rotated = cookie.clone();
+        apply_defaults(&mut rotated, self.keys.secure);
+        self.jar.signed_mut(&self.keys.primary).add(rotated);
         Some(cookie)
     }
 
@@ -496,7 +502,9 @@ impl PrivateCookieJar {
             .fallback
             .as_ref()
             .and_then(|fallback| self.jar.private(fallback).get(name))?;
-        self.jar.private_mut(&self.keys.primary).add(cookie.clone());
+        let mut rotated = cookie.clone();
+        apply_defaults(&mut rotated, self.keys.secure);
+        self.jar.private_mut(&self.keys.primary).add(rotated);
         Some(cookie)
     }
 
