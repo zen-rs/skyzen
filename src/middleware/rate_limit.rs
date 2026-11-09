@@ -388,11 +388,12 @@ impl RateLimitStore for KvStore {
             let index = now / window_ms;
             let bucket = format!("rl:{key}:{index}");
             let count = match self.kv.increment(&bucket, 1).await {
-                // A counter only ever grows by +1 — a negative value is corrupted data,
-                // and clamping it to zero would hand the key a free quota forever.
-                Ok(count) if count < 0 => {
+                // A counter only ever grows by +1, so after an increment it is always at
+                // least one — a stored negative corrupted to zero or below is not a fresh
+                // bucket, and counting it as one hands the key a free quota.
+                Ok(count) if count <= 0 => {
                     return Err(HitError::Unsupported(Error::msg(format!(
-                        "rate-limit counter under {bucket:?} went negative"
+                        "rate-limit counter under {bucket:?} is not positive"
                     ))))
                 }
                 Ok(count) => count.cast_unsigned(),
