@@ -35,7 +35,7 @@ use skyzen_core::{
     middleware::{Middleware, Next},
     Error, Extractor,
 };
-use skyzen_services::Kv;
+use skyzen_services::{Kv, KvError};
 
 use crate::extract::ClientIp;
 
@@ -59,10 +59,19 @@ struct Hit {
     retry_after: u64,
 }
 
+/// Why a count could not be taken.
+enum HitError {
+    /// The backend is unreachable or erred — a transient failure `fail_open` covers.
+    Backend(Error),
+    /// The backend has no atomic counter at all — a permanent capability gap that must
+    /// never pass silently, `fail_open` or not.
+    Unsupported(Error),
+}
+
 /// The counter backend — `Kv` bindings and the in-process map both fill it.
 #[allow(clippy::manual_async_fn)]
 trait RateLimitStore: fmt::Debug + Send + Sync + 'static {
-    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, Error>>;
+    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>>;
 }
 
 /// Builds the per-request counter backend — a KV binding or a shared in-process store.
@@ -192,8 +201,20 @@ impl Middleware for RateLimit {
                         .insert(RETRY_AFTER, HeaderValue::from(hit.retry_after.max(1)));
                     Ok(response)
                 }
-                Err(_) if self.fail_open => next.run(request).await,
-                Err(_) => Err(Error::from(RateLimitUnavailable::new())),
+                // A capability gap is permanent — a limiter that cannot count must surface,
+                // not silently admit everything.
+                Err(HitError::Unsupported(error)) => {
+                    tracing::error!("rate limit backend has no atomic counter: {error}");
+                    Err(Error::from(RateLimitUnavailable::new()))
+                }
+                Err(HitError::Backend(error)) if self.fail_open => {
+                    tracing::warn!("rate limit backend error, admitting request: {error}");
+                    next.run(request).await
+                }
+                Err(HitError::Backend(error)) => {
+                    tracing::warn!("rate limit backend error: {error}");
+                    Err(Error::from(RateLimitUnavailable::new()))
+                }
             }
         }
     }
@@ -234,7 +255,7 @@ struct KvStore {
 }
 
 impl RateLimitStore for KvStore {
-    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, Error>> {
+    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
         Box::pin(async move {
             let window_secs = window.as_secs().max(1);
             let now_secs = now_ms() / 1000;
@@ -244,7 +265,12 @@ impl RateLimitStore for KvStore {
                 .kv
                 .increment(&bucket, 1)
                 .await
-                .map_err(Error::new)?
+                .map_err(|error| match error {
+                    // No atomic increment — the Cloudflare case — is a capability gap, not a
+                    // transient outage.
+                    KvError::Unsupported(_) => HitError::Unsupported(Error::new(error)),
+                    other => HitError::Backend(Error::new(other)),
+                })?
                 .max(0)
                 .cast_unsigned();
             if count == 1 {
@@ -268,7 +294,7 @@ struct MemoryStore {
 
 impl RateLimitStore for MemoryStore {
     #[allow(clippy::significant_drop_tightening)]
-    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, Error>> {
+    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
         Box::pin(std::future::ready({
             let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
             let now = now_ms();
@@ -390,9 +416,11 @@ mod tests {
                 &'a self,
                 _: &'a str,
                 _: Duration,
-            ) -> futures_core::future::BoxFuture<'a, Result<super::Hit, skyzen_core::Error>>
+            ) -> futures_core::future::BoxFuture<'a, Result<super::Hit, super::HitError>>
             {
-                Box::pin(std::future::ready(Err(skyzen_core::Error::msg("kv down"))))
+                Box::pin(std::future::ready(Err(super::HitError::Backend(
+                    skyzen_core::Error::msg("kv down"),
+                ))))
             }
         }
 
