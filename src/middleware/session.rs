@@ -818,15 +818,13 @@ impl fmt::Debug for MemorySessionStore {
     }
 }
 
-/// Milliseconds on a monotonic clock. `Instant` has no `wasm32` implementation, so a Worker
-/// reads `Date.now` — wall-clock, but session expiry tolerates it.
+/// Wall-clock milliseconds — the value is serialized into cookies and compared across
+/// processes, so `Instant` is unusable here.
 #[cfg(not(target_arch = "wasm32"))]
 fn now_ms() -> f64 {
-    use std::sync::OnceLock;
-    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    EPOCH
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
         .as_secs_f64()
         * 1000.0
 }
