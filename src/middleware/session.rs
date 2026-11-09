@@ -31,7 +31,7 @@ use skyzen_core::{
     middleware::{Middleware, Next},
     Error, Extractor, Requirement,
 };
-use skyzen_services::kv::Kv;
+use skyzen_services::kv::{Kv, KvError};
 
 use crate::utils::cookie::{parse_request_jar, CookieKeys, MissingCookieKeys};
 
@@ -751,7 +751,15 @@ impl SessionStore for KvSessionStore {
                 .expire(&store_key(id), ttl)
                 .await
                 .map(|_| ())
-                .map_err(SessionError::store)
+                .or_else(|error| {
+                    // A backend without native expiry (Cloudflare KV) cannot slide a TTL
+                    // without rewriting the record — the session simply keeps the deadline
+                    // its last write set rather than failing the request.
+                    match error {
+                        KvError::Unsupported(_) => Ok(()),
+                        other => Err(SessionError::store(other)),
+                    }
+                })
         })
     }
 }
