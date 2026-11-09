@@ -382,26 +382,35 @@ impl DurableKvRateStore {
         if matches!(self.kv.get(&marker).await, Ok(Some(_))) {
             return;
         }
-        if let Ok(entries) = self
+        let Ok(entries) = self
             .kv
             .list(skyzen_services::durable::DurableListOptions {
                 prefix: Some("rl:"),
                 ..Default::default()
             })
             .await
-        {
-            let dead: Vec<&str> = entries
-                .iter()
-                .filter_map(|(key, raw)| {
-                    let text = std::str::from_utf8(raw).ok()?;
-                    let (_, reset) = text.split_once(':')?;
-                    let reset = reset.parse::<u64>().ok()?;
-                    // Sweep markers carry the same `{count}:{reset}` shape, so a stale
-                    // marker dies with its own window instead of piling up forever.
-                    (reset <= now).then_some(key.as_str())
-                })
-                .collect();
-            let _ = self.kv.delete_multiple(&dead).await;
+        else {
+            // No marker either — the next window's first hit retries instead of skipping a
+            // sweep that may never have happened.
+            return;
+        };
+        let dead: Vec<&str> = entries
+            .iter()
+            .filter_map(|(key, raw)| {
+                let text = std::str::from_utf8(raw).ok()?;
+                let (_, reset) = text.split_once(':')?;
+                let reset = reset.parse::<u64>().ok()?;
+                // Sweep markers carry the same `{count}:{reset}` shape, so a stale
+                // marker dies with its own window instead of piling up forever.
+                (reset <= now).then_some(key.as_str())
+            })
+            .collect();
+        // `delete_multiple` is bounded per call — chunk so a large dead set cannot fail
+        // wholesale, and any chunk error defers the marker to a later window.
+        for chunk in dead.chunks(128) {
+            if self.kv.delete_multiple(chunk).await.is_err() {
+                return;
+            }
         }
         // The marker itself dies at the window boundary — storage stays bounded.
         let _ = self.kv.put(&marker, format!("1:{reset}").as_bytes()).await;
