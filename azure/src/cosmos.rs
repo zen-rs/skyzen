@@ -651,7 +651,7 @@ impl KeyValueStore for CosmosKv {
                         counter_value(key, &stored)?
                             .checked_add(delta)
                             .ok_or_else(|| {
-                                KvError::backend(format!(
+                                KvError::Decode(format!(
                             "incrementing the counter under {key:?} by {delta} overflows a 64-bit \
                              integer"
                         ))
