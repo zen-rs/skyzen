@@ -96,6 +96,8 @@ pub struct DynamoKv {
     key_attribute: String,
     ttl_attribute: String,
     consistent_reads: bool,
+    /// Lazily probed `DescribeTimeToLive` result — `None` until a TTL-dependent call asks.
+    ttl_enabled: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
 }
 
 impl DynamoKv {
@@ -111,6 +113,7 @@ impl DynamoKv {
             key_attribute: key_attribute.into(),
             ttl_attribute: "expires_at".to_owned(),
             consistent_reads: false,
+            ttl_enabled: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -153,6 +156,33 @@ impl DynamoKv {
             self.key_attribute.clone(),
             AttributeValue::S(cursor.to_owned()),
         )])
+    }
+
+    /// Whether the table's TTL feature is enabled on [`Self::ttl_attribute`], probed once
+    /// with `DescribeTimeToLive` and cached for the lifetime of the client.
+    ///
+    /// DynamoDB only sweeps an expired item when the feature is on for the attribute the
+    /// item writes — a disabled or mismatched table would retain every record forever, so
+    /// TTL-dependent calls check this rather than trusting the write.
+    async fn ttl_enabled(&self) -> Result<bool, KvError> {
+        if let Some(enabled) = *self.ttl_enabled.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Ok(enabled);
+        }
+        let description = self
+            .client
+            .describe_time_to_live()
+            .table_name(&self.table_name)
+            .send()
+            .await
+            .map_err(|error| {
+                KvError::backend_with("describing the table's time-to-live settings failed", error)
+            })?;
+        let enabled = description.time_to_live_description().is_some_and(|ttl| {
+            ttl.time_to_live_status() == Some(&aws_sdk_dynamodb::types::TimeToLiveStatus::Enabled)
+                && ttl.attribute_name() == Some(self.ttl_attribute.as_str())
+        });
+        *self.ttl_enabled.lock().unwrap_or_else(|e| e.into_inner()) = Some(enabled);
+        Ok(enabled)
     }
 
     /// The current time as seconds since the Unix epoch.
@@ -437,6 +467,12 @@ impl KeyValueStore for DynamoKv {
         value: &[u8],
         ttl: core::time::Duration,
     ) -> Result<(), KvError> {
+        if !self.ttl_enabled().await? {
+            return Err(KvError::Unsupported(
+                "DynamoDB time-to-live is not enabled on this table's TTL attribute, so the \
+                 record would never expire; enable TimeToLive on the table",
+            ));
+        }
         let expires_at = expires_at_epoch_seconds(Self::now_epoch_seconds()?, ttl)?;
         self.client
             .put_item()
@@ -501,6 +537,12 @@ impl KeyValueStore for DynamoKv {
         delta: i64,
         ttl: core::time::Duration,
     ) -> Result<i64, KvError> {
+        if !self.ttl_enabled().await? {
+            return Err(KvError::Unsupported(
+                "DynamoDB time-to-live is not enabled on this table's TTL attribute, so a \
+                 counter would never expire; enable TimeToLive on the table",
+            ));
+        }
         self.increment_inner(key, delta, Some(ttl)).await
     }
 
@@ -509,6 +551,12 @@ impl KeyValueStore for DynamoKv {
     /// Returns `false` when no live item holds the key — including one whose TTL has already
     /// passed, which the portable contract already treats as absent.
     async fn expire(&self, key: &str, ttl: core::time::Duration) -> Result<bool, KvError> {
+        if !self.ttl_enabled().await? {
+            return Err(KvError::Unsupported(
+                "DynamoDB time-to-live is not enabled on this table's TTL attribute, so the \
+                 record would never expire; enable TimeToLive on the table",
+            ));
+        }
         let now_secs = Self::now_epoch_seconds()?;
         let expires_at = expires_at_epoch_seconds(now_secs, ttl)?;
 
