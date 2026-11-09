@@ -436,54 +436,75 @@ impl DurableKvRateStore {
         if matches!(self.kv.get(&marker).await, Ok(Some(_))) {
             return;
         }
-        // Page through `rl:` — a churned keyspace is never pulled in whole. A failed page
-        // or delete leaves the marker unwritten so the next window's first hit retries.
-        let mut cursor: Option<String> = None;
-        loop {
-            let Ok(page) = self
-                .kv
-                .list(skyzen_services::durable::DurableListOptions {
-                    prefix: Some("rl:"),
-                    start: cursor.as_deref(),
-                    limit: Some(128),
-                    ..Default::default()
-                })
-                .await
-            else {
-                return;
+        // One page per hit — a churned keyspace is never walked whole inside a request, and
+        // a cursor keyed to this window lets the next hit continue where this one stopped.
+        let cursor_key = format!("rl:sweep:{}", now / window_ms);
+        let cursor = self
+            .kv
+            .get(&cursor_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| {
+                std::str::from_utf8(&raw)
+                    .ok()?
+                    .rsplit_once("::")
+                    .map(|(start, _)| start.to_owned())
+            });
+        let Ok(page) = self
+            .kv
+            .list(skyzen_services::durable::DurableListOptions {
+                prefix: Some("rl:"),
+                start: cursor.as_deref(),
+                limit: Some(128),
+                ..Default::default()
+            })
+            .await
+        else {
+            // No marker either — the next window's first hit retries instead of skipping a
+            // sweep that may never have happened.
+            return;
+        };
+        let mut dead: Vec<&str> = Vec::new();
+        for (key, raw) in &page {
+            let Some(text) = std::str::from_utf8(raw).ok() else {
+                continue;
             };
-            if page.is_empty() {
-                break;
-            }
-            let page_len = page.len();
-            let mut dead: Vec<&str> = Vec::new();
-            for (key, raw) in &page {
-                let Some(text) = std::str::from_utf8(raw).ok() else {
-                    continue;
-                };
-                let Some((_, reset)) = text.split_once(':') else {
-                    continue;
-                };
-                // Sweep markers carry the same `{count}:{reset}` shape, so a stale
-                // marker dies with its own window instead of piling up forever.
-                if reset.parse::<u64>().is_ok_and(|reset| reset <= now) {
-                    dead.push(key.as_str());
-                }
-            }
-            cursor = page.last().map(|(key, _)| key.clone());
-            // `delete_multiple` is bounded per call — chunk so a large dead set cannot
-            // fail wholesale, and any error defers the marker to a later window.
-            for chunk in dead.chunks(128) {
-                if self.kv.delete_multiple(chunk).await.is_err() {
-                    return;
-                }
-            }
-            if page_len < 128 {
-                break;
+            // Every record's deadline is its last colon segment — `{count}:{reset}` for
+            // counters and markers, `{key}::{reset}` for cursors — so a stale marker or
+            // cursor dies with its own window instead of piling up forever.
+            if text
+                .rsplit(':')
+                .next()
+                .and_then(|reset| reset.parse::<u64>().ok())
+                .is_some_and(|reset| reset <= now)
+            {
+                dead.push(key.as_str());
             }
         }
-        // The marker itself dies at the window boundary — storage stays bounded.
-        let _ = self.kv.put(&marker, format!("1:{reset}").as_bytes()).await;
+        // `delete_multiple` is bounded per call — a delete error defers the page to the
+        // next hit's pass from the same cursor.
+        for chunk in dead.chunks(128) {
+            if self.kv.delete_multiple(chunk).await.is_err() {
+                return;
+            }
+        }
+        if page.len() == 128 {
+            // A full page means more may follow — park the cursor (with this window's own
+            // deadline) so the next hit resumes rather than restarts.
+            let Some((next, _)) = page.last() else {
+                return;
+            };
+            let _ = self
+                .kv
+                .put(&cursor_key, format!("{next}::{reset}").as_bytes())
+                .await;
+        } else {
+            // The pass is done for this window — the marker, not the cursor, says so; both
+            // die with the window they were written for.
+            let _ = self.kv.delete(&cursor_key).await;
+            let _ = self.kv.put(&marker, format!("1:{reset}").as_bytes()).await;
+        }
     }
 }
 
