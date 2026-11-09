@@ -144,13 +144,13 @@ impl TrustedProxies {
             }
         }
 
-        if let Some(addrs) = forwarded_chain(request) {
-            return self.anchored_client(&addrs, peer);
-        }
-        if let Some(addrs) = x_forwarded_for_chain(request) {
-            return self.anchored_client(&addrs, peer);
-        }
-        None
+        // Either header may carry the chain — an unanchored `Forwarded` is client-injected
+        // noise and must not shadow an anchored `X-Forwarded-For` the edge actually wrote.
+        forwarded_chain(request)
+            .and_then(|addrs| self.anchored_client(&addrs, peer))
+            .or_else(|| {
+                x_forwarded_for_chain(request).and_then(|addrs| self.anchored_client(&addrs, peer))
+            })
     }
 
     /// The client from a recorded chain, or `None` when nothing anchors it to trusted
