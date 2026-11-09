@@ -35,7 +35,10 @@ use skyzen_core::{
     middleware::{Middleware, Next},
     Error, Extractor, PendingResponseHeaders, Requirement,
 };
-use skyzen_services::kv::{Kv, KvError};
+use skyzen_services::{
+    durable::{AsDurableKv, DurableKv},
+    kv::{Kv, KvError},
+};
 
 use crate::utils::cookie::{parse_request_jar, CookieKeys, MissingCookieKeys};
 
@@ -839,6 +842,35 @@ impl Sessions {
         }
     }
 
+    /// Sessions in a Durable Object's co-located storage, resolved through the typed
+    /// durable binding `S` — the bare `DurableKv` the runtime injects or a `Deref` wrapper,
+    /// either through `AsDurableKv`.
+    ///
+    /// Pick this over [`kv`][Self::kv] when revocation must be airtight: the object's single
+    /// writer serializes each store call end to end, so a `destroy` and a stale `save`
+    /// cannot interleave the way they can on eventually-consistent KV. Records carry their
+    /// own deadline — Durable Object storage has no TTL — and die on next access.
+    #[allow(clippy::new_ret_no_self)]
+    #[must_use]
+    pub fn durable<S>() -> SessionsLayer
+    where
+        S: AsDurableKv + Send + Sync + 'static,
+    {
+        SessionsLayer {
+            resolve: Arc::new(|request| {
+                let kv = request
+                    .extensions()
+                    .get::<S>()
+                    .map(|service| service.as_durable_kv().clone())
+                    .ok_or_else(|| SessionError::MissingService(type_name::<S>()))?;
+                Ok(Arc::new(DurableKvSessionStore { kv }) as Arc<dyn SessionStore>)
+            }),
+            cookie_name: DEFAULT_COOKIE,
+            ttl: DEFAULT_TTL,
+            in_cookie: false,
+        }
+    }
+
     /// Sessions in a caller-provided [`SessionStore`].
     #[allow(clippy::new_ret_no_self)]
     #[must_use]
@@ -926,7 +958,7 @@ impl SessionStore for KvSessionStore {
         &'a self,
         id: &'a str,
         ttl: Duration,
-        expected: Option<&'a SessionData>,
+        _expected: Option<&'a SessionData>,
     ) -> BoxFuture<'a, Result<bool, SessionError>> {
         Box::pin(async move {
             let key = store_key(id);
@@ -942,6 +974,173 @@ impl SessionStore for KvSessionStore {
                 Err(KvError::Unsupported(_)) => Ok(false),
                 Err(other) => Err(SessionError::store(other)),
             }
+        })
+    }
+}
+
+/// Sessions in Durable Object co-located storage, resolved through `Sessions::durable`.
+///
+/// The object has one writer, so every read-modify-write below is atomic where KV's
+/// eventually-consistent pair would race — tombstone checks included. Storage there has no
+/// TTL, so records and tombstones embed their deadline in the value and die on next touch.
+struct DurableKvSessionStore {
+    kv: DurableKv,
+}
+
+impl fmt::Debug for DurableKvSessionStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DurableKvSessionStore(..)")
+    }
+}
+
+impl DurableKvSessionStore {
+    /// The deadline stored in a tombstone or record value, `None` when missing or corrupt.
+    fn deadline(raw: &[u8]) -> Option<f64> {
+        serde_json::from_slice::<Value>(raw)
+            .ok()?
+            .get("e")?
+            .as_f64()
+    }
+
+    /// Whether `id`'s tombstone is still alive — `deadline > now` means the id is dead.
+    async fn tombstoned(&self, id: &str, now: f64) -> Result<bool, SessionError> {
+        let raw = self
+            .kv
+            .get(&tomb_key(id))
+            .await
+            .map_err(SessionError::store)?;
+        Ok(raw.is_some_and(|raw| Self::deadline(&raw).is_some_and(|d| d > now)))
+    }
+}
+
+impl SessionStore for DurableKvSessionStore {
+    fn load<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<SessionData>, SessionError>> {
+        Box::pin(async move {
+            let now = now_ms();
+            if self.tombstoned(id, now).await? {
+                return Ok(None);
+            }
+            let Some(raw) = self
+                .kv
+                .get(&store_key(id))
+                .await
+                .map_err(SessionError::store)?
+            else {
+                return Ok(None);
+            };
+            let record = serde_json::from_slice::<Value>(&raw)
+                .map_err(|e| SessionError::encode("session", e))?;
+            if record
+                .get("e")
+                .and_then(Value::as_f64)
+                .is_some_and(|e| e <= now)
+            {
+                let _ = self.kv.delete(&store_key(id)).await;
+                return Ok(None);
+            }
+            Ok(record.get("d").cloned().map_or_else(
+                || Some(SessionData::new()),
+                |d| serde_json::from_value::<SessionData>(d).ok(),
+            ))
+        })
+    }
+
+    fn save<'a>(
+        &'a self,
+        id: &'a str,
+        data: &'a SessionData,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
+        Box::pin(async move {
+            let now = now_ms();
+            if self.tombstoned(id, now).await? {
+                return Ok(());
+            }
+            let record = serde_json::json!({
+                "d": data,
+                "e": ttl.as_secs_f64().mul_add(1000.0, now),
+            });
+            let bytes =
+                serde_json::to_vec(&record).map_err(|e| SessionError::encode("session", e))?;
+            self.kv
+                .put(&store_key(id), &bytes)
+                .await
+                .map_err(SessionError::store)
+        })
+    }
+
+    fn delete<'a>(&'a self, id: &'a str, ttl: Duration) -> BoxFuture<'a, Result<(), SessionError>> {
+        Box::pin(async move {
+            let tombstone = serde_json::json!({
+                "e": ttl.as_secs_f64().mul_add(1000.0, now_ms()),
+            });
+            let bytes =
+                serde_json::to_vec(&tombstone).map_err(|e| SessionError::encode("session", e))?;
+            self.kv
+                .put(&tomb_key(id), &bytes)
+                .await
+                .map_err(SessionError::store)?;
+            self.kv
+                .delete(&store_key(id))
+                .await
+                .map(|_| ())
+                .map_err(SessionError::store)
+        })
+    }
+
+    fn touch<'a>(
+        &'a self,
+        id: &'a str,
+        ttl: Duration,
+        expected: Option<&'a SessionData>,
+    ) -> BoxFuture<'a, Result<bool, SessionError>> {
+        Box::pin(async move {
+            let now = now_ms();
+            if self.tombstoned(id, now).await? {
+                return Ok(false);
+            }
+            let Some(raw) = self
+                .kv
+                .get(&store_key(id))
+                .await
+                .map_err(SessionError::store)?
+            else {
+                return Ok(false);
+            };
+            let record = serde_json::from_slice::<Value>(&raw)
+                .map_err(|e| SessionError::encode("session", e))?;
+            if record
+                .get("e")
+                .and_then(Value::as_f64)
+                .is_some_and(|e| e <= now)
+            {
+                let _ = self.kv.delete(&store_key(id)).await;
+                return Ok(false);
+            }
+            // Rewrite only what was read — a live record whose bytes differ belongs to a
+            // newer write, and single-writer ordering makes this check-and-put atomic.
+            let same = expected
+                .and_then(|expected| {
+                    record
+                        .get("d")
+                        .and_then(|d| serde_json::from_value::<SessionData>(d.clone()).ok())
+                        .map(|stored| stored == *expected)
+                })
+                .unwrap_or(false);
+            if !same {
+                return Ok(false);
+            }
+            let record = serde_json::json!({
+                "d": record.get("d").cloned().unwrap_or_default(),
+                "e": ttl.as_secs_f64().mul_add(1000.0, now),
+            });
+            let bytes =
+                serde_json::to_vec(&record).map_err(|e| SessionError::encode("session", e))?;
+            self.kv
+                .put(&store_key(id), &bytes)
+                .await
+                .map_err(SessionError::store)?;
+            Ok(true)
         })
     }
 }
