@@ -424,7 +424,16 @@ impl RateLimitStore for KvStore {
                     | KvError::Unauthorized
                     | KvError::Decode(_)
                     | KvError::Serialization(_)) => HitError::Unsupported(Error::new(error)),
-                    other => HitError::Backend(Error::new(other)),
+                    // The count already counted — a transient reclamation miss must not
+                    // throw away a hit the caller already paid for; the next request's
+                    // expire heals the deadline.
+                    other => {
+                        tracing::warn!("rate-limit bucket expiry deferred: {other}");
+                        return Ok(Hit {
+                            count,
+                            retry_after: ((index + 1) * window_ms).saturating_sub(now) / 1000,
+                        });
+                    }
                 });
             }
             Ok(Hit {
