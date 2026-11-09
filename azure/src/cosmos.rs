@@ -693,6 +693,12 @@ impl KeyValueStore for CosmosKv {
         delta: i64,
         ttl: Duration,
     ) -> Result<i64, KvError> {
+        if !self.layout.ttl_enabled {
+            return Err(KvError::Unsupported(
+                "this Cosmos container has time-to-live disabled, so a counter's ttl \
+                 field would not expire it; enable DefaultTimeToLive on the container",
+            ));
+        }
         self.increment_inner(key, delta, Some(ttl_seconds(ttl)?))
             .await
     }
