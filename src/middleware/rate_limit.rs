@@ -388,7 +388,14 @@ impl RateLimitStore for KvStore {
             let index = now / window_ms;
             let bucket = format!("rl:{key}:{index}");
             let count = match self.kv.increment(&bucket, 1).await {
-                Ok(count) => count.max(0).cast_unsigned(),
+                // A counter only ever grows by +1 — a negative value is corrupted data,
+                // and clamping it to zero would hand the key a free quota forever.
+                Ok(count) if count < 0 => {
+                    return Err(HitError::Unsupported(Error::msg(format!(
+                        "rate-limit counter under {bucket:?} went negative"
+                    ))))
+                }
+                Ok(count) => count.cast_unsigned(),
                 // No atomic increment — the Cloudflare case — is a capability gap, not a
                 // transient outage; rejected credentials and an undecodable counter are
                 // just as permanent, and all of them fail closed because fail-open only
