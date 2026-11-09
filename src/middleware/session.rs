@@ -202,8 +202,10 @@ impl Session {
         // store call would stall the layer's write-back pass.
         let (id, cached) = {
             let inner = lock(&self.inner);
+            // Load under the id the request came in on — `cycle_id` may already have minted
+            // the outgoing id, and loading that would silently discard the old record.
             (
-                inner.id.clone(),
+                inner.loaded_id.clone().unwrap_or_else(|| inner.id.clone()),
                 match &inner.data {
                     SessionCache::Ready(data) => Some(data.clone()),
                     SessionCache::Unloaded => None,
@@ -1073,6 +1075,12 @@ mod tests {
         session.id()
     }
 
+    async fn cycle_and_insert(session: Session) -> &'static str {
+        session.cycle_id();
+        session.insert("nick", "b").await.unwrap();
+        "done"
+    }
+
     async fn destroy_it(session: Session) -> &'static str {
         session.destroy();
         "gone"
@@ -1110,6 +1118,7 @@ mod tests {
             "/set".at(set_name),
             "/get".at(get_name),
             "/cycle".at(cycle_and_read),
+            "/cycle-insert".at(cycle_and_insert),
             "/destroy".at(destroy_it),
         ))
         .layer(sessions)
@@ -1183,6 +1192,23 @@ mod tests {
         let response = go(&router, "/get", Some(old_cookie)).await;
         let body = response.into_body().into_string().await.unwrap();
         assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn cycle_id_then_insert_keeps_the_old_record() {
+        let router = router(Sessions::memory());
+
+        let response = go(&router, "/set", None).await;
+        let old_cookie = session_cookie(&response).unwrap();
+
+        // Rotate, then write without ever reading — the write must merge into the record
+        // the request arrived on, not clobber it under the fresh id.
+        let response = go(&router, "/cycle-insert", Some(old_cookie)).await;
+        let new_cookie = session_cookie(&response).unwrap();
+
+        let response = go(&router, "/get", Some(new_cookie)).await;
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "lex");
     }
 
     #[tokio::test]
