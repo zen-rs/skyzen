@@ -162,7 +162,13 @@ macro_rules! impl_tuple_extractor {
                 }
             }
 
-            impl <$($ty: Extractor),+>core::error::Error for TupleExtractorError<$($ty),+> {}
+            impl <$($ty: Extractor),+>core::error::Error for TupleExtractorError<$($ty),+> {
+                fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+                    match self {
+                        $(TupleExtractorError::$ty(e) => Some(e),)+
+                    }
+                }
+            }
 
             impl <$($ty: Extractor),+>http_kit::HttpError for TupleExtractorError<$($ty),+> {
                 fn status(&self) -> http_kit::StatusCode {

@@ -46,7 +46,14 @@ impl<E: Extractor, R: Responder> http_kit::HttpError for HandlerError<E, R> {
     }
 }
 
-impl<E: Extractor, R: Responder> core::error::Error for HandlerError<E, R> {}
+impl<E: Extractor, R: Responder> core::error::Error for HandlerError<E, R> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::ExtractorError(e) => Some(e),
+            Self::ResponderError(e) => Some(e),
+        }
+    }
+}
 
 /// An HTTP handler.
 /// This trait is a wrapper trait for `Fn` types. You will rarely use this type directly.
