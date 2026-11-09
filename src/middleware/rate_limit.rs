@@ -399,11 +399,14 @@ impl RateLimitStore for KvStore {
             {
                 // A counter only ever grows by +1, so after an increment it is always at
                 // least one — a stored negative corrupted to zero or below is not a fresh
-                // bucket, and counting it as one hands the key a free quota.
+                // bucket, and counting it as one hands the key a free quota. Re-arming the
+                // poison keeps it non-positive: a corrupt -1 would otherwise climb through
+                // 0 into a fresh-looking 1 on the very next request.
                 Ok(count) if count <= 0 => {
+                    let _ = self.kv.put(&bucket, b"-1").await;
                     return Err(HitError::Unsupported(Error::msg(format!(
                         "rate-limit counter under {bucket:?} is not positive"
-                    ))))
+                    ))));
                 }
                 Ok(count) => count.cast_unsigned(),
                 // No atomic increment — the Cloudflare case — is a capability gap, not a
