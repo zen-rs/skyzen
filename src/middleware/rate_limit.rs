@@ -28,16 +28,15 @@ use std::{
 
 use futures_core::future::BoxFuture;
 use http_kit::{
-    header::{HeaderValue, RETRY_AFTER},
+    header::{HeaderMap, HeaderValue, RETRY_AFTER},
     http_error, Request, Response, StatusCode,
 };
 use skyzen_core::{
     middleware::{Middleware, Next},
-    Error, Extractor,
+    Error, Extractor, PendingResponseHeaders,
 };
 use skyzen_services::{Kv, KvError};
 
-use super::error_handling::{DeferredHeaders, HandlesErrors};
 use crate::extract::ClientIp;
 
 http_error!(
@@ -96,6 +95,7 @@ pub struct RateLimit {
     window: Duration,
     resolve: Resolver,
     key: KeyFn,
+    name: String,
     fail_open: bool,
 }
 
@@ -153,8 +153,22 @@ impl RateLimit {
                         .map_err(|error| Error::msg(format!("rate limit client ip: {error}")))
                 })
             }),
+            // Two policies sharing one backend would otherwise count into one bucket —
+            // distinct quotas and windows each need a namespace of their own.
+            name: format!("{limit}/{}", window.as_millis()),
             fail_open: true,
         }
+    }
+
+    /// Names this policy's bucket namespace on a shared backend. Two limiters that must
+    /// not share counts — different routes, different quotas — get distinct names; the
+    /// default is derived from `limit` and `window`, so only identical configurations
+    /// share a bucket. Name a policy explicitly when the limit or window may change but
+    /// the counter should carry over.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Key the window on something other than the client IP — a JWT subject, tenant, route,
@@ -202,28 +216,27 @@ impl Middleware for RateLimit {
                     return Err(Error::from(RateLimitUnavailable::new()));
                 }
             };
-            let key = (self.key)(request).await?;
+            let key = format!("rate:{}:{}", self.name, (self.key)(request).await?);
             match store.hit(&key, self.window).await {
                 Ok(hit) if hit.count <= self.limit => next.run(request).await,
                 Ok(hit) => {
-                    // A 429 goes through the shared error contract: when an error handler
-                    // claims the path the error propagates and the wait rides the request as
-                    // a deferred header; otherwise the layer renders the shared body itself.
-                    if request.extensions().get::<HandlesErrors>().is_some() {
-                        let retry = HeaderValue::from(hit.retry_after.max(1));
-                        let extensions = request.extensions_mut();
-                        if let Some(deferred) = extensions.get_mut::<DeferredHeaders>() {
-                            deferred.0.push((RETRY_AFTER, retry));
-                        } else {
-                            extensions.insert(DeferredHeaders(vec![(RETRY_AFTER, retry)]));
+                    // A 429 is an error — it propagates through the shared error path, with
+                    // the wait riding the request as a must-deliver header: whichever
+                    // boundary renders the error, the client still sees `Retry-After`.
+                    let retry = HeaderValue::from(hit.retry_after.max(1));
+                    let extensions = request.extensions_mut();
+                    match extensions.get_mut::<PendingResponseHeaders>() {
+                        Some(pending) => {
+                            pending.0.append(RETRY_AFTER, retry);
                         }
-                        return Err(Error::from(RateLimited::new()));
+                        None => {
+                            extensions.insert(PendingResponseHeaders(HeaderMap::from_iter([(
+                                RETRY_AFTER,
+                                retry,
+                            )])));
+                        }
                     }
-                    let mut response = skyzen_core::error_response(&RateLimited::new());
-                    response
-                        .headers_mut()
-                        .insert(RETRY_AFTER, HeaderValue::from(hit.retry_after.max(1)));
-                    Ok(response)
+                    Err(Error::from(RateLimited::new()))
                 }
                 // A capability gap is permanent — a limiter that cannot count must surface,
                 // not silently admit everything.
@@ -392,7 +405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_over_the_limit_answer_429_with_retry_after() {
+    async fn requests_over_the_limit_propagate_the_429_error() {
         let router: Router = Route::new(("/hi".at(hello),))
             .layer(
                 RateLimit::memory(2, Duration::from_secs(60))
@@ -404,14 +417,10 @@ mod tests {
             let response = router.clone().go(get()).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
-        let response = router.go(get()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let retry_after: u64 = response.headers()[RETRY_AFTER]
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!((1..=60).contains(&retry_after));
+        // The rejection travels as `Err` through the shared error path; `Retry-After` rides
+        // the request's `PendingResponseHeaders` for whichever boundary renders it.
+        let error = router.go(get()).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]
@@ -432,10 +441,8 @@ mod tests {
         let mut a2 = get();
         a2.headers_mut()
             .insert("x-tenant", HeaderValue::from_static("a"));
-        assert_eq!(
-            router.go(a2).await.unwrap().status(),
-            StatusCode::TOO_MANY_REQUESTS
-        );
+        let error = router.go(a2).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]
