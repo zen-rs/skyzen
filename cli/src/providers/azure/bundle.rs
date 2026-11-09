@@ -302,13 +302,24 @@ fn ncrontab(cron: &str) -> String {
             field
                 .split(',')
                 .map(|item| {
-                    item.split('-')
+                    // A step suffix belongs to the whole item, not its last range end — pull it
+                    // off first, translate the range, then put it back.
+                    let (range, step) = item
+                        .split_once('/')
+                        .map_or((item, ""), |(range, step)| (range, step));
+                    let translated = range
+                        .split('-')
                         .map(|part| {
                             part.parse::<u8>()
                                 .map_or_else(|_| part.to_owned(), |number| (number - 1).to_string())
                         })
                         .collect::<Vec<_>>()
-                        .join("-")
+                        .join("-");
+                    if step.is_empty() {
+                        translated
+                    } else {
+                        format!("{translated}/{step}")
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(",")
@@ -510,6 +521,12 @@ mod tests {
         assert_eq!(super::ncrontab("0 9 * * SUN"), "0 0 9 * * SUN");
         assert_eq!(super::ncrontab("0 9 * * MON-FRI"), "0 0 9 * * MON-FRI");
         assert_eq!(super::ncrontab("0 9 * * */2"), "0 0 9 * * */2");
+
+        // A step suffix is the item's own, not its last range end's: `2-6/2` is every other
+        // day Monday–Friday, and `1-7/2` must not smuggle a `7` through.
+        assert_eq!(super::ncrontab("0 9 * * 2-6/2"), "0 0 9 * * 1-5/2");
+        assert_eq!(super::ncrontab("0 9 * * 1-7/2"), "0 0 9 * * 0-6/2");
+        assert_eq!(super::ncrontab("0 9 * * 4/3"), "0 0 9 * * 3/3");
     }
 
     #[test]

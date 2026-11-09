@@ -153,7 +153,9 @@ fn section_config(
         route: config.route.clone(),
         zone_id: config.zone_id.clone(),
         vars: config.vars.clone(),
-        triggers: merged_crons(config, schedules).map(|crons| WranglerTriggers { crons }),
+        triggers: Some(WranglerTriggers {
+            crons: merged_crons(config, schedules),
+        }),
         assets: config.assets.as_ref().map(assets_config),
         queues: queues_config(config),
         durable_objects: durable_objects_config(config),
@@ -187,9 +189,11 @@ fn section_config(
 /// Every cron the Worker needs, portable first: the `[[schedule]]` crons followed by any
 /// Cloudflare-only ones `[cloudflare.triggers]` adds, with duplicates removed.
 ///
-/// `None` when both are empty so `triggers` is omitted rather than emitted with no crons.
-fn merged_crons(config: &CloudflareSection, schedules: &[ScheduleEntry]) -> Option<Vec<String>> {
-    let crons: Vec<String> = schedules
+/// Always emitted, even empty: a `wrangler.toml` with no `triggers.crons` leaves a previously
+/// deployed Cron Trigger in place, so removing the last `[[schedule]]` has to say so — `crons
+/// = []` is the only way a deploy clears them.
+fn merged_crons(config: &CloudflareSection, schedules: &[ScheduleEntry]) -> Vec<String> {
+    schedules
         .iter()
         .map(|entry| entry.cron.as_str().to_owned())
         .chain(config.triggers.crons.iter().cloned())
@@ -198,9 +202,7 @@ fn merged_crons(config: &CloudflareSection, schedules: &[ScheduleEntry]) -> Opti
                 merged.push(cron);
             }
             merged
-        });
-
-    (!crons.is_empty()).then_some(crons)
+        })
 }
 
 fn assets_config(assets: &skyzen_manifest::CfAssets) -> WranglerAssets {

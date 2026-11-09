@@ -67,19 +67,19 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
                 Step::Command(deploy_command(&config, &root_dir, &binary)),
             ];
             let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
+            // Every `[[schedule]]` is an EventBridge rule pointed at the function — the one
+            // part of a deploy `cargo lambda` cannot express, created in process so the
+            // deployed function actually fires rather than just existing. The task also runs
+            // with an empty list: reconciling what the manifest no longer declares is how a
+            // removed schedule's rule stops firing.
+            steps.push(Step::Task(Box::new(EventBridgeSchedules::new(
+                function.clone(),
+                manifest.data().schedule.clone(),
+            ))));
             if !delivery.is_empty() {
                 steps.push(Step::Task(Box::new(LambdaEnvironment::new(
-                    function.clone(),
-                    delivery,
-                ))));
-            }
-            if !manifest.data().schedule.is_empty() {
-                // Every `[[schedule]]` is an EventBridge rule pointed at the function — the one
-                // part of a deploy `cargo lambda` cannot express, created in process so the
-                // deployed function actually fires rather than just existing.
-                steps.push(Step::Task(Box::new(EventBridgeSchedules::new(
                     function,
-                    manifest.data().schedule.clone(),
+                    delivery,
                 ))));
             }
             steps
@@ -391,7 +391,7 @@ mod tests {
              [aws.env]\nRUST_LOG = \"info\"\n",
         );
 
-        assert_eq!(planned.len(), 3, "{planned:?}");
+        assert_eq!(planned.len(), 4, "{planned:?}");
         assert!(planned[0].contains("cargo lambda build"), "{planned:?}");
 
         let deploy = &planned[1];

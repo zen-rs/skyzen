@@ -49,6 +49,12 @@ impl EventBridgeSchedules {
 
 impl Task for EventBridgeSchedules {
     fn describe(&self) -> String {
+        if self.schedules.is_empty() {
+            return format!(
+                "reconcile `[[schedule]]` EventBridge rules of Lambda function `{}`",
+                self.function
+            );
+        }
         let names = self
             .schedules
             .iter()
@@ -91,12 +97,15 @@ impl Task for EventBridgeSchedules {
                 })?
                 .to_owned();
 
-            // arn:aws:lambda:{region}:{account}:function:{name} — the rule's ARN lives in the
-            // same partition, region and account, under the `events` service.
-            let (region, account) = arn
-                .split(':')
-                .nth(3)
-                .zip(arn.split(':').nth(4))
+            // arn:{partition}:lambda:{region}:{account}:function:{name} — the rule's ARN lives
+            // in the same partition, region and account, under the `events` service. The
+            // partition matters outside standard AWS: `aws-us-gov`, `aws-cn`.
+            let parts: Vec<&str> = arn.split(':').collect();
+            let (partition, region, account) = parts
+                .get(1)
+                .zip(parts.get(3))
+                .zip(parts.get(4))
+                .map(|((partition, region), account)| (*partition, *region, *account))
                 .with_context(|| {
                     format!(
                         "`{arn}` is not a Lambda function ARN EventBridge rules can be built from"
@@ -104,7 +113,7 @@ impl Task for EventBridgeSchedules {
                 })?;
 
             for entry in &self.schedules {
-                self.wire_one(&events, &lambda, &arn, (region, account), entry)
+                self.wire_one(&events, &lambda, &arn, (partition, region, account), entry)
                     .await?;
             }
             self.retire_stale(&events, &lambda).await?;
@@ -117,79 +126,138 @@ impl EventBridgeSchedules {
     /// Remove rules — and their invoke permissions — that a previous deploy created and the
     /// manifest no longer declares.
     ///
-    /// Skyzen's rules are exactly the ones named `{function}-*`, so the manifest's own set is
-    /// the diff: a rule in the prefix but not in the manifest belonged to a `[[schedule]]`
-    /// that was renamed or removed, and leaving it would keep firing a schedule the application
-    /// no longer has.
+    /// The function's resource policy is the record: every statement `skyzen-schedule-{name}`
+    /// is a grant this module made, so a grant whose name the manifest no longer declares is
+    /// unambiguously stale. The matching rule and permission are retired together.
     async fn retire_stale(
         &self,
         events: &aws_sdk_eventbridge::Client,
         lambda: &aws_sdk_lambda::Client,
     ) -> Result<()> {
-        let prefix = format!("{}-", self.function);
-        let declared: std::collections::BTreeSet<String> = self
+        const STATEMENT_PREFIX: &str = "skyzen-schedule-";
+
+        let Some(policy) = self.policy(lambda).await? else {
+            return Ok(());
+        };
+        let declared: std::collections::BTreeSet<&str> = self
             .schedules
             .iter()
-            .map(|entry| self.rule_name(entry.name.as_str()))
+            .map(|entry| entry.name.as_str())
             .collect();
+        let stale = policy["Statement"].as_array().map(|statements| {
+            statements
+                .iter()
+                .filter_map(|entry| entry["Sid"].as_str()?.strip_prefix(STATEMENT_PREFIX))
+                .filter(|name| !declared.contains(name))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+        let Some(stale) = stale else {
+            return Ok(());
+        };
 
-        let mut request = events.list_rules().name_prefix(&prefix);
-        loop {
-            let listed = request
+        for name in stale {
+            let rule = self.rule_name(&name);
+            self.retire_rule(events, &rule).await?;
+            match lambda
+                .remove_permission()
+                .function_name(&self.function)
+                .statement_id(format!("{STATEMENT_PREFIX}{name}"))
                 .send()
                 .await
-                .with_context(|| format!("failed to list EventBridge rules under `{prefix}`"))?;
-            for rule in listed.rules() {
-                let Some(name) = rule.name() else { continue };
-                if declared.contains(name) {
-                    continue;
+            {
+                Ok(_) => {}
+                Err(error)
+                    if error.as_service_error().is_some_and(
+                        aws_sdk_lambda::operation::remove_permission::RemovePermissionError::is_resource_not_found_exception,
+                    ) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to drop the invoke permission of `{rule}` on `{}`",
+                            self.function
+                        )
+                    });
                 }
-                events
-                    .remove_targets()
-                    .rule(name)
-                    .ids(name)
-                    .send()
-                    .await
-                    .with_context(|| format!("failed to clear targets of stale rule `{name}`"))?;
-                events
-                    .delete_rule()
-                    .name(name)
-                    .send()
-                    .await
-                    .with_context(|| format!("failed to delete stale EventBridge rule `{name}`"))?;
-                // The permission statement was named after the schedule, which is everything
-                // after the function prefix; a rule that outlived the deploy that made it may
-                // not have one, so a missing statement is not a failure.
-                let schedule = &name[prefix.len()..];
-                match lambda
-                    .remove_permission()
-                    .function_name(&self.function)
-                    .statement_id(format!("skyzen-schedule-{schedule}"))
-                    .send()
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(error)
-                        if error.as_service_error().is_some_and(
-                            aws_sdk_lambda::operation::remove_permission::RemovePermissionError::is_resource_not_found_exception,
-                        ) => {}
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "failed to drop the invoke permission of `{name}` on `{}`",
-                                self.function
-                            )
-                        });
-                    }
-                }
-                output::ok(format!("removed stale EventBridge rule `{name}`"));
             }
-            let Some(token) = listed.next_token() else {
-                break;
-            };
-            request = events.list_rules().name_prefix(&prefix).next_token(token);
+            output::ok(format!("removed stale EventBridge rule `{rule}`"));
         }
         Ok(())
+    }
+
+    /// Delete `rule` after stripping every target on it.
+    ///
+    /// `DeleteRule` refuses while any target remains — not just Skyzen's own — and a rule a
+    /// crashed deploy left behind may carry another one. Enumerated rather than assumed, and
+    /// `RemoveTargets`'s per-entry failures fail the deploy the way `PutTargets`'s do. A rule
+    /// that vanished between the policy read and here is not a failure.
+    async fn retire_rule(&self, events: &aws_sdk_eventbridge::Client, rule: &str) -> Result<()> {
+        let listed = match events.list_targets_by_rule().rule(rule).send().await {
+            Ok(listed) => listed,
+            Err(error)
+                if error.as_service_error().is_some_and(
+                    aws_sdk_eventbridge::operation::list_targets_by_rule::ListTargetsByRuleError::is_resource_not_found_exception,
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to list the targets of rule `{rule}`"));
+            }
+        };
+        let ids: Vec<String> = listed
+            .targets()
+            .iter()
+            .map(|target| target.id().to_owned())
+            .collect();
+        if !ids.is_empty() {
+            let removed = events
+                .remove_targets()
+                .rule(rule)
+                .set_ids(Some(ids))
+                .send()
+                .await
+                .with_context(|| format!("failed to clear targets of stale rule `{rule}`"))?;
+            let failures = removed.failed_entries();
+            anyhow::ensure!(
+                failures.is_empty(),
+                "EventBridge refused to strip a target of stale rule `{rule}`: {:?}",
+                failures
+                    .first()
+                    .map(aws_sdk_eventbridge::types::RemoveTargetsResultEntry::error_message)
+            );
+        }
+        events
+            .delete_rule()
+            .name(rule)
+            .send()
+            .await
+            .with_context(|| format!("failed to delete stale EventBridge rule `{rule}`"))?;
+        Ok(())
+    }
+
+    /// The function's resource policy document, or `None` when it has none.
+    async fn policy(&self, lambda: &aws_sdk_lambda::Client) -> Result<Option<serde_json::Value>> {
+        let policy = match lambda
+            .get_policy()
+            .function_name(&self.function)
+            .send()
+            .await
+        {
+            Ok(response) => response.policy().unwrap_or_default().to_owned(),
+            Err(error)
+                if error.as_service_error().is_some_and(
+                    aws_sdk_lambda::operation::get_policy::GetPolicyError::is_resource_not_found_exception,
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&policy)
+            .with_context(|| format!("the policy of `{}` is not JSON", self.function))?;
+        Ok(Some(parsed))
     }
 
     /// Create one `[[schedule]]`'s rule, permission and target.
@@ -198,10 +266,16 @@ impl EventBridgeSchedules {
         events: &aws_sdk_eventbridge::Client,
         lambda: &aws_sdk_lambda::Client,
         arn: &str,
-        (region, account): (&str, &str),
+        (partition, region, account): (&str, &str, &str),
         entry: &ScheduleEntry,
     ) -> Result<()> {
         let rule = self.rule_name(entry.name.as_str());
+        anyhow::ensure!(
+            rule.len() <= 64,
+            "the EventBridge rule `{rule}` is {} characters; AWS allows 64 — shorten the \
+             schedule or function name",
+            rule.len()
+        );
         let expression = aws_cron_expression(entry.cron.as_str()).with_context(|| {
             format!(
                 "[[schedule]] `{name}` cannot be expressed as an EventBridge cron",
@@ -222,7 +296,7 @@ impl EventBridgeSchedules {
         // decides whether `add_permission` is needed at all: `ResourceConflictException` is
         // ambiguous between "already granted" and "an update is in progress", and swallowing
         // the second case would leave the rule unable to invoke.
-        let rule_arn = format!("arn:aws:events:{region}:{account}:rule/{rule}");
+        let rule_arn = format!("arn:{partition}:events:{region}:{account}:rule/{rule}");
         let statement = format!("skyzen-schedule-{}", entry.name);
         if !self
             .has_statement(lambda, &statement, &rule_arn)
@@ -293,36 +367,25 @@ impl EventBridgeSchedules {
 
     /// Whether the function's policy already grants `statement` for `source_arn`.
     ///
-    /// `GetPolicy` answers 404 (`ResourceNotFoundException`) when the function has no
-    /// resource policy at all, which is the common first deploy: no statements, no grants.
+    /// The whole grant is compared — `Sid` alone is only the name: a statement that matches but
+    /// denies, or allows another principal or action, is not the permission `add_permission`
+    /// would create, and skipping the grant on its account would leave the rule unable to
+    /// invoke.
     async fn has_statement(
         &self,
         lambda: &aws_sdk_lambda::Client,
         statement: &str,
         source_arn: &str,
     ) -> Result<bool> {
-        let policy = match lambda
-            .get_policy()
-            .function_name(&self.function)
-            .send()
-            .await
-        {
-            Ok(response) => response.policy().unwrap_or_default().to_owned(),
-            Err(error)
-                if error.as_service_error().is_some_and(
-                    aws_sdk_lambda::operation::get_policy::GetPolicyError::is_resource_not_found_exception,
-                ) =>
-            {
-                return Ok(false)
-            }
-            Err(error) => return Err(error.into()),
+        let Some(policy) = self.policy(lambda).await? else {
+            return Ok(false);
         };
-
-        let parsed: serde_json::Value = serde_json::from_str(&policy)
-            .with_context(|| format!("the policy of `{}` is not JSON", self.function))?;
-        Ok(parsed["Statement"].as_array().is_some_and(|statements| {
+        Ok(policy["Statement"].as_array().is_some_and(|statements| {
             statements.iter().any(|entry| {
                 entry["Sid"] == statement
+                    && entry["Effect"] == "Allow"
+                    && entry["Principal"]["Service"] == EVENTS_PRINCIPAL
+                    && entry["Action"] == INVOKE_ACTION
                     && entry["Condition"]["ArnLike"]["AWS:SourceArn"] == source_arn
             })
         }))
