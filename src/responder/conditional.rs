@@ -227,5 +227,16 @@ mod tests {
         *request.uri_mut() = "/hello".parse().unwrap();
         let response = router.go(request).await.unwrap();
         assert_eq!(response.headers()[ETAG].to_str().unwrap(), etag);
+
+        // And a matching If-None-Match answers 304 with no body — the tag gates the
+        // response, it isn't decorative.
+        let mut request = Request::new(Body::empty());
+        *request.uri_mut() = "/hello".parse().unwrap();
+        request
+            .headers_mut()
+            .insert(IF_NONE_MATCH, etag.parse().unwrap());
+        let response = router.go(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(response.into_body().into_bytes().await.unwrap().is_empty());
     }
 }

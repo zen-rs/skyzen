@@ -9,6 +9,8 @@ use skyzen_core::{
 };
 use twox_hash::XxHash3_64;
 
+use crate::utils::conditional::{fresh, EntityTag};
+
 /// Default ceiling for hashing a body — 256 KiB.
 const DEFAULT_MAX_BODY: u64 = 256 * 1024;
 
@@ -80,11 +82,18 @@ impl Middleware for AutoETag {
             }
             let bytes = copy.into_bytes().await.map_err(Error::new)?;
             let hash = XxHash3_64::oneshot(&bytes);
+            let tag = EntityTag::weak(format!("{hash:016x}"));
             response.headers_mut().insert(
                 header::ETAG,
                 header::HeaderValue::try_from(format!("W/\"{hash:016x}\""))
                     .expect("a hex ETag is a valid header value"),
             );
+            // The tag is only worth emitting if it also gates the body — a matching
+            // `If-None-Match` answers 304 instead of re-sending identical bytes.
+            if fresh(request.headers(), Some(tag.etag()), None) {
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                *response.body_mut() = http_kit::Body::empty();
+            }
             Ok(response)
         }
     }
