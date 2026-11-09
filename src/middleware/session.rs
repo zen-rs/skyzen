@@ -71,10 +71,16 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Drop `id` entirely.
     fn delete<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), SessionError>>;
 
-    /// Refresh `id`'s idle expiry without rewriting it. Stores that cannot touch without a
-    /// rewrite leave this alone — it runs on clean reads only, so a miss is harmless.
-    fn touch<'a>(&'a self, id: &'a str, ttl: Duration) -> BoxFuture<'a, Result<(), SessionError>> {
-        let _ = (id, ttl);
+    /// Refresh `id`'s idle expiry without rewriting it. `expected` is the data this request
+    /// loaded — a store that slides a TTL only by rewriting must check the record still holds
+    /// those bytes first, or a concurrent write it never saw gets resurrected under it.
+    fn touch<'a>(
+        &'a self,
+        id: &'a str,
+        ttl: Duration,
+        expected: Option<&'a SessionData>,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
+        let _ = (id, ttl, expected);
         Box::pin(async { Ok(()) })
     }
 }
@@ -617,7 +623,11 @@ impl SessionsLayer {
                         jar.private_mut(keys.key()).add(cookie);
                     }
                 } else if loaded_id.is_some() {
-                    store.touch(&id, self.ttl).await?;
+                    let expected = match &loaded {
+                        SessionCache::Ready(Some(data)) => Some(data),
+                        _ => None,
+                    };
+                    store.touch(&id, self.ttl, expected).await?;
                     // Sliding expiry is two-sided: touching the record alone leaves the
                     // browser's Max-Age ticking toward the original deadline, so a clean
                     // session re-emits its cookie alongside the server-side refresh.
@@ -848,7 +858,12 @@ impl SessionStore for KvSessionStore {
         })
     }
 
-    fn touch<'a>(&'a self, id: &'a str, ttl: Duration) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn touch<'a>(
+        &'a self,
+        id: &'a str,
+        ttl: Duration,
+        expected: Option<&'a SessionData>,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
             let key = store_key(id);
             match self.kv.expire(&key, ttl).await {
@@ -860,10 +875,24 @@ impl SessionStore for KvSessionStore {
                     let Some(data) = self.kv.get(&key).await.map_err(SessionError::store)? else {
                         return Ok(());
                     };
-                    self.kv
-                        .put_with_ttl(&key, &data, ttl)
-                        .await
-                        .map_err(SessionError::store)
+                    // The record changed since this request read it — a rotation or logout
+                    // wrote (or deleted) something newer, and rewriting would resurrect it.
+                    // `expected == None` means this session never loaded, so there is nothing
+                    // to check against and nothing safe to write.
+                    let still_same = expected
+                        .and_then(|expected| {
+                            serde_json::from_slice::<SessionData>(&data)
+                                .ok()
+                                .map(|stored| stored == *expected)
+                        })
+                        .unwrap_or(false);
+                    if still_same {
+                        self.kv
+                            .put_with_ttl(&key, &data, ttl)
+                            .await
+                            .map_err(SessionError::store)?;
+                    }
+                    Ok(())
                 }
                 Err(other) => Err(SessionError::store(other)),
             }
@@ -1003,7 +1032,12 @@ impl SessionStore for MemorySessionStore {
         })
     }
 
-    fn touch<'a>(&'a self, id: &'a str, ttl: Duration) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn touch<'a>(
+        &'a self,
+        id: &'a str,
+        ttl: Duration,
+        _expected: Option<&'a SessionData>,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
             let now = now_ms();
             let mut entries = self.entries.lock().expect("memory store");
