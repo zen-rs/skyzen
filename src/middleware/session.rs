@@ -723,6 +723,12 @@ impl Sessions {
 
     /// Sessions encrypted into the cookie itself — no server state, no KV, and the privacy of
     /// [`PrivateCookieJar`]. Keep payloads small; a cookie is not a database.
+    ///
+    /// The trade-off of statelessness is revocation: `destroy` and `cycle_id` expire the
+    /// browser's copy, but a captured cookie replays until its embedded `exp` — nothing
+    /// server-side can invalidate it. Pick [`kv`][Self::kv] or [`memory`][Self::memory] when
+    /// sessions must die on demand (logout-everywhere, revocation, rotation with immediate
+    /// effect).
     #[allow(clippy::new_ret_no_self)]
     #[must_use]
     pub fn cookie() -> SessionsLayer {
