@@ -34,12 +34,17 @@ const ALIAS: &str = "skyzen";
 struct RuleSnapshot {
     /// The rule's name.
     name: String,
+    /// Whether the rule existed at all — a deploy-made rule that never was gets deleted.
+    existed: bool,
     /// Its schedule expression, if it had one.
     expression: Option<String>,
     /// Whether it was enabled.
     enabled: bool,
     /// The targets it carried.
     targets: Vec<Target>,
+    /// The policy statement that let it invoke, if one existed — removal is reversible only
+    /// when the grant comes back with the rule.
+    statement: Option<String>,
 }
 
 /// The rules that point `[[schedule]]` entries at a deployed function.
@@ -155,11 +160,64 @@ impl Task for EventBridgeSchedules {
             // the `skyzen` alias, so the transition itself is what makes them safe: the new
             // version publishes once the environment is in place, and the alias's atomic
             // repoint is the moment their invocations change.
+            // Restore needs what reconcile would have built: the qualified function the
+            // grants live on, and the ARN parts a rule's own ARN derives from.
+            let parts: Vec<&str> = arn.split(':').collect();
+            let (partition, region, account) = parts
+                .get(1)
+                .zip(parts.get(3))
+                .zip(parts.get(4))
+                .map(|((partition, region), account)| (*partition, *region, *account))
+                .with_context(|| {
+                    format!(
+                        "`{arn}` is not a Lambda function ARN EventBridge rules can be built from"
+                    )
+                })?;
+            let qualified = format!("{}:{ALIAS}", self.function);
             let mut snapshot = Vec::new();
-            let result = self.reconcile(&events, &lambda, &arn, &mut snapshot).await;
+            let mut alias = None;
+            let result = self
+                .reconcile(
+                    &events,
+                    &lambda,
+                    &arn,
+                    (partition, region, account),
+                    &mut snapshot,
+                    &mut alias,
+                )
+                .await;
             if let Err(error) = result {
+                // Rules first, then the alias: a rule that was never wired belongs to the
+                // rollback as much as one that was.
                 for taken in &snapshot {
-                    let _ = self.restore_rule(&events, taken).await;
+                    let rule_arn = format!(
+                        "arn:{partition}:events:{region}:{account}:rule/{}",
+                        taken.name
+                    );
+                    if let Err(restore) = self
+                        .restore_rule(&events, &lambda, &qualified, &rule_arn, taken)
+                        .await
+                    {
+                        output::warn(format!(
+                            "could not restore EventBridge rule `{}`: {restore}",
+                            taken.name
+                        ));
+                    }
+                }
+                if let Some(previous) = &alias {
+                    let restore = lambda
+                        .update_alias()
+                        .function_name(&self.function)
+                        .name(ALIAS)
+                        .function_version(previous)
+                        .send()
+                        .await;
+                    if let Err(restore) = restore {
+                        output::warn(format!(
+                            "could not repoint the `{ALIAS}` alias back at `{previous}`: \
+                             {restore}"
+                        ));
+                    }
                 }
                 return Err(error);
             }
@@ -179,7 +237,9 @@ impl EventBridgeSchedules {
         events: &aws_sdk_eventbridge::Client,
         lambda: &aws_sdk_lambda::Client,
         arn: &str,
+        (partition, region, account): (&str, &str, &str),
         snapshot: &mut Vec<RuleSnapshot>,
+        alias: &mut Option<String>,
     ) -> Result<()> {
         if !self.delivery.is_empty() {
             super::lambda_env::LambdaEnvironment::new(
@@ -193,45 +253,61 @@ impl EventBridgeSchedules {
 
         // The version captures the code and configuration $LATEST now holds; the rules
         // target the alias, so nothing they invoke changes until the repoint below — the
-        // only barrier EventBridge propagation cannot undermine.
-        let version = lambda
+        // only barrier EventBridge propagation cannot undermine. When nothing changed
+        // since the last publish, `PublishVersion` refuses and the existing latest
+        // version serves.
+        let version = match lambda
             .publish_version()
             .function_name(&self.function)
             .send()
             .await
-            .with_context(|| {
-                format!(
-                    "failed to publish a version of Lambda function `{}`",
-                    self.function
-                )
-            })?
-            .version()
-            .with_context(|| format!("`{}` published without a version", self.function))?
-            .to_owned();
+        {
+            Ok(published) => published
+                .version()
+                .with_context(|| format!("`{}` published without a version", self.function))?
+                .to_owned(),
+            Err(error) => {
+                // `PreconditionFailedException` means $LATEST already equals the last
+                // version — reuse it rather than treat an unchanged function as a failure.
+                if !error.as_service_error().is_some_and(
+                    aws_sdk_lambda::operation::publish_version::PublishVersionError::is_precondition_failed_exception,
+                ) {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to publish a version of Lambda function `{}`",
+                            self.function
+                        )
+                    });
+                }
+                lambda
+                    .list_versions_by_function()
+                    .function_name(&self.function)
+                    .send()
+                    .await
+                    .with_context(|| format!("failed to list versions of `{}`", self.function))?
+                    .versions()
+                    .iter()
+                    .filter_map(|version| version.version())
+                    .filter(|version| *version != "$LATEST")
+                    .max_by_key(|version| version.parse::<u64>().unwrap_or(0))
+                    .with_context(|| {
+                        format!("`{}` has no published version to point at", self.function)
+                    })?
+                    .to_owned()
+            }
+        };
+        *alias = self.alias_snapshot(lambda).await?;
         self.point_the_alias(lambda, &version).await?;
         let alias_arn = format!("{arn}:{ALIAS}");
         let qualified = format!("{}:{ALIAS}", self.function);
 
-        // arn:{partition}:lambda:{region}:{account}:function:{name} — the rule's ARN lives
-        // in the same partition, region and account, under the `events` service. The
-        // partition matters outside standard AWS: `aws-us-gov`, `aws-cn`.
-        let parts: Vec<&str> = arn.split(':').collect();
-        let (partition, region, account) = parts
-            .get(1)
-            .zip(parts.get(3))
-            .zip(parts.get(4))
-            .map(|((partition, region), account)| (*partition, *region, *account))
-            .with_context(|| {
-                format!("`{arn}` is not a Lambda function ARN EventBridge rules can be built from")
-            })?;
-
         for entry in &self.schedules {
-            if let Some(taken) = self
+            // Absent rules snapshot too: a rule the deploy creates belongs to the rollback,
+            // or a failed deployment leaves enabled wiring behind.
+            let taken = self
                 .rule_snapshot(events, &self.rule_name(entry.name.as_str()))
-                .await?
-            {
-                snapshot.push(taken);
-            }
+                .await?;
+            snapshot.push(taken);
             self.wire_one(
                 events,
                 lambda,
@@ -242,7 +318,7 @@ impl EventBridgeSchedules {
             )
             .await?;
         }
-        self.retire_stale(events, lambda, &qualified, &alias_arn, snapshot)
+        self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
             .await?;
         Ok(())
     }
@@ -254,7 +330,7 @@ impl EventBridgeSchedules {
         &self,
         events: &aws_sdk_eventbridge::Client,
         rule: &str,
-    ) -> Result<Option<RuleSnapshot>> {
+    ) -> Result<RuleSnapshot> {
         let found = match events.describe_rule().name(rule).send().await {
             Ok(found) => found,
             Err(error)
@@ -262,7 +338,14 @@ impl EventBridgeSchedules {
                     aws_sdk_eventbridge::operation::describe_rule::DescribeRuleError::is_resource_not_found_exception,
                 ) =>
             {
-                return Ok(None)
+                return Ok(RuleSnapshot {
+                    name: rule.to_owned(),
+                    existed: false,
+                    expression: None,
+                    enabled: false,
+                    targets: Vec::new(),
+                    statement: None,
+                })
             }
             Err(error) => {
                 return Err(error)
@@ -277,23 +360,58 @@ impl EventBridgeSchedules {
             .with_context(|| format!("failed to list the targets of rule `{rule}`"))?
             .targets()
             .to_vec();
-        Ok(Some(RuleSnapshot {
+        Ok(RuleSnapshot {
             name: rule.to_owned(),
+            existed: true,
             expression: found.schedule_expression().map(str::to_owned),
             enabled: matches!(
                 found.state(),
                 Some(aws_sdk_eventbridge::types::RuleState::Enabled)
             ),
             targets,
-        }))
+            statement: None,
+        })
     }
 
-    /// Put a snapshotted rule back: its schedule, its targets, its enabled state.
+    /// Put a snapshotted rule back: a rule that never existed gets deleted, and an existing
+    /// one gets its schedule, its targets, its invoke grant and its enabled state back.
     async fn restore_rule(
         &self,
         events: &aws_sdk_eventbridge::Client,
+        lambda: &aws_sdk_lambda::Client,
+        qualified: &str,
+        rule_arn: &str,
         snapshot: &RuleSnapshot,
     ) -> Result<()> {
+        if !snapshot.existed {
+            let listed = events
+                .list_targets_by_rule()
+                .rule(&snapshot.name)
+                .send()
+                .await;
+            if let Ok(listed) = listed {
+                let ids: Vec<String> = listed
+                    .targets()
+                    .iter()
+                    .map(|target| target.id().to_owned())
+                    .collect();
+                if !ids.is_empty() {
+                    let _ = events
+                        .remove_targets()
+                        .rule(&snapshot.name)
+                        .set_ids(Some(ids))
+                        .send()
+                        .await;
+                }
+            }
+            events
+                .delete_rule()
+                .name(&snapshot.name)
+                .send()
+                .await
+                .with_context(|| format!("failed to remove rule `{}`", snapshot.name))?;
+            return Ok(());
+        }
         let mut put = events
             .put_rule()
             .name(&snapshot.name)
@@ -309,15 +427,64 @@ impl EventBridgeSchedules {
             .await
             .with_context(|| format!("failed to restore rule `{}`", snapshot.name))?;
         if !snapshot.targets.is_empty() {
-            events
+            let put = events
                 .put_targets()
                 .rule(&snapshot.name)
                 .set_targets(Some(snapshot.targets.clone()))
                 .send()
                 .await
                 .with_context(|| format!("failed to restore targets of `{}`", snapshot.name))?;
+            anyhow::ensure!(
+                put.failed_entries().is_empty(),
+                "EventBridge refused to restore a target of `{}`: {:?}",
+                snapshot.name,
+                put.failed_entries()
+                    .first()
+                    .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
+            );
+        }
+        if let Some(statement) = &snapshot.statement {
+            lambda
+                .add_permission()
+                .function_name(qualified)
+                .action(INVOKE_ACTION)
+                .principal(EVENTS_PRINCIPAL)
+                .source_arn(rule_arn)
+                .statement_id(statement)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to restore the invoke permission of `{}`",
+                        snapshot.name
+                    )
+                })?;
         }
         Ok(())
+    }
+
+    /// Point the `skyzen` alias at `version`, creating the alias the first time.
+    /// The version the `skyzen` alias points at now, or `None` when it does not exist.
+    async fn alias_snapshot(&self, lambda: &aws_sdk_lambda::Client) -> Result<Option<String>> {
+        match lambda
+            .get_alias()
+            .function_name(&self.function)
+            .name(ALIAS)
+            .send()
+            .await
+        {
+            Ok(alias) => Ok(alias.function_version().map(str::to_owned)),
+            Err(error)
+                if error.as_service_error().is_some_and(
+                    aws_sdk_lambda::operation::get_alias::GetAliasError::is_resource_not_found_exception,
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to read the `{ALIAS}` alias of `{}`", self.function)
+            }),
+        }
     }
 
     /// Point the `skyzen` alias at `version`, creating the alias the first time.
@@ -378,26 +545,47 @@ impl EventBridgeSchedules {
         lambda: &aws_sdk_lambda::Client,
         qualified: &str,
         arn: &str,
+        alias_arn: &str,
         snapshot: &mut Vec<RuleSnapshot>,
     ) -> Result<()> {
         const STATEMENT_PREFIX: &str = "skyzen-schedule-";
 
-        let Some(policy) = self.policy(lambda, qualified).await? else {
+        // Grants live on the alias now, but an earlier deploy put them on the unqualified
+        // function — a schedule removed while upgrading still carries that statement, and
+        // its rule fires just the same. Both policies tell the whole story.
+        let mut statements = Vec::new();
+        for name in [qualified, &self.function] {
+            if let Some(policy) = self.policy(lambda, name).await? {
+                statements.push(policy);
+            }
+        }
+        if statements.is_empty() {
             return Ok(());
-        };
+        }
+        let policies = statements;
         let declared: std::collections::BTreeSet<&str> = self
             .schedules
             .iter()
             .map(|entry| entry.name.as_str())
             .collect();
-        let stale = policy["Statement"].as_array().map(|statements| {
-            statements
-                .iter()
-                .filter_map(|entry| entry["Sid"].as_str()?.strip_prefix(STATEMENT_PREFIX))
-                .filter(|name| !declared.contains(name))
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        });
+        let stale = {
+            let mut names = Vec::new();
+            for policy in &policies {
+                if let Some(statements) = policy["Statement"].as_array() {
+                    for entry in statements {
+                        if let Some(name) = entry["Sid"]
+                            .as_str()
+                            .and_then(|sid| sid.strip_prefix(STATEMENT_PREFIX))
+                        {
+                            if !declared.contains(name) && !names.contains(&name.to_owned()) {
+                                names.push(name.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            Some(names)
+        };
         let Some(stale) = stale else {
             return Ok(());
         };
@@ -405,29 +593,30 @@ impl EventBridgeSchedules {
         for name in stale {
             let rule = self.rule_name(&name);
             // The delete is one-way — the rule's own record is what a failed deploy restores.
-            if let Some(taken) = self.rule_snapshot(events, &rule).await? {
-                snapshot.push(taken);
-            }
-            self.retire_rule(events, arn, &rule).await?;
-            match lambda
-                .remove_permission()
-                .function_name(qualified)
-                .statement_id(format!("{STATEMENT_PREFIX}{name}"))
-                .send()
-                .await
-            {
-                Ok(_) => {}
-                Err(error)
-                    if error.as_service_error().is_some_and(
-                        aws_sdk_lambda::operation::remove_permission::RemovePermissionError::is_resource_not_found_exception,
-                    ) => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to drop the invoke permission of `{rule}` on `{}`",
-                            self.function
-                        )
-                    });
+            let mut taken = self.rule_snapshot(events, &rule).await?;
+            taken.statement = Some(format!("{STATEMENT_PREFIX}{name}"));
+            snapshot.push(taken);
+            self.retire_rule(events, &[arn, alias_arn], &rule).await?;
+            for owner in [qualified, self.function.as_str()] {
+                match lambda
+                    .remove_permission()
+                    .function_name(owner)
+                    .statement_id(format!("{STATEMENT_PREFIX}{name}"))
+                    .send()
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error)
+                        if error.as_service_error().is_some_and(
+                            aws_sdk_lambda::operation::remove_permission::RemovePermissionError::is_resource_not_found_exception,
+                        ) => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to drop the invoke permission of `{rule}` on `{owner}`"
+                            )
+                        });
+                    }
                 }
             }
             output::ok(format!("removed stale EventBridge rule `{rule}`"));
@@ -445,7 +634,7 @@ impl EventBridgeSchedules {
     async fn retire_rule(
         &self,
         events: &aws_sdk_eventbridge::Client,
-        arn: &str,
+        arns: &[&str],
         rule: &str,
     ) -> Result<()> {
         let listed = match events.list_targets_by_rule().rule(rule).send().await {
@@ -462,7 +651,11 @@ impl EventBridgeSchedules {
                     .with_context(|| format!("failed to list the targets of rule `{rule}`"));
             }
         };
-        if let Some(target) = listed.targets().iter().find(|target| target.arn() != arn) {
+        if let Some(target) = listed
+            .targets()
+            .iter()
+            .find(|target| !arns.contains(&target.arn()))
+        {
             output::warn(format!(
                 "leaving stale EventBridge rule `{rule}` in place: it carries a target pointing \
                  at `{}`, which is not Lambda function `{}`",
@@ -538,7 +731,7 @@ impl EventBridgeSchedules {
     async fn own_the_rule(
         &self,
         events: &aws_sdk_eventbridge::Client,
-        arn: &str,
+        arns: &[&str],
         rule: &str,
     ) -> Result<()> {
         match events.describe_rule().name(rule).send().await {
@@ -562,7 +755,11 @@ impl EventBridgeSchedules {
             .send()
             .await
             .with_context(|| format!("failed to list the targets of EventBridge rule `{rule}`"))?;
-        if let Some(target) = listed.targets().iter().find(|target| target.arn() != arn) {
+        if let Some(target) = listed
+            .targets()
+            .iter()
+            .find(|target| !arns.contains(&target.arn()))
+        {
             anyhow::bail!(
                 "EventBridge rule `{rule}` already exists and targets `{}`, not Lambda function \
                  `{}`; rename the schedule or remove the foreign rule",
@@ -624,7 +821,10 @@ impl EventBridgeSchedules {
             )
         })?;
 
-        self.own_the_rule(events, arn, &rule).await?;
+        // A rule an earlier deploy made still points at the unqualified function — it is
+        // ours, and wiring retargets it at the alias.
+        let legacy = arn.strip_suffix(&format!(":{ALIAS}")).unwrap_or(arn);
+        self.own_the_rule(events, &[arn, legacy], &rule).await?;
 
         // The rule goes up disabled and is switched on only once its permission and target
         // are both in place — a rule enabled before its transformer reconciles can fire the

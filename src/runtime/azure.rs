@@ -389,7 +389,15 @@ fn cookie_options(header: &str) -> serde_json::Value {
             "domain" => options["Domain"] = value.into(),
             "expires" => options["Expires"] = value.into(),
             "max-age" => {
-                options["MaxAge"] = format!("{value}:00:00").into();
+                // `Max-Age` counts seconds; the tuple carries a TimeSpan, spelled `h:mm:ss`.
+                let seconds = value.parse::<u64>().unwrap_or(0);
+                options["MaxAge"] = format!(
+                    "{}:{:02}:{:02}",
+                    seconds / 3600,
+                    seconds % 3600 / 60,
+                    seconds % 60
+                )
+                .into();
             }
             _ => {}
         }
