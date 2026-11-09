@@ -348,6 +348,16 @@ impl Session {
             .get::<SessionConfig>()
             .cloned()
             .ok_or(SessionError::NoLayer)?;
+
+        // A request that already extracted a session reuses the shared handle — a second
+        // SessionSlot would orphan the first extractor's writes at write-back.
+        if let Some(slot) = request.extensions().get::<SessionSlot>() {
+            return Ok(Self {
+                inner: slot.0.clone(),
+                config,
+            });
+        }
+
         let keys = request
             .extensions()
             .get::<CookieKeys>()
@@ -1210,6 +1220,26 @@ mod tests {
             error,
             crate::routing::RouteBuildError::MissingProvision { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn extracting_twice_shares_one_session() {
+        async fn handler(first: Session, second: Session) -> String {
+            first.insert("k", 7u32).await.unwrap();
+            second
+                .get("k")
+                .await
+                .unwrap()
+                .and_then(|v: Value| v.as_u64().map(|n| n.to_string()))
+                .unwrap_or_else(|| "lost".to_owned())
+        }
+        let router = Route::new(("/x".at(handler),))
+            .layer(Sessions::memory())
+            .layer(CookieKeys::new(Key::generate()).secure_cookies(false))
+            .build();
+        let response = go(&router, "/x", None).await;
+        // The second extractor's handle sees the first's writes — no orphaned slot.
+        assert_eq!(response.into_body().into_string().await.unwrap(), "7");
     }
 
     #[tokio::test]
