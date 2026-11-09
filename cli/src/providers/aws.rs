@@ -81,14 +81,15 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
             let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
             child_env = prepared.child_env;
             let mut steps = vec![
-                // Suspending comes first: a rule already enabled could fire the new code
-                // before its new environment exists.
+                Step::Command(build_command(&config, &root_dir, true)),
+                // Suspending sits between the build and the upload: a rule already enabled
+                // could fire the new code before its new environment exists, and a build
+                // that fails must not have already quieted them.
                 Step::Task(Box::new(SuspendSchedules::new(
                     function.clone(),
                     manifest.data().schedule.clone(),
                     child_env.clone(),
                 ))),
-                Step::Command(build_command(&config, &root_dir, true)),
                 Step::Command(deploy_command(&config, &root_dir, &binary)),
             ];
             let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
@@ -432,10 +433,13 @@ mod tests {
              [aws.env]\nRUST_LOG = \"info\"\n",
         );
 
-        assert_eq!(planned.len(), 4, "{planned:?}");
+        assert_eq!(planned.len(), 5, "{planned:?}");
         assert!(planned[0].contains("cargo lambda build"), "{planned:?}");
+        // Suspending the rules runs between the build and the upload, so a failed build never
+        // leaves the schedules quiet.
+        assert!(planned[1].contains("suspend"), "{planned:?}");
 
-        let deploy = &planned[1];
+        let deploy = &planned[2];
         assert!(deploy.contains("cargo lambda deploy"), "{deploy}");
         assert!(deploy.contains("--binary-name demo"), "{deploy}");
         assert!(deploy.contains("--memory 512"), "{deploy}");
@@ -573,8 +577,8 @@ mod tests {
             "[aws]\nurl = false\n",
         );
 
-        assert!(planned[1].contains("--disable-function-url"), "{planned:?}");
-        assert!(!planned[1].contains("--enable-function-url"), "{planned:?}");
+        assert!(planned[2].contains("--disable-function-url"), "{planned:?}");
+        assert!(!planned[2].contains("--enable-function-url"), "{planned:?}");
     }
 
     #[test]

@@ -120,6 +120,42 @@ impl Task for SuspendSchedules {
             }
             for name in names {
                 let rule = self.inner.rule_name(&name);
+                // A same-named rule belonging to something else is not ours to quiet —
+                // `wire_one` applies the same test before it would change it.
+                let owned = match events.describe_rule().name(&rule).send().await {
+                    Ok(_) => {
+                        let listed = events
+                            .list_targets_by_rule()
+                            .rule(&rule)
+                            .send()
+                            .await
+                            .with_context(|| {
+                                format!("failed to list the targets of rule `{rule}`")
+                            })?;
+                        let lambda_arn = lambda
+                            .get_function_configuration()
+                            .function_name(&self.inner.function)
+                            .send()
+                            .await
+                            .with_context(|| {
+                                format!("could not read Lambda function `{}`", self.inner.function)
+                            })?
+                            .function_arn()
+                            .map(str::to_owned);
+                        lambda_arn.is_some_and(|arn| {
+                            listed.targets().iter().all(|target| target.arn() == arn)
+                        })
+                    }
+                    Err(_) => true,
+                };
+                if !owned {
+                    output::warn(format!(
+                        "leaving EventBridge rule `{rule}` alone: its targets are not Lambda \
+                         function `{}`",
+                        self.inner.function
+                    ));
+                    continue;
+                }
                 match events.disable_rule().name(&rule).send().await {
                     Ok(_) => output::ok(format!("suspended EventBridge rule `{rule}`")),
                     Err(error)
@@ -477,11 +513,14 @@ impl EventBridgeSchedules {
 
         self.own_the_rule(events, arn, &rule).await?;
 
+        // The rule goes up disabled and is switched on only once its permission and target
+        // are both in place — a rule enabled before its transformer reconciles can fire the
+        // function with the previous deployment's `detail.cron`.
         events
             .put_rule()
             .name(&rule)
             .schedule_expression(&expression)
-            .state(RuleState::Enabled)
+            .state(RuleState::Disabled)
             .send()
             .await
             .with_context(|| format!("failed to create EventBridge rule `{rule}`"))?;
@@ -551,6 +590,15 @@ impl EventBridgeSchedules {
                 .first()
                 .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
         );
+
+        // Everything the rule needs — permission, target, transformer — is in place; only now
+        // does it switch on.
+        events
+            .enable_rule()
+            .name(&rule)
+            .send()
+            .await
+            .with_context(|| format!("failed to enable EventBridge rule `{rule}`"))?;
 
         output::ok(format!(
             "wired `[[schedule]] {name}` to EventBridge rule `{rule}` ({expression})",

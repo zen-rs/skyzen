@@ -348,15 +348,26 @@ fn base64(bytes: &[u8]) -> String {
 async fn wrapped_response(response: Response) -> Response {
     let (parts, body) = response.into_parts();
     let status = parts.status.as_u16();
-    let bytes = body.into_bytes().await.unwrap_or_default();
-    // `res.body` carries a string — UTF-8 text goes verbatim, anything else goes base64 the
-    // way a binary payload has to be represented in the binding's JSON.
-    let body =
-        String::from_utf8(bytes.to_vec()).unwrap_or_else(|error| base64(&error.into_bytes()));
+    let bytes = body.into_bytes().await.map_err(|_| {
+        error!("a response body could not be collected");
+    });
+    let Ok(bytes) = bytes else {
+        return failed("the application's response body could not be collected");
+    };
+    // `res.body` carries a string — UTF-8 text goes verbatim, anything else goes base64 and
+    // says so, or the host would hand the client the encoded characters.
+    let (body, base64_encoded) = match String::from_utf8(bytes.to_vec()) {
+        Ok(text) => (text, false),
+        Err(error) => (base64(&error.into_bytes()), true),
+    };
     // One name maps to every value it appeared with — a `Set-Cookie` pair is two values, not
-    // a second overwrite of the first.
+    // a second overwrite of the first. `Content-Length` is the host's to compute again: the
+    // wrapped body is not the bytes it was counted for.
     let mut headers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     for (name, value) in &parts.headers {
+        if name.as_str().eq_ignore_ascii_case("content-length") {
+            continue;
+        }
         if let Ok(value) = value.to_str() {
             headers
                 .entry(name.as_str().to_owned())
@@ -366,7 +377,14 @@ async fn wrapped_response(response: Response) -> Response {
         }
     }
     let payload = serde_json::json!({
-        "Outputs": { "res": { "statusCode": status, "headers": headers, "body": body } },
+        "Outputs": {
+            "res": {
+                "statusCode": status,
+                "headers": headers,
+                "body": body,
+                "isBase64Encoded": base64_encoded
+            }
+        },
         "Logs": []
     });
     let mut wrapped = Response::new(Body::from(serde_json::to_vec(&payload).unwrap_or_default()));
@@ -415,10 +433,17 @@ where
 
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let Some(trigger) = self.trigger_for(request) else {
-            // Not a trigger path — with no forwarding configured the host delivers every HTTP
-            // request to the catch-all function wrapped in its invocation envelope, the client
-            // request nested under `Data.req`. Unwrap that back into the request it was, and
-            // the response back into the `Outputs.res` the `http` output binding expects.
+            // The envelope protocol only exists when a trigger does — the generated bundle
+            // turns off forwarding exactly then, and only then can `Data.req` arrive. With no
+            // triggers the host forwards the client's body verbatim, and a client who sends
+            // `{"Data":{"req":{...}}}` shaped JSON is just sending a body.
+            if self.queue_triggers.is_empty() && self.scheduled_triggers.is_empty() {
+                return self.endpoint.respond(request).await;
+            }
+            // With no forwarding configured the host delivers every HTTP request to the
+            // catch-all function wrapped in its invocation envelope, the client request
+            // nested under `Data.req`. Unwrap that back into the request it was, and the
+            // response back into the `Outputs.res` the `http` output binding expects.
             let Some(forwarded) = forwarded_request(request).await else {
                 return self.endpoint.respond(request).await;
             };
