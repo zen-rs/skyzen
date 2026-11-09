@@ -494,7 +494,7 @@ fn encode_value(data: &[u8]) -> String {
 fn decode_value(encoded: &str) -> Result<Vec<u8>, KvError> {
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|error| KvError::backend_with("base64 decode error", error))
+        .map_err(|error| KvError::Decode(format!("base64 decode error: {error}")))
 }
 
 /// Convert a TTL duration to whole seconds for Cosmos DB's `ttl` field.
