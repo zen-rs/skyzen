@@ -220,7 +220,13 @@ impl Session {
             return Ok(data);
         }
         let loaded = self.config.store.load(&id).await?;
-        lock(&self.inner).data = SessionCache::Ready(loaded.clone());
+        // A concurrent insert may have populated the cache while the load was in flight —
+        // publishing the stale result over it would drop that write. Only a still-empty
+        // cache takes the loaded value.
+        let mut inner = lock(&self.inner);
+        if let SessionCache::Unloaded = inner.data {
+            inner.data = SessionCache::Ready(loaded.clone());
+        }
         Ok(loaded)
     }
 
