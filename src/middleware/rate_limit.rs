@@ -530,18 +530,25 @@ impl RateLimitStore for DurableKvRateStore {
                 .get(&bucket)
                 .await
                 .map_err(|error| HitError::Backend(Error::new(error)))?;
-            let (count, reset) = stored
-                .as_deref()
-                .and_then(|raw| {
-                    let text = std::str::from_utf8(raw).ok()?;
-                    let (count, reset) = text.split_once(':')?;
-                    Some((count.parse::<u64>().ok()?, reset.parse::<u64>().ok()?))
-                })
-                .filter(|(_, reset)| now < *reset)
-                .map_or(
-                    (0, ((now / window_ms) + 1) * window_ms),
-                    |(count, reset)| (count, reset),
-                );
+            let (count, reset) = match stored.as_deref() {
+                None => (0, ((now / window_ms) + 1) * window_ms),
+                // A record the format cannot read never decodes — treating it as absent
+                // would hand the key a fresh counter every window, so it fails closed.
+                Some(raw) => match std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|text| text.split_once(':'))
+                    .and_then(|(count, reset)| {
+                        Some((count.parse::<u64>().ok()?, reset.parse::<u64>().ok()?))
+                    }) {
+                    Some((count, reset)) if now < reset => (count, reset),
+                    Some(_) => (0, ((now / window_ms) + 1) * window_ms),
+                    None => {
+                        return Err(HitError::Unsupported(Error::msg(format!(
+                            "rate-limit record under {bucket:?} is not a counter"
+                        ))))
+                    }
+                },
+            };
             let count = count + 1;
             self.kv
                 .put(&bucket, format!("{count}:{reset}").as_bytes())

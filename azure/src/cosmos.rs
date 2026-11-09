@@ -527,7 +527,7 @@ fn counter_value(key: &str, value: &[u8]) -> Result<i64, KvError> {
         .ok()
         .and_then(|text| text.trim().parse::<i64>().ok())
         .ok_or_else(|| {
-            KvError::backend(format!(
+            KvError::Decode(format!(
                 "the value stored under {key:?} is not a decimal counter, so it cannot be \
                  incremented"
             ))
