@@ -156,18 +156,18 @@ impl TrustedProxies {
 
 /// The first hop not owned by a proxy, walking a recorded chain away from the server.
 ///
-/// The peer itself is not part of the recorded chain: `peer` carries it so the last recorded
-/// entry is trusted only when the hop that wrote it is trusted.
+/// Each entry right-to-left is trusted only while it is itself a trusted proxy; the first
+/// entry that is not is the address the trusted edge actually received the connection from —
+/// everything further left is what that client *claims*, so the walk stops there. The peer
+/// itself is not part of the recorded chain: the caller has already vouched for it.
 fn trusted_client(addrs: &[IpAddr], proxies: &TrustedProxies, peer: Option<IpAddr>) -> IpAddr {
-    let mut prev_trusted = peer.is_some_and(|peer| proxies.trusts(&peer));
     for addr in addrs.iter().rev() {
-        if !prev_trusted {
+        if !proxies.trusts(addr) {
             return *addr;
         }
-        prev_trusted = proxies.trusts(addr);
     }
-    // Every recorded hop is trusted, so the client is the leftmost entry — or, when the chain is
-    // empty, the peer itself.
+    // Every recorded hop is trusted, so the client is the leftmost entry — or, when the chain
+    // is empty, the peer itself.
     addrs
         .first()
         .copied()
@@ -517,6 +517,21 @@ mod tests {
         request.extensions_mut().insert(trusted(&["10.0.0.0/8"]));
 
         let ip = ClientIp::extract(&mut request).await.unwrap();
-        assert_eq!(ip.0, IpAddr::from([10, 0, 0, 1]));
+        assert_eq!(ip.0, IpAddr::from([198, 51, 100, 1]));
+    }
+
+    #[tokio::test]
+    async fn an_attacker_prepended_ip_does_not_win_the_trust_boundary() {
+        // The rightmost untrusted entry is what the trusted edge observed; entries left of it
+        // are the sender's own claims and must never resolve.
+        let mut request = with_header(
+            request_with_peer(Ipv4Addr::new(10, 0, 0, 2).into()),
+            "x-forwarded-for",
+            "9.9.9.9, 198.51.100.1, 10.0.0.1",
+        );
+        request.extensions_mut().insert(trusted(&["10.0.0.0/8"]));
+
+        let ip = ClientIp::extract(&mut request).await.unwrap();
+        assert_eq!(ip.0, IpAddr::from([198, 51, 100, 1]));
     }
 }
