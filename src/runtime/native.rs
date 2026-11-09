@@ -525,18 +525,32 @@ pub fn apply_tls_overrides(args: impl IntoIterator<Item = String>) -> Option<Tls
         }
     }
 
-    let cert = cert_flag.or_else(|| std::env::var(CERT_ENV).ok());
-    let key = key_flag.or_else(|| std::env::var(KEY_ENV).ok());
+    // `var_os`, not `var`: a non-UTF-8 path is still a configured TLS file, and
+    // `var`'s `.ok()` would read it as absent and boot the server plaintext —
+    // the worst outcome under a configuration that promised encryption.
+    let cert = cert_flag
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os(CERT_ENV).map(std::path::PathBuf::from));
+    let key = key_flag
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os(KEY_ENV).map(std::path::PathBuf::from));
     match (cert, key) {
         (None, None) => None,
         (Some(cert), Some(key)) => {
-            assert!(!cert.is_empty(), "an empty path is not a TLS certificate");
-            assert!(!key.is_empty(), "an empty path is not a TLS key");
-            info!("Configured TLS certificate {cert} with key {key}");
-            Some(TlsFiles {
-                cert: cert.into(),
-                key: key.into(),
-            })
+            assert!(
+                !cert.as_os_str().is_empty(),
+                "an empty path is not a TLS certificate"
+            );
+            assert!(
+                !key.as_os_str().is_empty(),
+                "an empty path is not a TLS key"
+            );
+            info!(
+                "Configured TLS certificate {} with key {}",
+                cert.display(),
+                key.display()
+            );
+            Some(TlsFiles { cert, key })
         }
         (Some(_), None) => panic!(
             "a TLS certificate was configured without a key; pass --tls-key or set {KEY_ENV}"
@@ -1429,6 +1443,7 @@ where
     // Nothing is ever sent through this channel: it exists so that dropping the last sender
     // tells the accept loop every connection task has finished.
     let (connection_guard, connections) = bounded::<Infallible>(1);
+    let connection_permits = Arc::new(async_lock::Semaphore::new(MAX_CONNECTIONS));
 
     let queue_consumers = ConsumerChannels::start(consumers, executor.as_ref(), &connection_guard);
 
@@ -1458,6 +1473,13 @@ where
                 match connection {
                     Some(Ok(accepted)) => {
                         let Accepted { stream, peer_addr } = accepted;
+                        // A full listener refuses at the socket: the permit is
+                        // held for the connection's whole life, so handshakes —
+                        // the expensive pre-auth work TLS adds — are bounded too.
+                        let Some(permit) = connection_permits.try_acquire_arc() else {
+                            warn!("connection limit ({MAX_CONNECTIONS}) reached; dropping a connection");
+                            continue;
+                        };
                         if let Some(peer) = peer_addr {
                             debug!("Accepted connection from {peer}");
                         }
@@ -1479,6 +1501,7 @@ where
                                 // Held for the lifetime of the connection so the shutdown path
                                 // can tell when the last one has finished.
                                 let _guard = guard;
+                                let _permit = permit;
 
                                 let Some((stream, is_h2)) =
                                     negotiated_stream(stream, tls.as_ref()).await
@@ -1669,6 +1692,16 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// The same bound, shortened so tests can actually observe it.
 #[cfg(test)]
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How many native connections may be live at once. Accepting past this refuses
+/// at the socket instead of queueing unbounded tasks — a handshake cannot
+/// outlive its connection, so the same number bounds in-flight TLS handshakes.
+#[cfg(not(test))]
+const MAX_CONNECTIONS: usize = 8_192;
+
+/// The same cap, small enough that a test can actually fill it.
+#[cfg(test)]
+const MAX_CONNECTIONS: usize = 8;
 
 /// The HTTP/2 connection preface a prior-knowledge h2c client opens with.
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -2859,5 +2892,83 @@ mod tests {
         // unread — hyper's parser rejects them on its own.
         let mut restored = Vec::new();
         let _ = stream.read(&mut restored).await;
+    }
+
+    /// `std::env::var`'s `.ok()` reads a non-UTF-8 value as *absent* — which is
+    /// how a configured certificate used to become a plaintext listener. The
+    /// path is unusable but it must still register as a TLS setting: either a
+    /// pair or a startup error, never `None`.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_non_utf8_tls_env_value_still_counts_as_configured() {
+        use std::os::unix::ffi::OsStrExt;
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        std::env::set_var(
+            "SKYZEN_TLS_CERT",
+            std::ffi::OsStr::from_bytes(b"\xff\xfe.pem"),
+        );
+        let pair = tls_overrides(&["app", "--tls-key", "k.pem"]);
+        std::env::remove_var("SKYZEN_TLS_CERT");
+        let pair = pair.expect("a non-UTF-8 path is still a certificate setting");
+        assert_eq!(pair.cert.as_os_str().as_bytes(), b"\xff\xfe.pem");
+    }
+
+    /// The accept loop holds one semaphore permit per live connection — fill
+    /// it and the next socket is dropped at the OS level rather than becoming
+    /// an unbounded task. Freeing a slot accepts again.
+    #[tokio::test]
+    #[cfg(feature = "server-tls")]
+    async fn the_connection_limit_refuses_past_capacity() {
+        use futures_util::TryStreamExt;
+        use std::time::Duration;
+
+        let listener = async_net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let incoming = listener.incoming().map_ok(|stream| super::Accepted {
+                peer_addr: stream.peer_addr().ok(),
+                stream,
+            });
+            super::serve_connections(SmolGlobal, TlsEndpoint, (), incoming, None).await
+        });
+
+        // Every permit taken by an h2c connection that idles after its preface.
+        let mut holders = Vec::new();
+        for _ in 0..super::MAX_CONNECTIONS {
+            let mut conn = async_net::TcpStream::connect(addr).await.expect("connect");
+            conn.write_all(HTTP2_PREFACE).await.expect("preface");
+            holders.push(conn);
+        }
+
+        // Full: the next socket is refused — the client sees a close, fast.
+        let mut late = async_net::TcpStream::connect(addr).await.expect("connect");
+        late.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .expect("write");
+        let mut buf = [0u8; 64];
+        let outcome = tokio::time::timeout(Duration::from_secs(2), late.read(&mut buf)).await;
+        assert!(
+            matches!(outcome, Ok(Ok(0) | Err(_))),
+            "a refused socket must close, got {outcome:?}"
+        );
+
+        // A freed permit accepts again: drop one holder, serve one more.
+        assert_eq!(holders.len(), super::MAX_CONNECTIONS);
+        let _freed = holders.pop();
+        let mut next = async_net::TcpStream::connect(addr).await.expect("connect");
+        next.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .expect("write");
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), next.read_to_end(&mut response)).await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1"),
+            "a freed slot must serve, got {response}"
+        );
+        drop(server);
     }
 }

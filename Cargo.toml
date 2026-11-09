@@ -135,6 +135,7 @@ smol.workspace = true
 # async-channel is always available on native (used by runtime) and is also
 # available on WASM when the `sse` feature is enabled
 async-channel = "2.5"
+async-lock = "3"
 ctrlc.workspace = true
 hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 http-body-util = "0.1.3"
