@@ -77,7 +77,12 @@ pub(crate) fn fresh(
     // applies when the stronger validator is absent (RFC 9110 §13.2.2). With nothing to
     // compare against, no member can match, so the answer is simply "not fresh".
     if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
-        return etag.is_some_and(|tag| !if_none_match.precondition_passes(tag));
+        return match etag {
+            Some(tag) => !if_none_match.precondition_passes(tag),
+            // `*` fails whenever a representation exists — and reaching `fresh` at all
+            // means the handler produced one, tag or no tag.
+            None => if_none_match == IfNoneMatch::any(),
+        };
     }
     if let (Some(if_modified_since), Some(modified)) =
         (headers.typed_get::<IfModifiedSince>(), last_modified)
