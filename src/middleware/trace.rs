@@ -401,22 +401,23 @@ mod tests {
     #[tokio::test]
     async fn the_span_carries_route_status_and_id_and_events_are_its_children() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(capture.clone()));
-
-        let router = Route::new(("/users/{id}".at(|| async { Result::Ok("u") }),))
-            .layer(Trace::new().with_request_id())
-            .build();
-        let response = router.go(get("/users/42")).await.unwrap();
+        let response = {
+            let _guard = tracing::subscriber::set_default(Registry::default().with(capture.clone()));
+            let router = Route::new(("/users/{id}".at(|| async { Result::Ok("u") }),))
+                .layer(Trace::new().with_request_id())
+                .build();
+            router.go(get("/users/42")).await.unwrap()
+        };
         assert_eq!(response.status(), StatusCode::OK);
-        drop(_guard);
 
-        let spans = capture.spans.lock().unwrap();
-        let span = spans.first().expect("the request span was recorded");
-        assert_eq!(span["http.route"], "/users/{id}");
-        assert_eq!(span["http.response.status_code"], "200");
-        assert_eq!(span["http.request.method"], "GET");
-        assert_eq!(span["request_id"].len(), 36);
-        drop(spans);
+        {
+            let spans = capture.spans.lock().unwrap();
+            let span = spans.first().expect("the request span was recorded");
+            assert_eq!(span["http.route"], "/users/{id}");
+            assert_eq!(span["http.response.status_code"], "200");
+            assert_eq!(span["http.request.method"], "GET");
+            assert_eq!(span["request_id"].len(), 36);
+        }
 
         let events = capture.events.lock().unwrap();
         let response_event = events
@@ -429,14 +430,14 @@ mod tests {
     #[tokio::test]
     async fn unmatched_requests_record_route_as_unmatched() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(capture.clone()));
-
-        let router = Route::new(("/known".at(|| async { Result::Ok("ok") }),))
-            .layer(Trace::new())
-            .build();
-        let response = router.go(get("/nope")).await.unwrap();
+        let response = {
+            let _guard = tracing::subscriber::set_default(Registry::default().with(capture.clone()));
+            let router = Route::new(("/known".at(|| async { Result::Ok("ok") }),))
+                .layer(Trace::new())
+                .build();
+            router.go(get("/nope")).await.unwrap()
+        };
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        drop(_guard);
 
         let span = capture.spans.lock().unwrap();
         assert_eq!(span[0]["http.route"], "<unmatched>");

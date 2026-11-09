@@ -146,7 +146,10 @@ mod tests {
     async fn an_unmatched_path_reports_no_template() {
         let router = Route::new(("/known".at(|| async { Result::Ok("ok") }),))
             .fallback(|route: Option<MatchedPath>| async move {
-                Result::Ok(route.map_or("<unmatched>".to_owned(), |path| path.as_str().to_owned()))
+                Result::Ok(route.map_or_else(
+                    || "<unmatched>".to_owned(),
+                    |path| path.as_str().to_owned(),
+                ))
             })
             .build();
 

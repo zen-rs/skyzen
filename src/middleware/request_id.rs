@@ -298,9 +298,11 @@ impl Extractor for RequestId {
 /// falls back to minting rather than smuggling an arbitrary string into `http.route`'s
 /// sibling field.
 fn trace_id(traceparent: &str) -> Option<&str> {
-    let is_hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+    // W3C trace context is strict: lowercase hex only, two-digit version (never `ff`),
+    // a 32-digit trace-id and 16-digit parent-id (neither all zero), two-digit flags.
+    let is_hex = |s: &str| s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let segments: Vec<&str> = traceparent.split('-').collect();
-    let [version, trace_id, parent_id, _flags] = segments.as_slice() else {
+    let [version, trace_id, parent_id, flags] = segments.as_slice() else {
         return None;
     };
     if version.len() != 2
@@ -312,6 +314,8 @@ fn trace_id(traceparent: &str) -> Option<&str> {
         || parent_id.len() != 16
         || !is_hex(parent_id)
         || parent_id.bytes().all(|b| b == b'0')
+        || flags.len() != 2
+        || !is_hex(flags)
     {
         return None;
     }
@@ -511,6 +515,19 @@ mod tests {
         );
         assert_eq!(
             trace_id("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            None
+        );
+        // Malformed flags and uppercase ids are not well-formed trace context.
+        assert_eq!(
+            trace_id("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz"),
+            None
+        );
+        assert_eq!(
+            trace_id("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1"),
+            None
+        );
+        assert_eq!(
+            trace_id("00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01"),
             None
         );
     }

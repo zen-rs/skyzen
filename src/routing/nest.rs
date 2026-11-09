@@ -59,28 +59,23 @@ impl Endpoint for NestedRouter {
             .ok_or_else(|| Box::new(NestedPathError(original.to_string())) as BoxHttpError)?;
 
         *request.uri_mut() = rewritten;
-        let outer_match = request.extensions().get::<MatchedPath>().cloned();
+        // The mount's own template (`/api` or `/api/{*skyzen_nested}`) is an internal
+        // routing artifact, not a user route — drop it before the inner router runs so
+        // inner handlers and fallbacks extracting `Option<MatchedPath>` see `None` unless
+        // a real inner route matches. An inner match is rejoined onto the mount prefix
+        // afterwards so the template describes the full route (`/api` + `/users/{id}`).
+        request.extensions_mut().remove::<MatchedPath>();
         let result = self.router.respond(request).await;
         // Put the path back so an outer layer that inspects the request after the inner router
         // returns still sees the URL the client asked for.
         *request.uri_mut() = original;
-        // An inner match overwrote the outer router's `MatchedPath`; rejoin it onto the mount
-        // prefix so the template describes the full route (`/api` + `/users/{id}`). One that
-        // survived untouched means the inner router's fallback answered — nothing
-        // user-visible matched, so the mount's internal catch-all template is dropped and
-        // the request reports `<unmatched>` in the trace.
-        if let Some(matched) = request.extensions().get::<MatchedPath>() {
-            if Some(matched) == outer_match.as_ref() {
-                request.extensions_mut().remove::<MatchedPath>();
+        if let Some(matched) = request.extensions().get::<MatchedPath>().cloned() {
+            let joined = if matched.as_str() == "/" {
+                self.prefix.to_string()
             } else {
-                let inner = matched.as_str().to_owned();
-                let joined = if inner == "/" {
-                    self.prefix.to_string()
-                } else {
-                    join_path(&self.prefix, &inner)
-                };
-                request.extensions_mut().insert(MatchedPath::new(joined));
-            }
+                join_path(&self.prefix, matched.as_str())
+            };
+            request.extensions_mut().insert(MatchedPath::new(joined));
         }
         result
     }
