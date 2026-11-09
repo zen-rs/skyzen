@@ -396,7 +396,9 @@ impl DurableKvRateStore {
                     let text = std::str::from_utf8(raw).ok()?;
                     let (_, reset) = text.split_once(':')?;
                     let reset = reset.parse::<u64>().ok()?;
-                    (reset <= now && !key.starts_with("rl:swept:")).then_some(key.as_str())
+                    // Sweep markers carry the same `{count}:{reset}` shape, so a stale
+                    // marker dies with its own window instead of piling up forever.
+                    (reset <= now).then_some(key.as_str())
                 })
                 .collect();
             let _ = self.kv.delete_multiple(&dead).await;
