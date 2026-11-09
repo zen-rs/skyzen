@@ -20,7 +20,7 @@ tracing.workspace = true
 # Cosmos DB.
 azure_data_cosmos = { version = "0.37.1", features = ["key_auth"], optional = true }
 
-# Service Bus speaks its REST API directly, on the same reqwest stack the blob backend uses. The
+# Service Bus speaks its REST API directly, on the same zenwave stack the blob backend uses. The
 # only published client, `azure_messaging_servicebus` 0.21, is built on legacy `azure_core` 0.21,
 # which logs the outgoing `authorization` header value at debug level (RUSTSEC-2026-0275) and drags
 # `http-types`, `async-std` and `rand 0.7` in behind it; there is no Service Bus client on
@@ -39,10 +39,13 @@ azure_core = { version = "1.0", optional = true }
 # Storage queues have no long polling of their own, so `receive` emulates one with a timer.
 async-io = { workspace = true, optional = true }
 
-# Blob Storage: OpenDAL moves the bytes, and the listing, tiering and presigning REST calls go out
-# on the same reqwest/reqsign stack OpenDAL's own azblob service is built on.
-opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "http-transport-reqwest-rustls", "services-azblob"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+# Blob Storage: OpenDAL moves the bytes over a zenwave `HttpTransport`, and the listing, tiering
+# and presigning REST calls go out on the same client and the same `reqsign` signer OpenDAL's own
+# azblob service is built on.
+opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "services-azblob"], optional = true }
+# zenwave is the workspace's HTTP client: hyper over async-io with rustls verified against the OS
+# trust store, HTTP/2 negotiated by ALPN — the same selection `skyzen-cli` makes.
+zenwave = { version = "0.8", default-features = false, features = ["hyper-backend", "rustls", "http2"], optional = true }
 reqsign-azure-storage = { version = "3.1", optional = true }
 reqsign-core = { version = "3.1", optional = true }
 quick-xml = { version = "0.41", features = ["serialize"], optional = true }
@@ -81,7 +84,7 @@ cosmos = ["dep:azure_data_cosmos", "dep:azure_core"]
 blob = [
     "dep:opendal",
     "dep:url",
-    "dep:reqwest",
+    "dep:zenwave",
     "dep:reqsign-azure-storage",
     "dep:reqsign-core",
     "dep:quick-xml",
@@ -89,11 +92,12 @@ blob = [
     "dep:bytes",
 ]
 servicebus = [
-    "dep:reqwest",
+    "dep:zenwave",
     "dep:url",
     "dep:time",
     "dep:hmac",
     "dep:sha2",
+    "dep:http",
 ]
 storage-queue = ["dep:azure_storage_queue", "dep:azure_core", "dep:async-io"]
 sql = [

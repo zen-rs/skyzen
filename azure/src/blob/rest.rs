@@ -3,7 +3,7 @@
 //! `OpenDAL` moves the bytes, but three things it cannot do are what a storage backend needs:
 //! listing from a server-side `marker` (its lister owns its own paging and cannot resume from an
 //! outside cursor), minting a shared access signature, and setting a blob's access tier. All three
-//! are ordinary Azure REST calls, so this module issues them on the same `reqwest` client and the
+//! are ordinary Azure REST calls, so this module issues them on the same `zenwave` client and the
 //! same `reqsign` signer `OpenDAL`'s own azblob service is built on — the request is signed exactly
 //! the way the data-plane requests beside it are.
 
@@ -16,6 +16,7 @@ use reqsign_core::{Context, SignRequest as _};
 use serde::Deserialize;
 use skyzen_services::storage::StorageError;
 use url::Url;
+use zenwave::{Body, DefaultClient, Endpoint as _, Request, Transport};
 
 use crate::status::{classify, retry_after, AzureStatus};
 
@@ -39,8 +40,9 @@ pub(super) const WRITE_PERMISSION: &str = "cw";
 
 /// The Azure Blob REST endpoint of one container.
 pub(super) struct BlobRest {
-    /// The HTTP client the requests go out on.
-    client: reqwest::Client,
+    /// The transport the requests go out on; the per-origin connection pool lives on it, so
+    /// clients built from it share connections.
+    transport: Transport,
     /// The signer, which turns a request into a signed one or a URL into a presigned one.
     signer: RequestSigner,
     /// `reqsign`'s ambient context. Shared-key signing needs nothing from it.
@@ -82,12 +84,23 @@ impl BlobRest {
             .push(container);
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            transport: Transport::system(),
             signer: RequestSigner::new(),
             context: Context::new(),
             credential,
             container_url,
         })
+    }
+
+    /// The client one request goes out on.
+    ///
+    /// One is built per request because the connection pool lives on the `Transport`: clients
+    /// over a clone of the same transport share connections, so this costs a struct wrap, not a
+    /// pool. It is the raw backend — a `reqsign` signature is bound to the URI it signs, so a
+    /// redirect could never be honored anyway, and a 3xx should surface as itself rather than as
+    /// a replayed hop.
+    fn client(&self) -> zenwave::backend::DefaultBackend {
+        DefaultClient::raw(self.transport.clone())
     }
 
     /// Whether this endpoint can mint a shared access signature of its own.
@@ -234,10 +247,10 @@ impl BlobRest {
                 StorageError::backend_with("failed to sign an Azure Blob request", error)
             })?;
 
-        let request = reqwest::Request::try_from(http::Request::from_parts(parts, body))
-            .map_err(|error| StorageError::backend_with("failed to build a request", error))?;
+        let mut request = Request::from_parts(parts, Body::from(body));
 
-        let response = self.client.execute(request).await.map_err(|error| {
+        let mut client = self.client();
+        let response = client.respond(&mut request).await.map_err(|error| {
             StorageError::backend_with(format!("the {method} request to Azure failed"), error)
         })?;
 
@@ -249,7 +262,12 @@ impl BlobRest {
             .map(ToOwned::to_owned);
 
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .into_body()
+                .into_string()
+                .await
+                .map(|body| body.to_string())
+                .unwrap_or_default();
             return Err(status_error(
                 status,
                 &method,
@@ -258,7 +276,7 @@ impl BlobRest {
             ));
         }
 
-        response.bytes().await.map_err(|error| {
+        response.into_body().into_bytes().await.map_err(|error| {
             StorageError::backend_with("failed to read Azure's response body", error)
         })
     }
