@@ -144,23 +144,22 @@ impl TrustedProxies {
             }
         }
 
-        // Order is trust-aware: a recorded peer provably appended the rightmost
-        // `X-Forwarded-For` entry, while a `Forwarded` it merely passed through stays
-        // client-written — so with a peer, XFF answers first and `Forwarded` cannot shadow
-        // it. With no peer nothing in either header is verifiable at all; `Forwarded` is
-        // still consulted first so the answer stays RFC-ordered, and both come back None.
-        if peer.is_some() {
-            return x_forwarded_for_chain(request)
-                .and_then(|addrs| self.anchored_client(&addrs, peer))
-                .or_else(|| {
-                    forwarded_chain(request).and_then(|addrs| self.anchored_client(&addrs, peer))
-                });
+        // A recorded peer provably appended to whichever header it writes — but the other,
+        // merely relayed, stays client-written and an attacker who set it could shadow the
+        // real record either way. Neither order is safe alone, so the two are consulted
+        // independently: when both resolve they must agree — a disagreement means at least
+        // one was forged, and the verified peer itself is the only honest answer left.
+        let peer = peer?;
+        let xff = x_forwarded_for_chain(request)
+            .and_then(|addrs| self.anchored_client(&addrs, Some(peer)));
+        let forwarded =
+            forwarded_chain(request).and_then(|addrs| self.anchored_client(&addrs, Some(peer)));
+        match (forwarded, xff) {
+            (Some(forwarded), Some(xff)) if forwarded == xff => Some(forwarded),
+            (Some(forwarded), None) => Some(forwarded),
+            (None, Some(xff)) => Some(xff),
+            _ => Some(peer),
         }
-        forwarded_chain(request)
-            .and_then(|addrs| self.anchored_client(&addrs, peer))
-            .or_else(|| {
-                x_forwarded_for_chain(request).and_then(|addrs| self.anchored_client(&addrs, peer))
-            })
     }
 
     /// The client from a recorded chain — but only when a recorded peer exists. With no
