@@ -68,8 +68,10 @@ pub trait SessionStore: Send + Sync + 'static {
         ttl: Duration,
     ) -> BoxFuture<'a, Result<(), SessionError>>;
 
-    /// Drop `id` entirely.
-    fn delete<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), SessionError>>;
+    /// Drop `id` and mark it dead for `ttl` — a tombstone. A request still holding a stale
+    /// view cannot recreate the id through `save` while the marker lives: stores that can
+    /// check it refuse the write. Once it expires, an id coming back is a new session.
+    fn delete<'a>(&'a self, id: &'a str, ttl: Duration) -> BoxFuture<'a, Result<(), SessionError>>;
 
     /// Refresh `id`'s idle expiry without rewriting it. `expected` is the data this request
     /// loaded — a store that slides a TTL only by rewriting must check the record still holds
@@ -97,6 +99,20 @@ fn store_key(id: &str) -> String {
     let digest = sha2::Sha256::digest(id.as_bytes());
     let mut key = String::with_capacity(KEY_PREFIX.len() + digest.len() * 2);
     key.push_str(KEY_PREFIX);
+    for byte in digest {
+        use core::fmt::Write;
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+/// The tombstone left by `delete` — `sess:tomb:<sha256(id)>`. While it lives a `save` on
+/// the same id is refused: a request that loaded before a `destroy` cannot write the
+/// session back into existence.
+fn tomb_key(id: &str) -> String {
+    let digest = sha2::Sha256::digest(id.as_bytes());
+    let mut key = String::with_capacity(10 + digest.len() * 2);
+    key.push_str("sess:tomb:");
     for byte in digest {
         use core::fmt::Write;
         let _ = write!(key, "{byte:02x}");
@@ -600,7 +616,7 @@ impl SessionsLayer {
         match pending {
             Pending::Destroyed => {
                 if let Some(loaded_id) = loaded_id {
-                    store.delete(&loaded_id).await?;
+                    store.delete(&loaded_id, self.ttl).await?;
                 }
                 let mut cookie = Cookie::new(self.cookie_name, "");
                 cookie.make_removal();
@@ -626,7 +642,7 @@ impl SessionsLayer {
                 } else {
                     store.save(&id, &data, self.ttl).await?;
                     if let Some(loaded_id) = loaded_id.filter(|old| *old != id) {
-                        store.delete(&loaded_id).await?;
+                        store.delete(&loaded_id, self.ttl).await?;
                     }
                     let mut cookie = Cookie::new(self.cookie_name, id.clone());
                     set_session_cookie_flags(&mut cookie, self.ttl, keys.secure());
@@ -851,6 +867,15 @@ impl fmt::Debug for KvSessionStore {
 impl SessionStore for KvSessionStore {
     fn load<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<SessionData>, SessionError>> {
         Box::pin(async move {
+            if self
+                .kv
+                .get(&tomb_key(id))
+                .await
+                .map_err(SessionError::store)?
+                .is_some()
+            {
+                return Ok(None);
+            }
             self.kv
                 .get_json::<SessionData>(&store_key(id))
                 .await
@@ -865,6 +890,17 @@ impl SessionStore for KvSessionStore {
         ttl: Duration,
     ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
+            // A tombstoned id stays dead — the stale request that wants to save it lost a
+            // race with the destroy, and its write must not win back the record.
+            if self
+                .kv
+                .get(&tomb_key(id))
+                .await
+                .map_err(SessionError::store)?
+                .is_some()
+            {
+                return Ok(());
+            }
             let bytes = serde_json::to_vec(data).map_err(|e| SessionError::encode("session", e))?;
             self.kv
                 .put_with_ttl(&store_key(id), &bytes, ttl)
@@ -873,8 +909,12 @@ impl SessionStore for KvSessionStore {
         })
     }
 
-    fn delete<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn delete<'a>(&'a self, id: &'a str, ttl: Duration) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
+            self.kv
+                .put_with_ttl(&tomb_key(id), b"1", ttl)
+                .await
+                .map_err(SessionError::store)?;
             self.kv
                 .delete(&store_key(id))
                 .await
@@ -933,7 +973,11 @@ impl SessionStore for CookieSessionStore {
         Box::pin(async { Ok(()) })
     }
 
-    fn delete<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn delete<'a>(
+        &'a self,
+        _id: &'a str,
+        _ttl: Duration,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -976,7 +1020,15 @@ impl SessionStore for MemorySessionStore {
         Box::pin(async move {
             let now = now_ms();
             let key = store_key(id);
+            let tomb = tomb_key(id);
             let mut entries = self.entries.lock().expect("memory store");
+            if entries
+                .get(&tomb)
+                .is_some_and(|(expires, _)| *expires > now)
+            {
+                drop(entries);
+                return Ok(None);
+            }
             match entries.get(&key) {
                 Some((expires, _)) if *expires <= now => {
                     entries.remove(&key);
@@ -1006,6 +1058,14 @@ impl SessionStore for MemorySessionStore {
             let now = now_ms();
             let expires = ttl.as_secs_f64().mul_add(1000.0, now);
             let mut entries = self.entries.lock().expect("memory store");
+            // A tombstoned id stays dead — a stale request's save cannot win back what
+            // destroy removed.
+            if entries
+                .get(&tomb_key(id))
+                .is_some_and(|(expires, _)| *expires > now)
+            {
+                return Ok(());
+            }
             entries.insert(store_key(id), (expires, data.clone()));
             if entries.len() > MAX_MEMORY_SESSIONS {
                 entries.retain(|_, (expires, _)| *expires > now);
@@ -1028,12 +1088,12 @@ impl SessionStore for MemorySessionStore {
         })
     }
 
-    fn delete<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn delete<'a>(&'a self, id: &'a str, ttl: Duration) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
-            self.entries
-                .lock()
-                .expect("memory store")
-                .remove(&store_key(id));
+            let mut entries = self.entries.lock().expect("memory store");
+            entries.remove(&store_key(id));
+            let tombstone = ttl.as_secs_f64().mul_add(1000.0, now_ms());
+            entries.insert(tomb_key(id), (tombstone, SessionData::new()));
             Ok(())
         })
     }
