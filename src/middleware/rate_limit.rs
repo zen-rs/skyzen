@@ -351,7 +351,7 @@ impl RateLimitStore for MemoryStore {
             let now = now_ms();
             let index = now / window_ms;
             let bucket = format!("rl:{key}:{index}");
-            let hit = {
+            let (count, reset) = {
                 let mut buckets = self
                     .buckets
                     .lock()
@@ -361,10 +361,11 @@ impl RateLimitStore for MemoryStore {
                 }
                 if buckets.len() > MAX_MEMORY_BUCKETS && !buckets.contains_key(&bucket) {
                     // The key space outran the sweep — evicting a live bucket would hand the
-                    // churn an easy reset of someone's real quota. Refuse the never-counted
-                    // key instead: existing buckets keep their counters, and whether this
-                    // request fails open or closed stays the caller's policy decision.
-                    None
+                    // churn an easy reset of someone's real quota, and an error would fail
+                    // open by default and admit the key uncounted. Count the request against
+                    // a spent bucket instead: the limiter answers 429, existing counters
+                    // keep their counts, and the map stays bounded.
+                    (u64::MAX, (index + 1) * window_ms)
                 } else {
                     let entry = buckets
                         .entry(bucket)
@@ -373,22 +374,13 @@ impl RateLimitStore for MemoryStore {
                         *entry = (0, (index + 1) * window_ms);
                     }
                     entry.0 += 1;
-                    Some((entry.0, entry.1))
+                    (entry.0, entry.1)
                 }
             };
-            hit.map_or_else(
-                || {
-                    Err(HitError::Backend(Error::msg(
-                        "rate limit store at capacity",
-                    )))
-                },
-                |(count, reset)| {
-                    Ok(Hit {
-                        count,
-                        retry_after: (reset - now) / 1000,
-                    })
-                },
-            )
+            Ok(Hit {
+                count,
+                retry_after: (reset - now) / 1000,
+            })
         }))
     }
 }
