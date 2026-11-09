@@ -15,8 +15,9 @@
 //! not take the service down itself) — `.fail_closed()` rejects instead, for endpoints whose
 //! abuse risk outweighs an outage.
 //!
-//! The Cloudflare caveat: Workers KV has no atomic increment, so `kv` there counts racy —
-//! honest for a soft limit, not for a hard quota. Reach for a Durable Object counter when
+//! The Cloudflare caveat: Workers KV has no atomic increment-with-deadline, so `kv` there
+//! reports the capability gap and every request is unavailable — it does not degrade into
+//! a racy soft limiter. Reach for a Durable Object counter when
 //! exactness matters.
 
 use core::{fmt, future::Future};
@@ -117,9 +118,10 @@ impl RateLimit {
     /// typed wrapper `import_config!` generates, resolved from the request extensions so the
     /// same code runs native, Lambda and Workers.
     ///
-    /// Only KV backends with an atomic `increment` count honestly (Redis, `DynamoDB`, Cosmos,
-    /// the in-memory mock). Cloudflare KV lacks one — the counter races under concurrency,
-    /// which suits a soft limit but not a hard quota.
+    /// Only KV backends with an atomic counter-with-deadline count honestly (Redis,
+    /// `DynamoDB`, Cosmos, the in-memory mock). Cloudflare KV has none, so it reports
+    /// the capability gap and every request is unavailable — use [`RateLimit::durable`]
+    /// inside a Durable Object instead of tolerating a racy counter.
     pub fn kv<S>(limit: u64, window: Duration) -> Self
     where
         S: Extractor + core::ops::Deref<Target = Kv>,
