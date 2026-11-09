@@ -557,7 +557,14 @@ impl RateLimitStore for DurableKvRateStore {
                     }
                 },
             };
-            let count = count + 1;
+            // A counter only ever grows — u64::MAX cannot be the next value, so an
+            // overflow is corrupted state that fails closed rather than wrapping to zero
+            // and reading as a fresh bucket.
+            let Some(count) = count.checked_add(1) else {
+                return Err(HitError::Unsupported(Error::msg(format!(
+                    "rate-limit record under {bucket:?} cannot grow past u64::MAX"
+                ))));
+            };
             self.kv
                 .put(&bucket, format!("{count}:{reset}").as_bytes())
                 .await
