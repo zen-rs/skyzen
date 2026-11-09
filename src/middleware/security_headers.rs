@@ -12,6 +12,8 @@ use skyzen_core::{
     Error,
 };
 
+use super::error_handling::HandlesErrors;
+
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
 const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
@@ -179,7 +181,15 @@ impl Middleware for SecurityHeaders {
             request
                 .extensions_mut()
                 .insert(DeferredHeaders(headers.clone()));
-            let mut response = next.run(request).await?;
+            let mut response = match next.run(request).await {
+                Ok(response) => response,
+                // An error path that is handled somewhere stamps the deferred set itself;
+                // an unhandled one materializes here so the response never goes out bare.
+                Err(error) if request.extensions().get::<HandlesErrors>().is_some() => {
+                    return Err(error);
+                }
+                Err(error) => skyzen_core::error_response(error.into_boxed_http_error().as_ref()),
+            };
             for (name, value) in headers {
                 response
                     .headers_mut()
