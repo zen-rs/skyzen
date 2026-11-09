@@ -24,7 +24,7 @@ use crate::{
         ProviderPlan, RunMode, SecretAction, Step,
     },
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eventbridge::EventBridgeSchedules;
 use lambda_env::{LambdaEnvironment, LambdaEnvironmentNames};
 use skyzen_manifest::{AwsSection, Manifest};
@@ -60,6 +60,17 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
         // A deploy always builds optimized first: `cargo lambda deploy` uploads whatever is in
         // `target/lambda`, so deploying without building would ship the previous build.
         Action::Deploy { .. } => {
+            // A cron the translation cannot express fails here — before the build, before
+            // `cargo lambda` uploads anything — rather than after the live function is
+            // already updated.
+            for entry in &manifest.data().schedule {
+                eventbridge::aws_cron_expression(entry.cron.as_str()).with_context(|| {
+                    format!(
+                        "[[schedule]] `{}` cannot be expressed as an EventBridge cron",
+                        entry.name
+                    )
+                })?;
+            }
             let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
             child_env = prepared.child_env;
             let mut steps = vec![
@@ -127,8 +138,11 @@ fn secret_step(
     config: &AwsSection,
     function: String,
 ) -> Result<Step> {
-    let env = prepare_child_environment(manifest, VariableKind::ALL)
-        .map(|prepared| prepared.child_env)
+    // `.env` credentials ride `child_env`; resolving every declared variable is *not* part of
+    // that — the secret being set is usually the one that is missing, and `unwrap_or_default`
+    // would discard the credentials along with the failure.
+    let env = crate::environment::Environment::load(manifest.root_dir())
+        .map(|loaded| loaded.child_overrides())
         .unwrap_or_default();
     let delivery = match action {
         SecretAction::Set { name, value } => Delivery::one(name.as_str(), value),

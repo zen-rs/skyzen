@@ -481,6 +481,16 @@ pub enum ScheduleError {
         /// The unmatched override name.
         name: String,
     },
+    /// Two `[azure.schedule.<name>]` tables differ only in case, and override lookup is
+    /// case-insensitive — one of them could never take effect.
+    #[error(
+        "[azure.schedule] declares `{name}` twice, once in each case; overrides match \
+         [[schedule]] names case-insensitively, so only one of the two tables can ever apply"
+    )]
+    DuplicateOverride {
+        /// The duplicated name.
+        name: String,
+    },
 }
 
 impl SkyzenManifest {
@@ -542,6 +552,15 @@ impl SkyzenManifest {
                 .find(|name| !claimed_names.contains(&name.to_ascii_lowercase()))
             {
                 return Err(ScheduleError::UnknownOverride { name: name.clone() });
+            }
+            // Overrides match names case-insensitively, so `Tick` and `tick` would both match
+            // the same schedule — and whichever one the map order surfaced would win with no
+            // sign the other was ever read.
+            let mut claimed_overrides = std::collections::BTreeSet::new();
+            for name in azure.schedule.keys() {
+                if !claimed_overrides.insert(name.to_ascii_lowercase()) {
+                    return Err(ScheduleError::DuplicateOverride { name: name.clone() });
+                }
             }
         }
         Ok(())

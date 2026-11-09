@@ -63,7 +63,10 @@ impl IntoScheduledOutcome for () {
 
 impl<E> IntoScheduledOutcome for Result<(), E>
 where
-    E: core::error::Error + Send + Sync + 'static,
+    // `Into<BoxError>` is the bound every error type meets — `std::error::Error`
+    // implementations through the blanket `From`, and `anyhow::Error` through its own
+    // conversion, which `std::error::Error` deliberately does not cover.
+    E: Into<BoxError>,
 {
     fn into_scheduled_outcome(self) -> Result<(), BoxError> {
         self.map_err(Into::into)

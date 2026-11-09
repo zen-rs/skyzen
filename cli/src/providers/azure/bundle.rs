@@ -37,7 +37,7 @@ pub fn render(
     let mut files = vec![
         GeneratedFile {
             path: bundle_dir.join("host.json"),
-            contents: FileContents::Public(to_json(&HostJson::new(config, binary))?),
+            contents: FileContents::Public(to_json(&HostJson::new(config, schedules, binary))?),
         },
         GeneratedFile {
             path: bundle_dir.join("local.settings.json"),
@@ -157,16 +157,23 @@ struct HostJson<'a> {
 }
 
 impl<'a> HostJson<'a> {
-    fn new(config: &AzureSection, binary: &'a str) -> Self {
+    fn new(config: &AzureSection, schedules: &[ScheduleEntry], binary: &'a str) -> Self {
         Self {
             version: HOST_VERSION,
             custom_handler: CustomHandler {
                 description: HandlerDescription {
                     default_executable_path: binary,
                 },
-                // Exactly one of the two forwarding keys, named by the manifest: the host ignores
-                // the one it is not given, and setting both would leave which wins to the host.
-                forwarding: BTreeMap::from([(config.http_mode.host_json_key(), true)]),
+                // Exactly one of the two forwarding keys, named by the manifest — but only when
+                // no trigger functions exist. Forwarding delivers the client's *raw* request to
+                // `/{function}`, indistinguishable from a trigger invocation, so with any
+                // trigger present the host must wrap every request in `Data.{binding}` —
+                // `req` for HTTP — where a client body can never reach the top level.
+                forwarding: if config.queue_triggers.is_empty() && schedules.is_empty() {
+                    BTreeMap::from([(config.http_mode.host_json_key(), true)])
+                } else {
+                    BTreeMap::new()
+                },
             },
             extension_bundle: ExtensionBundle {
                 id: EXTENSION_BUNDLE_ID,
@@ -194,7 +201,9 @@ impl<'a> HostJson<'a> {
 #[derive(Debug, Serialize)]
 struct CustomHandler<'a> {
     description: HandlerDescription<'a>,
-    /// `enableForwardingHttpRequest` or `enableProxyingHttpRequest`, whichever the manifest asked
+    /// `enableForwardingHttpRequest` or `enableProxyingHttpRequest`, whichever the manifest
+    /// asked for — omitted when trigger functions exist, so the host wraps HTTP requests in
+    /// the `req` binding and a crafted body can never reach `Data.timer` or `Data.message`.
     /// for. A map because the *key* is the choice.
     #[serde(flatten)]
     forwarding: BTreeMap<&'static str, bool>,

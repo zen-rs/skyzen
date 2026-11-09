@@ -530,7 +530,9 @@ fn event_template(cron: &str) -> String {
 ///
 /// [`anyhow::Error`] when the day-of-month and day-of-week fields are both constrained, or when
 /// a field does not map onto AWS's grammar.
-fn aws_cron_expression(cron: &str) -> Result<String> {
+/// `pub(super)` so `prepare` can reject an expression `EventBridge` cannot take before a
+/// deploy step uploads the Lambda and only then discovers it.
+pub(super) fn aws_cron_expression(cron: &str) -> Result<String> {
     let fields: Vec<&str> = cron.split_whitespace().collect();
     let [minute, hour, dom, month, dow] = fields
         .try_into()

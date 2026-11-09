@@ -306,6 +306,58 @@ impl<E, C, S> FunctionsHost<E, C, S> {
     }
 }
 
+/// Rebuild the HTTP request the host wrapped in its invocation envelope.
+///
+/// With forwarding off, the host POSTs `{"Data":{"req":{...}}}` to the catch-all function and
+/// the envelope — the whole of `Data` — is host-built, so nothing a client sends can ever
+/// surface there. `req` carries `method`, `url`, `headers` and `body`. A body that is not an
+/// envelope means this handler was reached directly — the forwarding mode or a developer on
+/// the host's port — and the request passes through untouched.
+async fn forwarded_request(request: &mut Request) -> Option<Request> {
+    if request.method() != Method::POST {
+        return None;
+    }
+    let body = request.body_mut().take().ok()?.into_bytes().await.ok()?;
+    let req = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()?
+        .get("Data")?
+        .get("req")?
+        .clone();
+
+    let mut forwarded = Request::new(Body::from(
+        req.get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec(),
+    ));
+    *forwarded.method_mut() = req
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|method| Method::from_bytes(method.as_bytes()).ok())
+        .unwrap_or(Method::GET);
+    if let Some(url) = req.get("url").and_then(serde_json::Value::as_str) {
+        // The URL is absolute; `Uri` keeps its path and query, which is all routing reads.
+        if let Ok(uri) = url.parse() {
+            *forwarded.uri_mut() = uri;
+        }
+    }
+    if let Some(headers) = req.get("headers").and_then(serde_json::Value::as_object) {
+        for (name, value) in headers {
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            if let (Ok(name), Ok(value)) = (
+                http_kit::header::HeaderName::from_bytes(name.as_bytes()),
+                http_kit::header::HeaderValue::from_str(value),
+            ) {
+                forwarded.headers_mut().insert(name, value);
+            }
+        }
+    }
+    Some(forwarded)
+}
+
 /// Whether `body` is a forwarded HTTP request rather than a trigger invocation.
 ///
 /// The host wraps every forwarded request under `Data.req`; the trigger's invocation instead
@@ -344,15 +396,20 @@ where
 
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let Some(trigger) = self.trigger_for(request) else {
+            // Not a trigger path — with no forwarding configured the host delivers every HTTP
+            // request to the catch-all function wrapped in its invocation envelope, the client
+            // request nested under `Data.req`. Unwrap that back into the request it was.
+            if let Some(forwarded) = forwarded_request(request).await {
+                *request = forwarded;
+            }
             return self.endpoint.respond(request).await;
         };
 
-        // A path match alone cannot decide what this POST is: the HTTP function forwards
-        // arbitrary client requests with their path intact, so `POST /tick` from the outside
-        // lands here too. The boundary the host guarantees is the envelope — its invocations
-        // carry the binding under `Data` (`timer`, `message`), while a forwarded request wraps
-        // the client body under `Data.req` and can never put a top-level binding there. Only
-        // an envelope-shaped body is an invocation; anything else is the router's to answer.
+        // A path match alone cannot decide what this POST is when the host forwards raw HTTP:
+        // `POST /tick` from the outside lands here too, and its body is whatever the client
+        // sent. The envelope is the boundary — a real invocation carries the trigger's own
+        // binding under `Data`, and a client can only ever land inside `Data.req`, never at
+        // the top level. Anything shaped like neither is the router's to answer.
         let Ok(body) = request.body_mut().take() else {
             return self.endpoint.respond(request).await;
         };
