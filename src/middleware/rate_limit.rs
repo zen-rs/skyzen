@@ -401,9 +401,15 @@ impl RateLimitStore for KvStore {
                 // least one — a stored negative corrupted to zero or below is not a fresh
                 // bucket, and counting it as one hands the key a free quota. Re-arming the
                 // poison keeps it non-positive: a corrupt -1 would otherwise climb through
-                // 0 into a fresh-looking 1 on the very next request.
+                // 0 into a fresh-looking 1 on the very next request. The swap is
+                // conditional — it only poisons the value we actually saw, so a racing
+                // increment is never overwritten — and it carries the record's deadline
+                // with it instead of stripping the TTL the way a plain write would.
                 Ok(count) if count <= 0 => {
-                    let _ = self.kv.put(&bucket, b"-1").await;
+                    let _ = self
+                        .kv
+                        .compare_and_swap(&bucket, Some(count.to_string().as_bytes()), b"-1")
+                        .await;
                     return Err(HitError::Unsupported(Error::msg(format!(
                         "rate-limit counter under {bucket:?} is not positive"
                     ))));
