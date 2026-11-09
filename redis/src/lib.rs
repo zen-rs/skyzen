@@ -45,6 +45,9 @@ const URL_ENV: &str = "REDIS_URL";
 /// The compare-and-swap script, kept in its own file so the Lua stays readable and reviewable.
 const COMPARE_AND_SWAP: &str = include_str!("compare_and_swap.lua");
 
+/// The `INCRBY` + `PEXPIRE` pair [`KeyValueStore::increment_with_ttl`] runs as one script.
+const INCREMENT_WITH_TTL: &str = include_str!("increment_with_ttl.lua");
+
 /// The [`COMPARE_AND_SWAP`] flag meaning "the key must hold the expected bytes".
 const EXPECTS_VALUE: &str = "1";
 
@@ -89,6 +92,8 @@ pub struct Redis {
     /// Shared so cloning a `Redis` per request does not re-hash the script body each time; the
     /// script is immutable, so an `Arc` is all the sharing it needs.
     compare_and_swap: Arc<Script>,
+    /// Same sharing story as [`Self::compare_and_swap`].
+    increment_with_ttl: Arc<Script>,
 }
 
 impl Redis {
@@ -137,6 +142,7 @@ impl Redis {
         Self {
             conn,
             compare_and_swap: Arc::new(Script::new(COMPARE_AND_SWAP)),
+            increment_with_ttl: Arc::new(Script::new(INCREMENT_WITH_TTL)),
         }
     }
 }
@@ -331,6 +337,30 @@ impl KeyValueStore for Redis {
     async fn increment(&self, key: &str, delta: i64) -> Result<i64, KvError> {
         let mut conn = self.conn.clone();
         conn.incr(key, delta).await.map_err(counter_error)
+    }
+
+    /// `INCRBY` + `PEXPIRE` as one script — a counter is born carrying its deadline, so a
+    /// transient failure between the two plain commands can never leave a TTL-less record.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::Decode`] when the key holds something that is not a counter, or when the
+    /// result would leave the `i64` range.
+    async fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: core::time::Duration,
+    ) -> Result<i64, KvError> {
+        let millis = expire_millis(ttl)?;
+        let mut conn = self.conn.clone();
+        self.increment_with_ttl
+            .key(key)
+            .arg(delta)
+            .arg(millis)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(counter_error)
     }
 
     /// Re-arm a key's expiry with `PEXPIRE`, at the same millisecond precision as

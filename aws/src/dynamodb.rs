@@ -355,6 +355,58 @@ fn counter_value(stored: Option<&[u8]>) -> Result<i64, KvError> {
         .map_err(|error| KvError::Decode(format!("counter {text:?} is not an integer: {error}")))
 }
 
+impl DynamoKv {
+    /// The CAS loop behind [`increment`](KeyValueStore::increment) and
+    /// [`increment_with_ttl`](KeyValueStore::increment_with_ttl): `ttl` arms the TTL
+    /// attribute only when the item is created — an existing item keeps the deadline it
+    /// already carries.
+    async fn increment_inner(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<core::time::Duration>,
+    ) -> Result<i64, KvError> {
+        for _ in 0..MAX_INCREMENT_ATTEMPTS {
+            let item = self.read_item(key, true, Projection::WholeItem).await?;
+            let stored = item
+                .as_ref()
+                .map(|item| extract_value(item, key))
+                .transpose()?;
+
+            let updated = counter_value(stored.as_deref())?
+                .checked_add(delta)
+                .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
+
+            // A counter born under a caller-supplied TTL carries its deadline from the
+            // first write; one that already existed keeps whatever expiry it has.
+            let expires_at = match (
+                item.as_ref()
+                    .and_then(|item| item_expires_at(item, &self.ttl_attribute)),
+                ttl,
+            ) {
+                (None, Some(ttl)) => {
+                    Some(expires_at_epoch_seconds(Self::now_epoch_seconds()?, ttl)?)
+                }
+                (existing, _) => existing,
+            };
+
+            if self
+                .conditional_put(
+                    key,
+                    stored.as_deref(),
+                    updated.to_string().as_bytes(),
+                    expires_at,
+                )
+                .await?
+            {
+                return Ok(updated);
+            }
+        }
+
+        Err(KvError::Conflict)
+    }
+}
+
 impl KeyValueStore for DynamoKv {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         let Some(item) = self
@@ -437,36 +489,19 @@ impl KeyValueStore for DynamoKv {
     /// `i64`, and [`KvError::Conflict`] if the swap lost its race
     /// [`MAX_INCREMENT_ATTEMPTS`] times running.
     async fn increment(&self, key: &str, delta: i64) -> Result<i64, KvError> {
-        for _ in 0..MAX_INCREMENT_ATTEMPTS {
-            let item = self.read_item(key, true, Projection::WholeItem).await?;
-            let stored = item
-                .as_ref()
-                .map(|item| extract_value(item, key))
-                .transpose()?;
+        self.increment_inner(key, delta, None).await
+    }
 
-            let updated = counter_value(stored.as_deref())?
-                .checked_add(delta)
-                .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
-
-            // A counter that had already expired starts a fresh, unexpiring one.
-            let expires_at = item
-                .as_ref()
-                .and_then(|item| item_expires_at(item, &self.ttl_attribute));
-
-            if self
-                .conditional_put(
-                    key,
-                    stored.as_deref(),
-                    updated.to_string().as_bytes(),
-                    expires_at,
-                )
-                .await?
-            {
-                return Ok(updated);
-            }
-        }
-
-        Err(KvError::Conflict)
+    /// Add `delta` to the counter under `key`, arming the TTL attribute in the same
+    /// `UpdateItem` when the item is created — an existing item keeps the deadline it
+    /// already carries.
+    async fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: core::time::Duration,
+    ) -> Result<i64, KvError> {
+        self.increment_inner(key, delta, Some(ttl)).await
     }
 
     /// Re-arm the expiry of a key that still holds a value, with `UpdateItem`.

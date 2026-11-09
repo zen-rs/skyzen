@@ -387,7 +387,16 @@ impl RateLimitStore for KvStore {
             let now = now_ms();
             let index = now / window_ms;
             let bucket = format!("rl:{key}:{index}");
-            let count = match self.kv.increment(&bucket, 1).await {
+            // The counter is born already carrying its deadline — `increment_with_ttl`
+            // arms the TTL in the same atomic write, so no record can exist without expiry
+            // regardless of what fails afterwards. A backend that cannot do both (a Cosmos
+            // container without TTL enabled, Cloudflare KV without `increment`) answers a
+            // capability error rather than piling counters forever.
+            let count = match self
+                .kv
+                .increment_with_ttl(&bucket, 1, window.saturating_mul(2))
+                .await
+            {
                 // A counter only ever grows by +1, so after an increment it is always at
                 // least one — a stored negative corrupted to zero or below is not a fresh
                 // bucket, and counting it as one hands the key a free quota.
@@ -413,29 +422,6 @@ impl RateLimitStore for KvStore {
                 Err(KvError::Conflict) => u64::MAX,
                 Err(other) => return Err(HitError::Backend(Error::new(other))),
             };
-            // Expire on every hit — the window lives in the key, so the deadline is purely
-            // reclamation: a missed write on one request self-heals on the next, and no
-            // counter can outlive its traffic. A backend that cannot expire at all (a Cosmos
-            // container without TTL enabled) would pile counters forever, so the gap still
-            // surfaces as a capability error rather than a silent write.
-            if let Err(error) = self.kv.expire(&bucket, window.saturating_mul(2)).await {
-                return Err(match error {
-                    error @ (KvError::Unsupported(_)
-                    | KvError::Unauthorized
-                    | KvError::Decode(_)
-                    | KvError::Serialization(_)) => HitError::Unsupported(Error::new(error)),
-                    // The count already counted — a transient reclamation miss must not
-                    // throw away a hit the caller already paid for; the next request's
-                    // expire heals the deadline.
-                    other => {
-                        tracing::warn!("rate-limit bucket expiry deferred: {other}");
-                        return Ok(Hit {
-                            count,
-                            retry_after: ((index + 1) * window_ms).saturating_sub(now) / 1000,
-                        });
-                    }
-                });
-            }
             Ok(Hit {
                 count,
                 retry_after: ((index + 1) * window_ms).saturating_sub(now) / 1000,

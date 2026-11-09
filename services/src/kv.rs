@@ -214,6 +214,29 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
         }
     }
 
+    /// Atomically add `delta` to the counter stored under `key`, arming a fresh `ttl` when
+    /// the key is created, and return the new value.
+    ///
+    /// A counter born already carrying its deadline can never persist without expiry, which
+    /// a plain [`increment`](KeyValueStore::increment) + [`expire`](KeyValueStore::expire)
+    /// cannot promise: a failure between the two leaves a TTL-less record behind forever.
+    /// The default implementation still splits them — documented non-atomic — while backends
+    /// with a native atomic form override it (a Cosmos create carrying the TTL field, Redis
+    /// `INCR` + `PEXPIRE` in one transaction, DynamoDB's `UpdateItem` writing the TTL
+    /// attribute in the same expression).
+    fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: core::time::Duration,
+    ) -> impl Future<Output = Result<i64, KvError>> + Send {
+        async move {
+            let count = self.increment(key, delta).await?;
+            self.expire(key, ttl).await?;
+            Ok(count)
+        }
+    }
+
     /// Set or refresh the time-to-live of a key that already holds a value.
     ///
     /// Returns `false` when no such key exists. This is what sliding-expiration sessions need, and
@@ -285,6 +308,12 @@ service_obj! {
         new: &'a [u8],
     ) -> Result<bool, KvError>;
     async fn increment<'a>(&'a self, key: &'a str, delta: i64) -> Result<i64, KvError>;
+    async fn increment_with_ttl<'a>(
+        &'a self,
+        key: &'a str,
+        delta: i64,
+        ttl: core::time::Duration,
+    ) -> Result<i64, KvError>;
     async fn expire<'a>(
         &'a self,
         key: &'a str,
@@ -399,6 +428,23 @@ impl Kv {
     /// if the stored value is not an integer, or another [`KvError`] if the backend fails.
     pub async fn increment(&self, key: &str, delta: i64) -> Result<i64, KvError> {
         self.0.increment(key, delta).await
+    }
+
+    /// Atomically add `delta` to the counter stored under `key`, arming a fresh `ttl` when
+    /// the key is created, and return the new value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvError::Unsupported`] if the backend has no atomic counter, [`KvError::Decode`]
+    /// if the stored value is not an integer or overflows an `i64`, or another [`KvError`] if
+    /// the backend fails.
+    pub async fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: core::time::Duration,
+    ) -> Result<i64, KvError> {
+        self.0.increment_with_ttl(key, delta, ttl).await
     }
 
     /// Set or refresh the time-to-live of a key that already holds a value.

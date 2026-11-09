@@ -445,6 +445,51 @@ impl CosmosKv {
         }
     }
 
+    /// The CAS loop behind [`increment`](KeyValueStore::increment) and
+    /// [`increment_with_ttl`](KeyValueStore::increment_with_ttl): `ttl_secs` arms the
+    /// document's `ttl` only when the counter is created — an existing document keeps the
+    /// deadline it already carries through `replace_if_unchanged`.
+    async fn increment_inner(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl_secs: Option<i32>,
+    ) -> Result<i64, KvError> {
+        for _ in 0..INCREMENT_ATTEMPTS {
+            let applied = match self.read_for_swap(key).await? {
+                None => {
+                    // An absent key counts as zero, and creating it is what makes the first
+                    // increment safe against a second caller doing the same — and what lets
+                    // a counter be born already carrying its deadline.
+                    let next = delta;
+                    self.create(key, next.to_string().as_bytes(), ttl_secs)
+                        .await?
+                        .then_some(next)
+                }
+                Some((stored, etag, ttl)) => {
+                    let next =
+                        counter_value(key, &stored)?
+                            .checked_add(delta)
+                            .ok_or_else(|| {
+                                KvError::Decode(format!(
+                            "incrementing the counter under {key:?} by {delta} overflows a 64-bit \
+                             integer"
+                        ))
+                            })?;
+                    self.replace_if_unchanged(key, next.to_string().as_bytes(), &etag, ttl)
+                        .await?
+                        .then_some(next)
+                }
+            };
+
+            if let Some(next) = applied {
+                return Ok(next);
+            }
+        }
+
+        Err(KvError::Conflict)
+    }
+
     /// Store a value, with or without a per-document time-to-live.
     async fn upsert(&self, key: &str, value: &[u8], ttl: Option<i32>) -> Result<(), KvError> {
         self.container
@@ -636,38 +681,20 @@ impl KeyValueStore for CosmosKv {
     /// guarded read-modify-write: a lost race is retried, and a key contended past
     /// [`INCREMENT_ATTEMPTS`] rounds reports [`KvError::Conflict`] rather than spinning.
     async fn increment(&self, key: &str, delta: i64) -> Result<i64, KvError> {
-        for _ in 0..INCREMENT_ATTEMPTS {
-            let applied = match self.read_for_swap(key).await? {
-                None => {
-                    // An absent key counts as zero, and creating it is what makes the first
-                    // increment safe against a second caller doing the same.
-                    let next = delta;
-                    self.create(key, next.to_string().as_bytes(), None)
-                        .await?
-                        .then_some(next)
-                }
-                Some((stored, etag, ttl)) => {
-                    let next =
-                        counter_value(key, &stored)?
-                            .checked_add(delta)
-                            .ok_or_else(|| {
-                                KvError::Decode(format!(
-                            "incrementing the counter under {key:?} by {delta} overflows a 64-bit \
-                             integer"
-                        ))
-                            })?;
-                    self.replace_if_unchanged(key, next.to_string().as_bytes(), &etag, ttl)
-                        .await?
-                        .then_some(next)
-                }
-            };
+        self.increment_inner(key, delta, None).await
+    }
 
-            if let Some(next) = applied {
-                return Ok(next);
-            }
-        }
-
-        Err(KvError::Conflict)
+    /// Add `delta` to the decimal counter stored under `key`, arming the document's `ttl`
+    /// field when the counter is created — an existing document keeps the deadline it
+    /// already carries through `replace_if_unchanged`.
+    async fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Duration,
+    ) -> Result<i64, KvError> {
+        self.increment_inner(key, delta, Some(ttl_seconds(ttl)?))
+            .await
     }
 
     /// Set the document's `ttl` field, leaving its value alone.

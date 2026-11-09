@@ -254,6 +254,36 @@ impl KeyValueStore for InMemoryKv {
         }))
     }
 
+    fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Duration,
+    ) -> impl Future<Output = Result<i64, KvError>> + Send {
+        ready(self.take_injected_failure().and_then(|()| {
+            let expires_at = self.expiry_for(ttl);
+            let mut data = self.write_purged();
+            let updated = counter_value(data.get(key))?
+                .checked_add(delta)
+                .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
+            // A counter born under the limiter carries its deadline from the first write;
+            // one that already existed keeps whatever expiry it has.
+            let expires_at = data
+                .get(key)
+                .and_then(|entry| entry.expires_at)
+                .or(expires_at);
+            data.insert(
+                key.to_owned(),
+                Entry {
+                    value: updated.to_string().into_bytes(),
+                    expires_at,
+                },
+            );
+            drop(data);
+            Ok(updated)
+        }))
+    }
+
     fn expire(
         &self,
         key: &str,
