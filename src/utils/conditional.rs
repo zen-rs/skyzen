@@ -54,9 +54,14 @@ impl EntityTag {
     }
 }
 
-/// `ETag` opaque values cannot carry `"` or `\`; drop them so construction never fails.
+/// `ETag` opaque values are `etagc` — visible ASCII plus `obs-text`, no `"` (the delimiter)
+/// and no `\` (the escape). Anything else — control characters included — would produce a
+/// tag the parser rejects; drop them so construction never panics on hostile input.
 fn sanitize(value: &str) -> String {
-    value.chars().filter(|c| *c != '"' && *c != '\\').collect()
+    value
+        .chars()
+        .filter(|c| matches!(c, '!' | '\u{23}'..='\u{7e}' | '\u{80}'..='\u{ff}') && *c != '\\')
+        .collect()
 }
 
 /// Would a `GET`/`HEAD` reuse the client's cached copy? — `true` means emit `304`.
