@@ -109,6 +109,7 @@ bytes = "1.11"
 # `Date::now` + WebCrypto instead of `getrandom` (the `uuid` entry under the wasm32
 # target adds it).
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
+ipnet = "2"
 mime_guess = "2.0"
 include_dir = "0.7"
 skyzen-macros.workspace = true

@@ -85,8 +85,8 @@ use aws_lambda_events::sqs::SqsEvent;
 use futures_util::FutureExt as _;
 use http_kit::Endpoint;
 use lambda_http::{
-    request::LambdaRequest, Adapter, LambdaEvent, Request as LambdaHttpRequest, RequestExt,
-    Response, Service,
+    request::{LambdaRequest, RequestContext},
+    Adapter, LambdaEvent, Request as LambdaHttpRequest, RequestExt, Response, Service,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -307,6 +307,20 @@ fn settle(
     response
 }
 
+/// The client address the platform itself observed — `requestContext.http.sourceIp` on HTTP
+/// APIs, `identity.sourceIp` on REST APIs. Other event sources (ALB, WebSocket, VPC Lattice)
+/// record no equivalent; their requests arrive peer-less and forwarding headers stay
+/// unverifiable there, by design.
+fn lambda_source_ip(request: &LambdaHttpRequest) -> Option<std::net::IpAddr> {
+    let context = request.extensions().get::<RequestContext>()?;
+    let raw = match context {
+        RequestContext::ApiGatewayV2(context) => context.http.source_ip.as_deref(),
+        RequestContext::ApiGatewayV1(context) => context.identity.source_ip.as_deref(),
+        _ => None,
+    };
+    raw.and_then(|raw| raw.parse().ok())
+}
+
 /// The inner service [`lambda_http`]'s adapter drives: a normalized request in, a response out.
 ///
 /// Its error type is [`Infallible`](core::convert::Infallible) by construction — an endpoint error
@@ -329,13 +343,21 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: LambdaHttpRequest) -> Self::Future {
+    fn call(&mut self, mut request: LambdaHttpRequest) -> Self::Future {
         let mut endpoint = self.endpoint.clone();
 
         Box::pin(async move {
             let request_id = request
                 .lambda_context_ref()
                 .map(|ctx| ctx.request_id.clone());
+            // API Gateway's recorded sourceIp is the platform-verified connection peer — the
+            // same authority PeerAddr carries on a socket server, so ClientIp can answer on
+            // Lambda instead of finding no peer and no trusted header at all.
+            if let Some(ip) = lambda_source_ip(&request) {
+                request
+                    .extensions_mut()
+                    .insert(skyzen_core::PeerAddr(std::net::SocketAddr::new(ip, 0)));
+            }
             let mut request: http_kit::Request = request.map(convert::into_skyzen_body);
             if let Some(request_id) = request_id {
                 request

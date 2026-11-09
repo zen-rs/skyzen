@@ -14,7 +14,7 @@ mod typed_header;
 pub use typed_header::{TypedHeader, TypedHeaderError};
 
 pub mod client_ip;
-pub use client_ip::{ClientIp, PeerAddr};
+pub use client_ip::{ClientIp, PeerAddr, TrustedProxies};
 
 #[cfg(feature = "auth")]
 pub mod auth;
