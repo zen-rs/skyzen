@@ -154,7 +154,7 @@ pub use param::{MissingParam, Params};
 
 // Export router types
 mod router;
-pub use router::{build, AllowedMethods, NotFound, RouteBuildError, Router};
+pub use router::{build, AllowedMethods, MatchedPath, NotFound, RouteBuildError, Router};
 
 mod nest;
 pub use nest::{NestedPathError, NestedRouter};

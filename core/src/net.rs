@@ -72,6 +72,23 @@ impl Extractor for PeerAddr {
     }
 }
 
+/// The identifier the hosting platform assigned to this invocation.
+///
+/// Serverless adapters insert it from the invocation context before the endpoint runs —
+/// `skyzen-lambda` copies `lambda_runtime::Context::request_id` — so a request-id layer can
+/// reuse the platform's own identifier instead of minting one no trace will ever join back
+/// to the invocation. Defining the type here lets any adapter populate it without depending
+/// on the top-level `skyzen` crate.
+#[derive(Debug, Clone)]
+pub struct PlatformRequestId(pub alloc::string::String);
+
+impl core::ops::Deref for PlatformRequestId {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,

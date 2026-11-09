@@ -52,6 +52,9 @@ struct MethodTable {
     entries: Vec<(Method, App)>,
     /// Handler registered with `.any`, answering whatever the exact entries do not.
     any: Option<App>,
+    /// The path template this table was registered under, such as `/users/{id}` — what
+    /// [`MatchedPath`] reports. Filled when the table is inserted into the matcher.
+    template: String,
 }
 
 /// Chain terminal that serves a request from a freshly built endpoint.
@@ -132,6 +135,68 @@ http_error!(
     "Route not found."
 );
 
+/// The route template that produced the matched handler, such as `/users/{id}`.
+///
+/// The router inserts it into the request extensions beside [`Params`] when a route matches;
+/// [`crate::middleware::Trace`] reads it back for the low-cardinality `http.route` span field,
+/// and handlers can extract it directly. A mounted router joins it with the mount prefix, so the
+/// template is always written from the outermost mount point. Requests that match nothing carry
+/// no `MatchedPath`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedPath(pub String);
+
+impl MatchedPath {
+    /// The template as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for MatchedPath {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl core::ops::Deref for MatchedPath {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl core::borrow::Borrow<str> for MatchedPath {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::convert::AsRef<str> for MatchedPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Extractor for MatchedPath {
+    type Error = std::convert::Infallible;
+    // Reading the template back out of the extensions is a synchronous clone, so the future is
+    // ready on creation rather than an `async` block with nothing to await.
+    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(Ok(request
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_else(|| Self(String::new()))))
+    }
+}
+
+/// The accumulated mount prefix a [`NestedRouter`] leaves for the router it delegates to, so its
+/// [`MatchedPath`] reads as the full template rather than the inner one. Replaced and restored by
+/// each nesting level.
+#[derive(Debug, Clone, Default)]
+pub struct MountPrefix(pub String);
+
 /// The methods registered for the path a `405` was produced for.
 ///
 /// Available to a [`Route::method_not_allowed`](crate::routing::Route::method_not_allowed)
@@ -187,6 +252,7 @@ enum RouteLookup<'app> {
         app: &'app App,
         head_fallback: bool,
         params: Vec<(String, String)>,
+        template: &'app str,
     },
     /// The path matched but no registered method did.
     MethodNotAllowed(Vec<Method>),
@@ -229,6 +295,7 @@ impl Router {
                     .iter()
                     .map(|(key, value)| (key.to_owned(), percent_decode(value)))
                     .collect(),
+                template: &value.template,
             },
         )
     }
@@ -244,8 +311,14 @@ impl Router {
                 app,
                 head_fallback,
                 params,
+                template,
             } => {
                 request.extensions_mut().insert(Params::new(params));
+                let matched = request.extensions().get::<MountPrefix>().map_or_else(
+                    || template.to_owned(),
+                    |prefix| super::join_path(&prefix.0, template),
+                );
+                request.extensions_mut().insert(MatchedPath(matched));
                 let mut response = app.run(request).await?;
                 if head_fallback {
                     *response.body_mut() = Body::empty();
@@ -696,7 +769,10 @@ fn build_method_table(
     global_provisions: &HashSet<std::any::TypeId>,
     routes: &mut Vec<(MethodFilter, String)>,
 ) -> Result<MethodTable, RouteBuildError> {
-    let mut table = MethodTable::default();
+    let mut table = MethodTable {
+        template: path.to_owned(),
+        ..MethodTable::default()
+    };
     let mut seen = HashSet::new();
 
     for endpoint in endpoints {

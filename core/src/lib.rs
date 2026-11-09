@@ -46,7 +46,10 @@ pub use server::Server;
 #[cfg(feature = "std")]
 mod net;
 #[cfg(feature = "std")]
-pub use net::{error_response, log_endpoint_error, panic_message, MissingRemoteAddr, PeerAddr};
+pub use net::{
+    error_response, log_endpoint_error, panic_message, MissingRemoteAddr, PeerAddr,
+    PlatformRequestId,
+};
 #[cfg(feature = "std")]
 mod secret;
 #[cfg(feature = "std")]

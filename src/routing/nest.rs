@@ -7,6 +7,7 @@ use http_kit::uri::PathAndQuery;
 
 use crate::{Endpoint, Request, Response, StatusCode, Uri};
 
+use super::router::MountPrefix;
 use super::Router;
 
 /// Serves a mounted [`Router`], with the mount prefix stripped from the request path.
@@ -59,7 +60,22 @@ impl Endpoint for NestedRouter {
             .ok_or_else(|| Box::new(NestedPathError(original.to_string())) as BoxHttpError)?;
 
         *request.uri_mut() = rewritten;
+        // The inner router's `MatchedPath` templates join onto whatever mounts came before, so it
+        // is told the accumulated prefix for the duration of its dispatch.
+        let joined = request.extensions().get::<MountPrefix>().map_or_else(
+            || self.prefix.to_string(),
+            |outer| crate::routing::join_path(&outer.0, &self.prefix),
+        );
+        let previous = request.extensions_mut().insert(MountPrefix(joined));
         let result = self.router.respond(request).await;
+        match previous {
+            Some(previous) => {
+                request.extensions_mut().insert(previous);
+            }
+            None => {
+                request.extensions_mut().remove::<MountPrefix>();
+            }
+        }
         // Put the path back so an outer layer that inspects the request after the inner router
         // returns still sees the URL the client asked for.
         *request.uri_mut() = original;
