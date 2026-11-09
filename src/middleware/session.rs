@@ -850,19 +850,23 @@ impl SessionStore for KvSessionStore {
 
     fn touch<'a>(&'a self, id: &'a str, ttl: Duration) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
-            self.kv
-                .expire(&store_key(id), ttl)
-                .await
-                .map(|_| ())
-                .or_else(|error| {
-                    // A backend without native expiry (Cloudflare KV) cannot slide a TTL
-                    // without rewriting the record — the session simply keeps the deadline
-                    // its last write set rather than failing the request.
-                    match error {
-                        KvError::Unsupported(_) => Ok(()),
-                        other => Err(SessionError::store(other)),
-                    }
-                })
+            let key = store_key(id);
+            match self.kv.expire(&key, ttl).await {
+                Ok(_) => Ok(()),
+                // A backend without native expiry (Cloudflare KV) slides a deadline only by
+                // rewriting the record — safe here because a clean session's bytes are
+                // unchanged, so the rewrite restores exactly what was read.
+                Err(KvError::Unsupported(_)) => {
+                    let Some(data) = self.kv.get(&key).await.map_err(SessionError::store)? else {
+                        return Ok(());
+                    };
+                    self.kv
+                        .put_with_ttl(&key, &data, ttl)
+                        .await
+                        .map_err(SessionError::store)
+                }
+                Err(other) => Err(SessionError::store(other)),
+            }
         })
     }
 }
