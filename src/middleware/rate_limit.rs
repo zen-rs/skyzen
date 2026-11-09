@@ -488,7 +488,15 @@ impl RateLimitStore for DurableKvRateStore {
 /// An in-process counter for single-binary deploys and tests.
 #[derive(Debug, Default)]
 struct MemoryStore {
-    buckets: Mutex<HashMap<String, (u64, u64)>>,
+    inner: Mutex<MemoryInner>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryInner {
+    buckets: HashMap<String, (u64, u64)>,
+    /// When the last full expiry sweep ran — retained once per window at most, so a
+    /// churned key space past the cap cannot make every request rescan the whole map.
+    last_sweep_ms: u64,
 }
 
 /// The map sweep threshold — past it a `hit` first drops expired buckets so an unbounded
@@ -506,14 +514,18 @@ impl RateLimitStore for MemoryStore {
             let index = now / window_ms;
             let bucket = format!("rl:{key}:{index}");
             let (count, reset) = {
-                let mut buckets = self
-                    .buckets
+                let mut inner = self
+                    .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if buckets.len() > MAX_MEMORY_BUCKETS {
-                    buckets.retain(|_, (_, reset)| *reset > now);
+                if inner.buckets.len() > MAX_MEMORY_BUCKETS
+                    && now.saturating_sub(inner.last_sweep_ms) >= window_ms
+                {
+                    inner.buckets.retain(|_, (_, reset)| *reset > now);
+                    inner.last_sweep_ms = now;
                 }
-                if buckets.len() > MAX_MEMORY_BUCKETS && !buckets.contains_key(&bucket) {
+                if inner.buckets.len() > MAX_MEMORY_BUCKETS && !inner.buckets.contains_key(&bucket)
+                {
                     // The key space outran the sweep — evicting a live bucket would hand the
                     // churn an easy reset of someone's real quota, and an error would fail
                     // open by default and admit the key uncounted. Count the request against
@@ -521,7 +533,8 @@ impl RateLimitStore for MemoryStore {
                     // keep their counts, and the map stays bounded.
                     (u64::MAX, (index + 1) * window_ms)
                 } else {
-                    let entry = buckets
+                    let entry = inner
+                        .buckets
                         .entry(bucket)
                         .or_insert((0, (index + 1) * window_ms));
                     if now >= entry.1 {
