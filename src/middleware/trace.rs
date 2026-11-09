@@ -217,6 +217,21 @@ impl Trace {
 
     /// The span for `request`, with the static fields filled and the dynamic ones reserved.
     fn span(&self, request: &Request, client: Option<&str>) -> Span {
+        // Header names are only known at configuration time, so they cannot be declared as
+        // individual span fields — tracing drops `record` calls for undeclared fields. They
+        // land together in one declared field as `name: value` pairs.
+        let headers = Headers(
+            self.include_headers
+                .iter()
+                .filter_map(|name| {
+                    request
+                        .headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                })
+                .collect(),
+        );
         // The span macro needs a level known at compile time; dispatch the configured one.
         macro_rules! build {
             ($level:expr) => {
@@ -228,31 +243,34 @@ impl Trace {
                     url.query = request.uri().query(),
                     http.route = Empty,
                     http.response.status_code = Empty,
+                    http.request.headers = tracing::field::display(&headers),
                     request_id = Empty,
                     client.address = client,
                 )
             };
         }
-        let span = match self.level {
+        match self.level {
             Level::TRACE => build!(Level::TRACE),
             Level::DEBUG => build!(Level::DEBUG),
             Level::INFO => build!(Level::INFO),
             Level::WARN => build!(Level::WARN),
             Level::ERROR => build!(Level::ERROR),
-        };
-        for name in &self.include_headers {
-            if let Some(value) = request
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-            {
-                span.record(
-                    format!("http.request.header.{}", name.as_str()).as_str(),
-                    value,
-                );
-            }
         }
-        span
+    }
+}
+
+/// The allow-listed request headers, as `name: value` pairs for one span field.
+struct Headers(Vec<(String, String)>);
+
+impl std::fmt::Display for Headers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, (name, value)) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{name}: {value}")?;
+        }
+        Ok(())
     }
 }
 
