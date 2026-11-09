@@ -144,8 +144,18 @@ impl TrustedProxies {
             }
         }
 
-        // Either header may carry the chain — an unanchored `Forwarded` is client-injected
-        // noise and must not shadow an anchored `X-Forwarded-For` the edge actually wrote.
+        // Order is trust-aware: a recorded peer provably appended the rightmost
+        // `X-Forwarded-For` entry, while a `Forwarded` it merely passed through stays
+        // client-written — so with a peer, XFF answers first and `Forwarded` cannot shadow
+        // it. With no peer (serverless) `Forwarded` leads per RFC 7239, and the chain still
+        // has to contain a trusted hop to count.
+        if peer.is_some() {
+            return x_forwarded_for_chain(request)
+                .and_then(|addrs| self.anchored_client(&addrs, peer))
+                .or_else(|| {
+                    forwarded_chain(request).and_then(|addrs| self.anchored_client(&addrs, peer))
+                });
+        }
         forwarded_chain(request)
             .and_then(|addrs| self.anchored_client(&addrs, peer))
             .or_else(|| {
