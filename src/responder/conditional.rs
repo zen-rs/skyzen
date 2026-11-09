@@ -79,11 +79,20 @@ impl<R> Conditional<R> {
 impl<R: Responder> Responder for Conditional<R> {
     type Error = R::Error;
     fn respond_to(self, request: &Request, response: &mut Response) -> Result<(), Self::Error> {
-        if fresh(
-            request.headers(),
-            self.etag.as_ref().map(EntityTag::etag),
-            self.last_modified,
-        ) {
+        // `If-None-Match`/`If-Modified-Since` only negotiate freshness on GET and HEAD —
+        // on unsafe methods they are write preconditions (Preconditions's job, answering
+        // 412), and a 304 here would silently drop the write.
+        let cacheable = matches!(
+            request.method(),
+            &http_kit::Method::GET | &http_kit::Method::HEAD
+        );
+        if cacheable
+            && fresh(
+                request.headers(),
+                self.etag.as_ref().map(EntityTag::etag),
+                self.last_modified,
+            )
+        {
             *response.status_mut() = StatusCode::NOT_MODIFIED;
             self.write_validators(response);
             // `inner` drops here — the body is never built for a 304.
@@ -145,6 +154,26 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers()[ETAG].to_str().unwrap(), "\"1\"");
         assert!(response.into_body().into_bytes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unsafe_method_never_answers_304() {
+        // If-None-Match on POST is a write precondition, not a freshness negotiation —
+        // a 304 here would silently swallow the write.
+        let router = Route::new(("/thing".post(tagged),)).build();
+
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = http_kit::Method::POST;
+        *request.uri_mut() = "/thing".parse().unwrap();
+        request
+            .headers_mut()
+            .insert(IF_NONE_MATCH, "\"1\"".parse().unwrap());
+        let response = router.go(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().into_string().await.unwrap(),
+            "the body"
+        );
     }
 
     async fn update(pre: Preconditions) -> Result<String, skyzen_core::Error> {
