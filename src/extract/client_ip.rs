@@ -154,14 +154,16 @@ impl TrustedProxies {
     }
 
     /// The client from a recorded chain, or `None` when nothing anchors it to trusted
-    /// infrastructure. A recorded peer is the anchor; a serverless host has none, so there the
-    /// chain itself must contain a trusted hop — otherwise every entry is client-supplied and
-    /// honoring it is an IP-spoofing hole.
+    /// infrastructure. Every honored chain must contain a trusted hop — a chain the client
+    /// could have written wholesale is client-supplied noise, and a trusted peer passing
+    /// `Forwarded` through verbatim would otherwise let it shadow the header the edge
+    /// actually appended.
     fn anchored_client(&self, addrs: &[IpAddr], peer: Option<IpAddr>) -> Option<IpAddr> {
-        if peer.is_none() && !addrs.iter().any(|addr| self.trusts(addr)) {
-            return None;
+        if addrs.iter().any(|addr| self.trusts(addr)) {
+            Some(trusted_client(addrs, self, peer))
+        } else {
+            None
         }
-        Some(trusted_client(addrs, self, peer))
     }
 }
 
