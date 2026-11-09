@@ -539,12 +539,10 @@ impl RateLimitStore for DurableKvRateStore {
                 .put(&bucket, format!("{count}:{reset}").as_bytes())
                 .await
                 .map_err(|error| HitError::Backend(Error::new(error)))?;
-            // A window's first hit sweeps the store once — a marker keyed to the window
-            // index keeps it to once per window globally, not once per client key, and dead
-            // records of churned or abandoned keys go out with it.
-            if count == 1 {
-                self.sweep_dead(now, reset, window_ms).await;
-            }
+            // Every hit advances the sweep one page — a marker keyed to the window index
+            // short-circuits once the pass is done, and the cursor keeps pages flowing to
+            // whichever request comes next rather than only the first of a bucket.
+            self.sweep_dead(now, reset, window_ms).await;
             Ok(Hit {
                 count,
                 retry_after: reset.saturating_sub(now) / 1000,
