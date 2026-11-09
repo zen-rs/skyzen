@@ -91,13 +91,6 @@ pub enum MountError {
         /// The name declared twice.
         function: String,
     },
-    /// A trigger's path is already served by a route of the application's own.
-    RouteCollision {
-        /// The function whose path is taken.
-        function: String,
-        /// The route pattern that takes it.
-        route: String,
-    },
 }
 
 impl core::fmt::Display for MountError {
@@ -117,12 +110,6 @@ impl core::fmt::Display for MountError {
                 f,
                 "the manifest declares the function `{function}` twice; every Functions name is \
                  a distinct URL path, so one would shadow the other"
-            ),
-            Self::RouteCollision { function, route } => write!(
-                f,
-                "[[azure.queue_triggers]] declares the function `{function}`, whose queue \
-                 messages arrive at `/{function}` — which this application already serves as \
-                 `{route}`. Rename the function, or the route"
             ),
         }
     }
@@ -164,7 +151,6 @@ where
                 function: trigger.function.to_owned(),
             });
         }
-        check_route_collision(trigger.function, endpoint.served_routes())?;
         info!(
             function = trigger.function,
             queue = trigger.queue,
@@ -183,7 +169,6 @@ where
                 function: trigger.function.to_owned(),
             });
         }
-        check_route_collision(trigger.function, endpoint.served_routes())?;
         info!(
             function = trigger.function,
             cron = trigger.cron,
@@ -199,52 +184,6 @@ where
         queue_triggers,
         scheduled_triggers,
     })
-}
-
-/// Refuse a trigger whose path the application already serves, and warn when it only might.
-///
-/// The distinction is what `matchit` would do with the request: a literal route for the same path
-/// is shadowed outright and is a mistake worth refusing to start over, whereas a parameterized or
-/// catch-all route merely loses one of the many paths it matches — which is sometimes exactly what
-/// the author intended, and is never silent.
-fn check_route_collision(
-    function: &str,
-    routes: &[(MethodFilter, String)],
-) -> Result<(), MountError> {
-    let path = format!("/{function}");
-    let mut table = matchit::Router::new();
-    for (filter, route) in routes {
-        // The trigger interceptor only ever takes `POST /{function}`: a route that answers no
-        // POST keeps all of its methods and cannot be shadowed, so only POST-serving routes
-        // are registered into the collision table.
-        let serves_post = matches!(filter, MethodFilter::Any)
-            || matches!(filter, MethodFilter::Exact(method) if method == Method::POST);
-        if serves_post {
-            // A path registered for several methods is one path here, and two routes that
-            // `matchit` considers the same are the router's own problem, reported when it was
-            // built.
-            let _ = table.insert(route.as_str(), route.clone());
-        }
-    }
-
-    let Ok(shadowed) = table.at(&path) else {
-        return Ok(());
-    };
-
-    if shadowed.value == &path {
-        return Err(MountError::RouteCollision {
-            function: function.to_owned(),
-            route: shadowed.value.clone(),
-        });
-    }
-
-    warn!(
-        function,
-        route = shadowed.value.as_str(),
-        "an Azure Functions queue trigger takes precedence over a route that would also match \
-         its path; that path no longer reaches the route while running under the Functions host"
-    );
-    Ok(())
 }
 
 /// An application wrapped for the Functions host: declared triggers first, then everything else.
@@ -310,9 +249,10 @@ impl<E, C, S> FunctionsHost<E, C, S> {
 ///
 /// With forwarding off, the host POSTs `{"Data":{"req":{...}}}` to the catch-all function and
 /// the envelope — the whole of `Data` — is host-built, so nothing a client sends can ever
-/// surface there. `req` carries `method`, `url`, `headers` and `body`. A body that is not an
-/// envelope means this handler was reached directly — the forwarding mode or a developer on
-/// the host's port — and the request passes through untouched.
+/// surface there. The `req` binding is the serialized `HttpRequest`: `method`, `url`,
+/// `headers` and `body`, with header values as a string or a string array. A body that is not
+/// an envelope means this handler was reached directly — the forwarding mode or a developer
+/// on the host's port — and the request passes through untouched.
 async fn forwarded_request(request: &mut Request) -> Option<Request> {
     if request.method() != Method::POST {
         return None;
@@ -344,18 +284,53 @@ async fn forwarded_request(request: &mut Request) -> Option<Request> {
     }
     if let Some(headers) = req.get("headers").and_then(serde_json::Value::as_object) {
         for (name, value) in headers {
-            let Some(value) = value.as_str() else {
+            let values = value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| value.as_array()?.first()?.as_str().map(ToOwned::to_owned));
+            let Some(value) = values else {
                 continue;
             };
             if let (Ok(name), Ok(value)) = (
                 http_kit::header::HeaderName::from_bytes(name.as_bytes()),
-                http_kit::header::HeaderValue::from_str(value),
+                http_kit::header::HeaderValue::from_str(&value),
             ) {
                 forwarded.headers_mut().insert(name, value);
             }
         }
     }
     Some(forwarded)
+}
+
+/// Serialize the application's response into the `Outputs.res` the `http` output binding
+/// declares — the shape the host turns back into the client's HTTP response.
+async fn wrapped_response(response: Response) -> Response {
+    let (parts, body) = response.into_parts();
+    let status = parts.status.as_u16();
+    let body = body
+        .into_bytes()
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let headers: serde_json::Map<String, serde_json::Value> = parts
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            serde_json::to_value(value.to_str().ok()?)
+                .ok()
+                .map(|v| (name.as_str().to_owned(), v))
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "Outputs": { "res": { "statusCode": status, "headers": headers, "body": body } },
+        "Logs": []
+    });
+    let mut wrapped = Response::new(Body::from(serde_json::to_vec(&payload).unwrap_or_default()));
+    wrapped.headers_mut().insert(
+        http_kit::header::CONTENT_TYPE,
+        http_kit::header::HeaderValue::from_static("application/json"),
+    );
+    wrapped
 }
 
 /// Whether `body` is a forwarded HTTP request rather than a trigger invocation.
@@ -398,11 +373,14 @@ where
         let Some(trigger) = self.trigger_for(request) else {
             // Not a trigger path — with no forwarding configured the host delivers every HTTP
             // request to the catch-all function wrapped in its invocation envelope, the client
-            // request nested under `Data.req`. Unwrap that back into the request it was.
-            if let Some(forwarded) = forwarded_request(request).await {
-                *request = forwarded;
-            }
-            return self.endpoint.respond(request).await;
+            // request nested under `Data.req`. Unwrap that back into the request it was, and
+            // the response back into the `Outputs.res` the `http` output binding expects.
+            let Some(forwarded) = forwarded_request(request).await else {
+                return self.endpoint.respond(request).await;
+            };
+            *request = forwarded;
+            let response = self.endpoint.respond(request).await?;
+            return Ok(wrapped_response(response).await);
         };
 
         // A path match alone cannot decide what this POST is when the host forwards raw HTTP:
@@ -806,10 +784,7 @@ struct InvokeResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        check_route_collision, failed, mount, succeeded, EnvelopeError, InvokeRequest, MountError,
-        QueueTrigger,
-    };
+    use super::{failed, mount, succeeded, EnvelopeError, InvokeRequest, MountError, QueueTrigger};
     use crate::{
         routing::{MethodFilter, ServedRoutes},
         runtime::consumer::{QueueConsumer, QueueConsumers},
@@ -952,8 +927,11 @@ mod tests {
     }
 
     #[test]
-    fn a_trigger_that_shadows_a_literal_route_refuses_to_mount() {
-        let error = mount(
+    fn a_trigger_beside_routes_that_share_its_path_mounts_cleanly() {
+        // The host wraps every HTTP request at the catch-all function, so a route's path and a
+        // trigger's path never meet: `POST /process` from a client unwraps into the route,
+        // while `POST /process` carrying `Data.message` is the trigger invocation.
+        mount(
             Routes(vec![(
                 MethodFilter::Exact(Method::POST),
                 "/process".to_owned(),
@@ -963,33 +941,7 @@ mod tests {
             &[TRIGGER],
             &[],
         )
-        .expect_err("the route and the trigger cannot both own POST /process");
-
-        assert!(matches!(error, MountError::RouteCollision { .. }));
-        let rendered = error.to_string();
-        assert!(rendered.contains("process"), "{rendered}");
-    }
-
-    #[test]
-    fn a_trigger_beside_unrelated_routes_mounts_cleanly() {
-        mount(
-            Routes::new(&["/health", "/jobs/{id}"]),
-            consumers(),
-            (),
-            &[TRIGGER],
-            &[],
-        )
-        .expect("nothing collides");
-    }
-
-    #[test]
-    fn a_parameterized_route_that_would_also_match_is_a_warning_not_a_refusal() {
-        // `/{name}` still serves every other name; only this one path is taken over.
-        check_route_collision(
-            TRIGGER.function,
-            &[(MethodFilter::Exact(Method::GET), "/{name}".to_owned())],
-        )
-        .expect("a partial overlap is not a refusal");
+        .expect("a shared path is not a collision when the host wraps");
     }
 
     #[test]

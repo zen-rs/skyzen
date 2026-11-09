@@ -70,6 +70,13 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
                         entry.name
                     )
                 })?;
+                let rule = format!("skyzen-{function}--{}", entry.name.as_str());
+                anyhow::ensure!(
+                    rule.len() <= 64,
+                    "the EventBridge rule `{rule}` is {} characters; AWS allows 64 — shorten \
+                     the schedule or function name",
+                    rule.len()
+                );
             }
             let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
             child_env = prepared.child_env;
@@ -78,23 +85,25 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
                 Step::Command(deploy_command(&config, &root_dir, &binary)),
             ];
             let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
+            // Environment delivery goes first: an enabled rule can fire the function before
+            // its variables exist, and a tick in that window would run on stale configuration.
+            if !delivery.is_empty() {
+                steps.push(Step::Task(Box::new(LambdaEnvironment::new(
+                    function.clone(),
+                    delivery,
+                    child_env.clone(),
+                ))));
+            }
             // Every `[[schedule]]` is an EventBridge rule pointed at the function — the one
             // part of a deploy `cargo lambda` cannot express, created in process so the
             // deployed function actually fires rather than just existing. The task also runs
             // with an empty list: reconciling what the manifest no longer declares is how a
             // removed schedule's rule stops firing.
             steps.push(Step::Task(Box::new(EventBridgeSchedules::new(
-                function.clone(),
+                function,
                 manifest.data().schedule.clone(),
                 child_env.clone(),
             ))));
-            if !delivery.is_empty() {
-                steps.push(Step::Task(Box::new(LambdaEnvironment::new(
-                    function,
-                    delivery,
-                    child_env.clone(),
-                ))));
-            }
             steps
         }
         Action::Logs { wrangler_args } => {
@@ -463,13 +472,16 @@ mod tests {
             &project(),
         )
         .expect("plan");
-        let last = plan
-            .steps
-            .last()
+        // Environment delivery must run before the EventBridge rules are enabled, so it is
+        // the last-but-one task — reconciliation is the deploy's final step.
+        let described: Vec<String> = plan.steps.iter().map(Step::describe).collect();
+        let delivery = described
+            .iter()
+            .position(|step| step.contains("environment"))
             .expect("a deploy delivers its environment");
-        let described = last.describe();
+        assert_eq!(delivery, plan.steps.len() - 2, "{described:?}");
+        let described = &described[delivery];
 
-        assert!(matches!(last, Step::Task(_)), "{described}");
         assert!(described.contains("skyzen-api"), "{described}");
         assert!(described.contains("RUST_LOG"), "{described}");
         assert!(described.contains("STRIPE_KEY"), "{described}");

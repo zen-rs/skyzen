@@ -77,10 +77,16 @@ impl IntoWorkerResult for () {
 
 impl<E> IntoWorkerResult for Result<(), E>
 where
-    E: std::error::Error + 'static,
+    // `Into<BoxError>` is the bound every error type meets — `std::error::Error`
+    // implementations through the blanket `From`, and `anyhow::Error` through its own
+    // conversion, which `std::error::Error` deliberately does not cover.
+    E: Into<skyzen_services::BoxError>,
 {
     fn into_worker_result(self) -> Result<(), JsValue> {
-        self.map_err(|error| log_event_error(&error))
+        self.map_err(|error| {
+            let boxed: skyzen_services::BoxError = error.into();
+            log_event_error(boxed.as_ref())
+        })
     }
 }
 
