@@ -138,6 +138,16 @@ where
     fn openapi() -> Option<crate::openapi::ExtractorSchema> {
         E::openapi()
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi_responses() -> Option<Vec<crate::openapi::ResponseSchema>> {
+        Some(vec![crate::openapi::ResponseSchema {
+            status: Some(StatusCode::UNPROCESSABLE_ENTITY),
+            description: Some("validation failed — a per-field violation list follows"),
+            schema: None,
+            content_type: Some("application/problem+json"),
+        }])
+    }
 }
 
 /// Why a [`Valid`] extraction failed — the inner extractor's error, the context extractor's
@@ -371,6 +381,31 @@ mod tests {
         *request.uri_mut() = "/search?q=hello".parse().unwrap();
         let response = router.go(request).await.unwrap();
         assert_eq!(response.into_body().into_string().await.unwrap(), "hello");
+    }
+
+    #[cfg(feature = "openapi")]
+    #[skyzen::openapi]
+    async fn documented_signup(Valid(Json(_), _): Valid<Json<SignUp>>) -> &'static str {
+        "ok"
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn the_openapi_document_advertises_the_422_problem_document() {
+        let openapi = Route::new(("/signup".post(documented_signup),)).openapi();
+        assert!(openapi.is_enabled());
+        let operation = openapi
+            .operations()
+            .iter()
+            .find(|operation| operation.path == "/signup")
+            .expect("expected POST /signup operation");
+        assert!(
+            operation.responses.iter().any(|response| {
+                response.status == Some(StatusCode::UNPROCESSABLE_ENTITY)
+                    && response.content_type == Some("application/problem+json")
+            }),
+            "the 422 problem document should appear in the operation's responses"
+        );
     }
 
     #[tokio::test]

@@ -605,11 +605,17 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     let mut assertions = Vec::new();
     let mut parameter_schema_fns = Vec::new();
     let mut parameter_name_lists = Vec::new();
+    let mut param_response_extends = Vec::new();
     let mut schema_collector_idents = Vec::new();
     let mut schema_collector_defs = Vec::new();
 
     for (included_idx, meta) in parameter_schemas.iter().enumerate() {
         let ty = &meta.ty;
+        param_response_extends.push(quote! {
+            responses.extend(
+                ::skyzen::openapi::extractor_responses_of::<#ty>().unwrap_or_default(),
+            );
+        });
         let schema_ident = format_ident!(
             "__SKYZEN_OPENAPI_PARAM_SCHEMA_{}_{}",
             fn_ident.to_string().to_uppercase(),
@@ -740,6 +746,8 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                     });
                 }
 
+                #(#param_response_extends)*
+
                 Some(responses)
             }
 
@@ -762,7 +770,16 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                     ::skyzen::openapi::register_responder_schemas_for::<#response_ty>(schemas);
                 }
             });
-            quote! { Some(::skyzen::openapi::responder_schemas_of::<#response_ty>) }
+            schema_collector_defs.push(quote! {
+                fn #response_schema_ident() -> Option<Vec<::skyzen::openapi::ResponseSchema>> {
+                    let mut responses =
+                        ::skyzen::openapi::responder_schemas_of::<#response_ty>()
+                            .unwrap_or_default();
+                    #(#param_response_extends)*
+                    Some(responses)
+                }
+            });
+            quote! { Some(#response_schema_ident) }
         };
 
     let schema_collectors = if schema_collector_idents.is_empty() {

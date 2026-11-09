@@ -109,6 +109,14 @@ pub trait Extractor: Sized + Send + Sync + 'static {
         None
     }
 
+    /// Error responses the extractor can produce — e.g. `Valid`'s `422` problem document —
+    /// merged into the operation's documented responses.
+    #[cfg(feature = "openapi")]
+    #[must_use]
+    fn openapi_responses() -> Option<Vec<crate::openapi::ResponseSchema>> {
+        None
+    }
+
     /// Register dependent schemas into the `OpenAPI` components map.
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(_defs: &mut BTreeMap<String, SchemaRef>) {}
