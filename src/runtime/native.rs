@@ -2917,11 +2917,17 @@ mod tests {
     /// The accept loop holds one semaphore permit per live connection — fill
     /// it and the next socket is dropped at the OS level rather than becoming
     /// an unbounded task. Freeing a slot accepts again.
+    ///
+    /// The probes retry rather than asserting on the first attempt: a conn may
+    /// legitimately win a race before a straggler holder has been accepted, and
+    /// a released permit takes a moment to come back.
     #[tokio::test]
     #[cfg(feature = "server-tls")]
     async fn the_connection_limit_refuses_past_capacity() {
         use futures_util::TryStreamExt;
         use std::time::Duration;
+
+        const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
 
         let listener = async_net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2935,7 +2941,7 @@ mod tests {
             super::serve_connections(SmolGlobal, TlsEndpoint, (), incoming, None).await
         });
 
-        // Every permit taken by an h2c connection that idles after its preface.
+        // Every permit taken by an h2c connection idling after its preface.
         let mut holders = Vec::new();
         for _ in 0..super::MAX_CONNECTIONS {
             let mut conn = async_net::TcpStream::connect(addr).await.expect("connect");
@@ -2943,32 +2949,41 @@ mod tests {
             holders.push(conn);
         }
 
-        // Full: the next socket is refused — the client sees a close, fast.
-        let mut late = async_net::TcpStream::connect(addr).await.expect("connect");
-        late.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-            .await
-            .expect("write");
-        let mut buf = [0u8; 64];
-        let outcome = tokio::time::timeout(Duration::from_secs(2), late.read(&mut buf)).await;
-        assert!(
-            matches!(outcome, Ok(Ok(0) | Err(_))),
-            "a refused socket must close, got {outcome:?}"
-        );
+        // Full: refuse at the socket — an early probe may still win a slot a
+        // straggler holder had not claimed yet, so probe until refusal.
+        let mut refused = false;
+        for _ in 0..32 {
+            let mut probe = async_net::TcpStream::connect(addr).await.expect("connect");
+            probe.write_all(GET).await.expect("write");
+            let mut buf = [0u8; 128];
+            if let Ok(Ok(0) | Err(_)) =
+                tokio::time::timeout(Duration::from_secs(2), probe.read(&mut buf)).await
+            {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "a full listener must refuse at the socket");
 
-        // A freed permit accepts again: drop one holder, serve one more.
-        assert_eq!(holders.len(), super::MAX_CONNECTIONS);
-        let _freed = holders.pop();
-        let mut next = async_net::TcpStream::connect(addr).await.expect("connect");
-        next.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-            .await
-            .expect("write");
-        let mut response = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(3), next.read_to_end(&mut response)).await;
-        let response = String::from_utf8_lossy(&response);
-        assert!(
-            response.starts_with("HTTP/1.1"),
-            "a freed slot must serve, got {response}"
-        );
+        // `let _ =` discards immediately — the socket actually drops here,
+        // freeing its permit. Then poll while the released slot settles.
+        let _ = holders.pop();
+        let mut got_response = false;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut conn = async_net::TcpStream::connect(addr).await.expect("connect");
+            conn.write_all(GET).await.expect("write");
+            let mut response = Vec::new();
+            if tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut response))
+                .await
+                .is_ok()
+                && String::from_utf8_lossy(&response).starts_with("HTTP/1.1")
+            {
+                got_response = true;
+                break;
+            }
+        }
+        assert!(got_response, "a freed permit must accept again");
         drop(server);
     }
 }
