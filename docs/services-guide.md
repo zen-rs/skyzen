@@ -352,6 +352,13 @@ let kv = Kv::new(Redis::connect("redis://localhost:6379").await?);
 let storage = Storage::new(S3Storage::from_env("my-bucket").await);
 ```
 
+A `rediss://` URL negotiates TLS through rustls once `skyzen-redis`'s `tls`
+feature is on; without it the scheme fails at `Client::open` before it can
+connect. `tls` pulls the rustls glue for both runtimes — upstream requires a
+TLS comp per enabled runtime, so a single feature is what keeps every feature
+combination buildable; a `runtime-smol`-only build still pins `prefer_smol` at
+first connect so the declared runtime wins.
+
 ### Cloudflare Workers (KV + R2)
 
 On WASM targets, services are created from the Workers environment bindings inside the request handler or startup:

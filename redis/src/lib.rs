@@ -98,7 +98,9 @@ impl Redis {
     ///
     /// Returns [`KvError::Backend`] if the connection cannot be established.
     pub async fn connect(url: &str) -> Result<Self, KvError> {
+        pin_runtime();
         let client = Client::open(url).map_err(backend_error)?;
+        install_tls_provider(&client);
         let conn = client
             .get_connection_manager()
             .await
@@ -110,7 +112,8 @@ impl Redis {
     ///
     /// Matches the `from_env` constructor every other Skyzen backend offers, so a deployment
     /// configures Redis the same way it configures S3 or `DynamoDB`. Credentials and TLS travel in
-    /// the URL, as `rediss://user:password@host:6379/0`.
+    /// the URL, as `rediss://user:password@host:6379/0` — a `rediss://` URL needs the `tls`
+    /// feature, which is what turns the scheme into an actual rustls handshake.
     ///
     /// # Errors
     ///
@@ -394,6 +397,77 @@ impl KeyValueStore for Redis {
     }
 }
 
+/// redis-rs builds its client config through `ClientConfig::builder()`, which
+/// picks the *process-default* `CryptoProvider` — ambiguous, and therefore a
+/// panic, when another dependency also enables `ring`. Pin aws-lc-rs once, and
+/// only for a `rediss://` address: a plaintext connect must not decide the
+/// provider for unrelated TLS clients in the process. An `Err` from
+/// `install_default` only means a default already exists — the app's own
+/// choice wins, which is fine.
+#[cfg(feature = "tls")]
+fn install_tls_provider(client: &redis::Client) {
+    if matches!(
+        client.get_connection_info().addr(),
+        redis::ConnectionAddr::TcpTls { .. }
+    ) {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = rustls::crypto::CryptoProvider::install_default(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            );
+        });
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+const fn install_tls_provider(_client: &redis::Client) {}
+
+/// `tls` compiles both runtime comps, so upstream picks the executor by
+/// tokio-handle detection and the declared runtime can lose either way: a
+/// `runtime-smol` consumer driven from a tokio context gets tokio, and a
+/// `runtime-tokio` consumer outside any tokio context gets smol. Pin the
+/// declared preference once — `prefer_*` exists only when upstream compiles
+/// both runtimes (exactly the ambiguity this resolves) and refuses to
+/// override a preference the app already set. With both runtime features on,
+/// the selection is genuinely ambiguous, so nothing is pinned.
+#[cfg(all(
+    feature = "tls",
+    feature = "runtime-tokio",
+    not(feature = "runtime-smol")
+))]
+fn pin_runtime() {
+    static PIN: std::sync::Once = std::sync::Once::new();
+    PIN.call_once(|| {
+        let _ = redis::aio::prefer_tokio();
+    });
+}
+
+#[cfg(all(
+    feature = "tls",
+    not(feature = "runtime-tokio"),
+    feature = "runtime-smol"
+))]
+fn pin_runtime() {
+    static PIN: std::sync::Once = std::sync::Once::new();
+    PIN.call_once(|| {
+        let _ = redis::aio::prefer_smol();
+    });
+}
+
+#[cfg(not(any(
+    all(
+        feature = "tls",
+        feature = "runtime-tokio",
+        not(feature = "runtime-smol")
+    ),
+    all(
+        feature = "tls",
+        not(feature = "runtime-tokio"),
+        feature = "runtime-smol"
+    )
+)))]
+const fn pin_runtime() {}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -611,5 +685,123 @@ mod tests {
 
         let io = RedisError::from((ErrorKind::Io, "connection reset"));
         assert!(matches!(backend_error(io), KvError::Backend { .. }));
+    }
+
+    /// `Client::open` is where a `rediss://` URL used to die — with `tls` on,
+    /// the scheme parses to a TLS connection instead of failing.
+    #[test]
+    #[cfg(feature = "tls")]
+    fn a_rediss_url_parses_with_tls_enabled() {
+        assert!(redis::Client::open("rediss://user:password@127.0.0.1:6379/0").is_ok());
+    }
+
+    /// Without `tls` the provider install is a no-op, so `builder()` — the
+    /// call upstream's connect path makes — still panics in this test's
+    /// dual-provider world. That is the disabled state, observable: `connect`
+    /// installs nothing the caller did not ask for.
+    #[test]
+    #[cfg(not(feature = "tls"))]
+    fn without_tls_no_provider_is_installed() {
+        let client = redis::Client::open("rediss://127.0.0.1:6379/0").expect("parses");
+        super::install_tls_provider(&client);
+        assert!(
+            std::panic::catch_unwind(rustls::ClientConfig::builder).is_err(),
+            "builder() must still panic — no provider was installed"
+        );
+    }
+
+    /// `builder()` resolves through the process default — exactly what redis's
+    /// connect path calls — and must not panic even with two providers on the
+    /// shared rustls: the dev-dependency's `ring` puts this test in that world.
+    /// `connect` installs aws-lc-rs for a `rediss://` address first.
+    #[test]
+    #[cfg(feature = "tls")]
+    fn the_process_default_provider_is_installed_for_rediss() {
+        let client = redis::Client::open("rediss://127.0.0.1:6379/0").expect("parses");
+        super::install_tls_provider(&client);
+        let _ = rustls::ClientConfig::builder();
+    }
+
+    /// A throwaway TLS peer on a std thread: rustls server with a self-signed
+    /// cert, reads one decrypted record and returns it. Enough to prove a real
+    /// `rediss://` handshake happened — or that verification rejected it.
+    #[cfg(all(feature = "tls", unix))]
+    fn self_signed_peer() -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+        use std::io::Read;
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
+        let config = rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+        )
+        .expect("server config");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let conn = rustls::ServerConnection::new(std::sync::Arc::new(config))
+                .expect("server connection");
+            let mut tls = rustls::StreamOwned::new(conn, sock);
+            let mut buf = vec![0u8; 256];
+            let n = tls.read(&mut buf).unwrap_or(0);
+            buf.truncate(n);
+            buf
+        });
+        (port, handle)
+    }
+
+    /// `#insecure` turns off verification upstream, so a self-signed peer is a
+    /// real handshake: the server must receive decrypted RESP bytes (redis's
+    /// connection manager sends CLIENT SETINFO / PING on connect).
+    #[tokio::test]
+    #[cfg(all(feature = "tls", unix))]
+    async fn a_rediss_connection_completes_a_tls_handshake() {
+        let (port, peer) = self_signed_peer();
+        let url = format!("rediss://127.0.0.1:{port}/#insecure");
+        // The manager may wait for a RESP reply our stub never sends — the
+        // proof is on the server side, so the client result does not matter.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::Redis::connect(&url),
+        )
+        .await;
+        let decrypted = peer.join().expect("peer thread");
+        assert!(
+            !decrypted.is_empty(),
+            "the TLS peer received no decrypted bytes — no handshake"
+        );
+    }
+
+    /// Without `#insecure` the same self-signed peer must be *rejected*:
+    /// certificate verification is on and rustls-native-certs does not know
+    /// it. A single-shot connect, not the manager — the manager retries a
+    /// failed handshake forever, and "keeps retrying" is not the failure being
+    /// asserted here.
+    #[tokio::test]
+    #[cfg(all(feature = "tls", unix))]
+    async fn a_rediss_connection_rejects_an_untrusted_certificate() {
+        let (port, _peer) = self_signed_peer();
+        let url = format!("rediss://127.0.0.1:{port}/");
+        let client = redis::Client::open(url).expect("parses");
+        // Same provider install `connect` performs — a `rediss://` client
+        // without it panics on `builder()` in a multi-provider world, which is
+        // the failure mode being prevented, not tested.
+        super::install_tls_provider(&client);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get_multiplexed_async_connection(),
+        )
+        .await;
+        let outcome = result.expect("certificate rejection should be an error, not a hang");
+        assert!(
+            outcome.is_err(),
+            "an untrusted certificate must not connect"
+        );
     }
 }
