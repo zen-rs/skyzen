@@ -361,7 +361,7 @@ fn extract_value(item: &HashMap<String, AttributeValue>, key: &str) -> Result<Ve
         .and_then(|v| v.as_b().ok())
         .map(|b| b.as_ref().to_vec())
         .ok_or_else(|| {
-            KvError::backend(format!(
+            KvError::Decode(format!(
                 "item for key {key:?} exists but its `{VALUE_ATTRIBUTE}` attribute is missing or \
                  not binary"
             ))
