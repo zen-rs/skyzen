@@ -14,14 +14,14 @@ use crate::utils::conditional::{fresh, EntityTag};
 /// Default ceiling for hashing a body — 256 KiB.
 const DEFAULT_MAX_BODY: u64 = 256 * 1024;
 
-/// Emits a weak `ETag` (`W/"xxh3-of-body"`) on `GET`/`HEAD` responses that don't already
+/// Emits a weak `ETag` (`W/"xxh3-of-body"`) on `GET` responses that don't already
 /// carry one.
 ///
 /// Bandwidth only — the body is still built and hashed every time. For responses whose
 /// validators are cheaper to compute than their bodies (a revision counter, a stored hash),
 /// reach for [`Conditional`][crate::responder::Conditional] instead.
 ///
-/// Pass-through rules: anything but `GET`/`HEAD`, non-`200` statuses, responses that already
+/// Pass-through rules: anything but `GET`, non-`200` statuses, responses that already
 /// carry `ETag`, and bodies that are streamed or exceed [`max_body`][Self::max_body] are left
 /// untouched.
 #[derive(Debug, Clone, Copy)]
@@ -36,7 +36,7 @@ impl Default for AutoETag {
 }
 
 impl AutoETag {
-    /// The default limits — `GET`/`HEAD` + `200` + a buffered body of at most 256 KiB.
+    /// The default limits — `GET` + `200` + a buffered body of at most 256 KiB.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -59,7 +59,9 @@ impl Middleware for AutoETag {
         request: &mut Request,
         next: Next<'_>,
     ) -> impl Future<Output = Result<Response, Error>> + Send {
-        let cacheable = request.method() == Method::GET || request.method() == Method::HEAD;
+        // GET only — a HEAD carries no body, so hashing its empty shell yields a tag that
+        // contradicts the one GET would compute for the same resource.
+        let cacheable = request.method() == Method::GET;
         let max_body = self.max_body;
         async move {
             let mut response = next.run(request).await?;
