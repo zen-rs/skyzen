@@ -224,6 +224,11 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
     /// with a native atomic form override it (a Cosmos create carrying the TTL field, Redis
     /// `INCR` + `PEXPIRE` in one transaction, DynamoDB's `UpdateItem` writing the TTL
     /// attribute in the same expression).
+    ///
+    /// The counter models a count that starts at zero and only ever rises — a stored
+    /// negative or non-integer value is corruption, not a count, and answers
+    /// [`KvError::Decode`] without being advanced, so a corrupt record keeps rejecting
+    /// every write until its own deadline removes it.
     fn increment_with_ttl(
         &self,
         key: &str,

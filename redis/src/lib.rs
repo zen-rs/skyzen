@@ -48,6 +48,9 @@ const COMPARE_AND_SWAP: &str = include_str!("compare_and_swap.lua");
 /// The `INCRBY` + `PEXPIRE` pair [`KeyValueStore::increment_with_ttl`] runs as one script.
 const INCREMENT_WITH_TTL: &str = include_str!("increment_with_ttl.lua");
 
+/// The reply code [`INCREMENT_WITH_TTL`] raises on a stored negative or non-integer value.
+const CORRUPT_COUNTER_CODE: &str = "CORRUPT";
+
 /// The [`COMPARE_AND_SWAP`] flag meaning "the key must hold the expected bytes".
 const EXPECTS_VALUE: &str = "1";
 
@@ -233,6 +236,7 @@ fn backend_error(error: RedisError) -> KvError {
 /// exact strings Redis sends.
 fn is_not_a_counter(code: Option<&str>, detail: Option<&str>) -> bool {
     code == Some(WRONG_TYPE_CODE)
+        || code == Some(CORRUPT_COUNTER_CODE)
         || detail.is_some_and(|detail| {
             NOT_A_COUNTER_DETAILS
                 .iter()

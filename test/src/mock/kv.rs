@@ -265,7 +265,15 @@ impl KeyValueStore for InMemoryKv {
         ready(self.take_injected_failure().and_then(|()| {
             let expires_at = self.expiry_for(ttl);
             let mut data = self.write_purged();
-            let updated = counter_value(data.get(key))?
+            let current = counter_value(data.get(key))?;
+            // The TTL counter counts from zero upward, so a stored negative is corruption,
+            // not a count: refuse it without a write, the way the real backends do.
+            if current < 0 {
+                return Err(KvError::Decode(format!(
+                    "counter under {key:?} holds the negative value {current}"
+                )));
+            }
+            let updated = current
                 .checked_add(delta)
                 .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
             // A counter born under the limiter carries its deadline from the first write;

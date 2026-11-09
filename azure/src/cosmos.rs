@@ -467,15 +467,21 @@ impl CosmosKv {
                         .then_some(next)
                 }
                 Some((stored, etag, ttl)) => {
-                    let next =
-                        counter_value(key, &stored)?
-                            .checked_add(delta)
-                            .ok_or_else(|| {
-                                KvError::Decode(format!(
+                    let current = counter_value(key, &stored)?;
+                    // `increment_with_ttl` counts from zero upward, so a stored negative
+                    // is corruption, not a count: it is refused here without a write and
+                    // keeps rejecting every hit until the record's deadline removes it.
+                    if ttl_secs.is_some() && current < 0 {
+                        return Err(KvError::Decode(format!(
+                            "counter under {key:?} holds the negative value {current}"
+                        )));
+                    }
+                    let next = current.checked_add(delta).ok_or_else(|| {
+                        KvError::Decode(format!(
                             "incrementing the counter under {key:?} by {delta} overflows a 64-bit \
                              integer"
                         ))
-                            })?;
+                    })?;
                     self.replace_if_unchanged(key, next.to_string().as_bytes(), &etag, ttl)
                         .await?
                         .then_some(next)
