@@ -175,14 +175,17 @@ impl Middleware for SecurityHeaders {
             let extensions = request.extensions_mut();
             match extensions.get_mut::<PendingResponseHeaders>() {
                 Some(pending) => {
+                    // `insert` replaces a same-named entry — a route-scoped layer deeper in
+                    // the chain overrides an outer policy on the error path too, matching
+                    // the or-insert semantics the success path applies.
                     for (name, value) in headers.clone() {
-                        pending.0.append(name, value);
+                        pending.0.insert(name, value);
                     }
                 }
                 None => {
                     let mut map = HeaderMap::new();
                     for (name, value) in headers.clone() {
-                        map.append(name, value);
+                        map.insert(name, value);
                     }
                     extensions.insert(PendingResponseHeaders(map));
                 }
