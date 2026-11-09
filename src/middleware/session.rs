@@ -237,6 +237,12 @@ impl Session {
         // cache takes the loaded value.
         let mut inner = lock(&self.inner);
         if let SessionCache::Unloaded = inner.data {
+            // The presented id named a record that no longer exists — expired or revoked.
+            // Keeping it would let the next insert recreate a dead session id, so the
+            // session moves on under a fresh one.
+            if loaded.is_none() && inner.loaded_id.is_some() {
+                inner.id = mint_id();
+            }
             inner.data = SessionCache::Ready(loaded.clone());
         }
         Ok(loaded)
