@@ -66,18 +66,17 @@ impl SecurityHeaders {
         }
     }
 
-    /// `Strict-Transport-Security` for `max_age`, `includeSubDomains` and `preload` ready.
+    /// `Strict-Transport-Security` for `max_age` — and nothing else.
     ///
     /// Opt-in because it is sticky: a client that sees it refuses plain HTTP until the
     /// max-age lapses. Only enable on deployments that are HTTPS-only for good.
+    /// `includeSubDomains` and `preload` widen the commitment beyond what the name promises
+    /// — deployments that want them set the header verbatim with [`header`][Self::header].
     #[must_use]
     pub fn hsts_with_max_age(self, max_age: Duration) -> Self {
         self.set(
             STRICT_TRANSPORT_SECURITY,
-            value(&format!(
-                "max-age={}; includeSubDomains; preload",
-                max_age.as_secs()
-            )),
+            value(&format!("max-age={}", max_age.as_secs())),
         )
     }
 
@@ -268,10 +267,7 @@ mod tests {
         *request.uri_mut() = "/hello".parse().unwrap();
         let response = router.go(request).await.unwrap();
         let headers = response.headers();
-        assert_eq!(
-            headers["strict-transport-security"],
-            "max-age=300; includeSubDomains; preload"
-        );
+        assert_eq!(headers["strict-transport-security"], "max-age=300");
         assert_eq!(
             headers["content-security-policy"],
             "default-src 'none'; frame-ancestors 'none'"
