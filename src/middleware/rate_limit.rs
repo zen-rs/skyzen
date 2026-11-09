@@ -292,6 +292,10 @@ struct MemoryStore {
     buckets: Mutex<HashMap<String, (u64, u64)>>,
 }
 
+/// The map sweep threshold — past it a `hit` first drops expired buckets so an unbounded
+/// key space cannot grow memory without bound.
+const MAX_MEMORY_BUCKETS: usize = 4096;
+
 impl RateLimitStore for MemoryStore {
     #[allow(clippy::significant_drop_tightening)]
     fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
@@ -305,6 +309,9 @@ impl RateLimitStore for MemoryStore {
                     .buckets
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if buckets.len() > MAX_MEMORY_BUCKETS {
+                    buckets.retain(|_, (_, reset)| *reset > now);
+                }
                 let entry = buckets
                     .entry(bucket)
                     .or_insert((0, (index + 1) * window_ms));
