@@ -114,7 +114,27 @@ pub fn apply_pending_headers(request: &Request, response: &mut Response) {
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
+    /// Machine-readable detail the error published in its `source()` chain — e.g. the field
+    /// violations of a `422` validation rejection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
+
+/// Machine-readable detail an error carries in its `source()` chain.
+///
+/// [`error_response`] merges it into the `{"error": ...}` body under `details`. An error
+/// reports one by storing it as its `source()`; it is not itself an `HttpError`, so it never
+/// sets the status.
+#[derive(Debug)]
+pub struct ErrorDetails(pub serde_json::Value);
+
+impl core::fmt::Display for ErrorDetails {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("error details")
+    }
+}
+
+impl core::error::Error for ErrorDetails {}
 
 /// Emit the endpoint-error log line that every Skyzen backend shares.
 ///
@@ -161,8 +181,14 @@ pub fn error_response(error: &dyn HttpError) -> Response {
         error.to_string()
     };
 
+    // Structured detail rides in the `source()` chain — the only channel `dyn HttpError`
+    // offers beyond `status` and `Display`.
+    let details = std::iter::successors(error.source(), |source| source.source())
+        .find_map(|source| source.downcast_ref::<ErrorDetails>())
+        .map(|details| details.0.clone());
     let payload = serde_json::to_vec(&ErrorBody {
         error: &body_message,
+        details,
     })
     .unwrap_or_else(|_| br#"{"error":"Internal server error"}"#.to_vec());
 

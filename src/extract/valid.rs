@@ -19,7 +19,7 @@ use core::{fmt, marker::PhantomData, ops::Deref};
 
 use garde::Validate;
 use http_kit::{HttpError, Request, StatusCode};
-use skyzen_core::{Extractor, Requirement};
+use skyzen_core::{ErrorDetails, Extractor, Requirement};
 
 use crate::{
     extract::{Path, Query},
@@ -199,18 +199,21 @@ pub struct FieldViolation {
 #[derive(Debug)]
 pub struct ValidationRejection {
     errors: Vec<FieldViolation>,
+    details: ErrorDetails,
 }
 
 impl ValidationRejection {
     fn new(report: &garde::Report) -> Self {
+        let errors: Vec<FieldViolation> = report
+            .iter()
+            .map(|(path, error)| FieldViolation {
+                path: path.to_string(),
+                message: error.to_string(),
+            })
+            .collect();
         Self {
-            errors: report
-                .iter()
-                .map(|(path, error)| FieldViolation {
-                    path: path.to_string(),
-                    message: error.to_string(),
-                })
-                .collect(),
+            details: ErrorDetails(serde_json::json!({ "violations": errors })),
+            errors,
         }
     }
 
@@ -234,7 +237,13 @@ impl fmt::Display for ValidationRejection {
     }
 }
 
-impl std::error::Error for ValidationRejection {}
+impl std::error::Error for ValidationRejection {
+    /// The violations ride in the `source()` chain where `error_response` finds them: it
+    /// merges an [`ErrorDetails`] node into the body as `details`.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.details)
+    }
+}
 
 impl HttpError for ValidationRejection {
     fn status(&self) -> StatusCode {
@@ -375,6 +384,13 @@ mod tests {
                 assert_eq!(rejection.status(), StatusCode::UNPROCESSABLE_ENTITY);
                 assert_eq!(rejection.errors().len(), 2);
                 assert_eq!(rejection.errors()[0].path, "email");
+
+                // The machine-readable list reaches the HTTP body too, through the
+                // `ErrorDetails` node in `source()`.
+                let response = skyzen_core::error_response(&rejection);
+                let body = response.into_body().into_string().await.unwrap();
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["details"]["violations"][0]["path"], "email");
             }
             other => panic!("expected a validation rejection, got {other:?}"),
         }
