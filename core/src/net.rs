@@ -105,8 +105,13 @@ pub struct PendingResponseHeaders(pub header::HeaderMap);
 /// [`error_response`] — so headers middleware marked as must-deliver survive errors.
 pub fn apply_pending_headers(request: &Request, response: &mut Response) {
     if let Some(pending) = request.extensions().get::<PendingResponseHeaders>() {
+        // Pending headers are defaults — a response that set its own wins, so an explicit
+        // policy on an error page is never doubled by the layer's.
         for (name, value) in &pending.0 {
-            response.headers_mut().append(name.clone(), value.clone());
+            response
+                .headers_mut()
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
         }
     }
 }
