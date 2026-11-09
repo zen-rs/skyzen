@@ -7,23 +7,230 @@ use std::{
 };
 
 use http::StatusCode;
+use ipnet::IpNet;
 
-use crate::{extract::Extractor, header, header::HeaderName, Request};
+use crate::{
+    extract::Extractor,
+    header::{self, HeaderName},
+    middleware::{Middleware, Next},
+    Error, Request, Response,
+};
 
 /// The remote peer address of the connection.
 ///
 /// Re-exported from [`skyzen_core`] so that server backends can populate it without depending on
 /// the top-level `skyzen` crate. If the server is behind a proxy this is the proxy's address; use
-/// [`ClientIp`] to honour `Forwarded`/`X-Forwarded-For`.
+/// [`ClientIp`] to resolve the address of the original client through trusted proxy headers.
 pub use skyzen_core::{MissingRemoteAddr, PeerAddr};
+
+const CF_CONNECTING_IP: HeaderName = HeaderName::from_static("cf-connecting-ip");
+
+/// The Cloudflare edge network's published IPv4 ranges, for [`TrustedProxies::cloudflare`].
+const CLOUDFLARE_IPV4: &[&str] = &[
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+];
+
+/// The Cloudflare edge network's published IPv6 ranges, for [`TrustedProxies::cloudflare`].
+const CLOUDFLARE_IPV6: &[&str] = &[
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+];
+
+/// Which proxies may set the client address through `Forwarded`/`X-Forwarded-For` headers.
+///
+/// Attach it as a middleware — usually with [`Route::layer`](crate::routing::Route::layer) so it
+/// reaches every extractor — and [`ClientIp`] honours the proxy headers only for the hops it
+/// trusts. Without it `ClientIp` reports the connection's [`PeerAddr`] and ignores the headers
+/// entirely, because a client can write them as easily as a proxy can.
+///
+/// ```rust
+/// use skyzen::{extract::TrustedProxies, routing::{CreateRouteNode, Route}};
+///
+/// let router = Route::new(("/".at(|| async { "ok" }),))
+///     .layer(TrustedProxies::cloudflare())
+///     .build();
+/// ```
+#[derive(Debug, Clone)]
+pub struct TrustedProxies {
+    nets: Vec<IpNet>,
+    /// Take the client address from `CF-Connecting-IP` when the peer is a Cloudflare edge
+    /// address; Cloudflare overwrites whatever the client sent, so the header cannot be spoofed
+    /// through it.
+    cf_connecting_ip: bool,
+}
+
+impl TrustedProxies {
+    /// Trust the proxies inside `nets`. An empty list restores the default: the peer address
+    /// only.
+    #[must_use]
+    pub fn new(nets: impl IntoIterator<Item = IpNet>) -> Self {
+        Self {
+            nets: nets.into_iter().collect(),
+            cf_connecting_ip: false,
+        }
+    }
+
+    /// Trust the published Cloudflare edge ranges and read the client address from
+    /// `CF-Connecting-IP`. For a server sitting directly behind Cloudflare this is the whole
+    /// configuration.
+    ///
+    /// # Panics
+    ///
+    /// Never: the ranges are fixed published literals.
+    #[must_use]
+    pub fn cloudflare() -> Self {
+        let mut proxies = Self::new(
+            CLOUDFLARE_IPV4
+                .iter()
+                .chain(CLOUDFLARE_IPV6)
+                .map(|net| IpNet::from_str(net).expect("published ranges parse")),
+        );
+        proxies.cf_connecting_ip = true;
+        proxies
+    }
+
+    /// Trust every hop, restoring the pre-hardening behaviour: the client address is whatever the
+    /// leftmost `Forwarded`/`X-Forwarded-For` entry claims. Correct only where an outer layer —
+    /// a platform that rewrites the headers on the way in, like an API gateway — guarantees the
+    /// chain.
+    ///
+    /// # Panics
+    ///
+    /// Never: the ranges are fixed literals.
+    #[must_use]
+    pub fn any() -> Self {
+        Self::new([
+            IpNet::from_str("0.0.0.0/0").expect("valid"),
+            IpNet::from_str("::/0").expect("valid"),
+        ])
+    }
+
+    /// Whether `addr` belongs to a trusted proxy hop.
+    #[must_use]
+    pub fn trusts(&self, addr: &IpAddr) -> bool {
+        self.nets.iter().any(|net| net.contains(addr))
+    }
+
+    /// Resolve the client from the proxy headers, walking the chains back from the trusted peer
+    /// and skipping every hop that is itself trusted.
+    fn forwarded_client(&self, request: &Request, peer: Option<IpAddr>) -> Option<IpAddr> {
+        if self.cf_connecting_ip {
+            if let Some(addr) = request
+                .headers()
+                .get(CF_CONNECTING_IP)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|raw| IpAddr::from_str(raw.trim()).ok())
+            {
+                return Some(addr);
+            }
+        }
+
+        if let Some(addrs) = forwarded_chain(request) {
+            return Some(trusted_client(&addrs, self, peer));
+        }
+        if let Some(addrs) = x_forwarded_for_chain(request) {
+            return Some(trusted_client(&addrs, self, peer));
+        }
+        None
+    }
+}
+
+/// The first hop not owned by a proxy, walking a recorded chain away from the server.
+///
+/// The peer itself is not part of the recorded chain: `peer` carries it so the last recorded
+/// entry is trusted only when the hop that wrote it is trusted.
+fn trusted_client(addrs: &[IpAddr], proxies: &TrustedProxies, peer: Option<IpAddr>) -> IpAddr {
+    let mut prev_trusted = peer.is_some_and(|peer| proxies.trusts(&peer));
+    for addr in addrs.iter().rev() {
+        if !prev_trusted {
+            return *addr;
+        }
+        prev_trusted = proxies.trusts(addr);
+    }
+    // Every recorded hop is trusted, so the client is the leftmost entry — or, when the chain is
+    // empty, the peer itself.
+    addrs
+        .first()
+        .copied()
+        .or(peer)
+        .unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST))
+}
+
+/// The `for=` chain of a `Forwarded` header, leftmost first. `None` when no `for=` is present.
+fn forwarded_chain(request: &Request) -> Option<Vec<IpAddr>> {
+    let value = request.headers().get(header::FORWARDED)?;
+    let mut addrs = Vec::new();
+    for entry in value.as_bytes().split(|b| *b == b',') {
+        for pair in entry.split(|b| *b == b';') {
+            let Some((mut key, value)) = split_once(pair, b'=') else {
+                continue;
+            };
+            trim(&mut key);
+            if !key.eq_ignore_ascii_case(b"for") {
+                continue;
+            }
+            if let Ok(addr) = parse_forwarded_for_value(value) {
+                addrs.push(addr);
+            }
+        }
+    }
+    (!addrs.is_empty()).then_some(addrs)
+}
+
+/// The address list of an `X-Forwarded-For` header, leftmost first.
+fn x_forwarded_for_chain(request: &Request) -> Option<Vec<IpAddr>> {
+    let value = request
+        .headers()
+        .get(HeaderName::from_static("x-forwarded-for"))?;
+    let addrs: Vec<IpAddr> = value
+        .as_bytes()
+        .split(|b| *b == b',')
+        .filter_map(|mut raw| {
+            trim(&mut raw);
+            std::str::from_utf8(raw)
+                .ok()
+                .and_then(|raw| IpAddr::from_str(raw).ok())
+        })
+        .collect();
+    (!addrs.is_empty()).then_some(addrs)
+}
+
+impl Middleware for TrustedProxies {
+    async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        request.extensions_mut().insert(self.clone());
+        next.run(request).await
+    }
+
+    fn provisions(&self) -> Vec<std::any::TypeId> {
+        vec![std::any::TypeId::of::<Self>()]
+    }
+}
 
 /// Extract the IP address of the client.
 ///
-/// This extractor will check for the presence of the `Forwarded` or `X-Forwarded-For` header, ensuring it works even when behind a proxy.
-/// The order of determination is as follows: `Forwarded` / `X-Forwarded-For` / the peer address of the client.
-/// # Warning
-/// This extractor carries the risk of spoofing because the client can send a fake `Forwarded` or `X-Forwarded-For` header.
-/// If you're working on something like rate limiting, consider using the `PeerAddr` extractor.
+/// The connection's [`PeerAddr`] is the answer unless a [`TrustedProxies`] layer says the hop it
+/// belongs to is trusted, in which case the `Forwarded` and `X-Forwarded-For` chains are walked
+/// right-to-left past every trusted hop. On Cloudflare (`wasm32`) the platform's
+/// `CF-Connecting-IP` is authoritative and always wins.
 #[derive(Debug, Clone)]
 pub struct ClientIp(pub IpAddr);
 
@@ -41,32 +248,36 @@ impl Extractor for ClientIp {
     // not a client-supplied request parameter and contributes no OpenAPI schema.
 }
 
-/// Resolve the client address from the proxy headers, falling back to the connection's peer.
+/// Resolve the client address from the peer and whichever proxy headers the peer may write.
 fn client_ip(request: &Request) -> Result<ClientIp, ClientIpError> {
-    if let Some(v) = request.headers().get(header::FORWARDED) {
-        if let Some(addr) = parse_forwarded(v.as_bytes())? {
-            return Ok(ClientIp(addr));
+    let peer = request
+        .extensions()
+        .get::<PeerAddr>()
+        .map(|peer| peer.0.ip());
+    let trusted = request.extensions().get::<TrustedProxies>();
+
+    // Cloudflare sets `CF-Connecting-IP` at the edge and removes the client's own, so on a Worker
+    // the header is the connection metadata `PeerAddr` would have been elsewhere.
+    #[cfg(target_arch = "wasm32")]
+    if let Some(value) = request.headers().get(CF_CONNECTING_IP) {
+        let raw = std::str::from_utf8(value.as_bytes())?;
+        return Ok(ClientIp(IpAddr::from_str(raw.trim())?));
+    }
+
+    if let Some(trusted) = trusted {
+        // A host that recorded no peer at all (a serverless one) trusts the chain it was given:
+        // that is what configuring proxies means there.
+        let peer_trusted = peer.is_none_or(|peer| trusted.trusts(&peer));
+        if peer_trusted {
+            if let Some(addr) = trusted.forwarded_client(request, peer) {
+                return Ok(ClientIp(addr));
+            }
         }
     }
 
-    if let Some(v) = request
-        .headers()
-        .get(HeaderName::from_static("x-forwarded-for"))
-    {
-        if let Some(addr) = parse_x_forwarded_for(v.as_bytes())? {
-            return Ok(ClientIp(addr));
-        }
-    }
-
-    // It's unnecessary to consume the extension.
-    Ok(ClientIp(
-        request
-            .extensions()
-            .get::<PeerAddr>()
-            .ok_or(ClientIpError::MissingRemoteAddr)?
-            .0
-            .ip(),
-    ))
+    peer.map_or(Err(ClientIpError::MissingRemoteAddr), |addr| {
+        Ok(ClientIp(addr))
+    })
 }
 
 /// An error occurred while extracting the client's IP.
@@ -89,24 +300,6 @@ pub enum ClientIpError {
         status = StatusCode::INTERNAL_SERVER_ERROR
     )]
     MissingRemoteAddr,
-}
-
-fn parse_forwarded(v: &[u8]) -> Result<Option<IpAddr>, ClientIpError> {
-    for v in v.split(|b| *b == b';') {
-        for v in v.split(|b| *b == b',') {
-            let (mut key, mut value) =
-                split_once(v, b'=').ok_or(ClientIpError::InvalidForwardedHeader)?;
-            trim(&mut key);
-
-            if !key.eq_ignore_ascii_case(b"for") {
-                continue;
-            }
-
-            trim(&mut value);
-            return Ok(Some(parse_forwarded_for_value(value)?));
-        }
-    }
-    Ok(None)
 }
 
 fn parse_forwarded_for_value(mut value: &[u8]) -> Result<IpAddr, ClientIpError> {
@@ -164,13 +357,6 @@ fn parse_bracketed_ipv6(value: &str) -> Result<Option<Ipv6Addr>, ClientIpError> 
     Ok(Some(Ipv6Addr::from_str(host)?))
 }
 
-fn parse_x_forwarded_for(v: &[u8]) -> Result<Option<IpAddr>, ClientIpError> {
-    // `split` always yields at least one (possibly empty) chunk.
-    let mut first = v.split(|v| *v == b',').next().unwrap_or_default();
-    trim(&mut first);
-    Ok(Some(IpAddr::from_str(std::str::from_utf8(first)?)?))
-}
-
 fn split_once(s: &[u8], pat: u8) -> Option<(&[u8], &[u8])> {
     for (i, ss) in s.iter().enumerate() {
         if *ss == pat {
@@ -201,87 +387,136 @@ const fn trim(s: &mut &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::IpAddr, str::FromStr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::{parse_forwarded, parse_x_forwarded_for, ClientIp, ClientIpError};
+    use super::{ClientIp, ClientIpError, TrustedProxies};
     use crate::{Body, Method, Request};
     use http_kit::header::HeaderValue;
-    use skyzen_core::Extractor;
+    use ipnet::IpNet;
+    use skyzen_core::{Extractor, PeerAddr};
+    use std::str::FromStr;
 
-    #[test]
-    fn test_forwarded_1() {
-        let addr=parse_forwarded(b" for =192.0.2.43;  proto=https, for=198.51.100.17 ;by=\"[::1]:1234\";host=\"example.com\"").unwrap().unwrap();
-        assert_eq!(addr, IpAddr::from([192, 0, 2, 43]));
-    }
-
-    #[test]
-    fn test_forwarded_2() {
-        let addr = parse_forwarded(b"For=\"[2001:db8:cafe::17]:4711\"")
-            .unwrap()
-            .unwrap();
-        assert_eq!(addr, IpAddr::from_str("2001:db8:cafe::17").unwrap());
-    }
-
-    #[test]
-    fn test_forwarded_3() {
-        let addr = parse_forwarded(b"  fOr =\"192.0.2.55\" ,  for =   \"192.0.2.43\" ,")
-            .unwrap()
-            .unwrap();
-        assert_eq!(addr, IpAddr::from([192, 0, 2, 55]));
-    }
-
-    #[test]
-    fn test_forwarded_with_ipv4_port() {
-        let addr = parse_forwarded(b"for=198.51.100.17:443").unwrap().unwrap();
-        assert_eq!(addr, IpAddr::from([198, 51, 100, 17]));
-    }
-
-    #[test]
-    fn test_forwarded_with_unquoted_ipv6_port() {
-        let addr = parse_forwarded(b"for=[2001:db8:cafe::17]:4711")
-            .unwrap()
-            .unwrap();
-        assert_eq!(addr, IpAddr::from_str("2001:db8:cafe::17").unwrap());
-    }
-
-    #[test]
-    fn test_x_forwarded_for_1() {
-        let addr = parse_x_forwarded_for(b"192.0.2.21,192.0.2.34,2001:db8:cafe::17")
-            .unwrap()
-            .unwrap();
-        assert_eq!(addr, IpAddr::from([192, 0, 2, 21]));
-    }
-
-    #[test]
-    fn test_x_forwarded_for_2() {
-        let addr = parse_x_forwarded_for(b" 2001:db8:cafe::17, 192.0.2.21")
-            .unwrap()
-            .unwrap();
-        assert_eq!(addr, IpAddr::from_str("2001:db8:cafe::17").unwrap());
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_forwarded_header() {
+    fn request_with_peer(ip: IpAddr) -> Request {
         let mut request = Request::new(Body::empty());
         *request.method_mut() = Method::GET;
         request
-            .headers_mut()
-            .insert(crate::header::FORWARDED, HeaderValue::from_static("for"));
+            .extensions_mut()
+            .insert(PeerAddr(SocketAddr::new(ip, 12345)));
+        request
+    }
 
-        let error = ClientIp::extract(&mut request).await.unwrap_err();
-        assert!(matches!(error, ClientIpError::InvalidForwardedHeader));
+    fn with_header(mut request: Request, name: &'static str, value: &'static str) -> Request {
+        request.headers_mut().insert(
+            http_kit::header::HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+        request
+    }
+
+    fn trusted(nets: &[&str]) -> TrustedProxies {
+        TrustedProxies::new(nets.iter().map(|net| IpNet::from_str(net).unwrap()))
     }
 
     #[tokio::test]
-    async fn rejects_unparsable_forwarded_address() {
-        let mut request = Request::new(Body::empty());
-        *request.method_mut() = Method::GET;
-        request.headers_mut().insert(
-            crate::header::FORWARDED,
-            HeaderValue::from_static("for=_hidden"),
+    async fn untrusted_peer_ignores_spoofed_forwarding_headers() {
+        let mut request = with_header(
+            request_with_peer(Ipv4Addr::new(203, 0, 113, 9).into()),
+            "x-forwarded-for",
+            "198.51.100.1",
         );
 
+        let ip = ClientIp::extract(&mut request).await.unwrap();
+        assert_eq!(ip.0, IpAddr::from([203, 0, 113, 9]));
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_walks_the_chain_past_trusted_hops() {
+        let mut request = with_header(
+            request_with_peer(Ipv4Addr::new(10, 0, 0, 2).into()),
+            "x-forwarded-for",
+            "198.51.100.1, 10.0.0.1",
+        );
+        request.extensions_mut().insert(trusted(&["10.0.0.0/8"]));
+
+        let ip = ClientIp::extract(&mut request).await.unwrap();
+        assert_eq!(ip.0, IpAddr::from([198, 51, 100, 1]));
+    }
+
+    #[tokio::test]
+    async fn an_all_trusted_chain_reports_the_leftmost_entry() {
+        let mut request = with_header(
+            request_with_peer(Ipv4Addr::new(10, 0, 0, 2).into()),
+            "x-forwarded-for",
+            "10.0.0.1, 10.0.0.9",
+        );
+        request.extensions_mut().insert(trusted(&["10.0.0.0/8"]));
+
+        let ip = ClientIp::extract(&mut request).await.unwrap();
+        assert_eq!(ip.0, IpAddr::from([10, 0, 0, 1]));
+    }
+
+    #[tokio::test]
+    async fn forwarded_header_is_walked_the_same_way() {
+        let mut request = with_header(
+            request_with_peer(Ipv4Addr::new(10, 0, 0, 2).into()),
+            "forwarded",
+            "for=198.51.100.1, for=10.0.0.1;proto=https",
+        );
+        request.extensions_mut().insert(trusted(&["10.0.0.0/8"]));
+
+        let ip = ClientIp::extract(&mut request).await.unwrap();
+        assert_eq!(ip.0, IpAddr::from([198, 51, 100, 1]));
+    }
+
+    #[tokio::test]
+    async fn cloudflare_reads_cf_connecting_ip_from_a_cf_peer() {
+        let mut request = with_header(
+            request_with_peer(IpAddr::from_str("172.70.1.1").unwrap()),
+            "cf-connecting-ip",
+            "198.51.100.7",
+        );
+        request
+            .extensions_mut()
+            .insert(TrustedProxies::cloudflare());
+
+        let ip = ClientIp::extract(&mut request).await.unwrap();
+        assert_eq!(ip.0, IpAddr::from([198, 51, 100, 7]));
+    }
+
+    #[tokio::test]
+    async fn cf_connecting_ip_from_a_non_cf_peer_is_not_read() {
+        let mut request = with_header(
+            request_with_peer(Ipv4Addr::new(203, 0, 113, 9).into()),
+            "cf-connecting-ip",
+            "198.51.100.7",
+        );
+        request
+            .extensions_mut()
+            .insert(TrustedProxies::cloudflare());
+
+        let ip = ClientIp::extract(&mut request).await.unwrap();
+        assert_eq!(ip.0, IpAddr::from([203, 0, 113, 9]));
+    }
+
+    #[tokio::test]
+    async fn no_peer_and_no_config_still_fails() {
+        let mut request = Request::new(Body::empty());
         let error = ClientIp::extract(&mut request).await.unwrap_err();
-        assert!(matches!(error, ClientIpError::AddrParseError(_)));
+        assert!(matches!(error, ClientIpError::MissingRemoteAddr));
+    }
+
+    #[tokio::test]
+    async fn no_peer_with_config_walks_the_recorded_chain() {
+        // A serverless host records no TCP peer; the fronting gateway's append is why the
+        // operator configured trust in the first place.
+        let mut request = with_header(
+            Request::new(Body::empty()),
+            "x-forwarded-for",
+            "198.51.100.1, 10.0.0.1",
+        );
+        request.extensions_mut().insert(trusted(&["10.0.0.0/8"]));
+
+        let ip = ClientIp::extract(&mut request).await.unwrap();
+        assert_eq!(ip.0, IpAddr::from([10, 0, 0, 1]));
     }
 }
