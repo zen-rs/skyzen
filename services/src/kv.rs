@@ -220,10 +220,10 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
     /// A counter born already carrying its deadline can never persist without expiry, which
     /// a plain [`increment`](KeyValueStore::increment) + [`expire`](KeyValueStore::expire)
     /// cannot promise: a failure between the two leaves a TTL-less record behind forever.
-    /// The default implementation still splits them — documented non-atomic — while backends
-    /// with a native atomic form override it (a Cosmos create carrying the TTL field, Redis
-    /// `INCR` + `PEXPIRE` in one transaction, DynamoDB's `UpdateItem` writing the TTL
-    /// attribute in the same expression).
+    /// Backends with a native atomic form implement it natively — a Cosmos create carrying
+    /// the TTL field, Redis `INCR` + `PEXPIRE` in one script, DynamoDB's `UpdateItem`
+    /// writing the TTL attribute in the same expression — and every other backend answers
+    /// [`KvError::Unsupported`] rather than silently degrading to the non-atomic pair.
     ///
     /// The counter models a count that starts at zero and only ever rises — a stored
     /// negative or non-integer value is corruption, not a count, and answers
@@ -235,10 +235,11 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
         delta: i64,
         ttl: core::time::Duration,
     ) -> impl Future<Output = Result<i64, KvError>> + Send {
-        async move {
-            let count = self.increment(key, delta).await?;
-            self.expire(key, ttl).await?;
-            Ok(count)
+        let _ = (key, delta, ttl);
+        async {
+            Err(KvError::Unsupported(
+                "atomic counter-with-deadline is not supported by this key-value backend",
+            ))
         }
     }
 
