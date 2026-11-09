@@ -96,9 +96,11 @@ impl BlobRest {
     ///
     /// One is built per request because the connection pool lives on the `Transport`: clients
     /// over a clone of the same transport share connections, so this costs a struct wrap, not a
-    /// pool.
-    fn client(&self) -> DefaultClient {
-        zenwave::client_with(self.transport.clone())
+    /// pool. It is the raw backend — a `reqsign` signature is bound to the URI it signs, so a
+    /// redirect could never be honored anyway, and a 3xx should surface as itself rather than as
+    /// a replayed hop.
+    fn client(&self) -> zenwave::backend::DefaultBackend {
+        DefaultClient::raw(self.transport.clone())
     }
 
     /// Whether this endpoint can mint a shared access signature of its own.

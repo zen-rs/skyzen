@@ -63,6 +63,9 @@ impl HttpTransport for ZenwaveTransport {
             parse_content_length(&parts.headers)?
         };
 
+        // A failure this late is a mid-transfer transport failure — a reset or truncated read —
+        // which OpenDAL retries, so it is temporary the way the previous transport classified
+        // body errors.
         let stream = body
             .try_filter(|chunk| future::ready(!chunk.is_empty()))
             .map_ok(Buffer::from)
@@ -70,6 +73,7 @@ impl HttpTransport for ZenwaveTransport {
                 Error::new(ErrorKind::Unexpected, "read data from http response")
                     .with_operation("zenwave::fetch")
                     .with_context("url", uri.to_string())
+                    .with_temporary(true)
                     .set_source(error)
             });
         Ok(Response::from_parts(
