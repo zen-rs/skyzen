@@ -188,8 +188,18 @@ impl Middleware for RateLimit {
         async move {
             let store = match (self.resolve)(request).await {
                 Ok(store) => store,
-                Err(_) if self.fail_open => return next.run(request).await,
-                Err(_) => return Err(Error::from(RateLimitUnavailable::new())),
+                // A missing binding is a permanent misconfiguration, not an outage —
+                // log it even while failing open so the limiter never silently dies.
+                Err(error) if self.fail_open => {
+                    tracing::warn!(
+                        "rate limit store could not resolve, admitting request: {error}"
+                    );
+                    return next.run(request).await;
+                }
+                Err(error) => {
+                    tracing::warn!("rate limit store could not resolve: {error}");
+                    return Err(Error::from(RateLimitUnavailable::new()));
+                }
             };
             let key = (self.key)(request).await?;
             match store.hit(&key, self.window).await {
