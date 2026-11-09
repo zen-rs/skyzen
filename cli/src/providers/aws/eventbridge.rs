@@ -142,7 +142,7 @@ impl Task for EventBridgeSchedules {
                 self.wire_one(&events, &lambda, &arn, (partition, region, account), entry)
                     .await?;
             }
-            self.retire_stale(&events, &lambda).await?;
+            self.retire_stale(&events, &lambda, &arn).await?;
             Ok(())
         })?
     }
@@ -159,6 +159,7 @@ impl EventBridgeSchedules {
         &self,
         events: &aws_sdk_eventbridge::Client,
         lambda: &aws_sdk_lambda::Client,
+        arn: &str,
     ) -> Result<()> {
         const STATEMENT_PREFIX: &str = "skyzen-schedule-";
 
@@ -184,7 +185,7 @@ impl EventBridgeSchedules {
 
         for name in stale {
             let rule = self.rule_name(&name);
-            self.retire_rule(events, &rule).await?;
+            self.retire_rule(events, arn, &rule).await?;
             match lambda
                 .remove_permission()
                 .function_name(&self.function)
@@ -213,11 +214,17 @@ impl EventBridgeSchedules {
 
     /// Delete `rule` after stripping every target on it.
     ///
-    /// `DeleteRule` refuses while any target remains — not just Skyzen's own — and a rule a
-    /// crashed deploy left behind may carry another one. Enumerated rather than assumed, and
+    /// `DeleteRule` refuses while any target remains. Enumerated rather than assumed, and
     /// `RemoveTargets`'s per-entry failures fail the deploy the way `PutTargets`'s do. A rule
-    /// that vanished between the policy read and here is not a failure.
-    async fn retire_rule(&self, events: &aws_sdk_eventbridge::Client, rule: &str) -> Result<()> {
+    /// that vanished between the policy read and here is not a failure — and neither is a rule
+    /// carrying a target that is not this Lambda: another integration attached one, and
+    /// removing it would take down somebody else's wiring, so the rule stays and says so.
+    async fn retire_rule(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+        arn: &str,
+        rule: &str,
+    ) -> Result<()> {
         let listed = match events.list_targets_by_rule().rule(rule).send().await {
             Ok(listed) => listed,
             Err(error)
@@ -232,6 +239,15 @@ impl EventBridgeSchedules {
                     .with_context(|| format!("failed to list the targets of rule `{rule}`"));
             }
         };
+        if let Some(target) = listed.targets().iter().find(|target| target.arn() != arn) {
+            output::warn(format!(
+                "leaving stale EventBridge rule `{rule}` in place: it carries a target pointing \
+                 at `{}`, which is not Lambda function `{}`",
+                target.arn(),
+                self.function
+            ));
+            return Ok(());
+        }
         let ids: Vec<String> = listed
             .targets()
             .iter()
@@ -325,6 +341,33 @@ impl EventBridgeSchedules {
                  `{}`; rename the schedule or remove the foreign rule",
                 target.arn(),
                 self.function
+            );
+        }
+
+        // Same-ARN targets with different ids are still distinct targets — `put_targets` adds
+        // rather than replaces, and EventBridge would invoke the function once per target.
+        // Strip every id but the one `wire_one` is about to write.
+        let surplus: Vec<String> = listed
+            .targets()
+            .iter()
+            .map(|target| target.id().to_owned())
+            .filter(|id| id != rule)
+            .collect();
+        if !surplus.is_empty() {
+            let removed = events
+                .remove_targets()
+                .rule(rule)
+                .set_ids(Some(surplus))
+                .send()
+                .await
+                .with_context(|| format!("failed to prune targets of rule `{rule}`"))?;
+            let failures = removed.failed_entries();
+            anyhow::ensure!(
+                failures.is_empty(),
+                "EventBridge refused to strip a target of rule `{rule}`: {:?}",
+                failures
+                    .first()
+                    .map(aws_sdk_eventbridge::types::RemoveTargetsResultEntry::error_message)
             );
         }
         Ok(())

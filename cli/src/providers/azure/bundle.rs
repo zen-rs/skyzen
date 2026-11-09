@@ -66,7 +66,14 @@ pub fn render(
                 .join("function.json"),
             contents: FileContents::Public(to_json(&FunctionJson::timer(
                 schedule,
-                config.schedule.get(schedule.name.as_str()),
+                config
+                    .schedule
+                    .iter()
+                    // `validate_schedules` matches override keys case-insensitively; the lookup
+                    // has to match the same way or a differently-cased table parses but never
+                    // applies.
+                    .find(|(name, _)| name.eq_ignore_ascii_case(schedule.name.as_str()))
+                    .map(|(_, override_)| override_),
             ))?),
         });
     }
@@ -89,31 +96,45 @@ pub fn render(
                 })?
         })
         .collect();
-    retire_stale_functions(bundle_dir, &declared);
+    retire_stale_functions(bundle_dir, &declared)?;
 
     Ok(files)
 }
 
 /// Remove generated function directories the manifest no longer declares.
 ///
-/// Best-effort — a directory that cannot be listed or removed is left for the deploy to
-/// tolerate rather than failing on an artifact it did not make.
-fn retire_stale_functions(bundle_dir: &Path, declared: &std::collections::BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(bundle_dir) else {
-        return;
+/// A directory that cannot be listed or removed is a hard failure: leaving it would publish
+/// a timer the manifest no longer declares, which is worse than the deploy failing loudly.
+fn retire_stale_functions(
+    bundle_dir: &Path,
+    declared: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let entries = match std::fs::read_dir(bundle_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not list {}", bundle_dir.display()))
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.with_context(|| format!("could not list {}", bundle_dir.display()))?;
         let path = entry.path();
-        let is_function = path.is_dir() && path.join("function.json").is_file();
-        let stale = is_function
+        let stale = path.is_dir()
+            && path.join("function.json").is_file()
             && entry
                 .file_name()
                 .to_str()
                 .is_some_and(|name| !declared.contains(name));
         if stale {
-            let _ = std::fs::remove_dir_all(&path);
+            std::fs::remove_dir_all(&path).with_context(|| {
+                format!(
+                    "could not remove stale Functions directory {}",
+                    path.display()
+                )
+            })?;
         }
     }
+    Ok(())
 }
 
 /// Serialize one document, with the trailing newline every generated file gets.

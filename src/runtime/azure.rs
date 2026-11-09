@@ -213,10 +213,18 @@ fn check_route_collision(
 ) -> Result<(), MountError> {
     let path = format!("/{function}");
     let mut table = matchit::Router::new();
-    for (_, route) in routes {
-        // A path registered for several methods is one path here, and two routes that `matchit`
-        // considers the same are the router's own problem, reported when it was built.
-        let _ = table.insert(route.as_str(), route.clone());
+    for (filter, route) in routes {
+        // The trigger interceptor only ever takes `POST /{function}`: a route that answers no
+        // POST keeps all of its methods and cannot be shadowed, so only POST-serving routes
+        // are registered into the collision table.
+        let serves_post = matches!(filter, MethodFilter::Any)
+            || matches!(filter, MethodFilter::Exact(method) if method == Method::POST);
+        if serves_post {
+            // A path registered for several methods is one path here, and two routes that
+            // `matchit` considers the same are the router's own problem, reported when it was
+            // built.
+            let _ = table.insert(route.as_str(), route.clone());
+        }
     }
 
     let Ok(shadowed) = table.at(&path) else {
@@ -300,16 +308,30 @@ impl<E, C, S> FunctionsHost<E, C, S> {
 
 /// Whether `body` is a forwarded HTTP request rather than a trigger invocation.
 ///
-/// This is the non-spoofable boundary between the two: the Functions host wraps every
-/// forwarded request under `Data.req` and builds `Data` itself, so a client's body — however
-/// shaped — can only ever appear inside it, never as a top-level `Data.timer` or
-/// `Data.message`. A body without `Data.req` is an invocation envelope (or a malformed one,
-/// which the read path reports as a failure the host retries).
-fn is_forwarded_http(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|envelope| envelope.get("Data")?.get("req").map(|_| ()))
-        .is_some()
+/// The host wraps every forwarded request under `Data.req`; the trigger's invocation instead
+/// carries its binding under `Data` (`message` for a queue trigger, `timer` for a timer). A
+/// body is an invocation only when it carries the trigger's own binding *and* no `req` —
+/// anything else is the router's to answer, because a body shaped like neither can only have
+/// come from the open HTTP surface, never the host's trigger path.
+fn is_invocation(body: &[u8], binding: &str) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(data) = envelope.get("Data") else {
+        return false;
+    };
+    data.get("req").is_none() && data.get(binding).is_some()
+}
+
+impl Trigger {
+    /// The `Data` key an invocation for this trigger always carries — `message` for a queue
+    /// trigger, `timer` for a timer trigger.
+    fn binding(&self) -> &'static str {
+        match self {
+            Self::Queue(_) => "message",
+            Self::Scheduled(_) => "timer",
+        }
+    }
 }
 
 impl<E, C, S> Endpoint for FunctionsHost<E, C, S>
@@ -338,7 +360,7 @@ where
             *request.body_mut() = Body::from(Vec::new());
             return self.endpoint.respond(request).await;
         };
-        if is_forwarded_http(&body) {
+        if !is_invocation(&body, trigger.binding()) {
             *request.body_mut() = Body::from(body.to_vec());
             return self.endpoint.respond(request).await;
         }
@@ -875,13 +897,16 @@ mod tests {
     #[test]
     fn a_trigger_that_shadows_a_literal_route_refuses_to_mount() {
         let error = mount(
-            Routes::new(&["/process", "/health"]),
+            Routes(vec![(
+                MethodFilter::Exact(Method::POST),
+                "/process".to_owned(),
+            )]),
             consumers(),
             (),
             &[TRIGGER],
             &[],
         )
-        .expect_err("the route and the trigger cannot both own /process");
+        .expect_err("the route and the trigger cannot both own POST /process");
 
         assert!(matches!(error, MountError::RouteCollision { .. }));
         let rendered = error.to_string();
@@ -985,10 +1010,13 @@ mod tests {
     }
 
     #[test]
-    fn an_invocation_the_handler_cannot_be_given_tells_the_host_to_redeliver() {
-        let (status, _) = respond(Method::POST, "/process", "not an envelope");
+    fn a_post_without_the_invocation_envelope_is_the_routers_to_answer() {
+        // A body that is neither a real invocation (`Data.message`) nor a forwarded request
+        // (`Data.req`) cannot come from the host's trigger path — it reaches the router like
+        // every other request and never sees the handler.
+        let (status, body) = respond(Method::POST, "/process", "not an envelope");
 
-        // A non-2xx is the only way a custom handler reports failure.
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "router");
     }
 }

@@ -127,6 +127,9 @@ fn secret_step(
     config: &AwsSection,
     function: String,
 ) -> Result<Step> {
+    let env = prepare_child_environment(manifest, VariableKind::ALL)
+        .map(|prepared| prepared.child_env)
+        .unwrap_or_default();
     let delivery = match action {
         SecretAction::Set { name, value } => Delivery::one(name.as_str(), value),
         SecretAction::Push => {
@@ -146,15 +149,12 @@ fn secret_step(
         }
         SecretAction::List => {
             return Ok(Step::Task(Box::new(LambdaEnvironmentNames::new(
-                function,
-                Vec::new(),
+                function, env,
             ))));
         }
     };
     Ok(Step::Task(Box::new(LambdaEnvironment::new(
-        function,
-        delivery,
-        Vec::new(),
+        function, delivery, env,
     ))))
 }
 
