@@ -388,7 +388,8 @@ fn apply_defaults(cookie: &mut Cookie<'_>, secure: bool) {
     }
 }
 
-fn parse_request_jar(request: &Request) -> Result<cookie::CookieJar, CookieParseError> {
+/// Parse the request's `Cookie` headers into a raw jar, for the session extractor.
+pub(crate) fn parse_request_jar(request: &Request) -> Result<cookie::CookieJar, CookieParseError> {
     parse_jar(request).map(|jar| jar.0)
 }
 
