@@ -37,5 +37,12 @@ runtime-smol = ["dep:redis", "redis/smol-comp"]
 # there is no `native-tls` variant.
 tls = ["dep:rustls", "redis/tokio-rustls-comp", "redis/smol-rustls-comp"]
 
+[dev-dependencies]
+# Enables `ring` alongside `aws_lc_rs` on the shared `rustls` in test builds, so
+# the provider test lives in the multi-provider world a consumer can land in —
+# where a bare `ClientConfig::builder()` panics without an installed default.
+# `--no-dev-deps` builds are unaffected.
+rustls = { version = "0.23", features = ["ring"] }
+
 [lints]
 workspace = true

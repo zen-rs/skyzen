@@ -98,6 +98,7 @@ impl Redis {
     ///
     /// Returns [`KvError::Backend`] if the connection cannot be established.
     pub async fn connect(url: &str) -> Result<Self, KvError> {
+        install_default_provider();
         let client = Client::open(url).map_err(backend_error)?;
         let conn = client
             .get_connection_manager()
@@ -110,9 +111,8 @@ impl Redis {
     ///
     /// Matches the `from_env` constructor every other Skyzen backend offers, so a deployment
     /// configures Redis the same way it configures S3 or `DynamoDB`. Credentials and TLS travel in
-    /// the URL, as `rediss://user:password@host:6379/0` — a `rediss://` URL needs the matching
-    /// runtime's TLS feature (`tls-tokio` or `tls-smol`), which is what turns the scheme into an
-    /// actual rustls handshake.
+    /// the URL, as `rediss://user:password@host:6379/0` — a `rediss://` URL needs the `tls`
+    /// feature, which is what turns the scheme into an actual rustls handshake.
     ///
     /// # Errors
     ///
@@ -396,6 +396,24 @@ impl KeyValueStore for Redis {
     }
 }
 
+/// redis-rs builds its client config through `ClientConfig::builder()`, which
+/// picks the *process-default* `CryptoProvider` — ambiguous, and therefore a
+/// panic, when another dependency also enables `ring`. Pin aws-lc-rs as the
+/// default the first time we connect; an `Err` from `install_default` only
+/// means a default already exists (the app's own choice wins, which is fine).
+#[cfg(feature = "tls")]
+fn install_default_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+    });
+}
+
+#[cfg(not(feature = "tls"))]
+fn install_default_provider() {}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -631,16 +649,14 @@ mod tests {
         assert!(redis::Client::open("rediss://127.0.0.1:6379/0").is_err());
     }
 
-    /// Parsing is not enough: upstream `tls-rustls` enables no crypto provider,
-    /// so `ClientConfig::builder()` panicked at connect. `tls` pulls `aws_lc_rs`
-    /// — prove it by building a config against the provider itself, which also
-    /// holds when another dependency adds `ring` to the shared rustls (a bare
-    /// `builder()` could not pick a default then).
+    /// `builder()` resolves through the process default — exactly what redis's
+    /// connect path calls — and must not panic even with two providers on the
+    /// shared rustls: the dev-dependency's `ring` puts this test in that world.
+    /// `connect` installs aws-lc-rs as the default first.
     #[test]
     #[cfg(feature = "tls")]
-    fn a_crypto_provider_is_installed_for_rediss() {
-        let _ = rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into(),
-        );
+    fn the_process_default_provider_is_installed_for_rediss() {
+        super::install_default_provider();
+        let _ = rustls::ClientConfig::builder();
     }
 }
