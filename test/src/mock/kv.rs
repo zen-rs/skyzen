@@ -216,12 +216,14 @@ impl KeyValueStore for InMemoryKv {
         ready(self.take_injected_failure().map(|()| {
             let mut data = self.write_purged();
             data.get(key).map(|entry| entry.value.as_slice()) == expected && {
+                // A swap replaces the value, not the record: the deadline the entry already
+                // carried survives, as `replace_if_unchanged` does on Cosmos.
+                let expires_at = data.get(key).and_then(|entry| entry.expires_at);
                 data.insert(
                     key.to_owned(),
                     Entry {
                         value: new.to_vec(),
-                        // A swap re-arms nothing: the winner owns the key outright, as `SET` does.
-                        expires_at: None,
+                        expires_at,
                     },
                 );
                 true

@@ -497,15 +497,25 @@ impl KeyValueStore for DynamoKv {
 
     /// Swap the value under `key` with a condition expression on its current bytes.
     ///
-    /// The winner owns the key outright: like `SET` on Redis and like `InMemoryKv`, a swap re-arms
-    /// no expiry, so the item is written without a TTL attribute.
+    /// A swap replaces the value, not the record: the deadline an existing item already
+    /// carries is written forward, as `replace_if_unchanged` does on Cosmos.
     async fn compare_and_swap(
         &self,
         key: &str,
         expected: Option<&[u8]>,
         new: &[u8],
     ) -> Result<bool, KvError> {
-        self.conditional_put(key, expected, new, None).await
+        // A swap replaces the value, not the record: the deadline an existing item already
+        // carries is read forward into the conditional write, as `replace_if_unchanged`
+        // does on Cosmos. When the caller expects absence there is no item to inherit from.
+        let expires_at = match expected {
+            Some(_) => self
+                .read_item(key, true, Projection::WholeItem)
+                .await?
+                .and_then(|item| item_expires_at(&item, &self.ttl_attribute)),
+            None => None,
+        };
+        self.conditional_put(key, expected, new, expires_at).await
     }
 
     /// Add `delta` to a counter by reading it and writing it back under a condition.
