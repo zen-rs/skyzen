@@ -389,34 +389,50 @@ impl DurableKvRateStore {
         if matches!(self.kv.get(&marker).await, Ok(Some(_))) {
             return;
         }
-        let Ok(entries) = self
-            .kv
-            .list(skyzen_services::durable::DurableListOptions {
-                prefix: Some("rl:"),
-                ..Default::default()
-            })
-            .await
-        else {
-            // No marker either — the next window's first hit retries instead of skipping a
-            // sweep that may never have happened.
-            return;
-        };
-        let dead: Vec<&str> = entries
-            .iter()
-            .filter_map(|(key, raw)| {
-                let text = std::str::from_utf8(raw).ok()?;
-                let (_, reset) = text.split_once(':')?;
-                let reset = reset.parse::<u64>().ok()?;
+        // Page through `rl:` — a churned keyspace is never pulled in whole. A failed page
+        // or delete leaves the marker unwritten so the next window's first hit retries.
+        let mut cursor: Option<String> = None;
+        loop {
+            let Ok(page) = self
+                .kv
+                .list(skyzen_services::durable::DurableListOptions {
+                    prefix: Some("rl:"),
+                    start: cursor.as_deref(),
+                    limit: Some(128),
+                    ..Default::default()
+                })
+                .await
+            else {
+                return;
+            };
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            let mut dead: Vec<&str> = Vec::new();
+            for (key, raw) in &page {
+                let Some(text) = std::str::from_utf8(raw).ok() else {
+                    continue;
+                };
+                let Some((_, reset)) = text.split_once(':') else {
+                    continue;
+                };
                 // Sweep markers carry the same `{count}:{reset}` shape, so a stale
                 // marker dies with its own window instead of piling up forever.
-                (reset <= now).then_some(key.as_str())
-            })
-            .collect();
-        // `delete_multiple` is bounded per call — chunk so a large dead set cannot fail
-        // wholesale, and any chunk error defers the marker to a later window.
-        for chunk in dead.chunks(128) {
-            if self.kv.delete_multiple(chunk).await.is_err() {
-                return;
+                if reset.parse::<u64>().is_ok_and(|reset| reset <= now) {
+                    dead.push(key.as_str());
+                }
+            }
+            cursor = page.last().map(|(key, _)| key.clone());
+            // `delete_multiple` is bounded per call — chunk so a large dead set cannot
+            // fail wholesale, and any error defers the marker to a later window.
+            for chunk in dead.chunks(128) {
+                if self.kv.delete_multiple(chunk).await.is_err() {
+                    return;
+                }
+            }
+            if page_len < 128 {
+                break;
             }
         }
         // The marker itself dies at the window boundary — storage stays bounded.
