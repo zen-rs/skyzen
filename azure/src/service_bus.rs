@@ -1,6 +1,6 @@
 //! Azure Service Bus implementation of [`MessageQueue`].
 //!
-//! The transport is the [Service Bus REST API] spoken directly on `reqwest`, rather than a client
+//! The transport is the [Service Bus REST API] spoken directly on `zenwave`, rather than a client
 //! library: the only published Service Bus crate, `azure_messaging_servicebus` 0.21, is built on
 //! legacy `azure_core` 0.21, which logs the outgoing `authorization` header value at debug level
 //! (RUSTSEC-2026-0275) and drags `http-types`, `async-std` and `rand 0.7` in behind it. Four
@@ -16,10 +16,6 @@ use core::{fmt, time::Duration};
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac as _};
-use reqwest::{
-    header::{HeaderMap, AUTHORIZATION, RETRY_AFTER},
-    Client, Method, Response, StatusCode,
-};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use skyzen_services::queue::{
@@ -28,6 +24,10 @@ use skyzen_services::queue::{
 };
 use time::{OffsetDateTime, UtcOffset};
 use url::Url;
+use zenwave::{
+    header::{HeaderMap, AUTHORIZATION, CONTENT_LENGTH, RETRY_AFTER},
+    Body, DefaultClient, Endpoint as _, Method, Request, Response, StatusCode, Transport,
+};
 
 use crate::status::{classify, retry_after, AzureStatus};
 
@@ -52,14 +52,6 @@ const BROKER_PROPERTIES_HEADER: &str = "brokerproperties";
 
 /// The header Azure services name their own error code in.
 const ERROR_CODE_HEADER: &str = "x-ms-error-code";
-
-/// The body of a request that has none, which is what puts `Content-Length: 0` on the wire.
-///
-/// The REST reference's own peek-lock example sends that header, and
-/// `azure_messaging_servicebus-0.21.0/src/service_bus/mod.rs` set it explicitly "to avoid
-/// truncation errors" — so a bodyless request here declares its length rather than leaving it to
-/// the transport.
-const EMPTY_BODY: &str = "";
 
 /// How long the SAS token minted for one request stays valid.
 ///
@@ -96,11 +88,13 @@ const TOKEN_TTL: time::Duration = time::Duration::seconds(300);
 /// fail, the rest are still delivered and [`QueueError::PartialBatch`] names exactly which entries
 /// were rejected.
 ///
-/// Cloning is cheap — the HTTP client is a handle onto a shared connection pool.
+/// Cloning is cheap — the connection pool lives on the transport, which is a handle onto shared
+/// state.
 #[derive(Debug, Clone)]
 pub struct ServiceBusQueue {
-    /// The HTTP client every request rides on.
-    http: Client,
+    /// The transport every request rides on. Its per-origin connection pool is shared by the
+    /// clients built from it, so cloning the queue keeps one pool.
+    transport: Transport,
     /// `https://{namespace}.servicebus.windows.net/{queue}`, the root of every request URL.
     queue_url: Url,
     /// The shared-access policy name that signs requests.
@@ -118,7 +112,7 @@ impl ServiceBusQueue {
     /// # Errors
     ///
     /// [`QueueError::Backend`] when the namespace or queue name could not appear in a Service Bus
-    /// URL, or when the HTTP client could not be built.
+    /// URL.
     pub fn new(
         namespace: &str,
         queue: &str,
@@ -126,9 +120,7 @@ impl ServiceBusQueue {
         signing_key: &str,
     ) -> Result<Self, QueueError> {
         Ok(Self {
-            http: Client::builder().build().map_err(|error| {
-                QueueError::backend_with("failed to build an HTTPS client for Service Bus", error)
-            })?,
+            transport: Transport::system(),
             queue_url: queue_url(namespace, queue)?,
             policy_name: policy_name.into(),
             signing_key: SigningKey(signing_key.to_owned()),
@@ -220,6 +212,33 @@ impl ServiceBusQueue {
         ))
     }
 
+    /// The client one request goes out on.
+    ///
+    /// One is built per request because the connection pool lives on the `Transport`: clients
+    /// over a clone of the same transport share connections, so this costs a struct wrap, not a
+    /// pool.
+    fn client(&self) -> DefaultClient {
+        zenwave::client_with(self.transport.clone())
+    }
+
+    /// Build a bodyless request against `url`, signed with that URL's SAS token.
+    ///
+    /// Every bodyless call declares `Content-Length: 0`: the REST reference's own peek-lock
+    /// example sends that header, and `azure_messaging_servicebus-0.21.0/src/service_bus/mod.rs`
+    /// set it explicitly "to avoid truncation errors" — so a bodyless request here declares its
+    /// length rather than leaving it to the transport.
+    fn request(&self, method: Method, url: &Url) -> Result<Request, ServiceBusError> {
+        http::Request::builder()
+            .method(method)
+            .uri(url.as_str())
+            .header(AUTHORIZATION, self.sas_token(url)?)
+            .header(CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .map_err(|error| {
+                ServiceBusError::local_with("failed to build a Service Bus request", error)
+            })
+    }
+
     /// Build the request one send goes out as.
     ///
     /// `POST {queue}/messages`, the body carrying the encoded text. A delay becomes the
@@ -236,27 +255,26 @@ impl ServiceBusQueue {
         &self,
         encoded: EncodedMessage,
         options: &SendOptions,
-    ) -> Result<reqwest::Request, ServiceBusError> {
+    ) -> Result<Request, ServiceBusError> {
         let url = self.message_url(&["messages"])?;
 
-        let mut request = self
-            .http
-            .post(url.clone())
-            .header(AUTHORIZATION, self.sas_token(&url)?)
-            .body(encoded.body);
+        let mut builder = http::Request::builder()
+            .method(Method::POST)
+            .uri(url.as_str())
+            .header(AUTHORIZATION, self.sas_token(&url)?);
 
         if let Some(delay) = options.delay {
-            request = request.header(
+            builder = builder.header(
                 BROKER_PROPERTIES_HEADER,
                 SendBrokerProperties::scheduled_at(scheduled_enqueue_time(delay)?).encode()?,
             );
         }
 
         if encoded.base64 {
-            request = request.header(CONTENT_ENCODING_PROPERTY, property_value(BASE64_ENCODING)?);
+            builder = builder.header(CONTENT_ENCODING_PROPERTY, property_value(BASE64_ENCODING)?);
         }
 
-        request.build().map_err(|error| {
+        builder.body(Body::from(encoded.body)).map_err(|error| {
             ServiceBusError::local_with("failed to build a Service Bus send request", error)
         })
     }
@@ -267,11 +285,11 @@ impl ServiceBusQueue {
         message: &[u8],
         options: SendOptions,
     ) -> Result<(), ServiceBusError> {
-        let request = self.send_request(encode_message(message), &options)?;
+        let mut request = self.send_request(encode_message(message), &options)?;
 
-        let response = self
-            .http
-            .execute(request)
+        let mut client = self.client();
+        let response = client
+            .respond(&mut request)
             .await
             .map_err(|error| ServiceBusError::transport("send", error))?;
 
@@ -293,12 +311,11 @@ impl ServiceBusQueue {
         url.query_pairs_mut()
             .append_pair("timeout", &wait.as_secs().to_string());
 
-        let response = self
-            .http
-            .post(url.clone())
-            .header(AUTHORIZATION, self.sas_token(&url).map_err(queue_error)?)
-            .body(EMPTY_BODY)
-            .send()
+        let mut request = self.request(Method::POST, &url).map_err(queue_error)?;
+
+        let mut client = self.client();
+        let response = client
+            .respond(&mut request)
             .await
             .map_err(|error| queue_error(ServiceBusError::transport("peek-lock", error)))?;
 
@@ -311,7 +328,7 @@ impl ServiceBusQueue {
 
         let properties = broker_properties(&headers)?;
         let encoding = content_encoding(&headers)?;
-        let body = response.bytes().await.map_err(|error| {
+        let body = response.into_body().into_bytes().await.map_err(|error| {
             QueueError::backend_with("failed to read a Service Bus message body", error)
         })?;
         let body = core::str::from_utf8(&body).map_err(|error| {
@@ -340,12 +357,11 @@ impl ServiceBusQueue {
             ])
             .map_err(queue_error)?;
 
-        let response = self
-            .http
-            .request(method, url.clone())
-            .header(AUTHORIZATION, self.sas_token(&url).map_err(queue_error)?)
-            .body(EMPTY_BODY)
-            .send()
+        let mut request = self.request(method, &url).map_err(queue_error)?;
+
+        let mut client = self.client();
+        let response = client
+            .respond(&mut request)
             .await
             .map_err(|error| queue_error(ServiceBusError::transport("settle", error)))?;
 
@@ -847,7 +863,7 @@ impl ServiceBusError {
     }
 
     /// A request that never got an answer: a refused connection, a TLS failure, a timeout.
-    fn transport(operation: &str, source: reqwest::Error) -> Self {
+    fn transport(operation: &str, source: zenwave::Error) -> Self {
         Self {
             answer: None,
             message: format!("the {operation} request to Service Bus failed"),
@@ -864,7 +880,7 @@ impl ServiceBusError {
 
         // Service Bus explains a refusal in the body — an XML `<Error><Code>…</Code>` document —
         // and a body this backend cannot read is no reason to lose the status.
-        let body = response.bytes().await.map_or_else(
+        let body = response.into_body().into_bytes().await.map_or_else(
             |_| String::new(),
             |body| String::from_utf8_lossy(&body).trim().to_owned(),
         );
@@ -1061,14 +1077,14 @@ mod tests {
     };
     use base64::Engine as _;
     use core::time::Duration;
-    use reqwest::{
-        header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE},
-        StatusCode,
-    };
     use skyzen_services::queue::{
         MessageQueue, MessageReceipt, QueueError, QueueRetry, ReceiveOptions, SendOptions,
     };
     use time::OffsetDateTime;
+    use zenwave::{
+        header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE},
+        StatusCode,
+    };
 
     const CONNECTION_STRING: &str = "Endpoint=sb://skyzen-test.servicebus.windows.net/;\
          SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=c2t5emVuLXRlc3Qta2V5";
@@ -1201,7 +1217,7 @@ mod tests {
             .expect("should build a send request");
 
         assert_eq!(
-            request.url().as_str(),
+            request.uri().to_string(),
             "https://skyzen-test.servicebus.windows.net/jobs/messages"
         );
         assert!(request.headers().contains_key(AUTHORIZATION));

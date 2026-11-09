@@ -1,13 +1,14 @@
 //! Azure Blob Storage implementation of [`ObjectStorage`].
 
 mod rest;
+mod transport;
 
 use core::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use futures_util::StreamExt as _;
 use http::{header::HeaderName, HeaderValue, Method};
-use opendal::{services::Azblob, ErrorKind, Operator};
+use opendal::{services::Azblob, ErrorKind, HttpTransporter, OperationContext, Operator};
 use reqsign_azure_storage::Credential;
 use skyzen_services::storage::{
     ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest, PutOption,
@@ -15,6 +16,7 @@ use skyzen_services::storage::{
 };
 
 use self::rest::{BlobRest, READ_PERMISSION, WRITE_PERMISSION};
+use self::transport::ZenwaveTransport;
 
 /// The environment variable [`AzureBlobConfig::from_env`] reads its connection string from.
 const CONNECTION_STRING_ENV: &str = "AZURE_STORAGE_CONNECTION_STRING";
@@ -305,7 +307,13 @@ impl AzureBlob {
             AzureBlobAuth::SasToken(token) => builder.sas_token(token),
         };
 
-        let operator = Operator::new(builder).map_err(storage_error)?;
+        // The operator's HTTP traffic rides the same zenwave client the REST calls beside it
+        // use: OpenDAL's transport is an extension point, and leaving it unset would make every
+        // data-plane request fail with "default HTTP transport is not installed".
+        let operator = Operator::new(builder).map_err(storage_error)?.with_context(
+            OperationContext::new()
+                .with_http_transport(HttpTransporter::new(ZenwaveTransport::system())),
+        );
         let rest = BlobRest::new(&endpoint, &container, credential)?;
 
         Ok(Self {

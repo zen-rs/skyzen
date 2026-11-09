@@ -22,6 +22,7 @@ use std::{
     collections::BTreeMap,
     process::{Command, Stdio},
 };
+use zenwave::Client as _;
 
 /// The ARM API version the two settings calls are made against.
 const API_VERSION: &str = "2022-03-01";
@@ -82,18 +83,19 @@ impl Task for AppSettings {
     fn run(&self) -> Result<()> {
         let token = access_token()?;
         block_on(async {
-            let client = reqwest::Client::new();
-            let existing = list(&client, &self.app, &token).await?;
+            let mut client = zenwave::client();
+            let existing = list(&mut client, &self.app, &token).await?;
             let merged = self.delivery.merged_over(existing);
 
             // The one place a delivered value is exposed: it goes into this body and nowhere else.
             let response = client
                 .put(self.app.url(""))
+                .context("failed to build the application settings request")?
                 .bearer_auth(token.expose_secret())
-                .json(&AppSettingsDocument {
+                .json_body(&AppSettingsDocument {
                     properties: &merged,
                 })
-                .send()
+                .context("failed to encode the application settings document")?
                 .await
                 .context("failed to write the Function App's application settings")?;
             check(response, "write the application settings").await?;
@@ -130,7 +132,7 @@ impl Task for AppSettingNames {
     fn run(&self) -> Result<()> {
         let token = access_token()?;
         block_on(async {
-            let settings = list(&reqwest::Client::new(), &self.app, &token).await?;
+            let settings = list(&mut zenwave::client(), &self.app, &token).await?;
             if settings.is_empty() {
                 output::ok(format!(
                     "Function App `{}` has no application settings",
@@ -156,15 +158,16 @@ impl Task for AppSettingNames {
 /// Fails when the request cannot be sent, when ARM refuses it, or when its answer is not the
 /// document this expects.
 async fn list(
-    client: &reqwest::Client,
+    client: &mut zenwave::DefaultClient,
     app: &FunctionApp,
     token: &SecretString,
 ) -> Result<BTreeMap<String, String>> {
     let response = client
         .post(app.url("/list"))
+        .context("failed to build the application settings request")?
         .bearer_auth(token.expose_secret())
-        .header(reqwest::header::CONTENT_LENGTH, 0)
-        .send()
+        .header(zenwave::header::CONTENT_LENGTH, "0")
+        .context("failed to declare Content-Length")?
         .await
         .context("failed to read the Function App's application settings")?;
     let body = check(response, "read the application settings").await?;
@@ -209,12 +212,14 @@ struct ArmError {
 /// # Errors
 ///
 /// Fails for any non-2xx status, and when the body cannot be read.
-async fn check(response: reqwest::Response, what: &str) -> Result<String> {
+async fn check(response: zenwave::Response, what: &str) -> Result<String> {
     let status = response.status();
     let body = response
-        .text()
+        .into_body()
+        .into_string()
         .await
-        .with_context(|| format!("failed to read Azure's answer when asked to {what}"))?;
+        .with_context(|| format!("failed to read Azure's answer when asked to {what}"))?
+        .to_string();
     if status.is_success() {
         return Ok(body);
     }
