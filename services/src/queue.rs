@@ -709,6 +709,8 @@ mod tests {
     #[derive(Debug, Clone)]
     struct QueueSendEndpoint;
 
+    http_kit::impl_send_endpoint!(QueueSendEndpoint);
+
     impl Endpoint for QueueSendEndpoint {
         type Error = Infallible;
 

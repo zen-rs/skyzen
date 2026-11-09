@@ -16,7 +16,7 @@ use std::{
 };
 
 use skyzen_core::{
-    apply_pending_headers, error_response, log_endpoint_error, BodyError, Endpoint, PeerAddr,
+    apply_pending_headers, error_response, log_endpoint_error, BodyError, PeerAddr, SendEndpoint,
 };
 
 type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
@@ -71,7 +71,7 @@ pub struct IntoService<E> {
     peer_addr: Option<SocketAddr>,
 }
 
-impl<E: Endpoint + Clone> IntoService<E> {
+impl<E: SendEndpoint + Clone> IntoService<E> {
     /// Create a new service with the given endpoint and executor.
     pub const fn new(endpoint: E, executor: Arc<AnyExecutor>) -> Self {
         Self {
@@ -91,7 +91,7 @@ impl<E: Endpoint + Clone> IntoService<E> {
     }
 }
 
-impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
+impl<E: SendEndpoint + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
     for IntoService<E>
 {
     type Response = hyper::Response<SkyzenBody>;
@@ -120,7 +120,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 request.extensions_mut().insert(PeerAddr::new(peer_addr));
             }
 
-            let response: skyzen_core::Response = match endpoint.respond(&mut request).await {
+            let response: skyzen_core::Response = match endpoint.respond_send(&mut request).await {
                 Ok(response) => {
                     tracing::info!(
                         method = method.as_str(),

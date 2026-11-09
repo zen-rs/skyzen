@@ -61,6 +61,9 @@
 //!     }
 //! }
 //!
+//! // Lambda drives the endpoint on a work-stealing executor, so its future must be `Send`.
+//! http_kit::impl_send_endpoint!(Hello);
+//!
 //! # fn main() -> Result<(), skyzen_lambda::Error> {
 //! // `NoQueueHandler` is what an application with no `#[skyzen::queue]` handler passes: an SQS
 //! // event that reaches it fails the invocation rather than acknowledging messages nothing read.
@@ -83,7 +86,7 @@ use std::{pin::Pin, sync::Arc};
 
 use aws_lambda_events::sqs::SqsEvent;
 use futures_util::FutureExt as _;
-use http_kit::Endpoint;
+use http_kit::SendEndpoint;
 use lambda_http::{
     request::{LambdaRequest, RequestContext},
     Adapter, LambdaEvent, Request as LambdaHttpRequest, RequestExt, Response, Service,
@@ -114,7 +117,7 @@ pub fn run<Factory, Fut, E, D>(factory: Factory) -> Result<(), Error>
 where
     Factory: FnOnce() -> Fut,
     Fut: Future<Output = (E, D)>,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
     D: QueueDispatch,
 {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -158,7 +161,7 @@ struct RecordKind<'a> {
 
 impl<E, D> Service<LambdaEvent<Box<RawValue>>> for Invocation<E, D>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
     D: QueueDispatch,
 {
     type Response = serde_json::Value;
@@ -333,7 +336,7 @@ struct HttpService<E> {
 
 impl<E> Service<LambdaHttpRequest> for HttpService<E>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
 {
     type Response = Response<lambda_http::Body>;
     type Error = core::convert::Infallible;
@@ -367,7 +370,7 @@ where
             let method = request.method().clone();
             let path = request.uri().path().to_owned();
 
-            let response = match endpoint.respond(&mut request).await {
+            let response = match endpoint.respond_send(&mut request).await {
                 Ok(response) => {
                     info!(
                         method = method.as_str(),
@@ -480,13 +483,15 @@ mod tests {
         "the database at 10.0.0.7 refused the connection"
     );
 
+    http_kit::impl_send_endpoint!(Echo);
+
     impl Endpoint for Echo {
         type Error = EchoFailed;
 
         fn respond(
             &mut self,
             request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             let answered = if self.fail.is_some() {
                 Err(EchoFailed::new())
             } else {

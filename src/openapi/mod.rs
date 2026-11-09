@@ -836,6 +836,8 @@ http_error!(
     /// Error returned when OpenAPI support is disabled.
     pub OpenApiUiDisabledError, StatusCode::NOT_IMPLEMENTED, "OpenAPI support is disabled for this build");
 
+http_kit::impl_send_endpoint!(OpenApiUiEndpoint);
+
 impl Endpoint for OpenApiUiEndpoint {
     type Error = OpenApiUiDisabledError;
     // The document is rendered at build time, so the future is ready on creation rather than an
@@ -843,7 +845,7 @@ impl Endpoint for OpenApiUiEndpoint {
     fn respond(
         &mut self,
         _request: &mut Request,
-    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Response, Self::Error>> {
         let content_type = self.content_type;
         ready(self.body.as_ref().map_or_else(
             || Err(OpenApiUiDisabledError::new()),

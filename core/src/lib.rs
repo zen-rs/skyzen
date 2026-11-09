@@ -70,7 +70,7 @@ pub const OPENAPI_DUMP_ENV: &str = "SKYZEN_OPENAPI_DUMP";
 
 pub use http_kit::{
     endpoint, header, method, uri, version, Body, BodyError, Endpoint, Extensions, Method, Request,
-    Response, StatusCode, Uri, Version,
+    Response, SendEndpoint, StatusCode, Uri, Version,
 };
 
 /// Error types used in skyzen.

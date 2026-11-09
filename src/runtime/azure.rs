@@ -20,11 +20,12 @@
 
 use std::{
     collections::BTreeMap,
+    future::Future,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use http_kit::{Body, Endpoint, Method, Request, Response, StatusCode};
+use http_kit::{Body, Endpoint, Method, Request, Response, SendEndpoint, StatusCode};
 use serde::{Deserialize, Serialize};
 use skyzen_services::queue::{
     envelope, QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition,
@@ -113,7 +114,7 @@ pub fn mount<E, C>(
     triggers: &'static [QueueTrigger],
 ) -> Result<FunctionsHost<E, C>, MountError>
 where
-    E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
+    E: SendEndpoint + ServedRoutes + Clone + Sync + 'static,
     C: ConsumerSet,
 {
     let mut seen = BTreeMap::new();
@@ -222,23 +223,36 @@ impl<E, C> FunctionsHost<E, C> {
 
 impl<E, C> Endpoint for FunctionsHost<E, C>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
     C: ConsumerSet,
 {
     type Error = E::Error;
 
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let Some(trigger) = self.trigger_for(request) else {
-            return self.endpoint.respond(request).await;
+            return self.endpoint.respond_send(request).await;
         };
 
         Ok(self.invoke(trigger, request).await)
     }
 }
 
+impl<E, C> SendEndpoint for FunctionsHost<E, C>
+where
+    E: SendEndpoint + Clone + Sync + 'static,
+    C: ConsumerSet,
+{
+    fn respond_send(
+        &mut self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        self.respond(request)
+    }
+}
+
 impl<E, C> FunctionsHost<E, C>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
     C: ConsumerSet,
 {
     /// Drive the queue handler for one invocation and answer the host.
@@ -546,13 +560,15 @@ mod tests {
         }
     }
 
+    http_kit::impl_send_endpoint!(Routes);
+
     impl Endpoint for Routes {
         type Error = core::convert::Infallible;
 
         fn respond(
             &mut self,
             _request: &mut Request,
-        ) -> impl core::future::Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl core::future::Future<Output = Result<Response, Self::Error>> {
             core::future::ready(Ok(Response::new(crate::Body::from_bytes("router"))))
         }
     }

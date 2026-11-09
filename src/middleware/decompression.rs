@@ -560,12 +560,14 @@ mod tests {
     #[derive(Clone)]
     struct EchoEndpoint;
 
+    http_kit::impl_send_endpoint!(EchoEndpoint);
+
     impl Endpoint for EchoEndpoint {
         type Error = Infallible;
         fn respond(
             &mut self,
             request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             let body = mem::take(request.body_mut());
             let saw_encoding = request.headers().contains_key(CONTENT_ENCODING);
             let saw_length = request.headers().contains_key(CONTENT_LENGTH);
