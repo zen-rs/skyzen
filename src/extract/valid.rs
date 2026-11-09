@@ -386,11 +386,14 @@ mod tests {
                 assert_eq!(rejection.errors()[0].path, "email");
 
                 // The machine-readable list reaches the HTTP body too, through the
-                // `ErrorDetails` node in `source()`.
+                // `ErrorDetails` node in `source()` — an RFC 9457 problem document.
                 let response = skyzen_core::error_response(&rejection);
+                assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
                 let body = response.into_body().into_string().await.unwrap();
                 let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-                assert_eq!(body["details"]["violations"][0]["path"], "email");
+                assert_eq!(body["status"], 422);
+                assert_eq!(body["title"], "Unprocessable Entity");
+                assert_eq!(body["violations"][0]["path"], "email");
             }
             other => panic!("expected a validation rejection, got {other:?}"),
         }
