@@ -595,6 +595,48 @@ impl SessionsLayer {
         }
         Ok(())
     }
+
+    /// Store-side effects of a mutated session, without the cookie — run when the chain
+    /// failed and there is no response to stamp onto. `destroy` still deletes, a rotated id
+    /// still writes its record; cookie-mode keeps its whole payload in the cookie, so there
+    /// is nothing store-side to save there, and a clean session is not renewed on failure.
+    async fn persist(
+        &self,
+        store: &dyn SessionStore,
+        slot: &SessionSlot,
+    ) -> Result<(), SessionError> {
+        let (id, loaded_id, loaded, pending) = {
+            let inner = slot.0.lock().expect("session lock");
+            (
+                inner.id.clone(),
+                inner.loaded_id.clone(),
+                inner.data.clone(),
+                inner.pending,
+            )
+        };
+        match pending {
+            Pending::Destroyed => {
+                if let Some(loaded_id) = loaded_id {
+                    store.delete(&loaded_id).await?;
+                }
+            }
+            Pending::Dirty if !self.in_cookie => {
+                let data = match loaded {
+                    SessionCache::Ready(data) => data.unwrap_or_default(),
+                    SessionCache::Unloaded => match &loaded_id {
+                        Some(old) => store.load(old).await?.unwrap_or_default(),
+                        None => SessionData::new(),
+                    },
+                };
+                store.save(&id, &data, self.ttl).await?;
+                if let Some(old) = loaded_id.filter(|old| *old != id) {
+                    store.delete(&old).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn set_session_cookie_flags(cookie: &mut Cookie<'_>, ttl: Duration, secure: bool) {
@@ -616,18 +658,28 @@ impl Middleware for SessionsLayer {
             ttl: self.ttl,
             in_cookie: self.in_cookie,
         });
-        let mut response = next.run(request).await?;
+        let result = next.run(request).await;
         let Some(slot) = request.extensions().get::<SessionSlot>().cloned() else {
-            return Ok(response);
+            return result;
         };
         let keys = request
             .extensions()
             .get::<CookieKeys>()
             .cloned()
             .ok_or_else(MissingCookieKeys::new)?;
-        self.write_back(&*store, &mut response, &keys, &slot)
-            .await?;
-        Ok(response)
+        match result {
+            Ok(mut response) => {
+                self.write_back(&*store, &mut response, &keys, &slot)
+                    .await?;
+                Ok(response)
+            }
+            // The chain failed — a response will be built at the edge, too late for a cookie
+            // — but a destroyed or rotated session must still reach the store.
+            Err(error) => {
+                self.persist(&*store, &slot).await?;
+                Err(error)
+            }
+        }
     }
 
     fn provisions(&self) -> Vec<TypeId> {
