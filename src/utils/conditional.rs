@@ -68,8 +68,11 @@ pub(crate) fn fresh(
     etag: Option<&ETag>,
     last_modified: Option<SystemTime>,
 ) -> bool {
-    if let (Some(if_none_match), Some(etag)) = (headers.typed_get::<IfNoneMatch>(), etag) {
-        return !if_none_match.precondition_passes(etag);
+    // `If-None-Match` is the sole freshness signal when present — `If-Modified-Since` only
+    // applies when the stronger validator is absent (RFC 9110 §13.2.2). With nothing to
+    // compare against, no member can match, so the answer is simply "not fresh".
+    if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
+        return etag.is_some_and(|tag| !if_none_match.precondition_passes(tag));
     }
     if let (Some(if_modified_since), Some(modified)) =
         (headers.typed_get::<IfModifiedSince>(), last_modified)
