@@ -147,8 +147,8 @@ impl TrustedProxies {
         // Order is trust-aware: a recorded peer provably appended the rightmost
         // `X-Forwarded-For` entry, while a `Forwarded` it merely passed through stays
         // client-written — so with a peer, XFF answers first and `Forwarded` cannot shadow
-        // it. With no peer (serverless) `Forwarded` leads per RFC 7239, and the chain still
-        // has to contain a trusted hop to count.
+        // it. With no peer nothing in either header is verifiable at all; `Forwarded` is
+        // still consulted first so the answer stays RFC-ordered, and both come back None.
         if peer.is_some() {
             return x_forwarded_for_chain(request)
                 .and_then(|addrs| self.anchored_client(&addrs, peer))
@@ -168,8 +168,8 @@ impl TrustedProxies {
     /// as easily as a client address, so peerless `Forwarded`/`X-Forwarded-For` are
     /// unverifiable and never honored. (Platform headers like `cf-connecting-ip` answer
     /// before this point — those the host itself supplies.)
-    fn anchored_client(&self, addrs: &[IpAddr], peer: Option<IpAddr>) -> Option<IpAddr> {
-        peer.map(|peer| trusted_client(addrs, self, Some(peer)))
+    fn anchored_client(&self, addrs: &[Option<IpAddr>], peer: Option<IpAddr>) -> Option<IpAddr> {
+        peer.and_then(|peer| trusted_client(addrs, self, Some(peer)))
     }
 }
 
@@ -179,39 +179,46 @@ impl TrustedProxies {
 /// entry that is not is the address the trusted edge actually received the connection from —
 /// everything further left is what that client *claims*, so the walk stops there. The peer
 /// itself is not part of the recorded chain: the caller has already vouched for it.
-fn trusted_client(addrs: &[IpAddr], proxies: &TrustedProxies, peer: Option<IpAddr>) -> IpAddr {
+fn trusted_client(
+    addrs: &[Option<IpAddr>],
+    proxies: &TrustedProxies,
+    peer: Option<IpAddr>,
+) -> Option<IpAddr> {
     for addr in addrs.iter().rev() {
-        if !proxies.trusts(addr) {
+        // An unparsed hop is opaque — it cannot be shown trusted, so it is the boundary.
+        // If the walk's client is that hop, nothing verifiable remains to report.
+        if !addr.is_some_and(|ip| proxies.trusts(&ip)) {
             return *addr;
         }
     }
     // Every recorded hop is trusted, so the client is the leftmost entry — or, when the chain
     // is empty, the peer itself.
-    addrs
-        .first()
-        .copied()
-        .or(peer)
-        .unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST))
+    addrs.first().copied().flatten().or(peer)
 }
 
 /// The `for=` chain of every `Forwarded` header field, leftmost first — each header
 /// instance contributes in received order, exactly as a comma-join of them would
 /// (RFC 7230 §3.2.2). `None` when no `for=` is present.
-fn forwarded_chain(request: &Request) -> Option<Vec<IpAddr>> {
+fn forwarded_chain(request: &Request) -> Option<Vec<Option<IpAddr>>> {
     let mut addrs = Vec::new();
     for value in request.headers().get_all(header::FORWARDED).iter() {
         for entry in value.as_bytes().split(|b| *b == b',') {
+            // Every member is a hop; its `for=` is the address claim. A member without one —
+            // or with a value that does not parse — still occupies a position: `None` marks
+            // an opaque hop the trust walk may not cross.
+            let mut hop = None;
             for pair in entry.split(|b| *b == b';') {
                 let Some((mut key, value)) = split_once(pair, b'=') else {
                     continue;
                 };
                 trim(&mut key);
-                if !key.eq_ignore_ascii_case(b"for") {
-                    continue;
+                if key.eq_ignore_ascii_case(b"for") {
+                    hop = Some(parse_forwarded_for_value(value).ok());
+                    break;
                 }
-                if let Ok(addr) = parse_forwarded_for_value(value) {
-                    addrs.push(addr);
-                }
+            }
+            if entry.iter().any(|b| !b.is_ascii_whitespace()) {
+                addrs.push(hop.flatten());
             }
         }
     }
@@ -220,14 +227,16 @@ fn forwarded_chain(request: &Request) -> Option<Vec<IpAddr>> {
 
 /// The address list of every `X-Forwarded-For` header field, leftmost first — each
 /// instance's entries extend the list in received order.
-fn x_forwarded_for_chain(request: &Request) -> Option<Vec<IpAddr>> {
-    let addrs: Vec<IpAddr> = request
+fn x_forwarded_for_chain(request: &Request) -> Option<Vec<Option<IpAddr>>> {
+    let addrs: Vec<Option<IpAddr>> = request
         .headers()
         .get_all(HeaderName::from_static("x-forwarded-for"))
         .iter()
         .flat_map(|value| value.as_bytes().split(|b| *b == b','))
-        .filter_map(|mut raw| {
+        .map(|mut raw| {
             trim(&mut raw);
+            // An entry that does not parse still occupies a position — `None` is an opaque
+            // hop the trust walk treats as untrusted rather than pretending it never was.
             std::str::from_utf8(raw)
                 .ok()
                 .and_then(|raw| IpAddr::from_str(raw).ok())
