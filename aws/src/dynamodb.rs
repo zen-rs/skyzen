@@ -174,9 +174,7 @@ impl DynamoKv {
             .table_name(&self.table_name)
             .send()
             .await
-            .map_err(|error| {
-                KvError::backend_with("describing the table's time-to-live settings failed", error)
-            })?;
+            .map_err(sdk_error)?;
         let enabled = description.time_to_live_description().is_some_and(|ttl| {
             ttl.time_to_live_status() == Some(&aws_sdk_dynamodb::types::TimeToLiveStatus::Enabled)
                 && ttl.attribute_name() == Some(self.ttl_attribute.as_str())
