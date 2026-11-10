@@ -39,7 +39,9 @@ use crate::{
 /// A bound, listening socket waiting for the thread that will serve it.
 #[derive(Debug)]
 pub(super) enum Socket {
-    /// A TCP listener.
+    /// A TCP listener of this thread's own. Windows never has one: its threads are dealt their
+    /// connections.
+    #[cfg(not(windows))]
     Tcp(std::net::TcpListener),
     /// The connections a separate acceptor deals to this thread, where one socket cannot be
     /// shared between threads.
@@ -77,6 +79,7 @@ impl Socket {
     )]
     pub(super) fn tcp_addr(&self) -> Option<io::Result<std::net::SocketAddr>> {
         match self {
+            #[cfg(not(windows))]
             Self::Tcp(listener) => Some(listener.local_addr()),
             Self::Handoff(incoming) => Some(incoming.local_addr()),
             #[cfg(unix)]
@@ -305,6 +308,7 @@ fn work<F, A, W>(
         };
 
         match socket {
+            #[cfg(not(windows))]
             Socket::Tcp(listener) => match Compio.tcp_listener(listener) {
                 Ok(listener) => {
                     serve_tcp(plan, &h1, executor, listener, endpoint, shutdown, ready).await;
