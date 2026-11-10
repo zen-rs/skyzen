@@ -23,8 +23,10 @@
 //! the two readings cannot disagree about where a `;` inside a quoted password ends a value.
 
 use connection_string::AdoNetString;
-use deadpool_tiberius::{tiberius::EncryptionLevel, Manager};
 use skyzen_services::DbError;
+use tiberius::{Config, EncryptionLevel};
+
+use super::pool::Manager;
 
 /// The keyword that decides whether the connection is encrypted.
 const ENCRYPT_KEY: &str = "encrypt";
@@ -52,24 +54,24 @@ pub fn manager(connection_string: &str) -> Result<Manager, DbError> {
     let keywords = keywords(connection_string)?;
     check_authentication(&keywords)?;
 
-    let manager = Manager::from_ado_string(connection_string).map_err(|error| {
+    let mut config = Config::from_ado_string(connection_string).map_err(|error| {
         DbError::backend_with(
             format!("the Azure SQL connection string could not be read: {error}"),
             error,
         )
     })?;
 
-    Ok(match keywords.get(ENCRYPT_KEY) {
-        None => manager.encryption(EncryptionLevel::Required),
+    match keywords.get(ENCRYPT_KEY) {
+        None => config.encryption(EncryptionLevel::Required),
         Some(value) => {
             tracing::debug!(
                 encrypt = %value,
                 "the Azure SQL connection string sets `Encrypt` itself; Azure SQL accepts only \
                  encrypted connections, so anything but a truthy value will fail to log in",
             );
-            manager
         }
-    })
+    }
+    Ok(Manager::new(config))
 }
 
 /// Read the keyword/value pairs of an ADO.NET connection string, with lowercased keywords.
@@ -108,7 +110,7 @@ fn check_authentication(keywords: &AdoNetString) -> Result<(), DbError> {
 #[cfg(test)]
 mod tests {
     use super::{check_authentication, keywords, manager, AdoNetString};
-    use deadpool_tiberius::tiberius::Config;
+    use tiberius::Config;
 
     /// The shape of the Azure portal's "ADO.NET (SQL authentication)" sample.
     const PORTAL_SAMPLE: &str = "Server=tcp:skyzen.database.windows.net,1433;\

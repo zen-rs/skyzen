@@ -25,8 +25,9 @@ use skyzen_services::queue::{
 use time::{OffsetDateTime, UtcOffset};
 use url::Url;
 use zenwave::{
+    backend::NativeBackend,
     header::{HeaderMap, AUTHORIZATION, CONTENT_LENGTH, RETRY_AFTER},
-    Body, DefaultClient, Endpoint as _, Method, Request, Response, StatusCode, Transport,
+    Body, Method, Request, Response, StatusCode,
 };
 
 use crate::status::{classify, retry_after, AzureStatus};
@@ -88,13 +89,13 @@ const TOKEN_TTL: time::Duration = time::Duration::seconds(300);
 /// fail, the rest are still delivered and [`QueueError::PartialBatch`] names exactly which entries
 /// were rejected.
 ///
-/// Cloning is cheap — the connection pool lives on the transport, which is a handle onto shared
+/// Cloning is cheap — the connection pool lives behind the backend, which is a handle onto shared
 /// state.
 #[derive(Debug, Clone)]
 pub struct ServiceBusQueue {
-    /// The transport every request rides on. Its per-origin connection pool is shared by the
-    /// clients built from it, so cloning the queue keeps one pool.
-    transport: Transport,
+    /// The backend every request rides on. Its connection pool is shared by every clone, so
+    /// cloning the queue keeps one pool.
+    http: NativeBackend,
     /// `https://{namespace}.servicebus.windows.net/{queue}`, the root of every request URL.
     queue_url: Url,
     /// The shared-access policy name that signs requests.
@@ -120,7 +121,7 @@ impl ServiceBusQueue {
         signing_key: &str,
     ) -> Result<Self, QueueError> {
         Ok(Self {
-            transport: Transport::system(),
+            http: crate::http::system_backend(),
             queue_url: queue_url(namespace, queue)?,
             policy_name: policy_name.into(),
             signing_key: SigningKey(signing_key.to_owned()),
@@ -212,15 +213,12 @@ impl ServiceBusQueue {
         ))
     }
 
-    /// The client one request goes out on.
+    /// Send `request` and return the service's answer, an error status included.
     ///
-    /// One is built per request because the connection pool lives on the `Transport`: clients
-    /// over a clone of the same transport share connections, so this costs a struct wrap, not a
-    /// pool. It is the raw backend — a SAS signature is bound to the URI it signs, so a redirect
-    /// could never be honored anyway, and a 3xx should surface as itself rather than as a
-    /// replayed hop.
-    fn client(&self) -> zenwave::backend::DefaultBackend {
-        DefaultClient::raw(self.transport.clone())
+    /// The raw backend — a SAS signature is bound to the URI it signs, so a redirect could never
+    /// be honored anyway, and a 3xx surfaces as itself rather than as a replayed hop.
+    async fn send(&self, request: &mut Request) -> Result<Response, zenwave::Error> {
+        crate::http::send(&mut self.http.clone(), request).await
     }
 
     /// Build a bodyless request against `url`, signed with that URL's SAS token.
@@ -289,9 +287,8 @@ impl ServiceBusQueue {
     ) -> Result<(), ServiceBusError> {
         let mut request = self.send_request(encode_message(message), &options)?;
 
-        let mut client = self.client();
-        let response = client
-            .respond(&mut request)
+        let response = self
+            .send(&mut request)
             .await
             .map_err(|error| ServiceBusError::transport("send", error))?;
 
@@ -315,9 +312,8 @@ impl ServiceBusQueue {
 
         let mut request = self.request(Method::POST, &url).map_err(queue_error)?;
 
-        let mut client = self.client();
-        let response = client
-            .respond(&mut request)
+        let response = self
+            .send(&mut request)
             .await
             .map_err(|error| queue_error(ServiceBusError::transport("peek-lock", error)))?;
 
@@ -361,9 +357,8 @@ impl ServiceBusQueue {
 
         let mut request = self.request(method, &url).map_err(queue_error)?;
 
-        let mut client = self.client();
-        let response = client
-            .respond(&mut request)
+        let response = self
+            .send(&mut request)
             .await
             .map_err(|error| queue_error(ServiceBusError::transport("settle", error)))?;
 
@@ -1105,6 +1100,86 @@ mod tests {
         ServiceBusQueue::from_connection_string(CONNECTION_STRING, "jobs").expect("should build")
     }
 
+    /// A message in Chinese, Japanese and Korean.
+    const LOOPBACK_MESSAGE: &str = "订单已付款。注文は支払い済み。주문 결제 완료.";
+
+    /// The queue `jobs` with every request going to `server` instead of the namespace's host.
+    fn loopback_queue(server: &skyzen_test::LoopbackServer) -> ServiceBusQueue {
+        ServiceBusQueue {
+            queue_url: url::Url::parse(&format!("http://{}/jobs", server.addr()))
+                .expect("a loopback URL"),
+            ..queue()
+        }
+    }
+
+    fn assert_no_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+    }
+
+    /// A send leaves through zenwave's native backend, signed with the queue's SAS, while the test
+    /// runs on compio with no tokio runtime.
+    #[compio::test]
+    async fn a_send_goes_out_on_zenwave_without_a_tokio_runtime() {
+        assert_no_tokio_runtime();
+        let (seen, received) = std::sync::mpsc::channel::<skyzen_test::ReceivedRequest>();
+        let server = skyzen_test::LoopbackServer::start(move |request| {
+            seen.send(request).expect("the test is still listening");
+            let mut response = http_kit::Response::new(http_kit::Body::empty());
+            *response.status_mut() = StatusCode::CREATED;
+            response
+        });
+
+        MessageQueue::send(&loopback_queue(&server), LOOPBACK_MESSAGE.as_bytes())
+            .await
+            .expect("the send should succeed");
+
+        let request = received.recv().expect("the server saw the send");
+        assert_eq!(request.method(), http::Method::POST);
+        assert_eq!(request.uri().path(), "/jobs/messages");
+        let authorization = request.headers()[AUTHORIZATION]
+            .to_str()
+            .expect("a text header");
+        assert!(
+            authorization.starts_with("SharedAccessSignature "),
+            "{authorization}"
+        );
+        assert_eq!(request.body().as_ref(), LOOPBACK_MESSAGE.as_bytes());
+    }
+
+    /// A `429` is the service's answer, read out of the response: the caller sees a throttle and
+    /// the delay the service asked for, not a transport failure.
+    #[compio::test]
+    async fn a_throttled_send_reports_the_services_retry_delay() {
+        assert_no_tokio_runtime();
+        let server = skyzen_test::LoopbackServer::start(|_| {
+            let mut response = http_kit::Response::new(http_kit::Body::from_bytes(
+                "<Error><Code>429</Code><Detail>The request was throttled.</Detail></Error>",
+            ));
+            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            response
+                .headers_mut()
+                .insert(zenwave::header::RETRY_AFTER, HeaderValue::from_static("30"));
+            response
+        });
+
+        let error = MessageQueue::send(&loopback_queue(&server), LOOPBACK_MESSAGE.as_bytes())
+            .await
+            .expect_err("a throttled send is an error");
+
+        assert!(
+            matches!(
+                error,
+                QueueError::Throttled {
+                    retry_after: Some(delay)
+                } if delay == Duration::from_secs(30)
+            ),
+            "{error:?}"
+        );
+    }
+
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (name, value) in pairs {
@@ -1576,7 +1651,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_delayed_retry_is_refused_rather_than_silently_immediate() {
         let error = queue()
             .nack(
@@ -1588,7 +1663,7 @@ mod tests {
         assert!(matches!(error, QueueError::Unsupported(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_per_delivery_visibility_timeout_is_refused() {
         let error = queue()
             .receive(
@@ -1601,7 +1676,7 @@ mod tests {
         assert!(matches!(error, QueueError::Unsupported(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_receive_without_a_wait_is_refused_and_names_the_wait_to_pass() {
         // The default options carry no wait, and Service Bus has no immediate receive to answer
         // them with — so the call says so instead of blocking for the service's own default.

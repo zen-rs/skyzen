@@ -11,7 +11,7 @@ use futures_util::TryStreamExt as _;
 use http::{header, HeaderMap, Method, Request, Response, StatusCode, Uri};
 use opendal::raw::{parse_content_encoding, parse_content_length};
 use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport, Result};
-use zenwave::{Body, DefaultClient, Endpoint as _, Transport};
+use zenwave::{backend::NativeBackend, Body};
 
 /// How many hops a redirected request may take before its answer is taken as-is — the bound
 /// `reqwest` and `zenwave` draw alike.
@@ -20,17 +20,14 @@ const MAX_REDIRECTS: u32 = 10;
 /// An [`HttpTransport`] that dispatches requests through `zenwave`.
 #[derive(Debug)]
 pub(super) struct ZenwaveTransport {
-    /// The transport the requests go out on; the per-origin connection pool lives on it, so
-    /// clients built per request still share connections.
-    transport: Transport,
+    /// The backend the requests go out on; clones share its connection pool.
+    http: NativeBackend,
 }
 
 impl ZenwaveTransport {
-    /// A transport over the system settings: the OS proxy rules and trust store.
-    pub(super) fn system() -> Self {
-        Self {
-            transport: Transport::system(),
-        }
+    /// A transport sending its requests through `http`.
+    pub(super) const fn new(http: NativeBackend) -> Self {
+        Self { http }
     }
 }
 
@@ -51,14 +48,17 @@ impl HttpTransport for ZenwaveTransport {
         let mut redirects = 0;
         let response = loop {
             let mut request = Request::from_parts(parts.clone(), Body::from_stream(body.clone()));
-            let mut client = DefaultClient::raw(self.transport.clone());
-            let response = client.respond(&mut request).await.map_err(|error| {
-                Error::new(ErrorKind::Unexpected, "send http request")
-                    .with_operation("zenwave::respond")
-                    .with_context("url", parts.uri.to_string())
-                    .with_temporary(error.is_transient())
-                    .set_source(error)
-            })?;
+            // An error status is OpenDAL's to read — a `404` is how it learns a blob is absent —
+            // so it comes back as the response it is.
+            let response = crate::http::send(&mut self.http.clone(), &mut request)
+                .await
+                .map_err(|error| {
+                    Error::new(ErrorKind::Unexpected, "send http request")
+                        .with_operation("zenwave::respond")
+                        .with_context("url", parts.uri.to_string())
+                        .with_temporary(error.is_transient())
+                        .set_source(error)
+                })?;
 
             let status = response.status();
             if redirects >= MAX_REDIRECTS

@@ -17,7 +17,9 @@ futures-util = "0.3"
 base64 = "0.22"
 tracing.workspace = true
 
-# Cosmos DB.
+# Cosmos DB. Its default features stay on: the client's driver builds its own reqwest transport
+# through an `HttpClientFactory` with no public setter, and runs its background loops on tokio, so
+# Cosmos still needs a tokio context.
 azure_data_cosmos = { version = "0.37.1", features = ["key_auth"], optional = true }
 
 # Service Bus speaks its REST API directly, on the same zenwave stack the blob backend uses. The
@@ -33,19 +35,23 @@ sha2 = { version = "0.10", optional = true }
 time = { version = "0.3", features = ["serde-well-known"], optional = true }
 url = { version = "2", optional = true }
 
-# Azure Storage queues, and the credential types Cosmos and the queues share.
-azure_storage_queue = { version = "1.0", optional = true }
-azure_core = { version = "1.0", optional = true }
+# Azure Storage queues, and the credential types Cosmos and the queues share. No default features:
+# those are reqwest on tokio. The queue client's requests go out on zenwave through an azure_core
+# `HttpClient` (`storage_queue::transport`), and `async-trait` is how that trait is implemented.
+azure_storage_queue = { version = "1.0", default-features = false, optional = true }
+azure_core = { version = "1.0", default-features = false, optional = true }
+async-trait = { version = "0.1", optional = true }
 # Storage queues have no long polling of their own, so `receive` emulates one with a timer.
 async-io = { workspace = true, optional = true }
 
 # Blob Storage: OpenDAL moves the bytes over a zenwave `HttpTransport`, and the listing, tiering
 # and presigning REST calls go out on the same client and the same `reqsign` signer OpenDAL's own
-# azblob service is built on.
-opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "services-azblob"], optional = true }
-# zenwave is the workspace's HTTP client: hyper over async-io with rustls verified against the OS
-# trust store, HTTP/2 negotiated by ALPN — the same selection `skyzen-cli` makes.
-zenwave = { version = "0.9", default-features = false, features = ["hyper-backend", "rustls", "http2"], optional = true }
+# azblob service is built on. No `executors-tokio`: the backend runs every OpenDAL operation at
+# concurrency one, which OpenDAL runs inline on the caller's task, so no executor is reached.
+opendal = { version = "0.58", default-features = false, features = ["services-azblob"], optional = true }
+# zenwave's runtime-neutral native backend (`http`): HTTP/1.1 on a connection pool that lives on a
+# compio driver, behind a `Send` handle, with rustls verified against the OS trust store.
+zenwave = { version = "0.9.1", default-features = false, features = ["native-compio"], optional = true }
 reqsign-azure-storage = { version = "3.1", optional = true }
 reqsign-core = { version = "3.1", optional = true }
 quick-xml = { version = "0.41", features = ["serialize"], optional = true }
@@ -53,16 +59,21 @@ http = { version = "1.4", optional = true }
 bytes = { version = "1", optional = true }
 
 # Azure SQL. `tiberius` is the only maintained TDS driver for Rust and sqlx has none, so it is what
-# makes Azure SQL reachable at all; `deadpool-tiberius` is the pool in front of it, chosen over
-# `bb8-tiberius` because deadpool's `Object::take` can detach a connection from the pool, which is
-# what keeps a transaction that was dropped without a commit from handing back a dirty connection.
+# makes Azure SQL reachable at all. It reads and writes any `futures-io` stream, and `async-net`'s
+# TCP stream is the one it runs on: async-io's reactor needs no tokio context, and tiberius needs a
+# `Send` stream, which a thread-per-core driver's socket is not. `deadpool` is the pool in front of
+# it, chosen over `bb8` because `Object::take` can detach a connection from the pool, which is what
+# keeps a transaction that was dropped without a commit from handing back a dirty connection; its
+# manager (`sql::pool`) is this crate's, because `deadpool-tiberius` dials `tokio::net::TcpStream`.
 # `native-tls` rather than `rustls`: tiberius's rustls feature pins rustls 0.21, whose
 # rustls-webpki 0.101 carries three RustSec vulnerabilities (2026-0098/0099/0104) with no
 # compatible fix. The platform TLS path costs an unmaintained `async-native-tls` wrapper and an
 # async-std transitive (already in the tree via sqlx-macros) — warnings, not vulnerabilities —
 # and puts SChannel/SecureTransport/OpenSSL under the handshake instead. Revisit when a tiberius
 # release moves to rustls >= 0.23.
-deadpool-tiberius = { version = "0.1.9", default-features = false, features = ["native-tls", "tds73", "chrono"], optional = true }
+tiberius = { version = "0.13.0", default-features = false, features = ["native-tls", "tds73", "chrono"], optional = true }
+deadpool = { version = "0.13.1", default-features = false, features = ["managed"], optional = true }
+async-net = { workspace = true, optional = true }
 # tiberius's own ADO.NET parser, named directly so the encryption and authentication policy applied
 # to a connection string reads exactly the string tiberius will read.
 connection-string = { version = "0.2", optional = true }
@@ -76,7 +87,12 @@ bigdecimal = { version = "0.4", optional = true }
 # `AzureStorageQueue::from_sas_env` is tested against a variable this crate sets and removes, and
 # the environment is process-wide: the tests that touch it run one at a time.
 serial_test = "3.2"
-tokio = { version = "1", features = ["macros", "rt"] }
+# The tests run on a compio runtime, the one the native server runs, against a loopback server;
+# tokio is here only to assert that no tokio runtime is running.
+compio = { version = "0.19.2", default-features = false, features = ["runtime", "time", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
+skyzen-test = { workspace = true, features = ["loopback"] }
+http-kit.workspace = true
 
 [features]
 default = ["cosmos", "blob", "servicebus", "storage-queue", "sql"]
@@ -99,9 +115,19 @@ servicebus = [
     "dep:sha2",
     "dep:http",
 ]
-storage-queue = ["dep:azure_storage_queue", "dep:azure_core", "dep:async-io"]
+storage-queue = [
+    "dep:azure_storage_queue",
+    "dep:azure_core",
+    "dep:async-trait",
+    "dep:async-io",
+    "dep:zenwave",
+    "dep:http",
+    "dep:bytes",
+]
 sql = [
-    "dep:deadpool-tiberius",
+    "dep:tiberius",
+    "dep:deadpool",
+    "dep:async-net",
     "dep:connection-string",
     "dep:chrono",
     "dep:bigdecimal",
