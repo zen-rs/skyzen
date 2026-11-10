@@ -38,6 +38,10 @@ name = "skyzen-core"
 git_tag_name = "core-v{{ version }}"
 
 [[package]]
+name = "skyzen-h1"
+git_tag_name = "h1-v{{ version }}"
+
+[[package]]
 name = "skyzen-hyper"
 git_tag_name = "hyper-v{{ version }}"
 

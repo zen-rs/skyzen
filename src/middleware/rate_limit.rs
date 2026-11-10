@@ -227,7 +227,7 @@ impl Middleware for RateLimit {
         &self,
         request: &mut Request,
         next: Next<'_>,
-    ) -> impl Future<Output = Result<Response, Error>> + Send {
+    ) -> impl Future<Output = Result<Response, Error>> {
         async move {
             let store = match (self.resolve)(request).await {
                 Ok(store) => store,

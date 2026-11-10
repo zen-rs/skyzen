@@ -7,7 +7,7 @@
 //! ```
 
 use core::{future::Future, marker::PhantomData};
-use http_kit::{Endpoint, Request, Response, SendEndpoint};
+use http_kit::{Endpoint, Request, Response};
 use skyzen_core::{Extractor, Responder};
 use std::fmt::Display;
 
@@ -66,24 +66,25 @@ impl<E: Extractor, R: Responder> core::error::Error for HandlerError<E, R> {
 //      |                              -- ^^^^^^^ not a handler
 //      = note: a handler is an `async fn` (or closure) whose arguments all implement `Extractor`
 //              and whose return type implements `Responder`
-//      = note: the future a handler returns must be `Send`: ...
 //      = note: a handler takes at most 15 arguments; ...
 //      = note: common fixes: ...
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a Skyzen handler",
     label = "not a handler",
     note = "a handler is an `async fn` (or closure) whose arguments all implement `Extractor` and whose return type implements `Responder`",
-    note = "the future a handler returns must be `Send`: do not hold an `Rc` or a `MutexGuard` across an `.await`",
     note = "a handler takes at most 15 arguments; group the rest into one extractor",
     note = "common fixes: take path parameters as `Path<T>` or `Params`, take a body as `Json<T>`/`Bytes`/`String`, and return `Json<T>`, `String` or `Result<T>` rather than a bare value",
     note = "a payload carried by `Json<T>`, `Form<T>`, `Query<T>` or `PrettyJson<T>` must also derive `ToSchema`, since that is what the generated OpenAPI document describes it with: `#[derive(Serialize, skyzen::ToSchema)]`"
 )]
-pub trait Handler<T: Extractor, R: Responder>: Send + Sync + Clone + 'static {
+///
+/// Neither the handler nor the future it returns has to be `Send`: a router is built and served on
+/// one thread, so a handler may capture an `Rc` of per-thread state and hold it across an `.await`.
+pub trait Handler<T: Extractor, R: Responder>: Clone + 'static {
     /// Handle the request and make a response.
     fn call_handler(
         &self,
         request: &mut Request,
-    ) -> impl Future<Output = Result<Response, HandlerError<T, R>>> + Send;
+    ) -> impl Future<Output = Result<Response, HandlerError<T, R>>>;
 }
 
 /// Adapter that turns a strongly typed [`Handler`] into an [`Endpoint`].
@@ -132,8 +133,8 @@ macro_rules! impl_handler {
     () => {
         impl<F, Fut, Res> Handler<(), Res> for F
         where
-            F: 'static + Clone + Send + Sync + Fn() -> Fut,
-            Fut: Send + Future<Output = Res>,
+            F: 'static + Clone + Fn() -> Fut,
+            Fut: Future<Output = Res>,
             Res: Responder,
         {
             async fn call_handler(&self, request: &mut Request) -> Result<Response, HandlerError<(), Res>> {
@@ -148,8 +149,8 @@ macro_rules! impl_handler {
 
         impl<F, Fut, Res,$($ty:Extractor,)+> Handler<($($ty,)+) , Res> for F
         where
-            F: 'static + Clone + Send + Sync + Fn($($ty,)+) -> Fut,
-            Fut: Send + Future<Output = Res>,
+            F: 'static + Clone + Fn($($ty,)+) -> Fut,
+            Fut: Future<Output = Res>,
             Res: Responder,
         {
             async fn call_handler(&self, request: &mut Request) -> Result<Response, HandlerError<($($ty,)+), Res>> {
@@ -164,22 +165,9 @@ macro_rules! impl_handler {
 
 tuples!(impl_handler);
 
-impl<H: Handler<T, R> + Send + Sync, T: Extractor + Send + Sync, R: Responder + Send + Sync>
-    Endpoint for IntoEndpoint<H, T, R>
-{
+impl<H: Handler<T, R>, T: Extractor, R: Responder> Endpoint for IntoEndpoint<H, T, R> {
     type Error = HandlerError<T, R>;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.handler.call_handler(request).await
-    }
-}
-
-impl<H: Handler<T, R> + Send + Sync, T: Extractor + Send + Sync, R: Responder + Send + Sync>
-    SendEndpoint for IntoEndpoint<H, T, R>
-{
-    fn respond_send(
-        &mut self,
-        request: &mut Request,
-    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
-        self.respond(request)
     }
 }

@@ -152,8 +152,6 @@ mod tests {
     #[derive(Debug, Clone)]
     struct ReadAlarmEndpoint;
 
-    http_kit::impl_send_endpoint!(ReadAlarmEndpoint);
-
     impl Endpoint for ReadAlarmEndpoint {
         type Error = Infallible;
 

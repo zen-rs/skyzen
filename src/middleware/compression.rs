@@ -521,8 +521,6 @@ mod tests {
         }
     }
 
-    http_kit::impl_send_endpoint!(StaticEndpoint);
-
     impl Endpoint for StaticEndpoint {
         type Error = Infallible;
         fn respond(
@@ -661,18 +659,6 @@ mod tests {
             _request: &mut Request,
         ) -> impl Future<Output = Result<Response, Self::Error>> {
             ready(Ok((self.0)()))
-        }
-    }
-
-    impl<F> http_kit::SendEndpoint for FnEndpoint<F>
-    where
-        F: Fn() -> Response + Clone + Send + Sync + 'static,
-    {
-        fn respond_send(
-            &mut self,
-            request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
-            self.respond(request)
         }
     }
 

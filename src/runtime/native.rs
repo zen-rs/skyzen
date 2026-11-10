@@ -1,14 +1,16 @@
 use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    pin::Pin,
-    ptr,
+    rc::Rc,
     sync::Arc,
+};
+#[cfg(feature = "server-tls")]
+use std::{
+    pin::Pin,
     task::{Context, Poll},
 };
 
 use crate::{
-    extract::PeerAddr,
     routing::ServedRoutes,
     runtime::{
         azure,
@@ -16,7 +18,7 @@ use crate::{
         context::ShutdownGuard,
         WorkerContext,
     },
-    SendEndpoint,
+    Endpoint,
 };
 use async_channel::{bounded, Receiver, Sender};
 #[cfg(unix)]
@@ -24,170 +26,23 @@ use async_net::unix::{UnixListener, UnixStream};
 use async_net::TcpListener;
 use core::convert::Infallible;
 use executor_core::{
-    smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
+    smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor,
+    LocalExecutor as _, Task,
 };
 use futures_util::{future::FutureExt, Stream, StreamExt, TryStreamExt};
-use http_body_util::BodyDataStream;
-use http_kit::{
-    error::BoxHttpError,
-    utils::{AsyncRead, AsyncReadExt, AsyncWrite},
-    BodyError,
-};
-use hyper::{
-    body::Incoming,
-    server::conn::{http1, http2},
-    service::Service,
-};
-use skyzen_hyper::AsyncIoTimer;
+use http_kit::utils::{AsyncRead, AsyncWrite};
+use http_kit::Extensions;
+use skyzen_core::EndpointFactory;
+use skyzen_hyper::{serve_connection, sniff_protocol, IntoService, Prefixed, Protocol};
 use tracing::{debug, error, info, warn};
 use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
 
-type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
-
-struct HyperExecutor<E>(Arc<E>);
-
-impl<E> Clone for HyperExecutor<E> {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl<E> std::fmt::Debug for HyperExecutor<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HyperExecutor").finish_non_exhaustive()
-    }
-}
-
-impl<Fut, E> hyper::rt::Executor<Fut> for HyperExecutor<E>
-where
-    Fut: Future + Send + 'static,
-    Fut::Output: Send + 'static,
-    E: CoreExecutor + 'static,
-{
-    fn execute(&self, fut: Fut) {
-        self.0.spawn(fut).detach();
-    }
-}
-
-struct ConnectionWrapper<C>(C);
-
-impl<C: Unpin + AsyncRead> hyper::rt::Read for ConnectionWrapper<C> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let inner = &mut self.get_mut().0;
-
-        // SAFETY: `buf.as_mut()` gives a `&mut [MaybeUninit<u8>]`. `AsyncRead` expects
-        // initialized memory, so we first zero every slot; only then is viewing the slice as
-        // `&mut [u8]` sound (a cast without initialization would be UB). We advance the buffer
-        // by the number of bytes written to maintain correctness.
-        let buffer = unsafe {
-            let unfilled = buf.as_mut();
-            for byte in unfilled.iter_mut() {
-                byte.write(0);
-            }
-            &mut *(ptr::from_mut(unfilled) as *mut [u8])
-        };
-
-        match Pin::new(inner).poll_read(cx, buffer) {
-            Poll::Ready(Ok(n)) => {
-                unsafe {
-                    buf.advance(n);
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<C: AsyncWrite + Unpin> hyper::rt::Write for ConnectionWrapper<C> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let inner = &mut self.get_mut().0;
-        Pin::new(inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        let inner = &mut self.get_mut().0;
-        Pin::new(inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let inner = &mut self.get_mut().0;
-        Pin::new(inner).poll_close(cx)
-    }
-}
-
-#[derive(Debug)]
-struct Prefixed<C> {
-    buffer: Vec<u8>,
-    pos: usize,
-    inner: C,
-}
-
-impl<C> Prefixed<C> {
-    const fn new(inner: C, buffer: Vec<u8>) -> Self {
-        Self {
-            buffer,
-            pos: 0,
-            inner,
-        }
-    }
-}
-
-impl<C: Unpin> Unpin for Prefixed<C> {}
-
-impl<C: AsyncRead + Unpin> AsyncRead for Prefixed<C> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let this = self.get_mut();
-        if this.pos < this.buffer.len() {
-            let available = this.buffer.len() - this.pos;
-            let n = available.min(buf.len());
-            buf[..n].copy_from_slice(&this.buffer[this.pos..this.pos + n]);
-            this.pos += n;
-            if this.pos == this.buffer.len() {
-                this.buffer.clear();
-                this.pos = 0;
-            }
-            return Poll::Ready(Ok(n));
-        }
-
-        Pin::new(&mut this.inner).poll_read(cx, buf)
-    }
-}
-
-impl<C: AsyncWrite + Unpin> AsyncWrite for Prefixed<C> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_close(cx)
-    }
-}
+/// The executor a native server thread spawns its connections on.
+///
+/// Local: a connection, its router and everything the router runs stay on this thread, so none
+/// of them has to be `Send`.
+type ThreadExecutor = async_executor::LocalExecutor<'static>;
 
 /// Initialize the tracing subscriber + color-eyre once per process.
 /// # Panics
@@ -1051,12 +906,14 @@ impl std::fmt::Display for StartupError {
 
 impl std::error::Error for StartupError {}
 
-/// Build the executor, serve the provided endpoint over Hyper, and run the declared queue
-/// consumers beside it.
+/// Build the executor, serve the application over Hyper, and run the declared queue consumers
+/// beside it.
 ///
-/// `factory` produces the endpoint together with its [`ConsumerSet`] — `()` for an application
-/// that declares no `[[native.queue_consumer]]` — so both are built from the same service
-/// instances rather than from two independent connections to one backend.
+/// `setup` builds the application's services once and returns an [`EndpointFactory`] that
+/// captures them together with the [`ConsumerSet`] — `()` for an application that declares no
+/// `[[native.queue_consumer]]` — so both are built from the same service instances rather than
+/// from two independent connections to one backend. The serving thread calls the factory on
+/// itself, so the router and everything it holds may be `!Send`.
 ///
 /// # Where this ends up running
 ///
@@ -1090,13 +947,14 @@ impl std::error::Error for StartupError {}
 /// # Panics
 ///
 /// Panics if the global executor fails to initialize.
-pub fn launch<Fut, E, C, Hook, HookFut>(
+pub fn launch<Setup, F, C, Hook, HookFut>(
     options: LaunchOptions,
-    factory: impl FnOnce() -> Fut,
+    setup: impl FnOnce() -> Setup,
     on_shutdown: Hook,
 ) where
-    Fut: Future<Output = (E, C)> + Send + 'static,
-    E: SendEndpoint + ServedRoutes + Clone + Sync + 'static,
+    Setup: Future<Output = (F, C)>,
+    F: EndpointFactory,
+    F::Endpoint: ServedRoutes,
     C: ConsumerSet,
     Hook: FnOnce() -> HookFut,
     HookFut: Future<Output = ()>,
@@ -1126,7 +984,7 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
         // executor, the listener or the shutdown drain below.
         // `run_on_lambda` never returns `Ok`: it either hands over for the life of the process
         // or explains why it could not.
-        let Err(error) = run_on_lambda(options, factory);
+        let Err(error) = run_on_lambda(options, setup);
         error!("Skyzen cannot start: {error}");
         std::process::exit(1);
     }
@@ -1136,48 +994,58 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
         debug!("Global executor already initialized; reusing existing instance");
     }
 
-    let failed = smol::block_on(async move {
-        tracing::info!("Skyzen application starting up");
+    // This thread serves: it owns the local executor its connections run on, and builds its
+    // router from the factory, so neither ever has to be `Send`.
+    let local = Rc::new(ThreadExecutor::new());
+    let serve = {
+        let local = Rc::clone(&local);
+        async move {
+            tracing::info!("Skyzen application starting up");
 
-        let (endpoint, consumers) = factory().await;
-        let outcome = match platform {
-            Platform::Lambda => unreachable!("handed over before the executor was built"),
-            Platform::Server => {
-                let addr = options
-                    .listen
-                    .as_ref()
-                    .map_or_else(server_addr, |listen| listen.addr.clone());
-                match build_server_tls(options.tls.as_ref(), &addr) {
-                    Ok(tls) => run_server(executor, endpoint, consumers, addr, tls).await,
-                    Err(error) => Err(error),
+            let (factory, consumers) = setup().await;
+            let endpoint = factory.endpoint().await;
+            let outcome = match platform {
+                Platform::Lambda => unreachable!("handed over before the executor was built"),
+                Platform::Server => {
+                    let addr = options
+                        .listen
+                        .as_ref()
+                        .map_or_else(server_addr, |listen| listen.addr.clone());
+                    match build_server_tls(options.tls.as_ref(), &addr) {
+                        Ok(tls) => {
+                            run_server(executor, local, endpoint, consumers, addr, tls).await
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
-            }
-            Platform::AzureFunctions { port } => {
-                serve_functions_host(executor, endpoint, consumers, &options, port).await
-            }
-        };
-        let failed = match outcome {
-            Ok(Shutdown { severed: 0 }) => {
-                info!("Skyzen server shut down gracefully");
-                false
-            }
-            Ok(Shutdown { severed }) => {
-                warn!(
-                    in_flight = severed,
-                    grace_period_secs = SHUTDOWN_GRACE_PERIOD.as_secs(),
-                    "Shutdown deadline elapsed with work still in flight; it was severed"
-                );
-                false
-            }
-            Err(error) => {
-                error!("Skyzen server terminated: {error}");
-                true
-            }
-        };
+                Platform::AzureFunctions { port } => {
+                    serve_functions_host(executor, local, endpoint, consumers, &options, port).await
+                }
+            };
+            let failed = match outcome {
+                Ok(Shutdown { severed: 0 }) => {
+                    info!("Skyzen server shut down gracefully");
+                    false
+                }
+                Ok(Shutdown { severed }) => {
+                    warn!(
+                        in_flight = severed,
+                        grace_period_secs = SHUTDOWN_GRACE_PERIOD.as_secs(),
+                        "Shutdown deadline elapsed with work still in flight; it was severed"
+                    );
+                    false
+                }
+                Err(error) => {
+                    error!("Skyzen server terminated: {error}");
+                    true
+                }
+            };
 
-        on_shutdown().await;
-        failed
-    });
+            on_shutdown().await;
+            failed
+        }
+    };
+    let failed = smol::block_on(local.run(serve));
 
     if failed {
         std::process::exit(1);
@@ -1250,6 +1118,7 @@ struct Accepted<C> {
 
 async fn run_server<Exec, E, C>(
     executor: Exec,
+    local: Rc<ThreadExecutor>,
     endpoint: E,
     consumers: C,
     addr: ListenAddr,
@@ -1257,7 +1126,7 @@ async fn run_server<Exec, E, C>(
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
-    E: SendEndpoint + Clone + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     C: ConsumerSet,
 {
     match addr {
@@ -1270,7 +1139,7 @@ where
                 peer_addr: stream.peer_addr().ok(),
                 stream,
             });
-            serve_connections(executor, endpoint, consumers, incoming, tls).await
+            serve_connections(executor, local, endpoint, consumers, incoming, tls).await
         }
         #[cfg(unix)]
         ListenAddr::Unix(path) => {
@@ -1287,7 +1156,8 @@ where
             });
             // `tls` is always `None` here: `build_server_tls` refused a non-TCP
             // listener before the bind.
-            let outcome = serve_connections(executor, endpoint, consumers, incoming, tls).await;
+            let outcome =
+                serve_connections(executor, local, endpoint, consumers, incoming, tls).await;
             // The socket file is ours: left behind it becomes the stale path the next bind
             // has to probe, and a dead process gets no later chance to clean it up. Already
             // gone is not a failure — the cleanup goal is met either way.
@@ -1339,7 +1209,7 @@ async fn bind_unix_listener(path: &std::path::Path) -> std::io::Result<UnixListe
 }
 
 /// Run the optional TLS handshake and work out which HTTP version the
-/// connection speaks, returning the stream to serve and whether it is h2.
+/// connection speaks, returning the stream to serve and its protocol.
 ///
 /// `None` means the connection is already dead — a failed handshake or a client
 /// that never sent a byte — having been logged here rather than by the caller.
@@ -1347,13 +1217,13 @@ async fn bind_unix_listener(path: &std::path::Path) -> std::io::Result<UnixListe
 async fn negotiated_stream<C>(
     stream: C,
     tls: Option<&ServerTls>,
-) -> Option<(Prefixed<TlsOrPlain<C>>, bool)>
+) -> Option<(Prefixed<TlsOrPlain<C>>, Protocol)>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
     let Some(tls) = tls else {
         // Cleartext: the preface sniff decides, exactly as it always has.
-        return match sniff_protocol_with_timeout(TlsOrPlain::Plain(stream), HTTP2_PREFACE).await {
+        return match sniff_protocol(TlsOrPlain::Plain(stream), HANDSHAKE_TIMEOUT).await {
             Ok(result) => Some(result),
             Err(error) => {
                 error!("Failed to read connection preface: {error}");
@@ -1380,10 +1250,8 @@ where
     // sends. There is no h2c-by-sniffing on a TLS connection.
     match stream.get_ref().1.alpn_protocol() {
         Some(b"h2") => {
-            match sniff_protocol_with_timeout(TlsOrPlain::Tls(Box::new(stream)), HTTP2_PREFACE)
-                .await
-            {
-                Ok((prefixed, true)) => Some((prefixed, true)),
+            match sniff_protocol(TlsOrPlain::Tls(Box::new(stream)), HANDSHAKE_TIMEOUT).await {
+                Ok((prefixed, Protocol::Http2)) => Some((prefixed, Protocol::Http2)),
                 Ok(_) => {
                     debug!("ALPN negotiated h2 but the connection does not open with the preface");
                     None
@@ -1396,7 +1264,7 @@ where
         }
         _ => Some((
             Prefixed::new(TlsOrPlain::Tls(Box::new(stream)), Vec::new()),
-            false,
+            Protocol::Http1,
         )),
     }
 }
@@ -1404,12 +1272,12 @@ where
 /// The cleartext-only counterpart: `ServerTls` is uninhabited, so there is never
 /// a handshake to run and the sniff decides the protocol as it always has.
 #[cfg(not(feature = "server-tls"))]
-async fn negotiated_stream<C>(stream: C, tls: Option<&ServerTls>) -> Option<(Prefixed<C>, bool)>
+async fn negotiated_stream<C>(stream: C, tls: Option<&ServerTls>) -> Option<(Prefixed<C>, Protocol)>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
     let _ = tls;
-    match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
+    match sniff_protocol(stream, HANDSHAKE_TIMEOUT).await {
         Ok(result) => Some(result),
         Err(error) => {
             error!("Failed to read connection preface: {error}");
@@ -1421,9 +1289,14 @@ where
 /// Serve every connection `incoming` yields until shutdown or a fatal consumer report.
 ///
 /// The transport is invisible past this point: TCP and unix connections get the same
-/// protocol sniff, the same Hyper builders and the same drain accounting.
+/// protocol sniff, the same hyper connection driver and the same drain accounting.
+///
+/// Connections are spawned on `local`, the serving thread's own executor, so the endpoint and
+/// everything it runs may be `!Send`. `executor` is the `Send` one the queue consumers and
+/// [`WorkerContext::wait_until`] spawn on: neither runs the router.
 async fn serve_connections<Exec, E, C, Conn, S>(
     executor: Exec,
+    local: Rc<ThreadExecutor>,
     endpoint: E,
     consumers: C,
     mut incoming: S,
@@ -1431,18 +1304,19 @@ async fn serve_connections<Exec, E, C, Conn, S>(
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
-    E: SendEndpoint + Clone + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     C: ConsumerSet,
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Stream<Item = std::io::Result<Accepted<Conn>>> + Unpin,
 {
     let executor = Arc::new(executor);
-    let hyper_executor = HyperExecutor(Arc::clone(&executor));
     let shared_executor: Arc<AnyExecutor> = Arc::new(AnyExecutor::new(Arc::clone(&executor)));
 
     // Nothing is ever sent through this channel: it exists so that dropping the last sender
     // tells the accept loop every connection task has finished.
     let (connection_guard, connections) = bounded::<Infallible>(1);
+    // Nor through this one: dropping `stop` tells every connection to shut down gracefully.
+    let (stop, stopping) = bounded::<Infallible>(1);
     let connection_permits = Arc::new(async_lock::Semaphore::new(MAX_CONNECTIONS));
 
     let queue_consumers = ConsumerChannels::start(consumers, executor.as_ref(), &connection_guard);
@@ -1483,61 +1357,50 @@ where
                         if let Some(peer) = peer_addr {
                             debug!("Accepted connection from {peer}");
                         }
-                        let endpoint = endpoint.clone();
-                        let shared_executor = shared_executor.clone();
-                        let hyper_executor = hyper_executor.clone();
                         let guard = connection_guard.clone();
                         let tls = tls.clone();
-                        // A second token, handed to the request's `WorkerContext` so post-response
-                        // work it spawns keeps shutdown waiting too — the connection's own token
-                        // is released as soon as the connection closes.
-                        let guard_token = connection_guard.clone();
+                        let stopping = stopping.clone();
+                        let service = connection_service(
+                            endpoint.clone(),
+                            Rc::clone(&local),
+                            peer_addr,
+                            // A second token, handed to the request's `WorkerContext` so
+                            // post-response work it spawns keeps shutdown waiting too — the
+                            // connection's own token is released as soon as it closes.
+                            WorkerContext::new(
+                                Arc::clone(&shared_executor),
+                                ShutdownGuard(connection_guard.clone()),
+                            ),
+                        );
+                        let connection_executor = Rc::clone(&local);
 
                         // Spawn the per-connection task *before* sniffing the protocol preface.
                         // Awaiting client bytes inline here would let a single idle client stall
                         // the accept loop for everyone.
-                        executor
-                            .spawn(async move {
+                        local
+                            .spawn_local(async move {
                                 // Held for the lifetime of the connection so the shutdown path
                                 // can tell when the last one has finished.
                                 let _guard = guard;
                                 let _permit = permit;
 
-                                let Some((stream, is_h2)) =
+                                let Some((stream, protocol)) =
                                     negotiated_stream(stream, tls.as_ref()).await
                                 else {
                                     return;
                                 };
 
-                                let service = IntoService::new(
-                                    endpoint,
-                                    shared_executor,
-                                    peer_addr,
-                                    ShutdownGuard(guard_token),
-                                );
-                                if is_h2 {
-                                    let mut builder = http2::Builder::new(hyper_executor);
-                                    // Without a timer hyper silently disables its h2 keep-alive.
-                                    builder.timer(AsyncIoTimer);
-                                    if let Err(error) = builder
-                                        .serve_connection(ConnectionWrapper(stream), service)
-                                        .await
-                                    {
-                                        error!("Hyper h2 connection error: {error}");
-                                    }
-                                } else {
-                                    let mut builder = http1::Builder::new();
-                                    // Without a timer hyper silently disables its header read
-                                    // timeout, so a slow-loris client would hold the connection.
-                                    builder.timer(AsyncIoTimer);
-                                    if let Err(error) = builder
-                                        .serve_connection(ConnectionWrapper(stream), service)
-                                        .with_upgrades()
-                                        .await
-                                    {
-                                        error!("Hyper h1 connection error: {error}");
-                                    }
-                                }
+                                serve_connection(
+                                    stream,
+                                    protocol,
+                                    service,
+                                    connection_executor,
+                                    async move {
+                                        // Resolves with an error once `stop` is dropped.
+                                        let _ = stopping.recv().await;
+                                    },
+                                )
+                                .await;
                             })
                             .detach();
                     }
@@ -1548,9 +1411,11 @@ where
         }
     }
 
-    // Tell the consumers to stop polling, then release the accept loop's own handle so only live
-    // connections and in-flight batches keep the drain channel open.
+    // Tell the consumers to stop polling and the connections to wind down, then release the
+    // accept loop's own handle so only live connections and in-flight batches keep the drain
+    // channel open.
     drop(queue_consumers);
+    drop(stop);
     drop(connection_guard);
     let severed = drain_connections(&connections, SHUTDOWN_GRACE_PERIOD).await;
 
@@ -1565,18 +1430,20 @@ where
 /// refuse: a Skyzen server that binds a socket inside Lambda is a function that times out on every
 /// invocation with nothing in its logs to explain why.
 #[cfg(feature = "lambda")]
-fn run_on_lambda<Fut, E, C>(
+fn run_on_lambda<Setup, F, C>(
     _options: LaunchOptions,
-    factory: impl FnOnce() -> Fut,
+    setup: impl FnOnce() -> Setup,
 ) -> Result<core::convert::Infallible, StartupError>
 where
-    Fut: Future<Output = (E, C)> + Send + 'static,
-    E: SendEndpoint + Clone + Sync + 'static,
+    Setup: Future<Output = (F, C)>,
+    F: EndpointFactory,
     C: ConsumerSet,
 {
+    // The adapter's runtime is single-threaded, so the endpoint is built once, on the thread that
+    // serves every invocation.
     skyzen_lambda::run(|| async move {
-        let (endpoint, consumers) = factory().await;
-        (endpoint, LambdaConsumers(consumers))
+        let (factory, consumers) = setup().await;
+        (factory.endpoint().await, LambdaConsumers(consumers))
     })
     .map_err(|error| StartupError::Lambda(error.to_string()))?;
 
@@ -1589,13 +1456,13 @@ where
 
 #[cfg(not(feature = "lambda"))]
 #[allow(clippy::needless_pass_by_value)]
-fn run_on_lambda<Fut, E, C>(
+fn run_on_lambda<Setup, F, C>(
     _options: LaunchOptions,
-    _factory: impl FnOnce() -> Fut,
+    _setup: impl FnOnce() -> Setup,
 ) -> Result<core::convert::Infallible, StartupError>
 where
-    Fut: Future<Output = (E, C)> + Send + 'static,
-    E: SendEndpoint + Clone + Sync + 'static,
+    Setup: Future<Output = (F, C)>,
+    F: EndpointFactory,
     C: ConsumerSet,
 {
     Err(StartupError::LambdaFeatureMissing)
@@ -1630,6 +1497,7 @@ impl<C: ConsumerSet> skyzen_lambda::QueueDispatch for LambdaConsumers<C> {
 /// serving somewhere the host is not listening.
 async fn serve_functions_host<Exec, E, C>(
     executor: Exec,
+    local: Rc<ThreadExecutor>,
     endpoint: E,
     consumers: C,
     options: &LaunchOptions,
@@ -1637,7 +1505,7 @@ async fn serve_functions_host<Exec, E, C>(
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
-    E: SendEndpoint + ServedRoutes + Clone + Sync + 'static,
+    E: Endpoint + ServedRoutes + Clone + 'static,
     C: ConsumerSet,
 {
     let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -1670,7 +1538,7 @@ where
     // pushes every message, so nothing here polls.
     // TLS is always `None` here — `launch` refuses a configured pair before this path runs,
     // since the Functions host speaks plaintext to its custom handler.
-    run_server(executor, endpoint, (), addr, None).await
+    run_server(executor, local, endpoint, (), addr, None).await
 }
 
 fn server_addr() -> ListenAddr {
@@ -1703,141 +1571,22 @@ const MAX_CONNECTIONS: usize = 8_192;
 #[cfg(test)]
 const MAX_CONNECTIONS: usize = 8;
 
-/// The HTTP/2 connection preface a prior-knowledge h2c client opens with.
-const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
-/// Run [`sniff_protocol`] with a handshake timeout so a client that connects but never sends
-/// any bytes cannot hold a connection task open indefinitely.
-async fn sniff_protocol_with_timeout<C>(
-    stream: C,
-    preface: &[u8],
-) -> std::io::Result<(Prefixed<C>, bool)>
-where
-    C: AsyncRead + AsyncWrite + Unpin,
-{
-    use futures_util::future::{select, Either};
-
-    let sniff = sniff_protocol(stream, preface);
-    futures_util::pin_mut!(sniff);
-    let timer = async_io::Timer::after(HANDSHAKE_TIMEOUT);
-    futures_util::pin_mut!(timer);
-
-    match select(sniff, timer).await {
-        Either::Left((result, _)) => result,
-        Either::Right((_deadline, _)) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out waiting for connection preface",
-        )),
-    }
-}
-
-async fn sniff_protocol<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Prefixed<C>, bool)>
-where
-    C: AsyncRead + AsyncWrite + Unpin,
-{
-    // A single `read` may return fewer bytes than the full HTTP/2 preface (it can arrive across
-    // several TCP segments). Keep reading until we have enough bytes to decide, the bytes so far
-    // already diverge from the preface (so it is HTTP/1), or we hit EOF. Whatever we consumed is
-    // replayed by `Prefixed`, so no data is lost regardless of the outcome.
-    let mut buf = vec![0u8; preface.len()];
-    let mut filled = 0;
-    while filled < preface.len() {
-        if buf[..filled] != preface[..filled] {
-            break;
-        }
-        let n = stream.read(&mut buf[filled..]).await?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    buf.truncate(filled);
-    let is_h2 = buf.starts_with(preface);
-    Ok((Prefixed::new(stream, buf), is_h2))
-}
-
-#[derive(Debug)]
-struct IntoService<E> {
+/// The hyper service one native connection is served with.
+///
+/// Every request it handles carries the connection's peer address, when the transport has one,
+/// and a [`WorkerContext`] whose post-response work holds graceful shutdown open.
+fn connection_service<E: Endpoint + Clone>(
     endpoint: E,
-    executor: Arc<AnyExecutor>,
+    local: Rc<ThreadExecutor>,
     peer_addr: Option<SocketAddr>,
-    /// A clone of the accept loop's drain token, so [`WorkerContext::wait_until`] can register
-    /// post-response work with graceful shutdown.
-    shutdown_guard: ShutdownGuard,
-}
-
-impl<E: SendEndpoint + Clone> IntoService<E> {
-    const fn new(
-        endpoint: E,
-        executor: Arc<AnyExecutor>,
-        peer_addr: Option<SocketAddr>,
-        shutdown_guard: ShutdownGuard,
-    ) -> Self {
-        Self {
-            endpoint,
-            executor,
-            peer_addr,
-            shutdown_guard,
-        }
-    }
-}
-
-impl<E: SendEndpoint + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
-    for IntoService<E>
-{
-    // `Body` is an `http_body::Body`: data and trailers pass through, and a file region is read
-    // out into data frames, since hyper cannot send a file.
-    type Response = hyper::Response<crate::Body>;
-    type Error = BoxHttpError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
-        let mut endpoint = self.endpoint.clone();
-        let executor = self.executor.clone();
-        let peer_addr = self.peer_addr;
-        let context = WorkerContext::new(self.executor.clone(), self.shutdown_guard.clone());
-        let fut = async move {
-            let on_upgrade = hyper::upgrade::on(&mut req);
-            let method = req.method().clone();
-            let path = req.uri().path().to_owned();
-            let mut request: crate::Request =
-                crate::Request::from(req.map(BodyDataStream::new).map(|body| {
-                    crate::Body::from_stream(
-                        body.map_err(|error| BodyError::Other(Box::new(error))),
-                    )
-                }));
-            request.extensions_mut().insert(on_upgrade);
-            request.extensions_mut().insert(executor);
-            request.extensions_mut().insert(context);
-            if let Some(peer_addr) = peer_addr {
-                request.extensions_mut().insert(PeerAddr(peer_addr));
-            }
-
-            // Convert errors to HTTP responses at the runtime level
-            let response: crate::Response = match endpoint.respond_send(&mut request).await {
-                Ok(response) => {
-                    info!(
-                        method = method.as_str(),
-                        path = path.as_str(),
-                        status = response.status().as_u16(),
-                        "request completed"
-                    );
-                    response
-                }
-                Err(err) => {
-                    // Log and render through the shared helpers so every backend emits the same
-                    // fields and applies the same 4xx/5xx redaction policy.
-                    skyzen_core::log_endpoint_error(&err, &method, path.as_str());
-                    let mut response = skyzen_core::error_response(&err);
-                    skyzen_core::apply_pending_headers(&request, &mut response);
-                    response
-                }
-            };
-
-            Ok(response)
-        };
-
-        Box::pin(fut)
+    context: WorkerContext,
+) -> IntoService<E, ThreadExecutor> {
+    let mut extensions = Extensions::new();
+    extensions.insert(context);
+    let service = IntoService::new(endpoint, local).with_extensions(extensions);
+    match peer_addr {
+        Some(peer) => service.with_peer_addr(peer),
+        None => service,
     }
 }
 
@@ -1846,29 +1595,25 @@ mod tests {
     #[cfg(unix)]
     use super::UnixListener;
     use super::{
-        apply_cli_overrides, drain_connections, server_addr, sniff_protocol, ListenAddr,
-        ListenAddrError, ListenOverride, Platform, Prefixed, StartupError, LAMBDA_RUNTIME_API_ENV,
+        apply_cli_overrides, drain_connections, server_addr, ListenAddr, ListenAddrError,
+        ListenOverride, Platform, StartupError, LAMBDA_RUNTIME_API_ENV,
     };
     #[cfg(feature = "server-tls")]
     use super::{
-        http1, negotiated_stream, sniff_protocol_with_timeout, AnyExecutor, Arc, BoxHttpError,
-        ConnectionWrapper, Infallible, IntoService, ShutdownGuard, SmolGlobal,
+        connection_service, negotiated_stream, serve_connection, AnyExecutor, Arc, Infallible,
+        Protocol, Rc, ShutdownGuard, SmolGlobal, ThreadExecutor, WorkerContext,
     };
     use crate::runtime::azure::CUSTOM_HANDLER_PORT_ENV;
     #[cfg(feature = "server-tls")]
     use crate::Endpoint;
-    use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    #[cfg(feature = "server-tls")]
+    use http_kit::utils::{AsyncReadExt, AsyncWriteExt};
     use serial_test::serial;
     #[cfg(feature = "server-tls")]
+    use skyzen_hyper::HTTP2_PREFACE;
+    #[cfg(feature = "server-tls")]
     use std::future::Future;
-    use std::{
-        io::{Cursor, Read},
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        pin::Pin,
-        task::{Context, Poll},
-    };
-
-    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     /// One environment variable, restored to whatever it was when the guard is dropped.
     ///
@@ -1922,59 +1667,6 @@ mod tests {
                     std::env::remove_var(self.name);
                 },
             }
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct TestStream {
-        read: Cursor<Vec<u8>>,
-        written: Vec<u8>,
-        closed: bool,
-    }
-
-    impl TestStream {
-        fn new(bytes: impl Into<Vec<u8>>) -> Self {
-            Self {
-                read: Cursor::new(bytes.into()),
-                written: Vec::new(),
-                closed: false,
-            }
-        }
-    }
-
-    impl AsyncRead for TestStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<Result<usize, std::io::Error>> {
-            Poll::Ready(Read::read(&mut self.read, buf))
-        }
-    }
-
-    impl AsyncWrite for TestStream {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<Result<usize, std::io::Error>> {
-            self.written.extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), std::io::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), std::io::Error>> {
-            self.closed = true;
-            Poll::Ready(Ok(()))
         }
     }
 
@@ -2304,154 +1996,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sniff_protocol_detects_http2_preface_and_replays_buffered_bytes() {
-        let payload = [HTTP2_PREFACE, b"rest"].concat();
-        let (mut stream, is_h2) = sniff_protocol(TestStream::new(payload.clone()), HTTP2_PREFACE)
-            .await
-            .unwrap();
-
-        assert!(is_h2);
-
-        let mut read = Vec::new();
-        stream.read_to_end(&mut read).await.unwrap();
-        assert_eq!(read, payload);
-    }
-
-    #[tokio::test]
-    async fn sniff_protocol_distinguishes_http1_and_preserves_writes() {
-        let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
-        let (mut stream, is_h2) = sniff_protocol(TestStream::new(payload.clone()), HTTP2_PREFACE)
-            .await
-            .unwrap();
-
-        assert!(!is_h2);
-
-        let mut read = Vec::new();
-        stream.read_to_end(&mut read).await.unwrap();
-        assert_eq!(read, payload);
-
-        stream.write_all(b"pong").await.unwrap();
-        stream.flush().await.unwrap();
-        stream.close().await.unwrap();
-        assert_eq!(stream.inner.written, b"pong".to_vec());
-        assert!(stream.inner.closed);
-    }
-
-    #[tokio::test]
-    async fn prefixed_reads_buffer_before_inner_stream() {
-        let mut stream = Prefixed::new(TestStream::new(b"tail".to_vec()), b"head".to_vec());
-
-        let mut read = Vec::new();
-        stream.read_to_end(&mut read).await.unwrap();
-
-        assert_eq!(read, b"headtail".to_vec());
-    }
-
-    // A stream that yields its bytes in caller-chosen chunks, to exercise `sniff_protocol`'s
-    // short-read handling (the HTTP/2 preface arriving across multiple reads).
-    struct ChunkedStream {
-        chunks: std::collections::VecDeque<Vec<u8>>,
-        written: Vec<u8>,
-    }
-
-    impl ChunkedStream {
-        fn new(chunks: Vec<Vec<u8>>) -> Self {
-            Self {
-                chunks: std::collections::VecDeque::from(chunks),
-                written: Vec::new(),
-            }
-        }
-    }
-
-    impl AsyncRead for ChunkedStream {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<std::io::Result<usize>> {
-            let this = self.get_mut();
-            if buf.is_empty() {
-                return Poll::Ready(Ok(0));
-            }
-            match this.chunks.pop_front() {
-                Some(mut chunk) => {
-                    let n = chunk.len().min(buf.len());
-                    buf[..n].copy_from_slice(&chunk[..n]);
-                    if n < chunk.len() {
-                        chunk.drain(..n);
-                        this.chunks.push_front(chunk);
-                    }
-                    Poll::Ready(Ok(n))
-                }
-                None => Poll::Ready(Ok(0)),
-            }
-        }
-    }
-
-    impl AsyncWrite for ChunkedStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            let this = self.get_mut();
-            this.written.extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    async fn read_all<R: AsyncRead + Unpin>(mut reader: R) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 16];
-        loop {
-            let n = reader.read(&mut buf).await.expect("read failed");
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
-        }
-        out
-    }
-
-    #[tokio::test]
-    async fn sniff_detects_split_http2_preface() {
-        let chunks = vec![
-            HTTP2_PREFACE[..5].to_vec(),
-            HTTP2_PREFACE[5..12].to_vec(),
-            HTTP2_PREFACE[12..].to_vec(),
-        ];
-        let stream = ChunkedStream::new(chunks);
-
-        let (_prefixed, is_h2) = sniff_protocol(stream, HTTP2_PREFACE).await.unwrap();
-        assert!(is_h2);
-    }
-
-    #[tokio::test]
-    async fn sniff_preserves_bytes_on_split_mismatch() {
-        let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
-        let chunks = vec![
-            payload[..3].to_vec(),
-            payload[3..10].to_vec(),
-            payload[10..].to_vec(),
-        ];
-        let stream = ChunkedStream::new(chunks);
-
-        let (prefixed, is_h2) = sniff_protocol(stream, HTTP2_PREFACE).await.unwrap();
-        assert!(!is_h2);
-
-        let restored = read_all(prefixed).await;
-        assert_eq!(restored, payload);
-    }
-
     /// A socket path no other test or run is using, short enough for the platform's limit.
     #[cfg(unix)]
     fn unique_socket_path() -> std::path::PathBuf {
@@ -2724,11 +2268,8 @@ mod tests {
     struct TlsEndpoint;
 
     #[cfg(feature = "server-tls")]
-    http_kit::impl_send_endpoint!(TlsEndpoint);
-
-    #[cfg(feature = "server-tls")]
     impl Endpoint for TlsEndpoint {
-        type Error = BoxHttpError;
+        type Error = Infallible;
 
         fn respond(
             &mut self,
@@ -2772,28 +2313,38 @@ mod tests {
         );
         drop((server_tls, client_tls));
 
-        // An http/1.1 client: the sniff still runs on the decrypted bytes, and
-        // the whole pipeline — accept, sniff, Hyper, IntoService — serves a
-        // real response.
+        // An http/1.1 client: the whole pipeline — accept, handshake, ALPN,
+        // Hyper, IntoService on the thread's local executor — serves a real
+        // response.
+        let local = Rc::new(ThreadExecutor::new());
         let serve = async {
             let (stream, _peer) = listener.accept().await.expect("accept");
-            let stream = acceptor.accept(stream).await.expect("server handshake");
-            let (stream, is_h2) = sniff_protocol_with_timeout(stream, HTTP2_PREFACE)
+            let (stream, protocol) = negotiated_stream(stream, Some(&acceptor))
                 .await
-                .expect("sniff");
-            assert!(!is_h2, "http/1.1 ALPN must not read as h2");
-            let (guard_tx, _guard_rx) = async_channel::bounded::<Infallible>(1);
-            let service = IntoService::new(
-                TlsEndpoint,
-                Arc::new(AnyExecutor::new(Arc::new(SmolGlobal))),
-                None,
-                ShutdownGuard(guard_tx),
+                .expect("the connection is served");
+            assert_eq!(
+                protocol,
+                Protocol::Http1,
+                "http/1.1 ALPN must not read as h2"
             );
-            http1::Builder::new()
-                .serve_connection(ConnectionWrapper(stream), service)
-                .with_upgrades()
-                .await
-                .expect("h1 connection serves");
+            let (guard_tx, _guard_rx) = async_channel::bounded::<Infallible>(1);
+            let service = connection_service(
+                TlsEndpoint,
+                Rc::clone(&local),
+                None,
+                WorkerContext::new(
+                    Arc::new(AnyExecutor::new(SmolGlobal)),
+                    ShutdownGuard(guard_tx),
+                ),
+            );
+            serve_connection(
+                stream,
+                protocol,
+                service,
+                Rc::clone(&local),
+                std::future::pending(),
+            )
+            .await;
         };
         let request = async {
             let client_stream = async_net::TcpStream::connect(addr).await.expect("connect");
@@ -2808,7 +2359,7 @@ mod tests {
             tls.read_to_end(&mut response).await.expect("read response");
             response
         };
-        let ((), response) = futures_util::future::join(serve, request).await;
+        let ((), response) = Box::pin(local.run(futures_util::future::join(serve, request))).await;
         let response = String::from_utf8(response).expect("response is HTTP text");
         assert!(
             response.starts_with("HTTP/1.1 200"),
@@ -2887,8 +2438,12 @@ mod tests {
             tls
         };
         let (prepared, _tls) = futures_util::future::join(serve, request).await;
-        let (mut stream, is_h2) = prepared.expect("the connection is still served");
-        assert!(!is_h2, "an http/1.1 ALPN must never serve h2");
+        let (mut stream, protocol) = prepared.expect("the connection is still served");
+        assert_eq!(
+            protocol,
+            Protocol::Http1,
+            "an http/1.1 ALPN must never serve h2"
+        );
         // The preface bytes reach the HTTP/1 layer as (invalid) request bytes,
         // unread — hyper's parser rejects them on its own.
         let mut restored = Vec::new();
@@ -2934,57 +2489,64 @@ mod tests {
             .await
             .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
-        let server = tokio::spawn(async move {
-            let incoming = listener.incoming().map_ok(|stream| super::Accepted {
-                peer_addr: stream.peer_addr().ok(),
-                stream,
-            });
-            super::serve_connections(SmolGlobal, TlsEndpoint, (), incoming, None).await
+        let local = Rc::new(ThreadExecutor::new());
+        let server = local.spawn({
+            let local = Rc::clone(&local);
+            async move {
+                let incoming = listener.incoming().map_ok(|stream| super::Accepted {
+                    peer_addr: stream.peer_addr().ok(),
+                    stream,
+                });
+                super::serve_connections(SmolGlobal, local, TlsEndpoint, (), incoming, None).await
+            }
         });
+        local
+            .run(async {
+                // Every permit taken by an h2c connection idling after its preface.
+                let mut holders = Vec::new();
+                for _ in 0..super::MAX_CONNECTIONS {
+                    let mut conn = async_net::TcpStream::connect(addr).await.expect("connect");
+                    conn.write_all(HTTP2_PREFACE).await.expect("preface");
+                    holders.push(conn);
+                }
 
-        // Every permit taken by an h2c connection idling after its preface.
-        let mut holders = Vec::new();
-        for _ in 0..super::MAX_CONNECTIONS {
-            let mut conn = async_net::TcpStream::connect(addr).await.expect("connect");
-            conn.write_all(HTTP2_PREFACE).await.expect("preface");
-            holders.push(conn);
-        }
+                // Full: refuse at the socket — an early probe may still win a slot a
+                // straggler holder had not claimed yet, so probe until refusal.
+                let mut refused = false;
+                for _ in 0..32 {
+                    let mut probe = async_net::TcpStream::connect(addr).await.expect("connect");
+                    probe.write_all(GET).await.expect("write");
+                    let mut buf = [0u8; 128];
+                    if let Ok(Ok(0) | Err(_)) =
+                        tokio::time::timeout(Duration::from_secs(2), probe.read(&mut buf)).await
+                    {
+                        refused = true;
+                        break;
+                    }
+                }
+                assert!(refused, "a full listener must refuse at the socket");
 
-        // Full: refuse at the socket — an early probe may still win a slot a
-        // straggler holder had not claimed yet, so probe until refusal.
-        let mut refused = false;
-        for _ in 0..32 {
-            let mut probe = async_net::TcpStream::connect(addr).await.expect("connect");
-            probe.write_all(GET).await.expect("write");
-            let mut buf = [0u8; 128];
-            if let Ok(Ok(0) | Err(_)) =
-                tokio::time::timeout(Duration::from_secs(2), probe.read(&mut buf)).await
-            {
-                refused = true;
-                break;
-            }
-        }
-        assert!(refused, "a full listener must refuse at the socket");
-
-        // `let _ =` discards immediately — the socket actually drops here,
-        // freeing its permit. Then poll while the released slot settles.
-        let _ = holders.pop();
-        let mut got_response = false;
-        for _ in 0..8 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let mut conn = async_net::TcpStream::connect(addr).await.expect("connect");
-            conn.write_all(GET).await.expect("write");
-            let mut response = Vec::new();
-            if tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut response))
-                .await
-                .is_ok()
-                && String::from_utf8_lossy(&response).starts_with("HTTP/1.1")
-            {
-                got_response = true;
-                break;
-            }
-        }
-        assert!(got_response, "a freed permit must accept again");
+                // `let _ =` discards immediately — the socket actually drops here,
+                // freeing its permit. Then poll while the released slot settles.
+                let _ = holders.pop();
+                let mut got_response = false;
+                for _ in 0..8 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let mut conn = async_net::TcpStream::connect(addr).await.expect("connect");
+                    conn.write_all(GET).await.expect("write");
+                    let mut response = Vec::new();
+                    if tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut response))
+                        .await
+                        .is_ok()
+                        && String::from_utf8_lossy(&response).starts_with("HTTP/1.1")
+                    {
+                        got_response = true;
+                        break;
+                    }
+                }
+                assert!(got_response, "a freed permit must accept again");
+            })
+            .await;
         drop(server);
     }
 }

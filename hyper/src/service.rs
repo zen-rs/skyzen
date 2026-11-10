@@ -1,9 +1,10 @@
-use executor_core::AnyExecutor;
+use executor_core::{LocalExecutor, Task};
 use futures_util::TryStreamExt;
 use http_body::SizeHint;
 use http_body_util::BodyDataStream;
 use hyper::{
     body::{Frame, Incoming},
+    rt::{Read as _, ReadBuf, Write as _},
     service::Service,
 };
 use std::{
@@ -11,15 +12,18 @@ use std::{
     future::Future,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    rc::Rc,
     task::{Context, Poll},
 };
 
+use http_kit::utils::{AsyncRead, AsyncWrite};
 use skyzen_core::{
-    apply_pending_headers, error_response, log_endpoint_error, BodyError, PeerAddr, SendEndpoint,
+    apply_pending_headers, error_response, log_endpoint_error,
+    upgrade::{OnUpgrade, Upgraded},
+    BodyError, Endpoint, Extensions, PeerAddr, StatusCode,
 };
 
-type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
+type LocalBoxFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 type Bytes = http_kit::utils::Bytes;
 
 /// Response body adapter bridging a skyzen [`Body`](skyzen_core::Body) to hyper.
@@ -62,22 +66,36 @@ impl http_body::Body for SkyzenBody {
 ///
 /// This is the canonical adapter for embedding Skyzen into a hyper server. It injects the peer
 /// address (when provided via [`IntoService::with_peer_addr`]) so the `PeerAddr`/`ClientIp`
-/// extractors work, and converts handler errors into JSON HTTP responses (hiding 5xx detail)
-/// instead of tearing down the connection.
-#[derive(Debug)]
-pub struct IntoService<E> {
+/// extractors work, converts handler errors into JSON HTTP responses (hiding 5xx detail) instead
+/// of tearing down the connection, and runs the session of an upgrade the endpoint answered with
+/// `101` on `executor`.
+///
+/// Neither the endpoint nor the future the service returns has to be `Send`: hyper drives an
+/// HTTP/1 connection on the task that serves it, and spawns HTTP/2 streams on whatever
+/// `hyper::rt::Executor` the connection was built with.
+pub struct IntoService<E, Ex> {
     endpoint: E,
-    executor: Arc<AnyExecutor>,
+    executor: Rc<Ex>,
     peer_addr: Option<SocketAddr>,
+    extensions: Extensions,
 }
 
-impl<E: SendEndpoint + Clone> IntoService<E> {
-    /// Create a new service with the given endpoint and executor.
-    pub const fn new(endpoint: E, executor: Arc<AnyExecutor>) -> Self {
+impl<E, Ex> std::fmt::Debug for IntoService<E, Ex> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntoService")
+            .field("peer_addr", &self.peer_addr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: Endpoint + Clone, Ex: LocalExecutor> IntoService<E, Ex> {
+    /// Create a new service with the given endpoint, spawning upgrade sessions on `executor`.
+    pub fn new(endpoint: E, executor: Rc<Ex>) -> Self {
         Self {
             endpoint,
             executor,
             peer_addr: None,
+            extensions: Extensions::new(),
         }
     }
 
@@ -89,21 +107,32 @@ impl<E: SendEndpoint + Clone> IntoService<E> {
         self.peer_addr = Some(peer_addr);
         self
     }
+
+    /// Insert a clone of every value in `extensions` into each request the service handles.
+    ///
+    /// This is how a runtime hands per-connection context to its handlers.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions.extend(extensions);
+        self
+    }
 }
 
-impl<E: SendEndpoint + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
-    for IntoService<E>
+impl<E, Ex> Service<hyper::Request<Incoming>> for IntoService<E, Ex>
+where
+    E: Endpoint + Clone + 'static,
+    Ex: LocalExecutor + 'static,
 {
     type Response = hyper::Response<SkyzenBody>;
     // Handler errors are converted into HTTP responses, so the service itself never fails.
     type Error = Infallible;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
+    type Future = LocalBoxFuture<Result<Self::Response, Self::Error>>;
 
     fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
-        // TODO: Rewrite when impl Trait in associated types stabilized
         let mut endpoint = self.endpoint.clone();
-        let executor = self.executor.clone();
+        let executor = Rc::clone(&self.executor);
         let peer_addr = self.peer_addr;
+        let extensions = self.extensions.clone();
         let fut = async move {
             let on_upgrade = hyper::upgrade::on(&mut req);
             let method = req.method().clone();
@@ -114,13 +143,12 @@ impl<E: SendEndpoint + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
                         body.map_err(|error| BodyError::Other(Box::new(error))),
                     )
                 }));
-            request.extensions_mut().insert(on_upgrade);
-            request.extensions_mut().insert(executor);
+            request.extensions_mut().extend(extensions);
             if let Some(peer_addr) = peer_addr {
                 request.extensions_mut().insert(PeerAddr::new(peer_addr));
             }
 
-            let response: skyzen_core::Response = match endpoint.respond_send(&mut request).await {
+            let mut response: skyzen_core::Response = match endpoint.respond(&mut request).await {
                 Ok(response) => {
                     tracing::info!(
                         method = method.as_str(),
@@ -138,9 +166,61 @@ impl<E: SendEndpoint + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
                 }
             };
 
+            if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+                if let Some(session) = response.extensions_mut().remove::<OnUpgrade>() {
+                    // hyper resolves the upgrade once the `101` has been written.
+                    executor
+                        .spawn_local(async move {
+                            match on_upgrade.await {
+                                Ok(upgraded) => {
+                                    session.run(Upgraded::new(HyperUpgraded(upgraded))).await;
+                                }
+                                Err(error) => tracing::error!("connection upgrade failed: {error}"),
+                            }
+                        })
+                        .detach();
+                }
+            }
+
             Ok(response.map(SkyzenBody::new))
         };
 
         Box::pin(fut)
+    }
+}
+
+/// hyper's upgraded connection, seen through the `futures-io` traits a session reads it with.
+struct HyperUpgraded(hyper::upgrade::Upgraded);
+
+impl AsyncRead for HyperUpgraded {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut read = ReadBuf::new(buf);
+        match Pin::new(&mut self.get_mut().0).poll_read(cx, read.unfilled()) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(read.filled().len())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for HyperUpgraded {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
     }
 }

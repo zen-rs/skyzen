@@ -129,15 +129,15 @@
 //! Middleware is applied from the outermost route to the innermost endpoint, so errors bubble up
 //! until they are handled.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, rc::Rc};
 
 #[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "ws")]
-use crate::websocket::{MaybeSend, MaybeSync, WebSocket};
+use crate::websocket::{MaybeSend, WebSocket};
 use crate::{handler, handler::Handler, middleware::Middleware, openapi, openapi::OpenApi};
-use http_kit::endpoint::AnySendEndpoint;
-use http_kit::{Method, SendEndpoint};
+use http_kit::endpoint::AnyEndpoint;
+use http_kit::{Endpoint, Method};
 use skyzen_core::{
     middleware::boxed, middleware::BoxMiddleware, Extractor, Requirement, Responder,
 };
@@ -146,9 +146,10 @@ use std::future::Future;
 
 /// Type alias for dynamically dispatched endpoints stored in the routing tree.
 ///
-/// The `Send` erased form: a router is shared by every thread of a work-stealing executor.
-pub type BoxEndpoint = AnySendEndpoint;
-pub(crate) type EndpointFactory = Arc<dyn Fn() -> BoxEndpoint + Send + Sync>;
+/// The local erased form: a router lives on the thread that built it, so neither an endpoint nor
+/// the future it returns has to be `Send`.
+pub type BoxEndpoint = AnyEndpoint;
+pub(crate) type EndpointFactory = Rc<dyn Fn() -> BoxEndpoint>;
 
 // Export param types
 mod param;
@@ -344,7 +345,7 @@ impl Route {
         let endpoint = handler::into_endpoint(handler);
         RouteWithAlarm {
             route: self,
-            alarm_endpoint: Arc::new(move || AnySendEndpoint::new(endpoint.clone())),
+            alarm_endpoint: Rc::new(move || AnyEndpoint::new(endpoint.clone())),
         }
     }
 
@@ -561,10 +562,9 @@ impl RouteNode {
         requirements: Vec<Requirement>,
     ) -> Self
     where
-        E: SendEndpoint + Clone + Sync + 'static,
+        E: Endpoint + Clone + 'static,
     {
-        let endpoint_factory: EndpointFactory =
-            Arc::new(move || AnySendEndpoint::new(endpoint.clone()));
+        let endpoint_factory: EndpointFactory = Rc::new(move || AnyEndpoint::new(endpoint.clone()));
         Self {
             path: path.into(),
             node_type: RouteNodeType::Endpoint {
@@ -606,7 +606,7 @@ impl RouteNode {
             }
             | RouteNodeType::Nested {
                 middleware: stack, ..
-            } => stack.insert(0, Arc::clone(middleware)),
+            } => stack.insert(0, Rc::clone(middleware)),
         }
     }
 
@@ -758,7 +758,7 @@ impl RouteNode {
     #[must_use]
     pub fn endpoint<E>(self, method: Method, endpoint: E) -> Self
     where
-        E: SendEndpoint + Clone + Sync + 'static,
+        E: Endpoint + Clone + 'static,
     {
         self.extend_with_nodes(vec![Self::new_endpoint(
             "",
@@ -783,8 +783,8 @@ impl RouteNode {
     #[must_use]
     pub fn ws<F, Fut>(self, session: F) -> Self
     where
-        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + MaybeSync + 'static,
-        Fut: Future + MaybeSend + 'static,
+        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + 'static,
+        Fut: Future + 'static,
         Fut::Output: crate::websocket::IntoWebSocketOutcome + 'static,
     {
         self.at(crate::websocket::session_handler(session))
@@ -926,7 +926,7 @@ where
 {
     let endpoint = handler::into_endpoint(handler);
     EndpointEntry {
-        factory: Arc::new(move || AnySendEndpoint::new(endpoint.clone())),
+        factory: Rc::new(move || AnyEndpoint::new(endpoint.clone())),
         requirements: T::requirements(),
     }
 }
@@ -1131,7 +1131,7 @@ pub trait CreateRouteNode: Sized {
     /// Especially when using `OpenAPI`, those methods will automatically generate documentation.
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
     where
-        E: SendEndpoint + Clone + Sync + 'static;
+        E: Endpoint + Clone + 'static;
 
     /// Attach a WebSocket handler that automatically performs the upgrade handshake.
     ///
@@ -1160,8 +1160,8 @@ pub trait CreateRouteNode: Sized {
     #[cfg(feature = "ws")]
     fn ws<F, Fut>(self, session: F) -> RouteNode
     where
-        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + MaybeSync + 'static,
-        Fut: Future + MaybeSend + 'static,
+        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + 'static,
+        Fut: Future + 'static,
         Fut::Output: crate::websocket::IntoWebSocketOutcome + 'static,
     {
         self.at(crate::websocket::session_handler(session))
@@ -1264,7 +1264,7 @@ where
 
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
     where
-        E: SendEndpoint + Clone + Sync + 'static,
+        E: Endpoint + Clone + 'static,
     {
         RouteNode::new_endpoint(
             self,

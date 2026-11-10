@@ -58,7 +58,7 @@ impl Middleware for AutoETag {
         &self,
         request: &mut Request,
         next: Next<'_>,
-    ) -> impl Future<Output = Result<Response, Error>> + Send {
+    ) -> impl Future<Output = Result<Response, Error>> {
         // GET only — a HEAD carries no body, so hashing its empty shell yields a tag that
         // contradicts the one GET would compute for the same resource.
         let cacheable = request.method() == Method::GET;

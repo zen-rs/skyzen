@@ -29,7 +29,7 @@ use sha1::{Digest, Sha1};
 use crate::{
     header::{self, HeaderMap, HeaderValue},
     routing::{IntoRouteNode, MethodFilter, Params, Route, RouteNode},
-    Body, Endpoint, Method, Request, Response, SendEndpoint, StatusCode,
+    Body, Endpoint, Method, Request, Response, StatusCode,
 };
 
 /// Mount a directory tree into the router.
@@ -196,7 +196,7 @@ impl IntoRouteNode for EmbeddedStaticDir {
     }
 }
 
-fn route_node_for_static<E: SendEndpoint + Clone + Sync + 'static>(
+fn route_node_for_static<E: Endpoint + Clone + 'static>(
     mount_path: String,
     endpoint: E,
 ) -> RouteNode
@@ -658,9 +658,6 @@ pub enum StaticDirError {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-http_kit::impl_send_endpoint!(StaticDirEndpoint);
-
-#[cfg(not(target_arch = "wasm32"))]
 impl Endpoint for StaticDirEndpoint {
     type Error = StaticDirError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
@@ -674,8 +671,6 @@ impl Endpoint for StaticDirEndpoint {
         .await
     }
 }
-
-http_kit::impl_send_endpoint!(EmbeddedStaticDirEndpoint);
 
 impl Endpoint for EmbeddedStaticDirEndpoint {
     type Error = StaticDirError;

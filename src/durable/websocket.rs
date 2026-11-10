@@ -216,11 +216,15 @@ impl Subprotocol {
     }
 }
 
+/// What a native Durable Object runs on an accepted socket.
+///
+/// The function travels in the request extensions, so it is `Send + Sync`; the session it returns
+/// runs on the connection's thread and is not `Send` — the socket itself is not.
 #[cfg(all(feature = "ws", not(target_arch = "wasm32")))]
 type NativeDurableObjectWebSocketAcceptFn = dyn Fn(
         crate::websocket::WebSocket,
         Vec<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
     + Send
     + Sync;
 
@@ -246,7 +250,7 @@ impl NativeDurableObjectState {
     pub(crate) fn new<F, Fut>(accept_websocket: F) -> Self
     where
         F: Fn(crate::websocket::WebSocket, Vec<String>) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
     {
         Self {
             accept_websocket: Arc::new(move |websocket, tags| {
@@ -259,7 +263,7 @@ impl NativeDurableObjectState {
         &self,
         websocket: crate::websocket::WebSocket,
         tags: Vec<String>,
-    ) -> impl std::future::Future<Output = ()> + Send {
+    ) -> impl std::future::Future<Output = ()> {
         (self.accept_websocket)(websocket, tags)
     }
 }

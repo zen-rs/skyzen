@@ -24,6 +24,62 @@ use syn::{
     spanned::Spanned,
 };
 
+/// The native setup future and the wasm endpoint factory `#[skyzen::main]` hands its runtimes.
+///
+/// Natively the services are built once and the queue consumers from those same instances; the
+/// router is built by a `Send` factory that each serving thread calls on itself, layering clones
+/// of the services around that thread's endpoint. The router never leaves its thread, so nothing
+/// the entry function builds has to be `Send`.
+///
+/// On wasm the factory receives the `WinterCG` env explicitly (as `__skyzen_wasm_env`), so endpoint
+/// construction never depends on an ambient thread-local that concurrent invocations could race.
+/// The platform owns event delivery there, so there are no consumers.
+fn endpoint_factories(
+    entry_call: &proc_macro2::TokenStream,
+    injections: &[Injection],
+    consumers: &proc_macro2::TokenStream,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let bindings: Vec<_> = injections
+        .iter()
+        .map(|injection| &injection.binding)
+        .collect();
+    let layers: Vec<_> = injections
+        .iter()
+        .map(|injection| &injection.layer)
+        .collect();
+    let captured: Vec<_> = injections
+        .iter()
+        .map(|injection| &injection.ident)
+        .collect();
+    let native_setup = quote! {
+        async move {
+            #(#bindings)*
+            let __skyzen_consumers = #consumers;
+            let __skyzen_endpoint_factory = move || {
+                #(let #captured = ::std::clone::Clone::clone(&#captured);)*
+                async move {
+                    let endpoint = #entry_call;
+                    #(#layers)*
+                    endpoint
+                }
+            };
+            (__skyzen_endpoint_factory, __skyzen_consumers)
+        }
+    };
+    let wasm_factory = quote! {
+        move |__skyzen_wasm_env: ::skyzen::runtime::wasm::Env| {
+            let _ = &__skyzen_wasm_env;
+            async move {
+                let endpoint = #entry_call;
+                #(#bindings)*
+                #(#layers)*
+                endpoint
+            }
+        }
+    };
+    (native_setup, wasm_factory)
+}
+
 /// Attribute macro that boots a Skyzen Endpoint on native or wasm runtimes.
 #[proc_macro_attribute]
 pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -55,36 +111,15 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(wiring) => wiring,
         Err(error) => return error.to_compile_error().into(),
     };
-    let PortableWiring { steps, consumers } = wiring;
+    let PortableWiring {
+        injections,
+        consumers,
+    } = wiring;
     let azure_queue_triggers = match azure_queue_trigger_tokens() {
         Ok(triggers) => triggers,
         Err(error) => return error.to_compile_error().into(),
     };
-    // Natively the factory yields the endpoint *and* the queue consumers, both built from the one
-    // set of service instances; on wasm the platform owns event delivery, so it yields only the
-    // endpoint and this whole arm is stripped.
-    let factory_body = quote! {
-        async move {
-            let endpoint = #entry_call;
-            #(#steps)*
-            {
-                #[cfg(not(target_arch = "wasm32"))]
-                { (endpoint, #consumers) }
-                #[cfg(target_arch = "wasm32")]
-                { endpoint }
-            }
-        }
-    };
-    let native_factory = factory_body.clone();
-    // On wasm the factory receives the WinterCG env explicitly (as `__skyzen_wasm_env`), so
-    // endpoint construction never depends on an ambient thread-local that concurrent
-    // invocations could race.
-    let wasm_factory = quote! {
-        move |__skyzen_wasm_env: ::skyzen::runtime::wasm::Env| {
-            let _ = &__skyzen_wasm_env;
-            #factory_body
-        }
-    };
+    let (native_setup, wasm_factory) = endpoint_factories(&entry_call, &injections, &consumers);
 
     let init_logging = if options.default_logger {
         quote! { ::skyzen::runtime::native::init_logging(); }
@@ -125,7 +160,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
                     tls: ::skyzen::runtime::native::apply_tls_overrides(::std::env::args()),
                     azure_queue_triggers: #azure_queue_triggers,
                 },
-                || #native_factory,
+                || #native_setup,
                 #shutdown_hook,
             );
         }
@@ -2613,12 +2648,26 @@ fn manifest_tracking_tokens() -> proc_macro2::TokenStream {
 
 /// What `#[skyzen::main]` inserts between building the endpoint and launching it.
 struct PortableWiring {
-    /// One group of statements per manifest entry: bind the service, then wrap the endpoint with
-    /// the middleware that injects it.
-    steps: Vec<proc_macro2::TokenStream>,
+    /// One entry per manifest entry, in declaration order.
+    injections: Vec<Injection>,
     /// The `ConsumerSet` the native runtime is launched with — `()` when the manifest declares no
     /// `[[native.queue_consumer]]`.
     consumers: proc_macro2::TokenStream,
+}
+
+/// How one manifest entry reaches the application.
+///
+/// The two halves run at different times natively: the service is bound **once**, before any
+/// serving thread starts, and the factory each thread builds its router with layers a clone of it
+/// around that thread's endpoint. The service is `Send + Sync`; the router it is layered onto
+/// never has to be.
+struct Injection {
+    /// The local the service is held in.
+    ident: proc_macro2::Ident,
+    /// `let <ident> = <init>;`
+    binding: proc_macro2::TokenStream,
+    /// Wrap `endpoint` with the middleware that injects a clone of `<ident>`.
+    layer: proc_macro2::TokenStream,
 }
 
 fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
@@ -2632,7 +2681,7 @@ fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
 /// Nothing to bind: the endpoint is launched exactly as the entry function built it.
 fn empty_portable_wiring() -> PortableWiring {
     PortableWiring {
-        steps: Vec::new(),
+        injections: Vec::new(),
         consumers: quote! { () },
     }
 }
@@ -2652,7 +2701,7 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
     }
     let default_database = default_database_index(databases)?;
 
-    let mut steps = Vec::with_capacity(services.len() + databases.len() + secrets.len() + 1);
+    let mut injections = Vec::with_capacity(services.len() + databases.len() + secrets.len());
     let service_type_counts = service_type_counts(services);
     let mut service_bindings = HashMap::new();
 
@@ -2668,7 +2717,7 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
         // The bare `Kv`/`Storage`/`Queue` extractor names whichever service of that type is the
         // only one, so it is injected exactly when the type is unambiguous.
         let inject_bare = service_type_counts[&service.service_type] == 1;
-        steps.push(named_injection_tokens(
+        injections.push(named_injection_tokens(
             &binding,
             &ident,
             &native_init,
@@ -2684,7 +2733,7 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
         let native_init = generate_native_database_init(database, manifest);
         let cloudflare_init = generate_cloudflare_database_init(database, manifest);
         let inject_bare = default_database == Some(index);
-        steps.push(named_injection_tokens(
+        injections.push(named_injection_tokens(
             &binding,
             &ident,
             &native_init,
@@ -2700,7 +2749,7 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
         let cloudflare_init = generate_cloudflare_secret_init(document, &secret.name)?;
         // There is no unambiguous bare secret: `Secret` names a value, not a capability, so a
         // single `[[secret]]` is still reached through its own generated type.
-        steps.push(named_injection_tokens(
+        injections.push(named_injection_tokens(
             &binding,
             &ident,
             &native_init,
@@ -2711,7 +2760,10 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
 
     let consumers = queue_consumer_tokens(manifest, &service_bindings)?;
 
-    Ok(PortableWiring { steps, consumers })
+    Ok(PortableWiring {
+        injections,
+        consumers,
+    })
 }
 
 /// The local binding that holds one manifest entry's service for the length of the factory.
@@ -2892,7 +2944,7 @@ fn named_injection_tokens(
     native_init: &proc_macro2::TokenStream,
     cloudflare_init: &proc_macro2::TokenStream,
     inject_bare: bool,
-) -> proc_macro2::TokenStream {
+) -> Injection {
     let bare = if inject_bare {
         quote! {
             let endpoint = ::skyzen::__private::with_middleware(
@@ -2904,18 +2956,23 @@ fn named_injection_tokens(
         quote! {}
     };
 
-    quote! {
-        let #binding = {
-            #[cfg(not(target_arch = "wasm32"))]
-            { #native_init }
-            #[cfg(target_arch = "wasm32")]
-            { #cloudflare_init }
-        };
-        let endpoint = ::skyzen::__private::with_middleware(
-            endpoint,
-            #ident::new(::std::clone::Clone::clone(&#binding)),
-        );
-        #bare
+    Injection {
+        ident: binding.clone(),
+        binding: quote! {
+            let #binding = {
+                #[cfg(not(target_arch = "wasm32"))]
+                { #native_init }
+                #[cfg(target_arch = "wasm32")]
+                { #cloudflare_init }
+            };
+        },
+        layer: quote! {
+            let endpoint = ::skyzen::__private::with_middleware(
+                endpoint,
+                #ident::new(::std::clone::Clone::clone(&#binding)),
+            );
+            #bare
+        },
     }
 }
 
@@ -4786,19 +4843,20 @@ binding = "DB"
 
         let wiring =
             portable_wiring(&document("[[secret]]\nname = \"STRIPE_KEY\"\n")).expect("wiring");
-        assert_eq!(wiring.steps.len(), 1);
+        assert_eq!(wiring.injections.len(), 1);
 
-        let step = wiring.steps[0].to_string();
-        assert!(step.contains(":: skyzen :: Secret :: new"), "{step}");
-        assert!(step.contains("\"STRIPE_KEY\""), "{step}");
+        let binding = wiring.injections[0].binding.to_string();
+        assert!(binding.contains(":: skyzen :: Secret :: new"), "{binding}");
+        assert!(binding.contains("\"STRIPE_KEY\""), "{binding}");
         assert!(
-            step.contains("portable secret `STRIPE_KEY` missing native env var `STRIPE_KEY`"),
-            "{step}"
+            binding.contains("portable secret `STRIPE_KEY` missing native env var `STRIPE_KEY`"),
+            "{binding}"
         );
-        assert!(step.contains("StripeKey :: new"), "{step}");
+        let layer = wiring.injections[0].layer.to_string();
+        assert!(layer.contains("StripeKey :: new"), "{layer}");
         // `Secret` names a value rather than a capability, so there is no bare wrapper to inject
         // even when the manifest declares exactly one secret.
-        assert_eq!(step.matches("with_middleware").count(), 1, "{step}");
+        assert_eq!(layer.matches("with_middleware").count(), 1, "{layer}");
     }
 
     #[test]
@@ -4915,8 +4973,18 @@ type = "storage"
         let native = quote! { ::skyzen::__services::Kv::new(backend) };
         let cloudflare = quote! { ::skyzen::__services::Kv::new(cf_backend) };
 
-        let unambiguous =
-            named_injection_tokens(&binding, &ident, &native, &cloudflare, true).to_string();
+        let expand = |injection: super::Injection| {
+            let super::Injection { binding, layer, .. } = injection;
+            quote! { #binding #layer }.to_string()
+        };
+
+        let unambiguous = expand(named_injection_tokens(
+            &binding,
+            &ident,
+            &native,
+            &cloudflare,
+            true,
+        ));
         assert!(unambiguous.contains("Cache :: new"));
         // The service is bound once and cloned into each layer, never built twice.
         assert!(unambiguous.contains("let __skyzen_service_cache"));
@@ -4924,8 +4992,13 @@ type = "storage"
         // Both the newtype and the bare wrapper are layered on.
         assert_eq!(unambiguous.matches("with_middleware").count(), 2);
 
-        let ambiguous =
-            named_injection_tokens(&binding, &ident, &native, &cloudflare, false).to_string();
+        let ambiguous = expand(named_injection_tokens(
+            &binding,
+            &ident,
+            &native,
+            &cloudflare,
+            false,
+        ));
         assert!(ambiguous.contains("Cache :: new"));
         assert_eq!(ambiguous.matches("with_middleware").count(), 1);
     }

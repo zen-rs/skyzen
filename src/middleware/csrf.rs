@@ -168,7 +168,7 @@ impl Middleware for Csrf {
         &self,
         request: &mut Request,
         next: Next<'_>,
-    ) -> impl Future<Output = Result<Response, Error>> + Send {
+    ) -> impl Future<Output = Result<Response, Error>> {
         let allowed = is_safe_method(request.method()) || self.passes(request);
         async move {
             if allowed {
