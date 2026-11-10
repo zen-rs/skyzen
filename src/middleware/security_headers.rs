@@ -173,22 +173,19 @@ impl Middleware for SecurityHeaders {
             // `ErrorHandlingMiddleware` stamps on the responses it renders — so the
             // protections survive whichever path turns an `Err` into a response.
             let extensions = request.extensions_mut();
-            match extensions.get_mut::<PendingResponseHeaders>() {
-                Some(pending) => {
-                    // `insert` replaces a same-named entry — a route-scoped layer deeper in
-                    // the chain overrides an outer policy on the error path too, matching
-                    // the or-insert semantics the success path applies.
-                    for (name, value) in headers.clone() {
-                        pending.0.insert(name, value);
-                    }
+            if let Some(pending) = extensions.get_mut::<PendingResponseHeaders>() {
+                // `insert` replaces a same-named entry — a route-scoped layer deeper in
+                // the chain overrides an outer policy on the error path too, matching
+                // the or-insert semantics the success path applies.
+                for (name, value) in headers.clone() {
+                    pending.0.insert(name, value);
                 }
-                None => {
-                    let mut map = HeaderMap::new();
-                    for (name, value) in headers.clone() {
-                        map.insert(name, value);
-                    }
-                    extensions.insert(PendingResponseHeaders(map));
+            } else {
+                let mut map = HeaderMap::new();
+                for (name, value) in headers.clone() {
+                    map.insert(name, value);
                 }
+                extensions.insert(PendingResponseHeaders(map));
             }
             let mut response = next.run(request).await?;
             for (name, value) in headers {

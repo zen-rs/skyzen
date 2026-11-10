@@ -139,9 +139,11 @@ service_extractor!(
     "Durable KV store not configured. Ensure a DurableKvStore implementation is injected."
 );
 
-/// `&DurableKv` access shared by the bare handle — what the Cloudflare runtime injects into
-/// extensions — and by typed `Deref<Target = DurableKv>` binding wrappers, so consumers bound
-/// on this trait rather than `Deref` and accept both.
+/// `&DurableKv` access shared by the bare handle and typed binding wrappers.
+///
+/// The bare handle is what the Cloudflare runtime injects into extensions; the wrappers are
+/// typed `Deref<Target = DurableKv>` bindings. Consumers bound on this trait rather than
+/// `Deref` and accept both.
 pub trait AsDurableKv {
     /// The underlying handle.
     fn as_durable_kv(&self) -> &DurableKv;

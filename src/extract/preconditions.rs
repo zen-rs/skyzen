@@ -37,9 +37,9 @@ http_error!(
 /// ```
 #[derive(Debug, Clone)]
 pub struct Preconditions {
-    if_match: Option<IfMatch>,
-    if_none_match: Option<IfNoneMatch>,
-    if_unmodified_since: Option<IfUnmodifiedSince>,
+    match_: Option<IfMatch>,
+    none_match: Option<IfNoneMatch>,
+    unmodified_since: Option<IfUnmodifiedSince>,
 }
 
 impl Preconditions {
@@ -58,14 +58,14 @@ impl Preconditions {
     /// # Errors
     /// [`PreconditionFailed`] when the request's validators reject the current state.
     pub fn check(&self, etag: &EntityTag) -> Result<(), PreconditionFailed> {
-        if let Some(if_match) = &self.if_match {
+        if let Some(if_match) = &self.match_ {
             if !if_match.precondition_passes(etag.etag()) {
                 return Err(PreconditionFailed::new());
             }
         }
         // A present `If-None-Match` whose precondition fails means the current state already
         // matches — `*` fails on any existing resource.
-        if let Some(if_none_match) = &self.if_none_match {
+        if let Some(if_none_match) = &self.none_match {
             if !if_none_match.precondition_passes(etag.etag()) {
                 return Err(PreconditionFailed::new());
             }
@@ -84,8 +84,8 @@ impl Preconditions {
         last_modified: SystemTime,
     ) -> Result<(), PreconditionFailed> {
         self.check(etag)?;
-        if self.if_match.is_none() {
-            if let Some(if_unmodified_since) = &self.if_unmodified_since {
+        if self.match_.is_none() {
+            if let Some(if_unmodified_since) = &self.unmodified_since {
                 if !if_unmodified_since.precondition_passes(last_modified) {
                     return Err(PreconditionFailed::new());
                 }
@@ -100,7 +100,7 @@ impl Preconditions {
     /// # Errors
     /// [`PreconditionRequired`] when the request carries no `If-Match`.
     pub const fn require(&self) -> Result<(), PreconditionRequired> {
-        if self.if_match.is_none() {
+        if self.match_.is_none() {
             return Err(PreconditionRequired::new());
         }
         Ok(())
@@ -109,7 +109,7 @@ impl Preconditions {
     /// Whether the request carried `If-Match` at all.
     #[must_use]
     pub const fn has_if_match(&self) -> bool {
-        self.if_match.is_some()
+        self.match_.is_some()
     }
 }
 
@@ -119,9 +119,9 @@ impl Extractor for Preconditions {
         request: &mut Request,
     ) -> impl core::future::Future<Output = Result<Self, Self::Error>> + Send {
         let preconditions = Self {
-            if_match: request.headers().typed_get::<IfMatch>(),
-            if_none_match: request.headers().typed_get::<IfNoneMatch>(),
-            if_unmodified_since: request.headers().typed_get::<IfUnmodifiedSince>(),
+            match_: request.headers().typed_get::<IfMatch>(),
+            none_match: request.headers().typed_get::<IfNoneMatch>(),
+            unmodified_since: request.headers().typed_get::<IfUnmodifiedSince>(),
         };
         std::future::ready(Ok(preconditions))
     }
