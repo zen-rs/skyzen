@@ -354,12 +354,13 @@ async fn wrapped_response(response: Response) -> Response {
     let Ok(bytes) = bytes else {
         return failed("the application's response body could not be collected");
     };
-    // A `{"$binary": ...}` body is the one JSON shape the host's `ExpandoObject` conversion
-    // turns into bytes — `RawScriptResult` then hands it the `ByteArrayOutputFormatter`,
-    // which writes them raw. `isBase64Encoded` is an AWS convention the host never reads.
+    // Every `res` value crosses the host as an `ExpandoObject`, which the response writer
+    // serializes back to JSON — no JSON shape produces `byte[]`, so a binary body has no
+    // representation in the wrapped protocol at all. Base64 keeps the bytes recoverable;
+    // an AWS-style `isBase64Encoded` flag the host never reads is left off deliberately.
     let body = match String::from_utf8(bytes.to_vec()) {
         Ok(text) => serde_json::json!(text),
-        Err(error) => serde_json::json!({"$binary": base64(&error.into_bytes())}),
+        Err(error) => serde_json::json!(base64(&error.into_bytes())),
     };
     // The host reads `res.headers` as name -> string — arrays come out as their serialized
     // form, not the values. Repeated values join with ", " the way HTTP itself folds them;
@@ -367,6 +368,7 @@ async fn wrapped_response(response: Response) -> Response {
     // its own object instead. `Content-Length` is the host's to compute again: the wrapped
     // body is not the bytes it was counted for.
     let mut headers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut extra_cookies = 0;
     for (name, value) in &parts.headers {
         if name.as_str().eq_ignore_ascii_case("content-length") {
             continue;
@@ -375,21 +377,20 @@ async fn wrapped_response(response: Response) -> Response {
             continue;
         };
         if name.as_str().eq_ignore_ascii_case("set-cookie") {
-            // `res.cookies` deserializes through `ExpandoObject` — the (name, value,
-            // CookieOptions) tuples the host's `RawScriptResult` expects can never arrive
-            // that way, so a Set-Cookie survives only as a header. Joined into one the way
-            // HTTP folds repeated headers, it keeps its `; Secure; HttpOnly` attributes
-            // intact for the client even though the host can't re-parse them.
-            match headers.entry(name.as_str().to_owned()) {
-                serde_json::map::Entry::Occupied(mut entry) => {
-                    if let serde_json::Value::String(joined) = entry.get_mut() {
-                        joined.push_str(", ");
-                        joined.push_str(&value);
-                    }
-                }
-                serde_json::map::Entry::Vacant(entry) => {
-                    entry.insert(value.into());
-                }
+            // `res.cookies` deserializes through `ExpandoObject` — the tuples the host's
+            // `RawScriptResult` expects can never arrive that way, so Set-Cookie survives
+            // only as a header, and a headers dictionary holds one value per name. The
+            // first cookie goes in whole; additional ones cannot share the field without
+            // RFC 6265's comma ambiguity, so they go into `x-ms-set-cookie-N` fields a
+            // client (or an API Management policy) can read rather than merging silently.
+            if headers.contains_key(name.as_str()) {
+                extra_cookies += 1;
+                headers.insert(
+                    format!("x-ms-set-cookie-{extra_cookies}"),
+                    value.to_owned().into(),
+                );
+            } else {
+                headers.insert(name.as_str().to_owned(), value.into());
             }
             continue;
         }

@@ -324,7 +324,10 @@ impl EventBridgeSchedules {
                 .await?;
             taken.statement = Some(format!("skyzen-schedule-{}", entry.name));
             taken.owner = Some(qualified.clone());
-            taken.granted = self
+            snapshot.push(taken);
+            // `wire_one` can fail partway — the snapshot must already be on the stack, or
+            // the half-wired rule survives the rollback it should have been part of.
+            let granted = self
                 .wire_one(
                     events,
                     lambda,
@@ -334,7 +337,9 @@ impl EventBridgeSchedules {
                     entry,
                 )
                 .await?;
-            snapshot.push(taken);
+            if let Some(taken) = snapshot.last_mut() {
+                taken.granted = granted;
+            }
         }
         self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
             .await?;
@@ -550,10 +555,13 @@ impl EventBridgeSchedules {
                     })?;
                     for version in page.versions().iter().filter_map(|v| v.version()) {
                         if version != "$LATEST" {
-                            let newer = newest
-                                .as_ref()
-                                .is_none_or(|newest: &String| version > newest.as_str());
-                            if newer {
+                            // Version numbers compare numerically — "9" sorts after "10"
+                            // as text, and only the true newest is safe to point at.
+                            if version.parse::<u64>().is_ok_and(|number| {
+                                newest.as_ref().is_none_or(|newest: &String| {
+                                    number > newest.parse::<u64>().unwrap_or(0)
+                                })
+                            }) {
                                 newest = Some(version.to_owned());
                             }
                         }
@@ -612,20 +620,37 @@ impl EventBridgeSchedules {
         events: &aws_sdk_eventbridge::Client,
         lambda: &aws_sdk_lambda::Client,
     ) -> Result<()> {
-        let arn = lambda
+        let arn = match lambda
             .get_function_configuration()
             .function_name(&self.function)
             .send()
             .await
-            .with_context(|| format!("could not read Lambda function `{}`", self.function))?
-            .function_arn()
-            .with_context(|| format!("`{}` reported no ARN", self.function))?
-            .to_owned();
-        let version = self.publish_or_reuse(lambda).await?;
-        self.point_the_alias(lambda, &version).await?;
-        let alias_arn = format!("{arn}:{ALIAS}");
+        {
+            Ok(configuration) => configuration
+                .function_arn()
+                .with_context(|| format!("`{}` reported no ARN", self.function))?
+                .to_owned(),
+            // A first deployment has no function and no rules to move — nothing to migrate.
+            Err(error)
+                if error.as_service_error().is_some_and(
+                    aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationError::is_resource_not_found_exception,
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("could not read Lambda function `{}`", self.function)
+                });
+            }
+        };
         let qualified = format!("{}:{ALIAS}", self.function);
+        let alias_arn = format!("{arn}:{ALIAS}");
 
+        // Only rules still carrying an unqualified target need moving — when none do, the
+        // alias stays exactly where it is. Repointing it anyway would resurrect the version
+        // a previous failed deployment deliberately rolled back.
+        let mut pending = Vec::new();
         for name in self.managed_names(lambda, &qualified).await? {
             let rule = self.rule_name(&name);
             let listed = match events.list_targets_by_rule().rule(&rule).send().await {
@@ -642,11 +667,67 @@ impl EventBridgeSchedules {
                         .with_context(|| format!("failed to list targets of `{rule}`"));
                 }
             };
-            if !listed.targets().iter().any(|target| target.arn() == arn) {
-                continue;
+            if listed.targets().iter().any(|target| target.arn() == arn) {
+                pending.push((rule, listed.targets().to_vec(), name));
             }
-            let targets: Vec<Target> = listed
-                .targets()
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // The alias must exist before anything can target it — but only creation is ours:
+        // an alias that already exists keeps the version its last deploy pointed it at.
+        if self.alias_snapshot(lambda).await?.is_none() {
+            let version = self.publish_or_reuse(lambda).await?;
+            lambda
+                .create_alias()
+                .function_name(&self.function)
+                .name(ALIAS)
+                .function_version(version)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to create the `{ALIAS}` alias of Lambda function `{}`",
+                        self.function
+                    )
+                })?;
+        }
+
+        // arn:{partition}:lambda:{region}:{account}:function:{name}
+        let parts: Vec<&str> = arn.split(':').collect();
+        let (partition, region, account) = parts
+            .get(1)
+            .zip(parts.get(3))
+            .zip(parts.get(4))
+            .map(|((partition, region), account)| (*partition, *region, *account))
+            .with_context(|| {
+                format!("`{arn}` is not a Lambda function ARN EventBridge rules can be built from")
+            })?;
+
+        for (rule, previous, name) in pending {
+            // The invoke grant precedes the retarget: a rule moved before its permission
+            // would sit unable to invoke until reconciliation catches up — or forever, if
+            // the deploy fails between.
+            let rule_arn = format!("arn:{partition}:events:{region}:{account}:rule/{rule}");
+            let statement = format!("skyzen-schedule-{name}");
+            if !self
+                .has_statement(lambda, &qualified, &statement, &rule_arn)
+                .await
+                .with_context(|| format!("failed to read the policy of `{qualified}`"))?
+            {
+                lambda
+                    .add_permission()
+                    .function_name(&qualified)
+                    .action(INVOKE_ACTION)
+                    .principal(EVENTS_PRINCIPAL)
+                    .source_arn(&rule_arn)
+                    .statement_id(&statement)
+                    .send()
+                    .await
+                    .with_context(|| format!("failed to let `{rule}` invoke `{qualified}`"))?;
+            }
+            let targets: Vec<Target> = previous
                 .iter()
                 .map(|target| {
                     let mut moved = target.clone();
@@ -662,14 +743,23 @@ impl EventBridgeSchedules {
                 .set_targets(Some(targets))
                 .send()
                 .await
-                .with_context(|| format!("failed to retarget `{rule}` at the `{ALIAS}` alias"))?;
-            anyhow::ensure!(
-                put.failed_entries().is_empty(),
-                "EventBridge refused to retarget `{rule}`: {:?}",
-                put.failed_entries()
-                    .first()
-                    .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
-            );
+                .with_context(|| format!("failed to retarget `{rule}` at `{ALIAS}`"))?;
+            // A partially failed retarget puts the previous targets back before the deploy
+            // reports it — a rule left half-moved fires neither side cleanly.
+            if !put.failed_entries().is_empty() {
+                let _ = events
+                    .put_targets()
+                    .rule(&rule)
+                    .set_targets(Some(previous))
+                    .send()
+                    .await;
+                anyhow::bail!(
+                    "EventBridge refused to retarget `{rule}`: {:?}",
+                    put.failed_entries()
+                        .first()
+                        .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
+                );
+            }
             output::ok(format!(
                 "retargeted EventBridge rule `{rule}` at the `{ALIAS}` alias"
             ));
