@@ -90,8 +90,8 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
                     function.clone(),
                     manifest.data().schedule.clone(),
                     child_env.clone(),
+                    deploy_command(&config, &root_dir, &binary),
                 ))),
-                Step::Command(deploy_command(&config, &root_dir, &binary)),
             ];
             let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
             // Suspension, environment delivery and rule wiring are one transaction: an

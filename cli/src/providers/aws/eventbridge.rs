@@ -109,6 +109,26 @@ impl EventBridgeSchedules {
 pub struct MigrateSchedulesToAlias {
     /// The rules' owner, reusing `EventBridgeSchedules`' naming and policy reading.
     inner: EventBridgeSchedules,
+    /// The `cargo lambda deploy` that follows — migration's rollback has to reach past it,
+    /// because a failed upload would otherwise strand the moved rules disabled.
+    deploy: crate::providers::CommandPlan,
+}
+
+/// What migration did to one rule — everything a rollback has to undo.
+#[derive(Debug)]
+struct Migrated {
+    /// The rule name.
+    rule: String,
+    /// Its previous targets.
+    previous: Vec<Target>,
+    /// Whether it was enabled before migration disabled it.
+    enabled: bool,
+    /// Whether the unqualified grant was actually removed.
+    legacy_removed: bool,
+    /// Whether the alias grant was created by this migration (not pre-existing).
+    grant_created: bool,
+    /// The rule's own ARN — rollback needs it to re-grant, not a reconstructed one.
+    rule_arn: String,
 }
 
 impl MigrateSchedulesToAlias {
@@ -117,6 +137,7 @@ impl MigrateSchedulesToAlias {
         function: String,
         schedules: Vec<ScheduleEntry>,
         env: Vec<(String, String)>,
+        deploy: crate::providers::CommandPlan,
     ) -> Self {
         Self {
             inner: EventBridgeSchedules::new(
@@ -125,6 +146,7 @@ impl MigrateSchedulesToAlias {
                 crate::providers::secrets::Delivery::default(),
                 env,
             ),
+            deploy,
         }
     }
 }
@@ -147,7 +169,31 @@ impl Task for MigrateSchedulesToAlias {
             let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let lambda = aws_sdk_lambda::Client::new(&shared);
             let events = aws_sdk_eventbridge::Client::new(&shared);
-            self.inner.migrate_to_alias(&events, &lambda).await
+            let migrated = self.inner.migrate_to_alias(&events, &lambda).await?;
+            // The upload is this step's, not a later step's: if it fails, the migration
+            // just made has to be undone here — the plan runner stops and nothing else
+            // could restore the moved rules or their disabled state.
+            let status = std::process::Command::new(&self.deploy.program)
+                .args(&self.deploy.args)
+                .current_dir(
+                    self.deploy
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| std::path::PathBuf::from(".")),
+                )
+                .status();
+            match status {
+                Ok(exit) if exit.success() => Ok(()),
+                _ => {
+                    output::warn("the deploy failed — restoring the migrated schedules");
+                    for entry in &migrated {
+                        self.inner.unmigrate_one(&events, &lambda, entry).await;
+                    }
+                    Err(anyhow::anyhow!(
+                        "`cargo lambda deploy` did not finish cleanly"
+                    ))
+                }
+            }
         })?
     }
 }
@@ -265,22 +311,22 @@ impl Task for CutoverAlias {
             // a failed deploy can leave changed on `$LATEST` without touching code or env.
             let config_of =
                 |config: &aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationOutput| {
-                    (
-                        config.timeout(),
-                        config.memory_size(),
-                        config.handler().map(str::to_owned),
-                        config.runtime().map(|runtime| runtime.as_str().to_owned()),
-                        config.role().map(str::to_owned),
-                        config
-                            .layers()
-                            .iter()
-                            .filter_map(|layer| layer.arn().map(str::to_owned))
-                            .collect::<Vec<_>>(),
-                        config
-                            .ephemeral_storage()
-                            .map(|storage| storage.size())
-                            .unwrap_or_default(),
-                    )
+                    vec![
+                        format!("{:?}", config.timeout()),
+                        format!("{:?}", config.memory_size()),
+                        format!("{:?}", config.handler()),
+                        format!("{:?}", config.runtime()),
+                        format!("{:?}", config.role()),
+                        format!("{:?}", config.layers()),
+                        format!("{:?}", config.ephemeral_storage()),
+                        format!("{:?}", config.vpc_config()),
+                        format!("{:?}", config.architectures()),
+                        format!("{:?}", config.dead_letter_config()),
+                        format!("{:?}", config.tracing_config()),
+                        format!("{:?}", config.snap_start()),
+                        format!("{:?}", config.logging_config()),
+                        format!("{:?}", config.file_system_configs()),
+                    ]
                 };
             if env_of(&latest) != env_of(&alias) || config_of(&latest) != config_of(&alias) {
                 anyhow::bail!(
@@ -930,7 +976,7 @@ impl EventBridgeSchedules {
         &self,
         events: &aws_sdk_eventbridge::Client,
         lambda: &aws_sdk_lambda::Client,
-    ) -> Result<()> {
+    ) -> Result<Vec<Migrated>> {
         let arn = match lambda
             .get_function_configuration()
             .function_name(&self.function)
@@ -947,7 +993,7 @@ impl EventBridgeSchedules {
                     aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationError::is_resource_not_found_exception,
                 ) =>
             {
-                return Ok(())
+                return Ok(Vec::new())
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -1031,7 +1077,7 @@ impl EventBridgeSchedules {
             }
         }
         if pending.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // The alias must exist before anything can target it — but only creation is ours:
@@ -1064,12 +1110,20 @@ impl EventBridgeSchedules {
                 format!("`{arn}` is not a Lambda function ARN EventBridge rules can be built from")
             })?;
 
-        let mut migrated: Vec<(String, Vec<Target>, bool)> = Vec::new();
+        let mut migrated: Vec<Migrated> = Vec::new();
         for (rule, previous, name, enabled) in pending {
             // A migration that fails partway puts every moved rule's previous targets, state
             // and grant back — not just the failing one's — or earlier rules keep pointing
             // at the alias while the rest still fire $LATEST.
             let rule_arn = format!("arn:{partition}:events:{region}:{account}:rule/{rule}");
+            let mut entry = Migrated {
+                rule: rule.clone(),
+                previous: previous.clone(),
+                enabled,
+                legacy_removed: false,
+                grant_created: false,
+                rule_arn: rule_arn.clone(),
+            };
             let result = self
                 .migrate_one(
                     events,
@@ -1081,57 +1135,85 @@ impl EventBridgeSchedules {
                     &rule,
                     &previous,
                     &name,
+                    &mut entry,
                 )
                 .await;
             if let Err(error) = result {
-                for (rule, previous, enabled) in migrated.iter().chain(std::iter::once(&(
-                    rule.clone(),
-                    previous.clone(),
-                    enabled,
-                ))) {
-                    // Targets, then the grant that may or may not have landed, then the
-                    // state — the order migration undoes them.
-                    let restored = events
-                        .put_targets()
-                        .rule(rule)
-                        .set_targets(Some(previous.clone()))
-                        .send()
-                        .await;
-                    if let Ok(restored) = restored {
-                        if !restored.failed_entries().is_empty() {
-                            output::warn(format!(
-                                "could not fully restore targets of `{rule}`: {:?}",
-                                restored
-                                    .failed_entries()
-                                    .first()
-                                    .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
-                            ));
-                        }
-                    }
-                    let _ = lambda
-                        .remove_permission()
-                        .function_name(&qualified)
-                        .statement_id(format!(
-                            "skyzen-schedule-{}",
-                            rule.strip_prefix(&format!("skyzen-{}--", self.function))
-                                .unwrap_or(rule)
-                        ))
-                        .send()
-                        .await;
-                    if *enabled {
-                        let _ = events.enable_rule().name(rule).send().await;
-                    }
+                for entry in migrated.iter().chain(std::iter::once(&entry)) {
+                    self.unmigrate_one(events, lambda, entry).await;
                 }
                 return Err(error);
             }
-            // Whether the grant was migration-made is the difference between removing it and
-            // deleting a permission that predates this deploy.
-            migrated.push((rule.clone(), previous, enabled));
+            migrated.push(entry);
             output::ok(format!(
                 "retargeted EventBridge rule `{rule}` at the `{ALIAS}` alias"
             ));
         }
-        Ok(())
+        Ok(migrated)
+    }
+
+    /// Put one migrated rule back: its original targets, its unqualified grant if migration
+    /// removed it, its alias grant only if migration created it, and its enabled state.
+    async fn unmigrate_one(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+        lambda: &aws_sdk_lambda::Client,
+        entry: &Migrated,
+    ) {
+        let qualified = format!("{}:{ALIAS}", self.function);
+        // Targets, then grants, then state — the order migration undoes them.
+        let restored = events
+            .put_targets()
+            .rule(&entry.rule)
+            .set_targets(Some(entry.previous.clone()))
+            .send()
+            .await;
+        if let Ok(restored) = restored {
+            if !restored.failed_entries().is_empty() {
+                output::warn(format!(
+                    "could not fully restore targets of `{}`: {:?}",
+                    entry.rule,
+                    restored
+                        .failed_entries()
+                        .first()
+                        .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
+                ));
+            }
+        }
+        if entry.grant_created {
+            let _ = lambda
+                .remove_permission()
+                .function_name(&qualified)
+                .statement_id(format!(
+                    "skyzen-schedule-{}",
+                    entry
+                        .rule
+                        .strip_prefix(&format!("skyzen-{}--", self.function))
+                        .unwrap_or(&entry.rule)
+                ))
+                .send()
+                .await;
+        }
+        if entry.legacy_removed {
+            let _ = lambda
+                .add_permission()
+                .function_name(&self.function)
+                .action(INVOKE_ACTION)
+                .principal(EVENTS_PRINCIPAL)
+                .source_arn(&entry.rule_arn)
+                .statement_id(format!(
+                    "skyzen-schedule-{}",
+                    entry
+                        .rule
+                        .strip_prefix(&format!("skyzen-{}--", self.function))
+                        .unwrap_or(&entry.rule)
+                ))
+                .send()
+                .await;
+        }
+        if entry.enabled {
+            let _ = events.enable_rule().name(&entry.rule).send().await;
+        }
     }
 
     /// Grant the rule its alias invoke permission, then retarget its unqualified entries.
@@ -1146,6 +1228,7 @@ impl EventBridgeSchedules {
         rule: &str,
         previous: &[Target],
         name: &str,
+        entry: &mut Migrated,
     ) -> Result<()> {
         // The invoke grant precedes the retarget: a rule moved before its permission
         // would sit unable to invoke until reconciliation catches up — or forever, if
@@ -1166,6 +1249,7 @@ impl EventBridgeSchedules {
                 .send()
                 .await
                 .with_context(|| format!("failed to let `{rule}` invoke `{qualified}`"))?;
+            entry.grant_created = true;
         }
         let targets: Vec<Target> = previous
             .iter()
@@ -1180,13 +1264,26 @@ impl EventBridgeSchedules {
         // The unqualified grant goes first — EventBridge propagates target and state changes
         // eventually, so `DisableRule` alone is no barrier, but a rule that has no permission
         // to invoke `$LATEST` fails closed during the gap and cannot run the swapped code.
-        let legacy = self.function.as_str();
-        let _ = lambda
+        // Anything other than "removed" or "already absent" stops the deploy here, before
+        // `$LATEST` swaps — a grant that could not be lifted is no barrier at all.
+        match lambda
             .remove_permission()
-            .function_name(legacy)
+            .function_name(&self.function)
             .statement_id(format!("skyzen-schedule-{name}"))
             .send()
-            .await;
+            .await
+        {
+            Ok(_) => entry.legacy_removed = true,
+            Err(error)
+                if error.as_service_error().is_some_and(
+                    aws_sdk_lambda::operation::remove_permission::RemovePermissionError::is_resource_not_found_exception,
+                ) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to drop the legacy invoke permission of `{rule}`")
+                });
+            }
+        }
         // Then the disable — whatever propagation lag remains overlaps the upload, which is
         // the slow part of the deploy. `reconcile` re-enables behind the alias once cut over.
         events
@@ -1464,7 +1561,13 @@ impl EventBridgeSchedules {
 
     /// Whether an AWS error is an authorization denial the caller may skip.
     fn is_access_denied(error: &anyhow::Error) -> bool {
-        error.to_string().contains("AccessDenied")
+        error
+            .downcast_ref::<aws_sdk_eventbridge::error::SdkError<
+                aws_sdk_eventbridge::operation::list_rules::ListRulesError,
+            >>()
+            .and_then(|sdk| sdk.as_service_error())
+            .map(|e| e.meta().code() == Some("AccessDeniedException"))
+            .unwrap_or(false)
     }
 
     /// Every rule name this module owns: the `skyzen-{function}--` prefix is ours by
