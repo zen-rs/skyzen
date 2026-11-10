@@ -88,6 +88,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
     };
 
     Ok(ProviderPlan {
+        prepare: Vec::new(),
         steps,
         generated_files: Vec::new(),
         build: None,

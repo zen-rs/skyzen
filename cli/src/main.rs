@@ -7,6 +7,7 @@ mod environment;
 mod migrate;
 mod openapi;
 mod output;
+mod precompress;
 mod project;
 mod providers;
 mod runtime;
@@ -195,6 +196,8 @@ fn execute(plan: &ProviderPlan, dry_run: bool) -> Result<()> {
         write_generated_file(file)?;
         output::step(format!("wrote {}", file.path.display()));
     }
+
+    providers::run_steps(&plan.prepare, simulate, &plan.child_env)?;
 
     if let Some(build) = &plan.build {
         if simulate {

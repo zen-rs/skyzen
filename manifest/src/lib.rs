@@ -65,8 +65,8 @@ pub use schema::{
     NativeDatabaseSection, NativeQueueConsumer, NativeSection, NativeServiceBackend,
     NativeServiceSection, PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring,
     RdsEngine, RedisWiring, S3Wiring, SecretEntry, ServiceBusWiring, ServiceEntry, ServiceType,
-    SkyzenManifest, SqlUrlWiring, SqsWiring, StorageQueueWiring, VarName, WiringEnvVar,
-    HTTP_FUNCTION_NAME, PLAINTEXT_VARIABLE_TABLES,
+    SkyzenManifest, SqlUrlWiring, SqsWiring, StaticFilesSection, StorageQueueWiring, VarName,
+    WiringEnvVar, HTTP_FUNCTION_NAME, PLAINTEXT_VARIABLE_TABLES,
 };
 pub use secrets::{scan_table, SecretError, SecretFinding, SecretReport};
 

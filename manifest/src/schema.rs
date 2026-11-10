@@ -19,6 +19,7 @@ use std::{
     ffi::OsStr,
     fmt::{Display, Formatter},
     num::{NonZeroU32, NonZeroUsize},
+    path::PathBuf,
     str::FromStr,
     time::Duration,
 };
@@ -199,6 +200,23 @@ pub struct SkyzenManifest {
     /// `[azure]` — Azure Functions deployment configuration.
     #[serde(default)]
     pub azure: Option<AzureSection>,
+    /// `[static_files]` — directories `StaticDir` serves, which `skyzen build` precompresses.
+    #[serde(default)]
+    pub static_files: Option<StaticFilesSection>,
+}
+
+/// `[static_files]` — what `skyzen build` prepares for `StaticDir`.
+///
+/// Every file below each `precompress` directory gets `.br`, `.zst` and `.gz` siblings, which
+/// `StaticDir` and `EmbeddedStaticDir` serve to clients that accept the coding. A sibling that
+/// would not be smaller than its file is not written. Cloudflare builds skip the step: on Workers
+/// the platform's asset server negotiates encodings itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticFilesSection {
+    /// Directories to precompress, relative to `Skyzen.toml`.
+    #[serde(default)]
+    pub precompress: Vec<PathBuf>,
 }
 
 /// One `[[service]]` entry.
