@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result};
-use eventbridge::{CutoverAlias, EventBridgeSchedules, MigrateSchedulesToAlias};
+use eventbridge::{CutoverAlias, MigrateSchedulesToAlias};
 use lambda_env::{LambdaEnvironment, LambdaEnvironmentNames};
 use skyzen_manifest::{AwsSection, Manifest};
 

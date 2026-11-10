@@ -139,7 +139,13 @@ fn execution_fingerprint(
         format!("{:?}", config.kms_key_arn()),
         format!("{:?}", config.description()),
         format!("{:?}", config.image_config_response()),
-        format!("{:?}", config.environment().map(|e| e.variables())),
+        format!(
+            "{:?}",
+            config
+                .environment()
+                .and_then(|e| e.variables())
+                .map(|vars| vars.iter().collect::<std::collections::BTreeMap<_, _>>())
+        ),
     ]
 }
 
@@ -222,7 +228,14 @@ impl Task for MigrateSchedulesToAlias {
                 if before.is_some() && before == after {
                     output::warn("the deploy failed — restoring the migrated schedules");
                     for entry in &migrated {
-                        let _ = self.inner.unmigrate_one(&events, &lambda, entry).await;
+                        if let Err(restore) =
+                            self.inner.unmigrate_one(&events, &lambda, entry).await
+                        {
+                            output::warn(format!(
+                                "could not restore migrated rule `{}`: {restore}",
+                                entry.rule
+                            ));
+                        }
                     }
                 } else {
                     output::warn(
@@ -295,8 +308,10 @@ impl Task for MigrateSchedulesToAlias {
             {
                 // The code already swapped — restoring legacy invocation would fire new code
                 // on the old configuration. Reconciliation's own rollback puts the rules
-                // back to their post-migration state (disabled, alias-targeted, old version)
-                // and stops there: a down schedule, never an unsafe one.
+                // back to their post-migration state (disabled, alias-targeted, old version).
+                // Then the rules that were enabled before migration get that state back
+                // too — the alias still serves the working version, so they can run again
+                // without ever touching the unqualified function.
                 self.inner
                     .rollback_reconcile(
                         &lambda,
@@ -307,6 +322,16 @@ impl Task for MigrateSchedulesToAlias {
                         &alias,
                     )
                     .await;
+                for entry in &migrated {
+                    if entry.enabled {
+                        if let Err(restore) = events.enable_rule().name(&entry.rule).send().await {
+                            output::warn(format!(
+                                "could not re-enable migrated rule `{}`: {restore}",
+                                entry.rule
+                            ));
+                        }
+                    }
+                }
                 return Err(error);
             }
             Ok(())
@@ -650,7 +675,7 @@ impl EventBridgeSchedules {
         for entry in &self.schedules {
             // Absent rules snapshot too: a rule the deploy creates belongs to the rollback,
             // or a failed deployment leaves enabled wiring behind.
-            let mut taken = self
+            let taken = self
                 .rule_snapshot(events, &self.rule_name(entry.name.as_str()))
                 .await?;
             snapshot.push(taken);
@@ -1129,10 +1154,12 @@ impl EventBridgeSchedules {
             }
             Err(error) => return Err(error),
         }
-        // Both discovery paths failing means "unknown", not "none" — a removed last
-        // schedule could still have a rule the upload would point at swapped code.
+        // Both discovery paths failing means "unknown", not "none" — a rule made before
+        // the alias existed has no alias either, so its absence cannot prove the set is
+        // empty. A removed last schedule could still have a rule the upload would point
+        // at swapped code.
         anyhow::ensure!(
-            !discovery_failed || !names.is_empty() || self.alias_snapshot(lambda).await?.is_none(),
+            !discovery_failed || !names.is_empty(),
             "could not discover Lambda function `{}`'s EventBridge rules: both the policy \
              read and the rule listing were denied, so a legacy schedule may remain — \
              grant `lambda:GetPolicy` or `events:ListRules`, or delete them first",
@@ -1254,7 +1281,12 @@ impl EventBridgeSchedules {
                 .await;
             if let Err(error) = result {
                 for entry in migrated.iter().chain(std::iter::once(&entry)) {
-                    let _ = self.unmigrate_one(events, lambda, entry).await;
+                    if let Err(restore) = self.unmigrate_one(events, lambda, entry).await {
+                        output::warn(format!(
+                            "could not restore migrated rule `{}`: {restore}",
+                            entry.rule
+                        ));
+                    }
                 }
                 return Err(error);
             }
