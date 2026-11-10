@@ -80,31 +80,21 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
             }
             let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
             child_env = prepared.child_env;
-            let mut steps = vec![
+            let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
+            // The whole transition is one transaction: rules an earlier deploy made still
+            // invoke the unqualified function — migration moves them onto the alias, then
+            // the upload swaps `$LATEST`, then reconciliation publishes, delivers the
+            // environment and re-enables — and a failure at any stage restores the rules.
+            vec![
                 Step::Command(build_command(&config, &root_dir, true)),
-                // Rules an earlier deploy made still invoke the unqualified function —
-                // the code swap would run new code on stale configuration before the
-                // reconciliation even started. Move them onto the alias first; the
-                // upload afterwards changes only the version the alias will repoint to.
                 Step::Task(Box::new(MigrateSchedulesToAlias::new(
-                    function.clone(),
+                    function,
                     manifest.data().schedule.clone(),
                     child_env.clone(),
+                    delivery,
                     deploy_command(&config, &root_dir, &binary),
                 ))),
-            ];
-            let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
-            // Suspension, environment delivery and rule wiring are one transaction: an
-            // enabled rule could otherwise fire the new code with stale configuration, and
-            // separate steps could leave suspended rules stranded on a failure — this task
-            // restores them before the error escapes.
-            steps.push(Step::Task(Box::new(EventBridgeSchedules::new(
-                function,
-                manifest.data().schedule.clone(),
-                delivery,
-                child_env.clone(),
-            ))));
-            steps
+            ]
         }
         Action::Logs { wrangler_args } => {
             vec![Step::Command(logs_command(
@@ -443,17 +433,19 @@ mod tests {
              [aws.env]\nRUST_LOG = \"info\"\n",
         );
 
-        assert_eq!(planned.len(), 4, "{planned:?}");
+        // One transaction step: the embedded deploy command stays visible in its
+        // description, so `--dry-run` and the log show the whole plan.
+        assert_eq!(planned.len(), 2, "{planned:?}");
         assert!(planned[0].contains("cargo lambda build"), "{planned:?}");
 
-        let deploy = &planned[2];
+        let deploy = &planned[1];
         assert!(deploy.contains("cargo lambda deploy"), "{deploy}");
         assert!(deploy.contains("--binary-name demo"), "{deploy}");
         assert!(deploy.contains("--memory 512"), "{deploy}");
         // humantime in, seconds out: that is the unit Lambda takes.
         assert!(deploy.contains("--timeout 45"), "{deploy}");
         assert!(deploy.contains("--enable-function-url"), "{deploy}");
-        assert!(deploy.ends_with("skyzen-api)"), "{deploy}");
+        assert!(deploy.contains("skyzen-api"), "{deploy}");
     }
 
     #[test]
@@ -583,8 +575,8 @@ mod tests {
             "[aws]\nurl = false\n",
         );
 
-        assert!(planned[2].contains("--disable-function-url"), "{planned:?}");
-        assert!(!planned[2].contains("--enable-function-url"), "{planned:?}");
+        assert!(planned[1].contains("--disable-function-url"), "{planned:?}");
+        assert!(!planned[1].contains("--enable-function-url"), "{planned:?}");
     }
 
     #[test]

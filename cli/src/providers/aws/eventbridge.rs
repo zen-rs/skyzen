@@ -132,20 +132,17 @@ struct Migrated {
 }
 
 impl MigrateSchedulesToAlias {
-    /// The step that moves `schedules` plus every `skyzen-schedule-*` grant's rule.
+    /// The step that moves `schedules` plus every `skyzen-schedule-*` grant's rule, then
+    /// uploads and reconciles — all inside one transaction.
     pub fn new(
         function: String,
         schedules: Vec<ScheduleEntry>,
         env: Vec<(String, String)>,
+        delivery: crate::providers::secrets::Delivery,
         deploy: crate::providers::CommandPlan,
     ) -> Self {
         Self {
-            inner: EventBridgeSchedules::new(
-                function,
-                schedules,
-                crate::providers::secrets::Delivery::default(),
-                env,
-            ),
+            inner: EventBridgeSchedules::new(function, schedules, delivery, env),
             deploy,
         }
     }
@@ -155,8 +152,9 @@ impl Task for MigrateSchedulesToAlias {
     fn describe(&self) -> String {
         format!(
             "point `[[schedule]]` EventBridge rules of Lambda function `{}` at the `{ALIAS}` \
-             alias",
-            self.inner.function
+             alias, run `{}`, then reconcile",
+            self.inner.function,
+            self.deploy.display()
         )
     }
 
@@ -169,31 +167,81 @@ impl Task for MigrateSchedulesToAlias {
             let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let lambda = aws_sdk_lambda::Client::new(&shared);
             let events = aws_sdk_eventbridge::Client::new(&shared);
+            // `$LATEST`'s code before the upload — a failed `cargo lambda deploy` is not an
+            // atomic rollback: the code may have swapped while a later sub-operation
+            // failed. Restoring legacy invocation is only safe if the code did not move.
+            let before = lambda
+                .get_function_configuration()
+                .function_name(&self.inner.function)
+                .send()
+                .await
+                .ok()
+                .and_then(|config| config.code_sha256().map(str::to_owned));
             let migrated = self.inner.migrate_to_alias(&events, &lambda).await?;
-            // The upload is this step's, not a later step's: if it fails, the migration
-            // just made has to be undone here — the plan runner stops and nothing else
-            // could restore the moved rules or their disabled state.
-            let status = std::process::Command::new(&self.deploy.program)
-                .args(&self.deploy.args)
-                .current_dir(
-                    self.deploy
-                        .cwd
-                        .clone()
-                        .unwrap_or_else(|| std::path::PathBuf::from(".")),
-                )
-                .status();
-            match status {
-                Ok(exit) if exit.success() => Ok(()),
-                _ => {
+            let arn = lambda
+                .get_function_configuration()
+                .function_name(&self.inner.function)
+                .send()
+                .await
+                .ok()
+                .and_then(|config| config.function_arn().map(str::to_owned))
+                .unwrap_or_default();
+            // The whole transaction lives here — migrate, upload, reconcile: a failure at
+            // any stage restores the moved rules before the error escapes, because the
+            // plan runner stops and nothing later could.
+            if let Err(error) = crate::providers::run_command(&self.deploy, &self.inner.env) {
+                let after = lambda
+                    .get_function_configuration()
+                    .function_name(&self.inner.function)
+                    .send()
+                    .await
+                    .ok()
+                    .and_then(|config| config.code_sha256().map(str::to_owned));
+                if before == after {
                     output::warn("the deploy failed — restoring the migrated schedules");
                     for entry in &migrated {
-                        self.inner.unmigrate_one(&events, &lambda, entry).await;
+                        let _ = self.inner.unmigrate_one(&events, &lambda, entry).await;
                     }
-                    Err(anyhow::anyhow!(
-                        "`cargo lambda deploy` did not finish cleanly"
-                    ))
+                } else {
+                    output::warn(
+                        "the deploy partially applied — the migrated schedules stay on the \
+                         alias rather than point new code at the old function",
+                    );
                 }
+                return Err(error);
             }
+            let parts: Vec<&str> = arn.split(':').collect();
+            let (partition, region, account) = parts
+                .get(1)
+                .zip(parts.get(3))
+                .zip(parts.get(4))
+                .map(|((partition, region), account)| (*partition, *region, *account))
+                .with_context(|| {
+                    format!(
+                        "`{arn}` is not a Lambda function ARN EventBridge rules can be built from"
+                    )
+                })?;
+            let mut snapshot = Vec::new();
+            let mut alias = None;
+            if let Err(error) = self
+                .inner
+                .reconcile(
+                    &events,
+                    &lambda,
+                    &arn,
+                    (partition, region, account),
+                    &mut snapshot,
+                    &mut alias,
+                )
+                .await
+            {
+                output::warn("reconciliation failed — restoring the migrated schedules");
+                for entry in &migrated {
+                    let _ = self.inner.unmigrate_one(&events, &lambda, entry).await;
+                }
+                return Err(error);
+            }
+            Ok(())
         })?
     }
 }
@@ -326,6 +374,9 @@ impl Task for CutoverAlias {
                         format!("{:?}", config.snap_start()),
                         format!("{:?}", config.logging_config()),
                         format!("{:?}", config.file_system_configs()),
+                        format!("{:?}", config.kms_key_arn()),
+                        format!("{:?}", config.description()),
+                        format!("{:?}", config.image_config_response()),
                     ]
                 };
             if env_of(&latest) != env_of(&alias) || config_of(&latest) != config_of(&alias) {
@@ -1007,16 +1058,23 @@ impl EventBridgeSchedules {
         // Schedule-specific policy reads are optional in discovery: an app whose credentials
         // never held `lambda:GetPolicy` still carries legacy rules, and the `skyzen-{fn}--`
         // prefix scan finds them whatever the policies say.
+        let mut discovery_failed = true;
         let mut names: std::collections::BTreeSet<String> =
             match self.managed_names(lambda, &qualified).await {
-                Ok(names) => names,
+                Ok(names) => {
+                    discovery_failed = false;
+                    names
+                }
                 Err(error) => {
                     output::warn(format!("could not read schedule grants: {error:#}"));
                     Default::default()
                 }
             };
         match self.managed_rule_names(events).await {
-            Ok(rules) => names.extend(rules),
+            Ok(rules) => {
+                discovery_failed = false;
+                names.extend(rules);
+            }
             // `events:ListRules` is optional too — the policies above are enough to keep a
             // deployment working that never asked for schedule-management access.
             Err(error) if Self::is_access_denied(&error) => {
@@ -1024,6 +1082,15 @@ impl EventBridgeSchedules {
             }
             Err(error) => return Err(error),
         }
+        // Both discovery paths failing means "unknown", not "none" — a removed last
+        // schedule could still have a rule the upload would point at swapped code.
+        anyhow::ensure!(
+            !discovery_failed || !names.is_empty() || self.alias_snapshot(lambda).await?.is_none(),
+            "could not discover Lambda function `{}`'s EventBridge rules: both the policy \
+             read and the rule listing were denied, so a legacy schedule may remain — \
+             grant `lambda:GetPolicy` or `events:ListRules`, or delete them first",
+            self.function
+        );
 
         // Only rules still carrying an unqualified target need moving — when none do, the
         // alias stays exactly where it is. Repointing it anyway would resurrect the version
@@ -1159,61 +1226,58 @@ impl EventBridgeSchedules {
         events: &aws_sdk_eventbridge::Client,
         lambda: &aws_sdk_lambda::Client,
         entry: &Migrated,
-    ) {
+    ) -> Result<()> {
         let qualified = format!("{}:{ALIAS}", self.function);
-        // Targets, then grants, then state — the order migration undoes them.
+        let name = entry
+            .rule
+            .strip_prefix(&format!("skyzen-{}--", self.function))
+            .unwrap_or(&entry.rule);
+        // Targets, then grants, then state — the order migration undoes them. Each stage
+        // fails the next: a rule whose targets could not be restored is not re-enabled
+        // pointing at something it cannot invoke.
         let restored = events
             .put_targets()
             .rule(&entry.rule)
             .set_targets(Some(entry.previous.clone()))
             .send()
-            .await;
-        if let Ok(restored) = restored {
-            if !restored.failed_entries().is_empty() {
-                output::warn(format!(
-                    "could not fully restore targets of `{}`: {:?}",
-                    entry.rule,
-                    restored
-                        .failed_entries()
-                        .first()
-                        .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
-                ));
-            }
-        }
+            .await
+            .with_context(|| format!("failed to restore targets of `{}`", entry.rule))?;
+        anyhow::ensure!(
+            restored.failed_entries().is_empty(),
+            "EventBridge refused to restore targets of `{}`: {:?}",
+            entry.rule,
+            restored.failed_entries()
+        );
         if entry.grant_created {
-            let _ = lambda
+            lambda
                 .remove_permission()
                 .function_name(&qualified)
-                .statement_id(format!(
-                    "skyzen-schedule-{}",
-                    entry
-                        .rule
-                        .strip_prefix(&format!("skyzen-{}--", self.function))
-                        .unwrap_or(&entry.rule)
-                ))
+                .statement_id(format!("skyzen-schedule-{name}"))
                 .send()
-                .await;
+                .await
+                .with_context(|| format!("failed to drop the alias grant of `{name}`"))?;
         }
         if entry.legacy_removed {
-            let _ = lambda
+            lambda
                 .add_permission()
                 .function_name(&self.function)
                 .action(INVOKE_ACTION)
                 .principal(EVENTS_PRINCIPAL)
                 .source_arn(&entry.rule_arn)
-                .statement_id(format!(
-                    "skyzen-schedule-{}",
-                    entry
-                        .rule
-                        .strip_prefix(&format!("skyzen-{}--", self.function))
-                        .unwrap_or(&entry.rule)
-                ))
+                .statement_id(format!("skyzen-schedule-{name}"))
                 .send()
-                .await;
+                .await
+                .with_context(|| format!("failed to restore the legacy grant of `{name}`"))?;
         }
         if entry.enabled {
-            let _ = events.enable_rule().name(&entry.rule).send().await;
+            events
+                .enable_rule()
+                .name(&entry.rule)
+                .send()
+                .await
+                .with_context(|| format!("failed to re-enable rule `{}`", entry.rule))?;
         }
+        Ok(())
     }
 
     /// Grant the rule its alias invoke permission, then retarget its unqualified entries.
