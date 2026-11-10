@@ -148,20 +148,26 @@ linkme = "0.3"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 # Native-only dependencies (always available, not gated by features)
-executor-core = { workspace = true, features = ["smol"] }
-# The serving thread's own executor: connections, and the router they run, stay on it.
-async-executor.workspace = true
+#
+# `smol` is the executor for the `Send` background work the runtime owns — queue consumers and
+# `WorkerContext::wait_until` — and `compio` is the runtime every serving thread runs.
+executor-core = { workspace = true, features = ["smol", "compio"] }
+# One compio runtime per core serves the application over `http-kit-io`'s compio driver; `net`
+# is for the unix-socket transport that driver has no listener for, `time` for the runtime's
+# own timers.
+compio = { version = "0.19.2", default-features = false, features = ["runtime", "net", "time", "io"] }
+http-kit-io = { workspace = true, features = ["compio"] }
+skyzen-h1.workspace = true
+# One `SO_REUSEPORT` listener per serving thread, which `std` cannot configure.
+socket2 = { version = "0.6.5", default-features = false, features = ["all"] }
 # File-region bodies, so the static file server's responses can be sent with sendfile/splice.
 http-kit = { workspace = true, features = ["fs"] }
 async-fs = "2.2.0"
 blocking = { version = "1.7", default-features = false }
-async-net.workspace = true
 async-io.workspace = true
-smol.workspace = true
 # async-channel is always available on native (used by runtime) and is also
 # available on WASM when the `sse` feature is enabled
 async-channel = "2.5"
-async-lock = "3"
 ctrlc.workspace = true
 hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 http-body-util = "0.1.3"
@@ -171,15 +177,11 @@ skyzen-hyper.workspace = true
 jsonwebtoken = { version = "10", optional = true, features = ["aws_lc_rs"] }
 # The AWS Lambda adapter, which brings its own Tokio runtime; see the `lambda` feature.
 skyzen-lambda = { workspace = true, optional = true }
-# TLS termination (`server-tls` feature). `futures-rustls` speaks futures-io, which is
-# what `async-net` streams and `http-kit`'s `AsyncRead`/`AsyncWrite` already are — a
-# tokio-based acceptor would need adapters on both sides. Its default `aws-lc-rs`
-# provider matches the AWS SDK's TLS stack, so the workspace resolves one crypto
-# backend; `rustls-pemfile` loads the certificate/key pair.
-futures-rustls = { version = "0.26", optional = true }
-rustls-pemfile = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# The `Server` tests and `examples/embed_hyper.rs` run their own smol executor.
+smol.workspace = true
+async-executor.workspace = true
 async-tungstenite = { version = "0.33.0", features = ["tokio-runtime"] }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "net"] }
 femme = "2.2.1"
@@ -187,7 +189,6 @@ skyzen-hyper.workspace = true
 # The `Server` tests and `examples/embed_hyper.rs` hand a server listeners registered with an
 # `http-kit-io` backend, and serve the same `!Send` router through both of Skyzen's servers.
 http-kit-io = { workspace = true, features = ["async-io"] }
-skyzen-h1.workspace = true
 # `tests/migrations.rs` asserts that what `embed_migrations!` baked in is byte-for-byte what the
 # shared reader produces, which means naming that reader directly.
 skyzen-manifest.workspace = true
@@ -203,8 +204,6 @@ bigdecimal = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = "1"
 tempfile = "3.25"
-# Mints the self-signed certificate the `server-tls` tests hand the acceptor.
-rcgen = "0.14"
 futures-lite = "2.6"
 serial_test = "3.2"
 # The decompression tests encode their fixture zstd frames; `ruzstd` only decodes.
@@ -325,13 +324,9 @@ ws = [
     "dep:async-tungstenite",  # Only compiles on native (target-specific dep)
 ]
 # The `rt` feature enables the built-in runtime for `#[skyzen::main]`.
-# On native targets: provides logging, signal handling (ctrl+c), and serves HTTP via hyper+tokio.
+# On native targets: provides logging, signal handling (ctrl+c), and serves HTTP on one compio runtime per core.
 # On WASM targets: no-op (WASM already runs in a runtime and uses WinterCG APIs).
 rt = []
-# Terminate TLS in the native server: `--tls-cert`/`--tls-key` (or `SKYZEN_TLS_CERT`/
-# `SKYZEN_TLS_KEY`) point the runtime at a PEM certificate chain and private key, and
-# `#[skyzen::main]` serves HTTPS on the bound listener with ALPN `h2, http/1.1`.
-server-tls = ["dep:futures-rustls", "dep:rustls-pemfile"]
 # The `lambda` feature lets `#[skyzen::main]` serve AWS Lambda invocations.
 # Nothing in an application changes: the runtime detects `AWS_LAMBDA_RUNTIME_API` and hands over
 # to the adapter instead of binding a listener. Without it, a binary that finds itself inside

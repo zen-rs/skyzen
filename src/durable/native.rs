@@ -296,7 +296,15 @@ where
 
                 let Some(inner) = weak.upgrade() else { return };
                 let namespace = Self { inner };
-                if let Err(error) = smol::block_on(namespace.alarm(&object_id)) {
+                // The handler runs on a compio runtime of its own, like every other native task.
+                let runtime = match executor_core::compio::Runtime::new() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::error!(%error, "no runtime to run the native durable alarm on");
+                        return;
+                    }
+                };
+                if let Err(error) = runtime.block_on(namespace.alarm(&object_id)) {
                     tracing::error!(%error, "native durable alarm handler failed");
                 }
             });

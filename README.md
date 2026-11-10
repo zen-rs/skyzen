@@ -207,7 +207,7 @@ before it binds anything, and the `wasm32` build is the Worker:
 
 | Target | How it is selected | Entry point |
 |---|---|---|
-| Native server | nothing else matched | Tokio + Hyper, `--port` / `--host` / `--listen` |
+| Native server | nothing else matched | One compio runtime per core serving HTTP/1.1, `--port` / `--host` / `--listen` |
 | AWS Lambda | `AWS_LAMBDA_RUNTIME_API` is set (needs the `lambda` feature) | `lambda_http` for HTTP, partial-batch responses for SQS |
 | Azure Functions | `FUNCTIONS_CUSTOMHANDLER_PORT` is set | custom handler; HTTP triggers reach the router, queue triggers reach `#[skyzen::queue]` |
 | Cloudflare Workers | compiled to `wasm32-unknown-unknown` | the WinterCG `fetch` export |

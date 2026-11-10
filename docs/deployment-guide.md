@@ -62,29 +62,14 @@ Without `--port` or `SKYZEN_ADDRESS`, Skyzen binds an available localhost port a
 
 ### TLS
 
-The built-in server serves HTTPS itself once the `server-tls` feature is on the
-`skyzen` dependency and a PEM certificate/key pair is configured — either on the
-command line or in the environment, per file:
+The built-in server speaks HTTP/1.1 on one runtime per core and does not terminate
+TLS yet. `--tls-cert`/`--tls-key` (and `SKYZEN_TLS_CERT`/`SKYZEN_TLS_KEY`) are still
+parsed, and a configured pair refuses to start rather than serve cleartext under
+settings that promised encryption. Half a pair refuses to start too, and so does a
+pair under AWS Lambda or Azure Functions, where the platform terminates TLS.
 
-```sh
-./target/release/my-app --listen 0.0.0.0:8443 --tls-cert cert.pem --tls-key key.pem
-# or
-SKYZEN_ADDRESS=0.0.0.0:8443 SKYZEN_TLS_CERT=cert.pem SKYZEN_TLS_KEY=key.pem ./target/release/my-app
-```
-
-TLS is terminated by Rustls (aws-lc-rs), and ALPN negotiates `h2`/`http/1.1`, so
-clients get HTTP/2 over HTTPS where they support it. A few deliberate limits:
-
-- Half a pair (a cert without a key, or either flag alone) refuses to start —
-  so does TLS on a `unix:` socket, which has no transport to encrypt, and TLS
-  under AWS Lambda or Azure Functions, where the platform terminates it.
-- A server built without `server-tls` refuses to start when the pair is
-  configured and names the feature to add, rather than silently serving
-  cleartext.
-- There is no ACME issuance, mTLS, certificate hot reload, or HTTP→HTTPS
-  redirect yet; fronting a load balancer or reverse proxy that already
-  terminates TLS stays a fully supported topology — just leave the TLS flags
-  unset there.
+Put the server behind a load balancer or reverse proxy that terminates TLS, and
+leave the TLS flags unset there.
 
 ### Docker
 
