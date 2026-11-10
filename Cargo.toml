@@ -155,15 +155,19 @@ executor-core = { workspace = true, features = ["smol", "compio"] }
 # One compio runtime per core serves the application over `http-kit-io`'s compio driver; `net`
 # is for the unix-socket transport that driver has no listener for, `time` for the runtime's
 # own timers.
-compio = { version = "0.19.2", default-features = false, features = ["runtime", "net", "time", "io"] }
+compio = { version = "0.19.2", default-features = false, features = ["runtime", "net", "time", "io", "fs"] }
 http-kit-io = { workspace = true, features = ["compio"] }
 skyzen-h1.workspace = true
 # One `SO_REUSEPORT` listener per serving thread, which `std` cannot configure.
 socket2 = { version = "0.6.5", default-features = false, features = ["all"] }
 # File-region bodies, so the static file server's responses can be sent with sendfile/splice.
 http-kit = { workspace = true, features = ["fs"] }
-async-fs = "2.2.0"
 blocking = { version = "1.7", default-features = false }
+# The static file server's per-thread cache (`static-files`): an LRU of resolved files, cleared by
+# filesystem notifications. FSEvents is the macOS backend; elsewhere notify picks inotify, kqueue
+# or ReadDirectoryChangesW on its own.
+lru = { version = "0.19.0", default-features = false, optional = true }
+notify = { version = "8.2.2", default-features = false, features = ["macos_fsevent"], optional = true }
 async-io.workspace = true
 # async-channel is always available on native (used by runtime) and is also
 # available on WASM when the `sse` feature is enabled
@@ -303,7 +307,7 @@ multipart = ["dep:multer", "dep:pin-project-lite"]
 sse = ["dep:itoa", "dep:async-channel", "dep:pin-project-lite"]
 # The static file server emits and honours `ETag`, `Last-Modified` and `Range`, which it parses
 # and renders with the `headers` crate rather than by hand.
-static-files = ["dep:sha1", "dep:base64"]
+static-files = ["dep:sha1", "dep:base64", "dep:lru", "dep:notify"]
 # `TypedHeader<H>` plus the `skyzen::headers` re-export. `headers` itself is a required
 # dependency — the conditional-request types use it unconditionally — so the feature only
 # marks the API surface.

@@ -849,36 +849,54 @@ mod tests {
         });
     }
 
+    /// Every event the test thread records, as text.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(target_os = "linux")]
+    impl Captured {
+        /// A subscriber writing every event at `level` and above here.
+        fn subscriber(&self, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
+            tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_ansi(false)
+                .with_writer(self.clone())
+                .finish()
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log lock").clone()).expect("UTF-8 log")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
     /// On Linux every accepted connection moves to kernel TLS, and a file region goes out through
     /// it intact. The mode is read from the handshake event the runtime records in the
     /// connection's span.
     #[test]
     #[cfg(target_os = "linux")]
     fn linux_connections_use_kernel_tls_and_serve_file_regions() {
-        use std::sync::Mutex;
-
-        #[derive(Clone, Default)]
-        struct Captured(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("log lock").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-            type Writer = Self;
-
-            fn make_writer(&'a self) -> Self {
-                self.clone()
-            }
-        }
-
         /// Answers every request with the whole of a file, as a file-region body.
         #[derive(Clone)]
         struct FileEndpoint(std::path::PathBuf, u64);
@@ -906,13 +924,8 @@ mod tests {
         std::fs::write(&path, &payload).expect("write the payload");
 
         let log = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(log.clone())
-            .finish();
         let (_dir, tls, der) = acceptor();
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::subscriber::with_default(log.subscriber(tracing::Level::DEBUG), || {
             on_compio(|runtime| async move {
                 let endpoint = FileEndpoint(path, payload.len() as u64);
                 let (addr, stop, task) = start(&runtime, tls, HttpServer::H1, endpoint);
@@ -927,10 +940,59 @@ mod tests {
             });
         });
 
-        let log = String::from_utf8(log.0.lock().expect("log lock").clone()).expect("UTF-8 log");
+        let log = log.text();
         assert!(
             log.contains("TLS handshake complete") && log.contains("mode=Kernel"),
             "the connection did not move to kernel TLS:\n{log}"
+        );
+    }
+
+    /// `StaticDir` over kernel TLS: a file above the inline limit reaches the socket through
+    /// `SendFile` — `http-kit-h1` records `sending a file region` exactly where it calls it — on a
+    /// connection the kernel encrypts, so the file's bytes never enter user space.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn static_files_go_through_send_file_over_kernel_tls() {
+        use crate::{
+            routing::{build, Route},
+            static_files::{StaticCacheSettings, StaticDir},
+        };
+
+        let payload: Vec<u8> = (0..20_000)
+            .flat_map(|line| format!("{line:06} {CJK}\n").into_bytes())
+            .collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), &payload).expect("write the payload");
+
+        let log = Captured::default();
+        let (_tls_dir, tls, der) = acceptor();
+        tracing::subscriber::with_default(log.subscriber(tracing::Level::TRACE), || {
+            on_compio(|runtime| async move {
+                // Inline limit zero: the file is cached as an open descriptor, sent as a region.
+                let router = build(Route::new((
+                    StaticDir::new("/", dir.path()).cache(StaticCacheSettings::new(16, 0)),
+                )))
+                .expect("the router builds");
+                let (addr, stop, task) = start(&runtime, tls, HttpServer::H1, router);
+
+                let mut client = tls_client(addr, &der, b"http/1.1").await;
+                let (head, body) = get(&mut client).await;
+                assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+                assert!(body == payload, "the file arrived changed");
+
+                drop(stop);
+                task.await;
+            });
+        });
+
+        let log = log.text();
+        assert!(
+            log.contains("TLS handshake complete") && log.contains("mode=Kernel"),
+            "the connection did not move to kernel TLS:\n{log}"
+        );
+        assert!(
+            log.contains("sending a file region"),
+            "the file did not go through send_file:\n{log}"
         );
     }
 }
