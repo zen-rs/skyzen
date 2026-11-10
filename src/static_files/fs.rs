@@ -64,7 +64,7 @@ pub(super) mod sealed {
         /// Read the first `len` bytes of the file, which must still hold that many.
         fn read(&self, handle: Self::Handle, len: u64) -> impl Future<Output = io::Result<Bytes>>;
 
-        /// The file as a `std` handle, which a file-region body owns.
+        /// The file as a `std` handle, which the cache shares among its file-region bodies.
         fn std_file(&self, handle: Self::Handle) -> io::Result<File>;
     }
 }
@@ -126,7 +126,7 @@ impl sealed::Ops for CompioFs {
         Ok(Bytes::from(buffer.into_inner()))
     }
 
-    /// One `dup` of the descriptor, once per cache fill, so the region owns a plain `File`.
+    /// One `dup` of the descriptor, once per cache fill, so the cache owns a plain `File`.
     fn std_file(&self, handle: Self::Handle) -> io::Result<File> {
         let owned = std::os::fd::AsFd::as_fd(&handle).try_clone_to_owned()?;
         Ok(File::from(owned))

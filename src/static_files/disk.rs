@@ -195,23 +195,24 @@ struct Representation {
 enum Content {
     /// Below the inline limit: the whole file, read once.
     Memory(Bytes),
-    /// The open file, sent as a region.
-    File(std::fs::File),
+    /// The open file, shared by every region cut from it.
+    File(std::sync::Arc<std::fs::File>),
 }
 
 impl Representation {
-    fn body(&self, offset: u64, length: u64) -> io::Result<Body> {
-        Ok(match &self.content {
+    fn body(&self, offset: u64, length: u64) -> Body {
+        match &self.content {
             Content::Memory(bytes) => {
                 let range = super::usize_range(offset, length);
                 Body::from_bytes(bytes.slice(range))
             }
-            // `FileRegion` owns its file, so each response takes a duplicate of the cached
-            // descriptor — one `dup`, never an `open`.
-            Content::File(file) => {
-                Body::from_file_region(http_kit::FileRegion::new(file.try_clone()?, offset, length))
-            }
-        })
+            // A region shares the cached file through its `Arc`: no `dup`, no `open`, no syscall.
+            Content::File(file) => Body::from_file_region(http_kit::FileRegion::new(
+                std::sync::Arc::clone(file),
+                offset,
+                length,
+            )),
+        }
     }
 }
 
@@ -257,7 +258,7 @@ impl<F: FileSystem> Shared<F> {
         );
         let mut response = served.head(&disposition, self.cache_control.as_ref());
         if let Some((offset, length)) = disposition.span(served.len) {
-            *response.body_mut() = representation.body(offset, length)?;
+            *response.body_mut() = representation.body(offset, length);
         }
         Ok(response)
     }
@@ -372,7 +373,7 @@ impl<F: FileSystem> Shared<F> {
         let content = if len < inline_limit {
             Content::Memory(self.fs.read(handle, len).await?)
         } else {
-            Content::File(self.fs.std_file(handle)?)
+            Content::File(std::sync::Arc::new(self.fs.std_file(handle)?))
         };
         Ok(Representation {
             len,
