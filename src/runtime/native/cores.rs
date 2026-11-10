@@ -20,7 +20,7 @@ use std::{io, num::NonZeroUsize, rc::Rc, sync::Arc, thread};
 
 use async_channel::{bounded, Receiver, Sender};
 use executor_core::{compio::Runtime, AnyExecutor};
-use http_kit_io::{compio::Compio, IntoPoll, Io, Listener, SendFile, Split};
+use http_kit_io::{compio::Compio, IntoPoll, Io, Listener, SendFile, Split, TcpOptions};
 use skyzen_core::{EndpointFactory, PeerAddress};
 use skyzen_h1::H1;
 use skyzen_hyper::Hyper;
@@ -353,6 +353,7 @@ async fn serve_tcp<F, W, L, E>(
     if !announce(ready).await {
         return;
     }
+    let listener = NoDelay(listener);
     match (&plan.tls, plan.server) {
         // ALPN chooses the protocol on the decrypted stream: `h2` is hyper's, anything else is
         // HTTP/1.1 served by the plan's selected server.
@@ -369,6 +370,30 @@ async fn serve_tcp<F, W, L, E>(
             .await;
         }
         (None, server) => serve_cleartext(server, h1, executor, listener, endpoint, shutdown).await,
+    }
+}
+
+/// A TCP listener whose connections send every write at once. With Nagle's algorithm left on, a
+/// response's last short segment waits for the client's delayed ACK, about 40 ms on Linux.
+#[derive(Debug)]
+struct NoDelay<L>(L);
+
+impl<L> Listener for NoDelay<L>
+where
+    L: Listener,
+    L::Stream: TcpOptions,
+{
+    type Stream = L::Stream;
+    type Addr = L::Addr;
+
+    async fn accept(&self) -> io::Result<(Self::Stream, Self::Addr)> {
+        let (stream, peer) = self.0.accept().await?;
+        stream.set_nodelay(true)?;
+        Ok((stream, peer))
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.0.local_addr()
     }
 }
 
@@ -605,5 +630,27 @@ mod tests {
             std::fs::remove_file(&path).expect("the socket file is ours to remove");
             assert!(body.starts_with("skyzen-"), "{server:?}: {body}");
         }
+    }
+
+    /// A TCP connection is served with Nagle's algorithm off.
+    #[test]
+    fn accepted_tcp_connections_send_without_delay() {
+        use http_kit_io::{compio::Compio, Io, Listener, TcpOptions};
+
+        executor_core::compio::Runtime::new()
+            .expect("compio runtime")
+            .block_on(async {
+                let listener = super::NoDelay(
+                    Compio
+                        .bind_tcp("127.0.0.1:0".parse().unwrap())
+                        .expect("bind loopback"),
+                );
+                let addr = listener.local_addr().expect("local addr");
+                let (accepted, client) =
+                    futures_util::future::join(listener.accept(), Compio.connect(addr)).await;
+                let _client = client.expect("connect");
+                let (stream, _peer) = accepted.expect("accept");
+                assert!(stream.nodelay().expect("read TCP_NODELAY"));
+            });
     }
 }
