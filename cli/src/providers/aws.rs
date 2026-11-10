@@ -156,8 +156,10 @@ fn secret_steps(
     // Delivery writes `$LATEST`; the cutover repoints `skyzen` so the schedules — the only
     // path that reads a frozen version — pick the rotation up too.
     let cutover_function = function.clone();
-    let cutover = move |env: Vec<(String, String)>| {
-        Step::Task(Box::new(CutoverAlias::new(cutover_function.clone(), env)) as Box<dyn Task>)
+    let cutover = move |env: Vec<(String, String)>, delivered: Vec<String>| {
+        Step::Task(
+            Box::new(CutoverAlias::new(cutover_function.clone(), env, delivered)) as Box<dyn Task>,
+        )
     };
     let delivery = match action {
         SecretAction::Set { name, value } => Delivery::one(name.as_str(), value),
@@ -170,13 +172,14 @@ fn secret_steps(
                      wiring variable and no [aws.env] entry"
                 );
             }
+            let delivered = delivery.keys();
             return Ok(vec![
                 Step::Task(Box::new(LambdaEnvironment::new(
                     function,
                     delivery,
                     prepared.child_env.clone(),
                 ))),
-                cutover(prepared.child_env),
+                cutover(prepared.child_env, delivered),
             ]);
         }
         SecretAction::List => {
@@ -185,13 +188,14 @@ fn secret_steps(
             )))]);
         }
     };
+    let delivered = delivery.keys();
     Ok(vec![
         Step::Task(Box::new(LambdaEnvironment::new(
             function,
             delivery,
             env.clone(),
         ))),
-        cutover(env),
+        cutover(env, delivered),
     ])
 }
 

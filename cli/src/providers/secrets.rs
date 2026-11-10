@@ -62,6 +62,12 @@ impl Delivery {
         self.0.is_empty()
     }
 
+    /// The names this delivery writes, in sorted order.
+    #[must_use]
+    pub fn keys(&self) -> Vec<String> {
+        self.0.keys().cloned().collect()
+    }
+
     /// The names alone, which is all a description or a log line may carry.
     #[must_use]
     pub fn names(&self) -> String {

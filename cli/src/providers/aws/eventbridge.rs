@@ -50,6 +50,9 @@ struct RuleSnapshot {
     owner: Option<String>,
     /// Whether the deploy added the grant — a created permission is rollback's to remove.
     granted: bool,
+    /// Whether retirement actually removed the grant — `statement` says it existed,
+    /// `removed` says it is now gone and restore must put it back.
+    removed: bool,
     /// Whether the transaction actually changed the rule — a snapshot whose ownership check
     /// rejected the rule was never mutated, and restoring it would be the mutation.
     mutated: bool,
@@ -157,11 +160,14 @@ impl Task for MigrateSchedulesToAlias {
 pub struct CutoverAlias {
     /// The alias owner, reusing `EventBridgeSchedules`' publish and repoint.
     inner: EventBridgeSchedules,
+    /// The names the delivery just wrote — the only keys `$LATEST` may legitimately
+    /// differ on.
+    delivered: Vec<String>,
 }
 
 impl CutoverAlias {
     /// The step that moves `skyzen` to the freshest published version of `function`.
-    pub fn new(function: String, env: Vec<(String, String)>) -> Self {
+    pub fn new(function: String, env: Vec<(String, String)>, delivered: Vec<String>) -> Self {
         Self {
             inner: EventBridgeSchedules::new(
                 function,
@@ -169,6 +175,7 @@ impl CutoverAlias {
                 crate::providers::secrets::Delivery::default(),
                 env,
             ),
+            delivered,
         }
     }
 }
@@ -234,6 +241,31 @@ impl Task for CutoverAlias {
                     "`{}`'s $LATEST does not match the code the `{ALIAS}` alias serves — \
                      deploy before rotating secrets, or the rotation would promote code a \
                      previous deployment rolled back",
+                    self.inner.function
+                );
+            }
+            // The same check on configuration: a failed deploy may leave environment B on
+            // `$LATEST` while the alias still serves A — publishing would promote B. The
+            // delivered names are the only keys permitted to differ.
+            let delivered: std::collections::BTreeSet<&String> = self.delivered.iter().collect();
+            let env_of =
+                |config: &aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationOutput| {
+                    config
+                        .environment()
+                        .and_then(|e| e.variables())
+                        .map(|vars| {
+                            vars.iter()
+                                .filter(|(name, _)| !delivered.contains(name))
+                                .map(|(name, value)| (name.clone(), value.clone()))
+                                .collect::<std::collections::BTreeMap<_, _>>()
+                        })
+                        .unwrap_or_default()
+                };
+            if env_of(&latest) != env_of(&alias) {
+                anyhow::bail!(
+                    "`{}`'s $LATEST carries configuration the `{ALIAS}` alias does not — \
+                     deploy before rotating secrets, or the rotation would promote \
+                     configuration a previous deployment rolled back",
                     self.inner.function
                 );
             }
@@ -521,6 +553,7 @@ impl EventBridgeSchedules {
                     statement: None,
                     owner: None,
                     granted: false,
+                    removed: false,
                     mutated: false,
                 })
             }
@@ -549,6 +582,7 @@ impl EventBridgeSchedules {
             statement: None,
             owner: None,
             granted: false,
+            removed: false,
             mutated: false,
         })
     }
@@ -702,22 +736,34 @@ impl EventBridgeSchedules {
                 .statement_id(format!("skyzen-schedule-{schedule}"))
                 .send()
                 .await;
-        } else if let Some(statement) = &snapshot.statement {
-            lambda
-                .add_permission()
-                .function_name(snapshot.owner.as_deref().unwrap_or(qualified))
-                .action(INVOKE_ACTION)
-                .principal(EVENTS_PRINCIPAL)
-                .source_arn(rule_arn)
-                .statement_id(statement)
-                .send()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to restore the invoke permission of `{}`",
-                        snapshot.name
-                    )
-                })?;
+        } else if snapshot.removed {
+            if let Some(statement) = &snapshot.statement {
+                // A grant that still exists is the desired state — a ResourceConflict here
+                // means nothing went missing, not that the restore failed; it must not stop
+                // the enabled state coming back below.
+                let add = lambda
+                    .add_permission()
+                    .function_name(snapshot.owner.as_deref().unwrap_or(qualified))
+                    .action(INVOKE_ACTION)
+                    .principal(EVENTS_PRINCIPAL)
+                    .source_arn(rule_arn)
+                    .statement_id(statement)
+                    .send()
+                    .await;
+                if let Err(error) = add {
+                    let conflict = error
+                        .as_service_error()
+                        .is_some_and(|e| e.meta().code() == Some("ResourceConflictException"));
+                    if !conflict {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to restore the invoke permission of `{}`",
+                                snapshot.name
+                            )
+                        });
+                    }
+                }
+            }
         }
         // The state is last: rule, targets and grant are all original again before the
         // rule is allowed to fire.
@@ -866,11 +912,24 @@ impl EventBridgeSchedules {
         let qualified = format!("{}:{ALIAS}", self.function);
         let alias_arn = format!("{arn}:{ALIAS}");
 
+        // Schedule-specific policy reads are optional in discovery: an app whose credentials
+        // never held `lambda:GetPolicy` still carries legacy rules, and the `skyzen-{fn}--`
+        // prefix scan finds them whatever the policies say.
+        let mut names: std::collections::BTreeSet<String> =
+            match self.managed_names(lambda, &qualified).await {
+                Ok(names) => names,
+                Err(error) => {
+                    output::warn(format!("could not read schedule grants: {error:#}"));
+                    Default::default()
+                }
+            };
+        names.extend(self.managed_rule_names(events).await?);
+
         // Only rules still carrying an unqualified target need moving — when none do, the
         // alias stays exactly where it is. Repointing it anyway would resurrect the version
         // a previous failed deployment deliberately rolled back.
         let mut pending = Vec::new();
-        for name in self.managed_names(lambda, &qualified).await? {
+        for name in names {
             let rule = self.rule_name(&name);
             let listed = match events.list_targets_by_rule().rule(&rule).send().await {
                 Ok(listed) => listed,
@@ -894,7 +953,19 @@ impl EventBridgeSchedules {
                 continue;
             }
             if listed.targets().iter().all(|target| target.arn() == arn) {
-                pending.push((rule, listed.targets().to_vec(), name));
+                // The rule's state goes with it: migration disables it before retargeting,
+                // and a failed deploy puts the state back along with the targets.
+                let enabled = matches!(
+                    events
+                        .describe_rule()
+                        .name(&rule)
+                        .send()
+                        .await
+                        .with_context(|| format!("failed to read rule `{rule}`"))?
+                        .state(),
+                    Some(aws_sdk_eventbridge::types::RuleState::Enabled)
+                );
+                pending.push((rule, listed.targets().to_vec(), name, enabled));
             } else if listed.targets().iter().any(|target| target.arn() == arn) {
                 // A rule sharing its targets with a foreign resource cannot be moved — and
                 // cannot be left either: `$LATEST` swaps under it the moment deploy runs.
@@ -939,11 +1010,11 @@ impl EventBridgeSchedules {
                 format!("`{arn}` is not a Lambda function ARN EventBridge rules can be built from")
             })?;
 
-        let mut migrated: Vec<(String, Vec<Target>)> = Vec::new();
-        for (rule, previous, name) in pending {
-            // A migration that fails partway puts every moved rule's previous targets back —
-            // not just the failing one's — or earlier rules keep pointing at the alias while
-            // the rest still fire $LATEST.
+        let mut migrated: Vec<(String, Vec<Target>, bool)> = Vec::new();
+        for (rule, previous, name, enabled) in pending {
+            // A migration that fails partway puts every moved rule's previous targets, state
+            // and grant back — not just the failing one's — or earlier rules keep pointing
+            // at the alias while the rest still fire $LATEST.
             let rule_arn = format!("arn:{partition}:events:{region}:{account}:rule/{rule}");
             let result = self
                 .migrate_one(
@@ -959,17 +1030,43 @@ impl EventBridgeSchedules {
                 )
                 .await;
             if let Err(error) = result {
-                for (rule, previous) in migrated.iter().chain(std::iter::once(&(rule, previous))) {
-                    let _ = events
+                for (rule, previous, enabled) in migrated.iter().chain(std::iter::once(&(
+                    rule.clone(),
+                    previous.clone(),
+                    enabled,
+                ))) {
+                    // Targets, then the grant that may or may not have landed, then the
+                    // state — the order migration undoes them.
+                    let restored = events
                         .put_targets()
                         .rule(rule)
                         .set_targets(Some(previous.clone()))
                         .send()
                         .await;
+                    if let Ok(restored) = restored {
+                        if !restored.failed_entries().is_empty() {
+                            output::warn(format!(
+                                "could not fully restore targets of `{rule}`: {:?}",
+                                restored
+                                    .failed_entries()
+                                    .first()
+                                    .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
+                            ));
+                        }
+                    }
+                    let _ = lambda
+                        .remove_permission()
+                        .function_name(&qualified)
+                        .statement_id(format!("skyzen-schedule-{name}"))
+                        .send()
+                        .await;
+                    if *enabled {
+                        let _ = events.enable_rule().name(rule).send().await;
+                    }
                 }
                 return Err(error);
             }
-            migrated.push((rule.clone(), previous));
+            migrated.push((rule.clone(), previous, enabled));
             output::ok(format!(
                 "retargeted EventBridge rule `{rule}` at the `{ALIAS}` alias"
             ));
@@ -1020,6 +1117,16 @@ impl EventBridgeSchedules {
                 moved
             })
             .collect();
+        // The rule is disabled before its target moves: `PutTargets` takes time to
+        // propagate, and a rule still enabled in the gap keeps firing the unqualified
+        // function — the code `deploy` is about to swap — with the old cron. Disabling
+        // first is the barrier `reconcile` re-enables behind once the alias has cut over.
+        events
+            .disable_rule()
+            .name(rule)
+            .send()
+            .await
+            .with_context(|| format!("failed to disable EventBridge rule `{rule}`"))?;
         let put = events
             .put_targets()
             .rule(rule)
@@ -1191,7 +1298,13 @@ impl EventBridgeSchedules {
                     .send()
                     .await
                 {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // The grant is actually gone — and only the owner it lived on counts:
+                        // a successful no-op on the other does not mean it was removed.
+                        if snapshot.last().and_then(|t| t.owner.as_deref()) == Some(owner) {
+                            snapshot.last_mut().map(|t| t.removed = true);
+                        }
+                    }
                     Err(error)
                         if error.as_service_error().is_some_and(
                             aws_sdk_lambda::operation::remove_permission::RemovePermissionError::is_resource_not_found_exception,
