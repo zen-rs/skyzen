@@ -53,6 +53,10 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace ${{ matrix.targets }} ${{ env.FEATURES }} -- -D warnings
 
+      # The build most applications compile: code behind a feature that is off must lint too.
+      - name: Run clippy (default features)
+        run: cargo clippy --workspace ${{ matrix.targets }} -- -D warnings
+
       - uses: taiki-e/install-action@nextest
 
       # The native TLS tests assert kernel TLS on Linux.

@@ -420,10 +420,10 @@ async fn serve_tcp<F, W, L, E>(
         return;
     }
     let listener = NoDelay(listener);
-    match (&plan.tls, plan.server) {
+    match &plan.tls {
         // ALPN chooses the protocol on the decrypted stream: `h2` is hyper's, anything else is
         // HTTP/1.1 served by the plan's selected server.
-        (Some(tls), server) => {
+        Some(tls) => {
             super::tls::serve(
                 executor,
                 listener,
@@ -432,14 +432,14 @@ async fn serve_tcp<F, W, L, E>(
                 tls.clone(),
                 plan.max_connections,
                 Protocols {
-                    server,
+                    server: plan.server,
                     h1: h1.clone(),
                     alt_svc: plan.http3.as_ref().map(|plan| plan.alt_svc.clone()),
                 },
             )
             .await;
         }
-        (None, server) => serve_cleartext(server, h1, executor, listener, endpoint, shutdown).await,
+        None => serve_cleartext(plan.server, h1, executor, listener, endpoint, shutdown).await,
     }
 }
 
