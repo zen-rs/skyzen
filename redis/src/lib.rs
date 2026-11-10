@@ -14,15 +14,15 @@
 //! kv.put("key", b"value").await?;
 //! ```
 //!
+//! # Runtime
+//!
+//! The connection runs on redis's smol runtime, whose sockets and timers are async-io's, so a
+//! [`Redis`] works under any executor — compio's thread-per-core runtime included — and needs no
+//! tokio context.
+//!
 //! # Feature Flags
 //!
-//! - `runtime-tokio` — Use Tokio as the async runtime
-//! - `runtime-smol` — Use Smol as the async runtime
-//!
-//! At least one of them must be enabled; with neither, this crate exposes
-//! nothing (the upstream `redis` crate cannot build its async support without
-//! a runtime).
-#![cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
+//! - `tls` — `rediss://` URLs, through rustls
 
 use std::sync::Arc;
 
@@ -106,7 +106,6 @@ impl Redis {
     ///
     /// Returns [`KvError::Backend`] if the connection cannot be established.
     pub async fn connect(url: &str) -> Result<Self, KvError> {
-        pin_runtime();
         let client = Client::open(url).map_err(backend_error)?;
         install_tls_provider(&client);
         let conn = client
@@ -456,52 +455,6 @@ fn install_tls_provider(client: &redis::Client) {
 #[cfg(not(feature = "tls"))]
 const fn install_tls_provider(_client: &redis::Client) {}
 
-/// `tls` compiles both runtime comps, so upstream picks the executor by
-/// tokio-handle detection and the declared runtime can lose either way: a
-/// `runtime-smol` consumer driven from a tokio context gets tokio, and a
-/// `runtime-tokio` consumer outside any tokio context gets smol. Pin the
-/// declared preference once — `prefer_*` exists only when upstream compiles
-/// both runtimes (exactly the ambiguity this resolves) and refuses to
-/// override a preference the app already set. With both runtime features on,
-/// the selection is genuinely ambiguous, so nothing is pinned.
-#[cfg(all(
-    feature = "tls",
-    feature = "runtime-tokio",
-    not(feature = "runtime-smol")
-))]
-fn pin_runtime() {
-    static PIN: std::sync::Once = std::sync::Once::new();
-    PIN.call_once(|| {
-        let _ = redis::aio::prefer_tokio();
-    });
-}
-
-#[cfg(all(
-    feature = "tls",
-    not(feature = "runtime-tokio"),
-    feature = "runtime-smol"
-))]
-fn pin_runtime() {
-    static PIN: std::sync::Once = std::sync::Once::new();
-    PIN.call_once(|| {
-        let _ = redis::aio::prefer_smol();
-    });
-}
-
-#[cfg(not(any(
-    all(
-        feature = "tls",
-        feature = "runtime-tokio",
-        not(feature = "runtime-smol")
-    ),
-    all(
-        feature = "tls",
-        not(feature = "runtime-tokio"),
-        feature = "runtime-smol"
-    )
-)))]
-const fn pin_runtime() {}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -790,17 +743,57 @@ mod tests {
         (port, handle)
     }
 
+    /// `connect` opens its socket and writes its first commands on redis's smol runtime under a
+    /// compio runtime, with no tokio runtime anywhere: a plain TCP peer on a std thread receives
+    /// the RESP the connection manager sends on connect.
+    #[compio::test]
+    async fn a_connection_writes_its_handshake_on_compio_without_a_tokio_runtime() {
+        use std::io::Read;
+
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut buf = vec![0u8; 256];
+            let n = socket.read(&mut buf).expect("read the first command");
+            buf.truncate(n);
+            buf
+        });
+
+        // The peer never answers, so the manager cannot finish connecting; the proof is what
+        // reached the peer.
+        let _ = compio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::Redis::connect(&format!("redis://127.0.0.1:{port}/")),
+        )
+        .await;
+        let received = peer.join().expect("peer thread");
+        assert_eq!(
+            received.first(),
+            Some(&b'*'),
+            "the peer should receive a RESP command array, got {received:?}"
+        );
+    }
+
     /// `#insecure` turns off verification upstream, so a self-signed peer is a
     /// real handshake: the server must receive decrypted RESP bytes (redis's
     /// connection manager sends CLIENT SETINFO / PING on connect).
-    #[tokio::test]
+    #[compio::test]
     #[cfg(all(feature = "tls", unix))]
     async fn a_rediss_connection_completes_a_tls_handshake() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
         let (port, peer) = self_signed_peer();
         let url = format!("rediss://127.0.0.1:{port}/#insecure");
         // The manager may wait for a RESP reply our stub never sends — the
         // proof is on the server side, so the client result does not matter.
-        let _ = tokio::time::timeout(
+        let _ = compio::time::timeout(
             std::time::Duration::from_secs(5),
             super::Redis::connect(&url),
         )
@@ -817,7 +810,7 @@ mod tests {
     /// it. A single-shot connect, not the manager — the manager retries a
     /// failed handshake forever, and "keeps retrying" is not the failure being
     /// asserted here.
-    #[tokio::test]
+    #[compio::test]
     #[cfg(all(feature = "tls", unix))]
     async fn a_rediss_connection_rejects_an_untrusted_certificate() {
         let (port, _peer) = self_signed_peer();
@@ -827,7 +820,7 @@ mod tests {
         // without it panics on `builder()` in a multi-provider world, which is
         // the failure mode being prevented, not tested.
         super::install_tls_provider(&client);
-        let result = tokio::time::timeout(
+        let result = compio::time::timeout(
             std::time::Duration::from_secs(5),
             client.get_multiplexed_async_connection(),
         )
