@@ -62,6 +62,11 @@ pub(super) fn requests_upgrade(headers: &HeaderMap) -> bool {
     headers.contains_key(header::UPGRADE) && lists_token(headers, &header::CONNECTION, "upgrade")
 }
 
+/// The message's `Upgrade` fields, to carry across a hop that takes part in the switch.
+pub(super) fn upgrade_fields(headers: &HeaderMap) -> Vec<HeaderValue> {
+    headers.get_all(header::UPGRADE).iter().cloned().collect()
+}
+
 /// Whether the client said it accepts trailer fields, for itself and anything behind it
 /// (RFC 9110 §10.1.4).
 pub(super) fn accepts_trailers(headers: &HeaderMap) -> bool {

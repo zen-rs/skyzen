@@ -268,15 +268,10 @@ impl Proxy {
         }
         // The protocols the client offers to switch to, kept only where the server can hand its
         // connection over once the upstream switches.
-        let offered: Vec<HeaderValue> = if headers::requests_upgrade(request.headers())
+        let offered = if headers::requests_upgrade(request.headers())
             && request.extensions().get::<UpgradeAvailable>().is_some()
         {
-            request
-                .headers()
-                .get_all(header::UPGRADE)
-                .iter()
-                .cloned()
-                .collect()
+            headers::upgrade_fields(request.headers())
         } else {
             Vec::new()
         };
@@ -364,13 +359,8 @@ impl Proxy {
         let switched = Upgrade::on(&mut response);
         let chunked = headers::is_chunked(response.headers());
         let version = response.version();
-        let protocols: Vec<HeaderValue> = if switched.is_some() {
-            response
-                .headers()
-                .get_all(header::UPGRADE)
-                .iter()
-                .cloned()
-                .collect()
+        let protocols = if switched.is_some() {
+            headers::upgrade_fields(response.headers())
         } else {
             Vec::new()
         };
