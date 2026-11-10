@@ -312,7 +312,8 @@ impl Task for MigrateSchedulesToAlias {
                 // Then the rules that were enabled before migration get that state back
                 // too — the alias still serves the working version, so they can run again
                 // without ever touching the unqualified function.
-                self.inner
+                let restored = self
+                    .inner
                     .rollback_reconcile(
                         &lambda,
                         &events,
@@ -322,13 +323,19 @@ impl Task for MigrateSchedulesToAlias {
                         &alias,
                     )
                     .await;
-                for entry in &migrated {
-                    if entry.enabled {
-                        if let Err(restore) = events.enable_rule().name(&entry.rule).send().await {
-                            output::warn(format!(
-                                "could not re-enable migrated rule `{}`: {restore}",
-                                entry.rule
-                            ));
+                // A rule is re-enabled only if its targets, grant and state actually came
+                // back — `None` means the alias repoint failed and nothing is safe to fire.
+                if let Some(restored) = restored {
+                    for entry in &migrated {
+                        if entry.enabled && restored.contains(&entry.rule) {
+                            if let Err(restore) =
+                                events.enable_rule().name(&entry.rule).send().await
+                            {
+                                output::warn(format!(
+                                    "could not re-enable migrated rule `{}`: {restore}",
+                                    entry.rule
+                                ));
+                            }
                         }
                     }
                 }
@@ -638,15 +645,10 @@ impl EventBridgeSchedules {
         // stale grants to retire — but an HTTP-only app need not hold the permissions that
         // cleanup wants. Its discovery is best-effort: whatever it cannot read, it leaves.
         if self.schedules.is_empty() {
-            // An HTTP-only app may hold none of the permissions cleanup wants — discovering
-            // it has no managed rules is enough to leave everything alone. But a failure
-            // while managed rules were actually found must stop the deploy, or the
-            // supposedly removed schedules keep firing.
-            // A failed discovery cannot prove no managed rules remain — whatever it cannot
-            // read, it cannot retire, and the deploy cannot claim it did.
-            if self.managed_rule_names(events).await?.is_empty() {
-                return Ok(());
-            }
+            // Retire whatever stale rules and grants it finds — an empty set retires
+            // nothing, so an HTTP-only deploy without schedule permissions is unaffected.
+            // `retire_stale` reads the policies AND the prefix — a grant whose rule is
+            // already gone still comes off here.
             self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
                 .await?;
             return Ok(());
@@ -1308,9 +1310,11 @@ impl EventBridgeSchedules {
         (partition, region, account): (&str, &str, &str),
         snapshot: &[RuleSnapshot],
         alias: &Option<String>,
-    ) {
+    ) -> Option<std::collections::BTreeSet<String>> {
         // The alias goes back first: rules re-enabled by the restore below must find the
         // old version behind them, or the rollback itself wakes a stale cron on new code.
+        // A failed repoint means the alias still serves the new version — nothing is safe
+        // to re-enable, so report no restoration rather than pretend.
         if let Some(previous) = alias {
             let restore = lambda
                 .update_alias()
@@ -1323,23 +1327,31 @@ impl EventBridgeSchedules {
                 output::warn(format!(
                     "could not repoint the `{ALIAS}` alias back at `{previous}`: {restore}"
                 ));
+                return None;
             }
         }
+        let mut restored = std::collections::BTreeSet::new();
         for taken in snapshot {
             let rule_arn = format!(
                 "arn:{partition}:events:{region}:{account}:rule/{}",
                 taken.name
             );
-            if let Err(restore) = self
+            match self
                 .restore_rule(&events, &lambda, qualified, &rule_arn, taken)
                 .await
             {
-                output::warn(format!(
-                    "could not restore EventBridge rule `{}`: {restore}",
-                    taken.name
-                ));
+                Ok(()) => {
+                    restored.insert(taken.name.clone());
+                }
+                Err(restore) => {
+                    output::warn(format!(
+                        "could not restore EventBridge rule `{}`: {restore}",
+                        taken.name
+                    ));
+                }
             }
         }
+        Some(restored)
     }
 
     /// Put one migrated rule back: its original targets, its unqualified grant if migration
@@ -1619,8 +1631,18 @@ impl EventBridgeSchedules {
 
         // The policies tell most of the story — but a rule whose grant is already gone still
         // fires its target. Names prefixed `skyzen-{function}--` are ours by construction,
-        // so a prefix scan finds the survivors the grants alone would miss.
-        for name in self.managed_rule_names(events).await? {
+        // so a prefix scan finds the survivors the grants alone would miss. The scan is
+        // best-effort: denied, it finds nothing, and the policy names still carry the day.
+        match self.managed_rule_names(events).await {
+            Ok(rules) => rules,
+            Err(error) if Self::is_access_denied(&error) => {
+                output::warn(format!("could not list managed rules: {error:#}"));
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        }
+        .into_iter()
+        .for_each(|name| {
             // `false` — a rule found by name alone carries no grant, and nothing gets
             // re-added for a permission that never was.
             if !declared.contains(name.as_str())
@@ -1628,7 +1650,7 @@ impl EventBridgeSchedules {
             {
                 stale.push((name, qualified.to_owned(), false));
             }
-        }
+        });
 
         for (name, owner, had_grant) in stale {
             let rule = self.rule_name(&name);
