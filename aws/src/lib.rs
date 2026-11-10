@@ -36,6 +36,7 @@
 #[cfg(any(feature = "dynamodb", feature = "rds-data", feature = "sqs"))]
 mod errors;
 
+pub mod credential_process;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 #[cfg(feature = "rds-data")]

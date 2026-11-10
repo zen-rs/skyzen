@@ -16,7 +16,11 @@
 
 use core::{fmt, time::Duration};
 
-use aws_config::{BehaviorVersion, ConfigLoader, SdkConfig};
+use aws_config::{
+    environment::EnvironmentVariableCredentialsProvider,
+    meta::credentials::CredentialsProviderChain, BehaviorVersion, ConfigLoader, SdkConfig,
+};
+use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_smithy_async::rt::sleep::{AsyncSleep, Sleep};
 use aws_smithy_runtime_api::client::{
     http::{
@@ -29,6 +33,8 @@ use aws_smithy_runtime_api::client::{
 use aws_smithy_types::body::SdkBody;
 use http_kit::{Body, Endpoint as _};
 use zenwave::{backend::NativeBackend, Transport};
+
+use crate::credential_process::CredentialProcessProvider;
 
 /// The AWS SDK's [`HttpClient`], on a zenwave [`NativeBackend`].
 ///
@@ -144,11 +150,29 @@ pub fn config_loader(http: ZenwaveHttpClient) -> ConfigLoader {
 /// The ambient AWS configuration — environment, profile files, instance metadata — loaded through
 /// [`config_loader`] with [`ZenwaveHttpClient::system`].
 ///
+/// The credentials come from the default chain with [`CredentialProcessProvider`] spliced in
+/// after the environment variables, which the default chain tries first, so a profile's
+/// `credential_process` is honoured and a profile without one falls through to the rest of the
+/// chain. aws-config's own `credential_process` support is compiled out, since it needs tokio.
+///
 /// # Panics
 ///
 /// If zenwave cannot start its driver thread.
 pub async fn load_config() -> SdkConfig {
-    config_loader(ZenwaveHttpClient::system()).load().await
+    let config = config_loader(ZenwaveHttpClient::system()).load().await;
+    let default_chain = config
+        .credentials_provider()
+        .expect("aws-config's loader always installs a credentials provider");
+    let chain = CredentialsProviderChain::first_try(
+        "Environment",
+        EnvironmentVariableCredentialsProvider::new(),
+    )
+    .or_else("CredentialProcess", CredentialProcessProvider::new())
+    .or_else("Default", default_chain);
+    config
+        .into_builder()
+        .credentials_provider(SharedCredentialsProvider::new(chain))
+        .build()
 }
 
 #[cfg(all(test, feature = "dynamodb"))]
