@@ -189,29 +189,13 @@ impl Task for CutoverAlias {
             let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let lambda = aws_sdk_lambda::Client::new(&shared);
             // An app that never scheduled has no alias — and no call for the permissions a
-            // repoint would take. Only a confirmed absence skips the cutover: every other
-            // failure means the delivery just happened and the schedules would keep the old
-            // values — report it rather than pretend the rotation finished.
+            // repoint would take. Only a confirmed absence skips the cutover: the delivery
+            // just happened, and every other answer leaves the schedules holding old values
+            // — report it rather than pretend the rotation finished.
             match self.inner.alias_snapshot(&lambda).await {
                 Ok(Some(_)) => {}
                 Ok(None) => return Ok(()),
                 Err(error) => {
-                    let access_denied = error
-                        .downcast_ref::<aws_sdk_lambda::error::SdkError<
-                            aws_sdk_lambda::operation::get_alias::GetAliasError,
-                        >>()
-                        .and_then(|sdk| {
-                            sdk.as_service_error()
-                                .map(|e| e.meta().code() == Some("AccessDeniedException"))
-                        })
-                        .unwrap_or(false);
-                    if access_denied {
-                        output::warn(format!(
-                            "cannot check the `{ALIAS}` alias — the scheduled environment is \
-                             unchanged: {error:#}"
-                        ));
-                        return Ok(());
-                    }
                     return Err(error).with_context(|| {
                         format!(
                             "failed to read the `{ALIAS}` alias of `{}` after delivering \
@@ -400,11 +384,19 @@ impl EventBridgeSchedules {
         // stale grants to retire — but an HTTP-only app need not hold the permissions that
         // cleanup wants. Its discovery is best-effort: whatever it cannot read, it leaves.
         if self.schedules.is_empty() {
-            if let Err(error) = self
-                .retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
-                .await
-            {
-                output::warn(format!("could not check for stale schedules: {error:#}"));
+            // An HTTP-only app may hold none of the permissions cleanup wants — discovering
+            // it has no managed rules is enough to leave everything alone. But a failure
+            // while managed rules were actually found must stop the deploy, or the
+            // supposedly removed schedules keep firing.
+            match self.managed_rule_names(events).await {
+                Ok(rules) if rules.is_empty() => {}
+                Ok(rules) => {
+                    self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
+                        .await?;
+                }
+                Err(error) => {
+                    output::warn(format!("could not check for stale schedules: {error:#}"));
+                }
             }
             return Ok(());
         }
@@ -575,27 +567,29 @@ impl EventBridgeSchedules {
                 .await
                 .with_context(|| format!("failed to remove rule `{}`", snapshot.name))?;
             // The grant the wiring added goes with it — a failed deploy must not leave
-            // invoke permissions behind for a rule that never was.
+            // invoke permissions behind for a rule that never was. `name` is the rule
+            // `skyzen-{function}--{schedule}` — the grant is `skyzen-schedule-{schedule}`.
             if snapshot.granted {
-                if let Some(statement) = &snapshot.statement {
-                    let _ = lambda
-                        .remove_permission()
-                        .function_name(qualified)
-                        .statement_id(statement)
-                        .send()
-                        .await;
-                }
+                let schedule = snapshot
+                    .name
+                    .strip_prefix(&format!("skyzen-{}--", self.function))
+                    .unwrap_or(&snapshot.name);
+                let _ = lambda
+                    .remove_permission()
+                    .function_name(qualified)
+                    .statement_id(format!("skyzen-schedule-{schedule}"))
+                    .send()
+                    .await;
             }
             return Ok(());
         }
+        // The rule goes back disabled regardless of its original state — it is enabled last,
+        // after its targets are restored, so the window between the recreate and the target
+        // fix cannot fire the rule with the failed deploy's transformer.
         let mut put = events
             .put_rule()
             .name(&snapshot.name)
-            .state(if snapshot.enabled {
-                aws_sdk_eventbridge::types::RuleState::Enabled
-            } else {
-                aws_sdk_eventbridge::types::RuleState::Disabled
-            });
+            .state(aws_sdk_eventbridge::types::RuleState::Disabled);
         if let Some(expression) = &snapshot.expression {
             put = put.schedule_expression(expression);
         }
@@ -686,6 +680,16 @@ impl EventBridgeSchedules {
                         snapshot.name
                     )
                 })?;
+        }
+        // The state is last: rule, targets and grant are all original again before the
+        // rule is allowed to fire.
+        if snapshot.enabled {
+            events
+                .enable_rule()
+                .name(&snapshot.name)
+                .send()
+                .await
+                .with_context(|| format!("failed to re-enable rule `{}`", snapshot.name))?;
         }
         Ok(())
     }
@@ -897,6 +901,7 @@ impl EventBridgeSchedules {
                 format!("`{arn}` is not a Lambda function ARN EventBridge rules can be built from")
             })?;
 
+        let mut migrated: Vec<(String, Vec<Target>)> = Vec::new();
         for (rule, previous, name) in pending {
             // The invoke grant precedes the retarget: a rule moved before its permission
             // would sit unable to invoke until reconciliation catches up — or forever, if
@@ -936,15 +941,21 @@ impl EventBridgeSchedules {
                 .send()
                 .await
                 .with_context(|| format!("failed to retarget `{rule}` at `{ALIAS}`"))?;
-            // A partially failed retarget puts the previous targets back before the deploy
-            // reports it — a rule left half-moved fires neither side cleanly.
+            // A partially failed retarget puts every moved rule's previous targets back —
+            // not just this one's — or the migration leaves earlier rules pointing at the
+            // alias while later ones still fire $LATEST.
             if !put.failed_entries().is_empty() {
-                let _ = events
-                    .put_targets()
-                    .rule(&rule)
-                    .set_targets(Some(previous))
-                    .send()
-                    .await;
+                for (rule, previous) in migrated
+                    .iter()
+                    .chain(std::iter::once(&(rule.clone(), previous.clone())))
+                {
+                    let _ = events
+                        .put_targets()
+                        .rule(rule)
+                        .set_targets(Some(previous.clone()))
+                        .send()
+                        .await;
+                }
                 anyhow::bail!(
                     "EventBridge refused to retarget `{rule}`: {:?}",
                     put.failed_entries()
@@ -952,6 +963,7 @@ impl EventBridgeSchedules {
                         .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
                 );
             }
+            migrated.push((rule.clone(), previous));
             output::ok(format!(
                 "retargeted EventBridge rule `{rule}` at the `{ALIAS}` alias"
             ));
@@ -1083,33 +1095,13 @@ impl EventBridgeSchedules {
         // The policies tell most of the story — but a rule whose grant is already gone still
         // fires its target. Names prefixed `skyzen-{function}--` are ours by construction,
         // so a prefix scan finds the survivors the grants alone would miss.
-        let prefix = format!("skyzen-{}--", self.function);
-        let mut token: Option<String> = None;
-        loop {
-            let mut list = events.list_rules().name_prefix(&prefix);
-            if let Some(next) = &token {
-                list = list.next_token(next);
-            }
-            let page = list
-                .send()
-                .await
-                .with_context(|| "failed to list this function's EventBridge rules")?;
-            for rule in page.rules() {
-                if let Some(name) = rule
-                    .name()
-                    .and_then(|name| name.strip_prefix(prefix.as_str()))
-                {
-                    // `false` — a rule found by name alone carries no grant, and nothing
-                    // gets re-added for a permission that never was.
-                    if !declared.contains(name) && !stale.iter().any(|(stale, _, _)| stale == name)
-                    {
-                        stale.push((name.to_owned(), qualified.to_owned(), false));
-                    }
-                }
-            }
-            match page.next_token() {
-                Some(next) if !next.is_empty() => token = Some(next.to_owned()),
-                _ => break,
+        for name in self.managed_rule_names(events).await? {
+            // `false` — a rule found by name alone carries no grant, and nothing gets
+            // re-added for a permission that never was.
+            if !declared.contains(name.as_str())
+                && !stale.iter().any(|(stale, _, _)| stale == &name)
+            {
+                stale.push((name, qualified.to_owned(), false));
             }
         }
 
@@ -1221,6 +1213,40 @@ impl EventBridgeSchedules {
             .await
             .with_context(|| format!("failed to delete stale EventBridge rule `{rule}`"))?;
         Ok(())
+    }
+
+    /// Every rule name this module owns: the `skyzen-{function}--` prefix is ours by
+    /// construction, whatever the policies say.
+    async fn managed_rule_names(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+    ) -> Result<Vec<String>> {
+        let prefix = format!("skyzen-{}--", self.function);
+        let mut names = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut list = events.list_rules().name_prefix(&prefix);
+            if let Some(next) = &token {
+                list = list.next_token(next);
+            }
+            let page = list
+                .send()
+                .await
+                .with_context(|| "failed to list this function's EventBridge rules")?;
+            for rule in page.rules() {
+                if let Some(name) = rule
+                    .name()
+                    .and_then(|name| name.strip_prefix(prefix.as_str()))
+                {
+                    names.push(name.to_owned());
+                }
+            }
+            match page.next_token() {
+                Some(next) if !next.is_empty() => token = Some(next.to_owned()),
+                _ => break,
+            }
+        }
+        Ok(names)
     }
 
     /// The function's resource policy document, or `None` when it has none.
