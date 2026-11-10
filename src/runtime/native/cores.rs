@@ -41,6 +41,13 @@ pub(super) enum Socket {
 
 impl Socket {
     /// The TCP listener, or `None` for a unix socket.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the `None` arm is the unix socket, which only unix compiles"
+        )
+    )]
     pub(super) const fn tcp(&self) -> Option<&std::net::TcpListener> {
         match self {
             Self::Tcp(listener) => Some(listener),
