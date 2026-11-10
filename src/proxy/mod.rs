@@ -359,9 +359,6 @@ impl Endpoint for Proxy {
         );
         let response = match self.client.respond(&mut forwarded).await {
             Ok(response) => response,
-            // The backend reports an error status as an error, holding the response it read; for
-            // a proxy that status is the answer.
-            Err(zenwave::Error::Http { response, .. }) => response.response,
             Err(zenwave::Error::Timeout) => return Err(ProxyError::Timeout),
             Err(error) => return Err(ProxyError::Upstream(error)),
         };
