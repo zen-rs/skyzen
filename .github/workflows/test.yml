@@ -53,6 +53,11 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
+      # The native TLS tests assert kernel TLS on Linux.
+      - name: Load the kernel TLS module
+        if: runner.os == 'Linux'
+        run: sudo modprobe tls
+
       - name: Run tests
         run: cargo nextest run --workspace ${{ matrix.targets }} ${{ matrix.features }}
 
