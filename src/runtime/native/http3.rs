@@ -16,6 +16,24 @@
 //!
 //! Without the `http3` feature [`Http3`] has no values, so a request for HTTP/3 is a refusal to
 //! start and nothing in this module compiles any QUIC code.
+//!
+//! # `OpenSSL`
+//!
+//! quiche's TLS is `BoringSSL`, linked statically and without a symbol prefix. Wherever
+//! `native-tls` means `OpenSSL` (every target but Apple's and Windows), `tls-native-tls` would
+//! link `OpenSSL` into the same binary, and the two export the same `SSL_*` symbols, so the build
+//! refuses the pair rather than leave the linker to mix them.
+
+#[cfg(all(
+    feature = "http3",
+    feature = "tls-native-tls",
+    not(any(target_vendor = "apple", windows))
+))]
+compile_error!(
+    "the `http3` and `tls-native-tls` features cannot be combined on this target: quiche's \
+     BoringSSL and native-tls's OpenSSL export the same symbols; use `tls-rustls` for the database \
+     connections"
+);
 
 use std::future::Future;
 

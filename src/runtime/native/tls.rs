@@ -901,7 +901,8 @@ mod tests {
                 write_all(&mut stream, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()).await;
                 stream
             };
-            let (refused, _stream) = futures_util::future::join(serve, client).await;
+            // Boxed: on Linux the stream carries kernel TLS state, which makes the join large.
+            let (refused, _stream) = Box::pin(futures_util::future::join(serve, client)).await;
             assert!(refused, "a plaintext client must not complete a handshake");
         });
     }
