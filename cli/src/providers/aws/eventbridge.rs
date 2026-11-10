@@ -804,7 +804,10 @@ impl EventBridgeSchedules {
             match self.alias_snapshot(lambda).await {
                 Ok(None) => return Ok(()),
                 Ok(Some(_)) => {}
-                Err(error) if tolerant => {
+                // Verified-no-rules tolerates a permanently denied read — never a
+                // transient one: stamping `none` over an alias that may exist records
+                // an absence that was never confirmed.
+                Err(error) if tolerant && Self::alias_read_denied(&error) => {
                     output::warn(format!("could not check the `{ALIAS}` alias: {error:#}"));
                     return Ok(());
                 }
@@ -1792,15 +1795,16 @@ impl EventBridgeSchedules {
                         )
                     });
                 }
-                // The record is unreadable — nothing verified a stale assertion
-                // exists, and tag operations are not a deploy prerequisite. Warn that
-                // the state stays unverified rather than fail the transition.
-                Err(_) => {
-                    output::warn(format!(
-                        "could not clear or verify the `skyzen-schedules` tag of Lambda \
-                         function `{}`: {error:#}",
-                        self.function
-                    ));
+                // The record is unreadable — an unverified state cannot prove a stale
+                // `none` is absent, so activating schedules over it is not safe.
+                Err(read_error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "could not invalidate or verify the `skyzen-schedules` tag \
+                             of Lambda function `{}` before enabling rules: {read_error:#}",
+                            self.function
+                        )
+                    });
                 }
             }
         }
@@ -1828,6 +1832,26 @@ impl EventBridgeSchedules {
                 self.function
             ));
         }
+    }
+
+    /// Whether an `alias_snapshot` failure was an IAM denial — `GetAlias` has no
+    /// typed `AccessDenied` variant, so the wire code is checked through the context
+    /// chain `with_context` preserved.
+    fn alias_read_denied(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<aws_sdk_lambda::error::SdkError<
+                    aws_sdk_lambda::operation::get_alias::GetAliasError,
+                >>()
+                .is_some_and(|sdk| {
+                    sdk.as_service_error().is_some_and(|service| {
+                        service
+                            .meta()
+                            .code()
+                            .is_some_and(|code| code.contains("AccessDenied"))
+                    })
+                })
+        })
     }
 
     /// The version the `skyzen` alias serves, or `None` when it does not exist.
