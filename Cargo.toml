@@ -185,6 +185,13 @@ skyzen-lambda = { workspace = true, optional = true }
 futures-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
+# Windows has no load-balancing `SO_REUSEPORT`, so every serving thread accepts on a clone of one
+# listening socket, and IOCP registers a socket with one completion port only. With one global port
+# that every runtime registers on, each thread's clone joins the same port and compio dispatches
+# its completions back to the runtime that submitted them.
+[target.'cfg(windows)'.dependencies]
+compio = { version = "0.19.2", default-features = false, features = ["iocp-global"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The `Server` tests and `examples/embed_hyper.rs` run their own smol executor.
 smol.workspace = true
