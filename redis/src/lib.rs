@@ -718,15 +718,6 @@ mod tests {
     /// handshake is the normal end of the session.
     #[cfg(all(feature = "tls", unix))]
     fn self_signed_peer() -> (u16, std::thread::JoinHandle<std::io::Result<Vec<u8>>>) {
-        use std::io::{ErrorKind, Read, Write};
-
-        fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
-            haystack
-                .windows(needle.len())
-                .filter(|window| *window == needle)
-                .count()
-        }
-
         let cert =
             rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
         let config = rustls::ServerConfig::builder_with_provider(
@@ -749,41 +740,53 @@ mod tests {
             while conn.is_handshaking() {
                 conn.complete_io(&mut sock)?;
             }
-            let mut tls = rustls::StreamOwned::new(conn, sock);
-            let mut received = Vec::new();
-            let (mut clients, mut pings) = (0, 0);
-            let mut buf = [0u8; 1024];
-            loop {
-                match tls.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => received.extend_from_slice(&buf[..n]),
-                    // A plain TCP close after the handshake carries no close_notify.
-                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
-                    Err(error) => return Err(error),
-                }
-                let seen_clients = occurrences(&received, b"CLIENT");
-                let seen_pings = occurrences(&received, b"PING");
-                for _ in clients..seen_clients {
-                    tls.write_all(b"+OK\r\n")?;
-                }
-                for _ in pings..seen_pings {
-                    tls.write_all(b"+PONG\r\n")?;
-                }
-                (clients, pings) = (seen_clients, seen_pings);
-                tls.flush()?;
-            }
-            Ok(received)
+            serve_setup(&mut rustls::StreamOwned::new(conn, sock))
         });
         (port, handle)
     }
 
-    /// `connect` opens its socket and writes its first commands on redis's smol runtime under a
-    /// compio runtime, with no tokio runtime anywhere: a plain TCP peer on a std thread receives
-    /// the RESP the connection manager sends on connect.
+    /// Answer the RESP commands redis-rs's connection setup sends over `stream` (`+OK` for each
+    /// `CLIENT`, `+PONG` for each `PING`) until the peer closes it, and return the bytes read.
+    fn serve_setup(stream: &mut (impl std::io::Read + std::io::Write)) -> std::io::Result<Vec<u8>> {
+        use std::io::ErrorKind;
+
+        fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+            haystack
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        let mut received = Vec::new();
+        let (mut clients, mut pings) = (0, 0);
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                // A plain TCP close after a TLS handshake carries no close_notify.
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+            let seen_clients = occurrences(&received, b"CLIENT");
+            let seen_pings = occurrences(&received, b"PING");
+            for _ in clients..seen_clients {
+                stream.write_all(b"+OK\r\n")?;
+            }
+            for _ in pings..seen_pings {
+                stream.write_all(b"+PONG\r\n")?;
+            }
+            (clients, pings) = (seen_clients, seen_pings);
+            stream.flush()?;
+        }
+        Ok(received)
+    }
+
+    /// A connection opens its socket and completes its setup on redis's smol runtime under a
+    /// compio runtime, with no tokio runtime anywhere: a plain TCP peer on a std thread answers
+    /// the RESP the connection manager sends on connect, and receives it.
     #[compio::test]
     async fn a_connection_writes_its_handshake_on_compio_without_a_tokio_runtime() {
-        use std::io::Read;
-
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "the test must run with no tokio runtime"
@@ -791,21 +794,30 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let peer = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
-            let mut buf = vec![0u8; 256];
-            let n = socket.read(&mut buf).expect("read the first command");
-            buf.truncate(n);
-            buf
+            let (mut socket, _) = listener.accept()?;
+            serve_setup(&mut socket)
         });
 
-        // The peer never answers, so the manager cannot finish connecting; the proof is what
-        // reached the peer.
-        let _ = compio::time::timeout(
-            std::time::Duration::from_secs(5),
-            super::Redis::connect(&format!("redis://127.0.0.1:{port}/")),
+        // The same manager `connect` builds, with its 1 s per-attempt bound lifted: under load an
+        // attempt can outlast it, and the peer serves exactly one connection. The outer 60 s
+        // bound only guards against a hang.
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}/")).expect("parses");
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(std::time::Duration::from_secs(60)))
+            .set_response_timeout(Some(std::time::Duration::from_secs(60)));
+        let manager = compio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.get_connection_manager_with_config(config),
         )
-        .await;
-        let received = peer.join().expect("peer thread");
+        .await
+        .expect("connect hung for 60 s")
+        .expect("connect to a peer that answers its setup must succeed");
+        // Closing the client ends the peer's session.
+        drop(super::Redis::from_connection_manager(manager));
+        let received = peer
+            .join()
+            .expect("peer thread panicked")
+            .expect("peer I/O failed");
         assert_eq!(
             received.first(),
             Some(&b'*'),
