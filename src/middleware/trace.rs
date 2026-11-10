@@ -65,7 +65,7 @@ fn now() -> f64 {
 
 #[cfg(target_arch = "wasm32")]
 fn elapsed_ms(started: f64) -> u64 {
-    (js_sys::Date::now() - started) as u64
+    super::js_millis(js_sys::Date::now() - started)
 }
 
 /// One `tracing` span per request, following OpenTelemetry field names.

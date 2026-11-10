@@ -300,10 +300,13 @@ validate = ["dep:garde"]
 # Request-body decompression codings for `DecompressionMiddleware`, one feature per
 # `Content-Encoding` token it can decode. gzip and deflate ride on `flate2`, already linked
 # for response compression; `br` and `zstd` each pull their pure-Rust decoder.
-decompress-gzip = []
-decompress-deflate = []
-decompress-br = ["dep:brotli"]
-decompress-zstd = ["dep:ruzstd"]
+decompress-gzip = ["decompress"]
+decompress-deflate = ["decompress"]
+decompress-br = ["decompress", "dep:brotli"]
+decompress-zstd = ["decompress", "dep:ruzstd"]
+# Internal: on whenever any `decompress-*` coding is, so the streaming decoder machinery is
+# compiled exactly when some coding uses it. Not meant to be enabled directly.
+decompress = []
 # Database drivers, sqlx runtimes and TLS backends. None is on by default: an application picks
 # the ones it uses, and each forwards to the `skyzen-services` feature of the same name.
 postgres = ["skyzen-services/postgres"]
