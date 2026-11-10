@@ -3,8 +3,8 @@
 //! Routes are defined by combining nodes produced by the [`CreateRouteNode`] extension. Path
 //! literals gain builder methods such as `.at(handler)` (GET), `.post(handler)`, `.put(handler)`,
 //! `.patch(handler)`, `.delete(handler)`, `.head(handler)`, `.options(handler)`,
-//! `.trace(handler)`, `.on(method, handler)`, `.any(handler)`, `.ws(handler)`, `.route(children)`
-//! and `.nest(router)` so you can describe the full tree declaratively. Once a tree is assembled,
+//! `.trace(handler)`, `.on(method, handler)`, `.any(handler)`, `.ws(handler)`, `.route(children)`,
+//! `.nest(router)` and `.mount(endpoint)` so you can describe the full tree declaratively. Once a tree is assembled,
 //! call [`Route::build`] to obtain a [`Router`] that can be mounted on a server or invoked
 //! directly from tests.
 //!
@@ -164,7 +164,7 @@ pub(crate) use matched_path::MountPrefix;
 pub use matched_path::{MatchedPath, NoMatchedPath};
 
 mod nest;
-pub use nest::{NestedPathError, NestedRouter};
+pub use nest::{MountPathError, Mounted};
 
 /// An endpoint that can say which routes it serves.
 ///
@@ -297,6 +297,13 @@ pub enum RouteNodeType {
         /// Middleware wrapping the mounted router, outermost first.
         middleware: Vec<BoxMiddleware>,
     },
+    /// An endpoint answering every method at the node's path and everything beneath it.
+    Mounted {
+        /// Factory producing the mounted endpoint, which sees paths with the mount prefix removed.
+        endpoint_factory: EndpointFactory,
+        /// Middleware wrapping the mounted endpoint, outermost first.
+        middleware: Vec<BoxMiddleware>,
+    },
 }
 
 impl fmt::Debug for RouteNodeType {
@@ -313,6 +320,10 @@ impl fmt::Debug for RouteNodeType {
             Self::Nested { router, middleware } => f
                 .debug_struct("Nested")
                 .field("router", router)
+                .field("middleware", &middleware.len())
+                .finish(),
+            Self::Mounted { middleware, .. } => f
+                .debug_struct("Mounted")
                 .field("middleware", &middleware.len())
                 .finish(),
         }
@@ -598,6 +609,22 @@ impl RouteNode {
         }
     }
 
+    /// Construct a node mounting `endpoint` under `path`, for every method and every path beneath.
+    #[must_use]
+    pub(crate) fn new_mounted<E>(path: impl Into<String>, endpoint: E) -> Self
+    where
+        E: Endpoint + Clone + 'static,
+    {
+        let endpoint_factory: EndpointFactory = Rc::new(move || AnyEndpoint::new(endpoint.clone()));
+        Self {
+            path: path.into(),
+            node_type: RouteNodeType::Mounted {
+                endpoint_factory,
+                middleware: Vec::new(),
+            },
+        }
+    }
+
     fn apply_middleware(&mut self, middleware: &BoxMiddleware) {
         match &mut self.node_type {
             RouteNodeType::Route(route) => route.apply_middleware(middleware),
@@ -605,6 +632,9 @@ impl RouteNode {
                 middleware: stack, ..
             }
             | RouteNodeType::Nested {
+                middleware: stack, ..
+            }
+            | RouteNodeType::Mounted {
                 middleware: stack, ..
             } => stack.insert(0, Rc::clone(middleware)),
         }
@@ -808,11 +838,24 @@ impl RouteNode {
         self.extend_with_nodes(vec![Self::new_nested("", router)])
     }
 
+    /// Mount an endpoint under the current path, for every method and every path beneath it.
+    ///
+    /// See [`CreateRouteNode::mount`] for what the mounted endpoint sees.
+    #[must_use]
+    pub fn mount<E>(self, endpoint: E) -> Self
+    where
+        E: Endpoint + Clone + 'static,
+    {
+        self.extend_with_nodes(vec![Self::new_mounted("", endpoint)])
+    }
+
     fn extend_with_nodes(self, mut additional: Vec<Self>) -> Self {
         let path = self.path;
         let mut nodes = match self.node_type {
             RouteNodeType::Route(route) => route.into_mounted_nodes(),
-            terminal @ (RouteNodeType::Endpoint { .. } | RouteNodeType::Nested { .. }) => {
+            terminal @ (RouteNodeType::Endpoint { .. }
+            | RouteNodeType::Nested { .. }
+            | RouteNodeType::Mounted { .. }) => {
                 vec![Self {
                     path: String::new(),
                     node_type: terminal,
@@ -997,6 +1040,9 @@ fn collect_openapi_entries(
             RouteNodeType::Nested { router, .. } => {
                 buf.extend(prefixed_openapi_entries(&path, router));
             }
+            // A mounted endpoint answers every method under its prefix, so it has no single
+            // operation to document.
+            RouteNodeType::Mounted { .. } => {}
         }
     }
 }
@@ -1124,6 +1170,34 @@ pub trait CreateRouteNode: Sized {
     /// Use [`route`](Self::route) instead to compose an unbuilt [`Route`]: nesting exists for the
     /// case where the router is already built and its internals are no longer reachable.
     fn nest(self, router: Router) -> RouteNode;
+
+    /// Mount an endpoint under the current path segment, answering every method at the path and
+    /// every path beneath it.
+    ///
+    /// Like [`nest`](Self::nest), the prefix is stripped before the endpoint sees the request and
+    /// put back afterwards, so an endpoint mounted at `/api` receives `/api/users?page=2` as
+    /// `/users?page=2`. This is how a reverse proxy is hung on a router.
+    ///
+    /// ```rust
+    /// use std::convert::Infallible;
+    ///
+    /// use skyzen::{routing::{CreateRouteNode, Route}, Body, Endpoint, Request, Response};
+    ///
+    /// #[derive(Clone)]
+    /// struct Echo;
+    ///
+    /// impl Endpoint for Echo {
+    ///     type Error = Infallible;
+    ///     async fn respond(&mut self, request: &mut Request) -> Result<Response, Infallible> {
+    ///         Ok(Response::new(Body::from(request.uri().to_string())))
+    ///     }
+    /// }
+    ///
+    /// let router = Route::new(("/api".mount(Echo),)).build();
+    /// ```
+    fn mount<E>(self, endpoint: E) -> RouteNode
+    where
+        E: Endpoint + Clone + 'static;
 
     /// Attach an endpoint at the specified method and path.
     ///
@@ -1281,5 +1355,12 @@ where
 
     fn nest(self, router: Router) -> RouteNode {
         RouteNode::new_nested(self.into(), router)
+    }
+
+    fn mount<E>(self, endpoint: E) -> RouteNode
+    where
+        E: Endpoint + Clone + 'static,
+    {
+        RouteNode::new_mounted(self.into(), endpoint)
     }
 }

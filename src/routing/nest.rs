@@ -1,4 +1,4 @@
-//! Mounting an already-built [`Router`] inside a larger route tree.
+//! Mounting an endpoint — an already-built [`Router`] or any other — inside a larger route tree.
 
 use std::sync::Arc;
 
@@ -7,37 +7,35 @@ use http_kit::uri::PathAndQuery;
 
 use crate::{Endpoint, Request, Response, StatusCode, Uri};
 
-use super::{join_path, MatchedPath, MountPrefix, Router};
+use super::{join_path, MatchedPath, MountPrefix};
 
-/// Serves a mounted [`Router`], with the mount prefix stripped from the request path.
+/// Serves a mounted endpoint, with the mount prefix stripped from the request path.
 ///
-/// Constructed by [`CreateRouteNode::nest`](super::CreateRouteNode::nest); it is public only
-/// because it appears in the routing tree's `Debug` output.
+/// Constructed by [`CreateRouteNode::nest`](super::CreateRouteNode::nest) for a [`Router`](super::Router) and by
+/// [`CreateRouteNode::mount`](super::CreateRouteNode::mount) for any other endpoint; it is public
+/// only because it appears in the routing tree's `Debug` output.
 ///
-/// The inner router matches against paths as if it were mounted at the root, which is what lets a
-/// library export a `Router` without knowing where its consumer will hang it. Its fallback and its
-/// `405` still belong to it: an unmatched path under the prefix is answered by the *inner* router,
-/// not by the outer one.
+/// The endpoint sees paths as if it were mounted at the root, which is what lets a library export
+/// a `Router` without knowing where its consumer will hang it, and what lets a reverse proxy
+/// forward `/api/users` as `/users`. A mounted router's fallback and its `405` still belong to
+/// it: an unmatched path under the prefix is answered by the *inner* router, not by the outer one.
 #[derive(Clone)]
-pub struct NestedRouter {
+pub struct Mounted<E> {
     prefix: Arc<str>,
-    router: Router,
+    endpoint: E,
 }
 
-impl std::fmt::Debug for NestedRouter {
+impl<E> std::fmt::Debug for Mounted<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NestedRouter")
+        f.debug_struct("Mounted")
             .field("prefix", &self.prefix)
             .finish_non_exhaustive()
     }
 }
 
-impl NestedRouter {
-    pub(crate) fn new(prefix: &str, router: Router) -> Self {
-        Self {
-            prefix: Arc::from(prefix),
-            router,
-        }
+impl<E> Mounted<E> {
+    pub(crate) fn new(prefix: Arc<str>, endpoint: E) -> Self {
+        Self { prefix, endpoint }
     }
 }
 
@@ -46,17 +44,17 @@ impl NestedRouter {
 /// The router only routes a request here after matching the prefix, so reaching this means the
 /// rewritten path was not a usable URI — a bug rather than bad input.
 #[skyzen::error(
-    message = "Could not rewrite `{0}` for the router mounted at its prefix",
+    message = "Could not rewrite `{0}` for the endpoint mounted at its prefix",
     status = StatusCode::INTERNAL_SERVER_ERROR
 )]
-pub struct NestedPathError(String);
+pub struct MountPathError(String);
 
-impl Endpoint for NestedRouter {
+impl<E: Endpoint<Error = BoxHttpError>> Endpoint for Mounted<E> {
     type Error = BoxHttpError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let original = request.uri().clone();
         let rewritten = strip_prefix(&original, &self.prefix)
-            .ok_or_else(|| Box::new(NestedPathError(original.to_string())) as BoxHttpError)?;
+            .ok_or_else(|| Box::new(MountPathError(original.to_string())) as BoxHttpError)?;
 
         *request.uri_mut() = rewritten;
         // The mount's own template (`/api` or `/api/{*skyzen_nested}`) is an internal
@@ -71,7 +69,7 @@ impl Endpoint for NestedRouter {
             None => self.prefix.to_string(),
         };
         let previous = request.extensions_mut().insert(MountPrefix(accumulated));
-        let result = self.router.respond(request).await;
+        let result = self.endpoint.respond(request).await;
         // Put the path back so an outer layer that inspects the request after the inner router
         // returns still sees the URL the client asked for.
         *request.uri_mut() = original;

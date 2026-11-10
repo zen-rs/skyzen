@@ -8,7 +8,7 @@ use std::{
 };
 
 use super::{
-    join_path, BoxEndpoint, EndpointFactory, MatchedPath, MethodFilter, MountPrefix, NestedRouter,
+    join_path, BoxEndpoint, EndpointFactory, MatchedPath, MethodFilter, MountPrefix, Mounted,
     Params, Route, RouteNode, RouteNodeType,
 };
 #[cfg(feature = "openapi")]
@@ -476,8 +476,8 @@ pub enum RouteBuildError {
         /// The path as the route tree assembled it.
         path: String,
     },
-    /// A router was mounted under a prefix containing a pattern segment.
-    NestedPatternPrefix {
+    /// A router or endpoint was mounted under a prefix containing a pattern segment.
+    MountPatternPrefix {
         /// The mount prefix that cannot be stripped.
         path: String,
     },
@@ -510,9 +510,9 @@ impl std::fmt::Display for RouteBuildError {
                 "route path `{path}` cannot match any request: every mount prefix must start \
                  with `/`"
             ),
-            Self::NestedPatternPrefix { path } => write!(
+            Self::MountPatternPrefix { path } => write!(
                 f,
-                "a router cannot be mounted at `{path}`: the prefix is removed from the request \
+                "nothing can be mounted at `{path}`: the prefix is removed from the request \
                  path literally, so it must not contain a `{{name}}` segment"
             ),
             Self::MissingProvision {
@@ -611,29 +611,56 @@ fn flatten(
                 // The prefix is removed from the raw request path by string comparison, so a
                 // pattern segment in it would leave no stable prefix to remove.
                 if path.contains('{') {
-                    return Err(RouteBuildError::NestedPatternPrefix { path });
+                    return Err(RouteBuildError::MountPatternPrefix { path });
                 }
 
                 #[cfg(feature = "openapi")]
                 openapi_entries.extend(super::prefixed_openapi_entries(&path, &router));
 
-                let nested = NestedRouter::new(&path, router);
+                let nested = Mounted::new(Arc::from(path.as_str()), router);
                 // The mount point itself and everything beneath it, for every method: the inner
                 // router decides which of them it answers, including its own 404 and 405.
-                for mounted in [path.clone(), join_path(&path, "/{*skyzen_nested}")] {
-                    let endpoint = nested.clone();
-                    buf.entry(mounted).or_default().push(FlatEndpoint {
-                        method: MethodFilter::Any,
-                        factory: Rc::new(move || BoxEndpoint::new(endpoint.clone())),
-                        middleware: middleware.clone(),
-                        requirements: Vec::new(),
-                    });
+                mount(&path, buf, &middleware, move || {
+                    BoxEndpoint::new(nested.clone())
+                });
+            }
+            RouteNodeType::Mounted {
+                endpoint_factory,
+                middleware,
+            } => {
+                if !path.starts_with('/') {
+                    return Err(RouteBuildError::InvalidPath { path });
                 }
+                if path.contains('{') {
+                    return Err(RouteBuildError::MountPatternPrefix { path });
+                }
+                let prefix: Arc<str> = Arc::from(path.as_str());
+                mount(&path, buf, &middleware, move || {
+                    BoxEndpoint::new(Mounted::new(Arc::clone(&prefix), endpoint_factory()))
+                });
             }
         }
     }
 
     Ok(())
+}
+
+/// Register `factory` at `path` and at every path beneath it, for every method.
+fn mount(
+    path: &str,
+    buf: &mut FlattenBuf,
+    middleware: &[BoxMiddleware],
+    factory: impl Fn() -> BoxEndpoint + 'static,
+) {
+    let factory: EndpointFactory = Rc::new(factory);
+    for mounted in [path.to_owned(), join_path(path, "/{*skyzen_nested}")] {
+        buf.entry(mounted).or_default().push(FlatEndpoint {
+            method: MethodFilter::Any,
+            factory: Rc::clone(&factory),
+            middleware: middleware.to_vec(),
+            requirements: Vec::new(),
+        });
+    }
 }
 
 /// Build a [`Router`] from the provided [`Route`].
@@ -1698,11 +1725,57 @@ mod tests {
         }
     }
 
+    /// Answers with the method and the URI it was handed.
+    #[derive(Clone)]
+    struct UriEcho;
+
+    impl crate::Endpoint for UriEcho {
+        type Error = std::convert::Infallible;
+        async fn respond(
+            &mut self,
+            request: &mut crate::Request,
+        ) -> std::result::Result<crate::Response, Self::Error> {
+            Ok(crate::Response::new(crate::Body::from(format!(
+                "{} {}",
+                request.method(),
+                request.uri()
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mounted_endpoint_answers_every_method_beneath_its_prefix() {
+        let router = build(Route::new(("/api".mount(UriEcho),))).unwrap();
+
+        for (method, path, seen) in [
+            (Method::GET, "/api/users?page=2", "GET /users?page=2"),
+            (Method::DELETE, "/api/users/7", "DELETE /users/7"),
+            (Method::PATCH, "/api", "PATCH /"),
+        ] {
+            let response = router
+                .clone()
+                .go(request_with_method(path, method))
+                .await
+                .unwrap();
+            let body = response.into_body().into_string().await.unwrap();
+            assert_eq!(body, seen);
+        }
+
+        let missed = router.clone().go(get_request("/apix")).await.unwrap();
+        assert_eq!(missed.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn an_endpoint_cannot_be_mounted_under_a_pattern_prefix() {
+        let error = build(Route::new(("/tenants/{tenant}".mount(UriEcho),))).unwrap_err();
+        assert!(matches!(error, RouteBuildError::MountPatternPrefix { .. }));
+    }
+
     #[test]
     fn a_router_cannot_be_mounted_under_a_pattern_prefix() {
         let inner = build(Route::new(("/x".at(|| async { Result::Ok("x") }),))).unwrap();
         let error = build(Route::new(("/tenants/{tenant}".nest(inner),))).unwrap_err();
-        assert!(matches!(error, RouteBuildError::NestedPatternPrefix { .. }));
+        assert!(matches!(error, RouteBuildError::MountPatternPrefix { .. }));
     }
 
     #[test]
