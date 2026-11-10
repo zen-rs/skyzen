@@ -50,6 +50,9 @@ struct RuleSnapshot {
     owner: Option<String>,
     /// Whether the deploy added the grant — a created permission is rollback's to remove.
     granted: bool,
+    /// Whether the transaction actually changed the rule — a snapshot whose ownership check
+    /// rejected the rule was never mutated, and restoring it would be the mutation.
+    mutated: bool,
 }
 
 /// The rules that point `[[schedule]]` entries at a deployed function.
@@ -327,7 +330,9 @@ impl EventBridgeSchedules {
             snapshot.push(taken);
             // `wire_one` can fail partway — the snapshot must already be on the stack, or
             // the half-wired rule survives the rollback it should have been part of.
-            let granted = self
+            let index = snapshot.len() - 1;
+            let (mut mutated, mut granted) = (false, false);
+            let result = self
                 .wire_one(
                     events,
                     lambda,
@@ -335,11 +340,14 @@ impl EventBridgeSchedules {
                     &alias_arn,
                     (partition, region, account),
                     entry,
+                    &mut mutated,
+                    &mut granted,
                 )
-                .await?;
-            if let Some(taken) = snapshot.last_mut() {
-                taken.granted = granted;
-            }
+                .await;
+            let taken = &mut snapshot[index];
+            taken.mutated = mutated;
+            taken.granted = granted;
+            result?;
         }
         self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
             .await?;
@@ -370,6 +378,7 @@ impl EventBridgeSchedules {
                     statement: None,
                     owner: None,
                     granted: false,
+                    mutated: false,
                 })
             }
             Err(error) => {
@@ -397,6 +406,7 @@ impl EventBridgeSchedules {
             statement: None,
             owner: None,
             granted: false,
+            mutated: false,
         })
     }
 
@@ -410,6 +420,11 @@ impl EventBridgeSchedules {
         rule_arn: &str,
         snapshot: &RuleSnapshot,
     ) -> Result<()> {
+        // A rule the transaction never changed must not be changed back — restoring an
+        // ownership-rejected rule would mutate somebody else's wiring.
+        if snapshot.existed && !snapshot.mutated {
+            return Ok(());
+        }
         if !snapshot.existed {
             let listed = events
                 .list_targets_by_rule()
@@ -465,6 +480,31 @@ impl EventBridgeSchedules {
         put.send()
             .await
             .with_context(|| format!("failed to restore rule `{}`", snapshot.name))?;
+        // `PutTargets` merges — a target id the wiring introduced outlives the restore.
+        // Strip whatever the snapshot does not carry before putting its targets back.
+        if let Ok(listed) = events
+            .list_targets_by_rule()
+            .rule(&snapshot.name)
+            .send()
+            .await
+        {
+            let kept: std::collections::BTreeSet<&str> =
+                snapshot.targets.iter().map(|target| target.id()).collect();
+            let surplus: Vec<String> = listed
+                .targets()
+                .iter()
+                .filter(|target| !kept.contains(target.id()))
+                .map(|target| target.id().to_owned())
+                .collect();
+            if !surplus.is_empty() {
+                let _ = events
+                    .remove_targets()
+                    .rule(&snapshot.name)
+                    .set_ids(Some(surplus))
+                    .send()
+                    .await;
+            }
+        }
         if !snapshot.targets.is_empty() {
             let put = events
                 .put_targets()
@@ -892,6 +932,8 @@ impl EventBridgeSchedules {
             let mut taken = self.rule_snapshot(events, &rule).await?;
             taken.statement = Some(format!("{STATEMENT_PREFIX}{name}"));
             taken.owner = Some(owner);
+            // Retiring mutates the rule the moment it deletes it — the snapshot restores.
+            taken.mutated = true;
             snapshot.push(taken);
             self.retire_rule(events, &[arn, alias_arn], &rule).await?;
             for owner in [qualified, self.function.as_str()] {
@@ -1103,7 +1145,9 @@ impl EventBridgeSchedules {
         arn: &str,
         (partition, region, account): (&str, &str, &str),
         entry: &ScheduleEntry,
-    ) -> Result<bool> {
+        mutated: &mut bool,
+        granted: &mut bool,
+    ) -> Result<()> {
         let rule = self.rule_name(entry.name.as_str());
         anyhow::ensure!(
             rule.len() <= 64,
@@ -1122,6 +1166,9 @@ impl EventBridgeSchedules {
         // ours, and wiring retargets it at the alias.
         let legacy = arn.strip_suffix(&format!(":{ALIAS}")).unwrap_or(arn);
         self.own_the_rule(events, &[arn, legacy], &rule).await?;
+        // Ownership verified — everything after here changes the rule, and the snapshot
+        // restores from here on. Before this line the function is still read-only.
+        *mutated = true;
 
         // The rule goes up disabled and is switched on only once its permission and target
         // are both in place — a rule enabled before its transformer reconciles can fire the
@@ -1142,7 +1189,7 @@ impl EventBridgeSchedules {
         // the grant is new — a failed deploy removes what it added.
         let rule_arn = format!("arn:{partition}:events:{region}:{account}:rule/{rule}");
         let statement = format!("skyzen-schedule-{}", entry.name);
-        let granted = !self
+        let needs_grant = !self
             .has_statement(lambda, qualified, &statement, &rule_arn)
             .await
             .with_context(|| {
@@ -1151,7 +1198,7 @@ impl EventBridgeSchedules {
                     self.function
                 )
             })?;
-        if granted {
+        if needs_grant {
             lambda
                 .add_permission()
                 .function_name(qualified)
@@ -1167,6 +1214,9 @@ impl EventBridgeSchedules {
                         self.function
                     )
                 })?;
+            // Recorded the moment the grant lands — a later wiring failure rolls the
+            // permission back too, not just the rule.
+            *granted = true;
         }
 
         let transformer = InputTransformer::builder()
@@ -1215,7 +1265,7 @@ impl EventBridgeSchedules {
             "wired `[[schedule]] {name}` to EventBridge rule `{rule}` ({expression})",
             name = entry.name
         ));
-        Ok(granted)
+        Ok(())
     }
 
     /// Whether the function's policy already grants `statement` for `source_arn`.

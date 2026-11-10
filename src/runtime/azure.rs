@@ -368,7 +368,6 @@ async fn wrapped_response(response: Response) -> Response {
     // its own object instead. `Content-Length` is the host's to compute again: the wrapped
     // body is not the bytes it was counted for.
     let mut headers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    let mut extra_cookies = 0;
     for (name, value) in &parts.headers {
         if name.as_str().eq_ignore_ascii_case("content-length") {
             continue;
@@ -380,14 +379,13 @@ async fn wrapped_response(response: Response) -> Response {
             // `res.cookies` deserializes through `ExpandoObject` — the tuples the host's
             // `RawScriptResult` expects can never arrive that way, so Set-Cookie survives
             // only as a header, and a headers dictionary holds one value per name. The
-            // first cookie goes in whole; additional ones cannot share the field without
-            // RFC 6265's comma ambiguity, so they go into `x-ms-set-cookie-N` fields a
-            // client (or an API Management policy) can read rather than merging silently.
+            // first cookie goes in whole; anything further has no correct representation —
+            // a comma join violates RFC 6265 and a renamed header leaks `HttpOnly` values
+            // to JavaScript — so it is dropped and the loss is logged.
             if headers.contains_key(name.as_str()) {
-                extra_cookies += 1;
-                headers.insert(
-                    format!("x-ms-set-cookie-{extra_cookies}"),
-                    value.to_owned().into(),
+                tracing::warn!(
+                    "dropping a Set-Cookie header: Azure's wrapped response cannot carry \
+                     multiple cookies"
                 );
             } else {
                 headers.insert(name.as_str().to_owned(), value.into());
