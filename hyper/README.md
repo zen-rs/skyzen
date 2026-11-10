@@ -58,6 +58,10 @@ See the [`embed_hyper.rs`](../examples/embed_hyper.rs) example for a complete wo
 |------|-------------|
 | `Hyper` | `Server` implementation using Hyper HTTP/1 + HTTP/2 |
 | `IntoService` | Adapter converting a Skyzen `Endpoint` into a Hyper `Service` |
+| `serve_connection` | Serve one accepted connection (after TLS, where ALPN picks the `Protocol`) |
+| `AltSvc` | `Alt-Svc` value advertising an HTTP/3 endpoint on UDP, attached with `IntoService::with_alt_svc` |
+
+Every `http-kit-io` driver works, `compio` included, and nothing served is required to be `Send`.
 
 ## License
 
