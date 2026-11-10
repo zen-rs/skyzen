@@ -17,8 +17,8 @@ path = "src/main.rs"
 anyhow = "1"
 askama = "0.16"
 # The Lambda environment is delivered in-process rather than through `cargo lambda`, so a value
-# never reaches a command line. Same feature selection as `skyzen-aws`, so the workspace resolves
-# one HTTP stack: the SDK default `rustls` feature pulls the legacy connector (rustls 0.21 /
+# never reaches a command line. The CLI runs on tokio, so it keeps the SDK's tokio client; the SDK
+# default `rustls` feature stays off because it pulls the legacy connector (rustls 0.21 /
 # hyper-rustls 0.24) alongside the modern `default-https-client`, and carries unpatched advisories.
 aws-config = "1"
 aws-sdk-lambda = { version = "1", default-features = false, features = [

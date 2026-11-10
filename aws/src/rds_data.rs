@@ -301,7 +301,7 @@ impl RdsDataDb {
         database: impl Into<String>,
         engine: RdsEngine,
     ) -> Self {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = crate::sdk::load_config().await;
         Self::new(
             Client::new(&config),
             resource_arn,
@@ -956,6 +956,7 @@ mod tests {
                 .behavior_version(BehaviorVersion::latest())
                 .region(Region::new("us-east-1"))
                 .credentials_provider(Credentials::new("AKIDTEST", "secret", None, None, "tests"))
+                .sleep_impl(crate::sdk::AsyncIoSleep)
                 .build(),
         )
     }
