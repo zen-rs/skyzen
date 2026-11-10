@@ -231,6 +231,20 @@ impl MigrateSchedulesToAlias {
                 "the deploy partially applied — the migrated schedules stay on the alias \
                  rather than point new code at the old function",
             );
+            // The upload went through, so `$LATEST` carries new code — but the rules
+            // target the alias, which still serves the version they were built for.
+            // Re-enable rather than strand them disabled: alias isolation keeps the
+            // new code unreachable until the next deploy repoints.
+            for entry in migrated {
+                if entry.enabled {
+                    if let Err(restore) = events.enable_rule().name(&entry.rule).send().await {
+                        output::warn(format!(
+                            "could not re-enable migrated rule `{}`: {restore}",
+                            entry.rule
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -457,11 +471,33 @@ impl Task for CutoverAlias {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run(&self) -> Result<()> {
         super::lambda_env::adopt_env(&self.inner.env);
         block_on(async {
             let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let lambda = aws_sdk_lambda::Client::new(&shared);
+            // A verified `none` tag proves there is no alias to cut over — it skips the
+            // `GetAlias` read an HTTP-only credential may not hold.
+            let arn = lambda
+                .get_function_configuration()
+                .function_name(&self.inner.function)
+                .send()
+                .await
+                .ok()
+                .and_then(|config| config.function_arn().map(str::to_owned));
+            if let Some(arn) = &arn {
+                if self
+                    .inner
+                    .schedule_tag(&lambda, arn)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|tag| tag == "none")
+                {
+                    return Ok(());
+                }
+            }
             // An app that never scheduled has no alias — and no call for the permissions a
             // repoint would take. Only a confirmed absence skips the cutover: the delivery
             // just happened, and every other answer leaves the schedules holding old values
@@ -673,7 +709,7 @@ impl Task for EventBridgeSchedules {
             // verified-clean deploy stamped, or a scan that verifies no managed rule
             // exists — "cannot read" is not "there are none".
             let marked_none = self
-                .schedule_tag(&lambda)
+                .schedule_tag(&lambda, ctx.arn)
                 .await
                 .ok()
                 .flatten()
@@ -745,15 +781,6 @@ impl EventBridgeSchedules {
             // skip it: a denied or failed lookup is "unknown", and claiming cleanup
             // completed over an alias that may still serve a frozen version would
             // let every later secret rotation fail.
-            if self
-                .schedule_tag(lambda)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|tag| tag == "none")
-            {
-                return Ok(());
-            }
             if self.alias_snapshot(lambda).await?.is_none() {
                 return Ok(());
             }
@@ -1292,18 +1319,20 @@ impl EventBridgeSchedules {
         // — the alias it lacks and the grant it might have lost are both invisible
         // when the scan is denied, so "no evidence" is "unknown", never "absent",
         // and unverified ownership refuses to move `$LATEST`.
-        let marked_none = self.schedule_tag(lambda).await?.as_deref() == Some("none");
+        let marked_none = self.schedule_tag(lambda, &arn).await?.as_deref() == Some("none");
+        // The `none` tag confirms only what no evidence contradicts — a stale value
+        // must not override a visible grant, rule or alias.
+        let has_history =
+            grant_found || rules_found || self.alias_snapshot(lambda).await?.is_some();
         anyhow::ensure!(
-            rule_scan_ok || marked_none,
+            rule_scan_ok || (marked_none && !has_history),
             "could not enumerate Lambda function `{}`'s EventBridge rules — an enabled \
              legacy rule invisible to the denied listing would fire the new code, so \
              grant `events:ListRules` or remove the rules first",
             self.function
         );
         // Scheduling history is an existing alias, a managed grant, or a discovered
-        // rule — the `none` tag overrides them all: a verified-clean deploy wrote it.
-        let has_history = !marked_none
-            && (grant_found || rules_found || self.alias_snapshot(lambda).await?.is_some());
+        // rule — verified above, when the scan ran.
 
         // Only rules still carrying an unqualified target need moving — when none do, the
         // alias stays exactly where it is. Repointing it anyway would resurrect the version
@@ -1655,20 +1684,32 @@ impl EventBridgeSchedules {
 
     /// The ownership record a previous deploy stamped: `yes` behind reconciled
     /// schedules, `none` once the last is retired and the alias gone — `None` means
-    /// the function predates tagging, which is unverified, not unscheduled.
-    async fn schedule_tag(&self, lambda: &aws_sdk_lambda::Client) -> Result<Option<String>> {
+    /// the function predates tagging, which is unverified, not unscheduled. Read via
+    /// `ListTags`: `GetFunction`'s `tags` field is empty without `lambda:ListTags`,
+    /// which a silent `.tags()` would misread as unmarked.
+    async fn schedule_tag(
+        &self,
+        lambda: &aws_sdk_lambda::Client,
+        arn: &str,
+    ) -> Result<Option<String>> {
         Ok(lambda
-            .get_function()
-            .function_name(&self.function)
+            .list_tags()
+            .resource(arn)
             .send()
             .await
-            .with_context(|| format!("could not read Lambda function `{}`", self.function))?
+            .with_context(|| {
+                format!(
+                    "could not read the tags of Lambda function `{}`",
+                    self.function
+                )
+            })?
             .tags()
             .and_then(|tags| tags.get("skyzen-schedules").cloned()))
     }
 
-    /// Stamp the verified ownership record the next deploy reads — a warn, not a
-    /// failure: the worst a denied tag does is make the next deploy re-enumerate.
+    /// Stamp the verified ownership record the next deploy reads. A failed write
+    /// removes the tag rather than leave the previous state standing — an obsolete
+    /// `none` would let a future deploy skip discovery over schedules that exist.
     async fn stamp_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) {
         let state = if self.schedules.is_empty() {
             "none"
@@ -1686,6 +1727,12 @@ impl EventBridgeSchedules {
                 "could not tag Lambda function `{}`'s schedule state: {error:#}",
                 self.function
             ));
+            let _ = lambda
+                .untag_resource()
+                .resource(arn)
+                .tag_keys("skyzen-schedules")
+                .send()
+                .await;
         }
     }
 
