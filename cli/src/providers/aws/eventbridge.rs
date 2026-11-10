@@ -46,6 +46,16 @@ struct Ctx<'a> {
     arn_parts: (&'a str, &'a str, &'a str),
 }
 
+/// What pre-upload discovery found.
+#[derive(Default)]
+struct Discovery {
+    /// The rules migration moved onto the alias.
+    migrated: Vec<Migrated>,
+    /// Whether the function shows any prior skyzen schedule wiring — an existing
+    /// alias, a managed grant, or a discovered rule.
+    has_history: bool,
+}
+
 /// What a rule looked like before this deploy touched it: enough to put it back.
 ///
 /// The many flags are orthogonal facts of a real AWS transaction — existence, mutation,
@@ -237,7 +247,11 @@ impl Task for MigrateSchedulesToAlias {
                 .await
                 .ok()
                 .map(|config| execution_fingerprint(&config));
-            let (migrated, rule_scan_ok) = self.inner.migrate_to_alias(&events, &lambda).await?;
+            let Discovery {
+                migrated,
+                has_history,
+                ..
+            } = self.inner.migrate_to_alias(&events, &lambda).await?;
             // The whole transaction lives here — migrate, upload, reconcile: a failure at
             // any stage restores the moved rules before the error escapes, because the
             // plan runner stops and nothing later could.
@@ -318,12 +332,12 @@ impl Task for MigrateSchedulesToAlias {
             let qualified = format!("{}:{ALIAS}", self.inner.function);
             let mut snapshot = Vec::new();
             let mut alias = None;
-            // Tolerating denied discovery is only safe when absence is confirmed: nothing
-            // migrated, no schedules declared, and the prefix scan actually ran. Removing
-            // the last alias-based schedule looks identical from the manifest — `migrated`
-            // stays empty because its rules already point at the alias — so only a
-            // successful `ListRules` proves there is nothing left to retire.
-            let tolerant = migrated.is_empty() && self.inner.schedules.is_empty() && rule_scan_ok;
+            // Tolerating denied discovery is only safe with no scheduling history: nothing
+            // migrated, no schedules declared, and no alias or managed grant in evidence.
+            // Removing the last alias-based schedule looks identical from the manifest —
+            // `migrated` stays empty because its rules already point at the alias — so the
+            // alias itself is what betrays the history `ListRules` cannot confirm.
+            let tolerant = migrated.is_empty() && self.inner.schedules.is_empty() && !has_history;
             let alias_arn = format!("{arn}:{ALIAS}");
             let ctx = Ctx {
                 events: &events,
@@ -624,10 +638,14 @@ impl Task for EventBridgeSchedules {
             let mut snapshot = Vec::new();
             let mut alias = None;
             // Denied discovery may be tolerated only when the manifest declares no
-            // schedules AND the prefix scan still proves none exist — "cannot read" is
-            // not "there are none".
-            let tolerant =
-                self.schedules.is_empty() && self.managed_rule_names(&events).await.is_ok();
+            // schedules AND nothing shows prior wiring — no alias, no managed grant —
+            // "cannot read" is not "there are none".
+            let tolerant = self.schedules.is_empty()
+                && self.alias_snapshot(&lambda).await?.is_none()
+                && self
+                    .managed_names(&lambda, &format!("{}:{ALIAS}", self.function))
+                    .await?
+                    .is_empty();
             let result = self
                 .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
                 .await;
@@ -676,6 +694,35 @@ impl EventBridgeSchedules {
             // `retire_stale` reads the policies AND the prefix — a grant whose rule is
             // already gone still comes off here.
             self.retire_stale(ctx, snapshot, tolerant).await?;
+            // The last schedule gone leaves the alias serving a version nothing will
+            // reconcile again — a later `secret set` would compare `$LATEST` against
+            // that frozen version and refuse every rotation. Deleting it is also
+            // fail-closed for whatever discovery missed: a surviving rule targets
+            // `function:skyzen`, which no longer resolves.
+            match lambda
+                .delete_alias()
+                .function_name(&self.function)
+                .name(ALIAS)
+                .send()
+                .await
+            {
+                Ok(_) => output::ok(format!(
+                    "deleted the `{ALIAS}` alias of Lambda function `{}`",
+                    self.function
+                )),
+                Err(error)
+                    if error.as_service_error().is_some_and(
+                        aws_sdk_lambda::operation::delete_alias::DeleteAliasError::is_resource_not_found_exception,
+                    ) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to delete the `{ALIAS}` alias of Lambda function `{}`",
+                            self.function
+                        )
+                    })
+                }
+            }
             return Ok(());
         }
 
@@ -1113,15 +1160,16 @@ impl EventBridgeSchedules {
     /// would run new code on stale configuration. Publishing the version the function was
     /// running and pointing the alias at it moves every rule behind the atomic repoint —
     /// and is itself idempotent: a second run finds the targets already moved.
-    /// The migrated rules, plus whether the prefix scan actually ran — a denied
-    /// `ListRules` returns `false`, which the caller reads as "discovery was not
-    /// authoritative", not as "there are no rules".
+    /// The migrated rules, whether the prefix scan ran, and any evidence the function
+    /// ever carried skyzen schedules — an existing alias, a managed grant, or a
+    /// discovered rule. Evidence-free is the only state where a denied `ListRules`
+    /// reads as "nothing to find".
     #[allow(clippy::too_many_lines)]
     async fn migrate_to_alias(
         &self,
         events: &aws_sdk_eventbridge::Client,
         lambda: &aws_sdk_lambda::Client,
-    ) -> Result<(Vec<Migrated>, bool)> {
+    ) -> Result<Discovery> {
         let arn = match lambda
             .get_function_configuration()
             .function_name(&self.function)
@@ -1138,7 +1186,7 @@ impl EventBridgeSchedules {
                     aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationError::is_resource_not_found_exception,
                 ) =>
             {
-                return Ok((Vec::new(), false))
+                return Ok(Discovery::default())
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -1178,6 +1226,19 @@ impl EventBridgeSchedules {
             }
             Err(error) => return Err(error),
         }
+        // Scheduling history shows without `ListRules` too: the alias this module made,
+        // or a grant still named on a policy. When either is present, an incomplete scan
+        // can hide a live legacy rule that would fire the code about to upload — refuse
+        // before `$LATEST` moves, rather than discover the gap after.
+        let has_history =
+            self.alias_snapshot(lambda).await?.is_some() || names.len() > self.schedules.len();
+        anyhow::ensure!(
+            rule_scan_ok || !has_history,
+            "Lambda function `{}` shows prior `[[schedule]]` wiring but `events:ListRules` \
+             is denied, so an enabled legacy rule could still exist — grant the permission \
+             or remove the rule before deploying",
+            self.function
+        );
         // Both discovery paths failing means "unknown", not "none" — a rule made before
         // the alias existed has no alias either, so its absence cannot prove the set is
         // empty. A removed last schedule could still have a rule the upload would point
@@ -1242,7 +1303,10 @@ impl EventBridgeSchedules {
             }
         }
         if pending.is_empty() {
-            return Ok((Vec::new(), rule_scan_ok));
+            return Ok(Discovery {
+                has_history,
+                ..Discovery::default()
+            });
         }
 
         // The alias must exist before anything can target it — but only creation is ours:
@@ -1316,7 +1380,10 @@ impl EventBridgeSchedules {
                 "retargeted EventBridge rule `{rule}` at the `{ALIAS}` alias"
             ));
         }
-        Ok((migrated, rule_scan_ok))
+        Ok(Discovery {
+            migrated,
+            has_history,
+        })
     }
 
     /// Undo what `reconcile` had already done when it failed: repoint the alias back at the
