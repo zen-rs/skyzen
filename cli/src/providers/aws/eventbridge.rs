@@ -188,6 +188,20 @@ impl Task for CutoverAlias {
         block_on(async {
             let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let lambda = aws_sdk_lambda::Client::new(&shared);
+            // An app that never scheduled has no alias — and no call for the permissions a
+            // repoint would take. When there is nothing to cut over, the delivery alone is
+            // the whole update.
+            match self.inner.alias_snapshot(&lambda).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    output::warn(format!(
+                        "could not check the `{ALIAS}` alias — the scheduled environment is \
+                         unchanged: {error:#}"
+                    ));
+                    return Ok(());
+                }
+            }
             // `$LATEST` just took the new values; a version freezes them so the alias's
             // repoint is atomic — nothing invokes a half-rotated environment.
             let version = self.inner.publish_or_reuse(&lambda).await?;
@@ -360,18 +374,40 @@ impl EventBridgeSchedules {
             .deliver()
             .await?;
         }
-        // A manifest with no schedules still carries the environment and retires stale
-        // grants — but has no alias to point and no rules to wire, so none of the
-        // schedule-management calls below apply.
+        // A manifest with no schedules still carries the environment and may still find
+        // stale grants to retire — but an HTTP-only app need not hold the permissions that
+        // cleanup wants. Its discovery is best-effort: whatever it cannot read, it leaves.
         if self.schedules.is_empty() {
-            return self
+            if let Err(error) = self
                 .retire_stale(events, lambda, &self.function, arn, "", snapshot)
-                .await;
+                .await
+            {
+                output::warn(format!("could not check for stale schedules: {error:#}"));
+            }
+            return Ok(());
         }
 
         let alias_arn = format!("{arn}:{ALIAS}");
         let qualified = format!("{}:{ALIAS}", self.function);
         let version = self.publish_or_reuse(lambda).await?;
+        // The alias must exist before any `add_permission` can name it — on a first deploy
+        // it does not — but it repoints only after the rules are reconciled. Create it at
+        // the published version here; the final `point_the_alias` below is the cutover.
+        if self.alias_snapshot(lambda).await?.is_none() {
+            lambda
+                .create_alias()
+                .function_name(&self.function)
+                .name(ALIAS)
+                .function_version(&version)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to create the `{ALIAS}` alias of Lambda function `{}`",
+                        self.function
+                    )
+                })?;
+        }
 
         for entry in &self.schedules {
             // Absent rules snapshot too: a rule the deploy creates belongs to the rollback,
@@ -403,11 +439,20 @@ impl EventBridgeSchedules {
         }
         self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
             .await?;
-        // The cutover is the last thing to move: rules stay on the old version until every
-        // schedule is reconciled and every stale one retired, then the alias repoints once —
-        // no event can catch the new version behind an old cron or a deleted schedule.
+        // The cutover is the last thing to move: every rule is wired disabled, so nothing
+        // fires while the transition is open — then the alias repoints once and the
+        // schedules switch on behind it, all at once.
         *alias = self.alias_snapshot(lambda).await?;
         self.point_the_alias(lambda, &version).await?;
+        for entry in &self.schedules {
+            let rule = self.rule_name(entry.name.as_str());
+            events
+                .enable_rule()
+                .name(&rule)
+                .send()
+                .await
+                .with_context(|| format!("failed to enable EventBridge rule `{rule}`"))?;
+        }
         Ok(())
     }
 
@@ -779,9 +824,13 @@ impl EventBridgeSchedules {
                         .with_context(|| format!("failed to list targets of `{rule}`"));
                 }
             };
-            // A rule carrying a foreign target is shared with something else — retargeting
-            // its unqualified entry would mutate wiring the ownership check refuses to
-            // touch. Only a rule entirely ours gets moved.
+            // A targetless rule has nothing to move — `PutTargets` with an empty set is
+            // rejected, and ordinary wiring adopts it. A rule carrying a foreign target is
+            // shared with something else — retargeting its unqualified entry would mutate
+            // wiring the ownership check refuses to touch.
+            if listed.targets().is_empty() {
+                continue;
+            }
             if listed.targets().iter().all(|target| target.arn() == arn) {
                 pending.push((rule, listed.targets().to_vec(), name));
             } else if listed.targets().iter().any(|target| target.arn() == arn) {
@@ -1003,6 +1052,36 @@ impl EventBridgeSchedules {
                         }
                     }
                 }
+            }
+        }
+
+        // The policies tell most of the story — but a rule whose grant is already gone still
+        // fires its target. Names prefixed `skyzen-{function}--` are ours by construction,
+        // so a prefix scan finds the survivors the grants alone would miss.
+        let prefix = format!("skyzen-{}--", self.function);
+        let mut token: Option<String> = None;
+        loop {
+            let mut list = events.list_rules().name_prefix(&prefix);
+            if let Some(next) = &token {
+                list = list.next_token(next);
+            }
+            let page = list
+                .send()
+                .await
+                .with_context(|| "failed to list this function's EventBridge rules")?;
+            for rule in page.rules() {
+                if let Some(name) = rule
+                    .name()
+                    .and_then(|name| name.strip_prefix(prefix.as_str()))
+                {
+                    if !declared.contains(name) && !stale.iter().any(|(stale, _)| stale == name) {
+                        stale.push((name.to_owned(), qualified.to_owned()));
+                    }
+                }
+            }
+            match page.next_token() {
+                Some(next) if !next.is_empty() => token = Some(next.to_owned()),
+                _ => break,
             }
         }
 
@@ -1332,15 +1411,9 @@ impl EventBridgeSchedules {
                 .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
         );
 
-        // Everything the rule needs — permission, target, transformer — is in place; only now
-        // does it switch on.
-        events
-            .enable_rule()
-            .name(&rule)
-            .send()
-            .await
-            .with_context(|| format!("failed to enable EventBridge rule `{rule}`"))?;
-
+        // The rule stays disabled through the whole transition — `reconcile` switches every
+        // schedule on at once only after the alias points at the new version, so no event
+        // can catch the old handler behind the new cron.
         output::ok(format!(
             "wired `[[schedule]] {name}` to EventBridge rule `{rule}` ({expression})",
             name = entry.name
