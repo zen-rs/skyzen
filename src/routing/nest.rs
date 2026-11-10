@@ -34,7 +34,7 @@ impl<E> std::fmt::Debug for Mounted<E> {
 }
 
 impl<E> Mounted<E> {
-    pub(crate) fn new(prefix: Arc<str>, endpoint: E) -> Self {
+    pub(crate) const fn new(prefix: Arc<str>, endpoint: E) -> Self {
         Self { prefix, endpoint }
     }
 }

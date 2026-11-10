@@ -1731,15 +1731,16 @@ mod tests {
 
     impl crate::Endpoint for UriEcho {
         type Error = std::convert::Infallible;
-        async fn respond(
+        fn respond(
             &mut self,
             request: &mut crate::Request,
-        ) -> std::result::Result<crate::Response, Self::Error> {
-            Ok(crate::Response::new(crate::Body::from(format!(
+        ) -> impl core::future::Future<Output = std::result::Result<crate::Response, Self::Error>>
+        {
+            core::future::ready(Ok(crate::Response::new(crate::Body::from(format!(
                 "{} {}",
                 request.method(),
                 request.uri()
-            ))))
+            )))))
         }
     }
 
