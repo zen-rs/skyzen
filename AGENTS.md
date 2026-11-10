@@ -209,6 +209,25 @@ remain Cloudflare-only, because nothing else has those events.
   and `__register_handler_spec!` hides the shape difference from the macro. Do not spread either
   crate's name beyond that file, and do not adopt `inventory` natively.
 
+### 5d. Static Files
+- `StaticDir` (native only) keeps a cache **per serving thread, per mount**, inside the endpoint the
+  thread's router owns: `Rc`/`RefCell`, no lock. Each cache owns a `notify` watcher whose thread
+  bumps an atomic generation on any non-access event; a lookup that sees it move drops the whole
+  cache, and a load that raced a change is served but not cached. A directory that cannot be
+  watched panics at router build — an unwatched cache would serve stale files.
+- `StaticCacheSettings` (entries, inline limit) is the operator's runtime-adjustable handle, shared
+  by every clone across threads; a change empties and resizes each cache at its next lookup. No
+  ceiling guards it.
+- Files below the inline limit are cached as `Bytes`; larger ones as an open descriptor, sent as a
+  `FileRegion` (a `dup` per response, since `FileRegion` owns its `File`) so the HTTP/1.1 server
+  hands it to `SendFile` — `splice`/`sendfile`, and kernel TLS on Linux.
+- The filesystem is a sealed `FileSystem` type parameter: `CompioFs` (default; open + statx pushed
+  together, one `io_uring_enter`) or `BlockingFs` for a router driven by another executor.
+- `Accept-Encoding` is read by one parser, `utils::accept_encoding`, shared with
+  `CompressionMiddleware`. Siblings (`.br`, `.zst`, `.gz`) are written by `skyzen build` from
+  `[static_files] precompress` (`cli/src/precompress.rs`), before compilation; a sibling older than
+  its file is skipped with a warning.
+
 ### 6. Error Handling & Log Security
 - `#[skyzen::error]` generates `Display`, `Error`, and `HttpError` implementations with status code attributes.
 - **4xx errors** return formatted JSON messages to clients.
