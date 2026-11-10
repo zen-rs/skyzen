@@ -21,11 +21,11 @@ use crate::{
     project::Project,
     providers::{
         prepare_child_environment, secrets::Delivery, Action, CommandPlan, CommandStdin,
-        ProviderPlan, RunMode, SecretAction, Step,
+        ProviderPlan, RunMode, SecretAction, Step, Task,
     },
 };
 use anyhow::{Context, Result};
-use eventbridge::{EventBridgeSchedules, MigrateSchedulesToAlias};
+use eventbridge::{CutoverAlias, EventBridgeSchedules, MigrateSchedulesToAlias};
 use lambda_env::{LambdaEnvironment, LambdaEnvironmentNames};
 use skyzen_manifest::{AwsSection, Manifest};
 
@@ -113,7 +113,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
                 wrangler_args,
             ))]
         }
-        Action::Secret(secret) => vec![secret_step(secret, manifest, &config, function)?],
+        Action::Secret(secret) => secret_steps(secret, manifest, &config, function)?,
         other => anyhow::bail!(
             "`skyzen {}` has no AWS implementation{}",
             super::action_name(other),
@@ -141,18 +141,24 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
 /// # Errors
 ///
 /// Fails when a declared variable is set nowhere, or when there is nothing at all to push.
-fn secret_step(
+fn secret_steps(
     action: &SecretAction,
     manifest: &Manifest,
     config: &AwsSection,
     function: String,
-) -> Result<Step> {
+) -> Result<Vec<Step>> {
     // `.env` credentials ride `child_env`; resolving every declared variable is *not* part of
     // that — the secret being set is usually the one that is missing, and `unwrap_or_default`
     // would discard the credentials along with the failure.
     let env = crate::environment::Environment::load(manifest.root_dir())
         .map(|loaded| loaded.child_overrides())
         .unwrap_or_default();
+    // Delivery writes `$LATEST`; the cutover repoints `skyzen` so the schedules — the only
+    // path that reads a frozen version — pick the rotation up too.
+    let cutover_function = function.clone();
+    let cutover = move |env: Vec<(String, String)>| {
+        Step::Task(Box::new(CutoverAlias::new(cutover_function.clone(), env)) as Box<dyn Task>)
+    };
     let delivery = match action {
         SecretAction::Set { name, value } => Delivery::one(name.as_str(), value),
         SecretAction::Push => {
@@ -164,21 +170,29 @@ fn secret_step(
                      wiring variable and no [aws.env] entry"
                 );
             }
-            return Ok(Step::Task(Box::new(LambdaEnvironment::new(
-                function,
-                delivery,
-                prepared.child_env,
-            ))));
+            return Ok(vec![
+                Step::Task(Box::new(LambdaEnvironment::new(
+                    function,
+                    delivery,
+                    prepared.child_env.clone(),
+                ))),
+                cutover(prepared.child_env),
+            ]);
         }
         SecretAction::List => {
-            return Ok(Step::Task(Box::new(LambdaEnvironmentNames::new(
+            return Ok(vec![Step::Task(Box::new(LambdaEnvironmentNames::new(
                 function, env,
-            ))));
+            )))]);
         }
     };
-    Ok(Step::Task(Box::new(LambdaEnvironment::new(
-        function, delivery, env,
-    ))))
+    Ok(vec![
+        Step::Task(Box::new(LambdaEnvironment::new(
+            function,
+            delivery,
+            env.clone(),
+        ))),
+        cutover(env),
+    ])
 }
 
 /// The function a deploy acts on: the manifest's name, or the binary's own.

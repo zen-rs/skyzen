@@ -136,12 +136,62 @@ impl Task for MigrateSchedulesToAlias {
     }
 
     fn run(&self) -> Result<()> {
+        // A manifest without schedules has nothing to migrate — and no call for the
+        // schedule-management permissions the migration would need.
+        if self.inner.schedules.is_empty() {
+            return Ok(());
+        }
         super::lambda_env::adopt_env(&self.inner.env);
         block_on(async {
             let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let lambda = aws_sdk_lambda::Client::new(&shared);
             let events = aws_sdk_eventbridge::Client::new(&shared);
             self.inner.migrate_to_alias(&events, &lambda).await
+        })?
+    }
+}
+
+/// Repoint the `skyzen` alias at a version holding the environment `deliver` just wrote.
+///
+/// Secrets deliver to `$LATEST` — without this step, schedules keep invoking the version
+/// the alias already points at and the rotation never reaches them.
+#[derive(Debug)]
+pub struct CutoverAlias {
+    /// The alias owner, reusing `EventBridgeSchedules`' publish and repoint.
+    inner: EventBridgeSchedules,
+}
+
+impl CutoverAlias {
+    /// The step that moves `skyzen` to the freshest published version of `function`.
+    pub fn new(function: String, env: Vec<(String, String)>) -> Self {
+        Self {
+            inner: EventBridgeSchedules::new(
+                function,
+                Vec::new(),
+                crate::providers::secrets::Delivery::default(),
+                env,
+            ),
+        }
+    }
+}
+
+impl Task for CutoverAlias {
+    fn describe(&self) -> String {
+        format!(
+            "point the `{ALIAS}` alias of Lambda function `{}` at the updated environment",
+            self.inner.function
+        )
+    }
+
+    fn run(&self) -> Result<()> {
+        super::lambda_env::adopt_env(&self.inner.env);
+        block_on(async {
+            let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let lambda = aws_sdk_lambda::Client::new(&shared);
+            // `$LATEST` just took the new values; a version freezes them so the alias's
+            // repoint is atomic — nothing invokes a half-rotated environment.
+            let version = self.inner.publish_or_reuse(&lambda).await?;
+            self.inner.point_the_alias(&lambda, &version).await
         })?
     }
 }
@@ -310,14 +360,18 @@ impl EventBridgeSchedules {
             .deliver()
             .await?;
         }
+        // A manifest with no schedules still carries the environment and retires stale
+        // grants — but has no alias to point and no rules to wire, so none of the
+        // schedule-management calls below apply.
+        if self.schedules.is_empty() {
+            return self
+                .retire_stale(events, lambda, &self.function, arn, "", snapshot)
+                .await;
+        }
 
-        // The alias's own state is part of the transaction: a repoint that survives a
-        // failed deploy would move every schedule to code that was never meant to run.
-        *alias = self.alias_snapshot(lambda).await?;
-        self.point_the_alias(lambda, &self.publish_or_reuse(lambda).await?)
-            .await?;
         let alias_arn = format!("{arn}:{ALIAS}");
         let qualified = format!("{}:{ALIAS}", self.function);
+        let version = self.publish_or_reuse(lambda).await?;
 
         for entry in &self.schedules {
             // Absent rules snapshot too: a rule the deploy creates belongs to the rollback,
@@ -349,6 +403,11 @@ impl EventBridgeSchedules {
         }
         self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
             .await?;
+        // The cutover is the last thing to move: rules stay on the old version until every
+        // schedule is reconciled and every stale one retired, then the alias repoints once —
+        // no event can catch the new version behind an old cron or a deleted schedule.
+        *alias = self.alias_snapshot(lambda).await?;
+        self.point_the_alias(lambda, &version).await?;
         Ok(())
     }
 
@@ -720,8 +779,16 @@ impl EventBridgeSchedules {
                         .with_context(|| format!("failed to list targets of `{rule}`"));
                 }
             };
-            if listed.targets().iter().any(|target| target.arn() == arn) {
+            // A rule carrying a foreign target is shared with something else — retargeting
+            // its unqualified entry would mutate wiring the ownership check refuses to
+            // touch. Only a rule entirely ours gets moved.
+            if listed.targets().iter().all(|target| target.arn() == arn) {
                 pending.push((rule, listed.targets().to_vec(), name));
+            } else if listed.targets().iter().any(|target| target.arn() == arn) {
+                output::warn(format!(
+                    "leaving EventBridge rule `{rule}` alone: it carries a target pointing at \
+                     another resource"
+                ));
             }
         }
         if pending.is_empty() {
