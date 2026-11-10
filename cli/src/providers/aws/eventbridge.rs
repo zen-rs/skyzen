@@ -237,7 +237,7 @@ impl Task for MigrateSchedulesToAlias {
                 .await
                 .ok()
                 .map(|config| execution_fingerprint(&config));
-            let migrated = self.inner.migrate_to_alias(&events, &lambda).await?;
+            let (migrated, rule_scan_ok) = self.inner.migrate_to_alias(&events, &lambda).await?;
             // The whole transaction lives here — migrate, upload, reconcile: a failure at
             // any stage restores the moved rules before the error escapes, because the
             // plan runner stops and nothing later could.
@@ -318,10 +318,12 @@ impl Task for MigrateSchedulesToAlias {
             let qualified = format!("{}:{ALIAS}", self.inner.function);
             let mut snapshot = Vec::new();
             let mut alias = None;
-            // Tolerating denied discovery is only safe when nothing was migrated and the
-            // manifest declares no schedules — a schedule-removal deploy still carries
-            // rules to retire, and "cannot read" is not "there are none".
-            let tolerant = migrated.is_empty() && self.inner.schedules.is_empty();
+            // Tolerating denied discovery is only safe when absence is confirmed: nothing
+            // migrated, no schedules declared, and the prefix scan actually ran. Removing
+            // the last alias-based schedule looks identical from the manifest — `migrated`
+            // stays empty because its rules already point at the alias — so only a
+            // successful `ListRules` proves there is nothing left to retire.
+            let tolerant = migrated.is_empty() && self.inner.schedules.is_empty() && rule_scan_ok;
             let alias_arn = format!("{arn}:{ALIAS}");
             let ctx = Ctx {
                 events: &events,
@@ -621,8 +623,13 @@ impl Task for EventBridgeSchedules {
             };
             let mut snapshot = Vec::new();
             let mut alias = None;
+            // Denied discovery may be tolerated only when the manifest declares no
+            // schedules AND the prefix scan still proves none exist — "cannot read" is
+            // not "there are none".
+            let tolerant =
+                self.schedules.is_empty() && self.managed_rule_names(&events).await.is_ok();
             let result = self
-                .reconcile(&ctx, &mut snapshot, &mut alias, self.schedules.is_empty())
+                .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
                 .await;
             if let Err(error) = result {
                 // The alias goes back first: rules re-enabled by the restore below must
@@ -1106,12 +1113,15 @@ impl EventBridgeSchedules {
     /// would run new code on stale configuration. Publishing the version the function was
     /// running and pointing the alias at it moves every rule behind the atomic repoint —
     /// and is itself idempotent: a second run finds the targets already moved.
+    /// The migrated rules, plus whether the prefix scan actually ran — a denied
+    /// `ListRules` returns `false`, which the caller reads as "discovery was not
+    /// authoritative", not as "there are no rules".
     #[allow(clippy::too_many_lines)]
     async fn migrate_to_alias(
         &self,
         events: &aws_sdk_eventbridge::Client,
         lambda: &aws_sdk_lambda::Client,
-    ) -> Result<Vec<Migrated>> {
+    ) -> Result<(Vec<Migrated>, bool)> {
         let arn = match lambda
             .get_function_configuration()
             .function_name(&self.function)
@@ -1128,7 +1138,7 @@ impl EventBridgeSchedules {
                     aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationError::is_resource_not_found_exception,
                 ) =>
             {
-                return Ok(Vec::new())
+                return Ok((Vec::new(), false))
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -1143,6 +1153,7 @@ impl EventBridgeSchedules {
         // never held `lambda:GetPolicy` still carries legacy rules, and the `skyzen-{fn}--`
         // prefix scan finds them whatever the policies say.
         let mut discovery_failed = true;
+        let mut rule_scan_ok = false;
         let mut names: std::collections::BTreeSet<String> =
             match self.managed_names(lambda, &qualified).await {
                 Ok(names) => {
@@ -1157,6 +1168,7 @@ impl EventBridgeSchedules {
         match self.managed_rule_names(events).await {
             Ok(rules) => {
                 discovery_failed = false;
+                rule_scan_ok = true;
                 names.extend(rules);
             }
             // `events:ListRules` is optional too — the policies above are enough to keep a
@@ -1230,7 +1242,7 @@ impl EventBridgeSchedules {
             }
         }
         if pending.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), rule_scan_ok));
         }
 
         // The alias must exist before anything can target it — but only creation is ours:
@@ -1304,7 +1316,7 @@ impl EventBridgeSchedules {
                 "retargeted EventBridge rule `{rule}` at the `{ALIAS}` alias"
             ));
         }
-        Ok(migrated)
+        Ok((migrated, rule_scan_ok))
     }
 
     /// Undo what `reconcile` had already done when it failed: repoint the alias back at the
@@ -1964,11 +1976,12 @@ impl EventBridgeSchedules {
         mutated: &mut bool,
         granted: &mut bool,
     ) -> Result<()> {
-        let (events, lambda, qualified, arn, (partition, region, account)) = (
+        let (events, lambda, qualified, arn, alias_arn, (partition, region, account)) = (
             ctx.events,
             ctx.lambda,
             ctx.qualified,
             ctx.arn,
+            ctx.alias_arn,
             ctx.arn_parts,
         );
         let rule = self.rule_name(entry.name.as_str());
@@ -1985,10 +1998,9 @@ impl EventBridgeSchedules {
             )
         })?;
 
-        // A rule an earlier deploy made still points at the unqualified function — it is
-        // ours, and wiring retargets it at the alias.
-        let legacy = arn.strip_suffix(&format!(":{ALIAS}")).unwrap_or(arn);
-        self.own_the_rule(events, &[arn, legacy], &rule, mutated)
+        // A rule an earlier deploy made points at the alias; one older than that points at
+        // the unqualified function — both are ours, and wiring settles on the alias target.
+        self.own_the_rule(events, &[alias_arn, arn], &rule, mutated)
             .await?;
 
         // The rule goes up disabled and is switched on only once its permission and target
@@ -2052,7 +2064,7 @@ impl EventBridgeSchedules {
             .targets(
                 Target::builder()
                     .id(&rule)
-                    .arn(arn)
+                    .arn(alias_arn)
                     .input_transformer(transformer)
                     .build()
                     .with_context(|| {
@@ -2061,7 +2073,9 @@ impl EventBridgeSchedules {
             )
             .send()
             .await
-            .with_context(|| format!("failed to point EventBridge rule `{rule}` at `{arn}`"))?;
+            .with_context(|| {
+                format!("failed to point EventBridge rule `{rule}` at `{alias_arn}`")
+            })?;
         // `PutTargets` can answer 200 and still reject entries per target — the failed list is
         // the only place that shows up, and printing "wired" over it would lie about the deploy.
         let failures = put.failed_entries();
