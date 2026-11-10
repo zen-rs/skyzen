@@ -1362,7 +1362,6 @@ where
                         let stopping = stopping.clone();
                         let service = connection_service(
                             endpoint.clone(),
-                            Rc::clone(&local),
                             peer_addr,
                             // A second token, handed to the request's `WorkerContext` so
                             // post-response work it spawns keeps shutdown waiting too — the
@@ -1577,13 +1576,12 @@ const MAX_CONNECTIONS: usize = 8;
 /// and a [`WorkerContext`] whose post-response work holds graceful shutdown open.
 fn connection_service<E: Endpoint + Clone>(
     endpoint: E,
-    local: Rc<ThreadExecutor>,
     peer_addr: Option<SocketAddr>,
     context: WorkerContext,
-) -> IntoService<E, ThreadExecutor> {
+) -> IntoService<E> {
     let mut extensions = Extensions::new();
     extensions.insert(context);
-    let service = IntoService::new(endpoint, local).with_extensions(extensions);
+    let service = IntoService::new(endpoint).with_extensions(extensions);
     match peer_addr {
         Some(peer) => service.with_peer_addr(peer),
         None => service,
@@ -2330,7 +2328,6 @@ mod tests {
             let (guard_tx, _guard_rx) = async_channel::bounded::<Infallible>(1);
             let service = connection_service(
                 TlsEndpoint,
-                Rc::clone(&local),
                 None,
                 WorkerContext::new(
                     Arc::new(AnyExecutor::new(SmolGlobal)),

@@ -1,25 +1,23 @@
-use executor_core::{LocalExecutor, Task};
 use futures_util::TryStreamExt;
 use http_body::SizeHint;
 use http_body_util::BodyDataStream;
 use hyper::{
     body::{Frame, Incoming},
-    rt::{Read as _, ReadBuf, Write as _},
     service::Service,
 };
 use std::{
+    cell::Cell,
     convert::Infallible,
     future::Future,
     net::SocketAddr,
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
+    time::Duration,
 };
 
-use http_kit::utils::{AsyncRead, AsyncWrite};
 use skyzen_core::{
-    apply_pending_headers, error_response, log_endpoint_error,
-    upgrade::{OnUpgrade, Upgraded},
+    apply_pending_headers, error_response, header, log_endpoint_error, upgrade::OnUpgrade,
     BodyError, Endpoint, Extensions, PeerAddr, StatusCode,
 };
 
@@ -62,25 +60,79 @@ impl http_body::Body for SkyzenBody {
     }
 }
 
+/// An `Alt-Svc` value (RFC 7838) announcing an HTTP/3 endpoint.
+///
+/// A server that terminates TLS on TCP and serves HTTP/3 on UDP attaches it to its TCP responses
+/// with [`IntoService::with_alt_svc`], so a client that reached it over HTTP/1.1 or HTTP/2 learns
+/// it can switch. Clients only honour the header over a secure connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AltSvc {
+    port: u16,
+    max_age: Duration,
+}
+
+impl AltSvc {
+    /// How long a client may remember the alternative unless [`max_age`](Self::max_age) says
+    /// otherwise: the 24 hours RFC 7838 §3.1 names as the default.
+    pub const DEFAULT_MAX_AGE: Duration = Duration::from_hours(24);
+
+    /// HTTP/3 on UDP `port` of the same host.
+    #[must_use]
+    pub const fn h3(port: u16) -> Self {
+        Self {
+            port,
+            max_age: Self::DEFAULT_MAX_AGE,
+        }
+    }
+
+    /// Let clients remember the alternative for `max_age`.
+    #[must_use]
+    pub const fn max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    fn header_value(&self) -> header::HeaderValue {
+        header::HeaderValue::from_str(&format!(
+            "h3=\":{}\"; ma={}",
+            self.port,
+            self.max_age.as_secs()
+        ))
+        .expect("an Alt-Svc value is visible ASCII")
+    }
+}
+
+/// The session of an upgrade the endpoint answered with `101`, waiting for hyper to finish
+/// writing the response and give the connection back.
+pub type UpgradeSlot = Rc<Cell<Option<OnUpgrade>>>;
+
 /// Hyper service adapter for skyzen endpoints.
 ///
 /// This is the canonical adapter for embedding Skyzen into a hyper server. It injects the peer
 /// address (when provided via [`IntoService::with_peer_addr`]) so the `PeerAddr`/`ClientIp`
-/// extractors work, converts handler errors into JSON HTTP responses (hiding 5xx detail) instead
-/// of tearing down the connection, and runs the session of an upgrade the endpoint answered with
-/// `101` on `executor`.
+/// extractors work, and converts handler errors into JSON HTTP responses (hiding 5xx detail)
+/// instead of tearing down the connection.
 ///
 /// Neither the endpoint nor the future the service returns has to be `Send`: hyper drives an
 /// HTTP/1 connection on the task that serves it, and spawns HTTP/2 streams on whatever
 /// `hyper::rt::Executor` the connection was built with.
-pub struct IntoService<E, Ex> {
+///
+/// The session of an upgrade the endpoint answers with `101` is not run by the service but by
+/// [`serve_connection`](crate::serve_connection), which takes the connection back from hyper
+/// once the response is written.
+pub struct IntoService<E> {
     endpoint: E,
-    executor: Rc<Ex>,
     peer_addr: Option<SocketAddr>,
     extensions: Extensions,
+    alt_svc: Option<header::HeaderValue>,
+    upgrade: UpgradeSlot,
 }
 
-impl<E, Ex> std::fmt::Debug for IntoService<E, Ex> {
+// The endpoint is only ever cloned and called, never pinned in place, so hyper may poll a
+// connection holding this service without pinning it.
+impl<E> Unpin for IntoService<E> {}
+
+impl<E> std::fmt::Debug for IntoService<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IntoService")
             .field("peer_addr", &self.peer_addr)
@@ -88,14 +140,15 @@ impl<E, Ex> std::fmt::Debug for IntoService<E, Ex> {
     }
 }
 
-impl<E: Endpoint + Clone, Ex: LocalExecutor> IntoService<E, Ex> {
-    /// Create a new service with the given endpoint, spawning upgrade sessions on `executor`.
-    pub fn new(endpoint: E, executor: Rc<Ex>) -> Self {
+impl<E: Endpoint + Clone> IntoService<E> {
+    /// Create a new service with the given endpoint.
+    pub fn new(endpoint: E) -> Self {
         Self {
             endpoint,
-            executor,
             peer_addr: None,
             extensions: Extensions::new(),
+            alt_svc: None,
+            upgrade: Rc::default(),
         }
     }
 
@@ -116,25 +169,36 @@ impl<E: Endpoint + Clone, Ex: LocalExecutor> IntoService<E, Ex> {
         self.extensions.extend(extensions);
         self
     }
+
+    /// Advertise an HTTP/3 endpoint in every response that does not carry an `Alt-Svc` of its own.
+    #[must_use]
+    pub fn with_alt_svc(mut self, alt_svc: &AltSvc) -> Self {
+        self.alt_svc = Some(alt_svc.header_value());
+        self
+    }
+
+    /// The slot an upgrade's session is left in, shared with the service's futures.
+    pub(crate) fn upgrade_slot(&self) -> UpgradeSlot {
+        Rc::clone(&self.upgrade)
+    }
 }
 
-impl<E, Ex> Service<hyper::Request<Incoming>> for IntoService<E, Ex>
+impl<E> Service<hyper::Request<Incoming>> for IntoService<E>
 where
     E: Endpoint + Clone + 'static,
-    Ex: LocalExecutor + 'static,
 {
     type Response = hyper::Response<SkyzenBody>;
     // Handler errors are converted into HTTP responses, so the service itself never fails.
     type Error = Infallible;
     type Future = LocalBoxFuture<Result<Self::Response, Self::Error>>;
 
-    fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
+    fn call(&self, req: hyper::Request<Incoming>) -> Self::Future {
         let mut endpoint = self.endpoint.clone();
-        let executor = Rc::clone(&self.executor);
         let peer_addr = self.peer_addr;
         let extensions = self.extensions.clone();
+        let alt_svc = self.alt_svc.clone();
+        let upgrade = Rc::clone(&self.upgrade);
         let fut = async move {
-            let on_upgrade = hyper::upgrade::on(&mut req);
             let method = req.method().clone();
             let path = req.uri().path().to_owned();
             let mut request: skyzen_core::Request =
@@ -168,59 +232,19 @@ where
 
             if response.status() == StatusCode::SWITCHING_PROTOCOLS {
                 if let Some(session) = response.extensions_mut().remove::<OnUpgrade>() {
-                    // hyper resolves the upgrade once the `101` has been written.
-                    executor
-                        .spawn_local(async move {
-                            match on_upgrade.await {
-                                Ok(upgraded) => {
-                                    session.run(Upgraded::new(HyperUpgraded(upgraded))).await;
-                                }
-                                Err(error) => tracing::error!("connection upgrade failed: {error}"),
-                            }
-                        })
-                        .detach();
+                    upgrade.set(Some(session));
                 }
+            }
+            if let Some(alt_svc) = alt_svc {
+                response
+                    .headers_mut()
+                    .entry(header::ALT_SVC)
+                    .or_insert(alt_svc);
             }
 
             Ok(response.map(SkyzenBody::new))
         };
 
         Box::pin(fut)
-    }
-}
-
-/// hyper's upgraded connection, seen through the `futures-io` traits a session reads it with.
-struct HyperUpgraded(hyper::upgrade::Upgraded);
-
-impl AsyncRead for HyperUpgraded {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let mut read = ReadBuf::new(buf);
-        match Pin::new(&mut self.get_mut().0).poll_read(cx, read.unfilled()) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(read.filled().len())),
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for HyperUpgraded {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
     }
 }
