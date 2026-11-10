@@ -429,7 +429,7 @@ impl Task for MigrateSchedulesToAlias {
             }
             // Reconcile verified the state it found — stamp it so the next deploy reads
             // the record rather than re-enumerating.
-            self.inner.stamp_tag(&lambda, &arn).await?;
+            self.inner.stamp_tag(&lambda, &arn).await;
             Ok(())
         })?
     }
@@ -733,7 +733,7 @@ impl Task for EventBridgeSchedules {
             }
             // Reconcile verified the state it found — stamp it so the next deploy
             // reads the record rather than re-enumerating.
-            self.stamp_tag(&lambda, ctx.arn).await?;
+            self.stamp_tag(&lambda, ctx.arn).await;
             Ok(())
         })?
     }
@@ -780,19 +780,10 @@ impl EventBridgeSchedules {
             // permission an HTTP-only app should need. Only a confirmed NotFound may
             // skip it: a denied or failed lookup is "unknown", and claiming cleanup
             // completed over an alias that may still serve a frozen version would
-            // let every later secret rotation fail. A verified `none` tag skips the
-            // `GetAlias` read a first-time HTTP-only deploy may not hold — `none` is
-            // only written after the alias was already deleted.
-            if self
-                .schedule_tag(lambda, ctx.arn)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|tag| tag == "none")
-            {
-                return Ok(());
-            }
-            if self.alias_snapshot(lambda).await?.is_none() {
+            // let every later secret rotation fail. Verified absence — the `none` tag
+            // or an empty scan — skips `GetAlias`/`DeleteAlias` outright, permissions a
+            // first-time HTTP-only deploy may not hold.
+            if tolerant || self.alias_snapshot(lambda).await?.is_none() {
                 return Ok(());
             }
             match lambda
@@ -822,6 +813,10 @@ impl EventBridgeSchedules {
             return Ok(());
         }
 
+        // Invalidate any ownership record before the first rule is enabled: a stale
+        // `none` surviving a schedule activation would tell a later `secret push` to
+        // skip the alias. Only a verifiably absent tag may skip the untag.
+        self.clear_tag(lambda, ctx.arn).await?;
         let version = self.publish_or_reuse(lambda).await?;
         // The alias must exist before any `add_permission` can name it — on a first deploy
         // it does not — but it repoints only after the rules are reconciled. Create it at
@@ -1336,10 +1331,12 @@ impl EventBridgeSchedules {
             .ok()
             .flatten()
             .is_some_and(|tag| tag == "none");
-        // The `none` tag confirms only what no evidence contradicts — a stale value
-        // must not override a visible grant, rule or alias.
-        let has_history =
-            grant_found || rules_found || self.alias_snapshot(lambda).await?.is_some();
+        // The `none` tag confirms only what no evidence contradicts — it also settles
+        // the alias question (`none` was stamped after the alias was deleted), so a
+        // verified-clean function never asks for `lambda:GetAlias`.
+        let has_history = grant_found
+            || rules_found
+            || (!marked_none && self.alias_snapshot(lambda).await?.is_some());
         anyhow::ensure!(
             rule_scan_ok || (marked_none && !has_history),
             "could not enumerate Lambda function `{}`'s EventBridge rules — an enabled \
@@ -1723,10 +1720,46 @@ impl EventBridgeSchedules {
             .and_then(|tags| tags.get("skyzen-schedules").cloned()))
     }
 
-    /// Stamp the verified ownership record the next deploy reads. A failed write
-    /// removes the tag rather than leave the previous state standing — an obsolete
-    /// `none` would let a future deploy skip discovery over schedules that exist.
-    async fn stamp_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) -> Result<()> {
+    /// Remove any ownership record before rules get enabled: a stale `none` that
+    /// outlives this point would authorize skipping the alias on the next secret
+    /// rotation. Tolerated only when the tag is verifiably absent already.
+    async fn clear_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) -> Result<()> {
+        if let Err(error) = lambda
+            .untag_resource()
+            .resource(arn)
+            .tag_keys("skyzen-schedules")
+            .send()
+            .await
+        {
+            if self
+                .schedule_tag(lambda, arn)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                output::warn(format!(
+                    "could not clear the `skyzen-schedules` tag of Lambda function `{}`: \
+                     {error:#}",
+                    self.function
+                ));
+                return Ok(());
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "could not invalidate the `skyzen-schedules` tag of Lambda function \
+                     `{}` before enabling rules",
+                    self.function
+                )
+            });
+        }
+        Ok(())
+    }
+
+    /// Stamp the verified ownership record the next deploy reads — warn-only: the
+    /// transition already invalidated whatever stood, so a denied write only means
+    /// the next deploy enumerates again.
+    async fn stamp_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) {
         let state = if self.schedules.is_empty() {
             "none"
         } else {
@@ -1743,23 +1776,7 @@ impl EventBridgeSchedules {
                 "could not tag Lambda function `{}`'s schedule state: {error:#}",
                 self.function
             ));
-            // A stale `none` authorizes skipping discovery over schedules that exist —
-            // the write failing is only safe to ignore if the invalidation lands.
-            lambda
-                .untag_resource()
-                .resource(arn)
-                .tag_keys("skyzen-schedules")
-                .send()
-                .await
-                .with_context(|| {
-                    format!(
-                        "could not write or clear the `skyzen-schedules` tag of Lambda \
-                         function `{}` — the next deploy cannot read a verified state",
-                        self.function
-                    )
-                })?;
         }
-        Ok(())
     }
 
     /// The version the `skyzen` alias serves, or `None` when it does not exist.
