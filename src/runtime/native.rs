@@ -16,7 +16,7 @@ use crate::{
         context::ShutdownGuard,
         WorkerContext,
     },
-    Endpoint,
+    SendEndpoint,
 };
 use async_channel::{bounded, Receiver, Sender};
 #[cfg(unix)]
@@ -26,15 +26,15 @@ use core::convert::Infallible;
 use executor_core::{
     smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
 };
-use futures_util::{future::FutureExt, stream::MapOk, Stream, StreamExt, TryStreamExt};
-use http_body_util::{BodyDataStream, StreamBody};
+use futures_util::{future::FutureExt, Stream, StreamExt, TryStreamExt};
+use http_body_util::BodyDataStream;
 use http_kit::{
     error::BoxHttpError,
     utils::{AsyncRead, AsyncReadExt, AsyncWrite},
     BodyError,
 };
 use hyper::{
-    body::{Frame, Incoming},
+    body::Incoming,
     server::conn::{http1, http2},
     service::Service,
 };
@@ -1096,7 +1096,7 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
     on_shutdown: Hook,
 ) where
     Fut: Future<Output = (E, C)> + Send + 'static,
-    E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
+    E: SendEndpoint + ServedRoutes + Clone + Sync + 'static,
     C: ConsumerSet,
     Hook: FnOnce() -> HookFut,
     HookFut: Future<Output = ()>,
@@ -1257,7 +1257,7 @@ async fn run_server<Exec, E, C>(
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
     C: ConsumerSet,
 {
     match addr {
@@ -1431,7 +1431,7 @@ async fn serve_connections<Exec, E, C, Conn, S>(
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
     C: ConsumerSet,
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Stream<Item = std::io::Result<Accepted<Conn>>> + Unpin,
@@ -1571,7 +1571,7 @@ fn run_on_lambda<Fut, E, C>(
 ) -> Result<core::convert::Infallible, StartupError>
 where
     Fut: Future<Output = (E, C)> + Send + 'static,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
     C: ConsumerSet,
 {
     skyzen_lambda::run(|| async move {
@@ -1595,7 +1595,7 @@ fn run_on_lambda<Fut, E, C>(
 ) -> Result<core::convert::Infallible, StartupError>
 where
     Fut: Future<Output = (E, C)> + Send + 'static,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
     C: ConsumerSet,
 {
     Err(StartupError::LambdaFeatureMissing)
@@ -1637,7 +1637,7 @@ async fn serve_functions_host<Exec, E, C>(
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
-    E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
+    E: SendEndpoint + ServedRoutes + Clone + Sync + 'static,
     C: ConsumerSet,
 {
     let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -1766,7 +1766,7 @@ struct IntoService<E> {
     shutdown_guard: ShutdownGuard,
 }
 
-impl<E: Endpoint + Clone> IntoService<E> {
+impl<E: SendEndpoint + Clone> IntoService<E> {
     const fn new(
         endpoint: E,
         executor: Arc<AnyExecutor>,
@@ -1782,12 +1782,12 @@ impl<E: Endpoint + Clone> IntoService<E> {
     }
 }
 
-impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
+impl<E: SendEndpoint + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
     for IntoService<E>
 {
-    type Response = hyper::Response<
-        StreamBody<MapOk<crate::Body, fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>>>,
-    >;
+    // `Body` is an `http_body::Body`: data and trailers pass through, and a file region is read
+    // out into data frames, since hyper cannot send a file.
+    type Response = hyper::Response<crate::Body>;
     type Error = BoxHttpError;
     type Future = BoxFuture<Result<Self::Response, Self::Error>>;
 
@@ -1814,7 +1814,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
             }
 
             // Convert errors to HTTP responses at the runtime level
-            let response: crate::Response = match endpoint.respond(&mut request).await {
+            let response: crate::Response = match endpoint.respond_send(&mut request).await {
                 Ok(response) => {
                     info!(
                         method = method.as_str(),
@@ -1834,13 +1834,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 }
             };
 
-            Ok(response.map(|body| {
-                let body: MapOk<
-                    crate::Body,
-                    fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>,
-                > = body.map_ok(Frame::data);
-                StreamBody::new(body)
-            }))
+            Ok(response)
         };
 
         Box::pin(fut)
@@ -1858,9 +1852,11 @@ mod tests {
     #[cfg(feature = "server-tls")]
     use super::{
         http1, negotiated_stream, sniff_protocol_with_timeout, AnyExecutor, Arc, BoxHttpError,
-        ConnectionWrapper, Endpoint, Infallible, IntoService, ShutdownGuard, SmolGlobal,
+        ConnectionWrapper, Infallible, IntoService, ShutdownGuard, SmolGlobal,
     };
     use crate::runtime::azure::CUSTOM_HANDLER_PORT_ENV;
+    #[cfg(feature = "server-tls")]
+    use crate::Endpoint;
     use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use serial_test::serial;
     #[cfg(feature = "server-tls")]
@@ -2728,13 +2724,16 @@ mod tests {
     struct TlsEndpoint;
 
     #[cfg(feature = "server-tls")]
+    http_kit::impl_send_endpoint!(TlsEndpoint);
+
+    #[cfg(feature = "server-tls")]
     impl Endpoint for TlsEndpoint {
         type Error = BoxHttpError;
 
         fn respond(
             &mut self,
             _request: &mut crate::Request,
-        ) -> impl Future<Output = Result<crate::Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<crate::Response, Self::Error>> {
             std::future::ready(Ok(crate::Response::new(crate::Body::from_bytes("tls-ok"))))
         }
     }

@@ -1,5 +1,5 @@
 use executor_core::AnyExecutor;
-use futures_util::{Stream, TryStreamExt};
+use futures_util::TryStreamExt;
 use http_body::SizeHint;
 use http_body_util::BodyDataStream;
 use hyper::{
@@ -16,7 +16,7 @@ use std::{
 };
 
 use skyzen_core::{
-    apply_pending_headers, error_response, log_endpoint_error, BodyError, Endpoint, PeerAddr,
+    apply_pending_headers, error_response, log_endpoint_error, BodyError, PeerAddr, SendEndpoint,
 };
 
 type BoxFuture<T> = Pin<Box<dyn 'static + Send + Future<Output = T>>>;
@@ -24,8 +24,9 @@ type Bytes = http_kit::utils::Bytes;
 
 /// Response body adapter bridging a skyzen [`Body`](skyzen_core::Body) to hyper.
 ///
-/// Unlike a plain stream wrapper, this adapter reports an exact
-/// [`size_hint`](http_body::Body::size_hint) whenever the underlying body knows its length, so
+/// It forwards the body's own `http_body::Body` view: data and trailers pass through, a file
+/// region is read out into data frames (hyper cannot send a file), and the
+/// [`size_hint`](http_body::Body::size_hint) is exact whenever the body knows its length, so
 /// fixed-size responses are sent with a `Content-Length` header instead of
 /// `Transfer-Encoding: chunked`.
 #[derive(Debug)]
@@ -45,20 +46,15 @@ impl http_body::Body for SkyzenBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        Pin::new(&mut self.0)
-            .poll_next(cx)
-            .map(|option| option.map(|result| result.map(Frame::data)))
+        Pin::new(&mut self.0).poll_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.0.is_empty() == Some(true)
+        self.0.is_end_stream()
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.0
-            .len()
-            .and_then(|len| u64::try_from(len).ok())
-            .map_or_else(SizeHint::default, SizeHint::with_exact)
+        http_body::Body::size_hint(&self.0)
     }
 }
 
@@ -75,7 +71,7 @@ pub struct IntoService<E> {
     peer_addr: Option<SocketAddr>,
 }
 
-impl<E: Endpoint + Clone> IntoService<E> {
+impl<E: SendEndpoint + Clone> IntoService<E> {
     /// Create a new service with the given endpoint and executor.
     pub const fn new(endpoint: E, executor: Arc<AnyExecutor>) -> Self {
         Self {
@@ -95,7 +91,7 @@ impl<E: Endpoint + Clone> IntoService<E> {
     }
 }
 
-impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
+impl<E: SendEndpoint + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
     for IntoService<E>
 {
     type Response = hyper::Response<SkyzenBody>;
@@ -124,7 +120,7 @@ impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incomin
                 request.extensions_mut().insert(PeerAddr::new(peer_addr));
             }
 
-            let response: skyzen_core::Response = match endpoint.respond(&mut request).await {
+            let response: skyzen_core::Response = match endpoint.respond_send(&mut request).await {
                 Ok(response) => {
                     tracing::info!(
                         method = method.as_str(),

@@ -27,7 +27,7 @@ use http::{
     header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH},
     HeaderValue, StatusCode,
 };
-use http_kit::{utils::Bytes, Body, BodyError, HttpError, Request, Response};
+use http_kit::{utils::Bytes, Body, BodyError, DataStream, HttpError, Request, Response};
 use skyzen_core::{
     error_response,
     middleware::{Middleware, Next},
@@ -300,7 +300,8 @@ fn wrap_body(body: Body, encoding: DecompressionEncoding) -> Body {
 /// open `read` reports [`BodyWouldBlock`], which [`DecodeStream`] catches on the way out to mean
 /// "poll the body for more" rather than "the body is corrupt".
 struct ChunkReader {
-    body: Body,
+    /// The body's data: a decoder needs bytes, so file regions are read out here.
+    body: DataStream,
     queue: VecDeque<Bytes>,
     /// Bytes queued across `queue`, so `poll_fill` can stop without summing.
     buffered: usize,
@@ -313,7 +314,7 @@ struct ChunkReader {
 impl ChunkReader {
     const fn new(body: Body) -> Self {
         Self {
-            body,
+            body: body.into_data_stream(),
             queue: VecDeque::new(),
             buffered: 0,
             done: false,
@@ -559,12 +560,14 @@ mod tests {
     #[derive(Clone)]
     struct EchoEndpoint;
 
+    http_kit::impl_send_endpoint!(EchoEndpoint);
+
     impl Endpoint for EchoEndpoint {
         type Error = Infallible;
         fn respond(
             &mut self,
             request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             let body = mem::take(request.body_mut());
             let saw_encoding = request.headers().contains_key(CONTENT_ENCODING);
             let saw_length = request.headers().contains_key(CONTENT_LENGTH);

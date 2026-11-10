@@ -29,7 +29,7 @@ use sha1::{Digest, Sha1};
 use crate::{
     header::{self, HeaderMap, HeaderValue},
     routing::{IntoRouteNode, MethodFilter, Params, Route, RouteNode},
-    Body, Endpoint, Method, Request, Response, StatusCode,
+    Body, Endpoint, Method, Request, Response, SendEndpoint, StatusCode,
 };
 
 /// Mount a directory tree into the router.
@@ -196,7 +196,7 @@ impl IntoRouteNode for EmbeddedStaticDir {
     }
 }
 
-fn route_node_for_static<E: Endpoint + Clone + Send + Sync + 'static>(
+fn route_node_for_static<E: SendEndpoint + Clone + Sync + 'static>(
     mount_path: String,
     endpoint: E,
 ) -> RouteNode
@@ -446,24 +446,17 @@ async fn serve_static(
     Ok(response)
 }
 
-/// Stream `length` bytes of `path` starting at `start`, without buffering the file.
+/// A body of `length` bytes of `path` starting at `start`: a file region, which a server can hand
+/// to the kernel and any other backend reads out without buffering the file.
 #[cfg(not(target_arch = "wasm32"))]
 async fn file_body(path: &Path, start: u64, length: u64) -> Result<Body, StaticDirError> {
-    use http_kit::utils::io::{AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
-
-    let mut file = async_fs::File::open(path)
+    let path = path.to_path_buf();
+    let file = blocking::unblock(move || std::fs::File::open(path))
         .await
         .map_err(StaticDirError::IoError)?;
-    if start > 0 {
-        file.seek(SeekFrom::Start(start))
-            .await
-            .map_err(StaticDirError::IoError)?;
-    }
-    let reader = BufReader::new(file.take(length));
-    Ok(Body::from_reader(
-        reader,
-        usize::try_from(length).unwrap_or(usize::MAX),
-    ))
+    Ok(Body::from_file_region(http_kit::FileRegion::new(
+        file, start, length,
+    )))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -665,6 +658,9 @@ pub enum StaticDirError {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+http_kit::impl_send_endpoint!(StaticDirEndpoint);
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Endpoint for StaticDirEndpoint {
     type Error = StaticDirError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
@@ -679,6 +675,8 @@ impl Endpoint for StaticDirEndpoint {
     }
 }
 
+http_kit::impl_send_endpoint!(EmbeddedStaticDirEndpoint);
+
 impl Endpoint for EmbeddedStaticDirEndpoint {
     type Error = StaticDirError;
     // The assets are compiled into the binary, so the future is ready on creation rather than an
@@ -686,7 +684,7 @@ impl Endpoint for EmbeddedStaticDirEndpoint {
     fn respond(
         &mut self,
         request: &mut Request,
-    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Response, Self::Error>> {
         ready(self.serve(request))
     }
 }

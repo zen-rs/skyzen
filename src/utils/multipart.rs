@@ -12,7 +12,7 @@ use crate::{
 };
 use futures_core::Stream;
 use http_kit::utils::{Bytes, Stream as LiteStream};
-use http_kit::BodyError;
+use http_kit::{BodyError, DataStream};
 use multer::Field as MulterField;
 use pin_project_lite::pin_project;
 use skyzen_core::{take_body_stream, BodyExtractorError, RequestBodyLimit};
@@ -234,13 +234,15 @@ fn boundary_from_headers(headers: &HeaderMap) -> Result<String, MultipartBoundar
 pin_project! {
     struct RequestBodyStream {
         #[pin]
-        body: Body,
+        body: DataStream,
     }
 }
 
 impl RequestBodyStream {
     const fn new(body: Body) -> Self {
-        Self { body }
+        Self {
+            body: body.into_data_stream(),
+        }
     }
 }
 
@@ -249,7 +251,7 @@ impl Stream for RequestBodyStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut body = self.project().body;
-        <Body as LiteStream>::poll_next(body.as_mut(), cx)
+        <DataStream as LiteStream>::poll_next(body.as_mut(), cx)
     }
 }
 

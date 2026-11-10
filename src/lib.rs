@@ -105,7 +105,8 @@ pub use include_dir;
 pub use http_kit;
 #[doc(inline)]
 pub use http_kit::{
-    header, Body, BodyError, Endpoint, HttpError, Method, Request, Response, StatusCode, Uri,
+    header, Body, BodyError, Endpoint, HttpError, Method, Request, Response, SendEndpoint,
+    StatusCode, Uri,
 };
 /// Service types used by macro expansions.
 ///
@@ -165,7 +166,7 @@ pub mod middleware;
 pub mod __private {
     use crate::{
         middleware::{layer, Layered, Middleware},
-        Endpoint,
+        SendEndpoint,
     };
 
     /// Wrap the endpoint `#[skyzen::main]` produced with one service injector.
@@ -174,7 +175,7 @@ pub mod __private {
     /// request without the route tree having to know about them.
     pub fn with_middleware<E, M>(endpoint: E, middleware: M) -> Layered<E>
     where
-        E: Endpoint + Clone + Send + Sync + 'static,
+        E: SendEndpoint + Clone + Sync + 'static,
         M: Middleware,
     {
         layer(endpoint, middleware)

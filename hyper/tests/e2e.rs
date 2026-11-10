@@ -28,13 +28,15 @@ http_error!(
 #[derive(Clone)]
 struct TestEndpoint;
 
+http_kit::impl_send_endpoint!(TestEndpoint);
+
 impl Endpoint for TestEndpoint {
     type Error = BoxHttpError;
 
     fn respond(
         &mut self,
         request: &mut Request,
-    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Response, Self::Error>> {
         core::future::ready(match request.uri().path() {
             "/hello" => Ok(Response::new(Body::from_bytes("hello world"))),
             "/teapot" => Err(Box::new(TeapotError::new()) as Self::Error),

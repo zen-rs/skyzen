@@ -7,7 +7,7 @@
 //! ```
 
 use core::{future::Future, marker::PhantomData};
-use http_kit::{Endpoint, Request, Response};
+use http_kit::{Endpoint, Request, Response, SendEndpoint};
 use skyzen_core::{Extractor, Responder};
 use std::fmt::Display;
 
@@ -170,5 +170,16 @@ impl<H: Handler<T, R> + Send + Sync, T: Extractor + Send + Sync, R: Responder + 
     type Error = HandlerError<T, R>;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.handler.call_handler(request).await
+    }
+}
+
+impl<H: Handler<T, R> + Send + Sync, T: Extractor + Send + Sync, R: Responder + Send + Sync>
+    SendEndpoint for IntoEndpoint<H, T, R>
+{
+    fn respond_send(
+        &mut self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        self.respond(request)
     }
 }

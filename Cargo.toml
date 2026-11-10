@@ -16,7 +16,7 @@ skyzen-test = { path = "test", version = "0.3.2" }
 skyzen-redis = { path = "redis", version = "0.3.1" }
 skyzen-s3 = { path = "s3", version = "0.3.1" }
 
-http-kit = "0.4.2"
+http-kit = "0.5.0"
 executor-core = { version = "0.7.1", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper", version = "0.2.1" }
 skyzen-lambda = { path = "lambda", version = "0.2.1" }
@@ -143,7 +143,10 @@ tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 # Native-only dependencies (always available, not gated by features)
 executor-core = { workspace = true, features = ["smol"] }
+# File-region bodies, so the static file server's responses can be sent with sendfile/splice.
+http-kit = { workspace = true, features = ["fs"] }
 async-fs = "2.2.0"
+blocking = { version = "1.7", default-features = false }
 async-net.workspace = true
 async-io.workspace = true
 smol.workspace = true

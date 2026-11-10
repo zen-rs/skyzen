@@ -74,9 +74,9 @@ impl<E: Into<Error>> IntoWebSocketOutcome for Result<(), E> {
 /// second thread — and requiring it there would reject every real edge session, because the socket
 /// itself is built from `Rc`s and JS handles that no `Send` future can hold across an `await`.
 ///
-/// The relaxation stops at the builder. What the router stores still has to satisfy
-/// `http_kit::Endpoint`'s unconditional `Send`, which is why the session is carried across that
-/// boundary in a cell whose `unsafe impl Send` is justified by the isolate being single-threaded.
+/// The relaxation stops at the builder. What the router stores still has to satisfy its
+/// `http_kit::SendEndpoint` bound, which is why the session is carried across that boundary in a
+/// cell whose `unsafe impl Send` is justified by the isolate being single-threaded.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait MaybeSend: Send {}
 
@@ -116,10 +116,10 @@ struct SessionCell<S>(S);
 /// Carries a session across the router's `Send + Sync` bounds.
 ///
 /// A wasm session is routinely `!Send`: it holds the socket's `Rc<RefCell<..>>` event closures and
-/// raw JS handles across every `await`. The bound it has to cross is not the framework's to relax
-/// — `http_kit::Endpoint` requires `Send` unconditionally, and the router's type erasure boxes
-/// every endpoint future as `dyn Send + Future` — so the session is carried through it in this
-/// cell instead of being rejected at compile time on the one target the framework exists for.
+/// raw JS handles across every `await`. The bound it has to cross is the router's: it erases every
+/// endpoint into `http_kit::endpoint::AnySendEndpoint`, which boxes the endpoint future as
+/// `dyn Send + Future` — so the session is carried through it in this cell instead of being
+/// rejected at compile time on the one target the framework exists for.
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone)]
 struct SessionCell<S>(S);

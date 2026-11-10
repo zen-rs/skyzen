@@ -51,6 +51,8 @@ impl NestedRouter {
 )]
 pub struct NestedPathError(String);
 
+http_kit::impl_send_endpoint!(NestedRouter);
+
 impl Endpoint for NestedRouter {
     type Error = BoxHttpError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {

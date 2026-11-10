@@ -54,7 +54,7 @@ use core::{
     pin::Pin,
 };
 
-use http_kit::{Endpoint, Request, Response};
+use http_kit::{Request, Response, SendEndpoint};
 
 use crate::error::Error;
 
@@ -209,7 +209,7 @@ pub async fn apply<M, E>(
 ) -> Result<Response, Error>
 where
     M: Middleware,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
 {
     let terminal = CloneEndpoint(endpoint);
     middleware.handle(request, Next::new(&[], &terminal)).await
@@ -220,12 +220,12 @@ struct CloneEndpoint<E>(E);
 
 impl<E> Dispatch for CloneEndpoint<E>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: SendEndpoint + Clone + Sync + 'static,
 {
     fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
             let mut endpoint = self.0.clone();
-            endpoint.respond(request).await.map_err(Error::from)
+            endpoint.respond_send(request).await.map_err(Error::from)
         })
     }
 }

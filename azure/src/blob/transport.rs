@@ -118,6 +118,7 @@ impl HttpTransport for ZenwaveTransport {
         // body errors.
         let answered_uri = parts.uri;
         let stream = response_body
+            .into_data_stream()
             .try_filter(|chunk| future::ready(!chunk.is_empty()))
             .map_ok(Buffer::from)
             .map_err(move |error| {

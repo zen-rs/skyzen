@@ -809,6 +809,8 @@ impl Endpoint for Router {
     }
 }
 
+http_kit::impl_send_endpoint!(Router);
+
 #[cfg(test)]
 mod tests {
     use super::{build, MethodFilter, RouteBuildError};

@@ -263,7 +263,7 @@ mod tests {
         fn respond(
             &mut self,
             _request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             ready(Err(BackendBroken::new()))
         }
     }
@@ -277,7 +277,7 @@ mod tests {
         fn respond(
             &mut self,
             _request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             ready(Err(BadInput::new()))
         }
     }
@@ -376,7 +376,7 @@ mod tests {
         fn respond(
             &mut self,
             request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             ready(Ok(Response::new(Body::from(request.method().to_string()))))
         }
     }

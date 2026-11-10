@@ -3,7 +3,7 @@
 //! Hyper server backend for the Skyzen framework.
 //!
 //! This crate provides [`Hyper`], which implements the [`Server`] trait from
-//! `skyzen-core`, bridging Skyzen's [`Endpoint`] abstraction with Hyper's
+//! `skyzen-core`, bridging Skyzen's [`SendEndpoint`] abstraction with Hyper's
 //! HTTP/1 and HTTP/2 server implementation.
 //!
 //! Most users don't need this crate directly — `#[skyzen::main]` sets up Hyper
@@ -17,7 +17,7 @@ use core::future::Future;
 use executor_core::{AnyExecutor, Executor, Task};
 use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, Stream, StreamExt};
 use hyper::server::conn::{http1::Builder as Http1Builder, http2::Builder as Http2Builder};
-use skyzen_core::{Endpoint, Server};
+use skyzen_core::{SendEndpoint, Server};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::ptr;
@@ -243,7 +243,7 @@ impl Server for Hyper {
         executor: impl executor_core::Executor + 'static,
         error_handler: impl Fn(E) + Send + Sync + 'static,
         mut connections: impl Stream<Item = Result<C, E>> + Unpin + Send + 'static,
-        endpoint: impl Endpoint + Sync + Clone + 'static,
+        endpoint: impl SendEndpoint + Sync + Clone + 'static,
     ) where
         C: Unpin + Send + AsyncRead + AsyncWrite + 'static,
         E: std::error::Error,

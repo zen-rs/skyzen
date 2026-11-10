@@ -136,8 +136,8 @@ use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "ws")]
 use crate::websocket::{MaybeSend, MaybeSync, WebSocket};
 use crate::{handler, handler::Handler, middleware::Middleware, openapi, openapi::OpenApi};
-use http_kit::endpoint::AnyEndpoint;
-use http_kit::{Endpoint, Method};
+use http_kit::endpoint::AnySendEndpoint;
+use http_kit::{Method, SendEndpoint};
 use skyzen_core::{
     middleware::boxed, middleware::BoxMiddleware, Extractor, Requirement, Responder,
 };
@@ -145,7 +145,9 @@ use skyzen_core::{
 use std::future::Future;
 
 /// Type alias for dynamically dispatched endpoints stored in the routing tree.
-pub type BoxEndpoint = AnyEndpoint;
+///
+/// The `Send` erased form: a router is shared by every thread of a work-stealing executor.
+pub type BoxEndpoint = AnySendEndpoint;
 pub(crate) type EndpointFactory = Arc<dyn Fn() -> BoxEndpoint + Send + Sync>;
 
 // Export param types
@@ -342,7 +344,7 @@ impl Route {
         let endpoint = handler::into_endpoint(handler);
         RouteWithAlarm {
             route: self,
-            alarm_endpoint: Arc::new(move || AnyEndpoint::new(endpoint.clone())),
+            alarm_endpoint: Arc::new(move || AnySendEndpoint::new(endpoint.clone())),
         }
     }
 
@@ -559,10 +561,10 @@ impl RouteNode {
         requirements: Vec<Requirement>,
     ) -> Self
     where
-        E: Endpoint + Clone + Send + Sync + 'static,
+        E: SendEndpoint + Clone + Sync + 'static,
     {
         let endpoint_factory: EndpointFactory =
-            Arc::new(move || AnyEndpoint::new(endpoint.clone()));
+            Arc::new(move || AnySendEndpoint::new(endpoint.clone()));
         Self {
             path: path.into(),
             node_type: RouteNodeType::Endpoint {
@@ -756,7 +758,7 @@ impl RouteNode {
     #[must_use]
     pub fn endpoint<E>(self, method: Method, endpoint: E) -> Self
     where
-        E: Endpoint + Clone + Send + Sync + 'static,
+        E: SendEndpoint + Clone + Sync + 'static,
     {
         self.extend_with_nodes(vec![Self::new_endpoint(
             "",
@@ -924,7 +926,7 @@ where
 {
     let endpoint = handler::into_endpoint(handler);
     EndpointEntry {
-        factory: Arc::new(move || AnyEndpoint::new(endpoint.clone())),
+        factory: Arc::new(move || AnySendEndpoint::new(endpoint.clone())),
         requirements: T::requirements(),
     }
 }
@@ -1129,7 +1131,7 @@ pub trait CreateRouteNode: Sized {
     /// Especially when using `OpenAPI`, those methods will automatically generate documentation.
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
     where
-        E: Endpoint + Clone + Send + Sync + 'static;
+        E: SendEndpoint + Clone + Sync + 'static;
 
     /// Attach a WebSocket handler that automatically performs the upgrade handshake.
     ///
@@ -1262,7 +1264,7 @@ where
 
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
     where
-        E: Endpoint + Clone + Send + Sync + 'static,
+        E: SendEndpoint + Clone + Sync + 'static,
     {
         RouteNode::new_endpoint(
             self,

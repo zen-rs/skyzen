@@ -352,7 +352,7 @@ async fn read_capped(body: Body, limit: Option<usize>) -> Result<Bytes, BodyRead
     // Deliberately not sized from `Content-Length`: a lying header must not let a client
     // pre-allocate for it.
     let mut buffered = Vec::new();
-    let mut body = pin!(body);
+    let mut body = pin!(body.into_data_stream());
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|_| BodyReadError::from(InvalidBody::new()))?;
         if buffered.len() + chunk.len() > limit {
