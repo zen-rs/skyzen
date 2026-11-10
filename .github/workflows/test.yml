@@ -5,6 +5,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # As in ci.yml: line tables only, so every job's cache fits the repo budget.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   native:

@@ -19,6 +19,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Line tables keep file:line in backtraces; full debuginfo roughly doubles a
+  # test build's target dir, and every job's cache has to fit the 10 GB repo
+  # budget at once.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # A release-plz bump changes workspace versions and the changelog and
@@ -73,7 +77,9 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-ubuntu
+          # One key per job: only a key's first save is kept, so jobs that
+          # build different things must not share one.
+          shared-key: ci-lint
           # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
           # per run against a 10 GiB repo budget was evicting entries before
           # the next run could restore them. Non-dev runs restore the
@@ -95,7 +101,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-ubuntu
+          # The wasm32 build the test.yml wasm jobs cache under the same key.
+          shared-key: ci-wasm
           # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
           # per run against a 10 GiB repo budget was evicting entries before
           # the next run could restore them. Non-dev runs restore the
@@ -116,7 +123,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-ubuntu
+          shared-key: ci-coverage
           # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
           # per run against a 10 GiB repo budget was evicting entries before
           # the next run could restore them. Non-dev runs restore the
@@ -138,15 +145,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
-          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
-          # per run against a 10 GiB repo budget was evicting entries before
-          # the next run could restore them. Non-dev runs restore the
-          # default-branch entry (restore-only) instead of writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-          cache-on-failure: true
+      # No build cache: this job compiles nothing.
       - name: Generate Lockfile
         run: cargo generate-lockfile
       # cargo-audit itself is the gate: it reads `.cargo/audit.toml` and exits
@@ -163,15 +162,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
-          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
-          # per run against a 10 GiB repo budget was evicting entries before
-          # the next run could restore them. Non-dev runs restore the
-          # default-branch entry (restore-only) instead of writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-          cache-on-failure: true
+      # No build cache: cargo-machete reads manifests and sources, it compiles nothing.
       - uses: taiki-e/install-action@cargo-machete
       - run: cargo machete
 
@@ -185,7 +176,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-ubuntu
+          shared-key: ci-features
           # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
           # per run against a 10 GiB repo budget was evicting entries before
           # the next run could restore them. Non-dev runs restore the
