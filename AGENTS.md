@@ -239,8 +239,12 @@ remain Cloudflare-only, because nothing else has those events.
   trusts, and the proxy's own hop is always written as `Forwarded` and `Via`.
 - Bodies are passed through as `Body` frames and never inspected, except that a chunked upstream
   response to a client without `TE: trailers` fails with `TrailersNotAccepted` at its trailers.
-- Upgrades and `CONNECT` are refused with `ProxyError::Tunnel` (501): zenwave's native backend
-  does not hand a switched connection back, and `OnUpgrade`'s `Send` session could not carry one.
+- An upgrade keeps `Upgrade` and `Connection: upgrade` upstream only when the request carries
+  `UpgradeAvailable`; on a `101` the response carries an `OnUpgrade` whose session claims
+  zenwave's `Switched` and copies both ways (`proxy/tunnel.rs`). That claim is only legal on the
+  thread running the proxy's pool, and it holds because both servers run the session on the
+  connection's thread, the one that built the router. `CONNECT` is refused with
+  `ProxyError::Connect` (501).
 
 ### 6. Error Handling & Log Security
 - `#[skyzen::error]` generates `Display`, `Error`, and `HttpError` implementations with status code attributes.

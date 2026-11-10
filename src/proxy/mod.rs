@@ -38,8 +38,17 @@
 //! with them: a request's go upstream as chunked trailers, and a response's reach the client when
 //! it asked for them with `TE: trailers`; a response that brings trailers to a client that did not
 //! ends with [`ProxyError::TrailersNotAccepted`] rather than losing them.
+//!
+//! A request that asks to switch protocols (`Connection: upgrade` with `Upgrade`, a WebSocket
+//! handshake for one) keeps those two fields on its way upstream when its connection can be handed
+//! over, which is an HTTP/1.1 one. When the upstream answers `101 Switching Protocols`, the
+//! client's connection and the upstream's are joined into one tunnel until both sides close; any
+//! other answer is returned as it is. On a connection that cannot switch (an HTTP/2 or HTTP/3
+//! stream), the request goes upstream without them, as an intermediary that does not take part in
+//! an upgrade sends it (RFC 9110 §7.8). `CONNECT` is refused with [`ProxyError::Connect`].
 
 mod headers;
+mod tunnel;
 
 use std::{
     fmt,
@@ -54,7 +63,7 @@ use http::{
     uri::{Authority, PathAndQuery, Scheme},
     Version,
 };
-use zenwave::backend::{NativeBackend, NativeIo};
+use zenwave::backend::{NativeBackend, NativeIo, Upgrade};
 
 /// The connection settings a [`Transport`] is built from.
 pub use zenwave::transport;
@@ -67,7 +76,7 @@ use crate::{
     Body, BodyError, Endpoint, Request, Response, StatusCode, Uri,
 };
 use headers::{ForwardedElement, ViaMember};
-use skyzen_core::PeerAddr;
+use skyzen_core::{upgrade::UpgradeAvailable, PeerAddr};
 
 /// The pseudonym a proxy records itself under in `Via` until [`Upstream::via`] names another.
 const DEFAULT_PSEUDONYM: &str = "skyzen";
@@ -254,14 +263,31 @@ impl Proxy {
         accepts_trailers: bool,
     ) -> Result<Request, ProxyError> {
         let settings = &*self.upstream;
-        if request.method() == http::Method::CONNECT || headers::requests_upgrade(request.headers())
-        {
-            return Err(ProxyError::Tunnel(request.method().clone()));
+        if request.method() == http::Method::CONNECT {
+            return Err(ProxyError::Connect);
         }
+        // The protocols the client offers to switch to, kept only where the server can hand its
+        // connection over once the upstream switches.
+        let offered: Vec<HeaderValue> = if headers::requests_upgrade(request.headers())
+            && request.extensions().get::<UpgradeAvailable>().is_some()
+        {
+            request
+                .headers()
+                .get_all(header::UPGRADE)
+                .iter()
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let version = request.version();
         let mut fields = request.headers().clone();
         headers::remove_hop_by_hop(&mut fields);
+        let upgrade = !offered.is_empty();
+        for protocol in offered {
+            fields.append(header::UPGRADE, protocol);
+        }
         if version == Version::HTTP_2 || version == Version::HTTP_3 {
             headers::fold_cookies(&mut fields);
         }
@@ -304,11 +330,20 @@ impl Proxy {
             }
             .to_value(),
         );
+        // `TE` and `Upgrade` are hop-by-hop themselves, so `Connection` nominates each this hop
+        // sends (RFC 9110 §7.6.1).
+        let connection = match (accepts_trailers, upgrade) {
+            (true, true) => Some("te, upgrade"),
+            (true, false) => Some("te"),
+            (false, true) => Some("upgrade"),
+            (false, false) => None,
+        };
         if accepts_trailers {
-            // This hop accepts trailers because the client does; `TE` is itself hop-by-hop, so
-            // `Connection` must nominate it (RFC 9110 §10.1.4).
+            // This hop accepts trailers because the client does (RFC 9110 §10.1.4).
             fields.insert(header::TE, HeaderValue::from_static("trailers"));
-            fields.insert(header::CONNECTION, HeaderValue::from_static("te"));
+        }
+        if let Some(connection) = connection {
+            fields.insert(header::CONNECTION, HeaderValue::from_static(connection));
         }
 
         let body = request
@@ -325,10 +360,31 @@ impl Proxy {
 
     /// The response to send the client, built from the one the upstream sent.
     fn returned_response(&self, mut response: Response, accepts_trailers: bool) -> Response {
+        // The backend hands over a switched connection only for the upgrade this proxy forwarded.
+        let switched = Upgrade::on(&mut response);
         let chunked = headers::is_chunked(response.headers());
         let version = response.version();
+        let protocols: Vec<HeaderValue> = if switched.is_some() {
+            response
+                .headers()
+                .get_all(header::UPGRADE)
+                .iter()
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let fields = response.headers_mut();
         headers::remove_hop_by_hop(fields);
+        if let Some(upgrade) = switched {
+            // The switch is this hop's too: it names the protocol it switched to.
+            for protocol in protocols {
+                fields.append(header::UPGRADE, protocol);
+            }
+            fields.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+            response.extensions_mut().insert(tunnel::session(upgrade));
+        }
+        let fields = response.headers_mut();
         fields.append(
             header::VIA,
             ViaMember {
@@ -401,13 +457,13 @@ pub enum ProxyError {
     /// The upstream did not answer in time.
     #[error("the upstream did not answer in time", status = StatusCode::GATEWAY_TIMEOUT)]
     Timeout,
-    /// The request asks to switch protocols (`Upgrade`, `CONNECT`); the upstream client hands no
-    /// switched connection back, so it cannot be tunnelled.
+    /// The request is a `CONNECT`, which asks for a tunnel to a host of the client's choosing; a
+    /// reverse proxy forwards only to its upstream.
     #[error(
-        "a `{0}` request that switches protocols cannot be tunnelled upstream",
+        "a reverse proxy opens no `CONNECT` tunnel",
         status = StatusCode::NOT_IMPLEMENTED
     )]
-    Tunnel(http::Method),
+    Connect,
     /// The request's `Host` is not visible ASCII.
     #[error("the request's `Host` is not visible ASCII", status = StatusCode::BAD_REQUEST)]
     InvalidHost,

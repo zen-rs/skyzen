@@ -31,6 +31,8 @@ use skyzen_h1::H1;
 
 /// A request body in Chinese, Japanese and Korean.
 const ORDER: &str = "订单：一杯茶。注文：お茶を一杯。주문: 차 한 잔.";
+/// What the origin refuses an upgrade with.
+const REFUSAL: &str = "不升级 / アップグレードしません / 업그레이드 안 함";
 
 /// One chunk of the bodies the backpressure tests stream.
 const CHUNK: usize = 64 * 1024;
@@ -126,6 +128,12 @@ impl Endpoint for Origin {
                 Ok(Response::new(Body::from(taken.to_string())))
             }
             "/v1/firehose" => Ok(Response::new(counted_body(Arc::clone(&self.produced)))),
+            "/v1/refuse-upgrade" => {
+                self.record(request, Vec::new(), None);
+                let mut response = Response::new(Body::from(REFUSAL));
+                *response.status_mut() = StatusCode::BAD_REQUEST;
+                Ok(response)
+            }
             other => panic!("the origin has no {other}"),
         }
     }
@@ -455,18 +463,189 @@ fn an_unreachable_origin_is_a_bad_gateway() {
 }
 
 #[test]
-fn a_protocol_switch_is_refused_before_anything_is_sent() {
+fn a_refused_upgrade_is_passed_through_unchanged() {
     run(async {
         let stage = stage(|route| route);
         let send = connect(stage.proxy).await;
-        let mut request = request(Method::GET, "/api/echo", Body::empty());
+        let mut request = request(Method::GET, "/api/refuse-upgrade", Body::empty());
         let fields = request.headers_mut();
-        fields.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        fields.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
         fields.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
         let response = send.send(request).await.expect("response");
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        assert!(stage.origin.seen.borrow().is_empty());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get(header::UPGRADE).is_none());
+        assert_eq!(response.headers()[header::VIA], "1.1 skyzen");
+        let (data, _) = read_frames(response.into_body()).await;
+        assert_eq!(data, REFUSAL.as_bytes());
+
+        // The offer reached the origin: `Upgrade`, and a `Connection` nominating it.
+        let seen = stage.origin.last();
+        assert_eq!(seen.headers[header::UPGRADE], "websocket");
+        assert_eq!(seen.headers[header::CONNECTION], "upgrade");
     });
+}
+
+#[test]
+fn a_switch_the_client_did_not_ask_for_is_a_bad_gateway() {
+    run(async {
+        // An origin that switches protocols whatever it is asked.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let origin = listener.local_addr().expect("local address");
+        let switcher = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut head = Vec::new();
+            let mut byte = [0; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).expect("request head");
+                head.push(byte[0]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\n\
+                      Upgrade: websocket\r\n\r\n",
+                )
+                .expect("write the switch");
+            String::from_utf8(head).expect("an ASCII head")
+        });
+
+        let target = format!("http://{origin}").parse().expect("URI");
+        let upstream = Upstream::new(&target).expect("upstream");
+        let proxy = serve(Route::new(("/".mount(Proxy::new(&upstream)),)).build());
+        let send = connect(proxy).await;
+        let response = send
+            .send(request(Method::GET, "/chat", Body::empty()))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let head = switcher.join().expect("the origin thread").to_lowercase();
+        assert!(
+            !head.contains("upgrade:"),
+            "the proxy offered a switch:\n{head}"
+        );
+    });
+}
+
+/// The WebSocket tunnel: a WebSocket origin behind the proxy, and a client upgrading through it.
+#[cfg(feature = "ws")]
+mod websocket {
+    use std::time::Duration;
+
+    use async_tungstenite::{
+        client_async,
+        tungstenite::{protocol::CloseFrame, Message},
+        WebSocketStream,
+    };
+    use bytes::Bytes;
+    use futures_util::StreamExt as _;
+    use http_kit_io::{compio::Compio, poll::CopyingPoll, IntoPoll as _, Io};
+    use skyzen::{
+        proxy::{Proxy, Upstream},
+        routing::{CreateRouteNode, Route},
+        websocket::WebSocketMessage,
+    };
+
+    use super::{run, serve};
+
+    /// The text messages: Chinese, Japanese and Korean.
+    const GREETINGS: [&str; 3] = ["你好世界", "こんにちは", "안녕하세요"];
+    /// The message that makes the origin close the connection itself.
+    const FAREWELL: &str = "再见 / さようなら / 안녕히 가세요";
+
+    type Client = WebSocketStream<CopyingPoll<<Compio as Io>::TcpStream>>;
+
+    /// A WebSocket echo origin, and a proxy mounted at `/api` forwarding to it under `/v1`;
+    /// returns the client's connection through the proxy, and the `Via` of its `101`.
+    async fn connect() -> (Client, String) {
+        let origin = serve(
+            Route::new(("/v1/echo".ws(|mut socket| async move {
+                while let Some(Ok(message)) = socket.next().await {
+                    let sent = match message {
+                        WebSocketMessage::Text(text) if &*text == FAREWELL => break,
+                        WebSocketMessage::Text(text) => socket.send_text(text).await,
+                        WebSocketMessage::Binary(data) => socket.send_binary(data).await,
+                        _ => Ok(()),
+                    };
+                    if sent.is_err() {
+                        return;
+                    }
+                }
+                let _ = socket.close(None).await;
+            }),))
+            .build(),
+        );
+        let target = format!("http://{origin}/v1").parse().expect("upstream URI");
+        let upstream = Upstream::new(&target).expect("upstream");
+        let proxy = serve(Route::new(("/api".mount(Proxy::new(&upstream)),)).build());
+
+        let stream = Compio.connect(proxy).await.expect("connect");
+        let (client, response) = client_async("ws://shop.example/api/echo", stream.into_poll())
+            .await
+            .expect("the WebSocket handshake through the proxy");
+        assert_eq!(response.status(), 101);
+        let via = response.headers()["via"].to_str().expect("Via").to_owned();
+        (client, via)
+    }
+
+    /// The next message from the origin, within a bound a working tunnel never comes near.
+    async fn next(client: &mut Client) -> Option<Message> {
+        compio::time::timeout(Duration::from_secs(10), client.next())
+            .await
+            .expect("the tunnel stalled")
+            .map(|message| message.expect("a WebSocket frame"))
+    }
+
+    #[test]
+    fn text_and_binary_messages_round_trip_through_the_tunnel() {
+        run(async {
+            let (mut client, via) = connect().await;
+            assert_eq!(via, "1.1 skyzen");
+
+            for greeting in GREETINGS {
+                client.send(Message::text(greeting)).await.expect("send");
+                let echoed = next(&mut client).await.expect("an echo");
+                assert_eq!(echoed.into_text().expect("text").as_str(), greeting);
+            }
+            // Every byte value, so nothing on the way treats the payload as text.
+            let binary: Vec<u8> = GREETINGS
+                .concat()
+                .into_bytes()
+                .into_iter()
+                .chain(0..=u8::MAX)
+                .collect();
+            client
+                .send(Message::binary(Bytes::from(binary.clone())))
+                .await
+                .expect("send");
+            assert_eq!(
+                next(&mut client).await.expect("an echo"),
+                Message::binary(binary)
+            );
+
+            // The client closes: the origin answers its close frame, and the tunnel ends.
+            client.close(None).await.expect("close");
+            while let Some(message) = next(&mut client).await {
+                assert!(message.is_close(), "after the close: {message:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn an_origin_close_reaches_the_client() {
+        run(async {
+            let (mut client, _) = connect().await;
+            client.send(Message::text(FAREWELL)).await.expect("send");
+            let closed = next(&mut client).await.expect("the origin's close frame");
+            assert!(
+                matches!(closed, Message::Close(None | Some(CloseFrame { .. }))),
+                "{closed:?}"
+            );
+            assert!(
+                next(&mut client).await.is_none(),
+                "the stream ends after the close"
+            );
+        });
+    }
 }
 
 #[test]
