@@ -51,7 +51,7 @@ clippy.future_not_send = { level = "allow", priority = 1 }
 
 # `skyzen-cli` is the installable toolchain, and a source `cargo install` costs
 # ~20 minutes of compile per consumer (CI runners included). cargo-dist builds
-# per-target binaries on every `skyzen-cli-v*` tag and attaches them to the
+# per-target binaries on every `v<version>` tag and attaches them to the
 # GitHub Release, so `cargo binstall skyzen-cli` and the shell/powershell
 # installers resolve to a download instead.
 #
