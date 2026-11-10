@@ -186,6 +186,12 @@ skyzen-lambda = { workspace = true, optional = true }
 # resolves one crypto backend; the certificate/key pair is loaded with rustls's own PEM support.
 http-kit-tls = { version = "0.2.0", default-features = false, optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
+# The reverse proxy's upstream client (`proxy`): zenwave's native backend, HTTP/1.1 on
+# `http-kit-h1` over the same `http-kit-io` sockets the server runs on, with a connection pool on
+# each serving thread. zenwave refuses to build without a default backend; `native-compio` is the
+# one whose runtime this crate already links, though the proxy only ever starts pools on the
+# serving thread's own runtime.
+zenwave = { version = "0.9.1", default-features = false, features = ["native-compio"], optional = true }
 
 # Kernel TLS on Linux: after the handshake the kernel seals and opens the records, so file-region
 # bodies go out through sendfile/splice.
@@ -226,6 +232,9 @@ futures-lite = "2.6"
 serial_test = "3.2"
 # The decompression tests encode their fixture zstd frames; `ruzstd` only decodes.
 zstd = { version = "0.13", default-features = false }
+# `tests/proxy.rs` drives the proxy with a raw HTTP/1.1 client, which sends and reads trailers and
+# pulls a body only as fast as the test asks.
+http-kit-h1.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The wasm half of the OpenAPI handler registry; see `src/openapi/registry.rs` for why
@@ -349,6 +358,9 @@ rt = []
 # `SKYZEN_TLS_KEY`) point the runtime at a PEM certificate chain and private key, and
 # `#[skyzen::main]` serves HTTPS on the bound listener with ALPN `h2, http/1.1`.
 server-tls = ["dep:http-kit-tls", "dep:rustls"]
+# The reverse-proxy endpoint (`skyzen::proxy`, native only), forwarding through zenwave's native
+# backend.
+proxy = ["dep:zenwave"]
 # The `lambda` feature lets `#[skyzen::main]` serve AWS Lambda invocations.
 # Nothing in an application changes: the runtime detects `AWS_LAMBDA_RUNTIME_API` and hands over
 # to the adapter instead of binding a listener. Without it, a binary that finds itself inside
@@ -374,6 +386,10 @@ required-features = ["sqlite"]
 [[test]]
 name = "hyper_websocket"
 required-features = ["sqlite"]
+
+[[test]]
+name = "proxy"
+required-features = ["proxy"]
 
 [lints]
 workspace = true
