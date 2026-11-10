@@ -9,16 +9,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The example binary `cargo test` built next to this test.
+/// The `native` example, built with the profile this test is built in; cargo reuses the build
+/// when nothing changed.
 fn example() -> PathBuf {
-    let test = std::env::current_exe().expect("the test binary's path");
-    let profile = test
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("target/<profile>/deps/<test>");
-    let example = profile.join("examples").join("native");
-    assert!(example.exists(), "{} was not built", example.display());
-    example
+    escargot::CargoBuild::new()
+        .example("native")
+        .manifest_path(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .current_release()
+        .run()
+        .expect("build the native example")
+        .path()
+        .to_path_buf()
 }
 
 /// The running example, killed if a test fails before it is stopped.

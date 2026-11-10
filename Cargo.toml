@@ -192,6 +192,8 @@ async-executor.workspace = true
 async-tungstenite = { version = "0.33.0", features = ["tokio-runtime"] }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "net"] }
 femme = "2.2.1"
+# `tests/native_runtime.rs` builds the `native` example itself, so it runs under any test runner.
+escargot = { version = "1.0.1", default-features = false }
 skyzen-hyper.workspace = true
 # The `Server` tests and `examples/embed_hyper.rs` hand a server listeners registered with an
 # `http-kit-io` backend, and serve the same `!Send` router through both of Skyzen's servers.

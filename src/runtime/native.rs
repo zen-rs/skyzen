@@ -923,9 +923,9 @@ where
     let threads = std::thread::available_parallelism()?;
     let sockets = cores::bind(&addr, threads)?;
     let scheme = if tls.is_some() { "https" } else { "http" };
-    let listening = match sockets.first() {
-        Some(cores::Socket::Tcp(listener)) => format!("{scheme}://{}", listener.local_addr()?),
-        _ => addr.to_string(),
+    let listening = match sockets.first().and_then(cores::Socket::tcp) {
+        Some(listener) => format!("{scheme}://{}", listener.local_addr()?),
+        None => addr.to_string(),
     };
 
     // A drain token for everything that must finish before the process may stop, and the

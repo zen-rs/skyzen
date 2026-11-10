@@ -39,6 +39,17 @@ pub(super) enum Socket {
     Unix(std::os::unix::net::UnixListener),
 }
 
+impl Socket {
+    /// The TCP listener, or `None` for a unix socket.
+    pub(super) const fn tcp(&self) -> Option<&std::net::TcpListener> {
+        match self {
+            Self::Tcp(listener) => Some(listener),
+            #[cfg(unix)]
+            Self::Unix(_) => None,
+        }
+    }
+}
+
 /// One listening socket per thread, all on `addr`.
 ///
 /// Binding happens here, on the starting thread, so that an address that cannot be bound fails
@@ -448,9 +459,7 @@ mod tests {
         let threads = NonZeroUsize::new(4).unwrap();
         let sockets =
             bind(&ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()), threads).expect("bind");
-        let Socket::Tcp(first) = &sockets[0] else {
-            unreachable!("a TCP address binds TCP sockets")
-        };
+        let first = sockets[0].tcp().expect("a TCP address binds TCP sockets");
         let addr = first.local_addr().expect("local addr");
 
         let serving = Serving::start(sockets, server);
