@@ -45,7 +45,7 @@ async-io = { workspace = true, optional = true }
 opendal = { version = "0.58", default-features = false, features = ["executors-tokio", "services-azblob"], optional = true }
 # zenwave is the workspace's HTTP client: hyper over async-io with rustls verified against the OS
 # trust store, HTTP/2 negotiated by ALPN — the same selection `skyzen-cli` makes.
-zenwave = { version = "0.8", default-features = false, features = ["hyper-backend", "rustls", "http2"], optional = true }
+zenwave = { version = "0.9", default-features = false, features = ["hyper-backend", "rustls", "http2"], optional = true }
 reqsign-azure-storage = { version = "3.1", optional = true }
 reqsign-core = { version = "3.1", optional = true }
 quick-xml = { version = "0.41", features = ["serialize"], optional = true }
