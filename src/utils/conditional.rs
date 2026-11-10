@@ -65,12 +65,12 @@ fn sanitize(value: &str) -> String {
             _ => {
                 out.push('%');
                 out.push(
-                    char::from_digit((byte >> 4) as u32, 16)
+                    char::from_digit(u32::from(byte >> 4), 16)
                         .unwrap()
                         .to_ascii_uppercase(),
                 );
                 out.push(
-                    char::from_digit((byte & 0xf) as u32, 16)
+                    char::from_digit(u32::from(byte & 0xf), 16)
                         .unwrap()
                         .to_ascii_uppercase(),
                 );
@@ -93,12 +93,12 @@ pub(crate) fn fresh(
     // applies when the stronger validator is absent (RFC 9110 §13.2.2). With nothing to
     // compare against, no member can match, so the answer is simply "not fresh".
     if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
-        return match etag {
-            Some(tag) => !if_none_match.precondition_passes(tag),
+        return etag.map_or_else(
             // `*` fails whenever a representation exists — and reaching `fresh` at all
             // means the handler produced one, tag or no tag.
-            None => if_none_match == IfNoneMatch::any(),
-        };
+            || if_none_match == IfNoneMatch::any(),
+            |tag| !if_none_match.precondition_passes(tag),
+        );
     }
     if let (Some(if_modified_since), Some(modified)) =
         (headers.typed_get::<IfModifiedSince>(), last_modified)

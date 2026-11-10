@@ -209,9 +209,10 @@ impl Task for MigrateSchedulesToAlias {
     fn describe(&self) -> String {
         format!(
             "point `[[schedule]]` EventBridge rules of Lambda function `{}` at the `{ALIAS}` \
-             alias, run `{}`, then reconcile",
+             alias, run `{}`, then {}",
             self.inner.function,
-            self.deploy.display()
+            self.deploy.display(),
+            self.inner.describe(),
         )
     }
 

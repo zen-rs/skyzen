@@ -35,6 +35,9 @@ http_error!(
 ///     save(edit).await
 /// }
 /// ```
+// The `if_` prefix is the headers' shared name, not a naming coincidence: each field holds
+// its `If-*` conditional verbatim.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone)]
 pub struct Preconditions {
     if_match: Option<IfMatch>,

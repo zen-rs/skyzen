@@ -255,7 +255,7 @@ impl Session {
         // publishing the stale result over it would drop that write. Only a still-empty
         // cache takes the loaded value.
         let mut inner = lock(&self.inner);
-        if let SessionCache::Unloaded = inner.data {
+        if matches!(inner.data, SessionCache::Unloaded) {
             // The presented id named a record that no longer exists — expired or revoked.
             // Keeping it would let the next insert recreate a dead session id, so the
             // session moves on under a fresh one.
@@ -264,6 +264,7 @@ impl Session {
             }
             inner.data = SessionCache::Ready(loaded.clone());
         }
+        drop(inner);
         Ok(loaded)
     }
 
@@ -706,15 +707,12 @@ impl SessionsLayer {
             .jar_for(store, keys, (id, loaded_id, loaded, pending))
             .await?;
         let extensions = request.extensions_mut();
-        let pending_headers = match extensions.get_mut::<PendingResponseHeaders>() {
-            Some(pending) => pending,
-            None => {
-                extensions.insert(PendingResponseHeaders(HeaderMap::new()));
-                extensions
-                    .get_mut::<PendingResponseHeaders>()
-                    .expect("pending headers just inserted")
-            }
-        };
+        if extensions.get_mut::<PendingResponseHeaders>().is_none() {
+            extensions.insert(PendingResponseHeaders(HeaderMap::new()));
+        }
+        let pending_headers = extensions
+            .get_mut::<PendingResponseHeaders>()
+            .expect("pending headers just inserted");
         for cookie in jar.delta() {
             pending_headers.0.append(
                 header::SET_COOKIE,
@@ -1274,15 +1272,16 @@ impl SessionStore for MemorySessionStore {
                 // closest to their own expiry first: bounding the map outweighs retiring
                 // a session a few minutes early.
                 let overflow = entries.len() - MAX_MEMORY_SESSIONS;
-                let mut expiries: Vec<(String, f64)> = entries
+                let mut expiry_order: Vec<(String, f64)> = entries
                     .iter()
                     .map(|(key, (expires, _))| (key.clone(), *expires))
                     .collect();
-                expiries.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-                for (key, _) in expiries.into_iter().take(overflow) {
+                expiry_order.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+                for (key, _) in expiry_order.into_iter().take(overflow) {
                     entries.remove(&key);
                 }
             }
+            drop(entries);
             Ok(())
         })
     }
@@ -1293,6 +1292,7 @@ impl SessionStore for MemorySessionStore {
             entries.remove(&store_key(id));
             let tombstone = ttl.as_secs_f64().mul_add(1000.0, now_ms());
             entries.insert(tomb_key(id), (tombstone, SessionData::new()));
+            drop(entries);
             Ok(())
         })
     }
@@ -1308,7 +1308,8 @@ impl SessionStore for MemorySessionStore {
             let mut entries = self.entries.lock().expect("memory store");
             // Refreshing a dead record would resurrect it — an expired entry is dropped
             // outright, same as `load`, so a stale signed cookie cannot revive a session.
-            match entries.get(&store_key(id)).map(|(expires, _)| *expires) {
+            let existing_expiry = entries.get(&store_key(id)).map(|(expires, _)| *expires);
+            let refreshed = match existing_expiry {
                 Some(expires) if expires > now => {
                     if let Some((expires, _)) = entries.get_mut(&store_key(id)) {
                         *expires = ttl.as_secs_f64().mul_add(1000.0, now);
@@ -1320,7 +1321,9 @@ impl SessionStore for MemorySessionStore {
                     Ok(false)
                 }
                 None => Ok(false),
-            }
+            };
+            drop(entries);
+            refreshed
         })
     }
 }

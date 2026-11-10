@@ -203,7 +203,7 @@ fn trusted_client(
 /// (RFC 7230 §3.2.2). `None` when no `for=` is present.
 fn forwarded_chain(request: &Request) -> Option<Vec<Option<IpAddr>>> {
     let mut addrs = Vec::new();
-    for value in request.headers().get_all(header::FORWARDED).iter() {
+    for value in request.headers().get_all(header::FORWARDED) {
         for entry in value.as_bytes().split(|b| *b == b',') {
             // Every member is a hop; its `for=` is the address claim. A member without one —
             // or with a value that does not parse — still occupies a position: `None` marks

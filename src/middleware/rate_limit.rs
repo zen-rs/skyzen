@@ -332,11 +332,12 @@ const MAX_KEY_COMPONENT: usize = 128;
 /// [`encode_key_component`] when short enough, else its sha256 hex — still injective, so a
 /// distinct name or client key still lands on a distinct bucket.
 fn bound_key_component(key: &str) -> String {
+    use sha2::Digest;
+
     let escaped = encode_key_component(key);
     if escaped.len() <= MAX_KEY_COMPONENT {
         return escaped;
     }
-    use sha2::Digest;
     let digest = sha2::Sha256::digest(key.as_bytes());
     // The `sha256:` tag can never appear in escaped output — `:` itself is %3A there — so a
     // short key that happens to equal a digest cannot claim a long key's bucket.
