@@ -123,7 +123,7 @@ impl H1 {
     ) where
         T: Timer + Clone + 'static,
         L: Listener,
-        L::Stream: Split,
+        L::Stream: Split + 'static,
         L::Addr: PeerAddress,
         <L::Stream as Split>::WriteHalf: SendFile,
         Ex: LocalExecutor + 'static,
@@ -157,12 +157,9 @@ impl H1 {
             let peer = peer.socket_addr();
             debug!(?peer, "accepted a connection");
 
-            let (read, write) = stream.split();
-            let connection = ServerConnection::new(read, write, timer.clone(), self.config.clone());
-            let service = H1Service {
-                endpoint: endpoint.clone(),
-                peer,
-            };
+            let server = self.clone();
+            let timer = timer.clone();
+            let endpoint = endpoint.clone();
             let stopping = stopping.clone();
             let live = live.clone();
             let slot = Slot::take(&open);
@@ -173,34 +170,9 @@ impl H1 {
                         // Resolves with an error once `stop` is dropped.
                         let _ = stopping.recv().await;
                     };
-                    let outcome = connection.serve_until(&service, stop).await;
-                    // An upgraded connection is no longer an HTTP exchange the drain waits for.
-                    drop(live);
-                    match outcome {
-                        Ok(ServerOutcome::Closed) => {}
-                        Ok(ServerOutcome::Upgraded {
-                            upgraded,
-                            mut response,
-                        }) => match response.extensions.remove::<OnUpgrade>() {
-                            Some(session) => {
-                                let stream = Replay {
-                                    buffered: upgraded.read_buf,
-                                    inner: CopyingPoll::new(Halves {
-                                        read: upgraded.read,
-                                        write: upgraded.write,
-                                    }),
-                                };
-                                session.run(Upgraded::new(stream)).await;
-                            }
-                            None => {
-                                error!(
-                                    "the endpoint answered 101 without an upgrade session; \
-                                     closing the connection"
-                                );
-                            }
-                        },
-                        Err(error) => debug!("h1 connection ended with an error: {error}"),
-                    }
+                    server
+                        .serve_connection(timer, stream, peer, endpoint, stop, live)
+                        .await;
                 })
                 .detach();
         }
@@ -208,6 +180,61 @@ impl H1 {
         drop(stop);
         drop(live);
         let _ = drained.recv().await;
+    }
+
+    /// Serve one already-accepted `stream` until it closes or `stop` resolves.
+    ///
+    /// This is what [`serve_listener`](Self::serve_listener) runs for each connection, public so
+    /// a caller that has work between accepting and serving — a TLS handshake — can do it on the
+    /// connection's own task instead of in the accept loop. `peer` is attached to every request
+    /// as its `PeerAddr`. `live` is dropped once the HTTP exchange is over, before an upgraded
+    /// session starts, which is how a drain stops waiting for the connection. The connection
+    /// limit is the caller's.
+    pub async fn serve_connection<T, S, E, G>(
+        &self,
+        timer: T,
+        stream: S,
+        peer: Option<SocketAddr>,
+        endpoint: E,
+        stop: impl Future<Output = ()>,
+        live: G,
+    ) where
+        T: Timer + Clone + 'static,
+        S: Split + 'static,
+        <S as Split>::WriteHalf: SendFile,
+        E: Endpoint + Clone + 'static,
+    {
+        let (read, write) = stream.split();
+        let connection = ServerConnection::new(read, write, timer, self.config.clone());
+        let service = H1Service { endpoint, peer };
+        let outcome = connection.serve_until(&service, stop).await;
+        // An upgraded connection is no longer an HTTP exchange the drain waits for.
+        drop(live);
+        match outcome {
+            Ok(ServerOutcome::Closed) => {}
+            Ok(ServerOutcome::Upgraded {
+                upgraded,
+                mut response,
+            }) => match response.extensions.remove::<OnUpgrade>() {
+                Some(session) => {
+                    let stream = Replay {
+                        buffered: upgraded.read_buf,
+                        inner: CopyingPoll::new(Halves {
+                            read: upgraded.read,
+                            write: upgraded.write,
+                        }),
+                    };
+                    session.run(Upgraded::new(stream)).await;
+                }
+                None => {
+                    error!(
+                        "the endpoint answered 101 without an upgrade session; \
+                         closing the connection"
+                    );
+                }
+            },
+            Err(error) => debug!("h1 connection ended with an error: {error}"),
+        }
     }
 }
 

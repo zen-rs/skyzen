@@ -17,8 +17,8 @@ skyzen-redis = { path = "redis", version = "0.3.1" }
 skyzen-s3 = { path = "s3", version = "0.3.1" }
 
 http-kit = "0.5.1"
-http-kit-io = { version = "0.3.1", default-features = false }
-http-kit-h1 = { version = "0.2.0", default-features = false }
+http-kit-io = { version = "0.3.2", default-features = false }
+http-kit-h1 = { version = "0.2.3", default-features = false }
 executor-core = { version = "0.7.2", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper", version = "0.2.1" }
 skyzen-h1 = { path = "h1", version = "0.1.0" }
@@ -177,13 +177,16 @@ skyzen-hyper.workspace = true
 jsonwebtoken = { version = "10", optional = true, features = ["aws_lc_rs"] }
 # The AWS Lambda adapter, which brings its own Tokio runtime; see the `lambda` feature.
 skyzen-lambda = { workspace = true, optional = true }
-# TLS termination (`server-tls` feature), the interim path until TLS runs on owned-buffer streams.
-# `futures-rustls` speaks futures-io, which is what the compio stream's poll-style capability
-# and hyper's connection driver already are. Its default `aws-lc-rs` provider matches the AWS
-# SDK's TLS stack, so the workspace resolves one crypto backend; `rustls-pemfile` loads the
-# certificate/key pair.
-futures-rustls = { version = "0.26", optional = true }
-rustls-pemfile = { version = "2", optional = true }
+# TLS termination (`server-tls` feature): rustls driven straight over the owned-buffer streams by
+# `http-kit-tls`. The `aws_lc_rs` provider matches the AWS SDK's TLS stack, so the workspace
+# resolves one crypto backend; the certificate/key pair is loaded with rustls's own PEM support.
+http-kit-tls = { version = "0.1.0", default-features = false, optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
+
+# Kernel TLS on Linux: after the handshake the kernel seals and opens the records, so file-region
+# bodies go out through sendfile/splice.
+[target.'cfg(target_os = "linux")'.dependencies]
+http-kit-tls = { version = "0.1.0", default-features = false, features = ["kernel"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The `Server` tests and `examples/embed_hyper.rs` run their own smol executor.
@@ -341,7 +344,7 @@ rt = []
 # Terminate TLS in the native server: `--tls-cert`/`--tls-key` (or `SKYZEN_TLS_CERT`/
 # `SKYZEN_TLS_KEY`) point the runtime at a PEM certificate chain and private key, and
 # `#[skyzen::main]` serves HTTPS on the bound listener with ALPN `h2, http/1.1`.
-server-tls = ["dep:futures-rustls", "dep:rustls-pemfile"]
+server-tls = ["dep:http-kit-tls", "dep:rustls"]
 # The `lambda` feature lets `#[skyzen::main]` serve AWS Lambda invocations.
 # Nothing in an application changes: the runtime detects `AWS_LAMBDA_RUNTIME_API` and hands over
 # to the adapter instead of binding a listener. Without it, a binary that finds itself inside

@@ -219,7 +219,7 @@ pub async fn serve_connection<S, E, Ex>(
                 }
             };
             if let Err(error) = result {
-                error!("hyper h2 connection error: {error}");
+                log_connection_error("h2", &error);
             }
         }
         Protocol::Http1 => {
@@ -245,7 +245,7 @@ pub async fn serve_connection<S, E, Ex>(
             })
             .await;
             if let Err(error) = result {
-                error!("hyper h1 connection error: {error}");
+                log_connection_error("h1", &error);
                 return;
             }
 
@@ -265,6 +265,24 @@ pub async fn serve_connection<S, E, Ex>(
             executor.spawn_local(session.run(stream)).detach();
         }
     }
+}
+
+/// Log how a connection ended: a peer that closes without finishing (a TLS client that sends no
+/// `close_notify` surfaces as `UnexpectedEof`) is routine and logged at debug; anything else is
+/// an error.
+fn log_connection_error(version: &str, error: &hyper::Error) {
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+        {
+            debug!("hyper {version} connection closed without finishing: {error}");
+            return;
+        }
+        source = cause.source();
+    }
+    error!("hyper {version} connection error: {error}");
 }
 
 /// An upgraded stream that first replays what the client sent after its upgrade request.

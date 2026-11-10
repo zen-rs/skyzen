@@ -354,9 +354,9 @@ async fn serve_tcp<F, W, L, E>(
         return;
     }
     match (&plan.tls, plan.server) {
-        // Skyzen's own server speaks cleartext only, so TLS is always hyper's, with ALPN choosing
-        // between h1 and h2.
-        (Some(tls), _) => {
+        // ALPN chooses the protocol on the decrypted stream: `h2` is hyper's, anything else is
+        // HTTP/1.1 served by the plan's selected server.
+        (Some(tls), server) => {
             super::tls::serve(
                 executor,
                 listener,
@@ -364,6 +364,7 @@ async fn serve_tcp<F, W, L, E>(
                 shutdown,
                 tls.clone(),
                 plan.max_connections,
+                (server, h1.clone()),
             )
             .await;
         }

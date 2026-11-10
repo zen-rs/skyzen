@@ -126,6 +126,8 @@ jobs:
           cache-on-failure: true
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
+      # The native TLS tests assert kernel TLS on Linux.
+      - run: sudo modprobe tls
       - run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v4
         with:
