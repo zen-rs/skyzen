@@ -120,12 +120,8 @@ pub(super) enum ServerTls {}
 
 /// How long a freshly accepted TLS connection may take to handshake, and an `h2` one to send its
 /// preface, before it is dropped. Prevents idle clients from pinning per-connection tasks forever.
-#[cfg(all(feature = "server-tls", not(test)))]
+#[cfg(feature = "server-tls")]
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// The same bound, shortened so tests can actually observe it.
-#[cfg(all(feature = "server-tls", test))]
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Turn the configured [`TlsFiles`] into the acceptor every connection shares, or refuse the
 /// start when they cannot become one.
@@ -273,7 +269,14 @@ pub(super) async fn serve<L, E>(
             .spawn_local(async move {
                 let _slot = slot;
                 let _live = live;
-                let Some((stream, protocol)) = negotiate(stream.into_poll(), &tls).await else {
+                let Some((stream, protocol)) = negotiate(
+                    stream.into_poll(),
+                    &tls,
+                    HANDSHAKE_TIMEOUT,
+                    HANDSHAKE_TIMEOUT,
+                )
+                .await
+                else {
                     return;
                 };
                 serve_connection(stream, protocol, service, connection_executor, async move {
@@ -317,8 +320,9 @@ impl Drop for Slot {
     }
 }
 
-/// Run the TLS handshake under [`HANDSHAKE_TIMEOUT`] and work out which HTTP version the
-/// connection speaks, returning the decrypted stream and its protocol.
+/// Run the TLS handshake under `handshake` and work out which HTTP version the connection speaks,
+/// waiting at most `preface` for an `h2` client's preface, returning the decrypted stream and its
+/// protocol.
 ///
 /// `None` means the connection is already dead — a failed handshake or an `h2` client that never
 /// sent its preface — having been logged here rather than by the caller.
@@ -326,6 +330,8 @@ impl Drop for Slot {
 async fn negotiate<C>(
     stream: C,
     tls: &ServerTls,
+    handshake: std::time::Duration,
+    preface: std::time::Duration,
 ) -> Option<(
     skyzen_hyper::Prefixed<futures_rustls::server::TlsStream<C>>,
     skyzen_hyper::Protocol,
@@ -340,8 +346,8 @@ where
     use skyzen_hyper::{sniff_protocol, Prefixed, Protocol};
     use tracing::{debug, error};
 
-    let handshake = pin!(tls.0.accept(stream));
-    let stream = match select(handshake, pin!(Compio.sleep(HANDSHAKE_TIMEOUT))).await {
+    let accepting = pin!(tls.0.accept(stream));
+    let stream = match select(accepting, pin!(Compio.sleep(handshake))).await {
         Either::Left((Ok(stream), _)) => stream,
         Either::Left((Err(error), _)) => {
             // TCP probes that connect and close, and plaintext clients knocking on an HTTPS
@@ -360,7 +366,7 @@ where
     // and any other negotiated outcome is served HTTP/1.1 whatever bytes the client sends. There
     // is no h2c-by-sniffing on a TLS connection.
     match stream.get_ref().1.alpn_protocol() {
-        Some(b"h2") => match sniff_protocol(stream, HANDSHAKE_TIMEOUT).await {
+        Some(b"h2") => match sniff_protocol(stream, preface).await {
             Ok((prefixed, Protocol::Http2)) => Some((prefixed, Protocol::Http2)),
             Ok(_) => {
                 debug!("ALPN negotiated h2 but the connection does not open with the preface");
@@ -386,8 +392,13 @@ mod tests {
     use http_kit_io::{compio::Compio, IntoPoll as _, Io as _, Listener as _};
     use skyzen_hyper::{Protocol, HTTP2_PREFACE};
 
-    use super::{load_tls_acceptor, negotiate, serve, ServerTls, TlsError};
+    use super::{load_tls_acceptor, negotiate, serve, ServerTls, TlsError, HANDSHAKE_TIMEOUT};
     use crate::{runtime::native::TlsFiles, Endpoint};
+
+    /// The preface wait of the test whose client completes its handshake and then goes silent.
+    /// Only that wait is shortened: every handshake in these tests runs under the production
+    /// [`HANDSHAKE_TIMEOUT`], so no test depends on how fast a loaded debug build handshakes.
+    const SHORT_PREFACE: core::time::Duration = core::time::Duration::from_millis(250);
 
     /// A self-signed leaf + key as PEM files in a fresh temporary directory.
     /// The leaf's DER bytes come back too, so the client side can pin it as its root.
@@ -577,7 +588,9 @@ mod tests {
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                negotiate(stream.into_poll(), &tls).await.is_none()
+                negotiate(stream.into_poll(), &tls, HANDSHAKE_TIMEOUT, SHORT_PREFACE)
+                    .await
+                    .is_none()
             };
             let client = async {
                 let stream = Compio.connect(addr).await.expect("connect");
@@ -615,7 +628,13 @@ mod tests {
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                negotiate(stream.into_poll(), &tls).await
+                negotiate(
+                    stream.into_poll(),
+                    &tls,
+                    HANDSHAKE_TIMEOUT,
+                    HANDSHAKE_TIMEOUT,
+                )
+                .await
             };
             let request = async {
                 let stream = Compio.connect(addr).await.expect("connect");
