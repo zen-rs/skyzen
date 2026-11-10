@@ -1884,7 +1884,12 @@ impl EventBridgeSchedules {
                 "could not tag Lambda function `{}`'s schedule state: {error:#}",
                 self.function
             ));
-            return false;
+            // A failed rewrite is harmless when the record already says the right
+            // thing — verify the existing value rather than demand the write.
+            return matches!(
+                self.schedule_tag(lambda, arn).await,
+                Ok(Some(tag)) if tag == state
+            );
         }
         matches!(self.schedule_tag(lambda, arn).await, Ok(Some(tag)) if tag == state)
     }
