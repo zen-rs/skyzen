@@ -78,6 +78,19 @@ pub use skyzen_core::middleware::{
 pub use timeout::Timeout;
 pub use trace::Trace;
 
+/// Whole milliseconds in a `js_sys::Date` reading or difference.
+///
+/// # Panics
+///
+/// Panics when `millis` is negative or not finite: a clock that reports that is broken, and
+/// every caller would otherwise carry a nonsense timestamp onward.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn js_millis(millis: f64) -> u64 {
+    let duration = core::time::Duration::try_from_secs_f64(millis / 1000.0)
+        .expect("js_sys::Date reported a negative or non-finite time");
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// An [`Endpoint`] wrapped in one [`Middleware`].
 ///
 /// Produced by [`layer`]. Composing repeatedly nests the wrappers, so the middleware applied last
