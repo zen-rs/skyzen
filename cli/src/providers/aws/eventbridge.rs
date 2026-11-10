@@ -25,11 +25,33 @@ const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
 
 /// The alias every rule's target carries: invocations through it change only when the deploy
-/// repoints it at the new version — atomically, unlike any rule-state change EventBridge can
-/// propagate.
+/// repoints it at the new version — atomically, unlike any rule-state change an event bus
+/// can propagate.
 const ALIAS: &str = "skyzen";
 
+/// The ambient identifiers every transaction call shares — bundled so no helper needs to
+/// spell out the clients, the names, and the ARN parts it derives rules and grants from.
+struct Ctx<'a> {
+    /// The events client.
+    events: &'a aws_sdk_eventbridge::Client,
+    /// The functions client.
+    lambda: &'a aws_sdk_lambda::Client,
+    /// `fn:skyzen` — the name alias-time grants live on.
+    qualified: &'a str,
+    /// The unqualified function ARN legacy rules once targeted.
+    arn: &'a str,
+    /// `arn:skyzen` — the alias-qualified ARN they target now.
+    alias_arn: &'a str,
+    /// `arn`'s `(partition, region, account)` — a rule's own ARN derives from them.
+    arn_parts: (&'a str, &'a str, &'a str),
+}
+
 /// What a rule looked like before this deploy touched it: enough to put it back.
+///
+/// The many flags are orthogonal facts of a real AWS transaction — existence, mutation,
+/// whether a grant lived and where, whether it was created or removed — and each decides a
+/// different half of the rollback, so they are fields, not a bitmap.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 struct RuleSnapshot {
     /// The rule's name.
@@ -169,7 +191,7 @@ struct Migrated {
 impl MigrateSchedulesToAlias {
     /// The step that moves `schedules` plus every `skyzen-schedule-*` grant's rule, then
     /// uploads and reconciles — all inside one transaction.
-    pub fn new(
+    pub const fn new(
         function: String,
         schedules: Vec<ScheduleEntry>,
         env: Vec<(String, String)>,
@@ -193,6 +215,7 @@ impl Task for MigrateSchedulesToAlias {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run(&self) -> Result<()> {
         // Zero declared schedules is not the same as zero legacy rules — a removed last
         // `[[schedule]]` still has an unqualified rule pointing at the code about to swap.
@@ -294,16 +317,22 @@ impl Task for MigrateSchedulesToAlias {
             let qualified = format!("{}:{ALIAS}", self.inner.function);
             let mut snapshot = Vec::new();
             let mut alias = None;
+            // Tolerating denied discovery is only safe when nothing was migrated and the
+            // manifest declares no schedules — a schedule-removal deploy still carries
+            // rules to retire, and "cannot read" is not "there are none".
+            let tolerant = migrated.is_empty() && self.inner.schedules.is_empty();
+            let alias_arn = format!("{arn}:{ALIAS}");
+            let ctx = Ctx {
+                events: &events,
+                lambda: &lambda,
+                qualified: &qualified,
+                arn: &arn,
+                alias_arn: &alias_arn,
+                arn_parts: (partition, region, account),
+            };
             if let Err(error) = self
                 .inner
-                .reconcile(
-                    &events,
-                    &lambda,
-                    &arn,
-                    (partition, region, account),
-                    &mut snapshot,
-                    &mut alias,
-                )
+                .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
                 .await
             {
                 // The code already swapped — restoring legacy invocation would fire new code
@@ -314,14 +343,7 @@ impl Task for MigrateSchedulesToAlias {
                 // without ever touching the unqualified function.
                 let restored = self
                     .inner
-                    .rollback_reconcile(
-                        &lambda,
-                        &events,
-                        &qualified,
-                        (partition, region, account),
-                        &snapshot,
-                        &alias,
-                    )
+                    .rollback_reconcile(&ctx, &snapshot, alias.as_deref())
                     .await;
                 // A rule is re-enabled only if its targets, grant and state actually came
                 // back — `None` means the alias repoint failed and nothing is safe to fire.
@@ -587,31 +609,26 @@ impl Task for EventBridgeSchedules {
                     )
                 })?;
             let qualified = format!("{}:{ALIAS}", self.function);
+            let alias_arn = format!("{arn}:{ALIAS}");
+            let ctx = Ctx {
+                events: &events,
+                lambda: &lambda,
+                qualified: &qualified,
+                arn: &arn,
+                alias_arn: &alias_arn,
+                arn_parts: (partition, region, account),
+            };
             let mut snapshot = Vec::new();
             let mut alias = None;
             let result = self
-                .reconcile(
-                    &events,
-                    &lambda,
-                    &arn,
-                    (partition, region, account),
-                    &mut snapshot,
-                    &mut alias,
-                )
+                .reconcile(&ctx, &mut snapshot, &mut alias, self.schedules.is_empty())
                 .await;
             if let Err(error) = result {
                 // The alias goes back first: rules re-enabled by the restore below must
                 // find the old version behind them, or the rollback itself wakes a stale
                 // cron on new code.
-                self.rollback_reconcile(
-                    &lambda,
-                    &events,
-                    &qualified,
-                    (partition, region, account),
-                    &snapshot,
-                    &alias,
-                )
-                .await;
+                self.rollback_reconcile(&ctx, &snapshot, alias.as_deref())
+                    .await;
                 return Err(error);
             }
             Ok(())
@@ -627,13 +644,12 @@ impl EventBridgeSchedules {
     /// wiring a stale rule still carried.
     async fn reconcile(
         &self,
-        events: &aws_sdk_eventbridge::Client,
-        lambda: &aws_sdk_lambda::Client,
-        arn: &str,
-        (partition, region, account): (&str, &str, &str),
+        ctx: &Ctx<'_>,
         snapshot: &mut Vec<RuleSnapshot>,
         alias: &mut Option<String>,
+        tolerant: bool,
     ) -> Result<()> {
+        let (events, lambda) = (ctx.events, ctx.lambda);
         if !self.delivery.is_empty() {
             super::lambda_env::LambdaEnvironment::new(
                 self.function.clone(),
@@ -643,8 +659,6 @@ impl EventBridgeSchedules {
             .deliver()
             .await?;
         }
-        let alias_arn = format!("{arn}:{ALIAS}");
-        let qualified = format!("{}:{ALIAS}", self.function);
         // A manifest with no schedules still carries the environment and may still find
         // stale grants to retire — but an HTTP-only app need not hold the permissions that
         // cleanup wants. Its discovery is best-effort: whatever it cannot read, it leaves.
@@ -653,8 +667,7 @@ impl EventBridgeSchedules {
             // nothing, so an HTTP-only deploy without schedule permissions is unaffected.
             // `retire_stale` reads the policies AND the prefix — a grant whose rule is
             // already gone still comes off here.
-            self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot, true)
-                .await?;
+            self.retire_stale(ctx, snapshot, tolerant).await?;
             return Ok(());
         }
 
@@ -689,25 +702,13 @@ impl EventBridgeSchedules {
             // the half-wired rule survives the rollback it should have been part of.
             let index = snapshot.len() - 1;
             let (mut mutated, mut granted) = (false, false);
-            let result = self
-                .wire_one(
-                    events,
-                    lambda,
-                    &qualified,
-                    &alias_arn,
-                    (partition, region, account),
-                    entry,
-                    &mut mutated,
-                    &mut granted,
-                )
-                .await;
+            let result = self.wire_one(ctx, entry, &mut mutated, &mut granted).await;
             let taken = &mut snapshot[index];
             taken.mutated = mutated;
             taken.granted = granted;
             result?;
         }
-        self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot, false)
-            .await?;
+        self.retire_stale(ctx, snapshot, false).await?;
         // The cutover is the last thing to move: every rule is wired disabled, so nothing
         // fires while the transition is open — then the alias repoints once and the
         // schedules switch on behind it, all at once.
@@ -785,14 +786,15 @@ impl EventBridgeSchedules {
 
     /// Put a snapshotted rule back: a rule that never existed gets deleted, and an existing
     /// one gets its schedule, its targets, its invoke grant and its enabled state back.
+    #[allow(clippy::too_many_lines)]
     async fn restore_rule(
         &self,
-        events: &aws_sdk_eventbridge::Client,
-        lambda: &aws_sdk_lambda::Client,
-        qualified: &str,
+        ctx: &Ctx<'_>,
         rule_arn: &str,
         snapshot: &RuleSnapshot,
+        re_enable: bool,
     ) -> Result<()> {
+        let (events, lambda, qualified) = (ctx.events, ctx.lambda, ctx.qualified);
         // A rule the transaction never changed must not be changed back — restoring an
         // ownership-rejected rule would mutate somebody else's wiring.
         if snapshot.existed && !snapshot.mutated {
@@ -873,7 +875,7 @@ impl EventBridgeSchedules {
             .await
             .with_context(|| format!("failed to list targets of `{}`", snapshot.name))?;
         let kept: std::collections::BTreeSet<&str> =
-            snapshot.targets.iter().map(|target| target.id()).collect();
+            snapshot.targets.iter().map(Target::id).collect();
         let surplus: Vec<String> = listed
             .targets()
             .iter()
@@ -987,8 +989,10 @@ impl EventBridgeSchedules {
             }
         }
         // The state is last: rule, targets and grant are all original again before the
-        // rule is allowed to fire.
-        if snapshot.enabled {
+        // rule is allowed to fire. `re_enable` is the alias gate — a rule whose target
+        // still ends at the alias must not be woken while the alias serves the rejected
+        // version, so it stays disabled rather than fire new code on the old wiring.
+        if snapshot.enabled && re_enable {
             events
                 .enable_rule()
                 .name(&snapshot.name)
@@ -1101,6 +1105,7 @@ impl EventBridgeSchedules {
     /// would run new code on stale configuration. Publishing the version the function was
     /// running and pointing the alias at it moves every rule behind the atomic repoint —
     /// and is itself idempotent: a second run finds the targets already moved.
+    #[allow(clippy::too_many_lines)]
     async fn migrate_to_alias(
         &self,
         events: &aws_sdk_eventbridge::Client,
@@ -1145,7 +1150,7 @@ impl EventBridgeSchedules {
                 }
                 Err(error) => {
                     output::warn(format!("could not read schedule grants: {error:#}"));
-                    Default::default()
+                    std::collections::BTreeSet::default()
                 }
             };
         match self.managed_rule_names(events).await {
@@ -1256,6 +1261,14 @@ impl EventBridgeSchedules {
             .with_context(|| {
                 format!("`{arn}` is not a Lambda function ARN EventBridge rules can be built from")
             })?;
+        let ctx = Ctx {
+            events,
+            lambda,
+            qualified: &qualified,
+            arn: &arn,
+            alias_arn: &alias_arn,
+            arn_parts: (partition, region, account),
+        };
 
         let mut migrated: Vec<Migrated> = Vec::new();
         for (rule, previous, name, enabled) in pending {
@@ -1272,18 +1285,7 @@ impl EventBridgeSchedules {
                 rule_arn: rule_arn.clone(),
             };
             let result = self
-                .migrate_one(
-                    events,
-                    lambda,
-                    &qualified,
-                    arn.as_str(),
-                    &alias_arn,
-                    &rule_arn,
-                    &rule,
-                    &previous,
-                    &name,
-                    &mut entry,
-                )
+                .migrate_one(&ctx, &rule_arn, &rule, &previous, &name, &mut entry)
                 .await;
             if let Err(error) = result {
                 for entry in migrated.iter().chain(std::iter::once(&entry)) {
@@ -1308,13 +1310,11 @@ impl EventBridgeSchedules {
     /// version it served, then put every snapshotted rule's targets, grant and state back.
     async fn rollback_reconcile(
         &self,
-        lambda: &aws_sdk_lambda::Client,
-        events: &aws_sdk_eventbridge::Client,
-        qualified: &str,
-        (partition, region, account): (&str, &str, &str),
+        ctx: &Ctx<'_>,
         snapshot: &[RuleSnapshot],
-        alias: &Option<String>,
+        alias: Option<&str>,
     ) -> Option<std::collections::BTreeSet<String>> {
+        let (lambda, (partition, region, account)) = (ctx.lambda, ctx.arn_parts);
         // The alias goes back first: rules re-enabled by the restore below must find the
         // old version behind them, or the rollback itself wakes a stale cron on new code.
         // A failed repoint means the alias still serves the new version — nothing is safe
@@ -1345,7 +1345,7 @@ impl EventBridgeSchedules {
                 taken.name
             );
             match self
-                .restore_rule(&events, &lambda, qualified, &rule_arn, taken)
+                .restore_rule(ctx, &rule_arn, taken, alias_restored)
                 .await
             {
                 Ok(()) => {
@@ -1426,17 +1426,20 @@ impl EventBridgeSchedules {
     /// Grant the rule its alias invoke permission, then retarget its unqualified entries.
     async fn migrate_one(
         &self,
-        events: &aws_sdk_eventbridge::Client,
-        lambda: &aws_sdk_lambda::Client,
-        qualified: &str,
-        arn: &str,
-        alias_arn: &str,
+        ctx: &Ctx<'_>,
         rule_arn: &str,
         rule: &str,
         previous: &[Target],
         name: &str,
         entry: &mut Migrated,
     ) -> Result<()> {
+        let (events, lambda, qualified, arn, alias_arn) = (
+            ctx.events,
+            ctx.lambda,
+            ctx.qualified,
+            ctx.arn,
+            ctx.alias_arn,
+        );
         // The invoke grant precedes the retarget: a rule moved before its permission
         // would sit unable to invoke until reconciliation catches up — or forever, if
         // the deploy fails between.
@@ -1463,7 +1466,7 @@ impl EventBridgeSchedules {
             .map(|target| {
                 let mut moved = target.clone();
                 if moved.arn() == arn {
-                    moved.arn = alias_arn.to_owned();
+                    moved.arn = alias_arn.to_string();
                 }
                 moved
             })
@@ -1591,17 +1594,21 @@ impl EventBridgeSchedules {
     /// The function's resource policy is the record: every statement `skyzen-schedule-{name}`
     /// is a grant this module made, so a grant whose name the manifest no longer declares is
     /// unambiguously stale. The matching rule and permission are retired together.
+    #[allow(clippy::too_many_lines)]
     async fn retire_stale(
         &self,
-        events: &aws_sdk_eventbridge::Client,
-        lambda: &aws_sdk_lambda::Client,
-        qualified: &str,
-        arn: &str,
-        alias_arn: &str,
+        ctx: &Ctx<'_>,
         snapshot: &mut Vec<RuleSnapshot>,
         tolerant: bool,
     ) -> Result<()> {
         const STATEMENT_PREFIX: &str = "skyzen-schedule-";
+        let (events, lambda, qualified, arn, alias_arn) = (
+            ctx.events,
+            ctx.lambda,
+            ctx.qualified,
+            ctx.arn,
+            ctx.alias_arn,
+        );
 
         // Grants live on the alias now, but an earlier deploy put them on the unqualified
         // function — a schedule removed while upgrading still carries that statement, and
@@ -1697,7 +1704,9 @@ impl EventBridgeSchedules {
                         // The grant is actually gone — and only the owner it lived on counts:
                         // a successful no-op on the other does not mean it was removed.
                         if snapshot.last().and_then(|t| t.owner.as_deref()) == Some(owner) {
-                            snapshot.last_mut().map(|t| t.removed = true);
+                            if let Some(t) = snapshot.last_mut() {
+                                t.removed = true;
+                            }
                         }
                     }
                     Err(error)
@@ -1796,8 +1805,13 @@ impl EventBridgeSchedules {
                 aws_sdk_eventbridge::operation::list_rules::ListRulesError,
             >>()
             .and_then(|sdk| sdk.as_service_error())
-            .map(|e| e.meta().code() == Some("AccessDeniedException"))
-            .unwrap_or(false)
+            .is_some_and(|e| e.meta().code() == Some("AccessDeniedException"))
+            || error
+                .downcast_ref::<aws_sdk_lambda::error::SdkError<
+                    aws_sdk_lambda::operation::get_policy::GetPolicyError,
+                >>()
+                .and_then(|sdk| sdk.as_service_error())
+                .is_some_and(|e| e.meta().code() == Some("AccessDeniedException"))
     }
 
     /// Every rule name this module owns: the `skyzen-{function}--` prefix is ours by
@@ -1944,15 +1958,18 @@ impl EventBridgeSchedules {
     /// Create one `[[schedule]]`'s rule, permission and target.
     async fn wire_one(
         &self,
-        events: &aws_sdk_eventbridge::Client,
-        lambda: &aws_sdk_lambda::Client,
-        qualified: &str,
-        arn: &str,
-        (partition, region, account): (&str, &str, &str),
+        ctx: &Ctx<'_>,
         entry: &ScheduleEntry,
         mutated: &mut bool,
         granted: &mut bool,
     ) -> Result<()> {
+        let (events, lambda, qualified, arn, (partition, region, account)) = (
+            ctx.events,
+            ctx.lambda,
+            ctx.qualified,
+            ctx.arn,
+            ctx.arn_parts,
+        );
         let rule = self.rule_name(entry.name.as_str());
         anyhow::ensure!(
             rule.len() <= 64,

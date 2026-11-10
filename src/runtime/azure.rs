@@ -254,6 +254,13 @@ impl<E, C, S> FunctionsHost<E, C, S> {
 /// an envelope means this handler was reached directly — the forwarding mode or a developer
 /// on the host's port — and the request passes through untouched.
 async fn forwarded_request(request: &mut Request) -> Option<Request> {
+    // The host serializes its `HttpRequest` with the .NET property names: `Body`, `Method`,
+    // `Url`, `Headers`. The lowercase spellings are read as well so a host version that
+    // differs does not silently empty the request.
+    fn field<'a>(req: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+        req.get(name)
+            .or_else(|| req.get(name.to_ascii_lowercase().as_str()))
+    }
     if request.method() != Method::POST {
         return None;
     }
@@ -267,14 +274,6 @@ async fn forwarded_request(request: &mut Request) -> Option<Request> {
         *request.body_mut() = Body::from(body.to_vec());
         return None;
     };
-
-    // The host serializes its `HttpRequest` with the .NET property names: `Body`, `Method`,
-    // `Url`, `Headers`. The lowercase spellings are read as well so a host version that
-    // differs does not silently empty the request.
-    fn field<'a>(req: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
-        req.get(name)
-            .or_else(|| req.get(name.to_ascii_lowercase().as_str()))
-    }
 
     let mut forwarded = Request::new(Body::from(
         field(&req, "Body")
@@ -333,7 +332,7 @@ fn base64(bytes: &[u8]) -> String {
             .into_iter()
             .enumerate()
         {
-            if i >= chunk.len() + 1 {
+            if i > chunk.len() {
                 encoded.push('=');
             } else {
                 encoded.push(ALPHABET[index as usize] as char);
@@ -442,7 +441,7 @@ fn is_invocation(body: &[u8], binding: &str) -> bool {
 impl Trigger {
     /// The `Data` key an invocation for this trigger always carries — `message` for a queue
     /// trigger, `timer` for a timer trigger.
-    fn binding(&self) -> &'static str {
+    const fn binding(&self) -> &'static str {
         match self {
             Self::Queue(_) => "message",
             Self::Scheduled(_) => "timer",

@@ -3051,7 +3051,7 @@ mod tests {
                 peer_addr: stream.peer_addr().ok(),
                 stream,
             });
-            super::serve_connections(SmolGlobal, TlsEndpoint, (), incoming, None).await
+            super::serve_connections(SmolGlobal, TlsEndpoint, (), (), incoming, None, false).await
         });
 
         // Every permit taken by an h2c connection idling after its preface.

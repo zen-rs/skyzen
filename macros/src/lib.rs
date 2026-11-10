@@ -743,7 +743,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     );
     schema_collector_idents.push(response_collector_ident.clone());
 
-    let response_schema_fn =
+    let response_schema_fn = {
         if let Some((payload_ty, content_type)) = documented_response_payload(&response_ty)? {
             let content_type_lit = LitStr::new(content_type, fn_ident.span());
             assertions.push(quote! { let _ = ::skyzen::openapi::schema_of::<#payload_ty>; });
@@ -782,7 +782,6 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                 ::skyzen::openapi::register_schema_for::<#payload_ty>(schemas);
             }
         });
-            quote! { Some(#response_schema_ident) }
         } else {
             let response_assert =
                 quote! { let _ = ::skyzen::openapi::responder_schemas_of::<#response_ty>; };
@@ -803,8 +802,9 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                     Some(responses)
                 }
             });
-            quote! { Some(#response_schema_ident) }
-        };
+        }
+        quote! { Some(#response_schema_ident) }
+    };
 
     let schema_collectors = if schema_collector_idents.is_empty() {
         quote! { &[] }

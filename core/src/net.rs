@@ -198,10 +198,19 @@ pub fn error_response(error: &dyn HttpError) -> Response {
                 .map(|details| details.0.clone())
         })
         .flatten();
-    let (payload, content_type) = match details {
+    let (payload, content_type) = details.map_or_else(
+        || {
+            (
+                serde_json::to_vec(&ErrorBody {
+                    error: &body_message,
+                })
+                .unwrap_or_else(|_| br#"{"error":"Internal server error"}"#.to_vec()),
+                "application/json",
+            )
+        },
         // An error that published machine-readable detail gets the RFC 9457 problem
         // document; the detail object's members merge in as extensions.
-        Some(mut details) => {
+        |mut details| {
             let mut problem = serde_json::json!({
                 "type": "about:blank",
                 "title": status.canonical_reason(),
@@ -217,15 +226,8 @@ pub fn error_response(error: &dyn HttpError) -> Response {
                 serde_json::to_vec(&problem).unwrap_or_else(|_| br#"{"title":"error"}"#.to_vec()),
                 "application/problem+json",
             )
-        }
-        None => (
-            serde_json::to_vec(&ErrorBody {
-                error: &body_message,
-            })
-            .unwrap_or_else(|_| br#"{"error":"Internal server error"}"#.to_vec()),
-            "application/json",
-        ),
-    };
+        },
+    );
 
     let mut response = Response::new(Body::from(payload));
     *response.status_mut() = status;

@@ -221,7 +221,7 @@ pub trait KeyValueStore: Send + Sync + Clone + 'static {
     /// a plain [`increment`](KeyValueStore::increment) + [`expire`](KeyValueStore::expire)
     /// cannot promise: a failure between the two leaves a TTL-less record behind forever.
     /// Backends with a native atomic form implement it natively — a Cosmos create carrying
-    /// the TTL field, Redis `INCR` + `PEXPIRE` in one script, DynamoDB's `UpdateItem`
+    /// the TTL field, Redis `INCR` + `PEXPIRE` in one script, `DynamoDB`'s `UpdateItem`
     /// writing the TTL attribute in the same expression — and every other backend answers
     /// [`KvError::Unsupported`] rather than silently degrading to the non-atomic pair.
     ///
