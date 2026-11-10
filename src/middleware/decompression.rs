@@ -13,30 +13,24 @@
 //! is also what stops a compression bomb.
 
 use std::{
-    collections::VecDeque,
     error::Error as StdError,
-    fmt::{self, Debug, Display},
-    io::{self, Read},
-    mem,
-    pin::Pin,
-    task::{Context, Poll},
+    fmt::{self, Display},
 };
 
-use futures_core::Stream;
+#[cfg(feature = "decompress")]
+use http::header::CONTENT_LENGTH;
+
 use http::{
-    header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH},
+    header::{ACCEPT_ENCODING, CONTENT_ENCODING},
     HeaderValue, StatusCode,
 };
-use http_kit::{utils::Bytes, Body, BodyError, DataStream, HttpError, Request, Response};
+use http_kit::{HttpError, Request, Response};
 use skyzen_core::{
     error_response,
     middleware::{Middleware, Next},
     Error,
 };
 use smallvec::SmallVec;
-
-/// Bytes written per `read` on the decoding stream.
-const DECODE_CHUNK: usize = 8 * 1024;
 
 /// Middleware that decodes `Content-Encoding` request bodies.
 ///
@@ -69,6 +63,7 @@ impl DecompressionMiddleware {
         self
     }
 
+    #[cfg(feature = "decompress")]
     fn accepts(&self, encoding: DecompressionEncoding) -> bool {
         self.encodings.contains(&encoding)
     }
@@ -91,52 +86,61 @@ impl DecompressionMiddleware {
         response
     }
 
-    /// Rewrite `request`'s body into its decoded form, or produce the `415` that answers it.
-    ///
-    /// A `Content-Encoding` list is undone in reverse declaration order, matching RFC 9110's
-    /// "listed in the order they were applied". `identity` entries are no-ops. `Some` is an
-    /// early refusal; `None` means the chain should run.
-    fn decode_request(&self, request: &mut Request) -> Option<Response> {
-        let mut codings: SmallVec<[(String, Coding); 4]> = SmallVec::new();
-        for value in request.headers().get_all(CONTENT_ENCODING) {
-            let Ok(raw) = value.to_str() else { continue };
-            for part in raw.split(',') {
-                let token = part.trim();
-                if !token.is_empty() {
-                    codings.push((token.to_owned(), parse_coding(token)));
-                }
-            }
-        }
-        if codings.is_empty() {
-            return None;
-        }
-
-        let mut decoders = SmallVec::<[DecompressionEncoding; 4]>::new();
-        for (token, coding) in &codings {
-            match coding {
-                Coding::Identity => {}
-                Coding::Encoding(encoding) if self.accepts(*encoding) => {
-                    decoders.push(*encoding);
-                }
-                Coding::Encoding(_) | Coding::Other => {
-                    return Some(self.unsupported(token));
-                }
-            }
-        }
-        if decoders.is_empty() {
-            return None;
-        }
-
-        let mut body = mem::take(request.body_mut());
-        for encoding in decoders.iter().rev() {
-            body = wrap_body(body, *encoding);
-        }
-        *request.body_mut() = body;
-        // The decoded stream carries neither its coding nor a length that still means anything.
-        request.headers_mut().remove(CONTENT_ENCODING);
-        request.headers_mut().remove(CONTENT_LENGTH);
-        None
+    /// The `415` answering the first coding in `codings` this instance cannot decode.
+    fn refusal(&self, codings: &[(String, Coding)]) -> Option<Response> {
+        codings
+            .iter()
+            .find(|(_, coding)| match *coding {
+                Coding::Identity => false,
+                #[cfg(feature = "decompress")]
+                Coding::Encoding(encoding) => !self.accepts(encoding),
+                Coding::Other => true,
+            })
+            .map(|(token, _)| self.unsupported(token))
     }
+}
+
+/// The `Content-Encoding` tokens of `request`, in declaration order.
+fn content_codings(request: &Request) -> SmallVec<[(String, Coding); 4]> {
+    let mut codings = SmallVec::new();
+    for value in request.headers().get_all(CONTENT_ENCODING) {
+        let Ok(raw) = value.to_str() else { continue };
+        for part in raw.split(',') {
+            let token = part.trim();
+            if !token.is_empty() {
+                codings.push((token.to_owned(), parse_coding(token)));
+            }
+        }
+    }
+    codings
+}
+
+/// Rewrite `request`'s body into its decoded form.
+///
+/// A `Content-Encoding` list is undone in reverse declaration order, matching RFC 9110's
+/// "listed in the order they were applied". `identity` entries are no-ops, and every other
+/// entry has already been approved by [`DecompressionMiddleware::refusal`].
+#[cfg(feature = "decompress")]
+fn decode_body(request: &mut Request, codings: &[(String, Coding)]) {
+    let decoders = codings
+        .iter()
+        .filter_map(|(_, coding)| match *coding {
+            Coding::Encoding(encoding) => Some(encoding),
+            Coding::Identity | Coding::Other => None,
+        })
+        .collect::<SmallVec<[DecompressionEncoding; 4]>>();
+    if decoders.is_empty() {
+        return;
+    }
+
+    let mut body = std::mem::take(request.body_mut());
+    for encoding in decoders.into_iter().rev() {
+        body = stream::wrap_body(body, encoding);
+    }
+    *request.body_mut() = body;
+    // The decoded stream carries neither its coding nor a length that still means anything.
+    request.headers_mut().remove(CONTENT_ENCODING);
+    request.headers_mut().remove(CONTENT_LENGTH);
 }
 
 impl Default for DecompressionMiddleware {
@@ -147,10 +151,13 @@ impl Default for DecompressionMiddleware {
 
 impl Middleware for DecompressionMiddleware {
     async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
-        match self.decode_request(request) {
-            Some(response) => Ok(response),
-            None => next.run(request).await,
+        let codings = content_codings(request);
+        if let Some(response) = self.refusal(&codings) {
+            return Ok(response);
         }
+        #[cfg(feature = "decompress")]
+        decode_body(request, &codings);
+        next.run(request).await
     }
 }
 
@@ -194,16 +201,16 @@ impl DecompressionEncoding {
 
 /// Every coding this build can decode, in wire order.
 fn compiled_encodings() -> SmallVec<[DecompressionEncoding; 4]> {
-    let mut encodings = SmallVec::new();
-    #[cfg(feature = "decompress-gzip")]
-    encodings.push(DecompressionEncoding::Gzip);
-    #[cfg(feature = "decompress-deflate")]
-    encodings.push(DecompressionEncoding::Deflate);
-    #[cfg(feature = "decompress-br")]
-    encodings.push(DecompressionEncoding::Brotli);
-    #[cfg(feature = "decompress-zstd")]
-    encodings.push(DecompressionEncoding::Zstd);
-    encodings
+    SmallVec::from_iter([
+        #[cfg(feature = "decompress-gzip")]
+        DecompressionEncoding::Gzip,
+        #[cfg(feature = "decompress-deflate")]
+        DecompressionEncoding::Deflate,
+        #[cfg(feature = "decompress-br")]
+        DecompressionEncoding::Brotli,
+        #[cfg(feature = "decompress-zstd")]
+        DecompressionEncoding::Zstd,
+    ])
 }
 
 /// What one `Content-Encoding` token resolves to in this build.
@@ -212,6 +219,7 @@ enum Coding {
     /// `identity`: explicitly no coding.
     Identity,
     /// A coding this build has a decoder for.
+    #[cfg(feature = "decompress")]
     Encoding(DecompressionEncoding),
     /// A token this build cannot decode, whether the feature was disabled or the name unknown.
     Other,
@@ -262,283 +270,312 @@ impl HttpError for UnsupportedContentEncoding {
     }
 }
 
-/// Wrap `body` in the decoder for `encoding`.
-///
-/// Only called for codings [`DecompressionMiddleware::accepts`] approved, so every arm is
-/// compiled in by construction.
-#[allow(unused_variables)] // `body` is unneeded only in a build with every codec feature off.
-fn wrap_body(body: Body, encoding: DecompressionEncoding) -> Body {
-    match encoding {
-        #[cfg(feature = "decompress-gzip")]
-        DecompressionEncoding::Gzip => Body::from_stream(DecodeStream::new(body, 0, |reader| {
-            Ok(flate2::read::GzDecoder::new(reader))
-        })),
-        #[cfg(feature = "decompress-deflate")]
-        DecompressionEncoding::Deflate => Body::from_stream(DecodeStream::new(body, 0, |reader| {
-            Ok(flate2::read::ZlibDecoder::new(reader))
-        })),
-        #[cfg(feature = "decompress-br")]
-        DecompressionEncoding::Brotli => Body::from_stream(DecodeStream::new(body, 0, |reader| {
-            Ok(brotli::Decompressor::new(reader, DECODE_CHUNK))
-        })),
-        #[cfg(feature = "decompress-zstd")]
-        DecompressionEncoding::Zstd => {
-            // ruzstd parses the frame header inside `new`, so the reader must already hold
-            // enough bytes: magic (4) + descriptor (1) + window descriptor (1) + dictionary
-            // id (4) + frame content size (8) = 18.
-            const ZSTD_HEADER_MAX: usize = 18;
-            Body::from_stream(DecodeStream::new(body, ZSTD_HEADER_MAX, |reader| {
-                ruzstd::decoding::StreamingDecoder::new(reader).map_err(io::Error::other)
-            }))
-        }
-    }
-}
+/// The streaming decoders. A build with no coding compiled in has nothing to decode with, so the
+/// whole machinery is absent from it.
+#[cfg(feature = "decompress")]
+mod stream {
+    use std::{
+        collections::VecDeque,
+        error::Error as StdError,
+        fmt::{self, Display},
+        io::{self, Read},
+        mem,
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
-/// A synchronous `io::Read` over the asynchronous request-body stream.
-///
-/// Decoders pull coded bytes through `read`; when the queue is drained but the stream is still
-/// open `read` reports [`BodyWouldBlock`], which [`DecodeStream`] catches on the way out to mean
-/// "poll the body for more" rather than "the body is corrupt".
-struct ChunkReader {
-    /// The body's data: a decoder needs bytes, so file regions are read out here.
-    body: DataStream,
-    queue: VecDeque<Bytes>,
-    /// Bytes queued across `queue`, so `poll_fill` can stop without summing.
-    buffered: usize,
-    /// The body stream is exhausted: `read` may still serve `queue`, then reports clean EOF.
-    done: bool,
-    /// A failure the body stream reported, surfaced once the queue has drained.
-    stream_error: Option<BodyError>,
-}
+    use futures_core::Stream;
+    use http_kit::{utils::Bytes, Body, BodyError, DataStream};
 
-impl ChunkReader {
-    const fn new(body: Body) -> Self {
-        Self {
-            body: body.into_data_stream(),
-            queue: VecDeque::new(),
-            buffered: 0,
-            done: false,
-            stream_error: None,
-        }
-    }
+    use super::DecompressionEncoding;
 
-    /// Poll the body until at least `target` bytes are queued or the stream ends.
-    fn poll_fill(&mut self, cx: &mut Context<'_>, target: usize) -> Poll<()> {
-        while self.buffered < target && !self.done {
-            match Pin::new(&mut self.body).poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => self.done = true,
-                Poll::Ready(Some(Ok(bytes))) => {
-                    self.buffered += bytes.len();
-                    self.queue.push_back(bytes);
-                }
-                Poll::Ready(Some(Err(error))) => {
-                    self.done = true;
-                    self.stream_error = Some(error);
-                }
+    /// Bytes written per `read` on the decoding stream.
+    pub(super) const DECODE_CHUNK: usize = 8 * 1024;
+
+    /// Wrap `body` in the decoder for `encoding`.
+    ///
+    /// Only called for codings [`DecompressionMiddleware::accepts`](super::DecompressionMiddleware)
+    /// approved, so every arm is compiled in by construction.
+    pub(super) fn wrap_body(body: Body, encoding: DecompressionEncoding) -> Body {
+        match encoding {
+            #[cfg(feature = "decompress-gzip")]
+            DecompressionEncoding::Gzip => {
+                Body::from_stream(DecodeStream::new(body, 0, |reader| {
+                    Ok(flate2::read::GzDecoder::new(reader))
+                }))
+            }
+            #[cfg(feature = "decompress-deflate")]
+            DecompressionEncoding::Deflate => {
+                Body::from_stream(DecodeStream::new(body, 0, |reader| {
+                    Ok(flate2::read::ZlibDecoder::new(reader))
+                }))
+            }
+            #[cfg(feature = "decompress-br")]
+            DecompressionEncoding::Brotli => {
+                Body::from_stream(DecodeStream::new(body, 0, |reader| {
+                    Ok(brotli::Decompressor::new(reader, DECODE_CHUNK))
+                }))
+            }
+            #[cfg(feature = "decompress-zstd")]
+            DecompressionEncoding::Zstd => {
+                // ruzstd parses the frame header inside `new`, so the reader must already hold
+                // enough bytes: magic (4) + descriptor (1) + window descriptor (1) + dictionary
+                // id (4) + frame content size (8) = 18.
+                const ZSTD_HEADER_MAX: usize = 18;
+                Body::from_stream(DecodeStream::new(body, ZSTD_HEADER_MAX, |reader| {
+                    ruzstd::decoding::StreamingDecoder::new(reader).map_err(io::Error::other)
+                }))
             }
         }
-        Poll::Ready(())
     }
-}
 
-/// Marker the [`ChunkReader`] embeds in an `io::Error` when its queue is empty and the body is
-/// still open. It rides inside the decoder's error chain — zstd's decoder wraps source errors
-/// several levels deep, so [`wants_more_input`] walks `source()` instead of trusting `kind()`.
-#[derive(Debug)]
-struct BodyWouldBlock;
-
-impl Display for BodyWouldBlock {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("request body is still streaming")
+    /// A synchronous `io::Read` over the asynchronous request-body stream.
+    ///
+    /// Decoders pull coded bytes through `read`; when the queue is drained but the stream is still
+    /// open `read` reports [`BodyWouldBlock`], which [`DecodeStream`] catches on the way out to mean
+    /// "poll the body for more" rather than "the body is corrupt".
+    struct ChunkReader {
+        /// The body's data: a decoder needs bytes, so file regions are read out here.
+        body: DataStream,
+        queue: VecDeque<Bytes>,
+        /// Bytes queued across `queue`, so `poll_fill` can stop without summing.
+        buffered: usize,
+        /// The body stream is exhausted: `read` may still serve `queue`, then reports clean EOF.
+        done: bool,
+        /// A failure the body stream reported, surfaced once the queue has drained.
+        stream_error: Option<BodyError>,
     }
-}
 
-impl StdError for BodyWouldBlock {}
+    impl ChunkReader {
+        const fn new(body: Body) -> Self {
+            Self {
+                body: body.into_data_stream(),
+                queue: VecDeque::new(),
+                buffered: 0,
+                done: false,
+                stream_error: None,
+            }
+        }
 
-/// A body-stream error packed for `io::Error` transport through a decoder.
-#[derive(Debug)]
-struct BodyIoError(BodyError);
-
-impl Display for BodyIoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Display::fmt(&self.0, f)
+        /// Poll the body until at least `target` bytes are queued or the stream ends.
+        fn poll_fill(&mut self, cx: &mut Context<'_>, target: usize) -> Poll<()> {
+            while self.buffered < target && !self.done {
+                match Pin::new(&mut self.body).poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => self.done = true,
+                    Poll::Ready(Some(Ok(bytes))) => {
+                        self.buffered += bytes.len();
+                        self.queue.push_back(bytes);
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        self.done = true;
+                        self.stream_error = Some(error);
+                    }
+                }
+            }
+            Poll::Ready(())
+        }
     }
-}
 
-impl StdError for BodyIoError {}
+    /// Marker the [`ChunkReader`] embeds in an `io::Error` when its queue is empty and the body is
+    /// still open. It rides inside the decoder's error chain — zstd's decoder wraps source errors
+    /// several levels deep, so [`wants_more_input`] walks `source()` instead of trusting `kind()`.
+    #[derive(Debug)]
+    struct BodyWouldBlock;
 
-/// Is `error` the decoder running out of input rather than a corrupt stream?
-///
-/// Two signals, because decoders differ: a decoder that propagates its source's `io::Error`
-/// keeps the `WouldBlock` kind; one that wraps it (zstd nests source errors several levels
-/// deep) still carries [`BodyWouldBlock`] somewhere in the `source()` chain.
-fn wants_more_input(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::WouldBlock {
-        return true;
+    impl Display for BodyWouldBlock {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("request body is still streaming")
+        }
     }
-    let mut current: &(dyn StdError + 'static) = error;
-    loop {
-        if current.downcast_ref::<BodyWouldBlock>().is_some() {
+
+    impl StdError for BodyWouldBlock {}
+
+    /// A body-stream error packed for `io::Error` transport through a decoder.
+    #[derive(Debug)]
+    struct BodyIoError(BodyError);
+
+    impl Display for BodyIoError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            Display::fmt(&self.0, f)
+        }
+    }
+
+    impl StdError for BodyIoError {}
+
+    /// Is `error` the decoder running out of input rather than a corrupt stream?
+    ///
+    /// Two signals, because decoders differ: a decoder that propagates its source's `io::Error`
+    /// keeps the `WouldBlock` kind; one that wraps it (zstd nests source errors several levels
+    /// deep) still carries [`BodyWouldBlock`] somewhere in the `source()` chain.
+    fn wants_more_input(error: &io::Error) -> bool {
+        if error.kind() == io::ErrorKind::WouldBlock {
             return true;
         }
-        match current.source() {
-            Some(source) => current = source,
-            None => return false,
-        }
-    }
-}
-
-impl Read for ChunkReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.queue.pop_front() {
-            Some(mut chunk) => {
-                let n = chunk.len().min(buf.len());
-                buf[..n].copy_from_slice(&chunk[..n]);
-                self.buffered -= n;
-                if n < chunk.len() {
-                    self.queue.push_front(chunk.split_off(n));
-                }
-                Ok(n)
-            }
-            None => {
-                if let Some(error) = self.stream_error.take() {
-                    Err(io::Error::other(BodyIoError(error)))
-                } else if self.done {
-                    Ok(0)
-                } else {
-                    Err(io::Error::new(io::ErrorKind::WouldBlock, BodyWouldBlock))
-                }
-            }
-        }
-    }
-}
-
-/// A decoder `Read`ing from a [`ChunkReader`] it owns, so [`DecodeStream`] can refill the source
-/// between calls through `get_mut`.
-trait StreamDecoder: Read {
-    /// The coded-input reader inside this decoder.
-    fn source_mut(&mut self) -> &mut ChunkReader;
-}
-
-#[cfg(feature = "decompress-gzip")]
-impl StreamDecoder for flate2::read::GzDecoder<ChunkReader> {
-    fn source_mut(&mut self) -> &mut ChunkReader {
-        self.get_mut()
-    }
-}
-
-#[cfg(feature = "decompress-deflate")]
-impl StreamDecoder for flate2::read::ZlibDecoder<ChunkReader> {
-    fn source_mut(&mut self) -> &mut ChunkReader {
-        self.get_mut()
-    }
-}
-
-#[cfg(feature = "decompress-br")]
-impl StreamDecoder for brotli::Decompressor<ChunkReader> {
-    fn source_mut(&mut self) -> &mut ChunkReader {
-        self.get_mut()
-    }
-}
-
-#[cfg(feature = "decompress-zstd")]
-impl StreamDecoder
-    for ruzstd::decoding::StreamingDecoder<ChunkReader, ruzstd::decoding::FrameDecoder>
-{
-    fn source_mut(&mut self) -> &mut ChunkReader {
-        self.get_mut()
-    }
-}
-
-/// The state of one [`DecodeStream`]: construction, streaming, or finished.
-enum DecodeState<D> {
-    /// `prefill` bytes are being accumulated for a constructor that parses a header eagerly.
-    Init(ChunkReader),
-    /// Decoding is underway.
-    Active(D),
-    /// Terminal: decoder EOF, failure, or construction failure already reported.
-    Done,
-}
-
-/// A `Stream` that drives a synchronous `io::Read` decoder off the asynchronous body.
-///
-/// `Body::from_stream` wraps it back into a [`Body`], so a decoded request body is
-/// indistinguishable from a plain one to everything downstream.
-struct DecodeStream<D> {
-    state: DecodeState<D>,
-    /// Build the decoder once `reader` holds `prefill` bytes (or the body ended).
-    make: fn(ChunkReader) -> io::Result<D>,
-    prefill: usize,
-    out: Vec<u8>,
-}
-
-impl<D: StreamDecoder> DecodeStream<D> {
-    fn new(body: Body, prefill: usize, make: fn(ChunkReader) -> io::Result<D>) -> Self {
-        Self {
-            state: DecodeState::Init(ChunkReader::new(body)),
-            make,
-            prefill,
-            out: vec![0; DECODE_CHUNK],
-        }
-    }
-
-    /// Fill the reader and run the constructor; `Some` carries a build failure to surface.
-    fn init(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Error>> {
-        let DecodeState::Init(reader) = &mut self.state else {
-            unreachable!("init outside Init state");
-        };
-        match reader.poll_fill(cx, self.prefill) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(()) => {
-                let DecodeState::Init(reader) = mem::replace(&mut self.state, DecodeState::Done)
-                else {
-                    unreachable!("state changed inside init");
-                };
-                Poll::Ready(match (self.make)(reader) {
-                    Ok(decoder) => {
-                        self.state = DecodeState::Active(decoder);
-                        None
-                    }
-                    Err(error) => Some(error),
-                })
-            }
-        }
-    }
-}
-
-impl<D: StreamDecoder + Unpin> Stream for DecodeStream<D> {
-    type Item = Result<Bytes, io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.as_mut().get_mut();
+        let mut current: &(dyn StdError + 'static) = error;
         loop {
-            match &mut this.state {
-                DecodeState::Init(_) => match this.init(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Some(error)) => return Poll::Ready(Some(Err(error))),
-                    Poll::Ready(None) => {}
-                },
-                DecodeState::Active(decoder) => match decoder.read(&mut this.out) {
-                    Ok(0) => {
-                        this.state = DecodeState::Done;
-                        return Poll::Ready(None);
+            if current.downcast_ref::<BodyWouldBlock>().is_some() {
+                return true;
+            }
+            match current.source() {
+                Some(source) => current = source,
+                None => return false,
+            }
+        }
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.queue.pop_front() {
+                Some(mut chunk) => {
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    self.buffered -= n;
+                    if n < chunk.len() {
+                        self.queue.push_front(chunk.split_off(n));
                     }
-                    Ok(n) => {
-                        return Poll::Ready(Some(Ok(Bytes::copy_from_slice(&this.out[..n]))));
+                    Ok(n)
+                }
+                None => {
+                    if let Some(error) = self.stream_error.take() {
+                        Err(io::Error::other(BodyIoError(error)))
+                    } else if self.done {
+                        Ok(0)
+                    } else {
+                        Err(io::Error::new(io::ErrorKind::WouldBlock, BodyWouldBlock))
                     }
-                    Err(error) if wants_more_input(&error) => {
-                        match decoder.source_mut().poll_fill(cx, 1) {
-                            Poll::Pending => return Poll::Pending,
-                            Poll::Ready(()) => {}
+                }
+            }
+        }
+    }
+
+    /// A decoder `Read`ing from a [`ChunkReader`] it owns, so [`DecodeStream`] can refill the source
+    /// between calls through `get_mut`.
+    trait StreamDecoder: Read {
+        /// The coded-input reader inside this decoder.
+        fn source_mut(&mut self) -> &mut ChunkReader;
+    }
+
+    #[cfg(feature = "decompress-gzip")]
+    impl StreamDecoder for flate2::read::GzDecoder<ChunkReader> {
+        fn source_mut(&mut self) -> &mut ChunkReader {
+            self.get_mut()
+        }
+    }
+
+    #[cfg(feature = "decompress-deflate")]
+    impl StreamDecoder for flate2::read::ZlibDecoder<ChunkReader> {
+        fn source_mut(&mut self) -> &mut ChunkReader {
+            self.get_mut()
+        }
+    }
+
+    #[cfg(feature = "decompress-br")]
+    impl StreamDecoder for brotli::Decompressor<ChunkReader> {
+        fn source_mut(&mut self) -> &mut ChunkReader {
+            self.get_mut()
+        }
+    }
+
+    #[cfg(feature = "decompress-zstd")]
+    impl StreamDecoder
+        for ruzstd::decoding::StreamingDecoder<ChunkReader, ruzstd::decoding::FrameDecoder>
+    {
+        fn source_mut(&mut self) -> &mut ChunkReader {
+            self.get_mut()
+        }
+    }
+
+    /// The state of one [`DecodeStream`]: construction, streaming, or finished.
+    enum DecodeState<D> {
+        /// `prefill` bytes are being accumulated for a constructor that parses a header eagerly.
+        Init(ChunkReader),
+        /// Decoding is underway.
+        Active(D),
+        /// Terminal: decoder EOF, failure, or construction failure already reported.
+        Done,
+    }
+
+    /// A `Stream` that drives a synchronous `io::Read` decoder off the asynchronous body.
+    ///
+    /// `Body::from_stream` wraps it back into a [`Body`], so a decoded request body is
+    /// indistinguishable from a plain one to everything downstream.
+    struct DecodeStream<D> {
+        state: DecodeState<D>,
+        /// Build the decoder once `reader` holds `prefill` bytes (or the body ended).
+        make: fn(ChunkReader) -> io::Result<D>,
+        prefill: usize,
+        out: Vec<u8>,
+    }
+
+    impl<D: StreamDecoder> DecodeStream<D> {
+        fn new(body: Body, prefill: usize, make: fn(ChunkReader) -> io::Result<D>) -> Self {
+            Self {
+                state: DecodeState::Init(ChunkReader::new(body)),
+                make,
+                prefill,
+                out: vec![0; DECODE_CHUNK],
+            }
+        }
+
+        /// Fill the reader and run the constructor; `Some` carries a build failure to surface.
+        fn init(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Error>> {
+            let DecodeState::Init(reader) = &mut self.state else {
+                unreachable!("init outside Init state");
+            };
+            match reader.poll_fill(cx, self.prefill) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    let DecodeState::Init(reader) =
+                        mem::replace(&mut self.state, DecodeState::Done)
+                    else {
+                        unreachable!("state changed inside init");
+                    };
+                    Poll::Ready(match (self.make)(reader) {
+                        Ok(decoder) => {
+                            self.state = DecodeState::Active(decoder);
+                            None
                         }
-                    }
-                    Err(error) => {
-                        this.state = DecodeState::Done;
-                        return Poll::Ready(Some(Err(error)));
-                    }
-                },
-                DecodeState::Done => return Poll::Ready(None),
+                        Err(error) => Some(error),
+                    })
+                }
+            }
+        }
+    }
+
+    impl<D: StreamDecoder + Unpin> Stream for DecodeStream<D> {
+        type Item = Result<Bytes, io::Error>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.as_mut().get_mut();
+            loop {
+                match &mut this.state {
+                    DecodeState::Init(_) => match this.init(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Some(error)) => return Poll::Ready(Some(Err(error))),
+                        Poll::Ready(None) => {}
+                    },
+                    DecodeState::Active(decoder) => match decoder.read(&mut this.out) {
+                        Ok(0) => {
+                            this.state = DecodeState::Done;
+                            return Poll::Ready(None);
+                        }
+                        Ok(n) => {
+                            return Poll::Ready(Some(Ok(Bytes::copy_from_slice(&this.out[..n]))));
+                        }
+                        Err(error) if wants_more_input(&error) => {
+                            match decoder.source_mut().poll_fill(cx, 1) {
+                                Poll::Pending => return Poll::Pending,
+                                Poll::Ready(()) => {}
+                            }
+                        }
+                        Err(error) => {
+                            this.state = DecodeState::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    },
+                    DecodeState::Done => return Poll::Ready(None),
+                }
             }
         }
     }
@@ -546,11 +583,18 @@ impl<D: StreamDecoder + Unpin> Stream for DecodeStream<D> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "decompress-br")]
+    use super::stream::DECODE_CHUNK;
     use super::*;
     use crate::middleware::apply;
     use core::future::Future;
-    use http_kit::Endpoint;
-    use std::{convert::Infallible, io::Write};
+    use http::header::CONTENT_LENGTH;
+    use http_kit::{Body, Endpoint};
+    #[cfg(feature = "decompress-br")]
+    use std::io::Read;
+    use std::{convert::Infallible, io::Write, mem};
+    #[cfg(feature = "decompress-gzip")]
+    use {http_kit::utils::Bytes, std::io};
 
     const PLAIN: &str = "Hello from the compressed side!";
 

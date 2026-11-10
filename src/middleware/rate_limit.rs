@@ -364,7 +364,7 @@ fn encode_key_component(key: &str) -> String {
 fn now_ms() -> u64 {
     #[cfg(target_arch = "wasm32")]
     {
-        js_sys::Date::now() as u64
+        super::js_millis(js_sys::Date::now())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

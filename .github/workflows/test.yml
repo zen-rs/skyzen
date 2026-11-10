@@ -78,6 +78,28 @@ jobs:
       - name: Check WASM build (with ws)
         run: cargo check -p skyzen --target wasm32-unknown-unknown --no-default-features --features json,ws
 
+  wasm-clippy:
+    name: WASM Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-wasm
+          # Only dev pushes save (see ci.yml); other runs restore the
+          # default-branch entry without writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
+
+      - name: Clippy skyzen-cloudflare (wasm32)
+        run: cargo clippy -p skyzen-cloudflare --target wasm32-unknown-unknown -- -D warnings
+
   wasm-workerd:
     name: WASM (workerd)
     runs-on: ubuntu-latest
