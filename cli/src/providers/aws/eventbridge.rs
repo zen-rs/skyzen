@@ -390,46 +390,53 @@ impl Task for MigrateSchedulesToAlias {
                 alias_arn: &alias_arn,
                 arn_parts: (partition, region, account),
             };
-            if let Err(error) = self
+            let verified = match self
                 .inner
                 .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
                 .await
             {
-                // The code already swapped — restoring legacy invocation would fire new code
-                // on the old configuration. Reconciliation's own rollback puts the rules
-                // back to their post-migration state (disabled, alias-targeted, old version).
-                // Then the rules that were enabled before migration get that state back
-                // too — the alias still serves the working version, so they can run again
-                // without ever touching the unqualified function.
-                let restored = self
-                    .inner
-                    .rollback_reconcile(&ctx, &snapshot, alias.as_deref())
-                    .await;
-                // A rule is re-enabled only if its targets, grant and state actually came
-                // back — `None` means the alias repoint failed and nothing is safe to fire.
-                if let Some(restored) = restored {
-                    // A rule reconcile never reached was never snapshotted — it's already in
-                    // its safe post-migration state (disabled, alias-targeted, old version)
-                    // and gets its enabled state back too.
-                    for entry in &migrated {
-                        let untouched = !snapshot.iter().any(|taken| taken.name == entry.rule);
-                        if entry.enabled && (untouched || restored.contains(&entry.rule)) {
-                            if let Err(restore) =
-                                events.enable_rule().name(&entry.rule).send().await
-                            {
-                                output::warn(format!(
-                                    "could not re-enable migrated rule `{}`: {restore}",
-                                    entry.rule
-                                ));
+                Ok(verified) => verified,
+                Err(error) => {
+                    // The code already swapped — restoring legacy invocation would fire new code
+                    // on the old configuration. Reconciliation's own rollback puts the rules
+                    // back to their post-migration state (disabled, alias-targeted, old version).
+                    // Then the rules that were enabled before migration get that state back
+                    // too — the alias still serves the working version, so they can run again
+                    // without ever touching the unqualified function.
+                    let restored = self
+                        .inner
+                        .rollback_reconcile(&ctx, &snapshot, alias.as_deref())
+                        .await;
+                    // A rule is re-enabled only if its targets, grant and state actually came
+                    // back — `None` means the alias repoint failed and nothing is safe to fire.
+                    if let Some(restored) = restored {
+                        // A rule reconcile never reached was never snapshotted — it's already in
+                        // its safe post-migration state (disabled, alias-targeted, old version)
+                        // and gets its enabled state back too.
+                        for entry in &migrated {
+                            let untouched = !snapshot.iter().any(|taken| taken.name == entry.rule);
+                            if entry.enabled && (untouched || restored.contains(&entry.rule)) {
+                                if let Err(restore) =
+                                    events.enable_rule().name(&entry.rule).send().await
+                                {
+                                    output::warn(format!(
+                                        "could not re-enable migrated rule `{}`: {restore}",
+                                        entry.rule
+                                    ));
+                                }
                             }
                         }
                     }
+                    return Err(error);
                 }
-                return Err(error);
-            }
+            };
             // Reconcile verified the state it found — stamp it so the next deploy reads
-            // the record rather than re-enumerating.
-            self.inner.stamp_tag(&lambda, &arn).await;
+            // the record rather than re-enumerating. An unverified alias state stays
+            // unstamped: `none` asserted over a denied lookup would authorize skipping
+            // discovery over an alias that may exist.
+            if verified {
+                self.inner.stamp_tag(&lambda, &arn).await;
+            }
             Ok(())
         })?
     }
@@ -737,20 +744,27 @@ impl Task for EventBridgeSchedules {
             if !self.schedules.is_empty() {
                 self.clear_tag(&lambda, ctx.arn).await?;
             }
-            let result = self
+            let verified = match self
                 .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
-                .await;
-            if let Err(error) = result {
-                // The alias goes back first: rules re-enabled by the restore below must
-                // find the old version behind them, or the rollback itself wakes a stale
-                // cron on new code.
-                self.rollback_reconcile(&ctx, &snapshot, alias.as_deref())
-                    .await;
-                return Err(error);
-            }
+                .await
+            {
+                Ok(verified) => verified,
+                Err(error) => {
+                    // The alias goes back first: rules re-enabled by the restore below
+                    // must find the old version behind them, or the rollback itself
+                    // wakes a stale cron on new code.
+                    self.rollback_reconcile(&ctx, &snapshot, alias.as_deref())
+                        .await;
+                    return Err(error);
+                }
+            };
             // Reconcile verified the state it found — stamp it so the next deploy
-            // reads the record rather than re-enumerating.
-            self.stamp_tag(&lambda, ctx.arn).await;
+            // reads the record rather than re-enumerating. An unverified alias state
+            // stays unstamped: `none` asserted over a denied lookup would authorize
+            // skipping discovery over an alias that may exist.
+            if verified {
+                self.stamp_tag(&lambda, ctx.arn).await;
+            }
             Ok(())
         })?
     }
@@ -768,7 +782,7 @@ impl EventBridgeSchedules {
         snapshot: &mut Vec<RuleSnapshot>,
         alias: &mut Option<String>,
         tolerant: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (events, lambda) = (ctx.events, ctx.lambda);
         if !self.delivery.is_empty() {
             super::lambda_env::LambdaEnvironment::new(
@@ -802,14 +816,15 @@ impl EventBridgeSchedules {
             // an orphan alias survives rule retirement, and `tolerant` buys a denied
             // `GetAlias`, not a skipped lookup.
             match self.alias_snapshot(lambda).await {
-                Ok(None) => return Ok(()),
+                Ok(None) => return Ok(true),
                 Ok(Some(_)) => {}
                 // Verified-no-rules tolerates a permanently denied read — never a
-                // transient one: stamping `none` over an alias that may exist records
-                // an absence that was never confirmed.
+                // transient one. The deploy may proceed, but `false` tells the caller
+                // the alias state was never confirmed: stamping `none` over a lookup
+                // that could not see the alias records an absence nobody verified.
                 Err(error) if tolerant && Self::alias_read_denied(&error) => {
                     output::warn(format!("could not check the `{ALIAS}` alias: {error:#}"));
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(error) => return Err(error),
             }
@@ -837,7 +852,7 @@ impl EventBridgeSchedules {
                     })
                 }
             }
-            return Ok(());
+            return Ok(true);
         }
 
         let version = self.publish_or_reuse(lambda).await?;
@@ -892,7 +907,7 @@ impl EventBridgeSchedules {
                 .await
                 .with_context(|| format!("failed to enable EventBridge rule `{rule}`"))?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// What a rule looked like before this deploy touched it, or `None` when it does not
