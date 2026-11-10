@@ -314,10 +314,9 @@ where
     let peer = request
         .extensions()
         .get::<http_kit_h3::ConnectionInfo>()
-        .map(http_kit_h3::ConnectionInfo::peer_addr);
-    if let Some(peer) = peer {
-        request.extensions_mut().insert(PeerAddr::new(peer));
-    }
+        .expect("http-kit-h3 attaches a ConnectionInfo to every request")
+        .peer_addr();
+    request.extensions_mut().insert(PeerAddr::new(peer));
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
 
