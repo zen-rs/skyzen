@@ -25,23 +25,28 @@ Enable the `hyper` feature on the `skyzen` crate:
 skyzen = { version = "0.1", features = ["hyper"] }
 ```
 
-Then use `Hyper.serve()` with your own executor and TCP listener:
+Then use `Hyper.serve()` with an `http-kit-io` backend, a listener registered with it, a
+thread-local executor and a shutdown signal. The endpoint never leaves the thread that serves it,
+so it may be `!Send`:
 
 ```rust
-use skyzen_hyper::Hyper;
+use http_kit_io::{async_io::AsyncIo, Io};
 use skyzen_core::Server;
+use skyzen_hyper::Hyper;
+use std::rc::Rc;
 
-async fn run() {
-    let endpoint = my_router().build();
-    let executor = MyExecutor::new();
-    let connections = my_tcp_listener();
-
-    Hyper.serve(
-        executor,
-        |error| eprintln!("Connection error: {error}"),
-        connections,
-        endpoint,
-    ).await;
+fn run(listener: std::net::TcpListener) -> std::io::Result<()> {
+    let executor = Rc::new(async_executor::LocalExecutor::new());
+    let listener = AsyncIo.tcp_listener(listener)?;
+    let serve = Hyper.serve(
+        AsyncIo,
+        Rc::clone(&executor),
+        listener,
+        my_router().build(),
+        shutdown_signal(),
+    );
+    futures_lite::future::block_on(executor.run(serve));
+    Ok(())
 }
 ```
 
