@@ -272,33 +272,44 @@ where
             let alarm_state = Arc::clone(&alarm_state);
             let generation = Arc::clone(&generation);
 
+            // The wait and the handler both run on one compio runtime: the delay is the
+            // runtime's timer, so nothing blocks a thread in `thread::sleep`.
             std::thread::spawn(move || {
-                let now = current_unix_ms();
-                if scheduled_time_ms > now {
-                    let delta = u64::try_from(scheduled_time_ms - now).unwrap_or(0);
-                    std::thread::sleep(std::time::Duration::from_millis(delta));
-                }
-
-                // A newer `set_alarm`/`delete_alarm` supersedes this timer.
-                if generation.load(Ordering::SeqCst) != expected_generation {
-                    return;
-                }
-                // Clear the stored alarm before dispatch (platform semantics: a fired alarm
-                // no longer shows up via `get_alarm`).
-                {
-                    let Ok(mut stored) = alarm_state.write() else {
-                        return;
-                    };
-                    if stored.take().is_none() {
+                let runtime = match executor_core::compio::Runtime::new() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::error!(%error, "no runtime to run the native durable alarm on");
                         return;
                     }
-                }
+                };
+                runtime.block_on(async move {
+                    let now = current_unix_ms();
+                    if scheduled_time_ms > now {
+                        let delta = u64::try_from(scheduled_time_ms - now).unwrap_or(0);
+                        compio::time::sleep(std::time::Duration::from_millis(delta)).await;
+                    }
 
-                let Some(inner) = weak.upgrade() else { return };
-                let namespace = Self { inner };
-                if let Err(error) = smol::block_on(namespace.alarm(&object_id)) {
-                    tracing::error!(%error, "native durable alarm handler failed");
-                }
+                    // A newer `set_alarm`/`delete_alarm` supersedes this timer.
+                    if generation.load(Ordering::SeqCst) != expected_generation {
+                        return;
+                    }
+                    // Clear the stored alarm before dispatch (platform semantics: a fired
+                    // alarm no longer shows up via `get_alarm`).
+                    {
+                        let Ok(mut stored) = alarm_state.write() else {
+                            return;
+                        };
+                        if stored.take().is_none() {
+                            return;
+                        }
+                    }
+
+                    let Some(inner) = weak.upgrade() else { return };
+                    let namespace = Self { inner };
+                    if let Err(error) = namespace.alarm(&object_id).await {
+                        tracing::error!(%error, "native durable alarm handler failed");
+                    }
+                });
             });
         }));
     }

@@ -131,7 +131,7 @@ build **reads its environment before it binds anything** and hands over accordin
 
 | Target | Selected by | What runs |
 |---|---|---|
-| Native server | nothing else matched | Hyper connections on the serving thread's local executor (smol reactor), the router built there from the factory, a `tracing` subscriber, `--port`/`--host`/`--listen`, `Ctrl+C` shutdown |
+| Native server | nothing else matched | One compio runtime per core (`available_parallelism`), each with its own listener (`SO_REUSEPORT` on Linux, one shared socket elsewhere) and its own router built from the factory on that thread, HTTP/1.1 through `skyzen-h1`; a `tracing` subscriber, `--port`/`--host`/`--listen` (`unix:` served by the same threads), `Ctrl+C` fanned out to every thread. Cleartext is `skyzen-h1` unless `--server hyper`/`SKYZEN_SERVER=hyper` picks Hyper (h2c; not on `unix:`); with `server-tls`, TLS is always Hyper with ALPN choosing h1/h2, via rustls over the compio `IntoPoll` bridge until #182 |
 | AWS Lambda | `AWS_LAMBDA_RUNTIME_API` is set | `skyzen-lambda` (root crate's `lambda` feature). Without the feature the binary **refuses to start** and names it, rather than binding a port nothing in Lambda can reach |
 | Azure Functions | `FUNCTIONS_CUSTOMHANDLER_PORT` is set | `src/runtime/azure.rs` mounts the declared `[[azure.queue_triggers]]` in front of the router; HTTP triggers reach the router untouched |
 | Cloudflare Workers | `target_arch = "wasm32"` | the WinterCG `fetch` export, plus whatever the manifest implies |

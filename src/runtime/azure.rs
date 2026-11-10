@@ -116,6 +116,26 @@ where
     E: Endpoint + ServedRoutes + Clone + 'static,
     C: ConsumerSet,
 {
+    mount_shared(endpoint, Arc::new(consumers), triggers)
+}
+
+/// [`mount`] over a consumer set that is already shared.
+///
+/// The thread-per-core runtime mounts one endpoint per serving thread, and every one of them
+/// reaches the application's single queue handler through the same set.
+///
+/// # Errors
+///
+/// The same as [`mount`].
+pub fn mount_shared<E, C>(
+    endpoint: E,
+    consumers: Arc<C>,
+    triggers: &'static [QueueTrigger],
+) -> Result<FunctionsHost<E, C>, MountError>
+where
+    E: Endpoint + ServedRoutes + Clone + 'static,
+    C: ConsumerSet,
+{
     let mut seen = BTreeMap::new();
     for trigger in triggers {
         if !C::DECLARES_HANDLER {
@@ -139,7 +159,7 @@ where
 
     Ok(FunctionsHost {
         endpoint,
-        consumers: Arc::new(consumers),
+        consumers,
         triggers,
     })
 }

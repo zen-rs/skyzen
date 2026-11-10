@@ -78,6 +78,11 @@ impl Endpoint for CountingEndpoint {
 
 /// Serve `H1` on a thread of its own, the endpoint built on that thread.
 fn start_server() -> SocketAddr {
+    start_server_with(H1::default())
+}
+
+/// [`start_server`] with `server`'s settings.
+fn start_server_with(server: H1) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("local addr");
 
@@ -87,7 +92,6 @@ fn start_server() -> SocketAddr {
         let endpoint = CountingEndpoint {
             served: Rc::new(Cell::new(0)),
         };
-        let server = H1::default();
         let serve = server.serve(
             AsyncIo,
             Rc::clone(&executor),
@@ -183,6 +187,47 @@ fn the_completion_driver_serves_the_same_endpoint() {
         let (_, second) = get(addr, "/count").await;
         assert_eq!(first, b"1");
         assert_eq!(second, b"2");
+    });
+}
+
+#[test]
+fn a_connection_past_the_limit_is_closed_and_a_freed_slot_is_served_again() {
+    let addr = start_server_with(H1::default().with_max_connections(1.try_into().unwrap()));
+    smol::block_on(async {
+        // The one slot, held by a connection that has sent nothing yet.
+        let holder = TcpStream::connect(addr).await.expect("connect");
+
+        // Past the limit the server closes the socket without reading it. Whether the holder was
+        // accepted before this one is a race, so probe until the refusal is observed.
+        let mut refused = false;
+        for _ in 0..32 {
+            let mut probe = TcpStream::connect(addr).await.expect("connect");
+            let _ = probe
+                .write_all(b"GET /count HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await;
+            let mut buf = Vec::new();
+            if matches!(probe.read_to_end(&mut buf).await, Ok(0) | Err(_)) {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "a full server must close the connection");
+
+        // The slot comes back once its holder is gone.
+        drop(holder);
+        let mut served = false;
+        for _ in 0..32 {
+            let mut conn = TcpStream::connect(addr).await.expect("connect");
+            let _ = conn
+                .write_all(b"GET /count HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await;
+            let mut raw = Vec::new();
+            if conn.read_to_end(&mut raw).await.is_ok() && raw.starts_with(b"HTTP/1.1 200") {
+                served = true;
+                break;
+            }
+        }
+        assert!(served, "a freed slot must accept again");
     });
 }
 

@@ -6,7 +6,7 @@
 //! in-process fakes from `skyzen-test` in a plain `cargo test`, with no sockets and no emulator.
 //! Those types live in [`skyzen_services`](https://docs.rs/skyzen-services).
 //!
-//! The HTTP layer is portable in the same way: one `#[skyzen::main]` serves a native Tokio/Hyper
+//! The HTTP layer is portable in the same way: one `#[skyzen::main]` serves a native thread-per-core
 //! server, an AWS Lambda, an Azure Functions custom handler, and a Cloudflare Worker, chosen by
 //! what the process finds in its environment rather than by anything in the application.
 //!

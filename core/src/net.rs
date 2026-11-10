@@ -52,6 +52,29 @@ impl PeerAddr {
     }
 }
 
+/// The peer address an `http-kit-io` [`Listener`](http_kit_io::Listener) reports, as the socket
+/// address a request's [`PeerAddr`] carries.
+///
+/// A TCP peer has one. A unix-domain peer is a path, or nothing, and has none: requests on its
+/// connections carry no [`PeerAddr`].
+pub trait PeerAddress {
+    /// The peer's socket address, when it has one.
+    fn socket_addr(&self) -> Option<SocketAddr>;
+}
+
+impl PeerAddress for SocketAddr {
+    fn socket_addr(&self) -> Option<SocketAddr> {
+        Some(*self)
+    }
+}
+
+#[cfg(unix)]
+impl PeerAddress for std::os::unix::net::SocketAddr {
+    fn socket_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+}
+
 impl core::ops::Deref for PeerAddr {
     type Target = SocketAddr;
     fn deref(&self) -> &Self::Target {
