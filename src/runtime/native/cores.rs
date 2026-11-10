@@ -23,12 +23,13 @@ use executor_core::{compio::Runtime, AnyExecutor};
 use http_kit_io::{compio::Compio, IntoPoll, Io, Listener, SendFile, Split, TcpOptions};
 use skyzen_core::{EndpointFactory, PeerAddress};
 use skyzen_h1::H1;
-use skyzen_hyper::Hyper;
+use skyzen_hyper::{AltSvc, Hyper};
 use tracing::error;
 
 use super::{
     handoff::{Acceptor, Incoming},
-    tls::ServerTls,
+    http3::Http3,
+    tls::{Protocols, ServerTls},
     HttpServer, RuntimeFailure,
 };
 use crate::{
@@ -62,6 +63,9 @@ pub(super) struct Bound {
     pub(super) sockets: Vec<Socket>,
     /// Deals connections to the `Handoff` sockets; `None` when the threads accept for themselves.
     pub(super) acceptor: Option<Acceptor>,
+    /// The UDP socket each thread serves HTTP/3 on, in the order of `sockets`; `None` for a
+    /// thread that does not run QUIC. Empty when HTTP/3 is not served.
+    pub(super) udp: Vec<Option<std::net::UdpSocket>>,
 }
 
 impl Socket {
@@ -105,6 +109,7 @@ pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Resul
             Ok(Bound {
                 sockets: incoming.into_iter().map(Socket::Handoff).collect(),
                 acceptor: Some(acceptor),
+                udp: Vec::new(),
             })
         }
         #[cfg(not(windows))]
@@ -114,6 +119,7 @@ pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Resul
                 .map(Socket::Tcp)
                 .collect(),
             acceptor: None,
+            udp: Vec::new(),
         }),
         #[cfg(unix)]
         super::ListenAddr::Unix(path) => {
@@ -128,6 +134,7 @@ pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Resul
             Ok(Bound {
                 sockets,
                 acceptor: None,
+                udp: Vec::new(),
             })
         }
     }
@@ -194,6 +201,17 @@ pub(super) struct Plan<F, W> {
     pub(super) server: HttpServer,
     /// The acceptor, when the listener terminates TLS.
     pub(super) tls: Option<ServerTls>,
+    /// HTTP/3, when it is served beside the TLS listener.
+    pub(super) http3: Option<Http3Plan>,
+}
+
+/// What HTTP/3 needs beyond the sockets in [`Bound::udp`].
+#[derive(Debug)]
+pub(super) struct Http3Plan {
+    /// The settings, certificate and key every thread's QUIC endpoint is built from.
+    pub(super) http3: Http3,
+    /// Points TLS TCP clients at the UDP port, on every response they get.
+    pub(super) alt_svc: AltSvc,
 }
 
 /// The serving threads, once started.
@@ -228,7 +246,12 @@ where
     A: Endpoint + Clone + 'static,
     W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
 {
-    let Bound { sockets, acceptor } = bound;
+    let Bound {
+        sockets,
+        acceptor,
+        udp,
+    } = bound;
+    let mut udp = udp.into_iter();
     let threads = sockets.len();
     let plan = Arc::new(plan);
     let (ready_tx, ready) = bounded(threads);
@@ -252,10 +275,11 @@ where
         let drain = drain.clone();
         let ready = ready_tx.clone();
         let exited = exited_tx.clone();
+        let udp = udp.next().flatten();
         thread::Builder::new()
             .name(format!("skyzen-{index}"))
             .spawn(move || {
-                work(&plan, socket, stop, drain, &ready);
+                work(&plan, socket, udp, stop, drain, &ready);
                 drop(exited);
             })?;
     }
@@ -271,6 +295,7 @@ where
 fn work<F, A, W>(
     plan: &Arc<Plan<F, W>>,
     socket: Socket,
+    udp: Option<std::net::UdpSocket>,
     stop: Receiver<Infallible>,
     drain: Sender<Infallible>,
     ready: &Sender<Result<(), RuntimeFailure>>,
@@ -301,38 +326,79 @@ fn work<F, A, W>(
             endpoint,
             context: WorkerContext::new(Arc::clone(&plan.executor), ShutdownGuard(drain)),
         };
-        let h1 = H1::default().with_max_connections(plan.max_connections);
+        let mut h1 = H1::default().with_max_connections(plan.max_connections);
+        // The QUIC endpoint, registered with this thread's runtime before anything reports
+        // ready: a certificate QUIC cannot load is a failed start, not a TLS-only server.
+        // Every thread's TLS responses advertise it, including one that does not run QUIC itself.
+        if let Some(plan) = &plan.http3 {
+            h1 = h1.with_alt_svc(plan.alt_svc.header_value());
+        }
+        let http3 = match (&plan.http3, udp) {
+            (Some(plan), Some(udp)) => match plan.http3.server(udp) {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    let _ = ready.send(Err(RuntimeFailure::Http3(error))).await;
+                    return;
+                }
+            },
+            _ => None,
+        };
+        let h3_shutdown = {
+            let stop = stop.clone();
+            async move {
+                // Resolves with an error once the sender is dropped.
+                let _ = stop.recv().await;
+            }
+        };
         let shutdown = async move {
             // Resolves with an error once the sender is dropped.
             let _ = stop.recv().await;
         };
 
-        match socket {
-            #[cfg(not(windows))]
-            Socket::Tcp(listener) => match Compio.tcp_listener(listener) {
-                Ok(listener) => {
+        // QUIC and TCP are independent: each drains its own connections once `stop` closes, and
+        // the thread, which holds the drain token, ends when both have.
+        let h3_endpoint = endpoint.clone();
+        let h3 = async move {
+            if let Some(server) = http3 {
+                server.serve(h3_endpoint, h3_shutdown).await;
+            }
+        };
+        let tcp = async {
+            match socket {
+                #[cfg(not(windows))]
+                Socket::Tcp(listener) => match Compio.tcp_listener(listener) {
+                    Ok(listener) => {
+                        serve_tcp(plan, &h1, executor, listener, endpoint, shutdown, ready).await;
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error.into())).await;
+                    }
+                },
+                Socket::Handoff(listener) => {
                     serve_tcp(plan, &h1, executor, listener, endpoint, shutdown, ready).await;
                 }
-                Err(error) => {
-                    let _ = ready.send(Err(error.into())).await;
-                }
-            },
-            Socket::Handoff(listener) => {
-                serve_tcp(plan, &h1, executor, listener, endpoint, shutdown, ready).await;
-            }
-            #[cfg(unix)]
-            Socket::Unix(listener) => match Compio.unix_listener(listener) {
-                Ok(listener) => {
-                    if announce(ready).await {
-                        serve_cleartext(plan.server, &h1, executor, listener, endpoint, shutdown)
+                #[cfg(unix)]
+                Socket::Unix(listener) => match Compio.unix_listener(listener) {
+                    Ok(listener) => {
+                        if announce(ready).await {
+                            serve_cleartext(
+                                plan.server,
+                                &h1,
+                                executor,
+                                listener,
+                                endpoint,
+                                shutdown,
+                            )
                             .await;
+                        }
                     }
-                }
-                Err(error) => {
-                    let _ = ready.send(Err(error.into())).await;
-                }
-            },
-        }
+                    Err(error) => {
+                        let _ = ready.send(Err(error.into())).await;
+                    }
+                },
+            }
+        };
+        futures_util::future::join(tcp, h3).await;
     });
 }
 
@@ -354,10 +420,10 @@ async fn serve_tcp<F, W, L, E>(
         return;
     }
     let listener = NoDelay(listener);
-    match (&plan.tls, plan.server) {
+    match &plan.tls {
         // ALPN chooses the protocol on the decrypted stream: `h2` is hyper's, anything else is
         // HTTP/1.1 served by the plan's selected server.
-        (Some(tls), server) => {
+        Some(tls) => {
             super::tls::serve(
                 executor,
                 listener,
@@ -365,11 +431,15 @@ async fn serve_tcp<F, W, L, E>(
                 shutdown,
                 tls.clone(),
                 plan.max_connections,
-                (server, h1.clone()),
+                Protocols {
+                    server: plan.server,
+                    h1: h1.clone(),
+                    alt_svc: plan.http3.as_ref().map(|plan| plan.alt_svc.clone()),
+                },
             )
             .await;
         }
-        (None, server) => serve_cleartext(server, h1, executor, listener, endpoint, shutdown).await,
+        None => serve_cleartext(plan.server, h1, executor, listener, endpoint, shutdown).await,
     }
 }
 
@@ -492,6 +562,7 @@ mod tests {
                 max_connections: NonZeroUsize::new(64).unwrap(),
                 server,
                 tls: None,
+                http3: None,
             };
             let cores = start(plan, bound, &stopping, &drain).expect("start the threads");
             for _ in 0..cores.threads {
@@ -585,6 +656,7 @@ mod tests {
             let bound = Bound {
                 sockets: incoming.into_iter().map(Socket::Handoff).collect(),
                 acceptor: Some(acceptor),
+                udp: Vec::new(),
             };
             let addr = bound.sockets[0]
                 .tcp_addr()

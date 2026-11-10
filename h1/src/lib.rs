@@ -21,6 +21,7 @@ use std::{cell::Cell, convert::Infallible, io, net::SocketAddr, num::NonZeroUsiz
 use executor_core::{LocalExecutor, Task};
 use futures_util::future::{select, Either};
 use http_kit::{
+    header::{self, HeaderValue},
     utils::{AsyncRead, AsyncWrite, Bytes},
     Request, Response,
 };
@@ -42,6 +43,7 @@ use tracing::{debug, error, warn};
 pub struct H1 {
     config: ServerConfig,
     max_connections: Option<NonZeroUsize>,
+    alt_svc: Option<HeaderValue>,
 }
 
 impl H1 {
@@ -51,7 +53,19 @@ impl H1 {
         Self {
             config,
             max_connections: None,
+            alt_svc: None,
         }
+    }
+
+    /// Advertise an alternative service in every response that does not carry an `Alt-Svc` of
+    /// its own, error responses included.
+    ///
+    /// The value is a complete `Alt-Svc` header value (RFC 7838), such as the one
+    /// `skyzen_hyper::AltSvc::header_value` renders for an HTTP/3 endpoint.
+    #[must_use]
+    pub fn with_alt_svc(mut self, alt_svc: HeaderValue) -> Self {
+        self.alt_svc = Some(alt_svc);
+        self
     }
 
     /// Refuse connections past `max` open at once.
@@ -206,7 +220,11 @@ impl H1 {
     {
         let (read, write) = stream.split();
         let connection = ServerConnection::new(read, write, timer, self.config.clone());
-        let service = H1Service { endpoint, peer };
+        let service = H1Service {
+            endpoint,
+            peer,
+            alt_svc: self.alt_svc.clone(),
+        };
         let outcome = connection.serve_until(&service, stop).await;
         // An upgraded connection is no longer an HTTP exchange the drain waits for.
         drop(live);
@@ -242,6 +260,7 @@ impl H1 {
 struct H1Service<E> {
     endpoint: E,
     peer: Option<SocketAddr>,
+    alt_svc: Option<HeaderValue>,
 }
 
 impl<E: Endpoint + Clone> Service for H1Service<E> {
@@ -254,7 +273,7 @@ impl<E: Endpoint + Clone> Service for H1Service<E> {
         request.extensions_mut().insert(UpgradeAvailable);
 
         let mut endpoint = self.endpoint.clone();
-        match endpoint.respond(&mut request).await {
+        let mut response = match endpoint.respond(&mut request).await {
             Ok(response) => {
                 tracing::info!(
                     method = method.as_str(),
@@ -270,7 +289,14 @@ impl<E: Endpoint + Clone> Service for H1Service<E> {
                 apply_pending_headers(&request, &mut response);
                 response
             }
+        };
+        if let Some(alt_svc) = &self.alt_svc {
+            response
+                .headers_mut()
+                .entry(header::ALT_SVC)
+                .or_insert_with(|| alt_svc.clone());
         }
+        response
     }
 }
 

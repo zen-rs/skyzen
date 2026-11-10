@@ -186,6 +186,10 @@ skyzen-lambda = { workspace = true, optional = true }
 # resolves one crypto backend; the certificate/key pair is loaded with rustls's own PEM support.
 http-kit-tls = { version = "0.2.0", default-features = false, optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
+# HTTP/3 (`http3` feature): quiche over the same compio threads. quiche builds BoringSSL from
+# source, so only a build that asks for HTTP/3 pays for it; `fs` lets a file-region body (static
+# files) go out over a QUIC stream.
+http-kit-h3 = { version = "0.3.0", default-features = false, features = ["quiche", "fs"], optional = true }
 
 # Kernel TLS on Linux: after the handshake the kernel seals and opens the records, so file-region
 # bodies go out through sendfile/splice.
@@ -348,6 +352,10 @@ rt = []
 # `SKYZEN_TLS_KEY`) point the runtime at a PEM certificate chain and private key, and
 # `#[skyzen::main]` serves HTTPS on the bound listener with ALPN `h2, http/1.1`.
 server-tls = ["dep:http-kit-tls", "dep:rustls"]
+# Serve HTTP/3 (QUIC, on quiche) on UDP beside the TLS listener, on its port and with its
+# certificate and key; the TLS responses advertise it with `Alt-Svc`. `--http3` or
+# `SKYZEN_HTTP3` additionally makes a start where it cannot be served an error.
+http3 = ["server-tls", "dep:http-kit-h3"]
 # The `lambda` feature lets `#[skyzen::main]` serve AWS Lambda invocations.
 # Nothing in an application changes: the runtime detects `AWS_LAMBDA_RUNTIME_API` and hands over
 # to the adapter instead of binding a listener. Without it, a binary that finds itself inside
@@ -373,6 +381,11 @@ required-features = ["sqlite"]
 [[test]]
 name = "hyper_websocket"
 required-features = ["sqlite"]
+
+# Serves one router through both servers, Hyper's among them.
+[[test]]
+name = "server"
+required-features = ["hyper"]
 
 [lints]
 workspace = true

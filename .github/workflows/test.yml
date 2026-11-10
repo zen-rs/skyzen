@@ -16,20 +16,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # All features on all platforms
+          # Every feature on every platform, but OpenSSL beside HTTP/3 on Linux
+          # (.github/scripts/ci-features.sh).
           - name: Linux
             os: ubuntu-latest
-            features: "--all-features"
             targets: "--all-targets"
 
           - name: macOS
             os: macos-latest
-            features: "--all-features"
             targets: "--all-targets"
 
           - name: Windows
             os: windows-latest
-            features: "--all-features"
             targets: "--all-targets"
     steps:
       - uses: actions/checkout@v4
@@ -48,8 +46,16 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           cache-on-failure: true
 
+      - name: Select features
+        shell: bash
+        run: echo "FEATURES=$(bash .github/scripts/ci-features.sh)" >> "$GITHUB_ENV"
+
       - name: Run clippy
-        run: cargo clippy --workspace ${{ matrix.targets }} ${{ matrix.features }} -- -D warnings
+        run: cargo clippy --workspace ${{ matrix.targets }} ${{ env.FEATURES }} -- -D warnings
+
+      # The build most applications compile: code behind a feature that is off must lint too.
+      - name: Run clippy (default features)
+        run: cargo clippy --workspace ${{ matrix.targets }} -- -D warnings
 
       - uses: taiki-e/install-action@nextest
 
@@ -59,7 +65,7 @@ jobs:
         run: sudo modprobe tls
 
       - name: Run tests
-        run: cargo nextest run --workspace ${{ matrix.targets }} ${{ matrix.features }}
+        run: cargo nextest run --workspace ${{ matrix.targets }} ${{ env.FEATURES }}
 
   wasm-build:
     name: WASM Build Check
