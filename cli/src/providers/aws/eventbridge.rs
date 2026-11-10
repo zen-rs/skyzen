@@ -199,6 +199,41 @@ struct Migrated {
 }
 
 impl MigrateSchedulesToAlias {
+    /// Put the migrated rules back the way an upload failure does: only when the
+    /// fingerprint proves neither code nor configuration moved does legacy targeting
+    /// return, and an unmigrate error warns rather than masks the real one.
+    async fn restore_migrated(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+        lambda: &aws_sdk_lambda::Client,
+        before: Option<&Vec<String>>,
+        migrated: &[Migrated],
+    ) {
+        let after = lambda
+            .get_function_configuration()
+            .function_name(&self.inner.function)
+            .send()
+            .await
+            .ok()
+            .map(|config| execution_fingerprint(&config));
+        if before.is_some() && before == after.as_ref() {
+            output::warn("the deploy failed — restoring the migrated schedules");
+            for entry in migrated {
+                if let Err(restore) = self.inner.unmigrate_one(events, lambda, entry).await {
+                    output::warn(format!(
+                        "could not restore migrated rule `{}`: {restore}",
+                        entry.rule
+                    ));
+                }
+            }
+        } else {
+            output::warn(
+                "the deploy partially applied — the migrated schedules stay on the alias \
+                 rather than point new code at the old function",
+            );
+        }
+    }
+
     /// The step that moves `schedules` plus every `skyzen-schedule-*` grant's rule, then
     /// uploads and reconciles — all inside one transaction.
     pub const fn new(
@@ -256,36 +291,15 @@ impl Task for MigrateSchedulesToAlias {
             // any stage restores the moved rules before the error escapes, because the
             // plan runner stops and nothing later could.
             if let Err(error) = crate::providers::run_command(&self.deploy, &self.inner.env) {
-                let after = lambda
-                    .get_function_configuration()
-                    .function_name(&self.inner.function)
-                    .send()
-                    .await
-                    .ok()
-                    .map(|config| execution_fingerprint(&config));
-                if before.is_some() && before == after {
-                    output::warn("the deploy failed — restoring the migrated schedules");
-                    for entry in &migrated {
-                        if let Err(restore) =
-                            self.inner.unmigrate_one(&events, &lambda, entry).await
-                        {
-                            output::warn(format!(
-                                "could not restore migrated rule `{}`: {restore}",
-                                entry.rule
-                            ));
-                        }
-                    }
-                } else {
-                    output::warn(
-                        "the deploy partially applied — the migrated schedules stay on the \
-                         alias rather than point new code at the old function",
-                    );
-                }
+                self.restore_migrated(&events, &lambda, before.as_ref(), &migrated)
+                    .await;
                 return Err(error);
             }
             // The upload leaves an update in progress — `publish` or `add_permission` meets
             // it as `ResourceConflictException`. Settle before the ARN read or reconcile.
-            lambda
+            // A wait or read failure here is past the upload but before reconcile — the
+            // migrated rules go back the same way an upload failure restores them.
+            let ready = lambda
                 .wait_until_function_updated_v2()
                 .function_name(&self.inner.function)
                 .wait(super::lambda_env::UPDATE_TIMEOUT)
@@ -296,7 +310,12 @@ impl Task for MigrateSchedulesToAlias {
                         self.inner.function,
                         super::lambda_env::UPDATE_TIMEOUT.as_secs()
                     )
-                })?;
+                });
+            if let Err(error) = ready {
+                self.restore_migrated(&events, &lambda, before.as_ref(), &migrated)
+                    .await;
+                return Err(error);
+            }
             // A first deployment creates the function — read its ARN only now that it is
             // guaranteed to exist, not before the upload.
             let arn = lambda
@@ -306,18 +325,28 @@ impl Task for MigrateSchedulesToAlias {
                 .await
                 .with_context(|| {
                     format!(
-                        "could not read Lambda function `{}` to point EventBridge rules at it",
+                        "could not read Lambda function `{}` to point EventBridge rules \
+                         at it",
                         self.inner.function
                     )
-                })?
-                .function_arn()
-                .with_context(|| {
-                    format!(
-                        "Lambda function `{}` reported no ARN to point EventBridge rules at",
-                        self.inner.function
-                    )
-                })?
-                .to_owned();
+                })
+                .and_then(|config| {
+                    config.function_arn().map(str::to_owned).with_context(|| {
+                        format!(
+                            "Lambda function `{}` reported no ARN to point EventBridge \
+                                 rules at",
+                            self.inner.function
+                        )
+                    })
+                });
+            let arn = match arn {
+                Ok(arn) => arn,
+                Err(error) => {
+                    self.restore_migrated(&events, &lambda, before.as_ref(), &migrated)
+                        .await;
+                    return Err(error);
+                }
+            };
             let parts: Vec<&str> = arn.split(':').collect();
             let (partition, region, account) = parts
                 .get(1)
@@ -384,6 +413,9 @@ impl Task for MigrateSchedulesToAlias {
                 }
                 return Err(error);
             }
+            // Reconcile verified the state it found — stamp it so the next deploy reads
+            // the record rather than re-enumerating.
+            self.inner.stamp_tag(&lambda, &arn).await;
             Ok(())
         })?
     }
@@ -637,13 +669,21 @@ impl Task for EventBridgeSchedules {
             };
             let mut snapshot = Vec::new();
             let mut alias = None;
-            // Denied discovery may be tolerated only when the prefix scan verifies no
-            // managed rule exists — "cannot read" is not "there are none".
+            // Denied discovery may be tolerated only on proof of absence: the tag a
+            // verified-clean deploy stamped, or a scan that verifies no managed rule
+            // exists — "cannot read" is not "there are none".
+            let marked_none = self
+                .schedule_tag(&lambda)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|tag| tag == "none");
             let tolerant = self.schedules.is_empty()
-                && self
-                    .managed_rule_names(&events)
-                    .await
-                    .is_ok_and(|rules| rules.is_empty());
+                && (marked_none
+                    || self
+                        .managed_rule_names(&events)
+                        .await
+                        .is_ok_and(|rules| rules.is_empty()));
             let result = self
                 .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
                 .await;
@@ -655,6 +695,9 @@ impl Task for EventBridgeSchedules {
                     .await;
                 return Err(error);
             }
+            // Reconcile verified the state it found — stamp it so the next deploy
+            // reads the record rather than re-enumerating.
+            self.stamp_tag(&lambda, ctx.arn).await;
             Ok(())
         })?
     }
@@ -702,6 +745,15 @@ impl EventBridgeSchedules {
             // skip it: a denied or failed lookup is "unknown", and claiming cleanup
             // completed over an alias that may still serve a frozen version would
             // let every later secret rotation fail.
+            if self
+                .schedule_tag(lambda)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|tag| tag == "none")
+            {
+                return Ok(());
+            }
             if self.alias_snapshot(lambda).await?.is_none() {
                 return Ok(());
             }
@@ -1233,21 +1285,25 @@ impl EventBridgeSchedules {
             }
             Err(error) => return Err(error),
         }
-        // `ListRules` is the only read that can actually enumerate a legacy rule: the
-        // alias it lacks and the grant it might have lost are both invisible when the
-        // scan is denied, so "no evidence" is "unknown", never "absent" — refuse to
-        // move `$LATEST` on unverified ownership.
+        // The tag is the authoritative record: `skyzen-schedules=none` can only have
+        // been written after a verified-clean reconcile, so it proves this function
+        // never carried schedules without needing `events:ListRules` again. Without
+        // it, `ListRules` is the only read that can actually enumerate a legacy rule
+        // — the alias it lacks and the grant it might have lost are both invisible
+        // when the scan is denied, so "no evidence" is "unknown", never "absent",
+        // and unverified ownership refuses to move `$LATEST`.
+        let marked_none = self.schedule_tag(lambda).await?.as_deref() == Some("none");
         anyhow::ensure!(
-            rule_scan_ok,
+            rule_scan_ok || marked_none,
             "could not enumerate Lambda function `{}`'s EventBridge rules — an enabled \
              legacy rule invisible to the denied listing would fire the new code, so \
              grant `events:ListRules` or remove the rules first",
             self.function
         );
         // Scheduling history is an existing alias, a managed grant, or a discovered
-        // rule — with the scan verified above, all three are confirmed facts now.
-        let has_history =
-            grant_found || rules_found || self.alias_snapshot(lambda).await?.is_some();
+        // rule — the `none` tag overrides them all: a verified-clean deploy wrote it.
+        let has_history = !marked_none
+            && (grant_found || rules_found || self.alias_snapshot(lambda).await?.is_some());
 
         // Only rules still carrying an unqualified target need moving — when none do, the
         // alias stays exactly where it is. Repointing it anyway would resurrect the version
@@ -1597,23 +1653,57 @@ impl EventBridgeSchedules {
         Ok(())
     }
 
-    /// The version the `skyzen` alias serves, or `None` when it does not exist.
-    ///
-    /// The read goes through the qualified name rather than `GetAlias`: resolving
-    /// `function:skyzen` needs only `lambda:GetFunctionConfiguration`, which the deploy
-    /// already holds, so an HTTP-only app never picks up a scheduling-management
-    /// permission just to prove it has no schedules.
-    async fn alias_snapshot(&self, lambda: &aws_sdk_lambda::Client) -> Result<Option<String>> {
-        match lambda
-            .get_function_configuration()
-            .function_name(format!("{}:{ALIAS}", self.function))
+    /// The ownership record a previous deploy stamped: `yes` behind reconciled
+    /// schedules, `none` once the last is retired and the alias gone — `None` means
+    /// the function predates tagging, which is unverified, not unscheduled.
+    async fn schedule_tag(&self, lambda: &aws_sdk_lambda::Client) -> Result<Option<String>> {
+        Ok(lambda
+            .get_function()
+            .function_name(&self.function)
+            .send()
+            .await
+            .with_context(|| format!("could not read Lambda function `{}`", self.function))?
+            .tags()
+            .and_then(|tags| tags.get("skyzen-schedules").cloned()))
+    }
+
+    /// Stamp the verified ownership record the next deploy reads — a warn, not a
+    /// failure: the worst a denied tag does is make the next deploy re-enumerate.
+    async fn stamp_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) {
+        let state = if self.schedules.is_empty() {
+            "none"
+        } else {
+            "yes"
+        };
+        if let Err(error) = lambda
+            .tag_resource()
+            .resource(arn)
+            .tags("skyzen-schedules", state)
             .send()
             .await
         {
-            Ok(config) => Ok(config.version().map(str::to_owned)),
+            output::warn(format!(
+                "could not tag Lambda function `{}`'s schedule state: {error:#}",
+                self.function
+            ));
+        }
+    }
+
+    /// The version the `skyzen` alias serves, or `None` when it does not exist.
+    /// `GetAlias` names the unqualified function, so it needs no qualified-resource
+    /// permission an HTTP-only deploy would lack.
+    async fn alias_snapshot(&self, lambda: &aws_sdk_lambda::Client) -> Result<Option<String>> {
+        match lambda
+            .get_alias()
+            .function_name(&self.function)
+            .name(ALIAS)
+            .send()
+            .await
+        {
+            Ok(alias) => Ok(alias.function_version().map(str::to_owned)),
             Err(error)
                 if error.as_service_error().is_some_and(
-                    aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationError::is_resource_not_found_exception,
+                    aws_sdk_lambda::operation::get_alias::GetAliasError::is_resource_not_found_exception,
                 ) =>
             {
                 Ok(None)
