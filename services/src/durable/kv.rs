@@ -410,8 +410,6 @@ mod tests {
     #[derive(Debug, Clone)]
     struct ReadDurableKvEndpoint;
 
-    http_kit::impl_send_endpoint!(ReadDurableKvEndpoint);
-
     impl Endpoint for ReadDurableKvEndpoint {
         type Error = Infallible;
 

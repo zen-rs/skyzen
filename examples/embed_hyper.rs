@@ -21,9 +21,9 @@
 //!
 //! - `hyper` - Enables only the Hyper server adapter (`skyzen::hyper`). Use this when
 //!   embedding Skyzen into your own application. You provide your own:
-//!   - Async runtime (smol, tokio, async-std, etc.)
-//!   - TCP listener
-//!   - Executor for background tasks
+//!   - An `http-kit-io` backend (`AsyncIo`, `Tokio` or `Compio`) and the listener it registers
+//!   - A thread-local executor (any `executor_core::LocalExecutor`) for the connections
+//!   - The shutdown signal
 //!
 //! # Cargo.toml configuration
 //!
@@ -32,8 +32,10 @@
 //! # Only enable hyper feature, not rt
 //! skyzen = { version = "0.1", default-features = false, features = ["json", "hyper"] }
 //! smol = "2.0"
-//! async-net = "2.0"
-//! futures-lite = "2.0"
+//! async-executor = "1.13"
+//! http-kit-io = { version = "0.2", default-features = false, features = ["async-io"] }
+//! async-channel = "2.5"
+//! ctrlc = "3"
 //! # Without `rt` nothing installs a log subscriber, so this application installs its own.
 //! tracing = "0.1"
 //! tracing-subscriber = "0.3"
@@ -41,9 +43,8 @@
 //!
 //! Run with: `cargo run --example embed_hyper`
 
-use async_net::TcpListener;
-use executor_core::smol::SmolGlobal;
-use futures_lite::stream;
+use async_executor::LocalExecutor;
+use http_kit_io::{async_io::AsyncIo, Io};
 use serde::Serialize;
 use skyzen::{
     hyper::Hyper,
@@ -51,6 +52,7 @@ use skyzen::{
     utils::Json,
     Server, ToSchema,
 };
+use std::rc::Rc;
 
 #[derive(Serialize, ToSchema)]
 struct StatusResponse {
@@ -89,36 +91,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // framework emits — is dropped.
     tracing_subscriber::fmt().init();
 
-    // Use smol's global executor
-    smol::block_on(async {
-        // Build the Skyzen router
-        let router = build_router();
+    // The router is `!Send`: it lives on this thread, and so does everything that serves it — a
+    // thread-local executor for the connections, and smol's reactor for the sockets.
+    let router = build_router();
+    let executor = Rc::new(LocalExecutor::new());
 
-        // Bind to a TCP listener using async-net (smol-compatible)
-        let addr = "127.0.0.1:3000";
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!("embedded Skyzen server listening on http://{addr}");
-        tracing::info!("using the smol runtime, to demonstrate multi-runtime support");
-        tracing::info!("try: curl http://{addr}/health");
-        tracing::info!("try: curl http://{addr}/status");
-        tracing::info!("try: curl http://{addr}/hello");
+    let addr = "127.0.0.1:3000";
+    let listener = AsyncIo.tcp_listener(std::net::TcpListener::bind(addr)?)?;
+    tracing::info!("embedded Skyzen server listening on http://{addr}");
+    tracing::info!("using the smol runtime, to demonstrate multi-runtime support");
+    tracing::info!("try: curl http://{addr}/health");
+    tracing::info!("try: curl http://{addr}/status");
+    tracing::info!("try: curl http://{addr}/hello");
 
-        // Convert TcpListener to an owned Stream of connections
-        let connections = Box::pin(stream::unfold(listener, |listener| async move {
-            let result = listener.accept().await;
-            Some((result.map(|(stream, _addr)| stream), listener))
-        }));
-
-        // Serve using the Hyper backend with smol's executor
-        Hyper
-            .serve(
-                SmolGlobal,
-                |error| tracing::error!("connection error: {error}"),
-                connections,
-                router,
-            )
-            .await;
-
-        Ok(())
-    })
+    // Serve until Ctrl+C: the accept loop stops, in-flight requests finish, then `serve` returns.
+    let (stop, stopped) = async_channel::bounded::<()>(1);
+    ctrlc::set_handler(move || {
+        stop.close();
+    })?;
+    let serve = Hyper.serve(
+        AsyncIo,
+        Rc::clone(&executor),
+        listener,
+        router,
+        async move {
+            let _ = stopped.recv().await;
+        },
+    );
+    smol::block_on(executor.run(serve));
+    Ok(())
 }

@@ -922,8 +922,6 @@ mod tests {
     #[derive(Debug, Clone)]
     struct ReadStorageEndpoint;
 
-    http_kit::impl_send_endpoint!(ReadStorageEndpoint);
-
     impl Endpoint for ReadStorageEndpoint {
         type Error = Infallible;
 

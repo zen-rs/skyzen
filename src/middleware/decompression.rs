@@ -604,8 +604,6 @@ mod tests {
     #[derive(Clone)]
     struct EchoEndpoint;
 
-    http_kit::impl_send_endpoint!(EchoEndpoint);
-
     impl Endpoint for EchoEndpoint {
         type Error = Infallible;
         fn respond(

@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     fmt::{Debug, Formatter},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -19,7 +20,7 @@ use http_kit::http_error;
 use matchit::Match;
 use skyzen_core::{
     error_response,
-    middleware::{boxed, BoxFuture, BoxMiddleware, Dispatch, Middleware, Next},
+    middleware::{boxed, BoxMiddleware, Dispatch, LocalBoxFuture, Middleware, Next},
     Error, Extractor, RequestBodyLimit, Requirement,
 };
 use tracing::debug;
@@ -62,7 +63,10 @@ struct MethodTable {
 struct FactoryDispatch<'a>(&'a EndpointFactory);
 
 impl Dispatch for FactoryDispatch<'_> {
-    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a mut Request,
+    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
             let mut endpoint = (self.0)();
             endpoint.respond(request).await.map_err(Error::from)
@@ -74,15 +78,20 @@ impl Dispatch for FactoryDispatch<'_> {
 struct MatchDispatch<'r>(&'r Router);
 
 impl Dispatch for MatchDispatch<'_> {
-    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a mut Request,
+    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
         Box::pin(self.0.dispatch_matched(request))
     }
 }
 
 /// An HTTP router returned by [`Route::build`](crate::routing::Route::build).
 ///
-/// `Router` stores its routing tree inside an [`Arc`], so it can be cloned cheaply and shared
-/// across threads.
+/// `Router` stores its routing tree behind an [`Rc`], so a clone is cheap. It is not `Send`: its
+/// handlers, middleware and their state may hold `Rc`s, so a router lives on the thread that built
+/// it. A server running on several threads builds one router per thread from a `Send` factory —
+/// see [`Server`](skyzen_core::Server).
 ///
 /// ```
 /// use skyzen::{routing::{CreateRouteNode, Route, Router}, Result};
@@ -97,17 +106,16 @@ impl Dispatch for MatchDispatch<'_> {
 /// ```
 #[derive(Clone)]
 pub struct Router {
-    inner: Arc<matchit::Router<MethodTable>>,
+    inner: Rc<matchit::Router<MethodTable>>,
     /// Middleware wrapping the entire dispatch, outermost first.
-    layers: Arc<Vec<BoxMiddleware>>,
+    layers: Rc<Vec<BoxMiddleware>>,
     fallback: Option<EndpointFactory>,
     method_not_allowed: Option<EndpointFactory>,
-    routes: Arc<Vec<(MethodFilter, String)>>,
-    already_router_enabled: bool,
+    routes: Rc<Vec<(MethodFilter, String)>>,
     /// Optional alarm handler for Durable Object alarm events.
     pub(crate) alarm_handler: Option<EndpointFactory>,
     #[cfg(feature = "openapi")]
-    openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
+    openapi_entries: Rc<Vec<RouteOpenApiEntry>>,
 }
 
 #[allow(clippy::missing_fields_in_debug)] // the endpoint factories have nothing to render
@@ -119,7 +127,6 @@ impl Debug for Router {
             .field("layers", &self.layers.len())
             .field("has_fallback", &self.fallback.is_some())
             .field("has_method_not_allowed", &self.method_not_allowed.is_some())
-            .field("already_router_enabled", &self.already_router_enabled)
             .field("has_alarm_handler", &self.alarm_handler.is_some());
         #[cfg(feature = "openapi")]
         {
@@ -311,9 +318,6 @@ impl Router {
             "request received"
         );
 
-        if self.already_router_enabled {
-            request.extensions_mut().insert(self.clone());
-        }
         // Insert-if-absent: a router mounted as an endpoint inside another router must not clear
         // the outer router's `BodyLimit`.
         if request.extensions().get::<RequestBodyLimit>().is_none() {
@@ -349,7 +353,7 @@ impl Router {
     /// wiring validation [`Route::try_build`](crate::routing::Route::try_build) performs.
     #[must_use]
     pub fn layer<M: Middleware>(mut self, middleware: M) -> Self {
-        Arc::make_mut(&mut self.layers).insert(0, boxed(middleware));
+        Rc::make_mut(&mut self.layers).insert(0, boxed(middleware));
         self
     }
 
@@ -357,16 +361,6 @@ impl Router {
     #[must_use]
     pub fn routes(&self) -> &[(MethodFilter, String)] {
         &self.routes
-    }
-
-    /// Enable extraction of the current router through [`Extractor`](skyzen_core::Extractor).
-    ///
-    /// When enabled, the router instance is stored in the request extensions for each call and can
-    /// be retrieved inside handlers via `Router::extract(request).await`.
-    #[must_use]
-    pub const fn enable_programmable_router(mut self) -> Self {
-        self.already_router_enabled = true;
-        self
     }
 
     /// Build an [`OpenApi`] definition containing every route registered on this router.
@@ -458,23 +452,6 @@ const fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
-    }
-}
-
-http_error!(pub RouterNotExist, StatusCode::INTERNAL_SERVER_ERROR, "Router not available in request extensions. Call `enable_programmable_router()` when building the route.");
-
-impl Extractor for Router {
-    type Error = RouterNotExist;
-    // Reading the router back out of the extensions is a synchronous clone, so the future is ready
-    // on creation rather than an `async` block with nothing to await.
-    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
-        ready(
-            request
-                .extensions()
-                .get::<Self>()
-                .cloned()
-                .ok_or(RouterNotExist::new()),
-        )
     }
 }
 
@@ -647,7 +624,7 @@ fn flatten(
                     let endpoint = nested.clone();
                     buf.entry(mounted).or_default().push(FlatEndpoint {
                         method: MethodFilter::Any,
-                        factory: Arc::new(move || BoxEndpoint::new(endpoint.clone())),
+                        factory: Rc::new(move || BoxEndpoint::new(endpoint.clone())),
                         middleware: middleware.clone(),
                         requirements: Vec::new(),
                     });
@@ -712,15 +689,14 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     });
 
     Ok(Router {
-        inner: Arc::new(matcher),
-        layers: Arc::new(layers),
+        inner: Rc::new(matcher),
+        layers: Rc::new(layers),
         fallback: fallback.map(|entry| entry.factory),
         method_not_allowed: method_not_allowed.map(|entry| entry.factory),
-        routes: Arc::new(routes),
-        already_router_enabled: false,
+        routes: Rc::new(routes),
         alarm_handler: None,
         #[cfg(feature = "openapi")]
-        openapi_entries: Arc::new(openapi_entries),
+        openapi_entries: Rc::new(openapi_entries),
     })
 }
 
@@ -808,8 +784,6 @@ impl Endpoint for Router {
             .map_err(Error::into_boxed_http_error)
     }
 }
-
-http_kit::impl_send_endpoint!(Router);
 
 #[cfg(test)]
 mod tests {

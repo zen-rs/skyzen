@@ -20,12 +20,11 @@
 
 use std::{
     collections::BTreeMap,
-    future::Future,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use http_kit::{Body, Endpoint, Method, Request, Response, SendEndpoint, StatusCode};
+use http_kit::{Body, Endpoint, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use skyzen_services::queue::{
     envelope, QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition,
@@ -114,7 +113,7 @@ pub fn mount<E, C>(
     triggers: &'static [QueueTrigger],
 ) -> Result<FunctionsHost<E, C>, MountError>
 where
-    E: SendEndpoint + ServedRoutes + Clone + Sync + 'static,
+    E: Endpoint + ServedRoutes + Clone + 'static,
     C: ConsumerSet,
 {
     let mut seen = BTreeMap::new();
@@ -223,36 +222,23 @@ impl<E, C> FunctionsHost<E, C> {
 
 impl<E, C> Endpoint for FunctionsHost<E, C>
 where
-    E: SendEndpoint + Clone + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     C: ConsumerSet,
 {
     type Error = E::Error;
 
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let Some(trigger) = self.trigger_for(request) else {
-            return self.endpoint.respond_send(request).await;
+            return self.endpoint.respond(request).await;
         };
 
         Ok(self.invoke(trigger, request).await)
     }
 }
 
-impl<E, C> SendEndpoint for FunctionsHost<E, C>
-where
-    E: SendEndpoint + Clone + Sync + 'static,
-    C: ConsumerSet,
-{
-    fn respond_send(
-        &mut self,
-        request: &mut Request,
-    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
-        self.respond(request)
-    }
-}
-
 impl<E, C> FunctionsHost<E, C>
 where
-    E: SendEndpoint + Clone + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     C: ConsumerSet,
 {
     /// Drive the queue handler for one invocation and answer the host.
@@ -559,8 +545,6 @@ mod tests {
             &self.0
         }
     }
-
-    http_kit::impl_send_endpoint!(Routes);
 
     impl Endpoint for Routes {
         type Error = core::convert::Infallible;

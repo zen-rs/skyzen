@@ -1,0 +1,39 @@
+[package]
+name = "skyzen-h1"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP/1.1 server backend for the Skyzen framework, on http-kit-h1 and owned-buffer I/O"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "../README.md"
+keywords = ["http", "web", "framework", "io-uring"]
+categories = ["web-programming::http-server"]
+
+[features]
+default = ["fs"]
+# File-region body frames — what the static file server emits natively — sent with the driver's
+# file-to-socket path. Without it a file-region body fails its connection.
+fs = ["http-kit-h1/fs"]
+
+[dependencies]
+skyzen-core.workspace = true
+http-kit.workspace = true
+http-kit-io.workspace = true
+http-kit-h1.workspace = true
+executor-core.workspace = true
+tracing.workspace = true
+futures-util = { version = "0.3.32", default-features = false }
+# Closing a channel is the broadcast that stops every connection, and the last dropped sender is
+# the signal that they have all drained.
+async-channel = "2.5"
+
+[dev-dependencies]
+async-executor.workspace = true
+futures-lite = "2.6"
+# The same server on a readiness driver and on the completion driver thread-per-core runs on.
+http-kit-io = { workspace = true, features = ["async-io", "compio"] }
+executor-core = { workspace = true, features = ["compio"] }
+smol.workspace = true
+
+[lints]
+workspace = true

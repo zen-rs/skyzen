@@ -53,11 +53,10 @@ pub mod auth;
 pub mod compression;
 
 use std::fmt::{self, Debug};
-use std::future::Future;
 
-use http_kit::{Endpoint, Request, Response, SendEndpoint};
+use http_kit::{Endpoint, Request, Response};
 use skyzen_core::{
-    middleware::{boxed, BoxFuture, Dispatch},
+    middleware::{boxed, Dispatch, LocalBoxFuture},
     Error,
 };
 
@@ -136,7 +135,7 @@ impl<E> Layered<E> {
 /// validation.
 pub fn layer<E, M>(endpoint: E, middleware: M) -> Layered<E>
 where
-    E: SendEndpoint + Clone + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     M: Middleware,
 {
     Layered {
@@ -147,7 +146,7 @@ where
 
 impl<E> Endpoint for Layered<E>
 where
-    E: SendEndpoint + Clone + Sync + 'static,
+    E: Endpoint + Clone + 'static,
 {
     type Error = http_kit::error::BoxHttpError;
 
@@ -160,29 +159,20 @@ where
     }
 }
 
-impl<E> SendEndpoint for Layered<E>
-where
-    E: SendEndpoint + Clone + Sync + 'static,
-{
-    fn respond_send(
-        &mut self,
-        request: &mut Request,
-    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
-        self.respond(request)
-    }
-}
-
 /// Chain terminal that serves a request from a fresh clone of a shared endpoint.
 struct CloneEndpoint<'e, E>(&'e E);
 
 impl<E> Dispatch for CloneEndpoint<'_, E>
 where
-    E: SendEndpoint + Clone + Sync + 'static,
+    E: Endpoint + Clone + 'static,
 {
-    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a mut Request,
+    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
             let mut endpoint = self.0.clone();
-            endpoint.respond_send(request).await.map_err(Error::from)
+            endpoint.respond(request).await.map_err(Error::from)
         })
     }
 }

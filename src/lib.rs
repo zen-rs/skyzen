@@ -105,8 +105,7 @@ pub use include_dir;
 pub use http_kit;
 #[doc(inline)]
 pub use http_kit::{
-    header, Body, BodyError, Endpoint, HttpError, Method, Request, Response, SendEndpoint,
-    StatusCode, Uri,
+    header, Body, BodyError, Endpoint, HttpError, Method, Request, Response, StatusCode, Uri,
 };
 /// Service types used by macro expansions.
 ///
@@ -129,11 +128,11 @@ pub use middleware::Middleware;
 #[doc(inline)]
 pub use routing::{CreateRouteNode, Route};
 pub use skyzen_core::error::*;
-pub use skyzen_core::Server;
 pub use skyzen_core::{
     apply_pending_headers, error_response, log_endpoint_error, ErrorChain, PendingResponseHeaders,
     RequestBodyLimit, Secret,
 };
+pub use skyzen_core::{EndpointFactory, Server};
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use wasm_bindgen;
@@ -166,7 +165,7 @@ pub mod middleware;
 pub mod __private {
     use crate::{
         middleware::{layer, Layered, Middleware},
-        SendEndpoint,
+        Endpoint,
     };
 
     /// Wrap the endpoint `#[skyzen::main]` produced with one service injector.
@@ -175,7 +174,7 @@ pub mod __private {
     /// request without the route tree having to know about them.
     pub fn with_middleware<E, M>(endpoint: E, middleware: M) -> Layered<E>
     where
-        E: SendEndpoint + Clone + Sync + 'static,
+        E: Endpoint + Clone + 'static,
         M: Middleware,
     {
         layer(endpoint, middleware)

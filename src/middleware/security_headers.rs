@@ -165,7 +165,7 @@ impl Middleware for SecurityHeaders {
         &self,
         request: &mut Request,
         next: Next<'_>,
-    ) -> impl Future<Output = Result<Response, Error>> + Send {
+    ) -> impl Future<Output = Result<Response, Error>> {
         let headers = self.headers.clone();
         async move {
             // The configured set also rides the request as `PendingResponseHeaders` — the

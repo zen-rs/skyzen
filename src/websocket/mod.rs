@@ -179,7 +179,7 @@ pub(crate) use native::upgrade_from_request;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
 pub(crate) use session::session_handler;
-pub use session::{IntoWebSocketOutcome, MaybeSend, MaybeSync, INTERNAL_ERROR};
+pub use session::{IntoWebSocketOutcome, MaybeSend, INTERNAL_ERROR};
 pub(crate) use types::select_offered_protocol;
 pub use types::*;
 #[cfg(target_arch = "wasm32")]

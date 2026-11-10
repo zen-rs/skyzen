@@ -44,10 +44,11 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 
 **Framework Core:**
 - **`skyzen`** (`/`) - Main framework crate: routing, extractors, responders, middleware, static files, and runtime helpers.
-- **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`) reusable by alternative runtimes, plus `Secret`, the one runtime representation of a `[[secret]]` value. Supports `no_std` when `std` feature is disabled (`Secret` is `std`-only).
+- **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`, `EndpointFactory`) reusable by alternative runtimes, the `upgrade` handover between a server and a WebSocket handler, plus `Secret`, the one runtime representation of a `[[secret]]` value. Supports `no_std` when `std` feature is disabled (`Server`, `upgrade` and `Secret` are `std`-only).
 - **`skyzen-macros`** (`macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::scheduled]`, `#[skyzen::email]`, `#[skyzen::tail]`, `#[skyzen::durable_object]`, `#[skyzen::test]`, `#[derive(HttpError)]`, plus the function-like `import_config!` (one named extractor per `[[service]]`, `[[database]]` and `[[secret]]`) and `embed_migrations!`.
 - **`skyzen-manifest`** (`manifest/`) - The one typed `Skyzen.toml` schema, consumed by **both** `skyzen-macros` (at compile time) and `skyzen-cli` (at deploy time), so a section can never be accepted by one and rejected by the other. Every struct carries `deny_unknown_fields` and the `type`/`backend` discriminants are enums, so a typo or an unsupported value fails at parse time.
-- **`skyzen-hyper`** (`hyper/`) - Hyper server adapter implementing the `Server` trait from `skyzen-core`.
+- **`skyzen-hyper`** (`hyper/`) - Hyper server adapter implementing the `Server` trait from `skyzen-core`: HTTP/1 and HTTP/2 (prior-knowledge sniffed), on any `http-kit-io` backend whose stream is `Send`. Its `serve_connection`/`IntoService` are also what the native runtime drives each connection with.
+- **`skyzen-h1`** (`h1/`) - Skyzen's own HTTP/1.1 server on `http-kit-h1` and owned-buffer `http-kit-io` streams, so it runs on a completion driver (compio) as well as a readiness one.
 - **`skyzen-lambda`** (`lambda/`) - AWS Lambda adapter: HTTP invocations and SQS batches, driven by its own Tokio runtime. Reached through the root crate's optional `lambda` feature, never named by an application.
 
 **Services Abstraction & Testing:**
@@ -82,15 +83,24 @@ Service wrappers travel in `http::Extensions`, which requires `Send + Sync` unco
 
 WebAssembly backends still work because portability is bought where the JS handles live, not in the trait: `skyzen-cloudflare` wraps each `JsValue` handle in a newtype carrying a contained `unsafe impl Send + Sync`, sound because a Workers isolate is single-threaded and never moves the handle across threads, and drives JS promises through `worker::send::IntoSendFuture`. A new wasm backend follows the same recipe.
 
-The old workspace-wide `MaybeSend` alias is **gone**. The name survives in exactly one place, `src/websocket/session.rs`, where `MaybeSend`/`MaybeSync` are `#[cfg]`-split markers bounding a *user's session closure and future* — not a service future. A WebSocket session on wasm is built from `Rc`s and JS handles that no `Send` future could hold across an `await`, and there is no second thread to send it to; the relaxation stops at the route builder, and what the router actually stores still satisfies its `http_kit::SendEndpoint` bound by carrying the session in a cell whose `unsafe impl Send` rests on the same single-threaded argument. Do not reintroduce the pattern anywhere else.
+### 2a. Routers Are Per-Thread and `!Send`
 
-`http_kit::Endpoint` itself no longer requires `Send`, nor does its future; `Send` is a property a concrete endpoint gets from its parts. Generic code cannot see that, so every place in Skyzen that moves an endpoint's future across threads — the router, which erases endpoints into `http_kit::endpoint::AnySendEndpoint`, `Layered`, `Server::serve`, the hyper, Lambda and Azure Functions adapters — bounds on `http_kit::SendEndpoint` and calls `respond_send`. A concrete endpoint gets that impl from `http_kit::impl_send_endpoint!`; a generic one writes it by forwarding to its own `respond` after calling `respond_send` on its generic parts.
+Endpoints, middleware, handlers and the state they capture never cross a thread, so none of them is bound by `Send` or `Sync`: a handler may hold an `Rc` or a `RefCell`. `Route`/`Router` store the *local* erased forms — `http_kit::endpoint::AnyEndpoint` and `Rc<dyn MiddlewareObj>` — and every generic bound in the router, `Layered`, `Server::serve` and the adapters is `Endpoint + Clone + 'static` with a non-`Send` future. Do not add `SendEndpoint` bounds back; the router is not one.
+
+What crosses threads is the recipe. `skyzen_core::EndpointFactory` (`Send + Sync`, blanket-implemented for `Fn() -> impl Future<Output = E>`) is handed to each serving thread, which builds its own router from it and gives that router, with its listeners and a thread-local `executor_core::LocalExecutor`, to `Server::serve`. `#[skyzen::main]` generates the factory: service clients are built once and *cloned* into each router (they are `Send + Sync`), and `!Send` per-thread state reaches handlers through the router the factory builds — never through `http::Extensions`. Because a `!Send` router cannot sit in `Extensions`, a router is not an extractor.
+
+An adapter whose host requires a `Send` future (lambda_http's `Adapter`) runs the router on a `LocalSet` and hands the host only the `JoinHandle`.
+
+**The upgrade handover.** An upgraded connection is `!Send` on a thread-per-core driver and so cannot travel in `Extensions` either. The server inserts the `skyzen_core::upgrade::UpgradeAvailable` marker on requests that can upgrade (HTTP/1); `WebSocketUpgrade` refuses with `426` without it. The handler answers `101` with an `OnUpgrade` token in the *response* extensions — a one-slot channel carrying the `Send` session closure — and the server, once the connection is handed back (`ServerOutcome::Upgraded` in `skyzen-h1`, hyper's upgrade future in `skyzen-hyper`), runs that session on its own thread over the erased `Upgraded` stream, replaying any bytes read past the handshake.
+
+`MaybeSend` survives in exactly one place, `src/websocket/session.rs`: it bounds a *user's WebSocket session closure* — `Send` natively, because the token carrying it sits in `Extensions`; nothing on wasm, where a session is built from `Rc`s and JS handles and `on_upgrade` starts it with `wasm_bindgen_futures::spawn_local` on the `WebSocketPair` it already holds. Do not reintroduce the pattern anywhere else.
 
 ### 3. Middleware, Layers & Build-Time Wiring
 
-- `skyzen_core::middleware::Middleware` takes **`&self`**. The router stores each middleware once
-  as `Arc<dyn MiddlewareObj>` and never clones it per request, so state kept in an atomic or a
-  channel persists. `Next::run(request)` continues the chain and hides the endpoint/middleware
+- `skyzen_core::middleware::Middleware` takes **`&self`** and returns a non-`Send` future. The
+  router stores each middleware once as `Rc<dyn MiddlewareObj>` (boxed futures are
+  `LocalBoxFuture`) and never clones it per request, so state kept in a `Cell`, an atomic or a
+  channel persists for that thread's router. `Next::run(request)` continues the chain and hides the endpoint/middleware
   error split behind `skyzen::Error`.
 - The trait lives in `skyzen-core`, not `skyzen`: `skyzen-services`' `service_extractor!` macro
   implements it and only depends on core.
@@ -121,7 +131,7 @@ build **reads its environment before it binds anything** and hands over accordin
 
 | Target | Selected by | What runs |
 |---|---|---|
-| Native server | nothing else matched | Tokio + Hyper, a `tracing` subscriber, `--port`/`--host`/`--listen`, `Ctrl+C` shutdown |
+| Native server | nothing else matched | Hyper connections on the serving thread's local executor (smol reactor), the router built there from the factory, a `tracing` subscriber, `--port`/`--host`/`--listen`, `Ctrl+C` shutdown |
 | AWS Lambda | `AWS_LAMBDA_RUNTIME_API` is set | `skyzen-lambda` (root crate's `lambda` feature). Without the feature the binary **refuses to start** and names it, rather than binding a port nothing in Lambda can reach |
 | Azure Functions | `FUNCTIONS_CUSTOMHANDLER_PORT` is set | `src/runtime/azure.rs` mounts the declared `[[azure.queue_triggers]]` in front of the router; HTTP triggers reach the router untouched |
 | Cloudflare Workers | `target_arch = "wasm32"` | the WinterCG `fetch` export, plus whatever the manifest implies |
