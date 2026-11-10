@@ -326,8 +326,12 @@ impl Task for MigrateSchedulesToAlias {
                 // A rule is re-enabled only if its targets, grant and state actually came
                 // back — `None` means the alias repoint failed and nothing is safe to fire.
                 if let Some(restored) = restored {
+                    // A rule reconcile never reached was never snapshotted — it's already in
+                    // its safe post-migration state (disabled, alias-targeted, old version)
+                    // and gets its enabled state back too.
                     for entry in &migrated {
-                        if entry.enabled && restored.contains(&entry.rule) {
+                        let untouched = !snapshot.iter().any(|taken| taken.name == entry.rule);
+                        if entry.enabled && (untouched || restored.contains(&entry.rule)) {
                             if let Err(restore) =
                                 events.enable_rule().name(&entry.rule).send().await
                             {
@@ -649,7 +653,7 @@ impl EventBridgeSchedules {
             // nothing, so an HTTP-only deploy without schedule permissions is unaffected.
             // `retire_stale` reads the policies AND the prefix — a grant whose rule is
             // already gone still comes off here.
-            self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
+            self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot, true)
                 .await?;
             return Ok(());
         }
@@ -702,7 +706,7 @@ impl EventBridgeSchedules {
             taken.granted = granted;
             result?;
         }
-        self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
+        self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot, false)
             .await?;
         // The cutover is the last thing to move: every rule is wired disabled, so nothing
         // fires while the transition is open — then the alias repoints once and the
@@ -1315,6 +1319,7 @@ impl EventBridgeSchedules {
         // old version behind them, or the rollback itself wakes a stale cron on new code.
         // A failed repoint means the alias still serves the new version — nothing is safe
         // to re-enable, so report no restoration rather than pretend.
+        let mut alias_restored = true;
         if let Some(previous) = alias {
             let restore = lambda
                 .update_alias()
@@ -1327,7 +1332,10 @@ impl EventBridgeSchedules {
                 output::warn(format!(
                     "could not repoint the `{ALIAS}` alias back at `{previous}`: {restore}"
                 ));
-                return None;
+                // The alias still serves the rejected version — nothing is safe to
+                // re-enable — but the snapshotted rules still need disabling and new
+                // wiring still needs removing, so the restore loop below still runs.
+                alias_restored = false;
             }
         }
         let mut restored = std::collections::BTreeSet::new();
@@ -1351,7 +1359,7 @@ impl EventBridgeSchedules {
                 }
             }
         }
-        Some(restored)
+        alias_restored.then_some(restored)
     }
 
     /// Put one migrated rule back: its original targets, its unqualified grant if migration
@@ -1591,6 +1599,7 @@ impl EventBridgeSchedules {
         arn: &str,
         alias_arn: &str,
         snapshot: &mut Vec<RuleSnapshot>,
+        tolerant: bool,
     ) -> Result<()> {
         const STATEMENT_PREFIX: &str = "skyzen-schedule-";
 
@@ -1609,7 +1618,19 @@ impl EventBridgeSchedules {
             .collect();
         let mut stale: Vec<(String, String, bool)> = Vec::new();
         for (resource, owner) in &owners {
-            if let Some(policy) = self.policy(lambda, resource).await? {
+            let policy = match self.policy(lambda, resource).await {
+                Ok(policy) => policy,
+                // An HTTP-only caller may hold no schedule permissions at all — a denied
+                // read retires nothing rather than fail a deploy that had none to clean.
+                Err(error) if tolerant && Self::is_access_denied(&error) => {
+                    output::warn(format!(
+                        "could not read the policy of `{resource}`: {error:#}"
+                    ));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(policy) = policy {
                 if let Some(statements) = policy["Statement"].as_array() {
                     for entry in statements {
                         if let Some(name) = entry["Sid"]
@@ -1635,7 +1656,7 @@ impl EventBridgeSchedules {
         // best-effort: denied, it finds nothing, and the policy names still carry the day.
         match self.managed_rule_names(events).await {
             Ok(rules) => rules,
-            Err(error) if Self::is_access_denied(&error) => {
+            Err(error) if tolerant && Self::is_access_denied(&error) => {
                 output::warn(format!("could not list managed rules: {error:#}"));
                 Vec::new()
             }
