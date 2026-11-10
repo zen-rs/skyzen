@@ -1724,6 +1724,13 @@ impl EventBridgeSchedules {
     /// outlives this point would authorize skipping the alias on the next secret
     /// rotation. Tolerated only when the tag is verifiably absent already.
     async fn clear_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) -> Result<()> {
+        // A verified `yes` is already the right record and a confirmed absence needs
+        // nothing — only `Ok(None)` proves absent, so a failed read stays an error,
+        // and only a stale `none` ever reaches `UntagResource`.
+        match self.schedule_tag(lambda, arn).await?.as_deref() {
+            Some("yes") | None => return Ok(()),
+            _ => {}
+        }
         if let Err(error) = lambda
             .untag_resource()
             .resource(arn)
@@ -1731,13 +1738,7 @@ impl EventBridgeSchedules {
             .send()
             .await
         {
-            if self
-                .schedule_tag(lambda, arn)
-                .await
-                .ok()
-                .flatten()
-                .is_none()
-            {
+            if self.schedule_tag(lambda, arn).await?.is_none() {
                 output::warn(format!(
                     "could not clear the `skyzen-schedules` tag of Lambda function `{}`: \
                      {error:#}",
