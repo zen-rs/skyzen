@@ -190,7 +190,7 @@ jobs:
       # selection that script makes rather than cargo-hack's own.
       - run: cargo hack check --workspace --each-feature --exclude-all-features --no-dev-deps
       - name: Select features
-        run: echo "FEATURES=$(bash .github/scripts/ci-features.sh)" >> "$GITHUB_ENV"
+        run: echo "FEATURES=$(bash .github/scripts/ci-features.sh --per-package)" >> "$GITHUB_ENV"
       - run: cargo hack check --workspace --no-dev-deps ${{ env.FEATURES }}
       # `skyzen` alone has 14 non-default features, so an unbounded powerset is
       # over 16k `cargo check` runs. Depth 2 covers every pair (~180 runs).
