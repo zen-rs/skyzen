@@ -69,6 +69,28 @@ pub(super) mod sealed {
     }
 }
 
+/// On Windows compio opens every file with `FILE_FLAG_OVERLAPPED`, and Windows rejects a synchronous
+/// read of an overlapped handle that carries no `OVERLAPPED` (`ERROR_INVALID_PARAMETER`, os error
+/// 87). A file region reads its `std` file synchronously, so that handle cannot be handed to it:
+/// there the files are opened and read by `std` on the blocking pool, exactly as [`BlockingFs`] does.
+#[cfg(windows)]
+impl sealed::Ops for CompioFs {
+    type Handle = File;
+
+    async fn open(&self, path: PathBuf) -> io::Result<Entry<Self::Handle>> {
+        sealed::Ops::open(&BlockingFs, path).await
+    }
+
+    async fn read(&self, handle: Self::Handle, len: u64) -> io::Result<Bytes> {
+        sealed::Ops::read(&BlockingFs, handle, len).await
+    }
+
+    fn std_file(&self, handle: Self::Handle) -> io::Result<File> {
+        sealed::Ops::std_file(&BlockingFs, handle)
+    }
+}
+
+#[cfg(not(windows))]
 impl sealed::Ops for CompioFs {
     type Handle = compio::fs::File;
 
@@ -106,10 +128,7 @@ impl sealed::Ops for CompioFs {
 
     /// One `dup` of the descriptor, once per cache fill, so the region owns a plain `File`.
     fn std_file(&self, handle: Self::Handle) -> io::Result<File> {
-        #[cfg(unix)]
         let owned = std::os::fd::AsFd::as_fd(&handle).try_clone_to_owned()?;
-        #[cfg(windows)]
-        let owned = std::os::windows::io::AsHandle::as_handle(&handle).try_clone_to_owned()?;
         Ok(File::from(owned))
     }
 }

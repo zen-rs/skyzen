@@ -19,6 +19,9 @@ pub struct Preference {
 }
 
 /// Whether the client accepts the response without any content coding.
+///
+/// Only the static file server asks, so it exists with that feature.
+#[cfg(feature = "static-files")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Identity {
     /// `identity` (or `*`) was listed with a non-zero quality.
@@ -67,6 +70,7 @@ impl<'h> AcceptEncoding<'h> {
     }
 
     /// Whether the unencoded representation is acceptable.
+    #[cfg(feature = "static-files")]
     pub fn identity(&self) -> Identity {
         let named = self.find(|token| token.eq_ignore_ascii_case("identity"));
         match named.or_else(|| self.find(|token| token == "*")) {
@@ -108,7 +112,9 @@ fn parse_part(part: &str) -> (&str, f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcceptEncoding, Identity, Preference};
+    #[cfg(feature = "static-files")]
+    use super::Identity;
+    use super::{AcceptEncoding, Preference};
     use http_kit::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING};
 
     fn headers(values: &[&'static str]) -> HeaderMap {
@@ -142,6 +148,7 @@ mod tests {
         assert_eq!(accept.preference(&["zstd"]).unwrap().quality, 0.8);
     }
 
+    #[cfg(feature = "static-files")]
     #[test]
     fn identity_is_implied_listed_or_refused() {
         assert_eq!(
