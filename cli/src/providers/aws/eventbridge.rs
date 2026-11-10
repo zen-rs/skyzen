@@ -136,11 +136,9 @@ impl Task for MigrateSchedulesToAlias {
     }
 
     fn run(&self) -> Result<()> {
-        // A manifest without schedules has nothing to migrate — and no call for the
-        // schedule-management permissions the migration would need.
-        if self.inner.schedules.is_empty() {
-            return Ok(());
-        }
+        // Zero declared schedules is not the same as zero legacy rules — a removed last
+        // `[[schedule]]` still has an unqualified rule pointing at the code about to swap.
+        // `managed_names` discovers those from the policies, whatever the manifest says.
         super::lambda_env::adopt_env(&self.inner.env);
         block_on(async {
             let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -204,6 +202,40 @@ impl Task for CutoverAlias {
                         )
                     });
                 }
+            }
+            // Publishing $LATEST freezes whatever code is there — which may be a deploy the
+            // last `reconcile` deliberately rolled back. The alias's own version must match
+            // the code $LATEST runs now, or the repoint would promote the very code the
+            // previous deployment rejected.
+            let latest = lambda
+                .get_function_configuration()
+                .function_name(&self.inner.function)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "could not read Lambda function `{}` to check its code",
+                        self.inner.function
+                    )
+                })?;
+            let alias = lambda
+                .get_function_configuration()
+                .function_name(format!("{}:{ALIAS}", self.inner.function))
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "could not read the `{ALIAS}` version of Lambda function `{}`",
+                        self.inner.function
+                    )
+                })?;
+            if latest.code_sha256() != alias.code_sha256() {
+                anyhow::bail!(
+                    "`{}`'s $LATEST does not match the code the `{ALIAS}` alias serves — \
+                     deploy before rotating secrets, or the rotation would promote code a \
+                     previous deployment rolled back",
+                    self.inner.function
+                );
             }
             // `$LATEST` just took the new values; a version freezes them so the alias's
             // repoint is atomic — nothing invokes a half-rotated environment.
@@ -388,16 +420,13 @@ impl EventBridgeSchedules {
             // it has no managed rules is enough to leave everything alone. But a failure
             // while managed rules were actually found must stop the deploy, or the
             // supposedly removed schedules keep firing.
-            match self.managed_rule_names(events).await {
-                Ok(rules) if rules.is_empty() => {}
-                Ok(rules) => {
-                    self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
-                        .await?;
-                }
-                Err(error) => {
-                    output::warn(format!("could not check for stale schedules: {error:#}"));
-                }
+            // A failed discovery cannot prove no managed rules remain — whatever it cannot
+            // read, it cannot retire, and the deploy cannot claim it did.
+            if self.managed_rule_names(events).await?.is_empty() {
+                return Ok(());
             }
+            self.retire_stale(events, lambda, &qualified, arn, &alias_arn, snapshot)
+                .await?;
             return Ok(());
         }
 
@@ -544,21 +573,30 @@ impl EventBridgeSchedules {
                 .list_targets_by_rule()
                 .rule(&snapshot.name)
                 .send()
-                .await;
-            if let Ok(listed) = listed {
-                let ids: Vec<String> = listed
-                    .targets()
-                    .iter()
-                    .map(|target| target.id().to_owned())
-                    .collect();
-                if !ids.is_empty() {
-                    let _ = events
-                        .remove_targets()
-                        .rule(&snapshot.name)
-                        .set_ids(Some(ids))
-                        .send()
-                        .await;
-                }
+                .await
+                .with_context(|| format!("failed to list targets of `{}`", snapshot.name))?;
+            let ids: Vec<String> = listed
+                .targets()
+                .iter()
+                .map(|target| target.id().to_owned())
+                .collect();
+            if !ids.is_empty() {
+                let removed = events
+                    .remove_targets()
+                    .rule(&snapshot.name)
+                    .set_ids(Some(ids))
+                    .send()
+                    .await
+                    .with_context(|| format!("failed to strip targets of `{}`", snapshot.name))?;
+                anyhow::ensure!(
+                    removed.failed_entries().is_empty(),
+                    "EventBridge refused to strip a target of `{}`: {:?}",
+                    snapshot.name,
+                    removed
+                        .failed_entries()
+                        .first()
+                        .map(aws_sdk_eventbridge::types::RemoveTargetsResultEntry::error_message)
+                );
             }
             events
                 .delete_rule()
@@ -903,52 +941,25 @@ impl EventBridgeSchedules {
 
         let mut migrated: Vec<(String, Vec<Target>)> = Vec::new();
         for (rule, previous, name) in pending {
-            // The invoke grant precedes the retarget: a rule moved before its permission
-            // would sit unable to invoke until reconciliation catches up — or forever, if
-            // the deploy fails between.
+            // A migration that fails partway puts every moved rule's previous targets back —
+            // not just the failing one's — or earlier rules keep pointing at the alias while
+            // the rest still fire $LATEST.
             let rule_arn = format!("arn:{partition}:events:{region}:{account}:rule/{rule}");
-            let statement = format!("skyzen-schedule-{name}");
-            if !self
-                .has_statement(lambda, &qualified, &statement, &rule_arn)
-                .await
-                .with_context(|| format!("failed to read the policy of `{qualified}`"))?
-            {
-                lambda
-                    .add_permission()
-                    .function_name(&qualified)
-                    .action(INVOKE_ACTION)
-                    .principal(EVENTS_PRINCIPAL)
-                    .source_arn(&rule_arn)
-                    .statement_id(&statement)
-                    .send()
-                    .await
-                    .with_context(|| format!("failed to let `{rule}` invoke `{qualified}`"))?;
-            }
-            let targets: Vec<Target> = previous
-                .iter()
-                .map(|target| {
-                    let mut moved = target.clone();
-                    if moved.arn() == arn {
-                        moved.arn = alias_arn.clone();
-                    }
-                    moved
-                })
-                .collect();
-            let put = events
-                .put_targets()
-                .rule(&rule)
-                .set_targets(Some(targets))
-                .send()
-                .await
-                .with_context(|| format!("failed to retarget `{rule}` at `{ALIAS}`"))?;
-            // A partially failed retarget puts every moved rule's previous targets back —
-            // not just this one's — or the migration leaves earlier rules pointing at the
-            // alias while later ones still fire $LATEST.
-            if !put.failed_entries().is_empty() {
-                for (rule, previous) in migrated
-                    .iter()
-                    .chain(std::iter::once(&(rule.clone(), previous.clone())))
-                {
+            let result = self
+                .migrate_one(
+                    events,
+                    lambda,
+                    &qualified,
+                    arn.as_str(),
+                    &alias_arn,
+                    &rule_arn,
+                    &rule,
+                    &previous,
+                    &name,
+                )
+                .await;
+            if let Err(error) = result {
+                for (rule, previous) in migrated.iter().chain(std::iter::once(&(rule, previous))) {
                     let _ = events
                         .put_targets()
                         .rule(rule)
@@ -956,18 +967,73 @@ impl EventBridgeSchedules {
                         .send()
                         .await;
                 }
-                anyhow::bail!(
-                    "EventBridge refused to retarget `{rule}`: {:?}",
-                    put.failed_entries()
-                        .first()
-                        .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
-                );
+                return Err(error);
             }
             migrated.push((rule.clone(), previous));
             output::ok(format!(
                 "retargeted EventBridge rule `{rule}` at the `{ALIAS}` alias"
             ));
         }
+        Ok(())
+    }
+
+    /// Grant the rule its alias invoke permission, then retarget its unqualified entries.
+    async fn migrate_one(
+        &self,
+        events: &aws_sdk_eventbridge::Client,
+        lambda: &aws_sdk_lambda::Client,
+        qualified: &str,
+        arn: &str,
+        alias_arn: &str,
+        rule_arn: &str,
+        rule: &str,
+        previous: &[Target],
+        name: &str,
+    ) -> Result<()> {
+        // The invoke grant precedes the retarget: a rule moved before its permission
+        // would sit unable to invoke until reconciliation catches up — or forever, if
+        // the deploy fails between.
+        let statement = format!("skyzen-schedule-{name}");
+        if !self
+            .has_statement(lambda, qualified, &statement, rule_arn)
+            .await
+            .with_context(|| format!("failed to read the policy of `{qualified}`"))?
+        {
+            lambda
+                .add_permission()
+                .function_name(qualified)
+                .action(INVOKE_ACTION)
+                .principal(EVENTS_PRINCIPAL)
+                .source_arn(rule_arn)
+                .statement_id(&statement)
+                .send()
+                .await
+                .with_context(|| format!("failed to let `{rule}` invoke `{qualified}`"))?;
+        }
+        let targets: Vec<Target> = previous
+            .iter()
+            .map(|target| {
+                let mut moved = target.clone();
+                if moved.arn() == arn {
+                    moved.arn = alias_arn.to_owned();
+                }
+                moved
+            })
+            .collect();
+        let put = events
+            .put_targets()
+            .rule(rule)
+            .set_targets(Some(targets))
+            .send()
+            .await
+            .with_context(|| format!("failed to retarget `{rule}` at `{ALIAS}`"))?;
+        anyhow::ensure!(
+            put.failed_entries().is_empty(),
+            "EventBridge refused to retarget `{rule}`: {:?}",
+            put.failed_entries()
+                .first()
+                .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
+        );
         Ok(())
     }
 
