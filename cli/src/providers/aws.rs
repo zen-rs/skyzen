@@ -12,6 +12,7 @@
 //! `--env-var NAME=value` flag is printed by every progress line and visible in the process table,
 //! so the variables are delivered afterwards through the SDK instead. See [`lambda_env`].
 
+mod eventbridge;
 mod lambda_env;
 
 use crate::{
@@ -20,10 +21,11 @@ use crate::{
     project::Project,
     providers::{
         prepare_child_environment, secrets::Delivery, Action, CommandPlan, CommandStdin,
-        ProviderPlan, RunMode, SecretAction, Step,
+        ProviderPlan, RunMode, SecretAction, Step, Task,
     },
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
+use eventbridge::{CutoverAlias, MigrateSchedulesToAlias};
 use lambda_env::{LambdaEnvironment, LambdaEnvironmentNames};
 use skyzen_manifest::{AwsSection, Manifest};
 
@@ -58,19 +60,41 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
         // A deploy always builds optimized first: `cargo lambda deploy` uploads whatever is in
         // `target/lambda`, so deploying without building would ship the previous build.
         Action::Deploy { .. } => {
+            // A cron the translation cannot express fails here — before the build, before
+            // `cargo lambda` uploads anything — rather than after the live function is
+            // already updated.
+            for entry in &manifest.data().schedule {
+                eventbridge::aws_cron_expression(entry.cron.as_str()).with_context(|| {
+                    format!(
+                        "[[schedule]] `{}` cannot be expressed as an EventBridge cron",
+                        entry.name
+                    )
+                })?;
+                let rule = format!("skyzen-{function}--{}", entry.name.as_str());
+                anyhow::ensure!(
+                    rule.len() <= 64,
+                    "the EventBridge rule `{rule}` is {} characters; AWS allows 64 — shorten \
+                     the schedule or function name",
+                    rule.len()
+                );
+            }
             let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
             child_env = prepared.child_env;
-            let mut steps = vec![
-                Step::Command(build_command(&config, &root_dir, true)),
-                Step::Command(deploy_command(&config, &root_dir, &binary)),
-            ];
             let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
-            if !delivery.is_empty() {
-                steps.push(Step::Task(Box::new(LambdaEnvironment::new(
-                    function, delivery,
-                ))));
-            }
-            steps
+            // The whole transition is one transaction: rules an earlier deploy made still
+            // invoke the unqualified function — migration moves them onto the alias, then
+            // the upload swaps `$LATEST`, then reconciliation publishes, delivers the
+            // environment and re-enables — and a failure at any stage restores the rules.
+            vec![
+                Step::Command(build_command(&config, &root_dir, true)),
+                Step::Task(Box::new(MigrateSchedulesToAlias::new(
+                    function,
+                    manifest.data().schedule.clone(),
+                    child_env.clone(),
+                    delivery,
+                    deploy_command(&config, &root_dir, &binary),
+                ))),
+            ]
         }
         Action::Logs { wrangler_args } => {
             vec![Step::Command(logs_command(
@@ -79,7 +103,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
                 wrangler_args,
             ))]
         }
-        Action::Secret(secret) => vec![secret_step(secret, manifest, &config, function)?],
+        Action::Secret(secret) => secret_steps(secret, manifest, &config, function)?,
         other => anyhow::bail!(
             "`skyzen {}` has no AWS implementation{}",
             super::action_name(other),
@@ -107,32 +131,62 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
 /// # Errors
 ///
 /// Fails when a declared variable is set nowhere, or when there is nothing at all to push.
-fn secret_step(
+fn secret_steps(
     action: &SecretAction,
     manifest: &Manifest,
     config: &AwsSection,
     function: String,
-) -> Result<Step> {
+) -> Result<Vec<Step>> {
+    // `.env` credentials ride `child_env`; resolving every declared variable is *not* part of
+    // that — the secret being set is usually the one that is missing, and `unwrap_or_default`
+    // would discard the credentials along with the failure.
+    let env = crate::environment::Environment::load(manifest.root_dir())
+        .map(|loaded| loaded.child_overrides())
+        .unwrap_or_default();
+    // Delivery writes `$LATEST`; the cutover repoints `skyzen` so the schedules — the only
+    // path that reads a frozen version — pick the rotation up too.
+    let cutover_function = function.clone();
+    let cutover = move |env: Vec<(String, String)>, delivered: Vec<String>| {
+        Step::Task(
+            Box::new(CutoverAlias::new(cutover_function.clone(), env, delivered)) as Box<dyn Task>,
+        )
+    };
     let delivery = match action {
         SecretAction::Set { name, value } => Delivery::one(name.as_str(), value),
         SecretAction::Push => {
-            let resolved = prepare_child_environment(manifest, VariableKind::ALL)?.resolved;
-            let delivery = Delivery::from_resolved(&resolved).with_defaults(&config.env);
+            let prepared = prepare_child_environment(manifest, VariableKind::ALL)?;
+            let delivery = Delivery::from_resolved(&prepared.resolved).with_defaults(&config.env);
             if delivery.is_empty() {
                 anyhow::bail!(
                     "there is nothing to push: Skyzen.toml declares no [[secret]], no native \
                      wiring variable and no [aws.env] entry"
                 );
             }
-            delivery
+            let delivered = delivery.keys();
+            return Ok(vec![
+                Step::Task(Box::new(LambdaEnvironment::new(
+                    function,
+                    delivery,
+                    prepared.child_env.clone(),
+                ))),
+                cutover(prepared.child_env, delivered),
+            ]);
         }
         SecretAction::List => {
-            return Ok(Step::Task(Box::new(LambdaEnvironmentNames::new(function))))
+            return Ok(vec![Step::Task(Box::new(LambdaEnvironmentNames::new(
+                function, env,
+            )))]);
         }
     };
-    Ok(Step::Task(Box::new(LambdaEnvironment::new(
-        function, delivery,
-    ))))
+    let delivered = delivery.keys();
+    Ok(vec![
+        Step::Task(Box::new(LambdaEnvironment::new(
+            function,
+            delivery,
+            env.clone(),
+        ))),
+        cutover(env, delivered),
+    ])
 }
 
 /// The function a deploy acts on: the manifest's name, or the binary's own.
@@ -379,7 +433,9 @@ mod tests {
              [aws.env]\nRUST_LOG = \"info\"\n",
         );
 
-        assert_eq!(planned.len(), 3, "{planned:?}");
+        // One transaction step: the embedded deploy command stays visible in its
+        // description, so `--dry-run` and the log show the whole plan.
+        assert_eq!(planned.len(), 2, "{planned:?}");
         assert!(planned[0].contains("cargo lambda build"), "{planned:?}");
 
         let deploy = &planned[1];
@@ -389,7 +445,7 @@ mod tests {
         // humantime in, seconds out: that is the unit Lambda takes.
         assert!(deploy.contains("--timeout 45"), "{deploy}");
         assert!(deploy.contains("--enable-function-url"), "{deploy}");
-        assert!(deploy.ends_with("skyzen-api)"), "{deploy}");
+        assert!(deploy.contains("skyzen-api"), "{deploy}");
     }
 
     #[test]
@@ -426,13 +482,15 @@ mod tests {
             &project(),
         )
         .expect("plan");
-        let last = plan
+        // Environment delivery rides inside the reconciliation task, which is the deploy's
+        // last step: suspension, delivery and rule wiring are one transaction there.
+        let described = plan
             .steps
             .last()
+            .map(Step::describe)
             .expect("a deploy delivers its environment");
-        let described = last.describe();
 
-        assert!(matches!(last, Step::Task(_)), "{described}");
+        assert!(described.contains("environment"), "{described}");
         assert!(described.contains("skyzen-api"), "{described}");
         assert!(described.contains("RUST_LOG"), "{described}");
         assert!(described.contains("STRIPE_KEY"), "{described}");

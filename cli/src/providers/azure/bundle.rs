@@ -6,7 +6,9 @@
 use crate::providers::{FileContents, GeneratedFile};
 use anyhow::{Context, Result};
 use serde::Serialize;
-use skyzen_manifest::{AzureQueueTrigger, AzureSection, HTTP_FUNCTION_NAME};
+use skyzen_manifest::{
+    AzureQueueTrigger, AzureScheduleSection, AzureSection, ScheduleEntry, HTTP_FUNCTION_NAME,
+};
 use std::{collections::BTreeMap, path::Path};
 
 /// The `function.json` schema version every Functions app declares.
@@ -28,13 +30,14 @@ const EXTENSION_BUNDLE_VERSION: &str = "[4.0.0, 5.0.0)";
 /// longer describe JSON.
 pub fn render(
     config: &AzureSection,
+    schedules: &[ScheduleEntry],
     binary: &str,
     bundle_dir: &Path,
 ) -> Result<Vec<GeneratedFile>> {
     let mut files = vec![
         GeneratedFile {
             path: bundle_dir.join("host.json"),
-            contents: FileContents::Public(to_json(&HostJson::new(config, binary))?),
+            contents: FileContents::Public(to_json(&HostJson::new(config, schedules, binary))?),
         },
         GeneratedFile {
             path: bundle_dir.join("local.settings.json"),
@@ -56,7 +59,82 @@ pub fn render(
         });
     }
 
+    for schedule in schedules {
+        files.push(GeneratedFile {
+            path: bundle_dir
+                .join(schedule.name.as_str())
+                .join("function.json"),
+            contents: FileContents::Public(to_json(&FunctionJson::timer(
+                schedule,
+                config
+                    .schedule
+                    .iter()
+                    // `validate_schedules` matches override keys case-insensitively; the lookup
+                    // has to match the same way or a differently-cased table parses but never
+                    // applies.
+                    .find(|(name, _)| name.eq_ignore_ascii_case(schedule.name.as_str()))
+                    .map(|(_, override_)| override_),
+            ))?),
+        });
+    }
+
+    // The bundle directory persists between deploys, so a schedule or trigger removed from
+    // the manifest would keep deploying — and keep firing — forever. Everything this renderer
+    // produces lives in a `{function}/function.json`, so a directory holding one whose name is
+    // no longer declared is unambiguously stale; `func publish` never learns it should exist.
+    let declared: std::collections::BTreeSet<String> = files
+        .iter()
+        .filter_map(|file| {
+            (file.path.extension() == Some(std::ffi::OsStr::new("json"))
+                && file.path.file_name()? == "function.json")
+                .then(|| {
+                    file.path
+                        .parent()
+                        .and_then(|dir| dir.file_name())
+                        .and_then(std::ffi::OsStr::to_str)
+                        .map(ToOwned::to_owned)
+                })?
+        })
+        .collect();
+    retire_stale_functions(bundle_dir, &declared)?;
+
     Ok(files)
+}
+
+/// Remove generated function directories the manifest no longer declares.
+///
+/// A directory that cannot be listed or removed is a hard failure: leaving it would publish
+/// a timer the manifest no longer declares, which is worse than the deploy failing loudly.
+fn retire_stale_functions(
+    bundle_dir: &Path,
+    declared: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let entries = match std::fs::read_dir(bundle_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not list {}", bundle_dir.display()))
+        }
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("could not list {}", bundle_dir.display()))?;
+        let path = entry.path();
+        let stale = path.is_dir()
+            && path.join("function.json").is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| !declared.contains(name));
+        if stale {
+            std::fs::remove_dir_all(&path).with_context(|| {
+                format!(
+                    "could not remove stale Functions directory {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Serialize one document, with the trailing newline every generated file gets.
@@ -79,16 +157,23 @@ struct HostJson<'a> {
 }
 
 impl<'a> HostJson<'a> {
-    fn new(config: &AzureSection, binary: &'a str) -> Self {
+    fn new(config: &AzureSection, schedules: &[ScheduleEntry], binary: &'a str) -> Self {
         Self {
             version: HOST_VERSION,
             custom_handler: CustomHandler {
                 description: HandlerDescription {
                     default_executable_path: binary,
                 },
-                // Exactly one of the two forwarding keys, named by the manifest: the host ignores
-                // the one it is not given, and setting both would leave which wins to the host.
-                forwarding: BTreeMap::from([(config.http_mode.host_json_key(), true)]),
+                // Exactly one of the two forwarding keys, named by the manifest — but only when
+                // no trigger functions exist. Forwarding delivers the client's *raw* request to
+                // `/{function}`, indistinguishable from a trigger invocation, so with any
+                // trigger present the host must wrap every request in `Data.{binding}` —
+                // `req` for HTTP — where a client body can never reach the top level.
+                forwarding: if config.queue_triggers.is_empty() && schedules.is_empty() {
+                    BTreeMap::from([(config.http_mode.host_json_key(), true)])
+                } else {
+                    BTreeMap::new()
+                },
             },
             extension_bundle: ExtensionBundle {
                 id: EXTENSION_BUNDLE_ID,
@@ -116,7 +201,9 @@ impl<'a> HostJson<'a> {
 #[derive(Debug, Serialize)]
 struct CustomHandler<'a> {
     description: HandlerDescription<'a>,
-    /// `enableForwardingHttpRequest` or `enableProxyingHttpRequest`, whichever the manifest asked
+    /// `enableForwardingHttpRequest` or `enableProxyingHttpRequest`, whichever the manifest
+    /// asked for — omitted when trigger functions exist, so the host wraps HTTP requests in
+    /// the `req` binding and a crafted body can never reach `Data.timer` or `Data.message`.
     /// for. A map because the *key* is the choice.
     #[serde(flatten)]
     forwarding: BTreeMap<&'static str, bool>,
@@ -208,6 +295,8 @@ impl FunctionJson {
                     ),
                     queue_name: None,
                     connection: None,
+                    schedule: None,
+                    run_on_startup: None,
                 },
                 Binding {
                     kind: "http",
@@ -218,6 +307,8 @@ impl FunctionJson {
                     methods: None,
                     queue_name: None,
                     connection: None,
+                    schedule: None,
+                    run_on_startup: None,
                 },
             ],
         }
@@ -238,9 +329,82 @@ impl FunctionJson {
                 methods: None,
                 queue_name: Some(trigger.queue.clone()),
                 connection: Some(trigger.connection_env.clone()),
+                schedule: None,
+                run_on_startup: None,
             }],
         }
     }
+
+    /// One `[[schedule]]`, as a Functions `timerTrigger`.
+    ///
+    /// The binding name is `timer` — the key the invocation's `Data` carries, which is what the
+    /// runtime reads the `TimerInfo` out of. The schedule is NCRONTAB, the six-field form the
+    /// host wants: the portable five-field expression with a leading seconds `0`, and Sunday
+    /// renumbered 7→0 where the user spelled it numerically.
+    fn timer(schedule: &ScheduleEntry, azure: Option<&AzureScheduleSection>) -> Self {
+        Self {
+            bindings: vec![Binding {
+                kind: "timerTrigger",
+                direction: "in",
+                name: "timer",
+                auth_level: None,
+                route: None,
+                methods: None,
+                queue_name: None,
+                connection: None,
+                schedule: Some(ncrontab(schedule.cron.as_str())),
+                run_on_startup: azure.and_then(|section| section.run_on_startup.then_some(true)),
+            }],
+        }
+    }
+}
+
+/// The NCRONTAB form of a portable cron: a leading seconds `0`, and day-of-week renumbered the
+/// way NCRONTAB counts it.
+///
+/// The portable grammar numbers days `1`–`7` Sunday through Saturday (Cloudflare's convention);
+/// NCRONTAB numbers them `0`–`6`. Every numeric item in the field — single values, range ends,
+/// and lists — shifts down by one. Names (`SUN`) and `*` need no remapping: both dialects speak
+/// them already.
+fn ncrontab(cron: &str) -> String {
+    let fields: Vec<&str> = cron.split_whitespace().collect();
+    let dow = fields.get(4).map_or_else(
+        || "?".to_owned(),
+        |field| {
+            field
+                .split(',')
+                .map(|item| {
+                    // A step suffix belongs to the whole item, not its last range end — pull it
+                    // off first, translate the range, then put it back.
+                    let (range, step) = item
+                        .split_once('/')
+                        .map_or((item, ""), |(range, step)| (range, step));
+                    let translated = range
+                        .split('-')
+                        .map(|part| {
+                            part.parse::<u8>()
+                                .map_or_else(|_| part.to_owned(), |number| (number - 1).to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("-");
+                    if step.is_empty() {
+                        translated
+                    } else {
+                        format!("{translated}/{step}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+
+    format!(
+        "0 {minute} {hour} {dom} {month} {dow}",
+        minute = fields.first().copied().unwrap_or("*"),
+        hour = fields.get(1).copied().unwrap_or("*"),
+        dom = fields.get(2).copied().unwrap_or("*"),
+        month = fields.get(3).copied().unwrap_or("*"),
+    )
 }
 
 /// One entry of a function's `bindings` array.
@@ -264,6 +428,10 @@ struct Binding {
     queue_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     connection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule: Option<String>,
+    #[serde(rename = "runOnStartup", skip_serializing_if = "Option::is_none")]
+    run_on_startup: Option<bool>,
 }
 
 #[cfg(test)]
@@ -282,8 +450,10 @@ mod tests {
     }
 
     fn rendered(source: &str) -> Vec<(PathBuf, serde_json::Value)> {
+        let manifest = Manifest::parse(source, "Skyzen.toml", "/tmp/app").expect("valid manifest");
         render(
             &config(source),
+            &manifest.data().schedule,
             "demo",
             Path::new("/tmp/app/.skyzen/gen/azure"),
         )
@@ -395,6 +565,51 @@ mod tests {
         // Exactly one binding, which is what lets the runtime read the message without agreeing
         // on its name.
         assert_eq!(queue["bindings"].as_array().expect("bindings").len(), 1);
+    }
+
+    #[test]
+    fn a_schedule_gets_its_own_timer_function() {
+        let files = rendered(
+            "[azure]\n\n[[schedule]]\nname = \"tick\"\ncron = \"*/10 9-17 * * MON-FRI\"\n",
+        );
+
+        let timer = document(&files, "tick/function.json");
+        let binding = &timer["bindings"][0];
+        assert_eq!(binding["type"], "timerTrigger");
+        assert_eq!(binding["name"], "timer");
+        // NCRONTAB: a leading seconds `0`, the portable fields carried over.
+        assert_eq!(binding["schedule"], "0 */10 9-17 * * MON-FRI");
+        assert!(binding["runOnStartup"].is_null());
+    }
+
+    #[test]
+    fn every_numeric_weekday_shifts_down_one_for_ncrontab() {
+        // Portable `1`–`7` is Sunday–Saturday (saffron/Cloudflare); NCRONTAB is `0`–`6`.
+        assert_eq!(super::ncrontab("0 9 * * 1"), "0 0 9 * * 0");
+        assert_eq!(super::ncrontab("0 9 * * 7"), "0 0 9 * * 6");
+        assert_eq!(super::ncrontab("0 9 * * 2-6"), "0 0 9 * * 1-5");
+        assert_eq!(super::ncrontab("0 9 * * 1-7"), "0 0 9 * * 0-6");
+        assert_eq!(super::ncrontab("0 9 * * 1,4,7"), "0 0 9 * * 0,3,6");
+        assert_eq!(super::ncrontab("0 9 * * SUN"), "0 0 9 * * SUN");
+        assert_eq!(super::ncrontab("0 9 * * MON-FRI"), "0 0 9 * * MON-FRI");
+        assert_eq!(super::ncrontab("0 9 * * */2"), "0 0 9 * * */2");
+
+        // A step suffix is the item's own, not its last range end's: `2-6/2` is every other
+        // day Monday–Friday, and `1-7/2` must not smuggle a `7` through.
+        assert_eq!(super::ncrontab("0 9 * * 2-6/2"), "0 0 9 * * 1-5/2");
+        assert_eq!(super::ncrontab("0 9 * * 1-7/2"), "0 0 9 * * 0-6/2");
+        assert_eq!(super::ncrontab("0 9 * * 4/3"), "0 0 9 * * 3/3");
+    }
+
+    #[test]
+    fn run_on_startup_is_emitted_when_the_manifest_asks() {
+        let files = rendered(
+            "[azure]\n\n[[schedule]]\nname = \"warm\"\ncron = \"0 * * * *\"\n\n\
+             [azure.schedule.warm]\nrun_on_startup = true\n",
+        );
+
+        let timer = document(&files, "warm/function.json");
+        assert_eq!(timer["bindings"][0]["runOnStartup"], true);
     }
 
     #[test]

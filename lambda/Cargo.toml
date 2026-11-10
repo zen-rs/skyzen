@@ -12,6 +12,9 @@ categories = ["web-programming::http-server"]
 [dependencies]
 aws_lambda_events = { version = "1.2", default-features = false, features = ["sqs"] }
 base64 = "0.22"
+# EventBridge's `time` is ISO-8601 text; the scheduled handler's `scheduled_time_ms` wants the
+# epoch milliseconds it names.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 futures-util = "0.3.32"
 http = "1.4"
 http-kit.workspace = true

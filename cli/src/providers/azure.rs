@@ -70,7 +70,7 @@ pub fn prepare(action: &Action, manifest: &Manifest, project: &Project) -> Resul
         });
     }
 
-    let files = bundle::render(&config, &binary, &bundle_dir)?;
+    let files = bundle::render(&config, &manifest.data().schedule, &binary, &bundle_dir)?;
     let build = HandlerBuild {
         root_dir,
         target: config.target.clone(),

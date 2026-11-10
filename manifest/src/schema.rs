@@ -187,6 +187,14 @@ pub struct SkyzenManifest {
     /// `[[secret]]` — values delivered to the deployed application at runtime.
     #[serde(default)]
     pub secret: Vec<SecretEntry>,
+    /// `[[schedule]]` — portable cron schedules driving the `#[skyzen::scheduled]` handler.
+    ///
+    /// One declaration is rendered per target: Skyzen's own timer loop natively, an `EventBridge`
+    /// rule on AWS, a `timerTrigger` function on Azure, and a `triggers.crons` entry on
+    /// Cloudflare. `[cloudflare.triggers] crons` remains as the Cloudflare-only form for a
+    /// schedule that must not exist on the other targets.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleEntry>,
     /// `[native]` — how the portable capabilities are backed on native targets.
     #[serde(default)]
     pub native: Option<NativeSection>,
@@ -223,6 +231,340 @@ pub struct ServiceEntry {
 pub struct SecretEntry {
     /// The secret's name, which is also the name the application reads it under.
     pub name: VarName,
+}
+
+/// One `[[schedule]]` entry — a cron schedule every target drives the same handler with.
+///
+/// `name` doubles as the per-provider resource name: the Functions name on Azure and the
+/// `EventBridge` rule name's suffix on AWS, which is why it is a [`ScheduleName`] rather than a
+/// free `String`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleEntry {
+    /// The schedule's name, which `ScheduledTick`'s consumers see in logs and which providers
+    /// embed in the resource they create.
+    pub name: ScheduleName,
+    /// The cron expression, in portable 5-field standard cron (`minute hour day-of-month month
+    /// day-of-week`). The CLI translates it per provider at deploy time.
+    pub cron: CronExpr,
+}
+
+/// The name of a `[[schedule]]` entry — `[A-Za-z][A-Za-z0-9_-]*`.
+///
+/// The strictest provider rule is Azure's Functions name (a letter, then letters, digits,
+/// hyphens and underscores); satisfying it here keeps the name usable on every target, and an
+/// invalid one fails the parse rather than a deploy.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ScheduleName(Cow<'static, str>);
+
+impl ScheduleName {
+    /// The name as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `name` is a well-formed schedule name.
+    fn is_valid(name: &str) -> bool {
+        let mut characters = name.chars();
+        characters
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic())
+            && characters.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+    }
+}
+
+/// A string that is not a well-formed schedule name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "`{name}` is not a valid schedule name: it must start with a letter and contain only \
+     letters, digits, hyphens and underscores (the name also becomes a Functions name on Azure \
+     and an EventBridge rule name on AWS)"
+)]
+pub struct InvalidScheduleName {
+    /// The rejected text.
+    pub name: String,
+}
+
+impl TryFrom<String> for ScheduleName {
+    type Error = InvalidScheduleName;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if Self::is_valid(&name) {
+            Ok(Self(Cow::Owned(name)))
+        } else {
+            Err(InvalidScheduleName { name })
+        }
+    }
+}
+
+impl Display for ScheduleName {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for ScheduleName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for ScheduleName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+/// A cron expression in portable 5-field standard cron.
+///
+/// Validation runs at parse time, so `#[skyzen::main]` and the CLI reject the same expression in
+/// the same words: exactly five fields (`minute hour day-of-month month day-of-week`), each a
+/// form [`saffron`] accepts — `*`, `,`, `-`, `/` and the `JAN`–`DEC`/`SUN`–`SAT` names — and an
+/// expression that can match at least one instant (`0 0 31 2 *` is refused, not silently never
+/// fired).
+///
+/// `?`, `L`, `W`, `#` and a seconds/year field are deliberately rejected: they belong to the
+/// provider dialects (`EventBridge`, `NCRONTAB`), not to the portable syntax the CLI translates.
+///
+/// [`saffron`]: https://docs.rs/saffron
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct CronExpr(Cow<'static, str>);
+
+impl CronExpr {
+    /// The expression as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The parsed schedule, for computing fire times.
+    ///
+    /// A `CronExpr` has already been validated, so this exists for consumers that want the
+    /// `saffron` value rather than re-parsing defensively.
+    ///
+    /// # Errors
+    ///
+    /// [`saffron::parse::CronParseError`] — unreachable for a value that passed `TryFrom`, and
+    /// returned rather than panicking so a hand-built `CronExpr` cannot crash a runtime loop.
+    pub fn parse(&self) -> Result<saffron::Cron, saffron::parse::CronParseError> {
+        self.0.parse()
+    }
+
+    /// Whether `text` is a valid portable cron expression.
+    fn is_valid(text: &str) -> bool {
+        // The portable syntax is exactly five fields; saffron would also accept a leading
+        // seconds field, which is the provider dialect this type exists to exclude.
+        if text.split_whitespace().count() != 5 {
+            return false;
+        }
+        text.split([' ', ',', '-', '/']).all(|atom| {
+            atom.is_empty()
+                || atom == "*"
+                || atom.chars().all(|c| c.is_ascii_digit())
+                || PORTABLE_CRON_NAMES.contains(&atom.to_uppercase().as_str())
+        }) && text.parse::<saffron::Cron>().is_ok_and(|cron| cron.any())
+    }
+}
+
+/// The month and weekday names the portable cron grammar keeps.
+///
+/// Saffron parses the Cloudflare extensions — `L`, `W`, `#`, `?` — which the other providers
+/// cannot read. The portable syntax keeps only these names, digits and the `*`, `,`, `-`, `/`
+/// operators.
+const PORTABLE_CRON_NAMES: [&str; 19] = [
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC", "SUN",
+    "MON", "TUE", "WED", "THU", "FRI", "SAT",
+];
+
+/// A string that is not a valid portable cron expression.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "`{expression}` is not a valid cron expression: the portable syntax is five fields \
+     (`minute hour day-of-month month day-of-week`) of standard cron, and it must be able to \
+     match at least one instant. Provider dialects (`?`, `L`, `W`, `#`, a seconds or year \
+     field) are not portable — write the standard form and let the CLI translate it"
+)]
+pub struct InvalidCronExpr {
+    /// The rejected text.
+    pub expression: String,
+}
+
+impl TryFrom<String> for CronExpr {
+    type Error = InvalidCronExpr;
+
+    fn try_from(expression: String) -> Result<Self, Self::Error> {
+        if Self::is_valid(&expression) {
+            Ok(Self(Cow::Owned(expression)))
+        } else {
+            Err(InvalidCronExpr { expression })
+        }
+    }
+}
+
+impl Display for CronExpr {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for CronExpr {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for CronExpr {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+/// Why a `[[schedule]]` entry cannot be used.
+///
+/// Checked when the manifest is parsed, so `#[skyzen::main]` reports it as a compile error and
+/// the CLI reports it before generating anything — one rule, both consumers.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ScheduleError {
+    /// The name is the one the catch-all HTTP function already uses.
+    #[error(
+        "[[schedule]] `{name}` is the name Skyzen gives the catch-all HTTP function; a schedule \
+         with that name would replace it, leaving the application with no HTTP surface"
+    )]
+    Reserved {
+        /// The rejected name.
+        name: String,
+    },
+    /// Two entries claim one name, and therefore one Functions directory, one `EventBridge`
+    /// rule and one native loop.
+    #[error("[[schedule]] declares `{name}` twice; each entry is a distinct schedule")]
+    Duplicate {
+        /// The name declared more than once.
+        name: String,
+    },
+    /// Two entries claim one cron.
+    ///
+    /// On Cloudflare two entries sharing a cron collapse to a single trigger — Cloudflare fires
+    /// per cron, not per schedule — while the other targets would still fire both. Rejecting the
+    /// duplicate keeps one cron meaning one schedule on every target.
+    #[error(
+        "[[schedule]] declares the cron `{cron}` twice; on Cloudflare that would be a single \
+         trigger firing once where the other targets fire twice — give the second schedule its \
+         own expression or merge the entries"
+    )]
+    DuplicateCron {
+        /// The cron declared more than once.
+        cron: String,
+    },
+    /// A schedule names a function a queue trigger already owns on Azure.
+    #[error(
+        "[[schedule]] `{name}` shares its name with the `[[azure.queue_triggers]]` function of \
+         the same name; on Azure both would write the same `function.json`"
+    )]
+    TriggerCollision {
+        /// The colliding name.
+        name: String,
+    },
+    /// An `[azure.schedule.<name>]` table names a schedule the manifest never declared.
+    ///
+    /// A typo here would be silently dropped by the bundle render — the override has to name a
+    /// real `[[schedule]]` to mean anything.
+    #[error(
+        "[azure.schedule.{name}] overrides a schedule the manifest never declares; rename the \
+         table or add [[schedule]] name = \"{name}\""
+    )]
+    UnknownOverride {
+        /// The unmatched override name.
+        name: String,
+    },
+    /// Two `[azure.schedule.<name>]` tables differ only in case, and override lookup is
+    /// case-insensitive — one of them could never take effect.
+    #[error(
+        "[azure.schedule] declares `{name}` twice, once in each case; overrides match \
+         [[schedule]] names case-insensitively, so only one of the two tables can ever apply"
+    )]
+    DuplicateOverride {
+        /// The duplicated name.
+        name: String,
+    },
+}
+
+impl SkyzenManifest {
+    /// Check the `[[schedule]]` entries against each other and the reserved names.
+    ///
+    /// The name is a Functions function on Azure and an `EventBridge` rule on AWS — one name is
+    /// one schedule everywhere, so a duplicate name, a duplicate cron or a collision with the
+    /// platform's own function names fails the parse rather than one provider's shadowing the
+    /// other.
+    ///
+    /// # Errors
+    ///
+    /// [`ScheduleError`] naming the first entry that cannot be used.
+    pub fn validate_schedules(&self) -> Result<(), ScheduleError> {
+        let mut claimed_names = std::collections::BTreeSet::new();
+        let mut claimed_crons = std::collections::BTreeSet::new();
+        let queue_functions: std::collections::BTreeSet<String> = self
+            .azure
+            .as_ref()
+            .map(|azure| {
+                azure
+                    .queue_triggers
+                    .iter()
+                    .map(|trigger| trigger.function.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for entry in &self.schedule {
+            let name = entry.name.as_str();
+            // Case-insensitive, for the same reason `validate_queue_triggers` is: the Functions
+            // bundle is a directory tree, which a case-insensitive filesystem collides on.
+            let lower = name.to_ascii_lowercase();
+            if lower == HTTP_FUNCTION_NAME {
+                return Err(ScheduleError::Reserved {
+                    name: name.to_owned(),
+                });
+            }
+            if !claimed_names.insert(lower.clone()) {
+                return Err(ScheduleError::Duplicate {
+                    name: name.to_owned(),
+                });
+            }
+            if queue_functions.contains(&lower) {
+                return Err(ScheduleError::TriggerCollision {
+                    name: name.to_owned(),
+                });
+            }
+            if !claimed_crons.insert(entry.cron.as_str().to_owned()) {
+                return Err(ScheduleError::DuplicateCron {
+                    cron: entry.cron.as_str().to_owned(),
+                });
+            }
+        }
+        if let Some(azure) = &self.azure {
+            if let Some(name) = azure
+                .schedule
+                .keys()
+                .find(|name| !claimed_names.contains(&name.to_ascii_lowercase()))
+            {
+                return Err(ScheduleError::UnknownOverride { name: name.clone() });
+            }
+            // Overrides match names case-insensitively, so `Tick` and `tick` would both match
+            // the same schedule — and whichever one the map order surfaced would win with no
+            // sign the other was ever read.
+            let mut claimed_overrides = std::collections::BTreeSet::new();
+            for name in azure.schedule.keys() {
+                if !claimed_overrides.insert(name.to_ascii_lowercase()) {
+                    return Err(ScheduleError::DuplicateOverride { name: name.clone() });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The portable service kinds a `[[service]]` entry can declare.
@@ -1420,6 +1762,22 @@ pub struct AzureSection {
     /// `[[azure.queue_triggers]]` — Storage queue triggers the host drives.
     #[serde(default)]
     pub queue_triggers: Vec<AzureQueueTrigger>,
+    /// `[azure.schedule.<name>]` — per-schedule Azure overrides, keyed by the `[[schedule]]` name.
+    ///
+    /// A `[[schedule]]` entry needs no entry here to deploy: the table only carries the knobs
+    /// NCRONTAB does not share with portable cron, such as firing when the host starts.
+    #[serde(default)]
+    pub schedule: BTreeMap<String, AzureScheduleSection>,
+}
+
+/// `[azure.schedule.<name>]` — Azure-specific options for one `[[schedule]]` entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AzureScheduleSection {
+    /// `runOnStartup` in the generated `function.json`: fire the timer once when the host
+    /// starts, in addition to every scheduled occurrence. Unset means off.
+    #[serde(default)]
+    pub run_on_startup: bool,
 }
 
 /// How the Functions host delivers an HTTP-trigger request to a custom handler.

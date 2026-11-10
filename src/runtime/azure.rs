@@ -11,6 +11,9 @@
 //!   envelope. Nothing in a router would recognize that, so [`mount`] wraps the application's
 //!   endpoint in one that intercepts exactly the declared function names and drives the
 //!   `#[skyzen::queue]` handler with them.
+//! - A **timer trigger** arrives through the same `POST /{functionName}` envelope shape, its
+//!   `Data` carrying the `TimerInfo` the `timerTrigger` binding declared. [`mount`] intercepts
+//!   it the same way and drives the `#[skyzen::scheduled]` handler.
 //!
 //! The interception is live *only* under `FUNCTIONS_CUSTOMHANDLER_PORT`: the same binary run
 //! locally serves those paths from the router like any other, because nothing else is POSTing
@@ -26,14 +29,15 @@ use std::{
 
 use http_kit::{Body, Endpoint, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use skyzen_services::queue::{
-    envelope, QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition,
+use skyzen_services::{
+    queue::{envelope, QueueBatch, QueueBatchDisposition, QueueMessage, QueueMessageDisposition},
+    ScheduledTick,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::{
-    routing::{MethodFilter, ServedRoutes},
-    runtime::consumer::ConsumerSet,
+    routing::ServedRoutes,
+    runtime::{consumer::ConsumerSet, scheduler::ScheduleSet},
 };
 
 /// The environment variable the Functions host sets, and the signal that we are running under it.
@@ -51,6 +55,20 @@ pub struct QueueTrigger {
     pub queue: &'static str,
 }
 
+/// One `[[schedule]]` entry, as the Azure Functions host drives it.
+///
+/// Every declared schedule is a `timerTrigger` function of its own: `function` is both the
+/// Functions name and the path the host POSTs its ticks to, and `cron` is the portable
+/// expression the manifest wrote — reported to the handler as [`ScheduledTick::cron`] so it
+/// reads the same on every target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledTrigger {
+    /// The Function name, which is the path the host POSTs the tick to.
+    pub function: &'static str,
+    /// The portable 5-field cron expression, reported to the handler as [`ScheduledTick::cron`].
+    pub cron: &'static str,
+}
+
 /// Why an application cannot be served under the Functions host.
 ///
 /// Every variant is a wiring mistake that no request will fix, so the runtime refuses to start
@@ -62,17 +80,16 @@ pub enum MountError {
         /// The first offending function, named so the error points somewhere.
         function: String,
     },
+    /// The manifest declares a `[[schedule]]` but the application has no
+    /// `#[skyzen::scheduled]` handler for it.
+    NoScheduledHandler {
+        /// The first offending function, named so the error points somewhere.
+        function: String,
+    },
     /// Two triggers claim the same function name, so one would shadow the other.
     DuplicateFunction {
         /// The name declared twice.
         function: String,
-    },
-    /// A trigger's path is already served by a route of the application's own.
-    RouteCollision {
-        /// The function whose path is taken.
-        function: String,
-        /// The route pattern that takes it.
-        route: String,
     },
 }
 
@@ -84,16 +101,15 @@ impl core::fmt::Display for MountError {
                 "[[azure.queue_triggers]] declares the function `{function}`, but this application \
                  has no #[skyzen::queue] handler to give its messages to"
             ),
+            Self::NoScheduledHandler { function } => write!(
+                f,
+                "[[schedule]] declares `{function}`, but this application has no \
+                 #[skyzen::scheduled] handler to give its ticks to"
+            ),
             Self::DuplicateFunction { function } => write!(
                 f,
-                "[[azure.queue_triggers]] declares the function `{function}` twice; every \
-                 Functions name is a distinct URL path, so one would shadow the other"
-            ),
-            Self::RouteCollision { function, route } => write!(
-                f,
-                "[[azure.queue_triggers]] declares the function `{function}`, whose queue \
-                 messages arrive at `/{function}` — which this application already serves as \
-                 `{route}`. Rename the function, or the route"
+                "the manifest declares the function `{function}` twice; every Functions name is \
+                 a distinct URL path, so one would shadow the other"
             ),
         }
     }
@@ -101,23 +117,30 @@ impl core::fmt::Display for MountError {
 
 impl std::error::Error for MountError {}
 
-/// Wrap `endpoint` so the declared queue triggers are answered before it sees them.
+/// Wrap `endpoint` so the declared triggers are answered before it sees them.
+///
+/// Queue and timer triggers share one table of function names — a Functions app cannot declare
+/// two functions with one name — so a name claimed in either list is a [`MountError`], whether
+/// it collides with its own kind or the other.
 ///
 /// # Errors
 ///
 /// [`MountError`] when a trigger has no handler behind it, when two triggers share a name, or when
 /// a trigger's path is one the application already serves as a literal route.
-pub fn mount<E, C>(
+pub fn mount<E, C, S>(
     endpoint: E,
     consumers: C,
-    triggers: &'static [QueueTrigger],
-) -> Result<FunctionsHost<E, C>, MountError>
+    schedules: S,
+    queue_triggers: &'static [QueueTrigger],
+    scheduled_triggers: &'static [ScheduledTrigger],
+) -> Result<FunctionsHost<E, C, S>, MountError>
 where
     E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     let mut seen = BTreeMap::new();
-    for trigger in triggers {
+    for trigger in queue_triggers {
         if !C::DECLARES_HANDLER {
             return Err(MountError::NoQueueHandler {
                 function: trigger.function.to_owned(),
@@ -128,7 +151,6 @@ where
                 function: trigger.function.to_owned(),
             });
         }
-        check_route_collision(trigger, endpoint.served_routes())?;
         info!(
             function = trigger.function,
             queue = trigger.queue,
@@ -136,114 +158,360 @@ where
             trigger.function
         );
     }
+    for trigger in scheduled_triggers {
+        if !S::DECLARES_HANDLER {
+            return Err(MountError::NoScheduledHandler {
+                function: trigger.function.to_owned(),
+            });
+        }
+        if seen.insert(trigger.function, trigger.cron).is_some() {
+            return Err(MountError::DuplicateFunction {
+                function: trigger.function.to_owned(),
+            });
+        }
+        info!(
+            function = trigger.function,
+            cron = trigger.cron,
+            "serving an Azure Functions timer trigger at POST /{}",
+            trigger.function
+        );
+    }
 
     Ok(FunctionsHost {
         endpoint,
         consumers: Arc::new(consumers),
-        triggers,
+        schedules: Arc::new(schedules),
+        queue_triggers,
+        scheduled_triggers,
     })
 }
 
-/// Refuse a trigger whose path the application already serves, and warn when it only might.
+/// An application wrapped for the Functions host: declared triggers first, then everything else.
 ///
-/// The distinction is what `matchit` would do with the request: a literal route for the same path
-/// is shadowed outright and is a mistake worth refusing to start over, whereas a parameterized or
-/// catch-all route merely loses one of the many paths it matches — which is sometimes exactly what
-/// the author intended, and is never silent.
-fn check_route_collision(
-    trigger: &QueueTrigger,
-    routes: &[(MethodFilter, String)],
-) -> Result<(), MountError> {
-    let path = format!("/{}", trigger.function);
-    let mut table = matchit::Router::new();
-    for (_, route) in routes {
-        // A path registered for several methods is one path here, and two routes that `matchit`
-        // considers the same are the router's own problem, reported when it was built.
-        let _ = table.insert(route.as_str(), route.clone());
-    }
-
-    let Ok(shadowed) = table.at(&path) else {
-        return Ok(());
-    };
-
-    if shadowed.value == &path {
-        return Err(MountError::RouteCollision {
-            function: trigger.function.to_owned(),
-            route: shadowed.value.clone(),
-        });
-    }
-
-    warn!(
-        function = trigger.function,
-        route = shadowed.value.as_str(),
-        "an Azure Functions queue trigger takes precedence over a route that would also match \
-         its path; that path no longer reaches the route while running under the Functions host"
-    );
-    Ok(())
-}
-
-/// An application wrapped for the Functions host: queue triggers first, then everything else.
-///
-/// Cloned once per connection like any other endpoint, which is why the consumer set — built once,
-/// and holding the application's one queue handler — sits behind an [`Arc`] rather than being
-/// required to clone itself.
+/// Cloned once per connection like any other endpoint, which is why the event sets — built once,
+/// and holding the application's one handler each — sit behind [`Arc`]s rather than being
+/// required to clone themselves.
 #[derive(Debug)]
-pub struct FunctionsHost<E, C> {
+pub struct FunctionsHost<E, C, S> {
     endpoint: E,
     consumers: Arc<C>,
-    triggers: &'static [QueueTrigger],
+    schedules: Arc<S>,
+    queue_triggers: &'static [QueueTrigger],
+    scheduled_triggers: &'static [ScheduledTrigger],
 }
 
-impl<E: Clone, C> Clone for FunctionsHost<E, C> {
+impl<E: Clone, C, S> Clone for FunctionsHost<E, C, S> {
     fn clone(&self) -> Self {
         Self {
             endpoint: self.endpoint.clone(),
             consumers: Arc::clone(&self.consumers),
-            triggers: self.triggers,
+            schedules: Arc::clone(&self.schedules),
+            queue_triggers: self.queue_triggers,
+            scheduled_triggers: self.scheduled_triggers,
         }
     }
 }
 
-impl<E, C> FunctionsHost<E, C> {
+/// The kind of trigger a `POST /{function}` is invoking.
+enum Trigger {
+    /// A Storage queue trigger, dispatched to the `#[skyzen::queue]` handler.
+    Queue(&'static QueueTrigger),
+    /// A timer trigger, dispatched to the `#[skyzen::scheduled]` handler.
+    Scheduled(&'static ScheduledTrigger),
+}
+
+impl<E, C, S> FunctionsHost<E, C, S> {
     /// The trigger this request is for, if it is for one at all.
     ///
     /// Matched on `POST /{function}` exactly: the host uses no other method or shape for a queue
-    /// invocation, and matching more loosely would swallow a `GET` the router should answer.
-    fn trigger_for(&self, request: &Request) -> Option<&'static QueueTrigger> {
+    /// or timer invocation, and matching more loosely would swallow a `GET` the router should
+    /// answer. Queue names win when both kinds somehow claim one — `mount` has already refused
+    /// to build that host, so this arm only orders the ordinary case.
+    fn trigger_for(&self, request: &Request) -> Option<Trigger> {
         if request.method() != Method::POST {
             return None;
         }
         let path = request.uri().path().strip_prefix('/')?;
-        self.triggers
+        self.queue_triggers
             .iter()
             .find(|trigger| trigger.function == path)
+            .map(Trigger::Queue)
+            .or_else(|| {
+                self.scheduled_triggers
+                    .iter()
+                    .find(|trigger| trigger.function == path)
+                    .map(Trigger::Scheduled)
+            })
     }
 }
 
-impl<E, C> Endpoint for FunctionsHost<E, C>
+/// Rebuild the HTTP request the host wrapped in its invocation envelope.
+///
+/// With forwarding off, the host POSTs `{"Data":{"req":{...}}}` to the catch-all function and
+/// the envelope — the whole of `Data` — is host-built, so nothing a client sends can ever
+/// surface there. The `req` binding is the serialized `HttpRequest`: `method`, `url`,
+/// `headers` and `body`, with header values as a string or a string array. A body that is not
+/// an envelope means this handler was reached directly — the forwarding mode or a developer
+/// on the host's port — and the request passes through untouched.
+async fn forwarded_request(request: &mut Request) -> Option<Request> {
+    if request.method() != Method::POST {
+        return None;
+    }
+    let body = request.body_mut().take().ok()?.into_bytes().await.ok()?;
+    let Some(req) = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|envelope| envelope.get("Data")?.get("req").cloned())
+    else {
+        // Not an envelope — the forwarding mode or a developer reached the handler directly,
+        // and the body the application reads has to go back before the router sees it.
+        *request.body_mut() = Body::from(body.to_vec());
+        return None;
+    };
+
+    // The host serializes its `HttpRequest` with the .NET property names: `Body`, `Method`,
+    // `Url`, `Headers`. The lowercase spellings are read as well so a host version that
+    // differs does not silently empty the request.
+    fn field<'a>(req: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+        req.get(name)
+            .or_else(|| req.get(name.to_ascii_lowercase().as_str()))
+    }
+
+    let mut forwarded = Request::new(Body::from(
+        field(&req, "Body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec(),
+    ));
+    *forwarded.method_mut() = field(&req, "Method")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|method| Method::from_bytes(method.as_bytes()).ok())
+        .unwrap_or(Method::GET);
+    if let Some(url) = field(&req, "Url").and_then(serde_json::Value::as_str) {
+        // The URL is absolute; `Uri` keeps its path and query, which is all routing reads.
+        if let Ok(uri) = url.parse() {
+            *forwarded.uri_mut() = uri;
+        }
+    }
+    if let Some(headers) = field(&req, "Headers").and_then(serde_json::Value::as_object) {
+        for (name, value) in headers {
+            // A header arrives as one string or an array of them; every value is kept.
+            let values: Vec<String> = value
+                .as_str()
+                .map(|value| vec![value.to_owned()])
+                .or_else(|| {
+                    value.as_array().map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            for value in values {
+                if let (Ok(name), Ok(value)) = (
+                    http_kit::header::HeaderName::from_bytes(name.as_bytes()),
+                    http_kit::header::HeaderValue::from_str(&value),
+                ) {
+                    forwarded.headers_mut().append(name, value);
+                }
+            }
+        }
+    }
+    Some(forwarded)
+}
+
+/// Standard base64, for binary `res.body` payloads.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut triple = [0u8; 3];
+        triple[..chunk.len()].copy_from_slice(chunk);
+        let n = u32::from_be_bytes([0, triple[0], triple[1], triple[2]]);
+        for (i, index) in [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63]
+            .into_iter()
+            .enumerate()
+        {
+            if i >= chunk.len() + 1 {
+                encoded.push('=');
+            } else {
+                encoded.push(ALPHABET[index as usize] as char);
+            }
+        }
+    }
+    encoded
+}
+
+/// Serialize the application's response into the `Outputs.res` the `http` output binding
+/// declares — the shape the host turns back into the client's HTTP response.
+async fn wrapped_response(response: Response) -> Response {
+    let (parts, body) = response.into_parts();
+    let status = parts.status.as_u16();
+    let bytes = body.into_bytes().await.map_err(|_| {
+        error!("a response body could not be collected");
+    });
+    let Ok(bytes) = bytes else {
+        return failed("the application's response body could not be collected");
+    };
+    // Every `res` value crosses the host as an `ExpandoObject`, which the response writer
+    // serializes back to JSON — no JSON shape produces `byte[]`, so a binary body has no
+    // representation in the wrapped protocol at all. Base64 keeps the bytes recoverable;
+    // an AWS-style `isBase64Encoded` flag the host never reads is left off deliberately.
+    let body = match String::from_utf8(bytes.to_vec()) {
+        Ok(text) => serde_json::json!(text),
+        Err(error) => serde_json::json!(base64(&error.into_bytes())),
+    };
+    // The host reads `res.headers` as name -> string — arrays come out as their serialized
+    // form, not the values. Repeated values join with ", " the way HTTP itself folds them;
+    // `Set-Cookie` is the one header that must not fold, and `res.cookies` carries each as
+    // its own object instead. `Content-Length` is the host's to compute again: the wrapped
+    // body is not the bytes it was counted for.
+    let mut headers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (name, value) in &parts.headers {
+        if name.as_str().eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        if name.as_str().eq_ignore_ascii_case("set-cookie") {
+            // `res.cookies` deserializes through `ExpandoObject` — the tuples the host's
+            // `RawScriptResult` expects can never arrive that way, so Set-Cookie survives
+            // only as a header, and a headers dictionary holds one value per name. The
+            // first cookie goes in whole; anything further has no correct representation —
+            // a comma join violates RFC 6265 and a renamed header leaks `HttpOnly` values
+            // to JavaScript — so it is dropped and the loss is logged.
+            if headers.contains_key(name.as_str()) {
+                tracing::warn!(
+                    "dropping a Set-Cookie header: Azure's wrapped response cannot carry \
+                     multiple cookies"
+                );
+            } else {
+                headers.insert(name.as_str().to_owned(), value.into());
+            }
+            continue;
+        }
+        match headers.entry(name.as_str().to_owned()) {
+            serde_json::map::Entry::Occupied(mut entry) => {
+                if let serde_json::Value::String(joined) = entry.get_mut() {
+                    joined.push_str(", ");
+                    joined.push_str(value);
+                }
+            }
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(value.into());
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "Outputs": {
+            "res": {
+                "statusCode": status,
+                "headers": headers,
+                "body": body,
+            }
+        },
+        "Logs": []
+    });
+    let mut wrapped = Response::new(Body::from(serde_json::to_vec(&payload).unwrap_or_default()));
+    wrapped.headers_mut().insert(
+        http_kit::header::CONTENT_TYPE,
+        http_kit::header::HeaderValue::from_static("application/json"),
+    );
+    wrapped
+}
+
+/// Whether `body` is a forwarded HTTP request rather than a trigger invocation.
+///
+/// The host wraps every forwarded request under `Data.req`; the trigger's invocation instead
+/// carries its binding under `Data` (`message` for a queue trigger, `timer` for a timer). A
+/// body is an invocation only when it carries the trigger's own binding *and* no `req` —
+/// anything else is the router's to answer, because a body shaped like neither can only have
+/// come from the open HTTP surface, never the host's trigger path.
+fn is_invocation(body: &[u8], binding: &str) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(data) = envelope.get("Data") else {
+        return false;
+    };
+    data.get("req").is_none() && data.get(binding).is_some()
+}
+
+impl Trigger {
+    /// The `Data` key an invocation for this trigger always carries — `message` for a queue
+    /// trigger, `timer` for a timer trigger.
+    fn binding(&self) -> &'static str {
+        match self {
+            Self::Queue(_) => "message",
+            Self::Scheduled(_) => "timer",
+        }
+    }
+}
+
+impl<E, C, S> Endpoint for FunctionsHost<E, C, S>
 where
     E: Endpoint + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     type Error = E::Error;
 
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let Some(trigger) = self.trigger_for(request) else {
-            return self.endpoint.respond(request).await;
+            // The envelope protocol only exists when a trigger does — the generated bundle
+            // turns off forwarding exactly then, and only then can `Data.req` arrive. With no
+            // triggers the host forwards the client's body verbatim, and a client who sends
+            // `{"Data":{"req":{...}}}` shaped JSON is just sending a body.
+            if self.queue_triggers.is_empty() && self.scheduled_triggers.is_empty() {
+                return self.endpoint.respond(request).await;
+            }
+            // With no forwarding configured the host delivers every HTTP request to the
+            // catch-all function wrapped in its invocation envelope, the client request
+            // nested under `Data.req`. Unwrap that back into the request it was, and the
+            // response back into the `Outputs.res` the `http` output binding expects.
+            let Some(forwarded) = forwarded_request(request).await else {
+                return self.endpoint.respond(request).await;
+            };
+            *request = forwarded;
+            let response = self.endpoint.respond(request).await?;
+            return Ok(wrapped_response(response).await);
         };
 
-        Ok(self.invoke(trigger, request).await)
+        // A path match alone cannot decide what this POST is when the host forwards raw HTTP:
+        // `POST /tick` from the outside lands here too, and its body is whatever the client
+        // sent. The envelope is the boundary — a real invocation carries the trigger's own
+        // binding under `Data`, and a client can only ever land inside `Data.req`, never at
+        // the top level. Anything shaped like neither is the router's to answer.
+        let Ok(body) = request.body_mut().take() else {
+            return self.endpoint.respond(request).await;
+        };
+        let Ok(body) = body.into_bytes().await else {
+            *request.body_mut() = Body::from(Vec::new());
+            return self.endpoint.respond(request).await;
+        };
+        if !is_invocation(&body, trigger.binding()) {
+            *request.body_mut() = Body::from(body.to_vec());
+            return self.endpoint.respond(request).await;
+        }
+
+        Ok(match trigger {
+            Trigger::Queue(trigger) => self.invoke_queue(trigger, &body).await,
+            Trigger::Scheduled(trigger) => self.invoke_scheduled(trigger, &body).await,
+        })
     }
 }
 
-impl<E, C> FunctionsHost<E, C>
+impl<E, C, S> FunctionsHost<E, C, S>
 where
     E: Endpoint + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     /// Drive the queue handler for one invocation and answer the host.
-    async fn invoke(&self, trigger: &QueueTrigger, request: &mut Request) -> Response {
-        let batch = match read_batch(trigger, request).await {
+    async fn invoke_queue(&self, trigger: &QueueTrigger, body: &[u8]) -> Response {
+        let batch = match read_batch(trigger, body) {
             Ok(batch) => batch,
             Err(error) => {
                 error!(
@@ -283,6 +551,58 @@ where
             }
         }
     }
+
+    /// Drive the scheduled handler for one invocation and answer the host.
+    ///
+    /// A timer trigger has no retry of its own to honor: `Err` is only ever reported to the
+    /// invocation log, the way an `Err` return reads on Cloudflare. A panic is reported the
+    /// same way — the same outcome both the native loop and Lambda give a panicking handler,
+    /// so one handler reads identically on all four targets.
+    async fn invoke_scheduled(&self, trigger: &ScheduledTrigger, body: &[u8]) -> Response {
+        let tick = match read_tick(trigger, body) {
+            Ok(tick) => tick,
+            Err(error) => {
+                error!(
+                    function = trigger.function,
+                    error = %error,
+                    "could not read the Functions timer envelope; the invocation fails"
+                );
+                return failed(&error.to_string());
+            }
+        };
+
+        debug!(
+            function = trigger.function,
+            cron = trigger.cron,
+            "handling a timer trigger invocation"
+        );
+
+        let handled = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            self.schedules.dispatch(tick),
+        ))
+        .await;
+        match handled {
+            Ok(Ok(())) => succeeded(),
+            Ok(Err(error)) => {
+                error!(
+                    function = trigger.function,
+                    cron = trigger.cron,
+                    error = %skyzen_core::ErrorChain(error.as_ref()),
+                    "the scheduled handler failed"
+                );
+                failed("the scheduled handler failed")
+            }
+            Err(panic) => {
+                error!(
+                    function = trigger.function,
+                    cron = trigger.cron,
+                    panic = skyzen_core::panic_message(panic.as_ref()),
+                    "the scheduled handler panicked"
+                );
+                failed("the scheduled handler panicked")
+            }
+        }
+    }
 }
 
 /// Whether a decision over a one-message batch acknowledges it.
@@ -300,18 +620,8 @@ const fn acknowledged(disposition: &QueueBatchDisposition) -> bool {
 }
 
 /// Read one Functions invocation into the portable batch the handler expects.
-async fn read_batch(
-    trigger: &QueueTrigger,
-    request: &mut Request,
-) -> Result<QueueBatch<Vec<u8>>, EnvelopeError> {
-    let body = request
-        .body_mut()
-        .take()
-        .map_err(|_| EnvelopeError::BodyUnavailable)?
-        .into_bytes()
-        .await
-        .map_err(|error| EnvelopeError::Unreadable(error.to_string()))?;
-    let envelope: InvokeRequest = serde_json::from_slice(&body)
+fn read_batch(trigger: &QueueTrigger, body: &[u8]) -> Result<QueueBatch<Vec<u8>>, EnvelopeError> {
+    let envelope: InvokeRequest = serde_json::from_slice(body)
         .map_err(|error| EnvelopeError::Malformed(error.to_string()))?;
 
     envelope.into_batch(trigger)
@@ -350,6 +660,23 @@ fn failed(reason: &str) -> Response {
         http_kit::header::HeaderValue::from_static("application/json"),
     );
     response
+}
+
+/// Read one timer invocation into the portable tick the handler expects.
+///
+/// The `timerTrigger` binding's `Data` carries its `TimerInfo` under the name the generated
+/// `function.json` declares — always `timer` for a Skyzen function. [`ScheduledTick::cron`]
+/// comes from the manifest rather than the payload: the host reports the NCRONTAB the CLI
+/// translated, and the handler should read the portable expression it was written with.
+/// [`ScheduledTick::scheduled_time_ms`] is the `ScheduleStatus.Next` the host reports — the
+/// due instant this invocation fulfills, which is also what a past-due firing still names —
+/// or the receive time when the invocation carries none or fired early (a manual `func`
+/// invoke or `runOnStartup`).
+fn read_tick(trigger: &ScheduledTrigger, body: &[u8]) -> Result<ScheduledTick, EnvelopeError> {
+    let envelope: InvokeRequest = serde_json::from_slice(body)
+        .map_err(|error| EnvelopeError::Malformed(error.to_string()))?;
+
+    envelope.into_tick(trigger)
 }
 
 /// What can go wrong reading an invocation the host sent.
@@ -451,6 +778,58 @@ impl InvokeRequest {
             }],
         })
     }
+
+    /// Turn one timer invocation into the portable tick the handler is given.
+    ///
+    /// # Errors
+    ///
+    /// [`EnvelopeError::UnexpectedBindings`] when `Data` does not hold the `timer` binding — the
+    /// only one a timer trigger can carry.
+    fn into_tick(self, trigger: &ScheduledTrigger) -> Result<ScheduledTick, EnvelopeError> {
+        if self.data.len() != 1 {
+            return Err(EnvelopeError::UnexpectedBindings(
+                self.data.keys().cloned().collect(),
+            ));
+        }
+        let (binding, value) = self
+            .data
+            .into_iter()
+            .next()
+            .expect("the map holds exactly one entry");
+        if binding != "timer" {
+            return Err(EnvelopeError::UnexpectedBindings(vec![binding]));
+        }
+
+        // `ScheduleStatus` reports the occurrences on either side of this invocation:
+        // `Last` is the *previous* firing and `Next` is the one being delivered — the due
+        // instant this tick names. A `Next` still in the future means the host fired early
+        // (`runOnStartup`, a manual invoke), which is no scheduled occurrence at all; receive
+        // time reports those the way a pull-based backend does.
+        let scheduled_time_ms = value
+            .get("ScheduleStatus")
+            .and_then(|status| status.get("Next"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|next| chrono::DateTime::parse_from_rfc3339(next).ok())
+            .map_or_else(now_ms, |next| {
+                let due = next.timestamp_millis();
+                if due <= now_ms() {
+                    due
+                } else {
+                    now_ms()
+                }
+            });
+
+        debug!(
+            function = trigger.function,
+            cron = trigger.cron,
+            "decoded a Functions timer invocation"
+        );
+
+        Ok(ScheduledTick::new(
+            trigger.cron.to_owned(),
+            scheduled_time_ms,
+        ))
+    }
 }
 
 /// Reverse the in-band [`envelope`] `AzureStorageQueue::send` applies.
@@ -501,10 +880,7 @@ struct InvokeResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        check_route_collision, failed, mount, succeeded, EnvelopeError, InvokeRequest, MountError,
-        QueueTrigger,
-    };
+    use super::{failed, mount, succeeded, EnvelopeError, InvokeRequest, MountError, QueueTrigger};
     use crate::{
         routing::{MethodFilter, ServedRoutes},
         runtime::consumer::{QueueConsumer, QueueConsumers},
@@ -647,42 +1023,26 @@ mod tests {
     }
 
     #[test]
-    fn a_trigger_that_shadows_a_literal_route_refuses_to_mount() {
-        let error = mount(
-            Routes::new(&["/process", "/health"]),
-            consumers(),
-            &[TRIGGER],
-        )
-        .expect_err("the route and the trigger cannot both own /process");
-
-        assert!(matches!(error, MountError::RouteCollision { .. }));
-        let rendered = error.to_string();
-        assert!(rendered.contains("process"), "{rendered}");
-    }
-
-    #[test]
-    fn a_trigger_beside_unrelated_routes_mounts_cleanly() {
+    fn a_trigger_beside_routes_that_share_its_path_mounts_cleanly() {
+        // The host wraps every HTTP request at the catch-all function, so a route's path and a
+        // trigger's path never meet: `POST /process` from a client unwraps into the route,
+        // while `POST /process` carrying `Data.message` is the trigger invocation.
         mount(
-            Routes::new(&["/health", "/jobs/{id}"]),
+            Routes(vec![(
+                MethodFilter::Exact(Method::POST),
+                "/process".to_owned(),
+            )]),
             consumers(),
+            (),
             &[TRIGGER],
+            &[],
         )
-        .expect("nothing collides");
-    }
-
-    #[test]
-    fn a_parameterized_route_that_would_also_match_is_a_warning_not_a_refusal() {
-        // `/{name}` still serves every other name; only this one path is taken over.
-        check_route_collision(
-            &TRIGGER,
-            &[(MethodFilter::Exact(Method::GET), "/{name}".to_owned())],
-        )
-        .expect("a partial overlap is not a refusal");
+        .expect("a shared path is not a collision when the host wraps");
     }
 
     #[test]
     fn a_trigger_declared_twice_refuses_to_mount() {
-        let error = mount(Routes::new(&[]), consumers(), &[TRIGGER, TRIGGER])
+        let error = mount(Routes::new(&[]), consumers(), (), &[TRIGGER, TRIGGER], &[])
             .expect_err("two functions cannot share a name");
 
         assert!(matches!(error, MountError::DuplicateFunction { .. }));
@@ -690,7 +1050,7 @@ mod tests {
 
     #[test]
     fn a_trigger_with_no_queue_handler_refuses_to_mount() {
-        let error = mount(Routes::new(&[]), (), &[TRIGGER])
+        let error = mount(Routes::new(&[]), (), (), &[TRIGGER], &[])
             .expect_err("there is nothing to hand the message to");
 
         assert!(matches!(error, MountError::NoQueueHandler { .. }));
@@ -702,12 +1062,12 @@ mod tests {
 
     #[test]
     fn an_application_with_no_triggers_mounts_and_changes_nothing() {
-        mount(Routes::new(&["/health"]), (), &[]).expect("nothing to mount");
+        mount(Routes::new(&["/health"]), (), (), &[], &[]).expect("nothing to mount");
     }
 
     /// Send one request through a mounted application and read back what answered it.
     fn respond(method: Method, path: &str, body: &'static str) -> (StatusCode, String) {
-        let mut host = mount(Routes::new(&["/health"]), consumers(), &[TRIGGER])
+        let mut host = mount(Routes::new(&["/health"]), consumers(), (), &[TRIGGER], &[])
             .expect("nothing collides with `process`");
         let mut request: Request = http::Request::builder()
             .method(method)
@@ -755,10 +1115,13 @@ mod tests {
     }
 
     #[test]
-    fn an_invocation_the_handler_cannot_be_given_tells_the_host_to_redeliver() {
-        let (status, _) = respond(Method::POST, "/process", "not an envelope");
+    fn a_post_without_the_invocation_envelope_is_the_routers_to_answer() {
+        // A body that is neither a real invocation (`Data.message`) nor a forwarded request
+        // (`Data.req`) cannot come from the host's trigger path — it reaches the router like
+        // every other request and never sees the handler.
+        let (status, body) = respond(Method::POST, "/process", "not an envelope");
 
-        // A non-2xx is the only way a custom handler reports failure.
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "router");
     }
 }

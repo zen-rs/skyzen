@@ -55,36 +55,21 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(wiring) => wiring,
         Err(error) => return error.to_compile_error().into(),
     };
-    let PortableWiring { steps, consumers } = wiring;
+    let PortableWiring {
+        steps,
+        consumers,
+        schedules,
+    } = wiring;
     let azure_queue_triggers = match azure_queue_trigger_tokens() {
         Ok(triggers) => triggers,
         Err(error) => return error.to_compile_error().into(),
     };
-    // Natively the factory yields the endpoint *and* the queue consumers, both built from the one
-    // set of service instances; on wasm the platform owns event delivery, so it yields only the
-    // endpoint and this whole arm is stripped.
-    let factory_body = quote! {
-        async move {
-            let endpoint = #entry_call;
-            #(#steps)*
-            {
-                #[cfg(not(target_arch = "wasm32"))]
-                { (endpoint, #consumers) }
-                #[cfg(target_arch = "wasm32")]
-                { endpoint }
-            }
-        }
+    let azure_scheduled_triggers = match azure_scheduled_trigger_tokens() {
+        Ok(triggers) => triggers,
+        Err(error) => return error.to_compile_error().into(),
     };
-    let native_factory = factory_body.clone();
-    // On wasm the factory receives the WinterCG env explicitly (as `__skyzen_wasm_env`), so
-    // endpoint construction never depends on an ambient thread-local that concurrent
-    // invocations could race.
-    let wasm_factory = quote! {
-        move |__skyzen_wasm_env: ::skyzen::runtime::wasm::Env| {
-            let _ = &__skyzen_wasm_env;
-            #factory_body
-        }
-    };
+    let (native_factory, wasm_factory) =
+        factory_tokens(&entry_call, &steps, &consumers, &schedules);
 
     let init_logging = if options.default_logger {
         quote! { ::skyzen::runtime::native::init_logging(); }
@@ -124,6 +109,10 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
                     listen: ::skyzen::runtime::native::apply_cli_overrides(::std::env::args()),
                     tls: ::skyzen::runtime::native::apply_tls_overrides(::std::env::args()),
                     azure_queue_triggers: #azure_queue_triggers,
+                    azure_scheduled_triggers: #azure_scheduled_triggers,
+                    test_scheduled: ::skyzen::runtime::native::test_scheduled_requested(
+                        ::std::env::args()
+                    ),
                 },
                 || #native_factory,
                 #shutdown_hook,
@@ -147,6 +136,41 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     output.into()
+}
+
+/// The launch factory, once for each target.
+///
+/// Natively the factory yields the endpoint *and* the event handler sets, all built from the one
+/// set of service instances; on wasm the platform owns event delivery, so it yields only the
+/// endpoint and the sets are stripped. On wasm the factory also receives the `WinterCG` env
+/// explicitly (as `__skyzen_wasm_env`), so endpoint construction never depends on an ambient
+/// thread-local that concurrent invocations could race.
+fn factory_tokens(
+    entry_call: &proc_macro2::TokenStream,
+    steps: &[proc_macro2::TokenStream],
+    consumers: &proc_macro2::TokenStream,
+    schedules: &proc_macro2::TokenStream,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let factory_body = quote! {
+        async move {
+            let endpoint = #entry_call;
+            #(#steps)*
+            {
+                #[cfg(not(target_arch = "wasm32"))]
+                { (endpoint, #consumers, #schedules) }
+                #[cfg(target_arch = "wasm32")]
+                { endpoint }
+            }
+        }
+    };
+    let native_factory = factory_body.clone();
+    let wasm_factory = quote! {
+        move |__skyzen_wasm_env: ::skyzen::runtime::wasm::Env| {
+            let _ = &__skyzen_wasm_env;
+            #factory_body
+        }
+    };
+    (native_factory, wasm_factory)
 }
 
 /// Attribute macro that runs an async test with Skyzen's native test runtime and injected mocks.
@@ -2619,6 +2643,9 @@ struct PortableWiring {
     /// The `ConsumerSet` the native runtime is launched with — `()` when the manifest declares no
     /// `[[native.queue_consumer]]`.
     consumers: proc_macro2::TokenStream,
+    /// The `ScheduleSet` the native runtime is launched with — `()` when the manifest declares no
+    /// `[[schedule]]`.
+    schedules: proc_macro2::TokenStream,
 }
 
 fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
@@ -2634,6 +2661,7 @@ fn empty_portable_wiring() -> PortableWiring {
     PortableWiring {
         steps: Vec::new(),
         consumers: quote! { () },
+        schedules: quote! { () },
     }
 }
 
@@ -2647,7 +2675,8 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
     let services = &manifest.service;
     let databases = &manifest.database;
     let secrets = &manifest.secret;
-    if services.is_empty() && databases.is_empty() && secrets.is_empty() {
+    let schedules_empty = manifest.schedule.is_empty();
+    if services.is_empty() && databases.is_empty() && secrets.is_empty() && schedules_empty {
         return Ok(empty_portable_wiring());
     }
     let default_database = default_database_index(databases)?;
@@ -2710,8 +2739,13 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
     }
 
     let consumers = queue_consumer_tokens(manifest, &service_bindings)?;
+    let schedules = schedule_tokens(manifest);
 
-    Ok(PortableWiring { steps, consumers })
+    Ok(PortableWiring {
+        steps,
+        consumers,
+        schedules,
+    })
 }
 
 /// The local binding that holds one manifest entry's service for the length of the factory.
@@ -2831,6 +2865,35 @@ fn queue_consumer_tokens(
             ::std::vec![#(#entries),*],
         )
     })
+}
+
+/// Build the `Schedules` value for every `[[schedule]]` entry.
+///
+/// Every entry shares the one generated `__SkyzenNativeScheduledHandler`, exactly as on
+/// Cloudflare where every cron reaches the same `scheduled` export. The crons themselves were
+/// validated when the manifest parsed, so nothing here is re-checked.
+fn schedule_tokens(manifest: &SkyzenManifest) -> proc_macro2::TokenStream {
+    if manifest.schedule.is_empty() {
+        return quote! { () };
+    }
+
+    let entries = manifest.schedule.iter().map(|entry| {
+        let name = LitStr::new(entry.name.as_str(), proc_macro2::Span::call_site());
+        let cron = LitStr::new(entry.cron.as_str(), proc_macro2::Span::call_site());
+        quote! {
+            ::skyzen::runtime::scheduler::ScheduleConfig {
+                name: ::std::string::String::from(#name),
+                cron: ::std::string::String::from(#cron),
+            }
+        }
+    });
+
+    quote! {
+        ::skyzen::runtime::scheduler::Schedules::new(
+            __SkyzenNativeScheduledHandler,
+            ::std::vec![#(#entries),*],
+        )
+    }
 }
 
 /// A `Duration` literal, always exactly the value the manifest parsed.
@@ -2977,12 +3040,56 @@ fn azure_trigger_table(triggers: &[AzureQueueTrigger]) -> proc_macro2::TokenStre
     quote! { &[#(#entries),*] }
 }
 
+/// The `[[schedule]]` entries, as the runtime's own static timer-trigger table.
+///
+/// Every declared schedule is a Functions `timerTrigger` of its own name — the CLI renders the
+/// `function.json` and the runtime answers the `POST /{function}` the host makes of it.
+fn azure_scheduled_trigger_tokens() -> syn::Result<proc_macro2::TokenStream> {
+    Ok(load_manifest()?.map_or_else(
+        || quote! { &[] },
+        |manifest| {
+            let entries = manifest.schedule.iter().map(|entry| {
+                let function = entry.name.as_str();
+                let cron = entry.cron.as_str();
+                quote! {
+                    ::skyzen::runtime::azure::ScheduledTrigger {
+                        function: #function,
+                        cron: #cron,
+                    }
+                }
+            });
+            quote! { &[#(#entries),*] }
+        },
+    ))
+}
+
 /// The `[[azure.queue_triggers]]` entries this manifest declares.
 fn azure_queue_triggers(manifest: &SkyzenManifest) -> &[AzureQueueTrigger] {
     manifest
         .azure
         .as_ref()
         .map_or(&[], |azure| azure.queue_triggers.as_slice())
+}
+
+/// Whether *any* target invokes the scheduled handler this crate declares.
+///
+/// `[[schedule]]` entries are the portable form and count on their own; a Worker that only ever
+/// runs on Cloudflare can still reach the handler through `[cloudflare.triggers] crons` —
+/// declared in the base or in an environment overlay, so every resolved environment is consulted.
+fn scheduled_handler_is_consumed(manifest: &Manifest) -> bool {
+    if !manifest.data().schedule.is_empty() {
+        return true;
+    }
+
+    core::iter::once(None)
+        .chain(manifest.environment_names().map(Some))
+        .any(|environment| {
+            manifest
+                .cloudflare(environment)
+                .ok()
+                .flatten()
+                .is_some_and(|cloudflare| !cloudflare.triggers.crons.is_empty())
+        })
 }
 
 fn native_queue_consumers(manifest: &SkyzenManifest) -> &[NativeQueueConsumer] {
@@ -3769,6 +3876,66 @@ fn native_queue_handler(
     })
 }
 
+/// The native half of `#[skyzen::scheduled]`: the handler the timer loops and the serverless
+/// platforms call.
+///
+/// Emitted only when the manifest declares `[[schedule]]` entries, which is exactly when
+/// `#[skyzen::main]` references it — a `[cloudflare.triggers]`-only Worker expands byte for
+/// byte as it did before the handler became dual-target.
+fn native_scheduled_handler(
+    function: &ItemFn,
+    internal_ident: &proc_macro2::Ident,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let arguments = &function.sig.inputs;
+    let [FnArg::Typed(tick)] = arguments.iter().collect::<Vec<_>>()[..] else {
+        return Err(Error::new_spanned(
+            arguments,
+            "a #[skyzen::scheduled] handler driven by [[schedule]] takes exactly one argument, \
+             `ScheduledTick`: `Env` and `CfScheduleContext` exist only on Cloudflare",
+        ));
+    };
+
+    if last_type_ident(&tick.ty)? != "ScheduledTick" {
+        return Err(Error::new_spanned(
+            &tick.ty,
+            "a #[skyzen::scheduled] handler driven by [[schedule]] must take `ScheduledTick`: \
+             `CfScheduledEvent` wraps the Cloudflare event and has no portable counterpart",
+        ));
+    }
+
+    let call = if function.sig.asyncness.is_some() {
+        quote! { #internal_ident(__skyzen_tick).await }
+    } else {
+        quote! { #internal_ident(__skyzen_tick) }
+    };
+
+    Ok(quote! {
+        /// The `#[skyzen::scheduled]` handler, as the native scheduler and the serverless
+        /// platforms drive it.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[doc(hidden)]
+        #[derive(Debug, Clone, Copy)]
+        pub struct __SkyzenNativeScheduledHandler;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        impl ::skyzen::__services::ScheduledHandler for __SkyzenNativeScheduledHandler {
+            // An `async` block rather than an `async fn`, for the same reason the queue glue is
+            // one: a synchronous handler must be run lazily, inside the driver's panic guard.
+            #[allow(clippy::manual_async_fn)]
+            fn handle(
+                &self,
+                __skyzen_tick: ::skyzen::events::ScheduledTick,
+            ) -> impl ::std::future::Future<
+                Output = ::std::result::Result<(), ::skyzen::__services::BoxError>,
+            > + ::std::marker::Send {
+                async move {
+                    ::skyzen::__services::IntoScheduledOutcome::into_scheduled_outcome(#call)
+                }
+            }
+        }
+    })
+}
+
 fn expand_cloudflare_event(
     mut function: ItemFn,
     kind: CloudflareEventKind,
@@ -3787,7 +3954,7 @@ fn expand_cloudflare_event(
 
     let wrapper_ident = format_ident!("{export_name}");
 
-    // The native consumer glue and `#[skyzen::main]`'s reference to it are gated on the very same
+    // The native event glue and `#[skyzen::main]`'s reference to it are gated on the very same
     // manifest question, which is what keeps a wasm-only Worker's expansion unchanged.
     let native_glue = match kind {
         CloudflareEventKind::Queue => {
@@ -3807,9 +3974,24 @@ fn expand_cloudflare_event(
                 _ => proc_macro2::TokenStream::new(),
             }
         }
-        CloudflareEventKind::Scheduled | CloudflareEventKind::Email | CloudflareEventKind::Tail => {
-            proc_macro2::TokenStream::new()
+        CloudflareEventKind::Scheduled => {
+            let manifest = load_manifest_document()?;
+            match manifest {
+                Some(manifest) if !manifest.data().schedule.is_empty() => {
+                    native_scheduled_handler(&function, &internal_ident)?
+                }
+                Some(manifest) if !scheduled_handler_is_consumed(&manifest) => {
+                    return Err(Error::new_spanned(
+                        &function.sig.ident,
+                        "this #[skyzen::scheduled] handler is never invoked: declare the cron it \
+                         runs on as [[schedule]] for every target, or as \
+                         [cloudflare.triggers] `crons` for Cloudflare only",
+                    ));
+                }
+                _ => proc_macro2::TokenStream::new(),
+            }
         }
+        CloudflareEventKind::Email | CloudflareEventKind::Tail => proc_macro2::TokenStream::new(),
     };
 
     let (wrapper_signature, wrapper_args) = build_cloudflare_event_wrapper(&function, kind)?;

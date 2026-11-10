@@ -14,6 +14,7 @@ use crate::{
         azure,
         consumer::{ConsumerFatal, ConsumerSet},
         context::ShutdownGuard,
+        scheduler::ScheduleSet,
         WorkerContext,
     },
     Endpoint,
@@ -467,6 +468,20 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<Lis
     })
 }
 
+/// Whether the command line asked for `--test-scheduled`: fire every `[[schedule]]` once at
+/// startup.
+///
+/// The native equivalent of `wrangler dev --test-scheduled`, reached through `skyzen dev --
+/// --test-scheduled` and used by hand as `cargo run -- --test-scheduled`. A dev aid — under the
+/// Functions host it fires the handler once rather than starting a second timer, and under
+/// Lambda it is ignored, since the platform owns delivery there too.
+#[must_use]
+pub fn test_scheduled_requested(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter()
+        .skip(1)
+        .any(|arg| arg == "--test-scheduled")
+}
+
 /// A `--tls-cert`/`--tls-key` flag that reached us at all promised TLS; a
 /// missing value is not ignorable — swallowing it would serve cleartext under
 /// a flag that promised encryption, which is worse than any panic.
@@ -906,6 +921,17 @@ pub struct LaunchOptions {
     /// Empty for everything that is not an Azure Functions app, which is the only case where they
     /// mean anything.
     pub azure_queue_triggers: &'static [azure::QueueTrigger],
+    /// The `[[schedule]]` entries this application declares, as Azure `timerTrigger` functions.
+    ///
+    /// On the plain-server path these become the native timer loops `ScheduleSet::start` spawns;
+    /// under the Functions host they are the function names the host POSTs ticks to. Empty when
+    /// the manifest declares no schedule.
+    pub azure_scheduled_triggers: &'static [azure::ScheduledTrigger],
+    /// `--test-scheduled` on the command line: fire every declared schedule once at startup.
+    ///
+    /// The native equivalent of `wrangler dev --test-scheduled`, reached through `skyzen dev --
+    /// --test-scheduled`. A dev aid only — it changes nothing about the loops still running.
+    pub test_scheduled: bool,
 }
 
 /// Where this process is running, as told by the environment its host set up.
@@ -1090,14 +1116,15 @@ impl std::error::Error for StartupError {}
 /// # Panics
 ///
 /// Panics if the global executor fails to initialize.
-pub fn launch<Fut, E, C, Hook, HookFut>(
+pub fn launch<Fut, E, C, S, Hook, HookFut>(
     options: LaunchOptions,
     factory: impl FnOnce() -> Fut,
     on_shutdown: Hook,
 ) where
-    Fut: Future<Output = (E, C)> + Send + 'static,
+    Fut: Future<Output = (E, C, S)> + Send + 'static,
     E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
     Hook: FnOnce() -> HookFut,
     HookFut: Future<Output = ()>,
 {
@@ -1139,7 +1166,7 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
     let failed = smol::block_on(async move {
         tracing::info!("Skyzen application starting up");
 
-        let (endpoint, consumers) = factory().await;
+        let (endpoint, consumers, schedules) = factory().await;
         let outcome = match platform {
             Platform::Lambda => unreachable!("handed over before the executor was built"),
             Platform::Server => {
@@ -1148,12 +1175,23 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
                     .as_ref()
                     .map_or_else(server_addr, |listen| listen.addr.clone());
                 match build_server_tls(options.tls.as_ref(), &addr) {
-                    Ok(tls) => run_server(executor, endpoint, consumers, addr, tls).await,
+                    Ok(tls) => {
+                        run_server(
+                            executor,
+                            endpoint,
+                            consumers,
+                            schedules,
+                            addr,
+                            tls,
+                            options.test_scheduled,
+                        )
+                        .await
+                    }
                     Err(error) => Err(error),
                 }
             }
             Platform::AzureFunctions { port } => {
-                serve_functions_host(executor, endpoint, consumers, &options, port).await
+                serve_functions_host(executor, endpoint, consumers, schedules, &options, port).await
             }
         };
         let failed = match outcome {
@@ -1202,13 +1240,14 @@ async fn drain_connections(
     }
 }
 
-/// The channels tying the accept loop to the queue consumers it started.
+/// The channels tying the accept loop to the event loops it started.
 ///
-/// Dropping the whole thing is what tells every consumer slot to stop initiating receives, so the
-/// shutdown path cannot forget one of the two halves.
+/// Queue consumers and schedule timers share the one stop sender: dropping the whole thing is
+/// what tells every consumer slot to stop receiving and every schedule loop to stop firing, so
+/// the shutdown path cannot forget one of the two halves.
 #[derive(Debug)]
-struct ConsumerChannels {
-    /// Watched by every consumer slot; closing it stops them.
+struct EventChannels {
+    /// Watched by every consumer slot and schedule loop; closing it stops them.
     _stop: Sender<Infallible>,
     /// Where a consumer that can never receive reports itself.
     fatal_rx: Receiver<ConsumerFatal>,
@@ -1218,16 +1257,27 @@ struct ConsumerChannels {
     _fatal_tx: Sender<ConsumerFatal>,
 }
 
-impl ConsumerChannels {
-    /// Start `consumers` on `executor`, each slot holding a clone of the drain `guard`.
-    fn start<Exec: CoreExecutor + 'static, C: ConsumerSet>(
+impl EventChannels {
+    /// Start `consumers` and `schedules` on `executor`, each task holding a clone of the drain
+    /// `guard`.
+    ///
+    /// When `fire_schedules` is set, every declared schedule is also dispatched once
+    /// immediately — the `--test-scheduled` dev aid.
+    fn start<Exec: CoreExecutor + 'static, C: ConsumerSet, S: ScheduleSet>(
         consumers: C,
+        schedules: S,
         executor: &Exec,
         guard: &Sender<Infallible>,
+        fire_schedules: bool,
     ) -> Self {
-        let (stop, consumers_stop) = bounded::<Infallible>(1);
+        let (stop, loops_stop) = bounded::<Infallible>(1);
         let (fatal_tx, fatal_rx) = bounded::<ConsumerFatal>(1);
-        consumers.start(executor, &consumers_stop, guard, &fatal_tx);
+        consumers.start(executor, &loops_stop, guard, &fatal_tx);
+        // `fire_once` borrows where `start` consumes, so the dev-aid firing is dispatched first.
+        if fire_schedules {
+            schedules.fire_once(executor, guard);
+        }
+        schedules.start(executor, &loops_stop, guard);
 
         Self {
             _stop: stop,
@@ -1248,17 +1298,20 @@ struct Accepted<C> {
     peer_addr: Option<SocketAddr>,
 }
 
-async fn run_server<Exec, E, C>(
+async fn run_server<Exec, E, C, S>(
     executor: Exec,
     endpoint: E,
     consumers: C,
+    schedules: S,
     addr: ListenAddr,
     tls: Option<ServerTls>,
+    test_scheduled: bool,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     match addr {
         ListenAddr::Tcp(addr) => {
@@ -1270,7 +1323,16 @@ where
                 peer_addr: stream.peer_addr().ok(),
                 stream,
             });
-            serve_connections(executor, endpoint, consumers, incoming, tls).await
+            serve_connections(
+                executor,
+                endpoint,
+                consumers,
+                schedules,
+                incoming,
+                tls,
+                test_scheduled,
+            )
+            .await
         }
         #[cfg(unix)]
         ListenAddr::Unix(path) => {
@@ -1287,7 +1349,16 @@ where
             });
             // `tls` is always `None` here: `build_server_tls` refused a non-TCP
             // listener before the bind.
-            let outcome = serve_connections(executor, endpoint, consumers, incoming, tls).await;
+            let outcome = serve_connections(
+                executor,
+                endpoint,
+                consumers,
+                schedules,
+                incoming,
+                tls,
+                test_scheduled,
+            )
+            .await;
             // The socket file is ours: left behind it becomes the stale path the next bind
             // has to probe, and a dead process gets no later chance to clean it up. Already
             // gone is not a failure — the cleanup goal is met either way.
@@ -1422,17 +1493,23 @@ where
 ///
 /// The transport is invisible past this point: TCP and unix connections get the same
 /// protocol sniff, the same Hyper builders and the same drain accounting.
-async fn serve_connections<Exec, E, C, Conn, S>(
+// The accept loop's `select!` arms are the function's work; a second event kind joins the
+// supervision without a new seam worth extracting.
+#[allow(clippy::too_many_lines)]
+async fn serve_connections<Exec, E, C, Sch, Conn, S>(
     executor: Exec,
     endpoint: E,
     consumers: C,
+    schedules: Sch,
     mut incoming: S,
     tls: Option<ServerTls>,
+    test_scheduled: bool,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     Exec: CoreExecutor + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    Sch: ScheduleSet,
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Stream<Item = std::io::Result<Accepted<Conn>>> + Unpin,
 {
@@ -1445,7 +1522,13 @@ where
     let (connection_guard, connections) = bounded::<Infallible>(1);
     let connection_permits = Arc::new(async_lock::Semaphore::new(MAX_CONNECTIONS));
 
-    let queue_consumers = ConsumerChannels::start(consumers, executor.as_ref(), &connection_guard);
+    let events = EventChannels::start(
+        consumers,
+        schedules,
+        executor.as_ref(),
+        &connection_guard,
+        test_scheduled,
+    );
 
     let shutdown_rx = shutdown_signal();
     let shutdown = shutdown_rx.recv().fuse();
@@ -1458,7 +1541,7 @@ where
                 info!("Ctrl+C received, stopping accept loop");
                 break;
             }
-            report = queue_consumers.fatal_rx.recv().fuse() => {
+            report = events.fatal_rx.recv().fuse() => {
                 if let Ok(report) = report {
                     error!(
                         queue = report.queue.as_str(),
@@ -1548,9 +1631,10 @@ where
         }
     }
 
-    // Tell the consumers to stop polling, then release the accept loop's own handle so only live
-    // connections and in-flight batches keep the drain channel open.
-    drop(queue_consumers);
+    // Tell the event loops to stop — consumers stop polling, schedules stop firing — then
+    // release the accept loop's own handle so only live connections and in-flight work keep the
+    // drain channel open.
+    drop(events);
     drop(connection_guard);
     let severed = drain_connections(&connections, SHUTDOWN_GRACE_PERIOD).await;
 
@@ -1565,18 +1649,19 @@ where
 /// refuse: a Skyzen server that binds a socket inside Lambda is a function that times out on every
 /// invocation with nothing in its logs to explain why.
 #[cfg(feature = "lambda")]
-fn run_on_lambda<Fut, E, C>(
+fn run_on_lambda<Fut, E, C, S>(
     _options: LaunchOptions,
     factory: impl FnOnce() -> Fut,
 ) -> Result<core::convert::Infallible, StartupError>
 where
-    Fut: Future<Output = (E, C)> + Send + 'static,
+    Fut: Future<Output = (E, C, S)> + Send + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     skyzen_lambda::run(|| async move {
-        let (endpoint, consumers) = factory().await;
-        (endpoint, LambdaConsumers(consumers))
+        let (endpoint, consumers, schedules) = factory().await;
+        (endpoint, LambdaHandlers(consumers, schedules))
     })
     .map_err(|error| StartupError::Lambda(error.to_string()))?;
 
@@ -1589,28 +1674,30 @@ where
 
 #[cfg(not(feature = "lambda"))]
 #[allow(clippy::needless_pass_by_value)]
-fn run_on_lambda<Fut, E, C>(
+fn run_on_lambda<Fut, E, C, S>(
     _options: LaunchOptions,
     _factory: impl FnOnce() -> Fut,
 ) -> Result<core::convert::Infallible, StartupError>
 where
-    Fut: Future<Output = (E, C)> + Send + 'static,
+    Fut: Future<Output = (E, C, S)> + Send + 'static,
     E: Endpoint + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     Err(StartupError::LambdaFeatureMissing)
 }
 
-/// The application's consumer set, seen through the Lambda adapter's own trait.
+/// The application's event handler sets, seen through the Lambda adapter's own traits.
 ///
-/// A local newtype because both the trait and `ConsumerSet`'s implementors would otherwise be
-/// foreign to one another; it carries nothing of its own.
+/// A local newtype because both traits and `ConsumerSet`/`ScheduleSet`'s implementors would
+/// otherwise be foreign to one another; it carries nothing of its own.
 #[cfg(feature = "lambda")]
-struct LambdaConsumers<C>(C);
+struct LambdaHandlers<C, S>(C, S);
 
 #[cfg(feature = "lambda")]
-impl<C: ConsumerSet> skyzen_lambda::QueueDispatch for LambdaConsumers<C> {
+impl<C: ConsumerSet, S: ScheduleSet> skyzen_lambda::QueueDispatch for LambdaHandlers<C, S> {
     const DECLARED: bool = C::DECLARES_HANDLER;
+    const SCHEDULED_DECLARED: bool = S::DECLARES_HANDLER;
 
     fn dispatch(
         &self,
@@ -1620,6 +1707,13 @@ impl<C: ConsumerSet> skyzen_lambda::QueueDispatch for LambdaConsumers<C> {
     > + Send {
         self.0.dispatch(batch)
     }
+
+    fn dispatch_scheduled(
+        &self,
+        tick: skyzen_services::ScheduledTick,
+    ) -> impl Future<Output = Result<(), skyzen_services::BoxError>> + Send {
+        self.1.dispatch(tick)
+    }
 }
 
 /// Serve the Azure Functions host on the port it chose, with the queue triggers mounted.
@@ -1628,10 +1722,11 @@ impl<C: ConsumerSet> skyzen_lambda::QueueDispatch for LambdaConsumers<C> {
 /// default and over `--host`/`--port`. An explicit `--listen` still wins over the host — that is
 /// someone running the binary by hand, and silently ignoring what they typed would be worse than
 /// serving somewhere the host is not listening.
-async fn serve_functions_host<Exec, E, C>(
+async fn serve_functions_host<Exec, E, C, S>(
     executor: Exec,
     endpoint: E,
     consumers: C,
+    schedules: S,
     options: &LaunchOptions,
     port: u16,
 ) -> Result<Shutdown, RuntimeFailure>
@@ -1639,6 +1734,7 @@ where
     Exec: CoreExecutor + 'static,
     E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
     C: ConsumerSet,
+    S: ScheduleSet,
 {
     let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let addr = match &options.listen {
@@ -1659,18 +1755,33 @@ where
 
     info!(
         port,
-        triggers = options.azure_queue_triggers.len(),
+        queue_triggers = options.azure_queue_triggers.len(),
+        timer_triggers = options.azure_scheduled_triggers.len(),
         "Serving the Azure Functions host as a custom handler"
     );
 
-    let endpoint = azure::mount(endpoint, consumers, options.azure_queue_triggers)
-        .map_err(RuntimeFailure::Mount)?;
+    // The `--test-scheduled` dev aid: fire every declared schedule once before the host's own
+    // delivery starts. The host owns timing here as much as it owns queue delivery, so the
+    // timer loops are never started — this is only a handler exercise, not a second scheduler.
+    if options.test_scheduled {
+        let (guard, _fired) = bounded::<Infallible>(1);
+        schedules.fire_once(&executor, &guard);
+    }
 
-    // The consumer set moved into the mounted endpoint: under the Functions host the platform
-    // pushes every message, so nothing here polls.
+    let endpoint = azure::mount(
+        endpoint,
+        consumers,
+        schedules,
+        options.azure_queue_triggers,
+        options.azure_scheduled_triggers,
+    )
+    .map_err(RuntimeFailure::Mount)?;
+
+    // Both event sets moved into the mounted endpoint: under the Functions host the platform
+    // pushes every event, so nothing here polls and nothing here times.
     // TLS is always `None` here — `launch` refuses a configured pair before this path runs,
     // since the Functions host speaks plaintext to its custom handler.
-    run_server(executor, endpoint, (), addr, None).await
+    run_server(executor, endpoint, (), (), addr, None, false).await
 }
 
 fn server_addr() -> ListenAddr {

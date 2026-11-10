@@ -19,6 +19,8 @@ serde_json = "1"
 # repeated key round-trips through the test client the way it does through the framework.
 serde_html_form = "0.4"
 insta = { version = "1", features = ["json"] }
+# `fire_scheduled` catches a panicking handler the way the runtime does, through `catch_unwind`.
+futures-util = "0.3.32"
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }

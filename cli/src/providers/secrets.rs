@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 /// The variables one delivery sets on a deployed function.
 ///
 /// Ordered by name, so a description and a request body list them the same way every run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Delivery(BTreeMap<String, SecretString>);
 
 impl Delivery {
@@ -60,6 +60,12 @@ impl Delivery {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The names this delivery writes, in sorted order.
+    #[must_use]
+    pub fn keys(&self) -> Vec<String> {
+        self.0.keys().cloned().collect()
     }
 
     /// The names alone, which is all a description or a log line may carry.

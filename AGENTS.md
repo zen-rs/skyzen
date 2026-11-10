@@ -130,7 +130,10 @@ Detection is in `src/runtime/mod.rs`; the adapters are `skyzen-lambda` and `src/
 polling loop (`src/runtime/consumer.rs`) when `[[native.queue_consumer]]` declares one, the
 platform's push on Workers and on Lambda, and the Functions host's `POST /{function}` on Azure. The
 polling loops deliberately do **not** run under either serverless host — the platform owns delivery
-there. `#[skyzen::scheduled]`, `#[skyzen::email]`, `#[skyzen::tail]` and `#[skyzen::durable_object]`
+there. `#[skyzen::scheduled]` works the same way: `[[schedule]]` entries drive `src/runtime/scheduler.rs`
+natively, become Cloudflare `triggers.crons` alongside `[cloudflare.triggers]`, become EventBridge
+rules on Lambda (`skyzen-lambda`'s `eventbridge`), and become `timerTrigger` functions on Azure.
+`#[skyzen::email]`, `#[skyzen::tail]` and `#[skyzen::durable_object]`
 remain Cloudflare-only, because nothing else has those events.
 
 ### 5a. Portable SQL and Migrations

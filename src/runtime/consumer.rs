@@ -396,7 +396,7 @@ pub async fn run_consumer<H: QueueConsumer>(
 }
 
 /// Hand the executor back to whatever else is ready, then continue.
-async fn yield_now() {
+pub(super) async fn yield_now() {
     let mut yielded = false;
     core::future::poll_fn(|context| {
         if yielded {
@@ -414,7 +414,10 @@ async fn yield_now() {
 ///
 /// `stop` carries no messages: it resolves exactly when the runtime drops the last sender, which
 /// is how one Ctrl+C reaches every consumer slot at once.
-async fn interruptible<T>(stop: &Receiver<Infallible>, work: impl Future<Output = T>) -> Option<T> {
+pub(super) async fn interruptible<T>(
+    stop: &Receiver<Infallible>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
     let work = core::pin::pin!(work);
     let stopped = core::pin::pin!(stop.recv());
 
@@ -425,7 +428,7 @@ async fn interruptible<T>(stop: &Receiver<Infallible>, work: impl Future<Output 
 }
 
 /// Sleep for `delay`, or return `None` as soon as the runtime starts shutting down.
-async fn idle(stop: &Receiver<Infallible>, delay: Duration) -> Option<()> {
+pub(super) async fn idle(stop: &Receiver<Infallible>, delay: Duration) -> Option<()> {
     interruptible(stop, async_io::Timer::after(delay))
         .await
         .map(|_deadline| ())
@@ -568,7 +571,7 @@ fn message_label<'a>(id: Option<&'a str>, receipt: &'a MessageReceipt) -> &'a st
 }
 
 /// The message a panicking handler carried, when it carried a printable one.
-fn panic_message(panic: &(dyn core::any::Any + Send)) -> &str {
+pub(super) fn panic_message(panic: &(dyn core::any::Any + Send)) -> &str {
     panic.downcast_ref::<&'static str>().map_or_else(
         || {
             panic

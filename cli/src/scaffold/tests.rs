@@ -249,6 +249,7 @@ fn every_template_manifest_renders_a_wrangler_config_wrangler_can_read() {
 
         let rendered = render(&RenderRequest {
             base,
+            schedules: &[],
             environments: Vec::new(),
             root_dir: Path::new("/tmp/proj"),
             entry_js_path: Path::new("/tmp/proj/dist/worker.js"),

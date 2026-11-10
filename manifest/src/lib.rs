@@ -56,17 +56,18 @@ pub use interpolate::{expand, expand_table, process_env, EnvLookup, InterpolateE
 pub use merge::deep_merge;
 pub use migrations::{MigrationFile, MigrationsError, DEFAULT_MIGRATIONS_DIR};
 pub use schema::{
-    AwsSection, AzureHttpMode, AzureQueueTrigger, AzureSection, BlobWiring, CfAssets,
-    CfAssetsNotFoundHandling, CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableObjects,
-    CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer, CfQueueProducer, CfQueues,
-    CfR2Bucket, CfServiceBinding, CfTriggers, CloudflareDatabaseSection, CloudflareSecretSection,
-    CloudflareSection, CloudflareServiceSection, CosmosWiring, DatabaseEntry, DatabaseType,
-    DynamoDbWiring, InvalidVarName, LambdaArchitecture, MemoryWiring, NativeDatabaseBackend,
-    NativeDatabaseSection, NativeQueueConsumer, NativeSection, NativeServiceBackend,
-    NativeServiceSection, PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring,
-    RdsEngine, RedisWiring, S3Wiring, SecretEntry, ServiceBusWiring, ServiceEntry, ServiceType,
-    SkyzenManifest, SqlUrlWiring, SqsWiring, StorageQueueWiring, VarName, WiringEnvVar,
-    HTTP_FUNCTION_NAME, PLAINTEXT_VARIABLE_TABLES,
+    AwsSection, AzureHttpMode, AzureQueueTrigger, AzureScheduleSection, AzureSection, BlobWiring,
+    CfAssets, CfAssetsNotFoundHandling, CfD1Database, CfDurableBinding, CfDurableMigration,
+    CfDurableObjects, CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer,
+    CfQueueProducer, CfQueues, CfR2Bucket, CfServiceBinding, CfTriggers, CloudflareDatabaseSection,
+    CloudflareSecretSection, CloudflareSection, CloudflareServiceSection, CosmosWiring, CronExpr,
+    DatabaseEntry, DatabaseType, DynamoDbWiring, InvalidCronExpr, InvalidScheduleName,
+    InvalidVarName, LambdaArchitecture, MemoryWiring, NativeDatabaseBackend, NativeDatabaseSection,
+    NativeQueueConsumer, NativeSection, NativeServiceBackend, NativeServiceSection,
+    PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring, RdsEngine, RedisWiring,
+    S3Wiring, ScheduleEntry, ScheduleError, ScheduleName, SecretEntry, ServiceBusWiring,
+    ServiceEntry, ServiceType, SkyzenManifest, SqlUrlWiring, SqsWiring, StorageQueueWiring,
+    VarName, WiringEnvVar, HTTP_FUNCTION_NAME, PLAINTEXT_VARIABLE_TABLES,
 };
 pub use secrets::{scan_table, SecretError, SecretFinding, SecretReport};
 
@@ -123,6 +124,14 @@ pub enum ManifestError {
         path: PathBuf,
         /// What is wrong with the entry.
         source: schema::QueueTriggerError,
+    },
+    /// A `[[schedule]]` entry cannot be used.
+    #[error("{path}: [[schedule]] {source}")]
+    Schedule {
+        /// The manifest path.
+        path: PathBuf,
+        /// What is wrong with the entries.
+        source: schema::ScheduleError,
     },
     /// A `[native.database.<name>]` RDS Data API wiring names some of its four values, not all.
     #[error("{path}: [native.database.{database}] {source}")]
@@ -355,6 +364,15 @@ impl Manifest {
                     source,
                 })?;
         }
+
+        // A `[[schedule]]` name becomes a Functions function and an EventBridge rule — one name
+        // is one schedule on every target, so a duplicate is rejected once here, for both
+        // consumers.
+        data.validate_schedules()
+            .map_err(|source| ManifestError::Schedule {
+                path: path.clone(),
+                source,
+            })?;
 
         // An RDS Data API wiring names all four of its values or none of them. Checked here, next
         // to the other cross-field rule, so the macro reports it as a compile error and the CLI
@@ -642,6 +660,59 @@ mod tests {
             NativeServiceBackend::Memory
         );
         assert!(data.database[0].default);
+    }
+
+    #[test]
+    fn schedules_parse_and_validate() {
+        let manifest = parse(
+            "[[schedule]]\nname = \"tick\"\ncron = \"*/10 9-17 * * MON-FRI\"\n\n\
+             [[schedule]]\nname = \"daily\"\ncron = \"0 9 * * 7\"\n",
+        )
+        .expect("manifest parses");
+
+        let data = manifest.data();
+        assert_eq!(data.schedule.len(), 2);
+        assert_eq!(data.schedule[0].name.as_str(), "tick");
+        assert_eq!(data.schedule[1].cron.as_str(), "0 9 * * 7");
+    }
+
+    #[test]
+    fn schedules_reject_bad_names_bad_crons_and_duplicates() {
+        // A name that cannot be an Azure function or an EventBridge rule name.
+        assert!(parse("[[schedule]]\nname = \"1bad\"\ncron = \"* * * * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"\"\ncron = \"* * * * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"bad name\"\ncron = \"* * * * *\"\n").is_err());
+
+        // Six fields (seconds), `?`, `L`, `W`, `#` — and a cron that can never fire.
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"0 */10 * * * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"* * ? * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"0 9 L * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"0 9 15W * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"0 9 * * 5#2\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"* * 32 * *\"\n").is_err());
+        assert!(parse("[[schedule]]\nname = \"x\"\ncron = \"* * 31 2 *\"\n").is_err());
+
+        // One logical schedule, one name — and one cron, which Cloudflare would otherwise
+        // collapse to a single trigger while the other targets fire both.
+        assert!(parse(
+            "[[schedule]]\nname = \"tick\"\ncron = \"* * * * *\"\n\n\
+             [[schedule]]\nname = \"tick\"\ncron = \"0 * * * *\"\n"
+        )
+        .is_err());
+        assert!(parse(
+            "[[schedule]]\nname = \"tick\"\ncron = \"*/5 * * * *\"\n\n\
+             [[schedule]]\nname = \"tock\"\ncron = \"*/5 * * * *\"\n"
+        )
+        .is_err());
+
+        // `http` is Skyzen's own catch-all function name, and a queue trigger's function name
+        // shares the Functions directory namespace.
+        assert!(parse("[[schedule]]\nname = \"http\"\ncron = \"* * * * *\"\n").is_err());
+        assert!(parse(
+            "[azure]\n\n[[azure.queue_triggers]]\nfunction = \"process\"\nqueue = \"jobs\"\n\n\
+             [[schedule]]\nname = \"process\"\ncron = \"* * * * *\"\n"
+        )
+        .is_err());
     }
 
     #[test]
