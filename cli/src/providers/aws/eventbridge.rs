@@ -261,7 +261,28 @@ impl Task for CutoverAlias {
                         })
                         .unwrap_or_default()
                 };
-            if env_of(&latest) != env_of(&alias) {
+            // And the rest of the versioned configuration — timeout, memory, layers — that
+            // a failed deploy can leave changed on `$LATEST` without touching code or env.
+            let config_of =
+                |config: &aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationOutput| {
+                    (
+                        config.timeout(),
+                        config.memory_size(),
+                        config.handler().map(str::to_owned),
+                        config.runtime().map(|runtime| runtime.as_str().to_owned()),
+                        config.role().map(str::to_owned),
+                        config
+                            .layers()
+                            .iter()
+                            .filter_map(|layer| layer.arn().map(str::to_owned))
+                            .collect::<Vec<_>>(),
+                        config
+                            .ephemeral_storage()
+                            .map(|storage| storage.size())
+                            .unwrap_or_default(),
+                    )
+                };
+            if env_of(&latest) != env_of(&alias) || config_of(&latest) != config_of(&alias) {
                 anyhow::bail!(
                     "`{}`'s $LATEST carries configuration the `{ALIAS}` alias does not — \
                      deploy before rotating secrets, or the rotation would promote \
@@ -754,7 +775,32 @@ impl EventBridgeSchedules {
                     let conflict = error
                         .as_service_error()
                         .is_some_and(|e| e.meta().code() == Some("ResourceConflictException"));
-                    if !conflict {
+                    if conflict {
+                        // A conflict means the grant exists or another operation is mid-flight —
+                        // check which, and retry rather than enable a rule that cannot invoke.
+                        let owner = snapshot.owner.as_deref().unwrap_or(qualified).to_owned();
+                        if !self
+                            .has_statement(lambda, &owner, statement, rule_arn)
+                            .await
+                            .with_context(|| format!("failed to read the policy of `{owner}`"))?
+                        {
+                            lambda
+                                .add_permission()
+                                .function_name(&owner)
+                                .action(INVOKE_ACTION)
+                                .principal(EVENTS_PRINCIPAL)
+                                .source_arn(rule_arn)
+                                .statement_id(statement)
+                                .send()
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "failed to restore the invoke permission of `{}`",
+                                        snapshot.name
+                                    )
+                                })?;
+                        }
+                    } else {
                         return Err(error).with_context(|| {
                             format!(
                                 "failed to restore the invoke permission of `{}`",
@@ -923,7 +969,15 @@ impl EventBridgeSchedules {
                     Default::default()
                 }
             };
-        names.extend(self.managed_rule_names(events).await?);
+        match self.managed_rule_names(events).await {
+            Ok(rules) => names.extend(rules),
+            // `events:ListRules` is optional too — the policies above are enough to keep a
+            // deployment working that never asked for schedule-management access.
+            Err(error) if Self::is_access_denied(&error) => {
+                output::warn(format!("could not list managed rules: {error:#}"));
+            }
+            Err(error) => return Err(error),
+        }
 
         // Only rules still carrying an unqualified target need moving — when none do, the
         // alias stays exactly where it is. Repointing it anyway would resurrect the version
@@ -1057,7 +1111,11 @@ impl EventBridgeSchedules {
                     let _ = lambda
                         .remove_permission()
                         .function_name(&qualified)
-                        .statement_id(format!("skyzen-schedule-{name}"))
+                        .statement_id(format!(
+                            "skyzen-schedule-{}",
+                            rule.strip_prefix(&format!("skyzen-{}--", self.function))
+                                .unwrap_or(rule)
+                        ))
                         .send()
                         .await;
                     if *enabled {
@@ -1066,6 +1124,8 @@ impl EventBridgeSchedules {
                 }
                 return Err(error);
             }
+            // Whether the grant was migration-made is the difference between removing it and
+            // deleting a permission that predates this deploy.
             migrated.push((rule.clone(), previous, enabled));
             output::ok(format!(
                 "retargeted EventBridge rule `{rule}` at the `{ALIAS}` alias"
@@ -1117,10 +1177,18 @@ impl EventBridgeSchedules {
                 moved
             })
             .collect();
-        // The rule is disabled before its target moves: `PutTargets` takes time to
-        // propagate, and a rule still enabled in the gap keeps firing the unqualified
-        // function — the code `deploy` is about to swap — with the old cron. Disabling
-        // first is the barrier `reconcile` re-enables behind once the alias has cut over.
+        // The unqualified grant goes first — EventBridge propagates target and state changes
+        // eventually, so `DisableRule` alone is no barrier, but a rule that has no permission
+        // to invoke `$LATEST` fails closed during the gap and cannot run the swapped code.
+        let legacy = self.function.as_str();
+        let _ = lambda
+            .remove_permission()
+            .function_name(legacy)
+            .statement_id(format!("skyzen-schedule-{name}"))
+            .send()
+            .await;
+        // Then the disable — whatever propagation lag remains overlaps the upload, which is
+        // the slow part of the deploy. `reconcile` re-enables behind the alias once cut over.
         events
             .disable_rule()
             .name(rule)
@@ -1392,6 +1460,11 @@ impl EventBridgeSchedules {
             .await
             .with_context(|| format!("failed to delete stale EventBridge rule `{rule}`"))?;
         Ok(())
+    }
+
+    /// Whether an AWS error is an authorization denial the caller may skip.
+    fn is_access_denied(error: &anyhow::Error) -> bool {
+        error.to_string().contains("AccessDenied")
     }
 
     /// Every rule name this module owns: the `skyzen-{function}--` prefix is ours by
