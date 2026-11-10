@@ -11,6 +11,9 @@
 //! and the BSDs hand every connection to one listener; Windows has no equivalent), so the threads
 //! share one socket through duplicated descriptors and whichever is idle takes the next
 //! connection: the same program, balanced by the accept queue instead of by the kernel's hash.
+//!
+//! Windows cannot share a socket that way, since a completion port takes a socket only once: one
+//! thread accepts and deals the connections out to the serving threads (see [`super::handoff`]).
 
 use core::{convert::Infallible, future::Future};
 use std::{io, num::NonZeroUsize, rc::Rc, sync::Arc, thread};
@@ -23,7 +26,11 @@ use skyzen_h1::H1;
 use skyzen_hyper::Hyper;
 use tracing::error;
 
-use super::{tls::ServerTls, HttpServer, RuntimeFailure};
+use super::{
+    handoff::{Acceptor, Incoming},
+    tls::ServerTls,
+    HttpServer, RuntimeFailure,
+};
 use crate::{
     runtime::{context::ShutdownGuard, WorkerContext},
     Endpoint, Request, Response,
@@ -34,13 +41,33 @@ use crate::{
 pub(super) enum Socket {
     /// A TCP listener.
     Tcp(std::net::TcpListener),
+    /// The connections a separate acceptor deals to this thread, where one socket cannot be
+    /// shared between threads.
+    #[cfg_attr(
+        not(any(windows, test)),
+        expect(dead_code, reason = "only Windows selects the handoff path")
+    )]
+    Handoff(Incoming),
     /// A filesystem unix socket.
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixListener),
 }
 
+/// The sockets of every serving thread, and the acceptor that feeds them when they share none.
+#[derive(Debug)]
+pub(super) struct Bound {
+    /// One per serving thread.
+    pub(super) sockets: Vec<Socket>,
+    /// Deals connections to the `Handoff` sockets; `None` when the threads accept for themselves.
+    pub(super) acceptor: Option<Acceptor>,
+}
+
 impl Socket {
-    /// The TCP listener, or `None` for a unix socket.
+    /// The address a TCP socket listens on, or `None` for a unix socket.
+    ///
+    /// # Errors
+    ///
+    /// The system cannot report the address.
     #[cfg_attr(
         not(unix),
         expect(
@@ -48,9 +75,10 @@ impl Socket {
             reason = "the `None` arm is the unix socket, which only unix compiles"
         )
     )]
-    pub(super) const fn tcp(&self) -> Option<&std::net::TcpListener> {
+    pub(super) fn tcp_addr(&self) -> Option<io::Result<std::net::SocketAddr>> {
         match self {
-            Self::Tcp(listener) => Some(listener),
+            Self::Tcp(listener) => Some(listener.local_addr()),
+            Self::Handoff(incoming) => Some(incoming.local_addr()),
             #[cfg(unix)]
             Self::Unix(_) => None,
         }
@@ -66,12 +94,24 @@ impl Socket {
 /// # Errors
 ///
 /// The address cannot be bound, or a socket cannot be duplicated.
-pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Result<Vec<Socket>> {
+pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Result<Bound> {
     match addr {
-        super::ListenAddr::Tcp(addr) => Ok(bind_tcp(*addr, threads.get())?
-            .into_iter()
-            .map(Socket::Tcp)
-            .collect()),
+        #[cfg(windows)]
+        super::ListenAddr::Tcp(addr) => {
+            let (incoming, acceptor) = super::handoff::bind(*addr, threads.get())?;
+            Ok(Bound {
+                sockets: incoming.into_iter().map(Socket::Handoff).collect(),
+                acceptor: Some(acceptor),
+            })
+        }
+        #[cfg(not(windows))]
+        super::ListenAddr::Tcp(addr) => Ok(Bound {
+            sockets: bind_tcp(*addr, threads.get())?
+                .into_iter()
+                .map(Socket::Tcp)
+                .collect(),
+            acceptor: None,
+        }),
         #[cfg(unix)]
         super::ListenAddr::Unix(path) => {
             let listener = super::bind_unix_socket(path)?;
@@ -82,13 +122,16 @@ pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Resul
                 sockets.push(Socket::Unix(listener.try_clone()?));
             }
             sockets.push(Socket::Unix(listener));
-            Ok(sockets)
+            Ok(Bound {
+                sockets,
+                acceptor: None,
+            })
         }
     }
 }
 
 /// The backlog asked of `listen(2)`; the system clamps it to its own limit.
-const BACKLOG: i32 = i32::MAX;
+pub(super) const BACKLOG: i32 = i32::MAX;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn bind_tcp(addr: std::net::SocketAddr, threads: usize) -> io::Result<Vec<std::net::TcpListener>> {
@@ -113,15 +156,13 @@ fn bind_tcp(addr: std::net::SocketAddr, threads: usize) -> io::Result<Vec<std::n
     Ok(listeners)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 fn bind_tcp(addr: std::net::SocketAddr, threads: usize) -> io::Result<Vec<std::net::TcpListener>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     // The address is bound once and shared. `SO_REUSEPORT` would not balance here: the BSDs and
-    // macOS deliver every connection to one of the listeners, and Windows has no such option
-    // (its `SO_REUSEADDR` lets another process take the port over).
-    #[cfg(not(windows))]
+    // macOS deliver every connection to one of the listeners.
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
     socket.listen(BACKLOG)?;
@@ -164,7 +205,8 @@ pub(super) struct Cores {
     pub(super) exited: Receiver<Infallible>,
 }
 
-/// Start one serving thread for each of `sockets`.
+/// Start one serving thread for each of `bound.sockets`, and the acceptor that feeds them if
+/// there is one.
 ///
 /// Every thread stops accepting when `stop` closes, lets its open connections finish, and holds a
 /// clone of `drain` for as long as it or any request on it is alive.
@@ -174,7 +216,7 @@ pub(super) struct Cores {
 /// A thread could not be created.
 pub(super) fn start<F, A, W>(
     plan: Plan<F, W>,
-    sockets: Vec<Socket>,
+    bound: Bound,
     stop: &Receiver<Infallible>,
     drain: &Sender<Infallible>,
 ) -> io::Result<Cores>
@@ -183,11 +225,23 @@ where
     A: Endpoint + Clone + 'static,
     W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
 {
+    let Bound { sockets, acceptor } = bound;
     let threads = sockets.len();
     let plan = Arc::new(plan);
     let (ready_tx, ready) = bounded(threads);
     // Nothing is sent: it closes once every thread has dropped its sender.
     let (exited_tx, exited) = bounded::<Infallible>(1);
+
+    if let Some(acceptor) = acceptor {
+        let stop = stop.clone();
+        let exited = exited_tx.clone();
+        thread::Builder::new()
+            .name("skyzen-accept".to_owned())
+            .spawn(move || {
+                acceptor.run(&stop);
+                drop(exited);
+            })?;
+    }
 
     for (index, socket) in sockets.into_iter().enumerate() {
         let plan = Arc::clone(&plan);
@@ -253,33 +307,15 @@ fn work<F, A, W>(
         match socket {
             Socket::Tcp(listener) => match Compio.tcp_listener(listener) {
                 Ok(listener) => {
-                    if !announce(ready).await {
-                        return;
-                    }
-                    match (&plan.tls, plan.server) {
-                        // Skyzen's own server speaks cleartext only, so TLS is always hyper's,
-                        // with ALPN choosing between h1 and h2.
-                        (Some(tls), _) => {
-                            super::tls::serve(
-                                executor,
-                                listener,
-                                endpoint,
-                                shutdown,
-                                tls.clone(),
-                                plan.max_connections,
-                            )
-                            .await;
-                        }
-                        (None, server) => {
-                            serve_cleartext(server, &h1, executor, listener, endpoint, shutdown)
-                                .await;
-                        }
-                    }
+                    serve_tcp(plan, &h1, executor, listener, endpoint, shutdown, ready).await;
                 }
                 Err(error) => {
                     let _ = ready.send(Err(error.into())).await;
                 }
             },
+            Socket::Handoff(listener) => {
+                serve_tcp(plan, &h1, executor, listener, endpoint, shutdown, ready).await;
+            }
             #[cfg(unix)]
             Socket::Unix(listener) => match Compio.unix_listener(listener) {
                 Ok(listener) => {
@@ -294,6 +330,41 @@ fn work<F, A, W>(
             },
         }
     });
+}
+
+/// Announce readiness, then serve `listener` over TCP: through TLS if the plan has it, else in
+/// cleartext with the plan's server.
+async fn serve_tcp<F, W, L, E>(
+    plan: &Plan<F, W>,
+    h1: &H1,
+    executor: Rc<Runtime>,
+    listener: L,
+    endpoint: E,
+    shutdown: impl Future<Output = ()> + 'static,
+    ready: &Sender<Result<(), RuntimeFailure>>,
+) where
+    L: Listener<Stream = <Compio as Io>::TcpStream, Addr = std::net::SocketAddr>,
+    E: Endpoint + Clone + 'static,
+{
+    if !announce(ready).await {
+        return;
+    }
+    match (&plan.tls, plan.server) {
+        // Skyzen's own server speaks cleartext only, so TLS is always hyper's, with ALPN choosing
+        // between h1 and h2.
+        (Some(tls), _) => {
+            super::tls::serve(
+                executor,
+                listener,
+                endpoint,
+                shutdown,
+                tls.clone(),
+                plan.max_connections,
+            )
+            .await;
+        }
+        (None, server) => serve_cleartext(server, h1, executor, listener, endpoint, shutdown).await,
+    }
 }
 
 /// Serve `listener`, TCP or unix, in cleartext with the chosen server.
@@ -365,7 +436,8 @@ mod tests {
     use executor_core::{smol::SmolGlobal, AnyExecutor};
     use http_kit::{error::BoxHttpError, Body};
 
-    use super::{bind, start, Cores, Plan, Socket};
+    use super::{bind, start, Bound, Cores, Plan, Socket};
+    use crate::runtime::native::handoff;
     use crate::{
         runtime::native::{HttpServer, ListenAddr},
         Endpoint, Request, Response,
@@ -380,7 +452,7 @@ mod tests {
     }
 
     impl Serving {
-        fn start(sockets: Vec<Socket>, server: HttpServer) -> Self {
+        fn start(bound: Bound, server: HttpServer) -> Self {
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
             let plan = Plan {
@@ -391,7 +463,7 @@ mod tests {
                 server,
                 tls: None,
             };
-            let cores = start(plan, sockets, &stopping, &drain).expect("start the threads");
+            let cores = start(plan, bound, &stopping, &drain).expect("start the threads");
             for _ in 0..cores.threads {
                 cores
                     .ready
@@ -464,14 +536,36 @@ mod tests {
 
     fn connections_spread_over_threads(server: HttpServer) {
         let threads = NonZeroUsize::new(4).unwrap();
-        let sockets =
-            bind(&ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()), threads).expect("bind");
-        let first = sockets[0].tcp().expect("a TCP address binds TCP sockets");
-        let addr = first.local_addr().expect("local addr");
-
-        let serving = Serving::start(sockets, server);
+        let bound = bind(&ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()), threads).expect("bind");
+        let addr = bound.sockets[0]
+            .tcp_addr()
+            .expect("a TCP address binds TCP sockets")
+            .expect("local addr");
+        let serving = Serving::start(bound, server);
         assert_eq!(serving.cores.threads, 4);
+        assert_spread(addr, server, serving);
+    }
 
+    /// The same, through the acceptor that Windows uses in place of a shared socket.
+    #[test]
+    fn dealt_connections_land_on_more_than_one_runtime_thread() {
+        for server in [HttpServer::H1, HttpServer::Hyper] {
+            let (incoming, acceptor) =
+                handoff::bind("127.0.0.1:0".parse().unwrap(), 4).expect("bind");
+            let bound = Bound {
+                sockets: incoming.into_iter().map(Socket::Handoff).collect(),
+                acceptor: Some(acceptor),
+            };
+            let addr = bound.sockets[0]
+                .tcp_addr()
+                .expect("a TCP address")
+                .expect("local addr");
+            let serving = Serving::start(bound, server);
+            assert_spread(addr, server, serving);
+        }
+    }
+
+    fn assert_spread(addr: std::net::SocketAddr, server: HttpServer, serving: Serving) {
         let served_by: BTreeSet<String> = (0..128)
             .map(|_| exchange(std::net::TcpStream::connect(addr).expect("connect")))
             .collect();

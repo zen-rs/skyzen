@@ -23,6 +23,7 @@ use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
 
 mod cores;
+mod handoff;
 mod tls;
 
 use tls::{ServerTls, TlsError};
@@ -921,10 +922,10 @@ where
     C: ConsumerSet,
 {
     let threads = std::thread::available_parallelism()?;
-    let sockets = cores::bind(&addr, threads)?;
+    let bound = cores::bind(&addr, threads)?;
     let scheme = if tls.is_some() { "https" } else { "http" };
-    let listening = match sockets.first().and_then(cores::Socket::tcp) {
-        Some(listener) => format!("{scheme}://{}", listener.local_addr()?),
+    let listening = match bound.sockets.first().and_then(cores::Socket::tcp_addr) {
+        Some(local) => format!("{scheme}://{}", local?),
         None => addr.to_string(),
     };
 
@@ -944,7 +945,7 @@ where
         server,
         tls,
     };
-    let started = cores::start(plan, sockets, &stopping, &drain)?;
+    let started = cores::start(plan, bound, &stopping, &drain)?;
 
     let mut failure = None;
     for _ in 0..started.threads {

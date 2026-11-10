@@ -15,8 +15,9 @@ use std::cell::Cell;
 use std::{future::Future, num::NonZeroUsize, rc::Rc};
 
 use executor_core::compio::Runtime;
-use http_kit_io::{compio::Compio, Io};
+use http_kit_io::{compio::Compio, Io, Listener};
 use skyzen_core::Endpoint;
+use std::net::SocketAddr;
 
 use super::{ListenAddr, RuntimeFailure, TlsFiles};
 
@@ -218,21 +219,22 @@ fn load_tls_acceptor(files: &TlsFiles) -> Result<futures_rustls::TlsAcceptor, Tl
 /// Nothing is shared with the other threads but the acceptor: the handshake, the protocol choice
 /// and the connection all run on the thread that accepted it.
 #[cfg(feature = "server-tls")]
-pub(super) async fn serve<E>(
+pub(super) async fn serve<L, E>(
     executor: Rc<Runtime>,
-    listener: <Compio as Io>::TcpListener,
+    listener: L,
     endpoint: E,
     shutdown: impl Future<Output = ()> + 'static,
     tls: ServerTls,
     max_connections: NonZeroUsize,
 ) where
+    L: Listener<Stream = <Compio as Io>::TcpStream, Addr = SocketAddr>,
     E: Endpoint + Clone + 'static,
 {
     use core::{convert::Infallible, pin::pin};
 
     use executor_core::{LocalExecutor as _, Task as _};
     use futures_util::future::{select, Either};
-    use http_kit_io::{IntoPoll as _, Listener as _};
+    use http_kit_io::IntoPoll as _;
     use skyzen_hyper::{serve_connection, IntoService};
     use tracing::{debug, error, warn};
 
@@ -290,14 +292,15 @@ pub(super) async fn serve<E>(
 
 /// Without `server-tls` there is no [`ServerTls`] to hold, so this cannot be called.
 #[cfg(not(feature = "server-tls"))]
-pub(super) async fn serve<E>(
+pub(super) async fn serve<L, E>(
     _executor: Rc<Runtime>,
-    _listener: <Compio as Io>::TcpListener,
+    _listener: L,
     _endpoint: E,
     _shutdown: impl Future<Output = ()> + 'static,
     tls: ServerTls,
     _max_connections: NonZeroUsize,
 ) where
+    L: Listener<Stream = <Compio as Io>::TcpStream, Addr = SocketAddr>,
     E: Endpoint + Clone + 'static,
 {
     match tls {}
