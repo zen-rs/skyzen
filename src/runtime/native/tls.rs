@@ -779,7 +779,8 @@ mod tests {
                 let BufResult(read, _) = tls.read(vec![0_u8; 8]).await;
                 read
             };
-            let (dropped, read) = futures_util::future::join(serve, client).await;
+            // Boxed: on Linux the stream carries kernel TLS state, which makes the join large.
+            let (dropped, read) = Box::pin(futures_util::future::join(serve, client)).await;
             assert!(
                 dropped,
                 "a silent h2 connection must be dropped, not served"
@@ -812,7 +813,8 @@ mod tests {
                 write_all(&mut tls, HTTP2_PREFACE.to_vec()).await;
                 tls
             };
-            let (accepted, _tls) = futures_util::future::join(serve, request).await;
+            // Boxed: on Linux the stream carries kernel TLS state, which makes the join large.
+            let (accepted, _tls) = Box::pin(futures_util::future::join(serve, request)).await;
             assert!(
                 matches!(accepted, Some(Accepted::Http1(_))),
                 "an http/1.1 ALPN must never serve h2"
