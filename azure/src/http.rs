@@ -17,11 +17,10 @@ pub fn system_backend() -> NativeBackend {
     NativeBackend::new(Transport::system())
 }
 
-/// Send `request`, an error status coming back as the response it is.
+/// Send `request`; an error status comes back as the response it is.
 ///
-/// zenwave reports a `4xx` or `5xx` as [`zenwave::Error::Http`], but every caller here reads the
-/// service's refusal — its status, its `Retry-After`, its error body — out of the response, which
-/// the error carries whole.
+/// zenwave hands back a `4xx` or `5xx` as an ordinary response, and every caller here reads the
+/// service's refusal — its status, its `Retry-After`, its error body — out of it.
 ///
 /// # Errors
 ///
@@ -30,8 +29,5 @@ pub async fn send(
     backend: &mut NativeBackend,
     request: &mut Request,
 ) -> Result<Response, zenwave::Error> {
-    match backend.respond(request).await {
-        Err(zenwave::Error::Http { response, .. }) => Ok(response.response),
-        answered => answered,
-    }
+    backend.respond(request).await
 }
