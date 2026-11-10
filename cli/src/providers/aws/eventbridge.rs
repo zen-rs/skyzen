@@ -114,6 +114,35 @@ pub struct MigrateSchedulesToAlias {
     deploy: crate::providers::CommandPlan,
 }
 
+/// A comparable fingerprint of a function's execution state: its code and every versioned
+/// setting `PublishVersion` would freeze. Two reads equal means nothing a failed deploy
+/// could have left behind is different.
+fn execution_fingerprint(
+    config: &aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationOutput,
+) -> Vec<String> {
+    vec![
+        format!("{:?}", config.code_sha256()),
+        format!("{:?}", config.timeout()),
+        format!("{:?}", config.memory_size()),
+        format!("{:?}", config.handler()),
+        format!("{:?}", config.runtime()),
+        format!("{:?}", config.role()),
+        format!("{:?}", config.layers()),
+        format!("{:?}", config.ephemeral_storage()),
+        format!("{:?}", config.vpc_config()),
+        format!("{:?}", config.architectures()),
+        format!("{:?}", config.dead_letter_config()),
+        format!("{:?}", config.tracing_config()),
+        format!("{:?}", config.snap_start()),
+        format!("{:?}", config.logging_config()),
+        format!("{:?}", config.file_system_configs()),
+        format!("{:?}", config.kms_key_arn()),
+        format!("{:?}", config.description()),
+        format!("{:?}", config.image_config_response()),
+        format!("{:?}", config.environment().map(|e| e.variables())),
+    ]
+}
+
 /// What migration did to one rule — everything a rollback has to undo.
 #[derive(Debug)]
 struct Migrated {
@@ -167,25 +196,18 @@ impl Task for MigrateSchedulesToAlias {
             let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let lambda = aws_sdk_lambda::Client::new(&shared);
             let events = aws_sdk_eventbridge::Client::new(&shared);
-            // `$LATEST`'s code before the upload — a failed `cargo lambda deploy` is not an
-            // atomic rollback: the code may have swapped while a later sub-operation
-            // failed. Restoring legacy invocation is only safe if the code did not move.
+            // `$LATEST`'s execution state before the upload — code plus every versioned
+            // setting, because a failed `cargo lambda deploy` is not an atomic rollback:
+            // the code or configuration may have moved while a later sub-operation failed.
+            // Restoring legacy invocation is only safe when that state is untouched.
             let before = lambda
                 .get_function_configuration()
                 .function_name(&self.inner.function)
                 .send()
                 .await
                 .ok()
-                .and_then(|config| config.code_sha256().map(str::to_owned));
+                .map(|config| execution_fingerprint(&config));
             let migrated = self.inner.migrate_to_alias(&events, &lambda).await?;
-            let arn = lambda
-                .get_function_configuration()
-                .function_name(&self.inner.function)
-                .send()
-                .await
-                .ok()
-                .and_then(|config| config.function_arn().map(str::to_owned))
-                .unwrap_or_default();
             // The whole transaction lives here — migrate, upload, reconcile: a failure at
             // any stage restores the moved rules before the error escapes, because the
             // plan runner stops and nothing later could.
@@ -196,8 +218,8 @@ impl Task for MigrateSchedulesToAlias {
                     .send()
                     .await
                     .ok()
-                    .and_then(|config| config.code_sha256().map(str::to_owned));
-                if before == after {
+                    .map(|config| execution_fingerprint(&config));
+                if before.is_some() && before == after {
                     output::warn("the deploy failed — restoring the migrated schedules");
                     for entry in &migrated {
                         let _ = self.inner.unmigrate_one(&events, &lambda, entry).await;
@@ -210,6 +232,41 @@ impl Task for MigrateSchedulesToAlias {
                 }
                 return Err(error);
             }
+            // The upload leaves an update in progress — `publish` or `add_permission` meets
+            // it as `ResourceConflictException`. Settle before the ARN read or reconcile.
+            lambda
+                .wait_until_function_updated_v2()
+                .function_name(&self.inner.function)
+                .wait(super::lambda_env::UPDATE_TIMEOUT)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Lambda function `{}` did not finish updating within {} seconds",
+                        self.inner.function,
+                        super::lambda_env::UPDATE_TIMEOUT.as_secs()
+                    )
+                })?;
+            // A first deployment creates the function — read its ARN only now that it is
+            // guaranteed to exist, not before the upload.
+            let arn = lambda
+                .get_function_configuration()
+                .function_name(&self.inner.function)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "could not read Lambda function `{}` to point EventBridge rules at it",
+                        self.inner.function
+                    )
+                })?
+                .function_arn()
+                .with_context(|| {
+                    format!(
+                        "Lambda function `{}` reported no ARN to point EventBridge rules at",
+                        self.inner.function
+                    )
+                })?
+                .to_owned();
             let parts: Vec<&str> = arn.split(':').collect();
             let (partition, region, account) = parts
                 .get(1)
@@ -221,6 +278,7 @@ impl Task for MigrateSchedulesToAlias {
                         "`{arn}` is not a Lambda function ARN EventBridge rules can be built from"
                     )
                 })?;
+            let qualified = format!("{}:{ALIAS}", self.inner.function);
             let mut snapshot = Vec::new();
             let mut alias = None;
             if let Err(error) = self
@@ -235,10 +293,20 @@ impl Task for MigrateSchedulesToAlias {
                 )
                 .await
             {
-                output::warn("reconciliation failed — restoring the migrated schedules");
-                for entry in &migrated {
-                    let _ = self.inner.unmigrate_one(&events, &lambda, entry).await;
-                }
+                // The code already swapped — restoring legacy invocation would fire new code
+                // on the old configuration. Reconciliation's own rollback puts the rules
+                // back to their post-migration state (disabled, alias-targeted, old version)
+                // and stops there: a down schedule, never an unsafe one.
+                self.inner
+                    .rollback_reconcile(
+                        &lambda,
+                        &events,
+                        &qualified,
+                        (partition, region, account),
+                        &snapshot,
+                        &alias,
+                    )
+                    .await;
                 return Err(error);
             }
             Ok(())
@@ -499,36 +567,15 @@ impl Task for EventBridgeSchedules {
                 // The alias goes back first: rules re-enabled by the restore below must
                 // find the old version behind them, or the rollback itself wakes a stale
                 // cron on new code.
-                if let Some(previous) = &alias {
-                    let restore = lambda
-                        .update_alias()
-                        .function_name(&self.function)
-                        .name(ALIAS)
-                        .function_version(previous)
-                        .send()
-                        .await;
-                    if let Err(restore) = restore {
-                        output::warn(format!(
-                            "could not repoint the `{ALIAS}` alias back at `{previous}`: \
-                             {restore}"
-                        ));
-                    }
-                }
-                for taken in &snapshot {
-                    let rule_arn = format!(
-                        "arn:{partition}:events:{region}:{account}:rule/{}",
-                        taken.name
-                    );
-                    if let Err(restore) = self
-                        .restore_rule(&events, &lambda, &qualified, &rule_arn, taken)
-                        .await
-                    {
-                        output::warn(format!(
-                            "could not restore EventBridge rule `{}`: {restore}",
-                            taken.name
-                        ));
-                    }
-                }
+                self.rollback_reconcile(
+                    &lambda,
+                    &events,
+                    &qualified,
+                    (partition, region, account),
+                    &snapshot,
+                    &alias,
+                )
+                .await;
                 return Err(error);
             }
             Ok(())
@@ -1207,7 +1254,7 @@ impl EventBridgeSchedules {
                 .await;
             if let Err(error) = result {
                 for entry in migrated.iter().chain(std::iter::once(&entry)) {
-                    self.unmigrate_one(events, lambda, entry).await;
+                    let _ = self.unmigrate_one(events, lambda, entry).await;
                 }
                 return Err(error);
             }
@@ -1217,6 +1264,50 @@ impl EventBridgeSchedules {
             ));
         }
         Ok(migrated)
+    }
+
+    /// Undo what `reconcile` had already done when it failed: repoint the alias back at the
+    /// version it served, then put every snapshotted rule's targets, grant and state back.
+    async fn rollback_reconcile(
+        &self,
+        lambda: &aws_sdk_lambda::Client,
+        events: &aws_sdk_eventbridge::Client,
+        qualified: &str,
+        (partition, region, account): (&str, &str, &str),
+        snapshot: &[RuleSnapshot],
+        alias: &Option<String>,
+    ) {
+        // The alias goes back first: rules re-enabled by the restore below must find the
+        // old version behind them, or the rollback itself wakes a stale cron on new code.
+        if let Some(previous) = alias {
+            let restore = lambda
+                .update_alias()
+                .function_name(&self.function)
+                .name(ALIAS)
+                .function_version(previous)
+                .send()
+                .await;
+            if let Err(restore) = restore {
+                output::warn(format!(
+                    "could not repoint the `{ALIAS}` alias back at `{previous}`: {restore}"
+                ));
+            }
+        }
+        for taken in snapshot {
+            let rule_arn = format!(
+                "arn:{partition}:events:{region}:{account}:rule/{}",
+                taken.name
+            );
+            if let Err(restore) = self
+                .restore_rule(&events, &lambda, qualified, &rule_arn, taken)
+                .await
+            {
+                output::warn(format!(
+                    "could not restore EventBridge rule `{}`: {restore}",
+                    taken.name
+                ));
+            }
+        }
     }
 
     /// Put one migrated rule back: its original targets, its unqualified grant if migration
