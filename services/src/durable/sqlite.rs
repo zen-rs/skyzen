@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use crate::durable::DurableDb;
 
-    #[tokio::test]
+    #[compio::test]
     async fn executes_and_reads_sql() {
         let backend = SqliteDurableDb::in_memory()
             .await
@@ -121,7 +121,7 @@ mod tests {
         assert_eq!(value, 7);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn sync_resolves_after_writes() {
         let db = DurableDb::new(
             SqliteDurableDb::in_memory()

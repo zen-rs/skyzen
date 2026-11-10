@@ -434,7 +434,7 @@ mod tests {
         user: String,
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn wrapper_supports_crud_listing_and_json_helpers() {
         let kv = DurableKv::new(InMemoryDurableKvStore::default());
 
@@ -499,7 +499,7 @@ mod tests {
         assert!(remaining.is_empty(), "{remaining:?}");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn get_json_surfaces_deserialization_errors() {
         let kv = DurableKv::new(InMemoryDurableKvStore::default());
         kv.put("session", b"not-json").await.unwrap();
@@ -509,7 +509,7 @@ mod tests {
         assert!(matches!(error, DurableKvError::Serialization(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn middleware_injects_durable_kv_for_downstream_endpoint_and_extractor() {
         let store = InMemoryDurableKvStore::default();
         store.put("message", b"hello").await.unwrap();
@@ -529,7 +529,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn extractor_returns_internal_server_error_when_durable_kv_is_missing() {
         let mut request = http_kit::Request::new(Body::empty());
 

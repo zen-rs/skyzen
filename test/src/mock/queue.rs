@@ -314,7 +314,7 @@ mod tests {
 
     use super::InMemoryQueue;
 
-    #[tokio::test]
+    #[compio::test]
     async fn send_and_send_batch_preserve_fifo_order_through_pop() {
         let queue = InMemoryQueue::new();
         queue.send(b"first").await.unwrap();
@@ -343,7 +343,7 @@ mod tests {
         assert!(queue.is_empty());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn receive_leases_a_message_and_ack_deletes_it() {
         let queue = InMemoryQueue::new();
         queue.send(b"job").await.unwrap();
@@ -362,7 +362,7 @@ mod tests {
         assert!(queue.is_empty());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_lapsed_lease_redelivers_the_message_with_a_higher_attempt_count() {
         let queue = InMemoryQueue::new();
         queue.send(b"job").await.unwrap();
@@ -384,7 +384,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn nack_reschedules_the_message_and_keeps_the_attempt_count() {
         let queue = InMemoryQueue::new();
         queue.send(b"job").await.unwrap();
@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(retried[0].attempts, Some(2));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn nack_with_a_delay_holds_the_message_back() {
         let queue = InMemoryQueue::new();
         queue.send(b"job").await.unwrap();
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(queue.len(), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn send_with_delay_holds_the_message_until_it_is_due() {
         let queue = InMemoryQueue::new();
         queue
@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(received[0].body, b"now".to_vec());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn max_messages_bounds_one_receive() {
         let queue = InMemoryQueue::new();
         queue
@@ -459,7 +459,7 @@ mod tests {
         assert_eq!(received[1].body, b"b".to_vec());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn settling_an_unknown_receipt_is_a_conflict() {
         let queue = InMemoryQueue::new();
         let receipt = MessageReceipt::new("never-issued");
@@ -474,7 +474,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn wrapper_receives_and_decodes_json_bodies() {
         #[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
         struct Job {
@@ -500,7 +500,7 @@ mod tests {
         assert!(backend.is_empty());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn fail_next_with_fails_exactly_one_operation() {
         let queue = InMemoryQueue::new();
         queue.fail_next_with("queue unreachable");

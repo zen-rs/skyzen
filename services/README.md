@@ -91,9 +91,10 @@ awaits promises through `worker::send::IntoSendFuture`. See
 
 ## Feature Flags
 
-### Runtime Selection
-`sqlx` 0.9 splits the runtime from the TLS stack, so one of each is picked independently:
-- `runtime-tokio` or `runtime-async-std`: the async runtime `sqlx` drives I/O on.
+### Runtime and TLS
+`sqlx` runs on its runtime-neutral `runtime-smol`, whose sockets and timers are async-io's, so a
+pool works under any executor — compio's thread-per-core runtime included — with no tokio context.
+There is no runtime to pick; the TLS stack is:
 - `tls-native-tls`, `tls-rustls`, or `tls-none`: the TLS stack for `postgres`/`mysql` connections (`sqlite` needs none).
 
 ### Database Backends

@@ -21,12 +21,13 @@ serde_html_form = "0.4"
 insta = { version = "1", features = ["json"] }
 
 [dev-dependencies]
-tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+# The tests run on a compio runtime, the one the native server runs.
+compio = { version = "0.19.2", default-features = false, features = ["runtime", "macros"] }
 
 [features]
-# `InMemoryDb` runs on SQLite over sqlx, which needs a runtime (SQLite uses no TLS,
-# so none is selected). Enabling this feature is what makes `InMemoryDb` exist.
-runtime-tokio = ["skyzen-services/runtime-tokio", "skyzen-services/sqlite"]
+# `InMemoryDb` and `InMemoryDurableDb` run on SQLite over sqlx (SQLite uses no TLS, so none is
+# selected). Enabling this feature is what makes them exist.
+sqlite = ["skyzen-services/sqlite"]
 
 [lints]
 workspace = true

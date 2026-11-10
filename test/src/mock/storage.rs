@@ -377,7 +377,7 @@ mod tests {
 
     use super::InMemoryStorage;
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_paginates_with_cursor_across_three_pages() {
         let storage = InMemoryStorage::new();
         for key in ["a", "b", "c", "d", "e"] {
@@ -418,7 +418,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_returns_no_cursor_when_the_page_is_complete() {
         let storage = InMemoryStorage::new();
         storage.put("a", b"1".to_vec()).await.unwrap();
@@ -436,7 +436,7 @@ mod tests {
         assert!(exact.cursor.is_none());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn put_with_round_trips_content_type_and_metadata() {
         let storage = InMemoryStorage::new();
         let mut metadata = HashMap::new();
@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(head.metadata, metadata);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn get_stream_and_put_stream_round_trip_a_body() {
         let storage = InMemoryStorage::new();
         storage
@@ -491,7 +491,7 @@ mod tests {
         assert!(storage.get_stream("absent.bin").await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn put_stream_rejects_a_content_length_that_does_not_match() {
         let storage = InMemoryStorage::new();
 
@@ -509,7 +509,7 @@ mod tests {
         assert!(storage.head("clip.bin").await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn get_range_slices_the_body_and_keeps_the_full_size_in_the_metadata() {
         let storage = InMemoryStorage::new();
         storage
@@ -546,7 +546,7 @@ mod tests {
             .is_none());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn get_range_reports_an_unsatisfiable_range() {
         let storage = InMemoryStorage::new();
         storage.put("short.txt", b"ab".to_vec()).await.unwrap();
@@ -558,7 +558,7 @@ mod tests {
         assert!(matches!(error, StorageError::Io(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn presigning_returns_a_deterministic_url_that_is_not_fetchable() {
         let storage = InMemoryStorage::new();
 
@@ -599,7 +599,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn fail_next_with_fails_exactly_one_operation() {
         let storage = InMemoryStorage::new();
         storage.put("key", b"value".to_vec()).await.unwrap();

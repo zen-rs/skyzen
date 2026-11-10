@@ -658,7 +658,7 @@ mod tests {
         message: String,
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn wrapper_supports_crud_and_list_round_trip() {
         let kv = Kv::new(InMemoryKeyValueStore::default());
 
@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(kv.get("prefix:a").await.unwrap(), None);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_all_drains_every_page_the_backend_hands_back() {
         let kv = Kv::new(InMemoryKeyValueStore::default());
         for key in ["a", "b", "c", "d", "e"] {
@@ -703,7 +703,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_all_refuses_a_backend_that_repeats_its_cursor() {
         #[derive(Clone, Default)]
         struct StuckCursorStore;
@@ -740,7 +740,7 @@ mod tests {
         assert!(matches!(&error, KvError::Backend { message, .. } if message.contains("repeated")));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn atomic_primitives_default_to_unsupported() {
         let kv = Kv::new(InMemoryKeyValueStore::default());
 
@@ -769,7 +769,7 @@ mod tests {
         assert_eq!(kv.list_all(None).await.unwrap(), Vec::<String>::new());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn get_json_round_trips_and_reports_malformed_payloads() {
         let kv = Kv::new(InMemoryKeyValueStore::default());
 
@@ -784,7 +784,7 @@ mod tests {
         assert!(matches!(error, KvError::Serialization(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn get_text_reports_invalid_utf8_as_decode_error() {
         let kv = Kv::new(InMemoryKeyValueStore::default());
 
@@ -796,7 +796,7 @@ mod tests {
         assert!(matches!(error, KvError::Decode(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn put_with_ttl_defaults_to_unsupported() {
         let kv = Kv::new(InMemoryKeyValueStore::default());
 
@@ -810,7 +810,7 @@ mod tests {
         assert_eq!(kv.get("key").await.unwrap(), None);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn extractor_returns_internal_server_error_when_kv_is_missing() {
         let mut request = http_kit::Request::new(http_kit::Body::empty());
 
