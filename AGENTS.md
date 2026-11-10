@@ -43,7 +43,7 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 ### Crate Structure
 
 **Framework Core:**
-- **`skyzen`** (`/`) - Main framework crate: routing, extractors, responders, middleware, static files, and runtime helpers.
+- **`skyzen`** (`/`) - Main framework crate: routing, extractors, responders, middleware, static files, the reverse proxy (`proxy` feature), and runtime helpers.
 - **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`, `EndpointFactory`) reusable by alternative runtimes, the `upgrade` handover between a server and a WebSocket handler, plus `Secret`, the one runtime representation of a `[[secret]]` value. Supports `no_std` when `std` feature is disabled (`Server`, `upgrade` and `Secret` are `std`-only).
 - **`skyzen-macros`** (`macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::scheduled]`, `#[skyzen::email]`, `#[skyzen::tail]`, `#[skyzen::durable_object]`, `#[skyzen::test]`, `#[derive(HttpError)]`, plus the function-like `import_config!` (one named extractor per `[[service]]`, `[[database]]` and `[[secret]]`) and `embed_migrations!`.
 - **`skyzen-manifest`** (`manifest/`) - The one typed `Skyzen.toml` schema, consumed by **both** `skyzen-macros` (at compile time) and `skyzen-cli` (at deploy time), so a section can never be accepted by one and rejected by the other. Every struct carries `deny_unknown_fields` and the `type`/`backend` discriminants are enums, so a typo or an unsupported value fails at parse time.
@@ -227,6 +227,20 @@ remain Cloudflare-only, because nothing else has those events.
   `CompressionMiddleware`. Siblings (`.br`, `.zst`, `.gz`) are written by `skyzen build` from
   `[static_files] precompress` (`cli/src/precompress.rs`), before compilation; a sibling older than
   its file is skipped with a warning.
+
+### 5e. Reverse Proxy (`proxy` feature, native only)
+- `Upstream` (`Send + Sync`) is the recipe, built once; `Proxy::new(&upstream)` builds one serving
+  thread's endpoint inside the factory, over zenwave's `NativeBackend::on_current_thread`, so each
+  thread has its own upstream pool. Never share a `Proxy` across threads.
+- It is hung on a router with `CreateRouteNode::mount`, which strips the prefix like `nest` does;
+  the forwarded path is the upstream URI's path plus what remains.
+- Hop-by-hop fields go in both directions; the incoming forwarding fields (`Forwarded`,
+  `X-Forwarded-*`, `X-Real-IP`, `CF-Connecting-IP`) survive only from a peer `TrustedProxies`
+  trusts, and the proxy's own hop is always written as `Forwarded` and `Via`.
+- Bodies are passed through as `Body` frames and never inspected, except that a chunked upstream
+  response to a client without `TE: trailers` fails with `TrailersNotAccepted` at its trailers.
+- Upgrades and `CONNECT` are refused with `ProxyError::Tunnel` (501): zenwave's native backend
+  does not hand a switched connection back, and `OnUpgrade`'s `Send` session could not carry one.
 
 ### 6. Error Handling & Log Security
 - `#[skyzen::error]` generates `Display`, `Error`, and `HttpError` implementations with status code attributes.
