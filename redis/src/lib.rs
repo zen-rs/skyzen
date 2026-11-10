@@ -709,12 +709,24 @@ mod tests {
         let _ = rustls::ClientConfig::builder();
     }
 
-    /// A throwaway TLS peer on a std thread: rustls server with a self-signed
-    /// cert, reads one decrypted record and returns it. Enough to prove a real
-    /// `rediss://` handshake happened — or that verification rejected it.
+    /// A throwaway TLS peer on a std thread: a rustls server with a self-signed cert that
+    /// completes the handshake, then answers the client's RESP commands (`+OK` for each
+    /// `CLIENT`, `+PONG` for each `PING`, which is all redis-rs's connection setup sends for a URL
+    /// without a password or database) until the client closes, and returns the decrypted bytes
+    /// it received. The handle yields `Err` if the handshake fails (the client rejecting the
+    /// certificate surfaces here) or any later I/O fails; the client closing the socket after the
+    /// handshake is the normal end of the session.
     #[cfg(all(feature = "tls", unix))]
-    fn self_signed_peer() -> (u16, std::thread::JoinHandle<Vec<u8>>) {
-        use std::io::Read;
+    fn self_signed_peer() -> (u16, std::thread::JoinHandle<std::io::Result<Vec<u8>>>) {
+        use std::io::{ErrorKind, Read, Write};
+
+        fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+            haystack
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
         let cert =
             rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
         let config = rustls::ServerConfig::builder_with_provider(
@@ -731,14 +743,36 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let handle = std::thread::spawn(move || {
-            let (sock, _) = listener.accept().expect("accept");
-            let conn = rustls::ServerConnection::new(std::sync::Arc::new(config))
-                .expect("server connection");
+            let (mut sock, _) = listener.accept()?;
+            let mut conn = rustls::ServerConnection::new(std::sync::Arc::new(config))
+                .map_err(std::io::Error::other)?;
+            while conn.is_handshaking() {
+                conn.complete_io(&mut sock)?;
+            }
             let mut tls = rustls::StreamOwned::new(conn, sock);
-            let mut buf = vec![0u8; 256];
-            let n = tls.read(&mut buf).unwrap_or(0);
-            buf.truncate(n);
-            buf
+            let mut received = Vec::new();
+            let (mut clients, mut pings) = (0, 0);
+            let mut buf = [0u8; 1024];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                    // A plain TCP close after the handshake carries no close_notify.
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
+                    Err(error) => return Err(error),
+                }
+                let seen_clients = occurrences(&received, b"CLIENT");
+                let seen_pings = occurrences(&received, b"PING");
+                for _ in clients..seen_clients {
+                    tls.write_all(b"+OK\r\n")?;
+                }
+                for _ in pings..seen_pings {
+                    tls.write_all(b"+PONG\r\n")?;
+                }
+                (clients, pings) = (seen_clients, seen_pings);
+                tls.flush()?;
+            }
+            Ok(received)
         });
         (port, handle)
     }
@@ -780,8 +814,9 @@ mod tests {
     }
 
     /// `#insecure` turns off verification upstream, so a self-signed peer is a
-    /// real handshake: the server must receive decrypted RESP bytes (redis's
-    /// connection manager sends CLIENT SETINFO / PING on connect).
+    /// real handshake: `connect` must return `Ok`, and the peer must have
+    /// received the decrypted RESP commands redis's connection setup sends
+    /// (`CLIENT SETINFO`), proving the TLS session carried data.
     #[compio::test]
     #[cfg(all(feature = "tls", unix))]
     async fn a_rediss_connection_completes_a_tls_handshake() {
@@ -791,17 +826,34 @@ mod tests {
         );
         let (port, peer) = self_signed_peer();
         let url = format!("rediss://127.0.0.1:{port}/#insecure");
-        // The manager may wait for a RESP reply our stub never sends — the
-        // proof is on the server side, so the client result does not matter.
-        let _ = compio::time::timeout(
-            std::time::Duration::from_secs(5),
-            super::Redis::connect(&url),
+        // `Redis::connect` uses redis-rs's defaults: each connection attempt (TCP, TLS handshake
+        // and setup, including loading the system roots) is cut off after 1 s and retried, and the
+        // peer serves exactly one connection. Under load an attempt can outlast that second, so
+        // the test builds the same manager `connect` does with the attempt bound lifted; the
+        // outer 60 s bound only guards against a hang.
+        let client = redis::Client::open(url).expect("parses");
+        super::install_tls_provider(&client);
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(std::time::Duration::from_secs(60)))
+            .set_response_timeout(Some(std::time::Duration::from_secs(60)));
+        let manager = compio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.get_connection_manager_with_config(config),
         )
-        .await;
-        let decrypted = peer.join().expect("peer thread");
+        .await
+        .expect("connect hung for 60 s")
+        .expect("connect over a self-signed peer with #insecure must succeed");
+        let redis = super::Redis::from_connection_manager(manager);
+        // Closing the client ends the peer's session.
+        drop(redis);
+        let decrypted = peer
+            .join()
+            .expect("peer thread panicked")
+            .expect("peer I/O failed");
         assert!(
-            !decrypted.is_empty(),
-            "the TLS peer received no decrypted bytes — no handshake"
+            decrypted.windows(6).any(|window| window == b"CLIENT"),
+            "the peer should have received the setup commands, got {:?}",
+            String::from_utf8_lossy(&decrypted)
         );
     }
 
@@ -813,7 +865,7 @@ mod tests {
     #[compio::test]
     #[cfg(all(feature = "tls", unix))]
     async fn a_rediss_connection_rejects_an_untrusted_certificate() {
-        let (port, _peer) = self_signed_peer();
+        let (port, peer) = self_signed_peer();
         let url = format!("rediss://127.0.0.1:{port}/");
         let client = redis::Client::open(url).expect("parses");
         // Same provider install `connect` performs — a `rediss://` client
@@ -829,6 +881,12 @@ mod tests {
         assert!(
             outcome.is_err(),
             "an untrusted certificate must not connect"
+        );
+        // The rejection must have happened in the handshake: the peer never got to read data.
+        drop(client);
+        assert!(
+            peer.join().expect("peer thread panicked").is_err(),
+            "the peer's handshake should have failed when the client rejected its certificate"
         );
     }
 }
