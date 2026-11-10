@@ -57,6 +57,9 @@ struct Discovery {
     /// The function did not exist before this deploy — no alias can exist on it
     /// either, so a denied `GetAlias` needs no further evidence.
     fresh: bool,
+    /// The prefix scan ran — rule discovery works without the tag, so stamping is
+    /// optional for the next deploy rather than required.
+    rule_scan_ok: bool,
 }
 
 /// What a rule looked like before this deploy touched it: enough to put it back.
@@ -303,6 +306,7 @@ impl Task for MigrateSchedulesToAlias {
                 migrated,
                 has_history,
                 fresh,
+                rule_scan_ok,
                 ..
             } = self.inner.migrate_to_alias(&events, &lambda).await?;
             // The whole transaction lives here — migrate, upload, reconcile: a failure at
@@ -436,10 +440,16 @@ impl Task for MigrateSchedulesToAlias {
             };
             // Reconcile verified the state it found — stamp it so the next deploy reads
             // the record rather than re-enumerating. An unverified alias state stays
-            // unstamped: `none` asserted over a denied lookup would authorize skipping
-            // discovery over an alias that may exist.
-            if verified {
-                self.inner.stamp_tag(&lambda, &arn).await;
+            // unstamped, and a stamp these credentials cannot write or read only fails
+            // the deploy when rule discovery cannot cover the next run either.
+            if verified && !self.inner.stamp_tag(&lambda, &arn).await {
+                anyhow::ensure!(
+                    rule_scan_ok,
+                    "reconciled Lambda function `{}` but could not persist a readable \
+                     `skyzen-schedules` tag, and `events:ListRules` is unavailable — \
+                     the next deploy could not verify ownership",
+                    self.inner.function
+                );
             }
             Ok(())
         })?
@@ -737,12 +747,10 @@ impl Task for EventBridgeSchedules {
                 .ok()
                 .flatten()
                 .is_some_and(|tag| tag == "none");
+            let scan_result = self.managed_rule_names(&events).await;
+            let scan_ok = scan_result.is_ok();
             let tolerant = self.schedules.is_empty()
-                && (marked_none
-                    || self
-                        .managed_rule_names(&events)
-                        .await
-                        .is_ok_and(|rules| rules.is_empty()));
+                && (marked_none || scan_result.as_ref().is_ok_and(Vec::is_empty));
             // Invalidate any ownership record before a rule is enabled — same guard as
             // the deploy path.
             if !self.schedules.is_empty() {
@@ -764,10 +772,16 @@ impl Task for EventBridgeSchedules {
             };
             // Reconcile verified the state it found — stamp it so the next deploy
             // reads the record rather than re-enumerating. An unverified alias state
-            // stays unstamped: `none` asserted over a denied lookup would authorize
-            // skipping discovery over an alias that may exist.
-            if verified {
-                self.stamp_tag(&lambda, ctx.arn).await;
+            // stays unstamped, and a stamp these credentials cannot write or read
+            // only fails the run when rule discovery cannot cover the next either.
+            if verified && !self.stamp_tag(&lambda, ctx.arn).await {
+                anyhow::ensure!(
+                    scan_ok,
+                    "reconciled Lambda function `{}` but could not persist a readable \
+                     `skyzen-schedules` tag, and `events:ListRules` is unavailable — \
+                     the next deploy could not verify ownership",
+                    self.function
+                );
             }
             Ok(())
         })?
@@ -1541,6 +1555,7 @@ impl EventBridgeSchedules {
             migrated,
             has_history,
             fresh: false,
+            rule_scan_ok,
         })
     }
 
@@ -1841,10 +1856,11 @@ impl EventBridgeSchedules {
         Ok(())
     }
 
-    /// Stamp the verified ownership record the next deploy reads — warn-only: the
-    /// transition already invalidated whatever stood, so a denied write only means
-    /// the next deploy enumerates again.
-    async fn stamp_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) {
+    /// Stamp the verified ownership record the next deploy reads — `true` only when
+    /// the write landed and these credentials can read it back: a deploy that depends
+    /// on the tag (because discovery is unavailable to it) needs both, while one whose
+    /// scan works anyway just loses a hint.
+    async fn stamp_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) -> bool {
         let state = if self.schedules.is_empty() {
             "none"
         } else {
@@ -1861,7 +1877,9 @@ impl EventBridgeSchedules {
                 "could not tag Lambda function `{}`'s schedule state: {error:#}",
                 self.function
             ));
+            return false;
         }
+        matches!(self.schedule_tag(lambda, arn).await, Ok(Some(_)))
     }
 
     /// Whether an `alias_snapshot` failure was an IAM denial — `GetAlias` has no
