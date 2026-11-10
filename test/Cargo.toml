@@ -20,6 +20,15 @@ serde_json = "1"
 serde_html_form = "0.4"
 insta = { version = "1", features = ["json"] }
 
+# `LoopbackServer` (`loopback`): Skyzen's own HTTP/1.1 server on a compio runtime of its own thread,
+# the same server and driver the native runtime serves with.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+skyzen-h1 = { workspace = true, optional = true }
+http-kit-io = { workspace = true, features = ["compio"], optional = true }
+executor-core = { workspace = true, features = ["compio"], optional = true }
+async-channel = { version = "2.5", default-features = false, optional = true }
+http = { version = "1.4", default-features = false, optional = true }
+
 [dev-dependencies]
 # The tests run on a compio runtime, the one the native server runs.
 compio = { version = "0.19.2", default-features = false, features = ["runtime", "macros"] }
@@ -28,6 +37,8 @@ compio = { version = "0.19.2", default-features = false, features = ["runtime", 
 # `InMemoryDb` and `InMemoryDurableDb` run on SQLite over sqlx (SQLite uses no TLS, so none is
 # selected). Enabling this feature is what makes them exist.
 sqlite = ["skyzen-services/sqlite"]
+# `LoopbackServer`, an HTTP/1.1 server on a loopback port that a backend's own HTTP client talks to.
+loopback = ["dep:skyzen-h1", "dep:http-kit-io", "dep:executor-core", "dep:async-channel", "dep:http"]
 
 [lints]
 workspace = true
