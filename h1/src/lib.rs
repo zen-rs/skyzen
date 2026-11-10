@@ -29,7 +29,7 @@ use http_kit_io::{CopyingPoll, Io, Listener, Read, SendFile, Split, Timer, Write
 use skyzen_core::{
     apply_pending_headers, error_response, log_endpoint_error,
     upgrade::{OnUpgrade, UpgradeAvailable, Upgraded},
-    Endpoint, PeerAddr, Server,
+    Endpoint, PeerAddr, PeerAddress, Server,
 };
 use tracing::{debug, error, warn};
 
@@ -67,34 +67,6 @@ impl H1 {
     }
 }
 
-/// A source of connections for [`H1::serve_accepting`].
-///
-/// Every `http-kit-io` [`Listener`] is one, with the peer's socket address. The trait exists for
-/// the transports that driver has no listener for — a unix domain socket, whose peer has no
-/// `SocketAddr` — so that they are served by exactly the same connection loop rather than a
-/// second one.
-pub trait Accept {
-    /// The accepted stream.
-    type Stream: Split;
-
-    /// Waits for the next connection. The address is `None` for a transport whose peers have no
-    /// socket address; requests on such a connection carry no `PeerAddr`.
-    fn accept(&self) -> impl Future<Output = io::Result<(Self::Stream, Option<SocketAddr>)>>;
-}
-
-impl<L> Accept for L
-where
-    L: Listener,
-    L::Stream: Split,
-{
-    type Stream = L::Stream;
-
-    async fn accept(&self) -> io::Result<(Self::Stream, Option<SocketAddr>)> {
-        let (stream, peer) = Listener::accept(self).await?;
-        Ok((stream, Some(peer)))
-    }
-}
-
 /// Counts a connection against the limit for as long as it lives.
 struct Slot(Rc<Cell<usize>>);
 
@@ -129,28 +101,31 @@ where
         Ex: LocalExecutor + 'static,
         E: Endpoint + Clone + 'static,
     {
-        self.serve_accepting(io, executor, listener, endpoint, shutdown)
+        self.serve_listener(io, executor, listener, endpoint, shutdown)
             .await;
     }
 }
 
 impl H1 {
-    /// [`Server::serve`] over any [`Accept`] source, with `timer` driving the connection
-    /// deadlines.
+    /// [`Server::serve`] over any `http-kit-io` [`Listener`] — TCP, or a unix-domain socket — with
+    /// `timer` driving the connection deadlines.
     ///
     /// The semantics are `serve`'s: it resolves once `shutdown` has, accepting has stopped and
-    /// the last connection has closed.
-    pub async fn serve_accepting<T, A, Ex, E>(
+    /// the last connection has closed. Requests carry a `PeerAddr` only when the listener's
+    /// address is a [`PeerAddress`] with a socket address.
+    pub async fn serve_listener<T, L, Ex, E>(
         &self,
         timer: T,
         executor: Ex,
-        acceptor: A,
+        listener: L,
         endpoint: E,
         shutdown: impl Future<Output = ()> + 'static,
     ) where
         T: Timer + Clone + 'static,
-        A: Accept,
-        <A::Stream as Split>::WriteHalf: SendFile,
+        L: Listener,
+        L::Stream: Split,
+        L::Addr: PeerAddress,
+        <L::Stream as Split>::WriteHalf: SendFile,
         Ex: LocalExecutor + 'static,
         E: Endpoint + Clone + 'static,
     {
@@ -163,7 +138,7 @@ impl H1 {
 
         let mut shutdown = pin!(shutdown);
         loop {
-            let accept = pin!(acceptor.accept());
+            let accept = pin!(listener.accept());
             let (stream, peer) = match select(accept, shutdown.as_mut()).await {
                 Either::Left((Ok(accepted), _)) => accepted,
                 Either::Left((Err(error), _)) => {
@@ -179,6 +154,7 @@ impl H1 {
                 warn!("connection limit reached; closing a connection");
                 continue;
             }
+            let peer = peer.socket_addr();
             debug!(?peer, "accepted a connection");
 
             let (read, write) = stream.split();

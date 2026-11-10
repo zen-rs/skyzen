@@ -31,7 +31,7 @@ use http_kit_io::{IntoPoll, Io, Listener};
 use hyper::server::conn::{http1::Builder as Http1Builder, http2::Builder as Http2Builder};
 use skyzen_core::{
     upgrade::{UpgradeAvailable, Upgraded},
-    Endpoint, Extensions, Server,
+    Endpoint, Extensions, PeerAddress, Server,
 };
 use std::convert::Infallible;
 use std::mem::MaybeUninit;
@@ -86,6 +86,32 @@ impl<I: Io> Server<I> for Hyper {
         Ex: LocalExecutor + 'static,
         E: Endpoint + Clone + 'static,
     {
+        self.serve_listener(io, executor, listener, endpoint, shutdown)
+            .await;
+    }
+}
+
+impl Hyper {
+    /// [`Server::serve`] over any `http-kit-io` [`Listener`] — TCP, or a unix-domain socket.
+    ///
+    /// The semantics are `serve`'s. Requests carry a `PeerAddr` only when the listener's address
+    /// is a [`PeerAddress`] with a socket address, so those on a unix socket carry none.
+    pub async fn serve_listener<I, L, Ex, E>(
+        &self,
+        io: I,
+        executor: Ex,
+        listener: L,
+        endpoint: E,
+        shutdown: impl Future<Output = ()> + 'static,
+    ) where
+        I: Io,
+        L: Listener,
+        L::Stream: IntoPoll + 'static,
+        <L::Stream as IntoPoll>::Poll: 'static,
+        L::Addr: PeerAddress,
+        Ex: LocalExecutor + 'static,
+        E: Endpoint + Clone + 'static,
+    {
         let executor = Rc::new(executor);
         // Nothing is ever sent on either channel. Dropping `stop` closes it, which every
         // connection watches to begin its graceful shutdown; each connection holds a clone of
@@ -104,9 +130,14 @@ impl<I: Io> Server<I> for Hyper {
                 }
                 Either::Right(((), _)) => break,
             };
-            debug!("accepted connection from {peer}");
+            let peer = peer.socket_addr();
+            debug!(?peer, "accepted a connection");
 
-            let service = IntoService::new(endpoint.clone()).with_peer_addr(peer);
+            let service = IntoService::new(endpoint.clone());
+            let service = match peer {
+                Some(peer) => service.with_peer_addr(peer),
+                None => service,
+            };
             let task_executor = Rc::clone(&executor);
             let stopping = stopping.clone();
             let live = live.clone();

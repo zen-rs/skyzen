@@ -17,8 +17,8 @@ skyzen-redis = { path = "redis", version = "0.3.1" }
 skyzen-s3 = { path = "s3", version = "0.3.1" }
 
 http-kit = "0.5.1"
-http-kit-io = { version = "0.2.0", default-features = false }
-http-kit-h1 = { version = "0.1.1", default-features = false }
+http-kit-io = { version = "0.3.0", default-features = false }
+http-kit-h1 = { version = "0.2.0", default-features = false }
 executor-core = { version = "0.7.2", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper", version = "0.2.1" }
 skyzen-h1 = { path = "h1", version = "0.1.0" }

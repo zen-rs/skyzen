@@ -12,13 +12,13 @@
 //! share one socket through duplicated descriptors and whichever is idle takes the next
 //! connection: the same program, balanced by the accept queue instead of by the kernel's hash.
 
-use core::convert::Infallible;
+use core::{convert::Infallible, future::Future};
 use std::{io, num::NonZeroUsize, rc::Rc, sync::Arc, thread};
 
 use async_channel::{bounded, Receiver, Sender};
 use executor_core::{compio::Runtime, AnyExecutor};
-use http_kit_io::{compio::Compio, Io};
-use skyzen_core::{EndpointFactory, Server as _};
+use http_kit_io::{compio::Compio, IntoPoll, Io, Listener, SendFile, Split};
+use skyzen_core::{EndpointFactory, PeerAddress};
 use skyzen_h1::H1;
 use skyzen_hyper::Hyper;
 use tracing::error;
@@ -252,13 +252,8 @@ fn work<F, A, W>(
                             )
                             .await;
                         }
-                        (None, HttpServer::H1) => {
-                            h1.serve_accepting(Compio, executor, listener, endpoint, shutdown)
-                                .await;
-                        }
-                        (None, HttpServer::Hyper) => {
-                            Hyper
-                                .serve(Compio, executor, listener, endpoint, shutdown)
+                        (None, server) => {
+                            serve_cleartext(server, &h1, executor, listener, endpoint, shutdown)
                                 .await;
                         }
                     }
@@ -268,11 +263,10 @@ fn work<F, A, W>(
                 }
             },
             #[cfg(unix)]
-            Socket::Unix(listener) => match super::unix::Listener::from_std(listener) {
+            Socket::Unix(listener) => match Compio.unix_listener(listener) {
                 Ok(listener) => {
                     if announce(ready).await {
-                        // `serve_cores` has refused every other server on a unix socket.
-                        h1.serve_accepting(Compio, executor, listener, endpoint, shutdown)
+                        serve_cleartext(plan.server, &h1, executor, listener, endpoint, shutdown)
                             .await;
                     }
                 }
@@ -282,6 +276,35 @@ fn work<F, A, W>(
             },
         }
     });
+}
+
+/// Serve `listener`, TCP or unix, in cleartext with the chosen server.
+async fn serve_cleartext<L, E>(
+    server: HttpServer,
+    h1: &H1,
+    executor: Rc<Runtime>,
+    listener: L,
+    endpoint: E,
+    shutdown: impl Future<Output = ()> + 'static,
+) where
+    L: Listener,
+    L::Stream: Split + IntoPoll + 'static,
+    <L::Stream as IntoPoll>::Poll: 'static,
+    <L::Stream as Split>::WriteHalf: SendFile,
+    L::Addr: PeerAddress,
+    E: Endpoint + Clone + 'static,
+{
+    match server {
+        HttpServer::H1 => {
+            h1.serve_listener(Compio, executor, listener, endpoint, shutdown)
+                .await;
+        }
+        HttpServer::Hyper => {
+            Hyper
+                .serve_listener(Compio, executor, listener, endpoint, shutdown)
+                .await;
+        }
+    }
 }
 
 /// Report that this thread is accepting. `false` when nobody is waiting for the report any more.
@@ -446,23 +469,26 @@ mod tests {
         assert!(served_by.iter().all(|name| name.starts_with("skyzen-")));
     }
 
-    /// A unix socket is served by the same threads and the same HTTP/1.1 loop, and the file goes
-    /// away with the socket's owner, not with a connection.
+    /// A unix socket is served by the same threads under either server, and the file goes away
+    /// with the socket's owner, not with a connection.
     #[test]
     #[cfg(unix)]
     fn a_unix_socket_is_served_by_the_serving_threads() {
-        let path = std::env::temp_dir().join(format!("skyzen-cores-{}.sock", std::process::id()));
-        let sockets = bind(
-            &ListenAddr::Unix(path.clone()),
-            NonZeroUsize::new(2).unwrap(),
-        )
-        .expect("bind the unix socket");
-        let serving = Serving::start(sockets, HttpServer::H1);
+        for (index, server) in [HttpServer::H1, HttpServer::Hyper].into_iter().enumerate() {
+            let path = std::env::temp_dir()
+                .join(format!("skyzen-cores-{}-{index}.sock", std::process::id()));
+            let sockets = bind(
+                &ListenAddr::Unix(path.clone()),
+                NonZeroUsize::new(2).unwrap(),
+            )
+            .expect("bind the unix socket");
+            let serving = Serving::start(sockets, server);
 
-        let body = exchange(std::os::unix::net::UnixStream::connect(&path).expect("connect"));
+            let body = exchange(std::os::unix::net::UnixStream::connect(&path).expect("connect"));
 
-        serving.stop();
-        std::fs::remove_file(&path).expect("the socket file is ours to remove");
-        assert!(body.starts_with("skyzen-"), "{body}");
+            serving.stop();
+            std::fs::remove_file(&path).expect("the socket file is ours to remove");
+            assert!(body.starts_with("skyzen-"), "{server:?}: {body}");
+        }
     }
 }

@@ -71,7 +71,7 @@ or Azure Functions, where the platform terminates TLS, or without the feature.
 
 Cleartext HTTP is served by Skyzen's own HTTP/1.1 server by default. `--server hyper`
 (or `SKYZEN_SERVER=hyper`) serves it with Hyper instead, which adds prior-knowledge
-HTTP/2 (h2c); Hyper is not available on a `unix:` listener.
+HTTP/2 (h2c), on a `unix:` listener as on TCP.
 
 ### Docker
 

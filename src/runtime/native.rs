@@ -24,8 +24,6 @@ use tracing_subscriber::EnvFilter;
 
 mod cores;
 mod tls;
-#[cfg(unix)]
-mod unix;
 
 use tls::{ServerTls, TlsError};
 
@@ -411,8 +409,7 @@ pub enum HttpServer {
     #[default]
     H1,
     /// Hyper: HTTP/1.1 and prior-knowledge HTTP/2 (h2c), over the compio stream's copying
-    /// poll-style bridge. Not available on a `unix:` socket, and without the per-thread
-    /// connection limit the default server applies.
+    /// poll-style bridge. Without the per-thread connection limit the default server applies.
     Hyper,
 }
 
@@ -501,8 +498,6 @@ enum RuntimeFailure {
     ThreadExited,
     /// TLS was configured but cannot be provided on this listener or this build.
     Tls(TlsError),
-    /// `--server hyper` was asked for a unix socket, which only the default server can serve.
-    HyperOnUnixSocket,
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -521,11 +516,6 @@ impl std::fmt::Display for RuntimeFailure {
             Self::Mount(error) => write!(f, "{error}"),
             Self::ThreadExited => write!(f, "a serving thread exited before it was accepting"),
             Self::Tls(error) => write!(f, "{error}"),
-            Self::HyperOnUnixSocket => write!(
-                f,
-                "a unix socket is served by the default server; drop `--server hyper` or listen \
-                 on TCP"
-            ),
         }
     }
 }
@@ -536,7 +526,7 @@ impl std::error::Error for RuntimeFailure {
             Self::Listener(error) => Some(error),
             Self::Mount(error) => Some(error),
             Self::Tls(error) => Some(error),
-            Self::QueueConsumer(_) | Self::ThreadExited | Self::HyperOnUnixSocket => None,
+            Self::QueueConsumer(_) | Self::ThreadExited => None,
         }
     }
 }
@@ -930,10 +920,6 @@ where
     W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
     C: ConsumerSet,
 {
-    #[cfg(unix)]
-    if server == HttpServer::Hyper && matches!(addr, ListenAddr::Unix(_)) {
-        return Err(RuntimeFailure::HyperOnUnixSocket);
-    }
     let threads = std::thread::available_parallelism()?;
     let sockets = cores::bind(&addr, threads)?;
     let scheme = if tls.is_some() { "https" } else { "http" };

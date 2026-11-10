@@ -10,7 +10,9 @@
 //! configured but this build cannot serve it" a refusal to start rather than a cleartext
 //! listener.
 
-use std::{cell::Cell, future::Future, num::NonZeroUsize, rc::Rc};
+#[cfg(feature = "server-tls")]
+use std::cell::Cell;
+use std::{future::Future, num::NonZeroUsize, rc::Rc};
 
 use executor_core::compio::Runtime;
 use http_kit_io::{compio::Compio, Io};
@@ -117,11 +119,11 @@ pub(super) enum ServerTls {}
 
 /// How long a freshly accepted TLS connection may take to handshake, and an `h2` one to send its
 /// preface, before it is dropped. Prevents idle clients from pinning per-connection tasks forever.
-#[cfg(not(test))]
+#[cfg(all(feature = "server-tls", not(test)))]
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The same bound, shortened so tests can actually observe it.
-#[cfg(test)]
+#[cfg(all(feature = "server-tls", test))]
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Turn the configured [`TlsFiles`] into the acceptor every connection shares, or refuse the

@@ -112,3 +112,24 @@ fn the_example_serves_a_unix_socket_and_removes_it_on_sigint() {
     assert!(server.interrupt(), "SIGINT is a graceful shutdown");
     assert!(!path.exists(), "the socket file is removed on shutdown");
 }
+
+#[test]
+fn the_example_serves_a_unix_socket_with_hyper_too() {
+    let path =
+        std::env::temp_dir().join(format!("skyzen-native-hyper-{}.sock", std::process::id()));
+    let server = Server::start(&[
+        "--server",
+        "hyper",
+        "--listen",
+        &format!("unix:{}", path.display()),
+    ]);
+
+    let response = exchange(connect_when_ready(|| {
+        std::os::unix::net::UnixStream::connect(&path)
+    }));
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(body(&response).contains("OK"), "{response}");
+    assert!(server.interrupt(), "SIGINT is a graceful shutdown");
+    assert!(!path.exists(), "the socket file is removed on shutdown");
+}
