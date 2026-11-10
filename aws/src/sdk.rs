@@ -14,7 +14,13 @@
 //! configuration through it — what every `from_env` constructor in this crate and in `skyzen-s3`
 //! calls.
 
-use core::{fmt, time::Duration};
+use core::{
+    fmt,
+    future::Future as _,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use aws_config::{
     environment::EnvironmentVariableCredentialsProvider,
@@ -32,6 +38,7 @@ use aws_smithy_runtime_api::client::{
 };
 use aws_smithy_types::body::SdkBody;
 use http_kit::{Body, Endpoint as _};
+use pin_project_lite::pin_project;
 use zenwave::{backend::NativeBackend, Transport};
 
 use crate::credential_process::CredentialProcessProvider;
@@ -43,9 +50,11 @@ use crate::credential_process::CredentialProcessProvider;
 ///
 /// # Timeouts
 ///
-/// zenwave's native backend has no separate connect or read timeout, so the connect and read
-/// timeouts in [`HttpConnectorSettings`] are not applied per socket. The SDK's operation and
-/// attempt timeouts, which run on [`AsyncIoSleep`], bound every call regardless.
+/// The SDK's operation and attempt timeouts run on [`AsyncIoSleep`] and bound every call. The
+/// connect and read timeouts in the [`HttpConnectorSettings`] the SDK passes are applied here, on
+/// async-io timers, though zenwave's native backend exposes no per-socket timeout: the response
+/// head must arrive within the connect timeout plus the read timeout (one alone bounds it by
+/// itself), and then no body chunk may take longer than the read timeout.
 #[derive(Clone)]
 pub struct ZenwaveHttpClient {
     backend: NativeBackend,
@@ -82,30 +91,115 @@ impl fmt::Debug for ZenwaveHttpClient {
 impl HttpClient for ZenwaveHttpClient {
     fn http_connector(
         &self,
-        _settings: &HttpConnectorSettings,
+        settings: &HttpConnectorSettings,
         _components: &RuntimeComponents,
     ) -> SharedHttpConnector {
-        SharedHttpConnector::new(self.clone())
+        SharedHttpConnector::new(ZenwaveConnector {
+            backend: self.backend.clone(),
+            head_timeout: head_timeout(settings),
+            read_timeout: settings.read_timeout(),
+        })
     }
 }
 
-impl HttpConnector for ZenwaveHttpClient {
+/// How long a response head may take: the connect timeout plus the read timeout, or whichever of
+/// the two is set. `None` when neither is.
+fn head_timeout(settings: &HttpConnectorSettings) -> Option<Duration> {
+    match (settings.connect_timeout(), settings.read_timeout()) {
+        (Some(connect), Some(read)) => Some(connect.saturating_add(read)),
+        (connect, read) => connect.or(read),
+    }
+}
+
+/// An [`HttpConnector`] bound to one set of [`HttpConnectorSettings`].
+#[derive(Debug, Clone)]
+struct ZenwaveConnector {
+    backend: NativeBackend,
+    /// The most the response head may take, connecting included.
+    head_timeout: Option<Duration>,
+    /// The most a wait for the next body chunk may take.
+    read_timeout: Option<Duration>,
+}
+
+impl HttpConnector for ZenwaveConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let mut backend = self.backend.clone();
+        let head_timeout = self.head_timeout;
+        let read_timeout = self.read_timeout;
         HttpConnectorFuture::new(async move {
             let mut request = request
                 .try_into_http1x()
                 .map_err(|error| ConnectorError::user(error.into()))?
                 .map(Body::new);
-            let response = match backend.respond(&mut request).await {
-                Ok(response) => response,
-                // The backend reports an error status as an error; the SDK wants the response.
-                Err(zenwave::Error::Http { response, .. }) => response.response,
-                Err(error) => return Err(connector_error(error)),
+            let answer = async { backend.respond(&mut request).await.map_err(connector_error) };
+            let response = match head_timeout {
+                Some(limit) => {
+                    futures_lite::future::or(answer, async {
+                        async_io::Timer::after(limit).await;
+                        Err(connector_error(zenwave::Error::Timeout))
+                    })
+                    .await?
+                }
+                None => answer.await?,
             };
-            HttpResponse::try_from(response.map(SdkBody::from_body_1_x))
-                .map_err(|error| ConnectorError::other(error.into(), None))
+            HttpResponse::try_from(response.map(|body| {
+                SdkBody::from_body_1_x(ReadTimeout {
+                    body,
+                    limit: read_timeout,
+                    timer: None,
+                })
+            }))
+            .map_err(|error| ConnectorError::other(error.into(), None))
         })
+    }
+}
+
+pin_project! {
+    /// A response body whose wait for each frame is bounded by `limit`.
+    struct ReadTimeout<B> {
+        #[pin]
+        body: B,
+        limit: Option<Duration>,
+        // The running timer of the frame being waited for.
+        timer: Option<async_io::Timer>,
+    }
+}
+
+impl<B> http_body::Body for ReadTimeout<B>
+where
+    B: http_body::Body,
+    B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
+{
+    type Data = B::Data;
+    type Error = Box<dyn core::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        if let Poll::Ready(frame) = this.body.poll_frame(cx) {
+            *this.timer = None;
+            return Poll::Ready(frame.map(|frame| frame.map_err(Into::into)));
+        }
+        if let Some(limit) = *this.limit {
+            let timer = this
+                .timer
+                .get_or_insert_with(|| async_io::Timer::after(limit));
+            if Pin::new(timer).poll(cx).is_ready() {
+                *this.timer = None;
+                return Poll::Ready(Some(Err(Box::new(zenwave::Error::Timeout))));
+            }
+        }
+        Poll::Pending
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -182,7 +276,9 @@ mod tests {
         mpsc, Arc,
     };
 
-    use aws_config::Region;
+    use std::time::{Duration, Instant};
+
+    use aws_config::{retry::RetryConfig, timeout::TimeoutConfig, Region};
     use aws_sdk_dynamodb::config::Credentials;
     use base64::Engine as _;
     use http_kit::{Body, Response, StatusCode};
@@ -199,7 +295,23 @@ mod tests {
     /// A `DynamoKv` whose SDK client loads its configuration through [`config_loader`] and sends
     /// every request to `server`.
     async fn kv(server: &LoopbackServer) -> DynamoKv {
+        kv_with(
+            server,
+            TimeoutConfig::builder().build(),
+            RetryConfig::standard(),
+        )
+        .await
+    }
+
+    /// [`kv`], with the SDK configured with `timeouts` and `retries`.
+    async fn kv_with(
+        server: &LoopbackServer,
+        timeouts: TimeoutConfig,
+        retries: RetryConfig,
+    ) -> DynamoKv {
         let config = config_loader(ZenwaveHttpClient::system())
+            .timeout_config(timeouts)
+            .retry_config(retries)
             .region(Region::new("us-east-1"))
             .credentials_provider(Credentials::new(
                 "AKIDLOOPBACK",
@@ -309,6 +421,110 @@ mod tests {
 
         assert_eq!(value.as_deref(), Some(VALUE.as_bytes()));
         assert_eq!(calls.load(Ordering::SeqCst), 2, "one failure, one retry");
+    }
+
+    /// A server that stalls for `delay` before answering, read by a client configured with
+    /// `timeouts`: the call fails as a timeout, within the limit plus slack and well before the
+    /// answer would have come.
+    async fn assert_stalled_call_times_out(timeouts: TimeoutConfig, limit: Duration) {
+        const DELAY: Duration = Duration::from_secs(5);
+        assert_no_tokio_runtime();
+        let server = LoopbackServer::start(|_| {
+            std::thread::sleep(DELAY);
+            answer(StatusCode::OK, &serde_json::json!({}))
+        });
+
+        let started = Instant::now();
+        let error = kv_with(&server, timeouts, RetryConfig::disabled())
+            .await
+            .get(KEY)
+            .await
+            .expect_err("a stalled server must time the call out");
+
+        let elapsed = started.elapsed();
+        assert!(elapsed >= limit, "failed after {elapsed:?}: {error}");
+        assert!(
+            elapsed < DELAY,
+            "waited out the stall ({elapsed:?}): {error}"
+        );
+        assert!(
+            format!("{error:?}").to_lowercase().contains("timeout"),
+            "{error:?}"
+        );
+    }
+
+    /// The read timeout set on the SDK's configuration reaches the connector and bounds the wait
+    /// for the response.
+    #[compio::test]
+    async fn a_configured_read_timeout_bounds_a_stalled_response() {
+        let limit = Duration::from_millis(300);
+        // The connect timeout is set too, since aws-config defaults it to seconds and the head's
+        // bound is the two together.
+        assert_stalled_call_times_out(
+            TimeoutConfig::builder()
+                .connect_timeout(Duration::from_millis(100))
+                .read_timeout(limit)
+                .build(),
+            limit,
+        )
+        .await;
+    }
+
+    /// The connect timeout alone bounds the response head too: zenwave has no separate connect
+    /// phase to apply it to.
+    #[compio::test]
+    async fn a_configured_connect_timeout_bounds_a_stalled_response() {
+        let limit = Duration::from_millis(300);
+        assert_stalled_call_times_out(
+            TimeoutConfig::builder().connect_timeout(limit).build(),
+            limit,
+        )
+        .await;
+    }
+
+    /// A body that never produces a frame.
+    struct Stalled;
+
+    impl http_body::Body for Stalled {
+        type Data = http_kit::utils::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A body that stalls mid-transfer fails with a timeout once the read timeout passes, instead
+    /// of waiting forever.
+    #[compio::test]
+    async fn a_stalled_body_times_out_after_the_read_timeout() {
+        use std::pin::pin;
+
+        let limit = Duration::from_millis(200);
+        let mut body = pin!(super::ReadTimeout {
+            body: Stalled,
+            limit: Some(limit),
+            timer: None,
+        });
+
+        let started = Instant::now();
+        let frame =
+            futures_lite::future::poll_fn(|cx| http_body::Body::poll_frame(body.as_mut(), cx))
+                .await
+                .expect("the stall ends in an error, not the end of the body");
+
+        assert!(started.elapsed() >= limit);
+        let error = frame.expect_err("a stalled body is an error");
+        assert!(
+            matches!(
+                error.downcast_ref::<zenwave::Error>(),
+                Some(zenwave::Error::Timeout)
+            ),
+            "{error}"
+        );
     }
 
     /// A `4xx` is the service's answer, not a transport failure: the SDK reads the error code from
