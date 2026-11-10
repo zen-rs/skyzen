@@ -437,6 +437,11 @@ mod tests {
 
     impl Serving {
         fn start(pki: &Pki) -> Self {
+            Self::serve(pki, || async { router() })
+        }
+
+        /// Serve the routers `factory` builds, one per thread.
+        fn serve(pki: &Pki, factory: impl crate::EndpointFactory) -> Self {
             let threads = NonZeroUsize::new(2).unwrap();
             let addr = loopback();
             let tls = tls::build(Some(&pki.files), &addr).expect("the pair loads");
@@ -452,7 +457,7 @@ mod tests {
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
             let plan = Plan {
-                factory: || async { router() },
+                factory,
                 wrap: Ok,
                 executor: Arc::new(AnyExecutor::new(SmolGlobal)),
                 max_connections: NonZeroUsize::new(64).unwrap(),
@@ -685,6 +690,190 @@ mod tests {
             assert!(build(requested, tls.as_ref(), &addr)
                 .expect("no refusal")
                 .is_some());
+        }
+    }
+
+    /// An HTTP/1.1 origin behind the reverse proxy, reached by an HTTP/3 client: what the origin
+    /// saw is returned as response fields, and the body (trailers included) is echoed back.
+    #[cfg(feature = "proxy")]
+    mod proxied {
+        use std::convert::Infallible;
+
+        use bytes::Bytes;
+        use futures_lite::{future::zip, StreamExt as _};
+        use http_kit::{
+            header::{self, HeaderMap, HeaderValue},
+            Body, BodyFrame, Method, Request, Response, StatusCode,
+        };
+        use http_kit_io::{compio::Compio, Io as _};
+        use sha2::{Digest as _, Sha256};
+
+        use super::{client, pki, request, Serving, CJK};
+        use crate::{
+            proxy::{Proxy, Upstream},
+            routing::{CreateRouteNode, Route},
+        };
+
+        /// One chunk of the streamed body.
+        const CHUNK: usize = 64 * 1024;
+        /// How many chunks it has: 4 MiB in all.
+        const CHUNKS: usize = 64;
+        /// A response field the origin sets, in Chinese, Japanese and Korean.
+        const ORIGIN: &str = "北京 / 東京 / 서울";
+
+        /// The origin: echoes the request body, frames and trailers alike, and reports the
+        /// forwarding fields it received.
+        #[derive(Clone)]
+        struct Origin;
+
+        impl crate::Endpoint for Origin {
+            type Error = Infallible;
+
+            #[expect(
+                clippy::unused_async_trait_impl,
+                reason = "the echo answers with the request's own body, so it awaits nothing"
+            )]
+            async fn respond(&mut self, request: &mut Request) -> Result<Response, Infallible> {
+                let body = request.body_mut().take().expect("body untaken");
+                let mut response = Response::new(body);
+                let fields = response.headers_mut();
+                for (name, seen) in [
+                    (header::VIA, "x-seen-via"),
+                    (header::HOST, "x-seen-host"),
+                    (header::FORWARDED, "x-seen-forwarded"),
+                    (header::TE, "x-seen-te"),
+                ] {
+                    if let Some(value) = request.headers().get(&name) {
+                        fields.insert(seen, value.clone());
+                    }
+                }
+                fields.insert(header::CONNECTION, HeaderValue::from_static("x-origin-hop"));
+                fields.insert("x-origin-hop", HeaderValue::from_static("1"));
+                // `from_static` takes visible ASCII only; a field value may carry UTF-8 octets.
+                fields.insert(
+                    "x-origin",
+                    HeaderValue::from_bytes(ORIGIN.as_bytes()).expect("a field value"),
+                );
+                Ok(response)
+            }
+        }
+
+        /// Every frame of `body`: its data, and its trailers if it ends with any.
+        async fn read(mut body: Body) -> (Vec<u8>, Option<HeaderMap>) {
+            let mut data = Vec::new();
+            let mut trailers = None;
+            while let Some(frame) = body.next().await {
+                match frame.expect("body frame") {
+                    BodyFrame::Data(bytes) => data.extend_from_slice(&bytes),
+                    BodyFrame::Trailers(fields) => trailers = Some(fields),
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+            (data, trailers)
+        }
+
+        fn chunk(index: usize) -> Bytes {
+            (0..CHUNK)
+                .map(|offset| u8::try_from((index * CHUNK + offset) * 31 % 251).expect("below 251"))
+                .collect::<Vec<u8>>()
+                .into()
+        }
+
+        #[test]
+        fn an_h3_client_streams_through_the_proxy_to_an_h1_origin() {
+            let origin = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the origin");
+            let origin_addr = origin.local_addr().expect("local address");
+            let target = format!("http://{origin_addr}/v1")
+                .parse()
+                .expect("upstream URI");
+            let upstream = Upstream::new(&target).expect("upstream");
+
+            let pki = pki();
+            let serving = Serving::serve(&pki, move || {
+                let upstream = upstream.clone();
+                async move { Route::new(("/api".mount(Proxy::new(&upstream)),)).build() }
+            });
+            let port = serving.addr.port();
+            let mut client = client(&pki);
+
+            super::on_compio(async {
+                let origin = Compio.tcp_listener(origin).expect("register the origin");
+                compio::runtime::spawn(async move {
+                    skyzen_h1::H1::default()
+                        .serve_listener(
+                            Compio,
+                            compio::runtime::Runtime::current(),
+                            origin,
+                            Origin,
+                            core::future::pending(),
+                        )
+                        .await;
+                })
+                .detach();
+
+                let socket = Compio.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+                let (send, connection) = client
+                    .connect(socket, Compio, "localhost", serving.addr)
+                    .expect("an h3 connection");
+                let exchange = async move {
+                    // A few MiB in chunks, ending in a trailer carrying its digest.
+                    let mut digest = Sha256::new();
+                    for index in 0..CHUNKS {
+                        digest.update(chunk(index));
+                    }
+                    let checksum = format!("{:x}", digest.finalize());
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("x-sha256", HeaderValue::try_from(&checksum).unwrap());
+                    let frames = futures_lite::stream::iter(0..CHUNKS)
+                        .map(|index| Ok::<_, Infallible>(BodyFrame::Data(chunk(index))))
+                        .chain(futures_lite::stream::once(Ok(BodyFrame::Trailers(
+                            trailers,
+                        ))));
+                    let mut streamed =
+                        request(port, Method::POST, "/api/echo", Body::from_frames(frames));
+                    streamed
+                        .headers_mut()
+                        .insert(header::TE, HeaderValue::from_static("trailers"));
+                    let response = send.send(streamed).await.expect("the streamed exchange");
+
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let fields = response.headers();
+                    assert_eq!(fields["x-seen-via"], "3 skyzen");
+                    assert_eq!(fields[header::VIA], "1.1 skyzen");
+                    assert_eq!(fields["x-seen-host"], origin_addr.to_string());
+                    assert_eq!(
+                        fields["x-seen-forwarded"],
+                        format!("for=127.0.0.1;host=\"localhost:{port}\";proto=https")
+                    );
+                    assert_eq!(fields["x-seen-te"], "trailers");
+                    assert_eq!(fields["x-origin"].as_bytes(), ORIGIN.as_bytes());
+                    assert!(fields.get("x-origin-hop").is_none());
+                    let (data, returned) = read(response.into_body()).await;
+                    assert_eq!(data.len(), CHUNK * CHUNKS);
+                    assert_eq!(format!("{:x}", Sha256::digest(&data)), checksum);
+                    assert_eq!(
+                        returned.expect("the echoed trailers")["x-sha256"],
+                        checksum.as_str()
+                    );
+
+                    let cjk = send
+                        .send(request(
+                            port,
+                            Method::POST,
+                            "/api/echo",
+                            Body::from(CJK.concat()),
+                        ))
+                        .await
+                        .expect("the CJK exchange");
+                    assert_eq!(cjk.status(), StatusCode::OK);
+                    let (data, _) = read(cjk.into_body()).await;
+                    assert_eq!(String::from_utf8(data).unwrap(), CJK.concat());
+                };
+                let ((), ran) = zip(exchange, connection.run()).await;
+                ran.expect("the connection ends cleanly");
+            });
+
+            serving.stop();
         }
     }
 

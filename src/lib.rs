@@ -35,6 +35,7 @@
 //! - [`static_files`] — Streamed file serving with `ETag`, `Range` and SPA fallback (requires
 //!   `static-files`)
 //! - [`websocket`] — Unified WebSocket API across native and WASM (requires `ws` feature)
+//! - `proxy` — A reverse-proxy endpoint, mounted on a router (requires `proxy`, native only)
 //!
 //! # Safe by default
 //!
@@ -87,6 +88,9 @@ pub use skyzen_macros::{
     durable_object, email, embed_migrations, error, import_config, main, openapi, queue, scheduled,
     sql, tail, test, Column, FromRow, HttpError,
 };
+
+#[cfg(all(feature = "proxy", not(target_arch = "wasm32")))]
+pub mod proxy;
 
 /// Static asset helpers for building file servers.
 #[cfg(feature = "static-files")]
