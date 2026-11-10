@@ -797,11 +797,18 @@ impl EventBridgeSchedules {
             // permission an HTTP-only app should need. Only a confirmed NotFound may
             // skip it: a denied or failed lookup is "unknown", and claiming cleanup
             // completed over an alias that may still serve a frozen version would
-            // let every later secret rotation fail. Verified absence — the `none` tag
-            // or an empty scan — skips `GetAlias`/`DeleteAlias` outright, permissions a
-            // first-time HTTP-only deploy may not hold.
-            if tolerant || self.alias_snapshot(lambda).await?.is_none() {
-                return Ok(());
+            // let every later secret rotation fail. A verified `none` tag settles the
+            // question without a read; an authoritatively empty scan still checks —
+            // an orphan alias survives rule retirement, and `tolerant` buys a denied
+            // `GetAlias`, not a skipped lookup.
+            match self.alias_snapshot(lambda).await {
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) => {}
+                Err(error) if tolerant => {
+                    output::warn(format!("could not check the `{ALIAS}` alias: {error:#}"));
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
             match lambda
                 .delete_alias()
@@ -1749,13 +1756,14 @@ impl EventBridgeSchedules {
     /// untag is tolerated only when the re-read confirms the tag is actually gone.
     async fn clear_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) -> Result<()> {
         // A verified `yes` is already the right record and a confirmed absence needs
-        // nothing — only `Ok(None)` proves absent, so a failed read stays an error,
-        // and only a stale `none` ever reaches `UntagResource`.
+        // nothing — a failed read is unverified, not absent, so it gets the
+        // invalidation attempt rather than count as evidence either way.
         match self.schedule_tag(lambda, arn).await {
             // A verified `yes` is already the right record and a confirmed absence
-            // needs nothing — only `Ok` proves the state, so a failed read falls
-            // through to invalidation rather than count as evidence either way.
+            // needs nothing — only a stale `none` makes invalidation mandatory.
             Ok(tag) if tag.as_deref() != Some("none") => return Ok(()),
+            // Anything else — a stale `none` or an unreadable record — gets the
+            // invalidation attempt; what it cannot verify is the caller's call.
             _ => {}
         }
         if let Err(error) = lambda
@@ -1765,21 +1773,36 @@ impl EventBridgeSchedules {
             .send()
             .await
         {
-            if self.schedule_tag(lambda, arn).await?.is_none() {
-                output::warn(format!(
-                    "could not clear the `skyzen-schedules` tag of Lambda function `{}`: \
-                     {error:#}",
-                    self.function
-                ));
-                return Ok(());
+            match self.schedule_tag(lambda, arn).await {
+                // The untag failed but the tag is verifiably gone — warn and move on.
+                Ok(None) => {
+                    output::warn(format!(
+                        "could not clear the `skyzen-schedules` tag of Lambda function \
+                         `{}`: {error:#}",
+                        self.function
+                    ));
+                }
+                // A stale `none` that can be seen must also be removed — bail.
+                Ok(Some(_)) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "could not invalidate the `skyzen-schedules` tag of Lambda \
+                             function `{}` before enabling rules",
+                            self.function
+                        )
+                    });
+                }
+                // The record is unreadable — nothing verified a stale assertion
+                // exists, and tag operations are not a deploy prerequisite. Warn that
+                // the state stays unverified rather than fail the transition.
+                Err(_) => {
+                    output::warn(format!(
+                        "could not clear or verify the `skyzen-schedules` tag of Lambda \
+                         function `{}`: {error:#}",
+                        self.function
+                    ));
+                }
             }
-            return Err(error).with_context(|| {
-                format!(
-                    "could not invalidate the `skyzen-schedules` tag of Lambda function \
-                     `{}` before enabling rules",
-                    self.function
-                )
-            });
         }
         Ok(())
     }
