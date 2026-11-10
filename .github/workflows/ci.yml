@@ -136,9 +136,6 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     name: Security Audit
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -152,9 +149,11 @@ jobs:
           cache-on-failure: true
       - name: Generate Lockfile
         run: cargo generate-lockfile
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # cargo-audit itself is the gate: it reads `.cargo/audit.toml` and exits
+      # non-zero on a vulnerability. The rustsec/audit-check reporter's Check-API
+      # update answers 404 on pull requests, failing clean audits.
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
 
   unused-deps:
     needs: changes

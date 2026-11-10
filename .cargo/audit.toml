@@ -7,4 +7,9 @@ ignore = [
     # ^0.5; the only patched range is >=0.7.6 and upstream has not released a
     # bump. Tracked in zen-rs/skyzen#117 until it does.
     "RUSTSEC-2026-0387",
+    # Bundled SQLite before 3.54 (CVE-2026-119375), exposed only when a process
+    # opens a database and `-wal` pair a less trusted party wrote. sqlx-sqlite
+    # 0.9.0, the latest sqlx, caps libsqlite3-sys below the patched 0.39.
+    # Tracked in zen-rs/skyzen#187 until sqlx releases the bump.
+    "RUSTSEC-2026-0459",
 ]
