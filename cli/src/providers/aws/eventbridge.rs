@@ -641,11 +641,12 @@ impl Task for EventBridgeSchedules {
             // schedules AND nothing shows prior wiring — no alias, no managed grant —
             // "cannot read" is not "there are none".
             let tolerant = self.schedules.is_empty()
-                && self.alias_snapshot(&lambda).await?.is_none()
+                && self.alias_snapshot(&lambda).await.ok().flatten().is_none()
                 && self
                     .managed_names(&lambda, &format!("{}:{ALIAS}", self.function))
-                    .await?
-                    .is_empty();
+                    .await
+                    .ok()
+                    .is_none_or(|(names, grant)| names.is_empty() && !grant);
             let result = self
                 .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
                 .await;
@@ -698,7 +699,12 @@ impl EventBridgeSchedules {
             // reconcile again — a later `secret set` would compare `$LATEST` against
             // that frozen version and refuse every rotation. Deleting it is also
             // fail-closed for whatever discovery missed: a surviving rule targets
-            // `function:skyzen`, which no longer resolves.
+            // `function:skyzen`, which no longer resolves. A deploy that never had
+            // the alias skips the call entirely — `lambda:DeleteAlias` is not a
+            // permission an HTTP-only app should need.
+            if self.alias_snapshot(lambda).await.ok().flatten().is_none() {
+                return Ok(());
+            }
             match lambda
                 .delete_alias()
                 .function_name(&self.function)
@@ -1127,16 +1133,20 @@ impl EventBridgeSchedules {
 
     /// Every schedule name this module manages: the manifest's plus every grant the policies
     /// — the alias's and the legacy unqualified function's — still carry.
+    /// The managed schedule names the policies name, plus whether any managed grant
+    /// was actually seen — a policy read that finds no `skyzen-schedule-*` SID is
+    /// evidence of no grants, not evidence a count can fake.
     async fn managed_names(
         &self,
         lambda: &aws_sdk_lambda::Client,
         qualified: &str,
-    ) -> Result<std::collections::BTreeSet<String>> {
+    ) -> Result<(std::collections::BTreeSet<String>, bool)> {
         let mut names: std::collections::BTreeSet<String> = self
             .schedules
             .iter()
             .map(|entry| entry.name.as_str().to_owned())
             .collect();
+        let mut grant_found = false;
         for owner in [qualified, self.function.as_str()] {
             if let Some(policy) = self.policy(lambda, owner).await? {
                 if let Some(statements) = policy["Statement"].as_array() {
@@ -1145,13 +1155,14 @@ impl EventBridgeSchedules {
                             .as_str()
                             .and_then(|sid| sid.strip_prefix("skyzen-schedule-"))
                         {
+                            grant_found = true;
                             names.insert(name.to_owned());
                         }
                     }
                 }
             }
         }
-        Ok(names)
+        Ok((names, grant_found))
     }
 
     /// Move every managed rule's unqualified target onto the `skyzen` alias.
@@ -1200,23 +1211,19 @@ impl EventBridgeSchedules {
         // Schedule-specific policy reads are optional in discovery: an app whose credentials
         // never held `lambda:GetPolicy` still carries legacy rules, and the `skyzen-{fn}--`
         // prefix scan finds them whatever the policies say.
-        let mut discovery_failed = true;
         let mut rule_scan_ok = false;
-        let mut names: std::collections::BTreeSet<String> =
-            match self.managed_names(lambda, &qualified).await {
-                Ok(names) => {
-                    discovery_failed = false;
-                    names
-                }
-                Err(error) => {
-                    output::warn(format!("could not read schedule grants: {error:#}"));
-                    std::collections::BTreeSet::default()
-                }
-            };
+        let (mut names, grant_found) = match self.managed_names(lambda, &qualified).await {
+            Ok((names, grant_found)) => (names, grant_found),
+            Err(error) => {
+                output::warn(format!("could not read schedule grants: {error:#}"));
+                (std::collections::BTreeSet::default(), false)
+            }
+        };
+        let mut rules_found = false;
         match self.managed_rule_names(events).await {
             Ok(rules) => {
-                discovery_failed = false;
                 rule_scan_ok = true;
+                rules_found = !rules.is_empty();
                 names.extend(rules);
             }
             // `events:ListRules` is optional too — the policies above are enough to keep a
@@ -1226,28 +1233,20 @@ impl EventBridgeSchedules {
             }
             Err(error) => return Err(error),
         }
-        // Scheduling history shows without `ListRules` too: the alias this module made,
-        // or a grant still named on a policy. When either is present, an incomplete scan
-        // can hide a live legacy rule that would fire the code about to upload — refuse
-        // before `$LATEST` moves, rather than discover the gap after.
-        let has_history =
-            self.alias_snapshot(lambda).await?.is_some() || names.len() > self.schedules.len();
+        // Scheduling history shows without `ListRules` too: the alias this module made —
+        // read through `function:skyzen`, which needs only the `GetFunctionConfiguration`
+        // the deploy already holds — or a grant still named on a policy. When either is
+        // present, an incomplete scan can hide a live legacy rule that would fire the
+        // code about to upload — refuse before `$LATEST` moves, rather than discover the
+        // gap after. No evidence at all is the genuinely HTTP-only case and proceeds.
+        let has_history = grant_found
+            || rules_found
+            || self.alias_snapshot(lambda).await.ok().flatten().is_some();
         anyhow::ensure!(
             rule_scan_ok || !has_history,
             "Lambda function `{}` shows prior `[[schedule]]` wiring but `events:ListRules` \
              is denied, so an enabled legacy rule could still exist — grant the permission \
              or remove the rule before deploying",
-            self.function
-        );
-        // Both discovery paths failing means "unknown", not "none" — a rule made before
-        // the alias existed has no alias either, so its absence cannot prove the set is
-        // empty. A removed last schedule could still have a rule the upload would point
-        // at swapped code.
-        anyhow::ensure!(
-            !discovery_failed || !names.is_empty(),
-            "could not discover Lambda function `{}`'s EventBridge rules: both the policy \
-             read and the rule listing were denied, so a legacy schedule may remain — \
-             grant `lambda:GetPolicy` or `events:ListRules`, or delete them first",
             self.function
         );
 
@@ -1599,19 +1598,23 @@ impl EventBridgeSchedules {
         Ok(())
     }
 
-    /// The version the `skyzen` alias points at now, or `None` when it does not exist.
+    /// The version the `skyzen` alias serves, or `None` when it does not exist.
+    ///
+    /// The read goes through the qualified name rather than `GetAlias`: resolving
+    /// `function:skyzen` needs only `lambda:GetFunctionConfiguration`, which the deploy
+    /// already holds, so an HTTP-only app never picks up a scheduling-management
+    /// permission just to prove it has no schedules.
     async fn alias_snapshot(&self, lambda: &aws_sdk_lambda::Client) -> Result<Option<String>> {
         match lambda
-            .get_alias()
-            .function_name(&self.function)
-            .name(ALIAS)
+            .get_function_configuration()
+            .function_name(format!("{}:{ALIAS}", self.function))
             .send()
             .await
         {
-            Ok(alias) => Ok(alias.function_version().map(str::to_owned)),
+            Ok(config) => Ok(config.version().map(str::to_owned)),
             Err(error)
                 if error.as_service_error().is_some_and(
-                    aws_sdk_lambda::operation::get_alias::GetAliasError::is_resource_not_found_exception,
+                    aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationError::is_resource_not_found_exception,
                 ) =>
             {
                 Ok(None)
