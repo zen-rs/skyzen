@@ -1008,8 +1008,9 @@ mod tests {
         .expect("valid manifest");
         let build = Action::Build { release: true };
         let step = precompress_step(&build, Provider::Native, &manifest).expect("a native build");
+        let dir = std::path::Path::new("/tmp/app").join("public");
         assert!(
-            step.describe().contains("/tmp/app/public"),
+            step.describe().contains(&dir.display().to_string()),
             "{}",
             step.describe()
         );
