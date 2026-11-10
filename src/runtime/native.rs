@@ -23,8 +23,11 @@ use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
 
 mod cores;
+mod tls;
 #[cfg(unix)]
 mod unix;
+
+use tls::{ServerTls, TlsError};
 
 /// Initialize the tracing subscriber + color-eyre once per process.
 /// # Panics
@@ -314,14 +317,11 @@ fn flag_value(flag: &str, value: Option<String>) -> String {
     }
 }
 
-/// The PEM files the native server is asked to terminate TLS with.
+/// The PEM files the native server terminates TLS with.
 ///
 /// One grammar everywhere — `--tls-cert`/`--tls-key` and the `SKYZEN_TLS_CERT`/
 /// `SKYZEN_TLS_KEY` environment variables name the same pair of files, and each
 /// flag wins over its variable independently.
-///
-/// The thread-per-core runtime does not terminate TLS yet, so [`launch`] refuses to start with a
-/// pair configured rather than serve cleartext under settings that promised encryption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsFiles {
     /// PEM file holding the certificate chain, leaf certificate first.
@@ -401,6 +401,68 @@ pub fn apply_tls_overrides(args: impl IntoIterator<Item = String>) -> Option<Tls
     }
 }
 
+/// The server that answers cleartext HTTP on the serving threads.
+///
+/// TLS is not a choice: `skyzen-h1` serves cleartext only, so a TLS listener is always hyper's,
+/// with ALPN choosing HTTP/1.1 or HTTP/2.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HttpServer {
+    /// Skyzen's own HTTP/1.1 server on owned-buffer I/O (`skyzen-h1`), the default.
+    #[default]
+    H1,
+    /// Hyper: HTTP/1.1 and prior-knowledge HTTP/2 (h2c), over the compio stream's copying
+    /// poll-style bridge. Not available on a `unix:` socket, and without the per-thread
+    /// connection limit the default server applies.
+    Hyper,
+}
+
+impl std::str::FromStr for HttpServer {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "h1" => Ok(Self::H1),
+            "hyper" => Ok(Self::Hyper),
+            other => Err(format!("`{other}` is not a server; use `h1` or `hyper`")),
+        }
+    }
+}
+
+/// Parse `--server`, falling back to `SKYZEN_SERVER`, and to the default [`HttpServer::H1`].
+///
+/// # Panics
+///
+/// A value that names no server kills the process at startup: silently serving the other
+/// protocol set than the one asked for is worse than not starting.
+#[must_use]
+pub fn apply_server_override(args: impl IntoIterator<Item = String>) -> HttpServer {
+    const ENV: &str = "SKYZEN_SERVER";
+
+    let mut args = args.into_iter();
+    let _ = args.next(); // binary name
+    let mut flag = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--server=") {
+            flag = Some(value.to_owned());
+        } else if arg == "--server" {
+            flag = Some(
+                args.next()
+                    .unwrap_or_else(|| panic!("--server expects `h1` or `hyper` after it")),
+            );
+        }
+    }
+
+    let value = flag.or_else(|| std::env::var(ENV).ok());
+    let Some(value) = value else {
+        return HttpServer::default();
+    };
+    let server = value
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid server: {error}"));
+    info!("Configured HTTP server: {value}");
+    server
+}
+
 fn shutdown_signal() -> Receiver<()> {
     let (tx, rx) = bounded(1);
     if let Err(error) = ctrlc::set_handler(move || {
@@ -437,6 +499,10 @@ enum RuntimeFailure {
     Mount(azure::MountError),
     /// A serving thread died instead of reporting that it was accepting.
     ThreadExited,
+    /// TLS was configured but cannot be provided on this listener or this build.
+    Tls(TlsError),
+    /// `--server hyper` was asked for a unix socket, which only the default server can serve.
+    HyperOnUnixSocket,
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -454,6 +520,12 @@ impl std::fmt::Display for RuntimeFailure {
             }
             Self::Mount(error) => write!(f, "{error}"),
             Self::ThreadExited => write!(f, "a serving thread exited before it was accepting"),
+            Self::Tls(error) => write!(f, "{error}"),
+            Self::HyperOnUnixSocket => write!(
+                f,
+                "a unix socket is served by the default server; drop `--server hyper` or listen \
+                 on TCP"
+            ),
         }
     }
 }
@@ -463,7 +535,8 @@ impl std::error::Error for RuntimeFailure {
         match self {
             Self::Listener(error) => Some(error),
             Self::Mount(error) => Some(error),
-            Self::QueueConsumer(_) | Self::ThreadExited => None,
+            Self::Tls(error) => Some(error),
+            Self::QueueConsumer(_) | Self::ThreadExited | Self::HyperOnUnixSocket => None,
         }
     }
 }
@@ -476,10 +549,12 @@ impl std::error::Error for RuntimeFailure {
 pub struct LaunchOptions {
     /// The address a command-line flag asked for, if any.
     pub listen: Option<ListenOverride>,
-    /// The TLS certificate/key pair asked for by `--tls-cert`/`--tls-key` or
-    /// `SKYZEN_TLS_CERT`/`SKYZEN_TLS_KEY`. `None` serves cleartext, as the runtime always has;
-    /// `Some` is refused until the runtime terminates TLS itself.
+    /// The TLS certificate/key pair the server terminates TLS with, from
+    /// `--tls-cert`/`--tls-key` or `SKYZEN_TLS_CERT`/`SKYZEN_TLS_KEY`.
+    /// `None` serves cleartext, as the runtime always has.
     pub tls: Option<TlsFiles>,
+    /// The server that answers cleartext connections, from `--server` or `SKYZEN_SERVER`.
+    pub server: HttpServer,
     /// The `[[azure.queue_triggers]]` entries this application declares.
     ///
     /// Empty for everything that is not an Azure Functions app, which is the only case where they
@@ -702,23 +777,15 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
         }
     };
 
-    // Serverless hosts terminate TLS upstream, so a configured pair there can only be a leftover
-    // that would silently go dead; and the server itself cannot terminate it yet. Either way,
-    // refuse rather than start under flags that promise TLS.
-    if options.tls.is_some() {
-        if matches!(platform, Platform::Server) {
-            error!(
-                "Skyzen cannot start: TLS is configured (--tls-cert/--tls-key or \
-                 SKYZEN_TLS_CERT/SKYZEN_TLS_KEY), but the thread-per-core runtime does not \
-                 terminate TLS yet; terminate it in a fronting proxy, or unset them"
-            );
-        } else {
-            error!(
-                "Skyzen cannot start: TLS is configured (--tls-cert/--tls-key or \
-                 SKYZEN_TLS_CERT/SKYZEN_TLS_KEY), but this platform terminates TLS \
-                 upstream; unset them or run where they apply"
-            );
-        }
+    // TLS is only meaningful on the path that owns a socket: both serverless hosts
+    // terminate it upstream, so a configured pair there can only be a leftover that
+    // would silently go dead. Refuse rather than start under flags that promise TLS.
+    if options.tls.is_some() && !matches!(platform, Platform::Server) {
+        error!(
+            "Skyzen cannot start: TLS is configured (--tls-cert/--tls-key or \
+             SKYZEN_TLS_CERT/SKYZEN_TLS_KEY), but this platform terminates TLS \
+             upstream; unset them or run where they apply"
+        );
         std::process::exit(1);
     }
 
@@ -751,7 +818,10 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
                     .listen
                     .as_ref()
                     .map_or_else(server_addr, |listen| listen.addr.clone());
-                serve_cores(factory, Ok, consumers, addr).await
+                match tls::build(options.tls.as_ref(), &addr) {
+                    Ok(tls) => serve_cores(factory, Ok, consumers, addr, options.server, tls).await,
+                    Err(error) => Err(error),
+                }
             }
             Platform::AzureFunctions { port } => {
                 serve_functions_host(factory, consumers, &options, port).await
@@ -851,6 +921,8 @@ async fn serve_cores<F, A, W, C>(
     wrap: W,
     consumers: C,
     addr: ListenAddr,
+    server: HttpServer,
+    tls: Option<ServerTls>,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     F: EndpointFactory,
@@ -858,10 +930,15 @@ where
     W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
     C: ConsumerSet,
 {
+    #[cfg(unix)]
+    if server == HttpServer::Hyper && matches!(addr, ListenAddr::Unix(_)) {
+        return Err(RuntimeFailure::HyperOnUnixSocket);
+    }
     let threads = std::thread::available_parallelism()?;
     let sockets = cores::bind(&addr, threads)?;
+    let scheme = if tls.is_some() { "https" } else { "http" };
     let listening = match sockets.first() {
-        Some(cores::Socket::Tcp(listener)) => format!("http://{}", listener.local_addr()?),
+        Some(cores::Socket::Tcp(listener)) => format!("{scheme}://{}", listener.local_addr()?),
         _ => addr.to_string(),
     };
 
@@ -878,6 +955,8 @@ where
         executor: Arc::new(AnyExecutor::new(SmolGlobal)),
         max_connections: NonZeroUsize::new(MAX_CONNECTIONS.div_ceil(threads.get()))
             .unwrap_or(NonZeroUsize::MIN),
+        server,
+        tls,
     };
     let started = cores::start(plan, sockets, &stopping, &drain)?;
 
@@ -1115,6 +1194,10 @@ where
         },
         (),
         addr,
+        options.server,
+        // `launch` refused a TLS pair before this path runs, since the Functions host speaks
+        // plaintext to its custom handler.
+        None,
     )
     .await
 }
@@ -1575,6 +1658,47 @@ mod tests {
         assert!(path.exists(), "the live socket must not be unlinked");
         drop(listener);
         std::fs::remove_file(&path).expect("the test created the socket");
+    }
+
+    fn server_override(args: &[&str]) -> super::HttpServer {
+        super::apply_server_override(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    #[serial]
+    fn the_default_server_is_h1() {
+        let _env = EnvGuard::clear_var("SKYZEN_SERVER");
+        assert_eq!(server_override(&["app"]), super::HttpServer::H1);
+    }
+
+    #[test]
+    #[serial]
+    fn the_server_flag_beats_the_environment() {
+        let _env = EnvGuard::set_var("SKYZEN_SERVER", "h1");
+        assert_eq!(
+            server_override(&["app", "--server", "hyper"]),
+            super::HttpServer::Hyper
+        );
+        assert_eq!(
+            server_override(&["app", "--server=hyper"]),
+            super::HttpServer::Hyper
+        );
+        assert_eq!(server_override(&["app"]), super::HttpServer::H1);
+    }
+
+    #[test]
+    #[serial]
+    fn the_server_environment_variable_selects_hyper() {
+        let _env = EnvGuard::set_var("SKYZEN_SERVER", "hyper");
+        assert_eq!(server_override(&["app"]), super::HttpServer::Hyper);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "not a server")]
+    fn an_unknown_server_stops_the_process() {
+        let _env = EnvGuard::clear_var("SKYZEN_SERVER");
+        let _ = server_override(&["app", "--server", "apache"]);
     }
 
     /// `apply_tls_overrides` through the same iterator shape `#[skyzen::main]` hands it:

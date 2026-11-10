@@ -62,14 +62,16 @@ Without `--port` or `SKYZEN_ADDRESS`, Skyzen binds an available localhost port a
 
 ### TLS
 
-The built-in server speaks HTTP/1.1 on one runtime per core and does not terminate
-TLS yet. `--tls-cert`/`--tls-key` (and `SKYZEN_TLS_CERT`/`SKYZEN_TLS_KEY`) are still
-parsed, and a configured pair refuses to start rather than serve cleartext under
-settings that promised encryption. Half a pair refuses to start too, and so does a
-pair under AWS Lambda or Azure Functions, where the platform terminates TLS.
+With the `server-tls` feature, `--tls-cert`/`--tls-key` (and `SKYZEN_TLS_CERT`/
+`SKYZEN_TLS_KEY`) terminate TLS on every serving thread. ALPN chooses the protocol:
+`h2` serves HTTP/2 and anything else HTTP/1.1, both through Hyper. This is an interim
+path (rustls over the compio stream's copying poll bridge) until TLS moves to
+owned-buffer I/O. Half a pair refuses to start, and so does a pair under AWS Lambda
+or Azure Functions, where the platform terminates TLS, or without the feature.
 
-Put the server behind a load balancer or reverse proxy that terminates TLS, and
-leave the TLS flags unset there.
+Cleartext HTTP is served by Skyzen's own HTTP/1.1 server by default. `--server hyper`
+(or `SKYZEN_SERVER=hyper`) serves it with Hyper instead, which adds prior-knowledge
+HTTP/2 (h2c); Hyper is not available on a `unix:` listener.
 
 ### Docker
 

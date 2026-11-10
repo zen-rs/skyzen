@@ -4,21 +4,35 @@
 //!
 //! This crate provides [`Hyper`], which implements the [`Server`] trait from `skyzen-core`:
 //! HTTP/1.1 (upgrades included) and prior-knowledge HTTP/2 over an `http-kit-io` TCP listener,
-//! driving a `!Send` endpoint on the thread that calls [`Server::serve`].
+//! driving a `!Send` endpoint on the thread that calls [`Server::serve`]. It serves every
+//! `http-kit-io` driver, the completion-based `compio` one included.
 //!
 //! [`serve_connection`] is the per-connection half, for a runtime that accepts connections itself
-//! — over TLS, or a unix socket — and only needs hyper to speak HTTP on them.
+//! — over TLS, where ALPN picks the [`Protocol`], or a unix socket — and only needs hyper to speak
+//! HTTP on them. A TLS server that also serves HTTP/3 on UDP announces it with
+//! [`IntoService::with_alt_svc`].
+//!
+//! # Nothing here is `Send`
+//!
+//! hyper's `with_upgrades()` boxes the connection as a `Send` stream, which a completion-based
+//! driver's socket is not. This crate never uses it: an HTTP/1 connection runs through hyper's
+//! `without_shutdown`, which resolves when an upgrade is pending and hands the stream and the
+//! bytes read past the request back, and the upgrade session then runs on that stream directly.
+//! HTTP/2 streams are spawned on the connection's `LocalExecutor` through hyper's executor hook.
 //!
 //! See the [`embed_hyper.rs`](https://github.com/zen-rs/skyzen/blob/main/examples/embed_hyper.rs)
 //! example for a complete setup.
 
 use core::future::Future;
 use executor_core::{LocalExecutor, Task};
-use futures_util::future::{select, Either};
-use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite};
+use futures_util::future::{poll_fn, select, Either};
+use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use http_kit_io::{IntoPoll, Io, Listener};
 use hyper::server::conn::{http1::Builder as Http1Builder, http2::Builder as Http2Builder};
-use skyzen_core::{upgrade::UpgradeAvailable, Endpoint, Extensions, Server};
+use skyzen_core::{
+    upgrade::{UpgradeAvailable, Upgraded},
+    Endpoint, Extensions, Server,
+};
 use std::convert::Infallible;
 use std::mem::MaybeUninit;
 use std::pin::{pin, Pin};
@@ -29,7 +43,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error};
 
 mod service;
-pub use service::{IntoService, SkyzenBody};
+pub use service::{AltSvc, IntoService, SkyzenBody};
 
 /// The HTTP/2 connection preface (RFC 9113 §3.4).
 pub const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -50,21 +64,20 @@ pub const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 ///
 /// # Drivers
 ///
-/// hyper boxes an upgraded HTTP/1 connection as a `Send` stream, so the driver's poll-style stream
-/// has to be `Send`: the `async-io` and `tokio` drivers' are. The endpoint and everything it runs
-/// stay `!Send`-capable either way.
+/// hyper reads and writes through borrowed buffers, so it drives the stream `http-kit-io` offers
+/// as [`IntoPoll`]. On the `async-io` and `tokio` drivers that costs nothing; on `compio` the
+/// capability is a `CopyingPoll`, which copies every read and write through a buffer of its own,
+/// so hyper on `io_uring` or IOCP pays that copy and the completion-based h1 server does not.
+/// Nothing the endpoint runs has to be `Send` on any of them.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Hyper;
 
-impl<I: Io> Server<I> for Hyper
-where
-    <I::TcpStream as IntoPoll>::Poll: Send + 'static,
-{
+impl<I: Io> Server<I> for Hyper {
     type Listeners = I::TcpListener;
 
     async fn serve<Ex, E>(
         &self,
-        _io: I,
+        io: I,
         executor: Ex,
         listener: I::TcpListener,
         endpoint: E,
@@ -93,15 +106,21 @@ where
             };
             debug!("accepted connection from {peer}");
 
-            let service =
-                IntoService::new(endpoint.clone(), Rc::clone(&executor)).with_peer_addr(peer);
+            let service = IntoService::new(endpoint.clone()).with_peer_addr(peer);
             let task_executor = Rc::clone(&executor);
             let stopping = stopping.clone();
             let live = live.clone();
+            let io = io.clone();
             executor
                 .spawn_local(async move {
                     let _live = live;
-                    let stream = match sniff_protocol(stream.into_poll(), SNIFF_TIMEOUT).await {
+                    // The driver's own timer bounds the sniff; hyper's timers cannot be one.
+                    let sniff = pin!(sniff_preface(stream.into_poll(), HTTP2_PREFACE));
+                    let stream = match select(sniff, pin!(io.sleep(SNIFF_TIMEOUT))).await {
+                        Either::Left((result, _)) => result,
+                        Either::Right(((), _)) => Err(sniff_timed_out()),
+                    };
+                    let stream = match stream {
                         Ok(sniffed) => sniffed,
                         Err(error) => {
                             debug!("failed to read the connection preface: {error}");
@@ -140,19 +159,21 @@ pub enum Protocol {
 /// [`UpgradeAvailable`], so a handler may answer them with a `101`; HTTP/2 streams cannot be
 /// upgraded and do not. Errors are logged and end only this connection.
 ///
-/// `stream` has to be `Send` because hyper hands an upgraded connection over as a `Send` box.
+/// The session of an upgrade runs as a task of its own on `executor`, which outlives this call, so
+/// a connection held by a WebSocket does not hold up a graceful shutdown. Neither `stream` nor
+/// anything the endpoint returns has to be `Send`.
 pub async fn serve_connection<S, E, Ex>(
     stream: S,
     protocol: Protocol,
-    service: IntoService<E, Ex>,
+    service: IntoService<E>,
     executor: Rc<Ex>,
     stop: impl Future<Output = ()>,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
     E: Endpoint + Clone + 'static,
     Ex: LocalExecutor + 'static,
 {
-    let stop = pin!(stop);
+    let mut stop = pin!(stop);
     match protocol {
         Protocol::Http2 => {
             let mut builder = Http2Builder::new(LocalHyperExecutor(executor));
@@ -178,20 +199,80 @@ pub async fn serve_connection<S, E, Ex>(
             // Without a timer hyper silently disables its header read timeout, so a slow-loris
             // client would hold the connection.
             builder.timer(AsyncIoTimer);
-            let mut connection = pin!(builder
-                .serve_connection(ConnectionWrapper(stream), service)
-                .with_upgrades());
-            let result = match select(connection.as_mut(), stop).await {
-                Either::Left((result, _)) => result,
-                Either::Right(((), _)) => {
-                    connection.as_mut().graceful_shutdown();
-                    connection.await
+            let upgrade = service.upgrade_slot();
+            let mut connection = builder.serve_connection(ConnectionWrapper(stream), service);
+            // `without_shutdown` resolves, with the stream still open, when an upgrade is
+            // pending as well as when the connection is done; unlike `with_upgrades` it asks
+            // nothing of the stream, `Send` least of all.
+            let mut stopping = false;
+            let result = poll_fn(|cx| {
+                if !stopping && stop.as_mut().poll(cx).is_ready() {
+                    stopping = true;
+                    Pin::new(&mut connection).graceful_shutdown();
                 }
-            };
+                connection.poll_without_shutdown(cx)
+            })
+            .await;
             if let Err(error) = result {
                 error!("hyper h1 connection error: {error}");
+                return;
             }
+
+            let parts = connection.into_parts();
+            let mut stream = parts.io.0;
+            let Some(session) = upgrade.take() else {
+                // Without the shutdown hyper would have made, close the stream here.
+                if let Err(error) = stream.close().await {
+                    debug!("closing the connection failed: {error}");
+                }
+                return;
+            };
+            let stream = Upgraded::new(Replay {
+                buffered: parts.read_buf,
+                inner: stream,
+            });
+            executor.spawn_local(session.run(stream)).detach();
         }
+    }
+}
+
+/// An upgraded stream that first replays what the client sent after its upgrade request.
+struct Replay<S> {
+    buffered: http_kit::utils::Bytes,
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Replay<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.buffered.is_empty() {
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
+        }
+        let n = buf.len().min(this.buffered.len());
+        buf[..n].copy_from_slice(&this.buffered.split_to(n));
+        Poll::Ready(Ok(n))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Replay<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
     }
 }
 
@@ -400,11 +481,15 @@ where
     let sniff = pin!(sniff_preface(stream, HTTP2_PREFACE));
     match select(sniff, async_io::Timer::after(timeout)).await {
         Either::Left((result, _)) => result,
-        Either::Right(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out reading connection preface",
-        )),
+        Either::Right(_) => Err(sniff_timed_out()),
     }
+}
+
+fn sniff_timed_out() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out reading connection preface",
+    )
 }
 
 async fn sniff_preface<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Prefixed<C>, Protocol)>

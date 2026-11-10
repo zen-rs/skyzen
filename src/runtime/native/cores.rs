@@ -17,12 +17,13 @@ use std::{io, num::NonZeroUsize, rc::Rc, sync::Arc, thread};
 
 use async_channel::{bounded, Receiver, Sender};
 use executor_core::{compio::Runtime, AnyExecutor};
-use http_kit_io::{compio::Compio, Io, Split};
-use skyzen_core::EndpointFactory;
-use skyzen_h1::{Accept, H1};
+use http_kit_io::{compio::Compio, Io};
+use skyzen_core::{EndpointFactory, Server as _};
+use skyzen_h1::H1;
+use skyzen_hyper::Hyper;
 use tracing::error;
 
-use super::RuntimeFailure;
+use super::{tls::ServerTls, HttpServer, RuntimeFailure};
 use crate::{
     runtime::{context::ShutdownGuard, WorkerContext},
     Endpoint, Request, Response,
@@ -124,8 +125,13 @@ pub(super) struct Plan<F, W> {
     pub(super) wrap: W,
     /// Where `WorkerContext::wait_until` runs post-response work.
     pub(super) executor: Arc<AnyExecutor>,
-    /// How many connections one thread keeps open before it refuses more.
+    /// How many connections one thread keeps open before it refuses more. Applies to the default
+    /// server and to TLS; [`Hyper`] on a cleartext listener has no such limit.
     pub(super) max_connections: NonZeroUsize,
+    /// The server that answers cleartext TCP connections.
+    pub(super) server: HttpServer,
+    /// The acceptor, when the listener terminates TLS.
+    pub(super) tls: Option<ServerTls>,
 }
 
 /// The serving threads, once started.
@@ -229,7 +235,33 @@ fn work<F, A, W>(
         match socket {
             Socket::Tcp(listener) => match Compio.tcp_listener(listener) {
                 Ok(listener) => {
-                    serve(&h1, executor, listener, endpoint, shutdown, ready).await;
+                    if !announce(ready).await {
+                        return;
+                    }
+                    match (&plan.tls, plan.server) {
+                        // Skyzen's own server speaks cleartext only, so TLS is always hyper's,
+                        // with ALPN choosing between h1 and h2.
+                        (Some(tls), _) => {
+                            super::tls::serve(
+                                executor,
+                                listener,
+                                endpoint,
+                                shutdown,
+                                tls.clone(),
+                                plan.max_connections,
+                            )
+                            .await;
+                        }
+                        (None, HttpServer::H1) => {
+                            h1.serve_accepting(Compio, executor, listener, endpoint, shutdown)
+                                .await;
+                        }
+                        (None, HttpServer::Hyper) => {
+                            Hyper
+                                .serve(Compio, executor, listener, endpoint, shutdown)
+                                .await;
+                        }
+                    }
                 }
                 Err(error) => {
                     let _ = ready.send(Err(error.into())).await;
@@ -238,7 +270,11 @@ fn work<F, A, W>(
             #[cfg(unix)]
             Socket::Unix(listener) => match super::unix::Listener::from_std(listener) {
                 Ok(listener) => {
-                    serve(&h1, executor, listener, endpoint, shutdown, ready).await;
+                    if announce(ready).await {
+                        // `serve_cores` has refused every other server on a unix socket.
+                        h1.serve_accepting(Compio, executor, listener, endpoint, shutdown)
+                            .await;
+                    }
                 }
                 Err(error) => {
                     let _ = ready.send(Err(error.into())).await;
@@ -248,25 +284,13 @@ fn work<F, A, W>(
     });
 }
 
-/// Report that this thread is accepting, then serve until `shutdown`.
-async fn serve<L, E>(
-    h1: &H1,
-    executor: Rc<Runtime>,
-    listener: L,
-    endpoint: E,
-    shutdown: impl core::future::Future<Output = ()> + 'static,
-    ready: &Sender<Result<(), RuntimeFailure>>,
-) where
-    L: Accept,
-    <L::Stream as Split>::WriteHalf: http_kit_io::SendFile,
-    E: Endpoint + Clone + 'static,
-{
-    if ready.send(Ok(())).await.is_err() {
+/// Report that this thread is accepting. `false` when nobody is waiting for the report any more.
+async fn announce(ready: &Sender<Result<(), RuntimeFailure>>) -> bool {
+    let reported = ready.send(Ok(())).await.is_ok();
+    if !reported {
         error!("the runtime stopped waiting for this serving thread to start");
-        return;
     }
-    h1.serve_accepting(Compio, executor, listener, endpoint, shutdown)
-        .await;
+    reported
 }
 
 /// An endpoint that hands every request the [`WorkerContext`] of the thread serving it.
@@ -301,7 +325,10 @@ mod tests {
     use http_kit::{error::BoxHttpError, Body};
 
     use super::{bind, start, Cores, Plan, Socket};
-    use crate::{runtime::native::ListenAddr, Endpoint, Request, Response};
+    use crate::{
+        runtime::native::{HttpServer, ListenAddr},
+        Endpoint, Request, Response,
+    };
 
     /// Serving threads that have all reported ready, and the handles that stop them.
     struct Serving {
@@ -312,7 +339,7 @@ mod tests {
     }
 
     impl Serving {
-        fn start(sockets: Vec<Socket>) -> Self {
+        fn start(sockets: Vec<Socket>, server: HttpServer) -> Self {
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
             let plan = Plan {
@@ -320,6 +347,8 @@ mod tests {
                 wrap: Ok,
                 executor: Arc::new(AnyExecutor::new(SmolGlobal)),
                 max_connections: NonZeroUsize::new(64).unwrap(),
+                server,
+                tls: None,
             };
             let cores = start(plan, sockets, &stopping, &drain).expect("start the threads");
             for _ in 0..cores.threads {
@@ -386,6 +415,13 @@ mod tests {
     /// one under the same name.
     #[test]
     fn connections_land_on_more_than_one_runtime_thread() {
+        // Both servers a cleartext listener can be given run through the same threads.
+        for server in [HttpServer::H1, HttpServer::Hyper] {
+            connections_spread_over_threads(server);
+        }
+    }
+
+    fn connections_spread_over_threads(server: HttpServer) {
         let threads = NonZeroUsize::new(4).unwrap();
         let sockets =
             bind(&ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()), threads).expect("bind");
@@ -394,7 +430,7 @@ mod tests {
         };
         let addr = first.local_addr().expect("local addr");
 
-        let serving = Serving::start(sockets);
+        let serving = Serving::start(sockets, server);
         assert_eq!(serving.cores.threads, 4);
 
         let served_by: BTreeSet<String> = (0..128)
@@ -405,7 +441,7 @@ mod tests {
 
         assert!(
             served_by.len() > 1,
-            "every request landed on one runtime thread: {served_by:?}"
+            "every request landed on one runtime thread under {server:?}: {served_by:?}"
         );
         assert!(served_by.iter().all(|name| name.starts_with("skyzen-")));
     }
@@ -421,7 +457,7 @@ mod tests {
             NonZeroUsize::new(2).unwrap(),
         )
         .expect("bind the unix socket");
-        let serving = Serving::start(sockets);
+        let serving = Serving::start(sockets, HttpServer::H1);
 
         let body = exchange(std::os::unix::net::UnixStream::connect(&path).expect("connect"));
 
