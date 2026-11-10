@@ -24,9 +24,6 @@ use skyzen_core::Endpoint;
 use std::net::SocketAddr;
 
 #[cfg(feature = "server-tls")]
-use skyzen_h1::H1;
-
-#[cfg(feature = "server-tls")]
 use super::HttpServer;
 use super::{ListenAddr, RuntimeFailure, TlsFiles};
 
@@ -121,7 +118,20 @@ impl std::error::Error for TlsError {
 /// The TLS acceptor shared by every connection of every thread.
 #[cfg(feature = "server-tls")]
 #[derive(Debug, Clone)]
-pub(super) struct ServerTls(http_kit_tls::TlsAcceptor);
+pub(super) struct ServerTls {
+    acceptor: http_kit_tls::TlsAcceptor,
+    /// The PEM pair the acceptor was built from, read once, for the QUIC endpoint to present.
+    #[cfg(feature = "http3")]
+    identity: http_kit_h3::Identity,
+}
+
+#[cfg(feature = "http3")]
+impl ServerTls {
+    /// The certificate chain and key this acceptor presents, for HTTP/3 to present too.
+    pub(super) fn identity(&self) -> http_kit_h3::Identity {
+        self.identity.clone()
+    }
+}
 
 /// Without `server-tls` the type is uninhabited, which is what makes the `None` the launch path
 /// hands the threads a fact rather than a promise.
@@ -151,7 +161,7 @@ pub(super) fn build(
             Err(RuntimeFailure::Tls(TlsError::NotTcp))
         }
         Some(files) => load_tls_acceptor(files)
-            .map(|acceptor| Some(ServerTls(acceptor)))
+            .map(Some)
             .map_err(RuntimeFailure::Tls),
     }
 }
@@ -192,11 +202,21 @@ fn pem_error(path: &std::path::Path, error: rustls::pki_types::pem::Error) -> Tl
 /// `default-https-client` uses it — and it is handed to the builder explicitly rather than
 /// installed as a process default.
 #[cfg(feature = "server-tls")]
-fn load_tls_acceptor(files: &TlsFiles) -> Result<http_kit_tls::TlsAcceptor, TlsError> {
+fn load_tls_acceptor(files: &TlsFiles) -> Result<ServerTls, TlsError> {
     use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
 
-    let certs = CertificateDer::pem_file_iter(&files.cert)
-        .map_err(|error| pem_error(&files.cert, error))?
+    // Each file is read exactly once: rustls parses these bytes, and with HTTP/3 the same bytes
+    // are what QUIC's TLS presents, so the two listeners cannot end up with different identities.
+    let read = |path: &std::path::Path| {
+        std::fs::read(path).map_err(|error| TlsError::Io {
+            path: path.to_owned(),
+            error,
+        })
+    };
+    let cert_pem = read(&files.cert)?;
+    let key_pem = read(&files.key)?;
+
+    let certs = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| pem_error(&files.cert, error))?;
     if certs.is_empty() {
@@ -205,7 +225,7 @@ fn load_tls_acceptor(files: &TlsFiles) -> Result<http_kit_tls::TlsAcceptor, TlsE
         });
     }
 
-    let key = match PrivateKeyDer::from_pem_file(&files.key) {
+    let key = match PrivateKeyDer::from_pem_slice(&key_pem) {
         Ok(key) => key,
         Err(rustls::pki_types::pem::Error::NoItemsFound) => {
             return Err(TlsError::NoPrivateKey {
@@ -228,7 +248,29 @@ fn load_tls_acceptor(files: &TlsFiles) -> Result<http_kit_tls::TlsAcceptor, TlsE
     #[cfg(target_os = "linux")]
     let acceptor =
         acceptor.with_kernel_tls(http_kit_tls::KernelTls::probe().map_err(TlsError::KernelProbe)?);
-    Ok(acceptor)
+    Ok(ServerTls {
+        acceptor,
+        #[cfg(feature = "http3")]
+        identity: http_kit_h3::Identity::from_pem(cert_pem, key_pem),
+    })
+}
+
+/// What serves the decrypted connections.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(feature = "server-tls"),
+    expect(
+        dead_code,
+        reason = "only a TLS build reads what serves the connections"
+    )
+)]
+pub(super) struct Protocols {
+    /// The server that answers HTTP/1.1.
+    pub(super) server: super::HttpServer,
+    /// `skyzen-h1`'s server, for [`HttpServer::H1`]; it carries the `Alt-Svc` value itself.
+    pub(super) h1: skyzen_h1::H1,
+    /// The HTTP/3 endpoint to advertise on every response, which `h1` already does for its own.
+    pub(super) alt_svc: Option<skyzen_hyper::AltSvc>,
 }
 
 /// Serve TLS connections from `listener` until `shutdown`, then wait for the open ones.
@@ -244,7 +286,7 @@ pub(super) async fn serve<L, E>(
     shutdown: impl Future<Output = ()> + 'static,
     tls: ServerTls,
     max_connections: NonZeroUsize,
-    http1: (HttpServer, H1),
+    protocols: Protocols,
 ) where
     L: Listener<Stream = <Compio as Io>::TcpStream, Addr = SocketAddr>,
     E: Endpoint + Clone + 'static,
@@ -287,7 +329,11 @@ pub(super) async fn serve<L, E>(
         let stopping = stopping.clone();
         let tls = tls.clone();
         let endpoint = endpoint.clone();
-        let h1 = http1.1.clone();
+        let Protocols {
+            server,
+            h1,
+            alt_svc,
+        } = protocols.clone();
         let connection_executor = Rc::clone(&executor);
         executor
             .spawn_local(
@@ -302,8 +348,14 @@ pub(super) async fn serve<L, E>(
                         // Resolves with an error once `stop` is dropped.
                         let _ = stopping.recv().await;
                     };
-                    let service = |endpoint: E| IntoService::new(endpoint).with_peer_addr(peer);
-                    match (accepted, http1.0) {
+                    let service = |endpoint: E| {
+                        let service = IntoService::new(endpoint).with_peer_addr(peer);
+                        match &alt_svc {
+                            Some(alt_svc) => service.with_alt_svc(alt_svc),
+                            None => service,
+                        }
+                    };
+                    match (accepted, server) {
                         (Accepted::Http1(stream), HttpServer::H1) => {
                             h1.serve_connection(Compio, stream, Some(peer), endpoint, stop, live)
                                 .await;
@@ -352,7 +404,7 @@ pub(super) async fn serve<L, E>(
     _shutdown: impl Future<Output = ()> + 'static,
     tls: ServerTls,
     _max_connections: NonZeroUsize,
-    _http1: (super::HttpServer, skyzen_h1::H1),
+    _protocols: Protocols,
 ) where
     L: Listener<Stream = <Compio as Io>::TcpStream, Addr = SocketAddr>,
     E: Endpoint + Clone + 'static,
@@ -406,7 +458,7 @@ where
     use skyzen_hyper::{sniff_protocol, Protocol};
     use tracing::debug;
 
-    let acceptor = tls.0.clone().with_handshake_timeout(Some(handshake));
+    let acceptor = tls.acceptor.clone().with_handshake_timeout(Some(handshake));
     let stream = match acceptor.accept(stream, &Compio).await {
         Ok(stream) => stream,
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
@@ -463,7 +515,8 @@ mod tests {
     use skyzen_hyper::HTTP2_PREFACE;
 
     use super::{
-        load_tls_acceptor, negotiate, serve, Accepted, ServerTls, TlsError, HANDSHAKE_TIMEOUT,
+        load_tls_acceptor, negotiate, serve, Accepted, Protocols, ServerTls, TlsError,
+        HANDSHAKE_TIMEOUT,
     };
     use crate::{
         runtime::native::{HttpServer, TlsFiles},
@@ -519,7 +572,7 @@ mod tests {
 
     fn acceptor() -> (tempfile::TempDir, ServerTls, Vec<u8>) {
         let (dir, files, der) = tls_material();
-        let tls = ServerTls(load_tls_acceptor(&files).expect("the generated pair loads"));
+        let tls = load_tls_acceptor(&files).expect("the generated pair loads");
         (dir, tls, der)
     }
 
@@ -695,7 +748,11 @@ mod tests {
                 },
                 tls,
                 8.try_into().unwrap(),
-                (server, H1::default()),
+                Protocols {
+                    server,
+                    h1: H1::default(),
+                    alt_svc: None,
+                },
             ),
         );
         (addr, stop, task)
@@ -844,7 +901,8 @@ mod tests {
                 write_all(&mut stream, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()).await;
                 stream
             };
-            let (refused, _stream) = futures_util::future::join(serve, client).await;
+            // Boxed: on Linux the stream carries kernel TLS state, which makes the join large.
+            let (refused, _stream) = Box::pin(futures_util::future::join(serve, client)).await;
             assert!(refused, "a plaintext client must not complete a handshake");
         });
     }
