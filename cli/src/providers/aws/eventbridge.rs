@@ -441,10 +441,17 @@ impl Task for MigrateSchedulesToAlias {
             // Reconcile verified the state it found — stamp it so the next deploy reads
             // the record rather than re-enumerating. An unverified alias state stays
             // unstamped, and a stamp these credentials cannot write or read only fails
-            // the deploy when rule discovery cannot cover the next run either.
-            if verified && !self.inner.stamp_tag(&lambda, &arn).await {
+            // the deploy when rule discovery cannot cover the next run either. A fresh
+            // function skipped the pre-creation scan, so it enumerates now that it
+            // exists — the flag it inherited is meaningless.
+            if verified {
+                let scan_ok = if fresh {
+                    self.inner.managed_rule_names(&events).await.is_ok()
+                } else {
+                    rule_scan_ok
+                };
                 anyhow::ensure!(
-                    rule_scan_ok,
+                    self.inner.stamp_tag(&lambda, &arn).await || scan_ok,
                     "reconciled Lambda function `{}` but could not persist a readable \
                      `skyzen-schedules` tag, and `events:ListRules` is unavailable — \
                      the next deploy could not verify ownership",
@@ -1879,7 +1886,7 @@ impl EventBridgeSchedules {
             ));
             return false;
         }
-        matches!(self.schedule_tag(lambda, arn).await, Ok(Some(_)))
+        matches!(self.schedule_tag(lambda, arn).await, Ok(Some(tag)) if tag == state)
     }
 
     /// Whether an `alias_snapshot` failure was an IAM denial — `GetAlias` has no
