@@ -161,11 +161,15 @@ impl DynamoKv {
     /// Whether the table's TTL feature is enabled on [`Self::ttl_attribute`], probed once
     /// with `DescribeTimeToLive` and cached for the lifetime of the client.
     ///
-    /// DynamoDB only sweeps an expired item when the feature is on for the attribute the
+    /// `DynamoDB` only sweeps an expired item when the feature is on for the attribute the
     /// item writes — a disabled or mismatched table would retain every record forever, so
     /// TTL-dependent calls check this rather than trusting the write.
     async fn ttl_enabled(&self) -> Result<bool, KvError> {
-        if let Some(enabled) = *self.ttl_enabled.lock().unwrap_or_else(|e| e.into_inner()) {
+        let cached = *self
+            .ttl_enabled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(enabled) = cached {
             return Ok(enabled);
         }
         let description = self
@@ -179,7 +183,10 @@ impl DynamoKv {
             ttl.time_to_live_status() == Some(&aws_sdk_dynamodb::types::TimeToLiveStatus::Enabled)
                 && ttl.attribute_name() == Some(self.ttl_attribute.as_str())
         });
-        *self.ttl_enabled.lock().unwrap_or_else(|e| e.into_inner()) = Some(enabled);
+        *self
+            .ttl_enabled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(enabled);
         Ok(enabled)
     }
 
