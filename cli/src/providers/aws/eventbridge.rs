@@ -637,16 +637,13 @@ impl Task for EventBridgeSchedules {
             };
             let mut snapshot = Vec::new();
             let mut alias = None;
-            // Denied discovery may be tolerated only when the manifest declares no
-            // schedules AND nothing shows prior wiring — no alias, no managed grant —
-            // "cannot read" is not "there are none".
+            // Denied discovery may be tolerated only when the prefix scan verifies no
+            // managed rule exists — "cannot read" is not "there are none".
             let tolerant = self.schedules.is_empty()
-                && self.alias_snapshot(&lambda).await.ok().flatten().is_none()
                 && self
-                    .managed_names(&lambda, &format!("{}:{ALIAS}", self.function))
+                    .managed_rule_names(&events)
                     .await
-                    .ok()
-                    .is_none_or(|(names, grant)| names.is_empty() && !grant);
+                    .is_ok_and(|rules| rules.is_empty());
             let result = self
                 .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
                 .await;
@@ -701,8 +698,11 @@ impl EventBridgeSchedules {
             // fail-closed for whatever discovery missed: a surviving rule targets
             // `function:skyzen`, which no longer resolves. A deploy that never had
             // the alias skips the call entirely — `lambda:DeleteAlias` is not a
-            // permission an HTTP-only app should need.
-            if self.alias_snapshot(lambda).await.ok().flatten().is_none() {
+            // permission an HTTP-only app should need. Only a confirmed NotFound may
+            // skip it: a denied or failed lookup is "unknown", and claiming cleanup
+            // completed over an alias that may still serve a frozen version would
+            // let every later secret rotation fail.
+            if self.alias_snapshot(lambda).await?.is_none() {
                 return Ok(());
             }
             match lambda
@@ -1233,22 +1233,21 @@ impl EventBridgeSchedules {
             }
             Err(error) => return Err(error),
         }
-        // Scheduling history shows without `ListRules` too: the alias this module made —
-        // read through `function:skyzen`, which needs only the `GetFunctionConfiguration`
-        // the deploy already holds — or a grant still named on a policy. When either is
-        // present, an incomplete scan can hide a live legacy rule that would fire the
-        // code about to upload — refuse before `$LATEST` moves, rather than discover the
-        // gap after. No evidence at all is the genuinely HTTP-only case and proceeds.
-        let has_history = grant_found
-            || rules_found
-            || self.alias_snapshot(lambda).await.ok().flatten().is_some();
+        // `ListRules` is the only read that can actually enumerate a legacy rule: the
+        // alias it lacks and the grant it might have lost are both invisible when the
+        // scan is denied, so "no evidence" is "unknown", never "absent" — refuse to
+        // move `$LATEST` on unverified ownership.
         anyhow::ensure!(
-            rule_scan_ok || !has_history,
-            "Lambda function `{}` shows prior `[[schedule]]` wiring but `events:ListRules` \
-             is denied, so an enabled legacy rule could still exist — grant the permission \
-             or remove the rule before deploying",
+            rule_scan_ok,
+            "could not enumerate Lambda function `{}`'s EventBridge rules — an enabled \
+             legacy rule invisible to the denied listing would fire the new code, so \
+             grant `events:ListRules` or remove the rules first",
             self.function
         );
+        // Scheduling history is an existing alias, a managed grant, or a discovered
+        // rule — with the scan verified above, all three are confirmed facts now.
+        let has_history =
+            grant_found || rules_found || self.alias_snapshot(lambda).await?.is_some();
 
         // Only rules still carrying an unqualified target need moving — when none do, the
         // alias stays exactly where it is. Repointing it anyway would resurrect the version
