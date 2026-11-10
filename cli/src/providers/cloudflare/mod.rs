@@ -134,6 +134,7 @@ pub fn prepare(
     generated_files.extend(planned.generated_files);
 
     Ok(ProviderPlan {
+        prepare: Vec::new(),
         steps: planned.steps,
         generated_files,
         build: boxed_build,
