@@ -169,7 +169,7 @@ pub(super) fn build(
 /// Without `server-tls` a configured pair refuses the start and names the feature to add; the
 /// alternative is cleartext under settings that promised TLS.
 #[cfg(not(feature = "server-tls"))]
-pub(super) fn build(
+pub(super) const fn build(
     files: Option<&TlsFiles>,
     _addr: &ListenAddr,
 ) -> Result<Option<ServerTls>, RuntimeFailure> {
@@ -397,6 +397,10 @@ pub(super) async fn serve<L, E>(
 
 /// Without `server-tls` there is no [`ServerTls`] to hold, so this cannot be called.
 #[cfg(not(feature = "server-tls"))]
+#[expect(
+    clippy::unused_async,
+    reason = "the call exists without the feature too, where no value reaches it"
+)]
 pub(super) async fn serve<L, E>(
     _executor: Rc<Runtime>,
     _listener: L,

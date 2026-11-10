@@ -310,6 +310,7 @@ impl Http3Server {
 impl Http3Server {
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "the call exists without the feature too, where no value reaches it"
     )]
     pub(super) async fn serve<E>(self, _endpoint: E, _shutdown: impl Future<Output = ()>)

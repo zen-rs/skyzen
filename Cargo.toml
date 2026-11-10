@@ -383,5 +383,10 @@ required-features = ["sqlite"]
 name = "hyper_websocket"
 required-features = ["sqlite"]
 
+# Serves one router through both servers, Hyper's among them.
+[[test]]
+name = "server"
+required-features = ["hyper"]
+
 [lints]
 workspace = true
