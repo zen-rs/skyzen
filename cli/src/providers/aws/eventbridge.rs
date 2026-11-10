@@ -54,6 +54,9 @@ struct Discovery {
     /// Whether the function shows any prior skyzen schedule wiring — an existing
     /// alias, a managed grant, or a discovered rule.
     has_history: bool,
+    /// The function did not exist before this deploy — no alias can exist on it
+    /// either, so a denied `GetAlias` needs no further evidence.
+    fresh: bool,
 }
 
 /// What a rule looked like before this deploy touched it: enough to put it back.
@@ -299,6 +302,7 @@ impl Task for MigrateSchedulesToAlias {
             let Discovery {
                 migrated,
                 has_history,
+                fresh,
                 ..
             } = self.inner.migrate_to_alias(&events, &lambda).await?;
             // The whole transaction lives here — migrate, upload, reconcile: a failure at
@@ -392,7 +396,7 @@ impl Task for MigrateSchedulesToAlias {
             };
             let verified = match self
                 .inner
-                .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
+                .reconcile(&ctx, &mut snapshot, &mut alias, tolerant, fresh)
                 .await
             {
                 Ok(verified) => verified,
@@ -745,7 +749,7 @@ impl Task for EventBridgeSchedules {
                 self.clear_tag(&lambda, ctx.arn).await?;
             }
             let verified = match self
-                .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
+                .reconcile(&ctx, &mut snapshot, &mut alias, tolerant, false)
                 .await
             {
                 Ok(verified) => verified,
@@ -782,6 +786,7 @@ impl EventBridgeSchedules {
         snapshot: &mut Vec<RuleSnapshot>,
         alias: &mut Option<String>,
         tolerant: bool,
+        fresh: bool,
     ) -> Result<bool> {
         let (events, lambda) = (ctx.events, ctx.lambda);
         if !self.delivery.is_empty() {
@@ -819,12 +824,16 @@ impl EventBridgeSchedules {
                 Ok(None) => return Ok(true),
                 Ok(Some(_)) => {}
                 // Verified-no-rules tolerates a permanently denied read — never a
-                // transient one. The deploy may proceed, but `false` tells the caller
-                // the alias state was never confirmed: stamping `none` over a lookup
-                // that could not see the alias records an absence nobody verified.
+                // transient one. The deploy may proceed either way; what the result
+                // reports is whether the alias state was ever confirmed: an existing
+                // function denies `GetAlias` unverified, a fresh one is confirmed
+                // absent by its own nonexistence.
                 Err(error) if tolerant && Self::alias_read_denied(&error) => {
                     output::warn(format!("could not check the `{ALIAS}` alias: {error:#}"));
-                    return Ok(false);
+                    // A function that did not exist before this deploy cannot carry an
+                    // alias either — `fresh` is the confirmed absence, so the denied
+                    // read leaves the outcome verified rather than unverified.
+                    return Ok(fresh);
                 }
                 Err(error) => return Err(error),
             }
@@ -1314,13 +1323,18 @@ impl EventBridgeSchedules {
                 .function_arn()
                 .with_context(|| format!("`{}` reported no ARN", self.function))?
                 .to_owned(),
-            // A first deployment has no function and no rules to move — nothing to migrate.
+            // A first deployment has no function and no rules to move — and no alias
+            // can exist on a function that did not, so `fresh` settles the alias
+            // question without a `GetAlias` read.
             Err(error)
                 if error.as_service_error().is_some_and(
                     aws_sdk_lambda::operation::get_function_configuration::GetFunctionConfigurationError::is_resource_not_found_exception,
                 ) =>
             {
-                return Ok(Discovery::default())
+                return Ok(Discovery {
+                    fresh: true,
+                    ..Discovery::default()
+                })
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -1526,6 +1540,7 @@ impl EventBridgeSchedules {
         Ok(Discovery {
             migrated,
             has_history,
+            fresh: false,
         })
     }
 
