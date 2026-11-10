@@ -325,8 +325,6 @@ impl EventBridgeSchedules {
             let mut taken = self
                 .rule_snapshot(events, &self.rule_name(entry.name.as_str()))
                 .await?;
-            taken.statement = Some(format!("skyzen-schedule-{}", entry.name));
-            taken.owner = Some(qualified.clone());
             snapshot.push(taken);
             // `wire_one` can fail partway — the snapshot must already be on the stack, or
             // the half-wired rule survives the rollback it should have been part of.
@@ -482,28 +480,37 @@ impl EventBridgeSchedules {
             .with_context(|| format!("failed to restore rule `{}`", snapshot.name))?;
         // `PutTargets` merges — a target id the wiring introduced outlives the restore.
         // Strip whatever the snapshot does not carry before putting its targets back.
-        if let Ok(listed) = events
+        let listed = events
             .list_targets_by_rule()
             .rule(&snapshot.name)
             .send()
             .await
-        {
-            let kept: std::collections::BTreeSet<&str> =
-                snapshot.targets.iter().map(|target| target.id()).collect();
-            let surplus: Vec<String> = listed
-                .targets()
-                .iter()
-                .filter(|target| !kept.contains(target.id()))
-                .map(|target| target.id().to_owned())
-                .collect();
-            if !surplus.is_empty() {
-                let _ = events
-                    .remove_targets()
-                    .rule(&snapshot.name)
-                    .set_ids(Some(surplus))
-                    .send()
-                    .await;
-            }
+            .with_context(|| format!("failed to list targets of `{}`", snapshot.name))?;
+        let kept: std::collections::BTreeSet<&str> =
+            snapshot.targets.iter().map(|target| target.id()).collect();
+        let surplus: Vec<String> = listed
+            .targets()
+            .iter()
+            .filter(|target| !kept.contains(target.id()))
+            .map(|target| target.id().to_owned())
+            .collect();
+        if !surplus.is_empty() {
+            let removed = events
+                .remove_targets()
+                .rule(&snapshot.name)
+                .set_ids(Some(surplus))
+                .send()
+                .await
+                .with_context(|| format!("failed to strip targets of `{}`", snapshot.name))?;
+            anyhow::ensure!(
+                removed.failed_entries().is_empty(),
+                "EventBridge refused to strip a target of `{}`: {:?}",
+                snapshot.name,
+                removed
+                    .failed_entries()
+                    .first()
+                    .map(aws_sdk_eventbridge::types::RemoveTargetsResultEntry::error_message)
+            );
         }
         if !snapshot.targets.is_empty() {
             let put = events
@@ -522,33 +529,39 @@ impl EventBridgeSchedules {
                     .map(aws_sdk_eventbridge::types::PutTargetsResultEntry::error_message)
             );
         }
-        if let Some(statement) = &snapshot.statement {
-            // A grant the deploy added goes back away; one retirement removed comes back —
-            // on the resource it originally lived on, not wherever the wiring landed it.
-            if snapshot.granted {
-                let _ = lambda
-                    .remove_permission()
-                    .function_name(qualified)
-                    .statement_id(statement)
-                    .send()
-                    .await;
-            } else {
-                lambda
-                    .add_permission()
-                    .function_name(snapshot.owner.as_deref().unwrap_or(qualified))
-                    .action(INVOKE_ACTION)
-                    .principal(EVENTS_PRINCIPAL)
-                    .source_arn(rule_arn)
-                    .statement_id(statement)
-                    .send()
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to restore the invoke permission of `{}`",
-                            snapshot.name
-                        )
-                    })?;
-            }
+        // `granted` alone means the deploy added the grant — remove what it added. The
+        // `statement`/`owner` pair means retirement removed a grant that existed before —
+        // re-add it on the resource it lived on, nowhere else. A grant that was already
+        // there and never removed needs nothing.
+        if snapshot.granted {
+            // `name` is the rule `skyzen-{function}--{schedule}` — the grant it added is
+            // `skyzen-schedule-{schedule}` on the alias.
+            let schedule = snapshot
+                .name
+                .strip_prefix(&format!("skyzen-{}--", self.function))
+                .unwrap_or(&snapshot.name);
+            let _ = lambda
+                .remove_permission()
+                .function_name(qualified)
+                .statement_id(format!("skyzen-schedule-{schedule}"))
+                .send()
+                .await;
+        } else if let Some(statement) = &snapshot.statement {
+            lambda
+                .add_permission()
+                .function_name(snapshot.owner.as_deref().unwrap_or(qualified))
+                .action(INVOKE_ACTION)
+                .principal(EVENTS_PRINCIPAL)
+                .source_arn(rule_arn)
+                .statement_id(statement)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to restore the invoke permission of `{}`",
+                        snapshot.name
+                    )
+                })?;
         }
         Ok(())
     }
