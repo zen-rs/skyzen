@@ -498,6 +498,18 @@ impl Task for CutoverAlias {
                     return Ok(());
                 }
             }
+            // An untagged HTTP-only function can still prove clean: the prefix scan is
+            // authoritative and needs no alias permission — verified no rules means no
+            // alias to cut over.
+            let events = aws_sdk_eventbridge::Client::new(&shared);
+            if self
+                .inner
+                .managed_rule_names(&events)
+                .await
+                .is_ok_and(|rules| rules.is_empty())
+            {
+                return Ok(());
+            }
             // An app that never scheduled has no alias — and no call for the permissions a
             // repoint would take. Only a confirmed absence skips the cutover: the delivery
             // just happened, and every other answer leaves the schedules holding old values
@@ -720,6 +732,11 @@ impl Task for EventBridgeSchedules {
                         .managed_rule_names(&events)
                         .await
                         .is_ok_and(|rules| rules.is_empty()));
+            // Invalidate any ownership record before a rule is enabled — same guard as
+            // the deploy path.
+            if !self.schedules.is_empty() {
+                self.clear_tag(&lambda, ctx.arn).await?;
+            }
             let result = self
                 .reconcile(&ctx, &mut snapshot, &mut alias, tolerant)
                 .await;
@@ -813,10 +830,6 @@ impl EventBridgeSchedules {
             return Ok(());
         }
 
-        // Invalidate any ownership record before the first rule is enabled: a stale
-        // `none` surviving a schedule activation would tell a later `secret push` to
-        // skip the alias. Only a verifiably absent tag may skip the untag.
-        self.clear_tag(lambda, ctx.arn).await?;
         let version = self.publish_or_reuse(lambda).await?;
         // The alias must exist before any `add_permission` can name it — on a first deploy
         // it does not — but it repoints only after the rules are reconciled. Create it at
@@ -1332,11 +1345,14 @@ impl EventBridgeSchedules {
             .flatten()
             .is_some_and(|tag| tag == "none");
         // The `none` tag confirms only what no evidence contradicts — it also settles
-        // the alias question (`none` was stamped after the alias was deleted), so a
-        // verified-clean function never asks for `lambda:GetAlias`.
+        // the alias question (`none` was stamped after the alias was deleted). An
+        // untagged function can prove the same thing when the scan itself verifies
+        // no managed rule and no grant survived — only then does a `GetAlias` read
+        // still count as evidence.
+        let alias_check_needed = !marked_none && (!rule_scan_ok || rules_found || grant_found);
         let has_history = grant_found
             || rules_found
-            || (!marked_none && self.alias_snapshot(lambda).await?.is_some());
+            || (alias_check_needed && self.alias_snapshot(lambda).await?.is_some());
         anyhow::ensure!(
             rule_scan_ok || (marked_none && !has_history),
             "could not enumerate Lambda function `{}`'s EventBridge rules — an enabled \
@@ -1344,6 +1360,12 @@ impl EventBridgeSchedules {
              grant `events:ListRules` or remove the rules first",
             self.function
         );
+        // Invalidate any ownership record before the upload: a stale `none` surviving a
+        // schedule activation would tell a later `secret push` to skip the alias, and a
+        // failed invalidation here aborts before `$LATEST` moves.
+        if !self.schedules.is_empty() {
+            self.clear_tag(lambda, &arn).await?;
+        }
         // Scheduling history is an existing alias, a managed grant, or a discovered
         // rule — verified above, when the scan ran.
 
@@ -1722,13 +1744,18 @@ impl EventBridgeSchedules {
 
     /// Remove any ownership record before rules get enabled: a stale `none` that
     /// outlives this point would authorize skipping the alias on the next secret
-    /// rotation. Tolerated only when the tag is verifiably absent already.
+    /// rotation. A verified `yes` or a confirmed absence needs nothing; anything
+    /// else — including an unreadable record — is invalidated outright, and a denied
+    /// untag is tolerated only when the re-read confirms the tag is actually gone.
     async fn clear_tag(&self, lambda: &aws_sdk_lambda::Client, arn: &str) -> Result<()> {
         // A verified `yes` is already the right record and a confirmed absence needs
         // nothing — only `Ok(None)` proves absent, so a failed read stays an error,
         // and only a stale `none` ever reaches `UntagResource`.
-        match self.schedule_tag(lambda, arn).await?.as_deref() {
-            Some("yes") | None => return Ok(()),
+        match self.schedule_tag(lambda, arn).await {
+            // A verified `yes` is already the right record and a confirmed absence
+            // needs nothing — only `Ok` proves the state, so a failed read falls
+            // through to invalidation rather than count as evidence either way.
+            Ok(tag) if tag.as_deref() != Some("none") => return Ok(()),
             _ => {}
         }
         if let Err(error) = lambda
