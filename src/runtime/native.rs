@@ -24,8 +24,10 @@ use tracing_subscriber::EnvFilter;
 
 mod cores;
 mod handoff;
+mod http3;
 mod tls;
 
+use http3::{Http3, Http3Error};
 use tls::{ServerTls, TlsError};
 
 /// Initialize the tracing subscriber + color-eyre once per process.
@@ -461,6 +463,38 @@ pub fn apply_server_override(args: impl IntoIterator<Item = String>) -> HttpServ
     server
 }
 
+/// Whether `--http3` or `SKYZEN_HTTP3` asks for HTTP/3, which the server then refuses to start
+/// without.
+///
+/// The flag stands alone; the variable is `true`/`1` or `false`/`0`, and the flag wins.
+///
+/// # Panics
+///
+/// A variable that is neither kills the process at startup, like every other malformed setting.
+#[must_use]
+pub fn apply_http3_override(args: impl IntoIterator<Item = String>) -> bool {
+    const ENV: &str = "SKYZEN_HTTP3";
+
+    if args.into_iter().skip(1).any(|arg| arg == "--http3") {
+        info!("HTTP/3 requested by --http3");
+        return true;
+    }
+    let Some(value) = std::env::var_os(ENV) else {
+        return false;
+    };
+    match value.to_str() {
+        Some("true" | "1") => {
+            info!("HTTP/3 requested by {ENV}");
+            true
+        }
+        Some("false" | "0") => false,
+        _ => panic!(
+            "{ENV} must be `true`, `1`, `false` or `0`, not {}",
+            value.to_string_lossy()
+        ),
+    }
+}
+
 fn shutdown_signal() -> Receiver<()> {
     let (tx, rx) = bounded(1);
     if let Err(error) = ctrlc::set_handler(move || {
@@ -499,6 +533,8 @@ enum RuntimeFailure {
     ThreadExited,
     /// TLS was configured but cannot be provided on this listener or this build.
     Tls(TlsError),
+    /// HTTP/3 was requested and cannot be served, or its endpoint cannot start.
+    Http3(Http3Error),
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -517,6 +553,7 @@ impl std::fmt::Display for RuntimeFailure {
             Self::Mount(error) => write!(f, "{error}"),
             Self::ThreadExited => write!(f, "a serving thread exited before it was accepting"),
             Self::Tls(error) => write!(f, "{error}"),
+            Self::Http3(error) => write!(f, "{error}"),
         }
     }
 }
@@ -527,6 +564,7 @@ impl std::error::Error for RuntimeFailure {
             Self::Listener(error) => Some(error),
             Self::Mount(error) => Some(error),
             Self::Tls(error) => Some(error),
+            Self::Http3(error) => Some(error),
             Self::QueueConsumer(_) | Self::ThreadExited => None,
         }
     }
@@ -544,6 +582,12 @@ pub struct LaunchOptions {
     /// `--tls-cert`/`--tls-key` or `SKYZEN_TLS_CERT`/`SKYZEN_TLS_KEY`.
     /// `None` serves cleartext, as the runtime always has.
     pub tls: Option<TlsFiles>,
+    /// Whether `--http3` or `SKYZEN_HTTP3` insisted on HTTP/3.
+    ///
+    /// HTTP/3 is served on UDP beside the TLS listener whenever TLS is configured and the `http3`
+    /// feature is compiled in; asking for it makes every case where that cannot happen a refusal
+    /// to start instead of a TLS-only server.
+    pub http3: bool,
     /// The server that answers cleartext connections, from `--server` or `SKYZEN_SERVER`.
     pub server: HttpServer,
     /// The `[[azure.queue_triggers]]` entries this application declares.
@@ -780,6 +824,12 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
         std::process::exit(1);
     }
 
+    // The same holds for HTTP/3: a serverless host owns the UDP side, if it has one.
+    if options.http3 && !matches!(platform, Platform::Server) {
+        error!("Skyzen cannot start: {}", http3::not_a_server());
+        std::process::exit(1);
+    }
+
     if platform == Platform::Lambda {
         // Lambda's runtime is Tokio's and the adapter owns it, so this path never touches the
         // executor, the listener or the shutdown drain below.
@@ -809,8 +859,14 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
                     .listen
                     .as_ref()
                     .map_or_else(server_addr, |listen| listen.addr.clone());
-                match tls::build(options.tls.as_ref(), &addr) {
-                    Ok(tls) => serve_cores(factory, Ok, consumers, addr, options.server, tls).await,
+                let secured = tls::build(options.tls.as_ref(), &addr).and_then(|tls| {
+                    let http3 = http3::build(options.http3, tls.as_ref(), &addr)?;
+                    Ok((tls, http3))
+                });
+                match secured {
+                    Ok((tls, http3)) => {
+                        serve_cores(factory, Ok, consumers, addr, options.server, tls, http3).await
+                    }
                     Err(error) => Err(error),
                 }
             }
@@ -914,6 +970,7 @@ async fn serve_cores<F, A, W, C>(
     addr: ListenAddr,
     server: HttpServer,
     tls: Option<ServerTls>,
+    http3: Option<Http3>,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     F: EndpointFactory,
@@ -922,8 +979,23 @@ where
     C: ConsumerSet,
 {
     let threads = std::thread::available_parallelism()?;
-    let bound = cores::bind(&addr, threads)?;
+    let mut bound = cores::bind(&addr, threads)?;
+    // QUIC takes the port TLS has on TCP, so a client that follows `Alt-Svc` stays on the host
+    // and port it came to. Bound here, with the TCP sockets, so a port that cannot be had fails
+    // the start before any thread exists.
+    let http3_port = match (
+        &http3,
+        bound.sockets.first().and_then(cores::Socket::tcp_addr),
+    ) {
+        (Some(http3), Some(local)) => {
+            let local = local?;
+            bound.udp = http3.bind(local, threads)?;
+            Some(local.port())
+        }
+        _ => None,
+    };
     let scheme = if tls.is_some() { "https" } else { "http" };
+    let http3_note = http3_port.map_or_else(String::new, |port| format!(" (HTTP/3 on udp/{port})"));
     let listening = match bound.sockets.first().and_then(cores::Socket::tcp_addr) {
         Some(local) => format!("{scheme}://{}", local?),
         None => addr.to_string(),
@@ -944,6 +1016,10 @@ where
             .unwrap_or(NonZeroUsize::MIN),
         server,
         tls,
+        http3: http3.zip(http3_port).map(|(http3, port)| cores::Http3Plan {
+            http3,
+            alt_svc: skyzen_hyper::AltSvc::h3(port),
+        }),
     };
     let started = cores::start(plan, bound, &stopping, &drain)?;
 
@@ -963,7 +1039,10 @@ where
     }
 
     if failure.is_none() {
-        info!(threads = started.threads, "Skyzen listening on {listening}");
+        info!(
+            threads = started.threads,
+            "Skyzen listening on {listening}{http3_note}"
+        );
 
         let shutdown_rx = shutdown_signal();
         let shutdown = shutdown_rx.recv().fuse();
@@ -1183,7 +1262,8 @@ where
         addr,
         options.server,
         // `launch` refused a TLS pair before this path runs, since the Functions host speaks
-        // plaintext to its custom handler.
+        // plaintext to its custom handler, and refuses HTTP/3 the same way.
+        None,
         None,
     )
     .await
@@ -1806,5 +1886,40 @@ mod tests {
         std::env::remove_var("SKYZEN_TLS_CERT");
         let pair = pair.expect("a non-UTF-8 path is still a certificate setting");
         assert_eq!(pair.cert.as_os_str().as_bytes(), b"\xff\xfe.pem");
+    }
+
+    fn http3_requested(args: &[&str]) -> bool {
+        super::apply_http3_override(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    #[serial]
+    fn http3_is_not_requested_by_default() {
+        let _env = EnvGuard::clear_var("SKYZEN_HTTP3");
+        assert!(!http3_requested(&["app"]));
+    }
+
+    #[test]
+    #[serial]
+    fn http3_is_requested_by_the_flag_or_the_variable() {
+        let cleared = EnvGuard::clear_var("SKYZEN_HTTP3");
+        assert!(http3_requested(&["app", "--http3"]));
+        drop(cleared);
+        for value in ["true", "1"] {
+            let _env = EnvGuard::set_var("SKYZEN_HTTP3", value);
+            assert!(http3_requested(&["app"]), "{value}");
+        }
+        for value in ["false", "0"] {
+            let _env = EnvGuard::set_var("SKYZEN_HTTP3", value);
+            assert!(!http3_requested(&["app"]), "{value}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "SKYZEN_HTTP3 must be")]
+    fn a_malformed_http3_variable_stops_the_process() {
+        let _env = EnvGuard::set_var("SKYZEN_HTTP3", "maybe");
+        let _ = http3_requested(&["app"]);
     }
 }

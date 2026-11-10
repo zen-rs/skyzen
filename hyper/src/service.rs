@@ -92,7 +92,13 @@ impl AltSvc {
         self
     }
 
-    fn header_value(&self) -> header::HeaderValue {
+    /// The `Alt-Svc` header value this announces, for a server that attaches it by itself.
+    ///
+    /// # Panics
+    ///
+    /// Never: the value is visible ASCII by construction.
+    #[must_use]
+    pub fn header_value(&self) -> header::HeaderValue {
         header::HeaderValue::from_str(&format!(
             "h3=\":{}\"; ma={}",
             self.port,

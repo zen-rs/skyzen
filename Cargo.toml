@@ -192,6 +192,10 @@ rustls = { version = "0.23.46", default-features = false, features = ["std", "tl
 # one whose runtime this crate already links, though the proxy only ever starts pools on the
 # serving thread's own runtime.
 zenwave = { version = "0.9.1", default-features = false, features = ["native-compio"], optional = true }
+# HTTP/3 (`http3` feature): quiche over the same compio threads. quiche builds BoringSSL from
+# source, so only a build that asks for HTTP/3 pays for it; `fs` lets a file-region body (static
+# files) go out over a QUIC stream.
+http-kit-h3 = { version = "0.3.0", default-features = false, features = ["quiche", "fs"], optional = true }
 
 # Kernel TLS on Linux: after the handshake the kernel seals and opens the records, so file-region
 # bodies go out through sendfile/splice.
@@ -361,6 +365,10 @@ server-tls = ["dep:http-kit-tls", "dep:rustls"]
 # The reverse-proxy endpoint (`skyzen::proxy`, native only), forwarding through zenwave's native
 # backend.
 proxy = ["dep:zenwave"]
+# Serve HTTP/3 (QUIC, on quiche) on UDP beside the TLS listener, on its port and with its
+# certificate and key; the TLS responses advertise it with `Alt-Svc`. `--http3` or
+# `SKYZEN_HTTP3` additionally makes a start where it cannot be served an error.
+http3 = ["server-tls", "dep:http-kit-h3"]
 # The `lambda` feature lets `#[skyzen::main]` serve AWS Lambda invocations.
 # Nothing in an application changes: the runtime detects `AWS_LAMBDA_RUNTIME_API` and hands over
 # to the adapter instead of binding a listener. Without it, a binary that finds itself inside
@@ -390,6 +398,11 @@ required-features = ["sqlite"]
 [[test]]
 name = "proxy"
 required-features = ["proxy"]
+
+# Serves one router through both servers, Hyper's among them.
+[[test]]
+name = "server"
+required-features = ["hyper"]
 
 [lints]
 workspace = true

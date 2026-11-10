@@ -134,3 +134,32 @@ fn the_example_serves_a_unix_socket_with_hyper_too() {
     assert!(server.interrupt(), "SIGINT is a graceful shutdown");
     assert!(!path.exists(), "the socket file is removed on shutdown");
 }
+
+/// What the example printed and how it ended, for a start that is expected to fail.
+fn refused(args: &[&str]) -> (bool, String) {
+    let output = Command::new(example())
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the example");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), log)
+}
+
+/// `--http3` is a promise: a server that cannot keep it exits non-zero and names the reason,
+/// whichever it is (no `http3` feature in this build, no TLS, a unix socket).
+#[test]
+fn the_example_refuses_to_start_when_http3_is_requested_and_cannot_be_served() {
+    for args in [
+        &["--http3"][..],
+        &["--http3", "--listen", "unix:/tmp/skyzen-http3-refused.sock"][..],
+    ] {
+        let (success, log) = refused(args);
+        assert!(!success, "{args:?} started: {log}");
+        assert!(log.contains("HTTP/3 is requested"), "{args:?}: {log}");
+    }
+}
