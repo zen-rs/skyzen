@@ -39,6 +39,17 @@ pub fn failed(message: impl Display) {
     println!("[fail] {message}");
 }
 
+/// Report a facility that is off or unsupported: a fact about the machine, not a failure.
+pub fn off(message: impl Display) {
+    println!("[off] {message}");
+}
+
+/// Report something that could not be determined, with the reason; never a guess.
+#[cfg(target_os = "linux")]
+pub fn unknown(message: impl Display) {
+    println!("[unknown] {message}");
+}
+
 /// Report something the user should know but that is not a failure.
 pub fn warn(message: impl Display) {
     eprintln!("{PREFIX} warning: {message}");

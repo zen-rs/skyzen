@@ -61,6 +61,8 @@ mod secret;
 pub use secret::Secret;
 #[cfg(feature = "openapi")]
 pub mod openapi;
+#[cfg(all(feature = "steering", target_os = "linux"))]
+pub mod steering;
 
 /// Asks a Skyzen binary to print its `OpenAPI` document to this path — or to standard output, when
 /// the value is `-` — and exit without serving anything.

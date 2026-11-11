@@ -69,7 +69,18 @@ wasm-bindgen-shared = "=0.2.120"
 wasm-opt = "0.116"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process"] }
+
+# `skyzen doctor`'s report of the Linux acceleration facilities (`src/host/linux.rs`).
+[target.'cfg(target_os = "linux")'.dependencies]
+# NIC features (`tls-hw-*-offload`) and ring parameters (`tcp-data-split`) over ethtool's generic
+# netlink family, on the CLI's tokio runtime; `futures-util` reads its reply streams.
+ethtool = { version = "0.4.0", default-features = false, features = ["tokio_socket"] }
+futures-util = { version = "0.3.31", default-features = false }
+# Probing whether an io_uring accepts a NAPI registration, by making one.
+io-uring = { version = "0.7.16", default-features = false }
+# The steering decision, read exactly as the runtime reads it.
+skyzen-core = { workspace = true, features = ["steering"] }
 
 [dev-dependencies]
 tempfile = "3"
