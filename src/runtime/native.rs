@@ -25,9 +25,12 @@ use tracing_subscriber::EnvFilter;
 mod cores;
 mod handoff;
 mod http3;
+pub mod steering;
 mod tls;
 
 use http3::{Http3, Http3Error};
+use steering::SteeringError;
+pub use steering::{apply_steering_override, Steering};
 use tls::{ServerTls, TlsError};
 
 /// Initialize the tracing subscriber + color-eyre once per process.
@@ -535,6 +538,8 @@ enum RuntimeFailure {
     Tls(TlsError),
     /// HTTP/3 was requested and cannot be served, or its endpoint cannot start.
     Http3(Http3Error),
+    /// Connection steering was forced on and cannot be had, or a thread cannot be pinned.
+    Steering(SteeringError),
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -554,6 +559,7 @@ impl std::fmt::Display for RuntimeFailure {
             Self::ThreadExited => write!(f, "a serving thread exited before it was accepting"),
             Self::Tls(error) => write!(f, "{error}"),
             Self::Http3(error) => write!(f, "{error}"),
+            Self::Steering(error) => write!(f, "{error}"),
         }
     }
 }
@@ -565,6 +571,7 @@ impl std::error::Error for RuntimeFailure {
             Self::Mount(error) => Some(error),
             Self::Tls(error) => Some(error),
             Self::Http3(error) => Some(error),
+            Self::Steering(error) => Some(error),
             Self::QueueConsumer(_) | Self::ThreadExited => None,
         }
     }
@@ -588,6 +595,9 @@ pub struct LaunchOptions {
     /// feature is compiled in; asking for it makes every case where that cannot happen a refusal
     /// to start instead of a TLS-only server.
     pub http3: bool,
+    /// Whether connections are steered to the thread on the CPU that received them, from
+    /// `--steering` or `SKYZEN_STEERING`.
+    pub steering: Steering,
     /// The server that answers cleartext connections, from `--server` or `SKYZEN_SERVER`.
     pub server: HttpServer,
     /// The `[[azure.queue_triggers]]` entries this application declares.
@@ -883,6 +893,11 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
         std::process::exit(1);
     }
 
+    if options.steering == Steering::On && !matches!(platform, Platform::Server) {
+        error!("Skyzen cannot start: {}", SteeringError::NotServer);
+        std::process::exit(1);
+    }
+
     if platform == Platform::Lambda {
         // Lambda's runtime is Tokio's and the adapter owns it, so this path never touches the
         // executor, the listener or the shutdown drain below.
@@ -920,7 +935,19 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
                 });
                 match secured {
                     Ok((tls, http3)) => {
-                        serve_cores(factory, Ok, consumers, addr, options.server, tls, http3).await
+                        serve_cores(
+                            factory,
+                            Ok,
+                            consumers,
+                            addr,
+                            ListenerSetup {
+                                server: options.server,
+                                tls,
+                                http3,
+                                steering: options.steering,
+                            },
+                        )
+                        .await
                     }
                     Err(error) => Err(error),
                 }
@@ -1012,6 +1039,30 @@ impl ConsumerChannels {
     }
 }
 
+/// The first serving thread to fail instead of reporting that it is accepting.
+async fn first_failure(started: &cores::Cores) -> Option<RuntimeFailure> {
+    for _ in 0..started.threads {
+        match started.ready.recv().await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Some(error),
+            Err(_) => return Some(RuntimeFailure::ThreadExited),
+        }
+    }
+    None
+}
+
+/// How the listeners of [`serve_cores`] are served beyond the address they bind.
+struct ListenerSetup {
+    /// The server that answers cleartext connections.
+    server: HttpServer,
+    /// The acceptor, when the listener terminates TLS.
+    tls: Option<ServerTls>,
+    /// HTTP/3, when it is served beside the TLS listener.
+    http3: Option<Http3>,
+    /// Whether connections are steered to the CPU that received them.
+    steering: Steering,
+}
+
 /// Bind `addr`, start one serving thread per core, and run until `Ctrl+C`, a fatal consumer
 /// report, or the serving threads' own end.
 ///
@@ -1023,9 +1074,7 @@ async fn serve_cores<F, A, W, C>(
     wrap: W,
     consumers: C,
     addr: ListenAddr,
-    server: HttpServer,
-    tls: Option<ServerTls>,
-    http3: Option<Http3>,
+    setup: ListenerSetup,
 ) -> Result<Shutdown, RuntimeFailure>
 where
     F: EndpointFactory,
@@ -1033,8 +1082,16 @@ where
     W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
     C: ConsumerSet,
 {
+    let ListenerSetup {
+        server,
+        tls,
+        http3,
+        steering,
+    } = setup;
     let threads = std::thread::available_parallelism()?;
-    let mut bound = cores::bind(&addr, threads)?;
+    let pins =
+        steering::decide(steering, threads.get(), &addr).map_err(RuntimeFailure::Steering)?;
+    let mut bound = cores::bind(&addr, threads, pins)?;
     // QUIC takes the port TLS has on TCP, so a client that follows `Alt-Svc` stays on the host
     // and port it came to. Bound here, with the TCP sockets, so a port that cannot be had fails
     // the start before any thread exists.
@@ -1080,20 +1137,7 @@ where
     };
     let started = cores::start(plan, bound, &stopping, &drain, &released)?;
 
-    let mut failure = None;
-    for _ in 0..started.threads {
-        match started.ready.recv().await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                failure = Some(error);
-                break;
-            }
-            Err(_) => {
-                failure = Some(RuntimeFailure::ThreadExited);
-                break;
-            }
-        }
-    }
+    let mut failure = first_failure(&started).await;
 
     if failure.is_none() {
         info!(
@@ -1321,11 +1365,15 @@ where
         },
         (),
         addr,
-        options.server,
-        // `launch` refused a TLS pair before this path runs, since the Functions host speaks
-        // plaintext to its custom handler, and refuses HTTP/3 the same way.
-        None,
-        None,
+        ListenerSetup {
+            server: options.server,
+            // `launch` refused a TLS pair before this path runs, since the Functions host speaks
+            // plaintext to its custom handler, and refuses HTTP/3 the same way.
+            tls: None,
+            http3: None,
+            // The host owns the sockets, so nothing here is steered; `launch` refuses forcing it.
+            steering: Steering::Off,
+        },
     )
     .await
 }
@@ -1354,6 +1402,7 @@ mod tests {
         apply_cli_overrides, drain_connections, server_addr, ListenAddr, ListenAddrError,
         ListenOverride, Platform, StartupError, LAMBDA_RUNTIME_API_ENV,
     };
+    use super::{apply_steering_override, Steering};
     use crate::runtime::azure::CUSTOM_HANDLER_PORT_ENV;
     use serial_test::serial;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1982,5 +2031,35 @@ mod tests {
     fn a_malformed_http3_variable_stops_the_process() {
         let _env = EnvGuard::set_var("SKYZEN_HTTP3", "maybe");
         let _ = http3_requested(&["app"]);
+    }
+
+    fn steering_requested(args: &[&str]) -> Steering {
+        apply_steering_override(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    #[serial]
+    fn steering_is_auto_by_default_and_the_flag_beats_the_variable() {
+        let cleared = EnvGuard::clear_var("SKYZEN_STEERING");
+        assert_eq!(steering_requested(&["app"]), Steering::Auto);
+        assert_eq!(
+            steering_requested(&["app", "--steering", "on"]),
+            Steering::On
+        );
+        drop(cleared);
+        let _env = EnvGuard::set_var("SKYZEN_STEERING", "on");
+        assert_eq!(steering_requested(&["app"]), Steering::On);
+        assert_eq!(
+            steering_requested(&["app", "--steering=off"]),
+            Steering::Off
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "invalid SKYZEN_STEERING")]
+    fn a_malformed_steering_variable_stops_the_process() {
+        let _env = EnvGuard::set_var("SKYZEN_STEERING", "maybe");
+        let _ = steering_requested(&["app"]);
     }
 }

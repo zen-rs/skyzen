@@ -449,7 +449,12 @@ mod tests {
             let http3 = build(true, tls.as_ref(), &addr)
                 .expect("HTTP/3 is served")
                 .expect("with TLS, it is");
-            let mut bound = bind(&addr, threads).expect("bind TCP");
+            let mut bound = bind(
+                &addr,
+                threads,
+                crate::runtime::native::steering::Pins::default(),
+            )
+            .expect("bind TCP");
             let local = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
             bound.udp = http3
                 .bind(local, threads)
