@@ -749,9 +749,12 @@ impl std::error::Error for StartupError {}
 /// On a thread-per-core server, and under the Azure Functions host that is one, every thread runs
 /// a compio runtime, and each rebinds its clients to a connection pool of its own: a service
 /// request made on a serving thread is sent on a connection that thread's runtime drives. The
-/// coordinating thread does the same for the clients the queue consumers poll with. Under AWS
-/// Lambda the one thread runs the adapter's tokio runtime, so the clients keep the pools zenwave
-/// runs on its own driver thread.
+/// coordinating thread does the same for the clients the queue consumers poll with, and owns the
+/// pools the AWS credentials are fetched on: setup, which runs there, loads the one AWS
+/// configuration every AWS client is built from on [`driver`](Self::driver), so a credentials
+/// refresh a serving thread's call starts goes out on the coordinating thread's connections,
+/// which outlive the drain. Under AWS Lambda the one thread runs the adapter's tokio runtime, so
+/// the clients and the credentials keep the pools zenwave runs on its own driver thread.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct ServicePools {
@@ -759,8 +762,19 @@ pub struct ServicePools {
 }
 
 impl ServicePools {
-    /// `service` as the calling thread uses it: `rebind` hands it the thread's compio driver to
-    /// pool on where the platform's threads run compio; otherwise it is returned as built.
+    /// The calling thread's compio driver, to pool on, where the platform's threads run compio;
+    /// `None` where they do not, and a client keeps zenwave's own driver thread.
+    #[must_use]
+    pub const fn driver(self) -> Option<http_kit_io::compio::Compio> {
+        if self.per_thread {
+            Some(http_kit_io::compio::Compio)
+        } else {
+            None
+        }
+    }
+
+    /// `service` as the calling thread uses it: `rebind` hands it the thread's
+    /// [`driver`](Self::driver) to pool on where there is one; otherwise it is returned as built.
     ///
     /// # Panics
     ///
@@ -771,10 +785,9 @@ impl ServicePools {
         service: S,
         rebind: impl FnOnce(S, http_kit_io::compio::Compio) -> S,
     ) -> S {
-        if self.per_thread {
-            rebind(service, http_kit_io::compio::Compio)
-        } else {
-            service
+        match self.driver() {
+            Some(io) => rebind(service, io),
+            None => service,
         }
     }
 }

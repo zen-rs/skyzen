@@ -117,14 +117,24 @@ impl DynamoKv {
         }
     }
 
+    /// Create a new `DynamoKv` whose client is built from `config`, with a key attribute of
+    /// `"pk"`.
+    ///
+    /// Clients built from one configuration share its credentials provider and cache; see
+    /// [`crate::sdk::load_config`].
+    #[must_use]
+    pub fn from_config(config: &crate::sdk::SdkConfig, table_name: impl Into<String>) -> Self {
+        Self::new(Client::new(config), table_name, "pk")
+    }
+
     /// Create a new `DynamoKv` from environment configuration.
     ///
-    /// Loads the ambient AWS configuration through [`crate::sdk::load_config`] and uses a default
-    /// key attribute of `"pk"`.
+    /// Loads the ambient AWS configuration through [`crate::sdk::load_config`] on
+    /// [`ZenwaveHttpClient::system`](crate::sdk::ZenwaveHttpClient::system) and builds the store
+    /// with [`from_config`](Self::from_config).
     pub async fn from_env(table_name: impl Into<String>) -> Self {
-        let config = crate::sdk::load_config().await;
-        let client = Client::new(&config);
-        Self::new(client, table_name, "pk")
+        let config = crate::sdk::load_config(crate::sdk::ZenwaveHttpClient::system()).await;
+        Self::from_config(&config, table_name)
     }
 
     /// This store with its requests sent through `http`, its client otherwise configured as it

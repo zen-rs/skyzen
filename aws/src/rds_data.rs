@@ -301,9 +301,22 @@ impl RdsDataDb {
         database: impl Into<String>,
         engine: RdsEngine,
     ) -> Self {
-        let config = crate::sdk::load_config().await;
+        let config = crate::sdk::load_config(crate::sdk::ZenwaveHttpClient::system()).await;
+        Self::from_config(&config, resource_arn, secret_arn, database, engine)
+    }
+
+    /// [`from_parts`](Self::from_parts) with the client built from `config`, which clients built
+    /// from the same configuration share credentials with; see [`crate::sdk::load_config`].
+    #[must_use]
+    pub fn from_config(
+        config: &crate::sdk::SdkConfig,
+        resource_arn: impl Into<String>,
+        secret_arn: impl Into<String>,
+        database: impl Into<String>,
+        engine: RdsEngine,
+    ) -> Self {
         Self::new(
-            Client::new(&config),
+            Client::new(config),
             resource_arn,
             secret_arn,
             database,
@@ -322,12 +335,25 @@ impl RdsDataDb {
     /// [`DbError::Backend`] if any of the four variables is unset, or if `RDS_ENGINE` does not name
     /// an engine the Data API serves.
     pub async fn from_env() -> Result<Self, DbError> {
-        let resource_arn = required_env(RESOURCE_ARN_ENV, "an Aurora cluster ARN")?;
-        let secret_arn = required_env(SECRET_ARN_ENV, "a Secrets Manager secret ARN")?;
-        let database = required_env(DATABASE_ENV, "a database name")?;
-        let engine = required_env(ENGINE_ENV, "`aurora-postgresql` or `aurora-mysql`")?.parse()?;
-
+        let (resource_arn, secret_arn, database, engine) = env_coordinates()?;
         Ok(Self::from_parts(resource_arn, secret_arn, database, engine).await)
+    }
+
+    /// [`from_env`](Self::from_env) with the client built from `config`: the four variables are
+    /// read the same way, and the backend is built through [`from_config`](Self::from_config).
+    ///
+    /// # Errors
+    ///
+    /// As [`from_env`](Self::from_env).
+    pub fn from_config_and_env(config: &crate::sdk::SdkConfig) -> Result<Self, DbError> {
+        let (resource_arn, secret_arn, database, engine) = env_coordinates()?;
+        Ok(Self::from_config(
+            config,
+            resource_arn,
+            secret_arn,
+            database,
+            engine,
+        ))
     }
 
     /// This backend with its requests sent through `http`, its client otherwise configured as it
@@ -599,6 +625,17 @@ enum RowMode {
     Collect,
     /// Ask for neither, and report only how many rows the statement wrote.
     Discard,
+}
+
+/// The cluster ARN, secret ARN, database and engine, from the four variables
+/// [`RdsDataDb::from_env`] documents.
+fn env_coordinates() -> Result<(String, String, String, RdsEngine), DbError> {
+    Ok((
+        required_env(RESOURCE_ARN_ENV, "an Aurora cluster ARN")?,
+        required_env(SECRET_ARN_ENV, "a Secrets Manager secret ARN")?,
+        required_env(DATABASE_ENV, "a database name")?,
+        required_env(ENGINE_ENV, "`aurora-postgresql` or `aurora-mysql`")?.parse()?,
+    ))
 }
 
 /// Read a required environment variable, saying what it should hold when it is missing.

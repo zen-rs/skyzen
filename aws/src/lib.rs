@@ -44,6 +44,8 @@ pub mod rds_data;
 pub mod sdk;
 #[cfg(feature = "sqs")]
 pub mod sqs;
+#[cfg(all(test, any(unix, feature = "dynamodb")))]
+mod test_env;
 
 #[cfg(feature = "dynamodb")]
 pub use dynamodb::DynamoKv;

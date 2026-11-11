@@ -259,37 +259,7 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
-    use crate::sdk::load_config;
-
-    /// Sets process environment variables and restores them on drop.
-    struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-    impl Environment {
-        fn set(vars: &[(&'static str, Option<&Path>)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(name, _)| (*name, std::env::var_os(name)))
-                .collect();
-            for (name, value) in vars {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-            Self(saved)
-        }
-    }
-
-    impl Drop for Environment {
-        fn drop(&mut self) {
-            for (name, value) in self.0.drain(..) {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
+    use crate::{sdk::load_config, test_env::Environment};
 
     /// Config files in a temp directory, selected through the environment.
     struct Fixture {
@@ -365,7 +335,7 @@ mod tests {
     }
 
     async fn credentials() -> aws_credential_types::provider::Result {
-        load_config()
+        load_config(crate::sdk::ZenwaveHttpClient::system())
             .await
             .credentials_provider()
             .expect("the loaded config has a credentials provider")
