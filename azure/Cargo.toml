@@ -51,7 +51,7 @@ async-io = { workspace = true, optional = true }
 opendal = { version = "0.58", default-features = false, features = ["services-azblob"], optional = true }
 # zenwave's runtime-neutral native backend (`http`): HTTP/1.1 on a connection pool that lives on a
 # compio driver, behind a `Send` handle, with rustls verified against the OS trust store.
-zenwave = { version = "0.11.0", default-features = false, features = ["native-compio"], optional = true }
+zenwave = { version = "0.12.0", default-features = false, features = ["native-compio"], optional = true }
 # `AzureHttp::system_on_current_thread` starts its pool on the calling thread's compio runtime.
 compio = { version = "0.19.2", default-features = false, features = ["runtime"], optional = true }
 reqsign-azure-storage = { version = "3.1", optional = true }

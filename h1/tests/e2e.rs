@@ -6,7 +6,7 @@ use std::{cell::Cell, net::SocketAddr, rc::Rc};
 
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use http_kit::{error::BoxHttpError, header, http_error, Body, Request, Response, StatusCode};
-use http_kit_io::{async_io::AsyncIo, Io};
+use http_kit_io::{async_io::AsyncIo, FromStd as _};
 use skyzen_core::{
     upgrade::{OnUpgrade, UpgradeAvailable},
     Endpoint, PeerAddr, Server,
@@ -115,7 +115,7 @@ fn start_compio_server() -> SocketAddr {
         let runtime = Rc::new(executor_core::compio::Runtime::new().expect("compio runtime"));
         let serve_runtime = Rc::clone(&runtime);
         runtime.block_on(async move {
-            let io = http_kit_io::compio::Compio;
+            let io = http_kit_io::compio::Compio::default();
             let listener = io.tcp_listener(listener).expect("register listener");
             let endpoint = CountingEndpoint {
                 served: Rc::new(Cell::new(0)),

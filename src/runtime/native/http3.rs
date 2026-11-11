@@ -147,10 +147,7 @@ pub(super) struct Http3(std::convert::Infallible);
 #[cfg(feature = "http3")]
 #[derive(Debug)]
 pub(super) struct Http3Server(
-    http_kit_h3::Server<
-        <http_kit_io::compio::Compio as http_kit_io::Io>::UdpSocket,
-        http_kit_io::compio::Compio,
-    >,
+    http_kit_h3::Server<http_kit_io::compio::UdpSocket, http_kit_io::compio::Compio>,
 );
 
 /// Uninhabited without the `http3` feature, like [`Http3`].
@@ -226,12 +223,16 @@ impl Http3 {
     }
 
     /// The QUIC endpoint of the calling thread, over its `socket`. Runs inside the thread's
-    /// runtime, which the socket is registered with.
-    pub(super) fn server(&self, socket: std::net::UdpSocket) -> Result<Http3Server, Http3Error> {
-        use http_kit_io::{compio::Compio, Io as _};
+    /// runtime, which the socket is registered with through `io`, the thread's driver.
+    pub(super) fn server(
+        &self,
+        socket: std::net::UdpSocket,
+        io: &http_kit_io::compio::Compio,
+    ) -> Result<Http3Server, Http3Error> {
+        use http_kit_io::FromStd as _;
 
-        let socket = Compio.udp_socket(socket).map_err(Http3Error::Register)?;
-        http_kit_h3::Server::new(socket, Compio, &self.config)
+        let socket = io.udp_socket(socket).map_err(Http3Error::Register)?;
+        http_kit_h3::Server::new(socket, io.clone(), &self.config)
             .map(Http3Server)
             .map_err(Http3Error::Endpoint)
     }
@@ -250,6 +251,7 @@ impl Http3 {
     pub(super) const fn server(
         &self,
         _socket: std::net::UdpSocket,
+        _io: &http_kit_io::compio::Compio,
     ) -> Result<Http3Server, Http3Error> {
         match self.0 {}
     }
@@ -374,7 +376,7 @@ mod tests {
     use futures_lite::future::zip;
     use http_kit::{Body, Method, Request, StatusCode};
     use http_kit_h3::{Client, ClientConfig, Roots};
-    use http_kit_io::{compio::Compio, DatagramSocket as _, Io as _};
+    use http_kit_io::{compio::Compio, Datagram as _, DatagramSocket as _};
     use skyzen_hyper::AltSvc;
 
     use super::{build, Http3Error};
@@ -463,11 +465,17 @@ mod tests {
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
             let (release, released) = bounded::<Infallible>(1);
+            let max_connections = NonZeroUsize::new(64).unwrap();
+            let options = crate::runtime::native::IoOptions::default();
             let plan = Plan {
                 factory,
                 wrap: Ok,
                 executor: Arc::new(AnyExecutor::new(SmolGlobal)),
-                max_connections: NonZeroUsize::new(64).unwrap(),
+                max_connections,
+                io: crate::runtime::native::IoSettings::new(
+                    options.driver(),
+                    options.recv_ring(max_connections),
+                ),
                 server: HttpServer::H1,
                 tls,
                 http3: Some(Http3Plan {
@@ -538,10 +546,11 @@ mod tests {
         let mut client = client(&pki);
 
         on_compio(async {
-            let socket = Compio.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+            let io = Compio::default();
+            let socket = io.bind_udp("127.0.0.1:0".parse().unwrap()).await.unwrap();
             let own = socket.local_addr().unwrap();
             let (send, connection) = client
-                .connect(socket, Compio, "localhost", serving.addr)
+                .connect(socket, io, "localhost", serving.addr)
                 .expect("an h3 connection");
             // Owns `send`, so the connection ends when the last request has been answered.
             let exchange = async move {
@@ -632,9 +641,10 @@ mod tests {
         let client_thread = std::thread::spawn(move || {
             let mut client = client(&pki);
             on_compio(async move {
-                let socket = Compio.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+                let io = Compio::default();
+                let socket = io.bind_udp("127.0.0.1:0".parse().unwrap()).await.unwrap();
                 let (send, connection) = client
-                    .connect(socket, Compio, "localhost", addr)
+                    .connect(socket, io, "localhost", addr)
                     .expect("an h3 connection");
                 let exchange = async {
                     let response = send
@@ -715,7 +725,7 @@ mod tests {
             header::{self, HeaderMap, HeaderValue},
             Body, BodyFrame, Method, Request, Response, StatusCode,
         };
-        use http_kit_io::{compio::Compio, Io as _};
+        use http_kit_io::{compio::Compio, Datagram as _, FromStd as _};
         use sha2::{Digest as _, Sha256};
 
         use super::{client, pki, request, Serving, CJK};
@@ -807,11 +817,13 @@ mod tests {
             let mut client = client(&pki);
 
             super::on_compio(async {
-                let origin = Compio.tcp_listener(origin).expect("register the origin");
+                let io = Compio::default();
+                let origin = io.tcp_listener(origin).expect("register the origin");
+                let origin_io = io.clone();
                 compio::runtime::spawn(async move {
                     skyzen_h1::H1::default()
                         .serve_listener(
-                            Compio,
+                            origin_io,
                             compio::runtime::Runtime::current(),
                             origin,
                             Origin,
@@ -821,9 +833,9 @@ mod tests {
                 })
                 .detach();
 
-                let socket = Compio.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+                let socket = io.bind_udp("127.0.0.1:0".parse().unwrap()).await.unwrap();
                 let (send, connection) = client
-                    .connect(socket, Compio, "localhost", serving.addr)
+                    .connect(socket, io, "localhost", serving.addr)
                     .expect("an h3 connection");
                 let exchange = async move {
                     // A few MiB in chunks, ending in a trailer carrying its digest.

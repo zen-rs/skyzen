@@ -25,7 +25,7 @@ use http_kit::{
     Request, Response,
 };
 use http_kit_h1::{ServerConfig, ServerConnection, ServerOutcome, Service};
-use http_kit_io::{Io, Listener, SendFile, SpliceRead, SpliceWrite, Split, Timer};
+use http_kit_io::{Listen, Listener, ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, Timer};
 use skyzen_core::{
     apply_pending_headers, error_response, log_endpoint_error,
     upgrade::{OnUpgrade, UpgradeAvailable, Upgraded},
@@ -98,17 +98,15 @@ impl Drop for Slot {
 
 impl<I> Server<I> for H1
 where
-    I: Io,
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
+    I: Listen + Timer + Clone + 'static,
 {
-    type Listeners = I::TcpListener;
+    type Listeners = I::Listener;
 
     async fn serve<Ex, E>(
         &self,
         io: I,
         executor: Ex,
-        listener: I::TcpListener,
+        listener: I::Listener,
         endpoint: E,
         shutdown: impl Future<Output = ()> + 'static,
     ) where
@@ -139,7 +137,7 @@ impl H1 {
         L: Listener,
         L::Stream: Split + 'static,
         L::Addr: PeerAddress,
-        <L::Stream as Split>::ReadHalf: SpliceRead,
+        <L::Stream as Split>::ReadHalf: ReadOwned + SpliceRead,
         <L::Stream as Split>::WriteHalf: SendFile + SpliceWrite,
         Ex: LocalExecutor + 'static,
         E: Endpoint + Clone + 'static,
@@ -216,7 +214,7 @@ impl H1 {
     ) where
         T: Timer + Clone + 'static,
         S: Split + 'static,
-        <S as Split>::ReadHalf: SpliceRead,
+        <S as Split>::ReadHalf: ReadOwned + SpliceRead,
         <S as Split>::WriteHalf: SendFile + SpliceWrite,
         E: Endpoint + Clone + 'static,
     {

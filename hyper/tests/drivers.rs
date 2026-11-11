@@ -22,7 +22,10 @@ use http_body_util::{BodyExt, Empty};
 use http_kit::{
     error::BoxHttpError, header, Body, FileRegion, Request, Response, StatusCode, Version,
 };
-use http_kit_io::{async_io::AsyncIo, compio::Compio, tokio::Tokio, IntoPoll, Io, Listener};
+use http_kit_io::{
+    async_io::AsyncIo, compio::Compio, tokio::Tokio, Datagram as _, FromStd, IntoPoll, Listener,
+    Timer,
+};
 use skyzen_core::{
     error_response,
     upgrade::{OnUpgrade, UpgradeAvailable},
@@ -146,6 +149,18 @@ enum Driver {
     Compio,
 }
 
+/// What the scenarios use of a driver: adopting the test's sockets, its timer, and streams hyper
+/// can poll.
+trait Io:
+    FromStd<Listener: Listener<Stream: IntoPoll<Poll: 'static>>> + Timer + Clone + 'static
+{
+}
+
+impl<I> Io for I where
+    I: FromStd<Listener: Listener<Stream: IntoPoll<Poll: 'static>>> + Timer + Clone + 'static
+{
+}
+
 /// What a server thread does, generic over the driver it runs on.
 trait Scenario: Send + 'static {
     async fn run<I: Io, Ex: LocalExecutor + 'static>(self, io: I, executor: Rc<Ex>);
@@ -170,7 +185,7 @@ fn start<S: Scenario>(driver: Driver, scenario: S) -> thread::JoinHandle<()> {
         }
         Driver::Compio => {
             let runtime = Rc::new(executor_core::compio::Runtime::new().expect("compio runtime"));
-            let run = scenario.run(Compio, Rc::clone(&runtime));
+            let run = scenario.run(Compio::default(), Rc::clone(&runtime));
             runtime.block_on(run);
         }
     })
@@ -600,6 +615,7 @@ fn h2_beside_h3(driver: Driver) {
         .expect("h3 client");
         let socket = AsyncIo
             .bind_udp(([127, 0, 0, 1], 0).into())
+            .await
             .expect("client socket");
         let (send, connection) = client
             .connect(socket, AsyncIo, "localhost", ([127, 0, 0, 1], port).into())

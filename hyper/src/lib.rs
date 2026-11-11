@@ -27,7 +27,7 @@ use core::future::Future;
 use executor_core::{LocalExecutor, Task};
 use futures_util::future::{poll_fn, select, Either};
 use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use http_kit_io::{IntoPoll, Io, Listener};
+use http_kit_io::{IntoPoll, Listen, Listener, Timer};
 use hyper::server::conn::{http1::Builder as Http1Builder, http2::Builder as Http2Builder};
 use skyzen_core::{
     upgrade::{UpgradeAvailable, Upgraded},
@@ -72,14 +72,19 @@ pub const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Hyper;
 
-impl<I: Io> Server<I> for Hyper {
-    type Listeners = I::TcpListener;
+impl<I> Server<I> for Hyper
+where
+    I: Listen + Timer + Clone + 'static,
+    <I::Listener as Listener>::Stream: IntoPoll,
+    <<I::Listener as Listener>::Stream as IntoPoll>::Poll: 'static,
+{
+    type Listeners = I::Listener;
 
     async fn serve<Ex, E>(
         &self,
         io: I,
         executor: Ex,
-        listener: I::TcpListener,
+        listener: I::Listener,
         endpoint: E,
         shutdown: impl Future<Output = ()> + 'static,
     ) where
@@ -104,7 +109,7 @@ impl Hyper {
         endpoint: E,
         shutdown: impl Future<Output = ()> + 'static,
     ) where
-        I: Io,
+        I: Timer + Clone + 'static,
         L: Listener,
         L::Stream: IntoPoll + 'static,
         <L::Stream as IntoPoll>::Poll: 'static,

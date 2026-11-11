@@ -20,8 +20,12 @@ use std::{io, num::NonZeroUsize, rc::Rc, sync::Arc, thread};
 
 use async_channel::{bounded, Receiver, Sender};
 use executor_core::{compio::Runtime, AnyExecutor};
+#[cfg(unix)]
+use http_kit_io::FromStdUnix as _;
 use http_kit_io::{
-    compio::Compio, IntoPoll, Io, Listener, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions,
+    compio::{Compio, TcpStream},
+    FromStd as _, IntoPoll, Listener, ReadOwned, SendFile, SpliceRead, SpliceWrite, Split,
+    TcpOptions,
 };
 use skyzen_core::{EndpointFactory, PeerAddress};
 use skyzen_h1::H1;
@@ -33,7 +37,7 @@ use super::{
     http3::Http3,
     steering::Pins,
     tls::{Protocols, ServerTls},
-    HttpServer, RuntimeFailure,
+    HttpServer, IoSettings, RuntimeFailure,
 };
 use crate::{
     runtime::{context::ShutdownGuard, WorkerContext},
@@ -90,7 +94,7 @@ impl Socket {
         match self {
             #[cfg(not(windows))]
             Self::Tcp(listener) => Some(listener.local_addr()),
-            Self::Handoff(incoming) => Some(incoming.local_addr()),
+            Self::Handoff(incoming) => Some(Ok(incoming.local_addr())),
             #[cfg(unix)]
             Self::Unix(_) => None,
         }
@@ -228,6 +232,9 @@ pub(super) struct Plan<F, W> {
     /// How many connections one thread keeps open before it refuses more. Applies to the default
     /// server and to TLS; [`Hyper`] on a cleartext listener has no such limit.
     pub(super) max_connections: NonZeroUsize,
+    /// The receive ring every thread's runtime is built with, and the driver, carrying the shared
+    /// zero-copy and file-table settings, its sockets run on.
+    pub(super) io: IoSettings,
     /// The server that answers cleartext TCP connections.
     pub(super) server: HttpServer,
     /// The acceptor, when the listener terminates TLS.
@@ -355,7 +362,7 @@ fn work<F, A, W>(
     A: Endpoint + Clone + 'static,
     W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
 {
-    let runtime = match Runtime::new() {
+    let runtime = match plan.io.runtime() {
         Ok(runtime) => Rc::new(runtime),
         Err(error) => {
             let _ = ready.send_blocking(Err(error.into()));
@@ -363,6 +370,7 @@ fn work<F, A, W>(
         }
     };
     let executor = Rc::clone(&runtime);
+    let io = plan.io.driver();
     runtime.block_on(async {
         // The router is built here, on the thread that serves it, so it may hold anything.
         let endpoint = plan.factory.endpoint().await;
@@ -376,6 +384,7 @@ fn work<F, A, W>(
         let endpoint = WithContext {
             endpoint,
             context: WorkerContext::new(Arc::clone(&plan.executor), ShutdownGuard(drain)),
+            io: plan.io.clone(),
         };
         let mut h1 = H1::default().with_max_connections(plan.max_connections);
         // The QUIC endpoint, registered with this thread's runtime before anything reports
@@ -385,7 +394,7 @@ fn work<F, A, W>(
             h1 = h1.with_alt_svc(plan.alt_svc.header_value());
         }
         let http3 = match (&plan.http3, udp) {
-            (Some(plan), Some(udp)) => match plan.http3.server(udp) {
+            (Some(plan), Some(udp)) => match plan.http3.server(udp, &io) {
                 Ok(server) => Some(server),
                 Err(error) => {
                     let _ = ready.send(Err(RuntimeFailure::Http3(error))).await;
@@ -417,25 +426,28 @@ fn work<F, A, W>(
         let tcp = async {
             match socket {
                 #[cfg(not(windows))]
-                Socket::Tcp(listener) => match Compio.tcp_listener(listener) {
+                Socket::Tcp(listener) => match io.tcp_listener(listener) {
                     Ok(listener) => {
-                        serve_tcp(plan, &h1, executor, listener, endpoint, shutdown, ready).await;
+                        serve_tcp(plan, &h1, executor, io, listener, endpoint, shutdown, ready)
+                            .await;
                     }
                     Err(error) => {
                         let _ = ready.send(Err(error.into())).await;
                     }
                 },
-                Socket::Handoff(listener) => {
-                    serve_tcp(plan, &h1, executor, listener, endpoint, shutdown, ready).await;
+                Socket::Handoff(incoming) => {
+                    let listener = incoming.adopted_by(io.clone());
+                    serve_tcp(plan, &h1, executor, io, listener, endpoint, shutdown, ready).await;
                 }
                 #[cfg(unix)]
-                Socket::Unix(listener) => match Compio.unix_listener(listener) {
+                Socket::Unix(listener) => match io.unix_listener(listener) {
                     Ok(listener) => {
                         if announce(ready).await {
                             serve_cleartext(
                                 plan.server,
                                 &h1,
                                 executor,
+                                io,
                                 listener,
                                 endpoint,
                                 shutdown,
@@ -458,16 +470,21 @@ fn work<F, A, W>(
 
 /// Announce readiness, then serve `listener` over TCP: through TLS if the plan has it, else in
 /// cleartext with the plan's server.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one serving thread's pieces, each owned by the caller's frame"
+)]
 async fn serve_tcp<F, W, L, E>(
     plan: &Plan<F, W>,
     h1: &H1,
     executor: Rc<Runtime>,
+    io: Compio,
     listener: L,
     endpoint: E,
     shutdown: impl Future<Output = ()> + 'static,
     ready: &Sender<Result<(), RuntimeFailure>>,
 ) where
-    L: Listener<Stream = <Compio as Io>::TcpStream, Addr = std::net::SocketAddr>,
+    L: Listener<Stream = TcpStream, Addr = std::net::SocketAddr>,
     E: Endpoint + Clone + 'static,
 {
     if !announce(ready).await {
@@ -486,6 +503,7 @@ async fn serve_tcp<F, W, L, E>(
                 tls.clone(),
                 plan.max_connections,
                 Protocols {
+                    io,
                     server: plan.server,
                     h1: h1.clone(),
                     alt_svc: plan.http3.as_ref().map(|plan| plan.alt_svc.clone()),
@@ -493,7 +511,9 @@ async fn serve_tcp<F, W, L, E>(
             )
             .await;
         }
-        None => serve_cleartext(plan.server, h1, executor, listener, endpoint, shutdown).await,
+        None => {
+            serve_cleartext(plan.server, h1, executor, io, listener, endpoint, shutdown).await;
+        }
     }
 }
 
@@ -526,6 +546,7 @@ async fn serve_cleartext<L, E>(
     server: HttpServer,
     h1: &H1,
     executor: Rc<Runtime>,
+    io: Compio,
     listener: L,
     endpoint: E,
     shutdown: impl Future<Output = ()> + 'static,
@@ -533,19 +554,19 @@ async fn serve_cleartext<L, E>(
     L: Listener,
     L::Stream: Split + IntoPoll + 'static,
     <L::Stream as IntoPoll>::Poll: 'static,
-    <L::Stream as Split>::ReadHalf: SpliceRead,
+    <L::Stream as Split>::ReadHalf: ReadOwned + SpliceRead,
     <L::Stream as Split>::WriteHalf: SendFile + SpliceWrite,
     L::Addr: PeerAddress,
     E: Endpoint + Clone + 'static,
 {
     match server {
         HttpServer::H1 => {
-            h1.serve_listener(Compio, executor, listener, endpoint, shutdown)
+            h1.serve_listener(io, executor, listener, endpoint, shutdown)
                 .await;
         }
         HttpServer::Hyper => {
             Hyper
-                .serve_listener(Compio, executor, listener, endpoint, shutdown)
+                .serve_listener(io, executor, listener, endpoint, shutdown)
                 .await;
         }
     }
@@ -560,7 +581,8 @@ async fn announce(ready: &Sender<Result<(), RuntimeFailure>>) -> bool {
     reported
 }
 
-/// An endpoint that hands every request the [`WorkerContext`] of the thread serving it.
+/// An endpoint that hands every request the [`WorkerContext`] of the thread serving it, and the
+/// runtime's [`IoSettings`].
 ///
 /// The context carries a drain token, so a request in flight, and any post-response work it
 /// registers, keeps graceful shutdown waiting.
@@ -568,6 +590,7 @@ async fn announce(ready: &Sender<Result<(), RuntimeFailure>>) -> bool {
 struct WithContext<E> {
     endpoint: E,
     context: WorkerContext,
+    io: IoSettings,
 }
 
 impl<E: Endpoint> Endpoint for WithContext<E> {
@@ -578,6 +601,7 @@ impl<E: Endpoint> Endpoint for WithContext<E> {
         request: &mut Request,
     ) -> impl core::future::Future<Output = Result<Response, Self::Error>> {
         request.extensions_mut().insert(self.context.clone());
+        request.extensions_mut().insert(self.io.clone());
         self.endpoint.respond(request)
     }
 }
@@ -594,7 +618,7 @@ mod tests {
     use super::{bind, start, Bound, Cores, Pins, Plan, Socket};
     use crate::runtime::native::handoff;
     use crate::{
-        runtime::native::{HttpServer, ListenAddr},
+        runtime::native::{HttpServer, IoOptions, IoSettings, ListenAddr},
         Endpoint, Request, Response,
     };
 
@@ -612,11 +636,14 @@ mod tests {
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
             let (release, released) = bounded::<Infallible>(1);
+            let max_connections = NonZeroUsize::new(64).unwrap();
+            let options = IoOptions::default();
             let plan = Plan {
                 factory: || async { ServingThread },
                 wrap: Ok,
                 executor: Arc::new(AnyExecutor::new(SmolGlobal)),
-                max_connections: NonZeroUsize::new(64).unwrap(),
+                max_connections,
+                io: IoSettings::new(options.driver(), options.recv_ring(max_connections)),
                 server,
                 tls: None,
                 http3: None,
@@ -815,19 +842,19 @@ mod tests {
     /// A TCP connection is served with Nagle's algorithm off.
     #[test]
     fn accepted_tcp_connections_send_without_delay() {
-        use http_kit_io::{compio::Compio, Io, Listener, TcpOptions};
+        use http_kit_io::{compio::Compio, Dial as _, Listen as _, Listener, TcpOptions};
 
         executor_core::compio::Runtime::new()
             .expect("compio runtime")
             .block_on(async {
+                let io = Compio::default();
                 let listener = super::NoDelay(
-                    Compio
-                        .bind_tcp("127.0.0.1:0".parse().unwrap())
+                    io.bind_tcp("127.0.0.1:0".parse().unwrap())
                         .expect("bind loopback"),
                 );
                 let addr = listener.local_addr().expect("local addr");
                 let (accepted, client) =
-                    futures_util::future::join(listener.accept(), Compio.connect(addr)).await;
+                    futures_util::future::join(listener.accept(), io.connect(addr)).await;
                 let _client = client.expect("connect");
                 let (stream, _peer) = accepted.expect("accept");
                 assert!(stream.nodelay().expect("read TCP_NODELAY"));

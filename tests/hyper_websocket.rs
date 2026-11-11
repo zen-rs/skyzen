@@ -9,7 +9,7 @@ use async_tungstenite::{
     WebSocketStream,
 };
 use futures_util::StreamExt;
-use http_kit_io::{async_io::AsyncIo, Io};
+use http_kit_io::{async_io::AsyncIo, FromStd as _};
 use hyper::header::SEC_WEBSOCKET_PROTOCOL;
 use skyzen::{
     hyper::Hyper,

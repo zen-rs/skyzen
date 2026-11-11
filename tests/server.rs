@@ -4,7 +4,7 @@
 //! can cross a thread. What crosses is the [`EndpointFactory`]: the serving thread asks it for the
 //! router, then hands that router to the server along with listeners and a thread-local executor.
 
-use http_kit_io::{async_io::AsyncIo, Io};
+use http_kit_io::{async_io::AsyncIo, FromStd as _, Listen};
 use skyzen::{
     hyper::Hyper,
     routing::{CreateRouteNode, Route, Router},
@@ -30,7 +30,7 @@ fn counting_router() -> Router {
 /// Serve the factory's router with `server` on a thread of its own, and return the bound address.
 fn start<S>(server: S, factory: impl EndpointFactory) -> SocketAddr
 where
-    S: Server<AsyncIo, Listeners = <AsyncIo as Io>::TcpListener> + Send + 'static,
+    S: Server<AsyncIo, Listeners = <AsyncIo as Listen>::Listener> + Send + 'static,
 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("local addr");

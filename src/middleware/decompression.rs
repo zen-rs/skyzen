@@ -487,6 +487,12 @@ mod stream {
     }
 
     /// The state of one [`DecodeStream`]: construction, streaming, or finished.
+    #[expect(
+        clippy::large_enum_variant,
+        reason = "every decoder `D` owns the `ChunkReader` it reads (`StreamDecoder::source_mut`), \
+                  so `Active` is at least as large as `Init`; boxing would add an allocation per \
+                  body and save nothing"
+    )]
     enum DecodeState<D> {
         /// `prefill` bytes are being accumulated for a constructor that parses a header eagerly.
         Init(ChunkReader),

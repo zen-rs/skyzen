@@ -13,7 +13,7 @@ use std::{
 };
 
 use executor_core::compio::Runtime;
-use http_kit_io::{compio::Compio, Io as _, Listener as _};
+use http_kit_io::{compio::Compio, Listen as _, Listener as _};
 use skyzen::{
     routing::{build, Route},
     static_files::{StaticCacheSettings, StaticDir},
@@ -59,7 +59,7 @@ fn start(dir: std::path::PathBuf, log: Captured) -> SocketAddr {
         tracing::subscriber::with_default(subscriber, || {
             let runtime = Rc::new(Runtime::new().expect("compio runtime"));
             runtime.block_on(async {
-                let listener = Compio
+                let listener = Compio::default()
                     .bind_tcp("127.0.0.1:0".parse().unwrap())
                     .expect("bind loopback");
                 addr_tx
@@ -73,7 +73,7 @@ fn start(dir: std::path::PathBuf, log: Captured) -> SocketAddr {
                 .expect("the router builds");
                 H1::default()
                     .serve(
-                        Compio,
+                        Compio::default(),
                         Rc::clone(&runtime),
                         listener,
                         router,

@@ -2,7 +2,7 @@ use core::future::Future;
 
 use executor_core::LocalExecutor;
 use http_kit::Endpoint;
-use http_kit_io::Io;
+use http_kit_io::Listen;
 
 /// An HTTP protocol implementation, serving one thread's share of an application.
 ///
@@ -15,12 +15,14 @@ use http_kit_io::Io;
 /// (`SO_REUSEPORT`) and an endpoint built on that thread by a `Send` factory. What crosses threads
 /// is the factory and the services it captures, never a router.
 ///
-/// `I` is the I/O driver the listeners belong to: `http_kit_io::compio::Compio`,
-/// `http_kit_io::tokio::Tokio` or `http_kit_io::async_io::AsyncIo`.
-pub trait Server<I: Io> {
+/// `I` is the I/O driver the listeners belong to — `http_kit_io::compio::Compio`,
+/// `http_kit_io::tokio::Tokio` or `http_kit_io::async_io::AsyncIo` — named by the one capability
+/// every server needs from it, binding a listener. An implementation asks for the others it uses
+/// (a `Timer` for its deadlines) on its own impl.
+pub trait Server<I: Listen> {
     /// What this server accepts work on.
     ///
-    /// A protocol over TCP takes `I::TcpListener`, one over QUIC takes `I::UdpSocket`, and a server
+    /// A protocol over TCP takes `I::Listener`, one over QUIC takes a datagram socket, and a server
     /// that speaks both takes the pair — so a server can never be handed a transport it does not
     /// speak.
     type Listeners;

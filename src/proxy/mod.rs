@@ -62,7 +62,10 @@ use http::{
     uri::{Authority, PathAndQuery, Scheme},
     Version,
 };
-use zenwave::backend::{NativeBackend, NativeIo, Upgrade};
+use zenwave::{
+    backend::{NativeBackend, NativeIo, NativeResolve, Upgrade},
+    dns::Getaddrinfo,
+};
 
 /// The connection settings a [`Transport`] is built from.
 pub use zenwave::transport;
@@ -237,20 +240,32 @@ impl Proxy {
     #[must_use]
     pub fn new(upstream: &Upstream) -> Self {
         compio::runtime::Runtime::with_current(|runtime| {
-            Self::on_current_thread(upstream, http_kit_io::compio::Compio, runtime)
+            Self::on_current_thread(
+                upstream,
+                http_kit_io::compio::Compio::default(),
+                Getaddrinfo,
+                runtime,
+            )
         })
     }
 
-    /// This thread's proxy to `upstream`, its connections driven by `io` and spawned on
-    /// `executor`, both of which must belong to the runtime the current thread runs.
-    pub fn on_current_thread<I, E>(upstream: &Upstream, io: I, executor: &E) -> Self
+    /// This thread's proxy to `upstream`, its connections driven by `io`, the names it dials
+    /// resolved by `resolver`, and spawned on `executor`; `io` and `executor` must belong to the
+    /// runtime the current thread runs.
+    pub fn on_current_thread<I, R, E>(upstream: &Upstream, io: I, resolver: R, executor: &E) -> Self
     where
         I: NativeIo,
+        R: NativeResolve,
         E: LocalExecutor,
     {
         Self {
             upstream: Arc::new(upstream.clone()),
-            client: NativeBackend::on_current_thread(upstream.transport.clone(), io, executor),
+            client: NativeBackend::on_current_thread(
+                upstream.transport.clone(),
+                io,
+                resolver,
+                executor,
+            ),
         }
     }
 

@@ -18,7 +18,7 @@ use std::{
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use http_kit::BodyFrame;
-use http_kit_io::{compio::Compio, Io};
+use http_kit_io::{compio::Compio, Dial as _, FromStd as _};
 use ipnet::IpNet;
 use skyzen::{
     extract::TrustedProxies,
@@ -250,11 +250,12 @@ impl Origin {
 fn serve<E: Endpoint + Clone + 'static>(endpoint: E) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local address");
-    let listener = Compio.tcp_listener(listener).expect("register listener");
+    let io = Compio::default();
+    let listener = io.tcp_listener(listener).expect("register listener");
     compio::runtime::spawn(async move {
         H1::default()
             .serve_listener(
-                Compio,
+                io,
                 compio::runtime::Runtime::current(),
                 listener,
                 endpoint,
@@ -292,9 +293,10 @@ fn stage(configure: impl FnOnce(Route) -> Route) -> Stage {
 
 /// A fresh HTTP/1.1 connection to `addr`.
 async fn connect(addr: SocketAddr) -> http_kit_h1::SendRequest {
-    let stream = Compio.connect(addr).await.expect("connect");
+    let io = Compio::default();
+    let stream = io.connect(addr).await.expect("connect");
     let (send, connection) =
-        http_kit_h1::handshake_stream(stream, Compio, http_kit_h1::ClientConfig::default());
+        http_kit_h1::handshake_stream(stream, io, http_kit_h1::ClientConfig::default());
     compio::runtime::spawn(async move {
         let _ = connection.run().await;
     })
@@ -619,7 +621,11 @@ mod websocket {
     };
     use bytes::Bytes;
     use futures_util::StreamExt as _;
-    use http_kit_io::{compio::Compio, poll::CopyingPoll, IntoPoll as _, Io};
+    use http_kit_io::{
+        compio::{Compio, TcpStream},
+        poll::CopyingPoll,
+        Dial as _, IntoPoll as _,
+    };
     use skyzen::{
         proxy::{Proxy, Upstream},
         routing::{CreateRouteNode, Route, Router},
@@ -633,7 +639,7 @@ mod websocket {
     /// The message that makes the origin close the connection itself.
     const FAREWELL: &str = "再见 / さようなら / 안녕히 가세요";
 
-    type Client = WebSocketStream<CopyingPoll<<Compio as Io>::TcpStream>>;
+    type Client = WebSocketStream<CopyingPoll<TcpStream>>;
 
     /// A WebSocket origin echoing every message at `/v1/echo` until it receives [`FAREWELL`].
     pub fn echo_origin() -> Router {
@@ -662,7 +668,7 @@ mod websocket {
         let upstream = Upstream::new(&target).expect("upstream");
         let proxy = serve(Route::new(("/api".mount(Proxy::new(&upstream)),)).build());
 
-        let stream = Compio.connect(proxy).await.expect("connect");
+        let stream = Compio::default().connect(proxy).await.expect("connect");
         let (client, response) = client_async("ws://shop.example/api/echo", stream.into_poll())
             .await
             .expect("the WebSocket handshake through the proxy");

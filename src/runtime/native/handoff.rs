@@ -18,7 +18,10 @@ use std::{io, net::SocketAddr};
 use async_channel::{unbounded, Receiver, Sender};
 use async_io::Async;
 use futures_util::{future::Either, pin_mut};
-use http_kit_io::{compio::TcpStream, Listener};
+use http_kit_io::{
+    compio::{Compio, TcpStream},
+    Listener,
+};
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::error;
 
@@ -34,15 +37,35 @@ pub(super) struct Incoming {
     local: SocketAddr,
 }
 
-impl Listener for Incoming {
+impl Incoming {
+    /// The dealt connections as the serving thread's listener, each adopted by `io`, the
+    /// thread's driver, on that thread's runtime.
+    pub(super) const fn adopted_by(self, io: Compio) -> Dealt {
+        Dealt { incoming: self, io }
+    }
+
+    /// The address the acceptor listens on.
+    pub(super) const fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+}
+
+/// [`Incoming`] on the serving thread, adopting each connection into its runtime.
+#[derive(Debug)]
+pub(super) struct Dealt {
+    incoming: Incoming,
+    io: Compio,
+}
+
+impl Listener for Dealt {
     type Stream = TcpStream;
     type Addr = SocketAddr;
 
     async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        match self.receiver.recv().await {
+        match self.incoming.receiver.recv().await {
             Ok((stream, peer)) => {
                 let stream = compio::net::TcpStream::from_std(stream)?;
-                Ok((TcpStream::from(stream), peer))
+                Ok((self.io.tcp_stream(stream), peer))
             }
             // The acceptor has stopped, which is what a closed listener means. The servers retry
             // a failed accept at once, so reporting it would spin until their shutdown signal,
@@ -52,7 +75,7 @@ impl Listener for Incoming {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local)
+        Ok(self.incoming.local)
     }
 }
 

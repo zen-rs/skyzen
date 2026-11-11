@@ -41,6 +41,7 @@ use aws_smithy_types::body::SdkBody;
 use http_kit::{Body, Endpoint as _};
 use zenwave::{
     backend::{NativeBackend, NativeIo},
+    dns::Getaddrinfo,
     Transport, TransportBuilder,
 };
 
@@ -254,7 +255,13 @@ impl ThreadPools {
                     .entry(timeouts)
                     .or_insert_with(|| {
                         compio::runtime::Runtime::with_current(|runtime| {
-                            NativeBackend::on_current_thread(transport, io.clone(), runtime)
+                            // The system resolver, as on zenwave's own driver threads.
+                            NativeBackend::on_current_thread(
+                                transport,
+                                io.clone(),
+                                Getaddrinfo,
+                                runtime,
+                            )
                         })
                     })
                     .clone();

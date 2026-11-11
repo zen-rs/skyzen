@@ -53,7 +53,7 @@ impl FrameSource for Forwarded {
         // No limit of the proxy's own: a pipe frame holds whatever the pipe takes.
         let mut own = PipeOffer::new(usize::MAX);
         let offer = offer.unwrap_or(&mut own);
-        match Pin::new(body).poll_frame_offering(cx, offer) {
+        match Pin::new(body).poll_frame_offering(cx, Some(offer)) {
             Poll::Ready(Some(Ok(BodyFrame::Trailers(_)))) if this.refuse_trailers => {
                 this.body = None;
                 tracing::error!(

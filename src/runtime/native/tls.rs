@@ -19,7 +19,10 @@ use std::cell::Cell;
 use std::{future::Future, num::NonZeroUsize, rc::Rc};
 
 use executor_core::compio::Runtime;
-use http_kit_io::{compio::Compio, Io, Listener};
+use http_kit_io::{
+    compio::{Compio, TcpStream},
+    Listener,
+};
 use skyzen_core::Endpoint;
 use std::net::SocketAddr;
 
@@ -265,6 +268,8 @@ fn load_tls_acceptor(files: &TlsFiles) -> Result<ServerTls, TlsError> {
     )
 )]
 pub(super) struct Protocols {
+    /// The serving thread's driver, whose timer bounds the handshake and serves the connection.
+    pub(super) io: Compio,
     /// The server that answers HTTP/1.1.
     pub(super) server: super::HttpServer,
     /// `skyzen-h1`'s server, for [`HttpServer::H1`]; it carries the `Alt-Svc` value itself.
@@ -288,7 +293,7 @@ pub(super) async fn serve<L, E>(
     max_connections: NonZeroUsize,
     protocols: Protocols,
 ) where
-    L: Listener<Stream = <Compio as Io>::TcpStream, Addr = SocketAddr>,
+    L: Listener<Stream = TcpStream, Addr = SocketAddr>,
     E: Endpoint + Clone + 'static,
 {
     use core::{convert::Infallible, pin::pin};
@@ -330,6 +335,7 @@ pub(super) async fn serve<L, E>(
         let tls = tls.clone();
         let endpoint = endpoint.clone();
         let Protocols {
+            io,
             server,
             h1,
             alt_svc,
@@ -340,7 +346,7 @@ pub(super) async fn serve<L, E>(
                 async move {
                     let _slot = slot;
                     let Some(accepted) =
-                        negotiate(stream, &tls, HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT).await
+                        negotiate(stream, &tls, &io, HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT).await
                     else {
                         return;
                     };
@@ -357,7 +363,7 @@ pub(super) async fn serve<L, E>(
                     };
                     match (accepted, server) {
                         (Accepted::Http1(stream), HttpServer::H1) => {
-                            h1.serve_connection(Compio, stream, Some(peer), endpoint, stop, live)
+                            h1.serve_connection(io, stream, Some(peer), endpoint, stop, live)
                                 .await;
                         }
                         (Accepted::Http1(stream), HttpServer::Hyper) => {
@@ -410,7 +416,7 @@ pub(super) async fn serve<L, E>(
     _max_connections: NonZeroUsize,
     _protocols: Protocols,
 ) where
-    L: Listener<Stream = <Compio as Io>::TcpStream, Addr = SocketAddr>,
+    L: Listener<Stream = TcpStream, Addr = SocketAddr>,
     E: Endpoint + Clone + 'static,
 {
     match tls {}
@@ -452,6 +458,7 @@ enum Accepted<S: http_kit_tls::Transport> {
 async fn negotiate<S>(
     stream: S,
     tls: &ServerTls,
+    timer: &Compio,
     handshake: std::time::Duration,
     preface: std::time::Duration,
 ) -> Option<Accepted<S>>
@@ -463,9 +470,9 @@ where
     use tracing::debug;
 
     let acceptor = tls.acceptor.clone().with_handshake_timeout(Some(handshake));
-    let stream = match acceptor.accept(stream, &Compio).await {
+    let stream = match acceptor.accept(stream, timer).await {
         Ok(stream) => stream,
-        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+        Err(http_kit_tls::HandshakeError::TimedOut(_)) => {
             debug!("timed out in TLS handshake");
             return None;
         }
@@ -513,7 +520,10 @@ mod tests {
 
     use executor_core::compio::Runtime;
     use http_kit::{Body, Response};
-    use http_kit_io::{compio::Compio, BufResult, Io as _, Listener as _, Read as _};
+    use http_kit_io::{
+        compio::{Compio, TcpStream},
+        BufResult, Dial as _, Listen as _, Listener as _, Read as _,
+    };
     use http_kit_tls::{rustls, TlsConnector};
     use skyzen_h1::H1;
     use skyzen_hyper::HTTP2_PREFACE;
@@ -592,10 +602,11 @@ mod tests {
         addr: std::net::SocketAddr,
         der: &[u8],
         alpn: &[u8],
-    ) -> http_kit_tls::TlsStream<<Compio as http_kit_io::Io>::TcpStream, http_kit_tls::Client> {
-        let stream = Compio.connect(addr).await.expect("connect");
+    ) -> http_kit_tls::TlsStream<TcpStream, http_kit_tls::Client> {
+        let io = Compio::default();
+        let stream = io.connect(addr).await.expect("connect");
         tls_connector(der, alpn)
-            .connect(server_name(), stream, &Compio)
+            .connect(server_name(), stream, &io)
             .await
             .expect("client handshake")
     }
@@ -736,7 +747,7 @@ mod tests {
         async_channel::Sender<Infallible>,
         impl std::future::Future<Output = ()>,
     ) {
-        let listener = Compio
+        let listener = Compio::default()
             .bind_tcp("127.0.0.1:0".parse().unwrap())
             .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
@@ -753,6 +764,7 @@ mod tests {
                 tls,
                 8.try_into().unwrap(),
                 Protocols {
+                    io: Compio::default(),
                     server,
                     h1: H1::default(),
                     alt_svc: None,
@@ -823,16 +835,22 @@ mod tests {
     fn an_h2_client_that_never_sends_a_preface_is_dropped() {
         let (_dir, tls, der) = acceptor();
         on_compio(|_| async move {
-            let listener = Compio
+            let listener = Compio::default()
                 .bind_tcp("127.0.0.1:0".parse().unwrap())
                 .expect("bind loopback");
             let addr = listener.local_addr().expect("local addr");
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                negotiate(stream, &tls, HANDSHAKE_TIMEOUT, SHORT_PREFACE)
-                    .await
-                    .is_none()
+                negotiate(
+                    stream,
+                    &tls,
+                    &Compio::default(),
+                    HANDSHAKE_TIMEOUT,
+                    SHORT_PREFACE,
+                )
+                .await
+                .is_none()
             };
             let client = async {
                 let mut tls = tls_client(addr, &der, b"h2").await;
@@ -860,14 +878,21 @@ mod tests {
     fn an_h1_alpn_client_sending_the_h2_preface_stays_h1() {
         let (_dir, tls, der) = acceptor();
         on_compio(|_| async move {
-            let listener = Compio
+            let listener = Compio::default()
                 .bind_tcp("127.0.0.1:0".parse().unwrap())
                 .expect("bind loopback");
             let addr = listener.local_addr().expect("local addr");
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                negotiate(stream, &tls, HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT).await
+                negotiate(
+                    stream,
+                    &tls,
+                    &Compio::default(),
+                    HANDSHAKE_TIMEOUT,
+                    HANDSHAKE_TIMEOUT,
+                )
+                .await
             };
             let request = async {
                 let mut tls = tls_client(addr, &der, b"http/1.1").await;
@@ -889,19 +914,25 @@ mod tests {
     fn a_failed_handshake_ends_the_connection_quietly() {
         let (_dir, tls, _der) = acceptor();
         on_compio(|_| async move {
-            let listener = Compio
+            let listener = Compio::default()
                 .bind_tcp("127.0.0.1:0".parse().unwrap())
                 .expect("bind loopback");
             let addr = listener.local_addr().expect("local addr");
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                negotiate(stream, &tls, HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT)
-                    .await
-                    .is_none()
+                negotiate(
+                    stream,
+                    &tls,
+                    &Compio::default(),
+                    HANDSHAKE_TIMEOUT,
+                    HANDSHAKE_TIMEOUT,
+                )
+                .await
+                .is_none()
             };
             let client = async {
-                let mut stream = Compio.connect(addr).await.expect("connect");
+                let mut stream = Compio::default().connect(addr).await.expect("connect");
                 write_all(&mut stream, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()).await;
                 stream
             };
