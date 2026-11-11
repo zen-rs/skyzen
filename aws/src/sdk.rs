@@ -440,7 +440,7 @@ impl<P: Pools> HttpConnector for ZenwaveConnector<P> {
 /// refusal — as final.
 fn connector_error(error: zenwave::Error) -> ConnectorError {
     match error {
-        zenwave::Error::Timeout => ConnectorError::timeout(error.into()),
+        zenwave::Error::Timeout(_) => ConnectorError::timeout(error.into()),
         error if error.is_transient() => ConnectorError::io(error.into()),
         error => ConnectorError::other(error.into(), None),
     }

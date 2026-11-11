@@ -20,7 +20,7 @@ aws-config = { version = "1.13.1", default-features = false, features = ["sso"] 
 aws-smithy-runtime-api = { version = "1.21.0", default-features = false, features = ["client", "http-1x"] }
 aws-smithy-async = { version = "1.3.1", default-features = false }
 aws-smithy-types = { version = "1.9.4", default-features = false, features = ["http-body-1-x"] }
-zenwave = { version = "0.12.0", default-features = false, features = ["native-compio"] }
+zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "deps/208-fork-sources", default-features = false, features = ["native-compio"] }
 # A client pooled on its own thread (`ZenwaveHttpClient::on_current_thread`) keeps a task on that
 # thread's compio runtime, which builds a pool for each set of timeouts the SDK asks for; requests
 # reach it over a channel.
