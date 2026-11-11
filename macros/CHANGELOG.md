@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/skyzen/compare/macros/v0.5.2...macros/v0.6.0) - 2026-11-11
+
+### Added
+
+- *(runtime)* serve HTTP/3 on quiche beside the TLS listener
+- [**breaking**] Server over http-kit-io listeners with per-thread !Send routers
+- *(extract)* Valid<E> — garde validation on decoded payloads ([#165](https://github.com/zen-rs/skyzen/pull/165))
+- *(runtime)* terminate TLS in the native server ([#144](https://github.com/zen-rs/skyzen/pull/144))
+
+### Fixed
+
+- *(aws)* [**breaking**] fetch credentials on the coordinating thread's pools
+- *(runtime)* [**breaking**] build HTTP service clients on each serving thread
+- satisfy current clippy across the workspace
+
+### Other
+
+- Merge origin/dev into feat/179-thread-per-core
+
 ## [0.4.0](https://github.com/zen-rs/skyzen/compare/macros-v0.3.0...macros-v0.4.0) - 2026-09-18
 
 ### Added

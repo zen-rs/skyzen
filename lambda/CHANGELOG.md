@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/skyzen/compare/lambda/v0.2.1...lambda/v0.3.0) - 2026-11-11
+
+### Added
+
+- [**breaking**] Server over http-kit-io listeners with per-thread !Send routers
+- [**breaking**] bound on SendEndpoint where an endpoint's future crosses threads
+- *(middleware)* RequestId, Trace and MatchedPath ([#162](https://github.com/zen-rs/skyzen/pull/162))
+
+### Fixed
+
+- *(extract)* [**breaking**] trust proxy headers only from configured proxies ([#160](https://github.com/zen-rs/skyzen/pull/160))
+
 ## [0.2.1](https://github.com/zen-rs/skyzen/compare/lambda-v0.2.0...lambda-v0.2.1) - 2026-11-05
 
 ### Other

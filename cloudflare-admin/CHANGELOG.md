@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/skyzen/compare/cloudflare-admin/v0.5.2...cloudflare-admin/v0.6.0) - 2026-11-11
+
+### Added
+
+- [**breaking**] #[skyzen::main] serves one compio runtime per core over skyzen-h1
+- request body decompression middleware
+
 ## [0.5.0](https://github.com/zen-rs/skyzen/compare/skyzen-cloudflare-admin-v0.4.4...skyzen-cloudflare-admin-v0.5.0) - 2026-10-27
 
 ### Added

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/skyzen/compare/core/v0.2.1...core/v0.3.0) - 2026-11-11
+
+### Added
+
+- *(runtime)* [**breaking**] serve unix sockets through http-kit-io, hyper included
+- [**breaking**] Server over http-kit-io listeners with per-thread !Send routers
+- [**breaking**] bound on SendEndpoint where an endpoint's future crosses threads
+- [**breaking**] adapt to http-kit's frame-based Body
+- *(middleware)* SecurityHeaders — the standard hardening headers ([#167](https://github.com/zen-rs/skyzen/pull/167))
+- *(extract)* Valid<E> — garde validation on decoded payloads ([#165](https://github.com/zen-rs/skyzen/pull/165))
+- *(middleware)* RequestId, Trace and MatchedPath ([#162](https://github.com/zen-rs/skyzen/pull/162))
+
+### Fixed
+
+- satisfy current clippy across the workspace
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into chore/http-kit-31-body-frames
+
 ## [0.2.1](https://github.com/zen-rs/skyzen/compare/core-v0.2.0...core-v0.2.1) - 2026-09-05
 
 ### Added

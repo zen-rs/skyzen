@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/skyzen/compare/aws/v0.3.1...aws/v0.4.0) - 2026-11-11
+
+### Added
+
+- *(aws)* pool an SDK client's connections on the thread that uses it
+- *(aws)* restore the credential_process credentials source without tokio
+- *(middleware)* RateLimit — fixed-window counter over portable KV ([#169](https://github.com/zen-rs/skyzen/pull/169))
+
+### Fixed
+
+- *(aws)* [**breaking**] fetch credentials on the coordinating thread's pools
+- *(aws)* report a transport that cannot be built as a connector error
+- *(aws)* hand the SDK's connect and read timeouts to zenwave
+- *(aws)* honor the SDK's connect and read timeouts on the zenwave client
+- *(aws)* [**breaking**] do the AWS SDK's I/O on zenwave's native backend
+- satisfy current clippy across the workspace
+
 ## [0.3.1](https://github.com/zen-rs/skyzen/compare/skyzen-aws-v0.3.0...skyzen-aws-v0.3.1) - 2026-11-05
 
 ### Other
