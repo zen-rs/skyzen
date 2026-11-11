@@ -61,10 +61,11 @@ pub use schema::{
     CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer, CfQueueProducer, CfQueues,
     CfR2Bucket, CfServiceBinding, CfTriggers, CloudflareDatabaseSection, CloudflareSecretSection,
     CloudflareSection, CloudflareServiceSection, CosmosWiring, DatabaseEntry, DatabaseType,
-    DynamoDbWiring, InvalidVarName, LambdaArchitecture, MemoryWiring, NativeDatabaseBackend,
-    NativeDatabaseSection, NativeQueueConsumer, NativeSection, NativeServiceBackend,
-    NativeServiceSection, PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring,
-    RdsEngine, RedisWiring, S3Wiring, SecretEntry, ServiceBusWiring, ServiceEntry, ServiceType,
+    DynamoDbWiring, InvalidVarName, KernelTlsState, LambdaArchitecture, MemoryWiring,
+    NativeDatabaseBackend, NativeDatabaseSection, NativeLinuxNic, NativeLinuxSection,
+    NativeQueueConsumer, NativeSection, NativeServiceBackend, NativeServiceSection,
+    PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring, RdsEngine, RedisWiring,
+    RxIrqPlacement, S3Wiring, SecretEntry, ServiceBusWiring, ServiceEntry, ServiceType,
     SkyzenManifest, SqlUrlWiring, SqsWiring, StaticFilesSection, StorageQueueWiring, VarName,
     WiringEnvVar, HTTP_FUNCTION_NAME, PLAINTEXT_VARIABLE_TABLES,
 };
@@ -583,8 +584,9 @@ fn take_environment_overlays(
 #[cfg(test)]
 mod tests {
     use super::{
-        InterpolateError, Manifest, ManifestError, NativeDatabaseBackend, NativeDatabaseSection,
-        NativeServiceBackend, NativeServiceSection, RdsEngine, ServiceType, VarName,
+        InterpolateError, KernelTlsState, Manifest, ManifestError, NativeDatabaseBackend,
+        NativeDatabaseSection, NativeLinuxNic, NativeServiceBackend, NativeServiceSection,
+        RdsEngine, RxIrqPlacement, ServiceType, VarName,
     };
     use std::time::Duration;
 
@@ -1014,6 +1016,55 @@ mod tests {
         assert_eq!(consumer.poll_wait, Duration::from_secs(1));
         assert_eq!(consumer.visibility_timeout, Some(Duration::from_secs(90)));
         assert_eq!(consumer.retry_delay, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn the_linux_section_states_the_host_settings_in_kernel_units() {
+        let manifest = parse(
+            "[native.linux]\nkernel_tls = \"loaded\"\nbusy_poll = 50\nbusy_read = 0\n\n\
+             [native.linux.nic.eth0]\ntls_hw_tx_offload = true\ntls_hw_rx_offload = false\n\
+             tcp_data_split = true\nnapi_defer_hard_irqs = 2\ngro_flush_timeout = 200000\n\
+             rx_irqs = \"serving\"\n",
+        )
+        .expect("manifest parses");
+
+        let linux = manifest
+            .data()
+            .native
+            .as_ref()
+            .and_then(|native| native.linux.as_ref())
+            .expect("[native.linux]");
+        assert_eq!(linux.kernel_tls, Some(KernelTlsState::Loaded));
+        assert_eq!(linux.busy_poll, Some(50));
+        assert_eq!(linux.busy_read, Some(0));
+        assert_eq!(
+            linux.nic["eth0"],
+            NativeLinuxNic {
+                tls_hw_tx_offload: Some(true),
+                tls_hw_rx_offload: Some(false),
+                tcp_data_split: Some(true),
+                napi_defer_hard_irqs: Some(2),
+                gro_flush_timeout: Some(200_000),
+                rx_irqs: Some(RxIrqPlacement::Serving),
+            }
+        );
+    }
+
+    #[test]
+    fn the_linux_section_refuses_what_it_cannot_apply() {
+        for (source, named) in [
+            ("[native.linux]\nkernel_tls = \"unloaded\"\n", "unloaded"),
+            ("[native.linux]\nbusy_pol = 50\n", "busy_pol"),
+            (
+                "[native.linux.nic.eth0]\ntls_offload = true\n",
+                "tls_offload",
+            ),
+            ("[native.linux.nic.eth0]\nrx_irqs = \"spread\"\n", "spread"),
+            ("[native.linux]\nbusy_poll = -1\n", "busy_poll"),
+        ] {
+            let error = parse(source).expect_err(source);
+            assert!(error.to_string().contains(named), "{source}: {error}");
+        }
     }
 
     #[test]
