@@ -34,6 +34,7 @@ skyzen-core = { version = "0.1", default-features = false }
 |---------|---------|-------------|
 | `std` | Yes | Standard library support |
 | `openapi` | No | OpenAPI schema generation (requires `std`) |
+| `steering` | No | `steering`: whether the native runtime steers connections on this Linux machine (requires `std`; Linux only) |
 
 ## Usage
 

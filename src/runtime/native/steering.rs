@@ -27,7 +27,7 @@ pub(super) use linux::pin_current_thread;
 #[cfg(target_os = "linux")]
 pub(super) use linux::set_incoming_cpu;
 #[cfg(target_os = "linux")]
-pub use linux::{rx_layout, rx_layout_at, RxLayout, RxQueue};
+pub use skyzen_core::steering::{rx_layout, rx_layout_at, Placement, RxLayout, RxQueue};
 
 /// Whether connections are steered to the thread on the CPU that received them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

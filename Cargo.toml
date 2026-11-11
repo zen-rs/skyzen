@@ -201,8 +201,10 @@ http-kit-h3 = { version = "0.5.0", default-features = false, features = ["quiche
 # bodies go out through sendfile/splice, and the proxy splices bodies and tunnels between the
 # client's connection and the upstream's.
 [target.'cfg(target_os = "linux")'.dependencies]
-# Pinning serving threads and steering connections to the CPU that received them.
+# Pinning serving threads and steering connections to the CPU that received them; whether to steer
+# is `skyzen-core`'s `steering`, which `skyzen doctor` reads too.
 libc = "0.2"
+skyzen-core = { workspace = true, features = ["steering"] }
 http-kit-tls = { version = "0.3.0", default-features = false, features = ["kernel"], optional = true }
 zenwave = { version = "0.11.0", default-features = false, features = ["native-compio", "native-kernel-tls"], optional = true }
 
