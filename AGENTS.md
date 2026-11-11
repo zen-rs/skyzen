@@ -232,8 +232,9 @@ remain Cloudflare-only, because nothing else has those events.
 
 ### 5e. Reverse Proxy (`proxy` feature, native only)
 - `Upstream` (`Send + Sync`) is the recipe, built once; `Proxy::new(&upstream)` builds one serving
-  thread's endpoint inside the factory, over zenwave's `NativeBackend::on_current_thread`, so each
-  thread has its own upstream pool. Never share a `Proxy` across threads.
+  thread's endpoint inside the factory, and its first request builds the pool, over zenwave's
+  `NativeBackend::on_current_thread`, so each thread has its own upstream pool. Never share a
+  `Proxy` across threads.
 - It is hung on a router with `CreateRouteNode::mount`, which strips the prefix like `nest` does;
   the forwarded path is the upstream URI's path plus what remains.
 - Hop-by-hop fields go in both directions; the incoming forwarding fields (`Forwarded`,
@@ -247,9 +248,12 @@ remain Cloudflare-only, because nothing else has those events.
   can splice, carrying the pipe it drained last, so on Linux an HTTP/1.1 source answers with a
   pipe that writer splices and one pipe serves a connection's bodies. A writer that cannot splice
   (user-space TLS, HTTP/2, HTTP/3) offers nothing and is handed data frames.
-- `Proxy::new` pools on a default `Compio` driver, not on the operator's `IoSettings`: the factory
-  that builds it has no handle on the serving thread's driver. `Proxy::on_current_thread` takes
-  the driver, resolver and executor explicitly.
+- The factory has no handle on the serving thread's driver, so that first request supplies it: the
+  pool is dialed with the driver of the `IoSettings` the native runtime puts into every request, so
+  the operator's zero-copy threshold and file table reach upstream sockets. A request without
+  them (an embedding host, `TestClient`) carries no operator settings and gets
+  `Compio::default()`. `Proxy::on_current_thread` takes the driver, resolver and executor
+  explicitly and builds the pool at once.
 - An upgrade keeps `Upgrade` and `Connection: upgrade` upstream only when the request carries
   `UpgradeAvailable`; on a `101` the response carries an `OnUpgrade` whose session claims
   zenwave's `Switched` and forwards both ways (`proxy/tunnel.rs`): `SpliceDuplex::join` when both

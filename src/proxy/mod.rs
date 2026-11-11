@@ -55,13 +55,14 @@ mod body;
 mod headers;
 mod tunnel;
 
-use std::{fmt, sync::Arc};
+use std::{cell::OnceCell, fmt, rc::Rc, sync::Arc};
 
 use executor_core::LocalExecutor;
 use http::{
     uri::{Authority, PathAndQuery, Scheme},
     Version,
 };
+use http_kit_io::compio::Compio;
 use zenwave::{
     backend::{NativeBackend, NativeIo, NativeResolve, Upgrade},
     dns::Getaddrinfo,
@@ -218,7 +219,9 @@ impl Upstream {
 #[derive(Clone)]
 pub struct Proxy {
     upstream: Arc<Upstream>,
-    client: NativeBackend,
+    /// The upstream pool, which [`Proxy::new`] builds on the first request, with the driver that
+    /// request was served on.
+    client: Rc<OnceCell<NativeBackend>>,
 }
 
 impl fmt::Debug for Proxy {
@@ -233,20 +236,22 @@ impl Proxy {
     /// This thread's proxy to `upstream`, on the compio runtime `#[skyzen::main]` serves each
     /// thread with.
     ///
+    /// Its pool is built on the first request, with the driver of the serving thread that request
+    /// names in its [`IoSettings`](crate::runtime::native::IoSettings), so upstream sockets follow
+    /// the operator's zero-copy threshold and file table; a request without them (an embedding
+    /// host, a test client) comes from no runtime with operator settings, and gets a default
+    /// driver.
+    ///
     /// # Panics
     ///
-    /// When the current thread is not running a compio runtime; on another runtime use
-    /// [`Proxy::on_current_thread`].
+    /// At its first request, when that request is served on a thread not running a compio
+    /// runtime; on another runtime use [`Proxy::on_current_thread`].
     #[must_use]
     pub fn new(upstream: &Upstream) -> Self {
-        compio::runtime::Runtime::with_current(|runtime| {
-            Self::on_current_thread(
-                upstream,
-                http_kit_io::compio::Compio::default(),
-                Getaddrinfo,
-                runtime,
-            )
-        })
+        Self {
+            upstream: Arc::new(upstream.clone()),
+            client: Rc::new(OnceCell::new()),
+        }
     }
 
     /// This thread's proxy to `upstream`, its connections driven by `io`, the names it dials
@@ -260,13 +265,30 @@ impl Proxy {
     {
         Self {
             upstream: Arc::new(upstream.clone()),
-            client: NativeBackend::on_current_thread(
+            client: Rc::new(OnceCell::from(NativeBackend::on_current_thread(
                 upstream.transport.clone(),
                 io,
                 resolver,
                 executor,
-            ),
+            ))),
         }
+    }
+
+    /// This thread's pool, built on its first use with the driver `request` was served on.
+    fn client(&self, request: &Request) -> NativeBackend {
+        self.client
+            .get_or_init(|| {
+                let io = driver(request);
+                compio::runtime::Runtime::with_current(|runtime| {
+                    NativeBackend::on_current_thread(
+                        self.upstream.transport.clone(),
+                        io,
+                        Getaddrinfo,
+                        runtime,
+                    )
+                })
+            })
+            .clone()
     }
 
     /// The request to send upstream, built from the one the client sent; `accepts_trailers` is
@@ -404,18 +426,34 @@ impl Proxy {
     }
 }
 
+/// The driver of the serving thread `request` came from, or a default one when it came from no
+/// runtime that carries operator settings.
+fn driver(request: &Request) -> Compio {
+    #[cfg(feature = "rt")]
+    if let Some(settings) = request
+        .extensions()
+        .get::<crate::runtime::native::IoSettings>()
+    {
+        return settings.driver();
+    }
+    #[cfg(not(feature = "rt"))]
+    let _ = request;
+    Compio::default()
+}
+
 impl Endpoint for Proxy {
     type Error = ProxyError;
 
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let accepts_trailers = headers::accepts_trailers(request.headers());
+        let mut client = self.client(request);
         let mut forwarded = self.forwarded_request(request, accepts_trailers)?;
         tracing::debug!(
             method = %forwarded.method(),
             target = %forwarded.uri(),
             "forwarding upstream"
         );
-        let response = match self.client.respond(&mut forwarded).await {
+        let response = match client.respond(&mut forwarded).await {
             Ok(response) => response,
             Err(zenwave::Error::Timeout) => return Err(ProxyError::Timeout),
             Err(error) => return Err(ProxyError::Upstream(error)),
@@ -459,4 +497,35 @@ pub enum ProxyError {
         status = StatusCode::BAD_GATEWAY
     )]
     TrailersNotAccepted,
+}
+
+#[cfg(all(test, feature = "rt"))]
+mod tests {
+    use core::num::NonZeroUsize;
+
+    use super::driver;
+    use crate::{Body, Request};
+
+    /// A request the native runtime served carries its driver, and the proxy's pool is built with
+    /// it: the zero-copy threshold and file table the operator changes are the ones its upstream
+    /// sockets read.
+    #[test]
+    fn a_request_from_the_native_runtime_hands_the_proxy_its_driver() {
+        use crate::runtime::native::{IoOptions, IoSettings};
+
+        let options = IoOptions::default();
+        let settings = IoSettings::new(
+            options.driver(),
+            options.recv_ring(NonZeroUsize::new(8).unwrap()),
+        );
+        let mut request = Request::new(Body::empty());
+        request.extensions_mut().insert(settings.clone());
+
+        let io = driver(&request);
+        settings.zero_copy().set_threshold(12_345);
+        settings.file_table().set_slots(321);
+
+        assert_eq!(io.zero_copy().threshold(), 12_345);
+        assert_eq!(io.file_table().slots(), 321);
+    }
 }

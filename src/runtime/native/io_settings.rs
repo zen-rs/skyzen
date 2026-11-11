@@ -60,7 +60,7 @@ impl IoOptions {
     /// The driver every serving thread runs its sockets on, holding the two shared handles these
     /// options start at.
     #[must_use]
-    pub(super) fn driver(&self) -> Compio {
+    pub(crate) fn driver(&self) -> Compio {
         Compio::default()
             .with_zero_copy(ZeroCopySend::new(
                 self.zero_copy_threshold
@@ -76,7 +76,7 @@ impl IoOptions {
     /// Unless the operator sized it, the ring holds one buffer per connection the thread may keep
     /// open, so every open connection can have an arrival waiting to be read before a receive has
     /// to fall back to a buffer of its own (compio's default of 8 runs out at the ninth).
-    pub(super) fn recv_ring(&self, connections: NonZeroUsize) -> RecvRing {
+    pub(crate) fn recv_ring(&self, connections: NonZeroUsize) -> RecvRing {
         let buffers = self.recv_buffers.unwrap_or_else(|| {
             let connections = u16::try_from(connections.get()).expect(
                 "a thread's share of the connection limit fits a ring, whose count is a u16",
@@ -195,7 +195,7 @@ http_error!(
 
 impl IoSettings {
     /// The settings a runtime with `driver` and `recv_ring` serves on.
-    pub(super) const fn new(driver: Compio, recv_ring: RecvRing) -> Self {
+    pub(crate) const fn new(driver: Compio, recv_ring: RecvRing) -> Self {
         Self { driver, recv_ring }
     }
 
@@ -217,8 +217,9 @@ impl IoSettings {
         self.recv_ring
     }
 
-    /// The driver a serving thread's sockets are created and adopted with.
-    pub(super) fn driver(&self) -> Compio {
+    /// The driver a serving thread's sockets are created and adopted with, and a proxy's upstream
+    /// sockets dialed with.
+    pub(crate) fn driver(&self) -> Compio {
         self.driver.clone()
     }
 

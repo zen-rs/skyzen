@@ -633,13 +633,21 @@ mod tests {
 
     impl Serving {
         fn start(bound: Bound, server: HttpServer) -> Self {
+            Self::start_with(bound, server, || async { ServingThread })
+        }
+
+        fn start_with<F: skyzen_core::EndpointFactory>(
+            bound: Bound,
+            server: HttpServer,
+            factory: F,
+        ) -> Self {
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
             let (release, released) = bounded::<Infallible>(1);
             let max_connections = NonZeroUsize::new(64).unwrap();
             let options = IoOptions::default();
             let plan = Plan {
-                factory: || async { ServingThread },
+                factory,
                 wrap: Ok,
                 executor: Arc::new(AnyExecutor::new(SmolGlobal)),
                 max_connections,
@@ -717,6 +725,56 @@ mod tests {
     /// Each connection goes to the listener the kernel picks, so asking for it over many
     /// connections is what shows the work spreads; a single serving thread would answer every
     /// one under the same name.
+    /// A proxy built by the factory, before any runtime settings reach it, builds its pool on the
+    /// serving thread at its first request and forwards through it.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn a_proxy_served_by_the_runtime_builds_its_pool_on_the_serving_thread() {
+        use std::io::{Read, Write};
+
+        use crate::{
+            proxy::{Proxy, Upstream},
+            routing::{CreateRouteNode, Route},
+        };
+
+        let origin = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the origin");
+        let target: crate::Uri = format!("http://{}", origin.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let answering = std::thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("the proxy dials");
+            let mut head = Vec::new();
+            let mut byte = [0];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).expect("read the request head");
+                head.push(byte[0]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin",
+                )
+                .expect("answer");
+        });
+
+        let upstream = Upstream::new(&target).expect("upstream");
+        let bound = bind(
+            &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
+            NonZeroUsize::new(1).unwrap(),
+            Pins::default(),
+        )
+        .expect("bind");
+        let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
+        let serving = Serving::start_with(bound, HttpServer::H1, move || {
+            let upstream = upstream.clone();
+            async move { Route::new(("/".mount(Proxy::new(&upstream)),)).build() }
+        });
+
+        let body = exchange(std::net::TcpStream::connect(addr).expect("connect"));
+        answering.join().expect("the origin answered");
+        serving.stop();
+        assert_eq!(body, "origin");
+    }
+
     #[test]
     fn connections_land_on_more_than_one_runtime_thread() {
         // Both servers a cleartext listener can be given run through the same threads.
