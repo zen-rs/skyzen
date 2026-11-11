@@ -345,8 +345,6 @@ pub(super) async fn serve<L, E>(
             .spawn_local(
                 async move {
                     let _slot = slot;
-                    // Boxed: with kernel TLS state on Linux the handshake's future is larger than
-                    // the connection task should carry inline for the connection's whole life.
                     let Some(accepted) = Box::pin(negotiate(
                         stream,
                         &tls,
@@ -462,6 +460,9 @@ enum Accepted<S: http_kit_tls::Transport> {
 ///
 /// `None` means the connection is already dead — a failed handshake or an `h2` client that never
 /// sent its preface — having been logged here rather than by the caller.
+///
+/// Callers box the future: with kernel TLS state on Linux it is about 17 KiB, more than a
+/// connection task should carry inline for the connection's whole life.
 #[cfg(feature = "server-tls")]
 async fn negotiate<S>(
     stream: S,
