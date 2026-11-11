@@ -67,6 +67,17 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace ${{ matrix.targets }} ${{ env.FEATURES }}
 
+      # The test build already compiled the CLI `skyzen-cli` releases; keep it
+      # so a pull request's CLI can be tried without building it again.
+      - name: Upload the skyzen CLI
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: skyzen-cli-${{ runner.os }}-${{ runner.arch }}
+          path: target/debug/skyzen${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 90
+
   wasm-build:
     name: WASM Build Check
     runs-on: ubuntu-latest
