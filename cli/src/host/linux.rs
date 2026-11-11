@@ -40,7 +40,35 @@ pub struct Host {
     pub busy_poll: BusyPoll,
     /// What decides whether the runtime steers connections here.
     pub steering: Probe<Steering>,
+    /// What bounds the memory zero-copy sends pin.
+    pub locked_memory: LockedMemory,
 }
+
+/// What decides whether a zero-copy send happens under load.
+///
+/// A zero-copy send pins the pages it sends until the peer acknowledges them, and `io_uring`
+/// charges them to the user's `RLIMIT_MEMLOCK` unless the process has `CAP_IPC_LOCK`
+/// (`io_notif_account_mem`); a send past the limit is refused by the kernel and copies instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockedMemory {
+    /// This process's `RLIMIT_MEMLOCK`, from `getrlimit(2)`.
+    pub limit: Probe<MemlockLimit>,
+    /// Whether this process has `CAP_IPC_LOCK` in its effective set (`CapEff` in
+    /// `/proc/self/status`).
+    pub ipc_lock: Probe<bool>,
+}
+
+/// An `RLIMIT_MEMLOCK` pair, in bytes; `None` is unlimited (`RLIM_INFINITY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemlockLimit {
+    /// The soft limit, the one the kernel charges against.
+    pub soft: Option<u64>,
+    /// The hard limit, the most the soft one can be raised to without privilege.
+    pub hard: Option<u64>,
+}
+
+/// `CAP_IPC_LOCK`'s bit in a capability set (`include/uapi/linux/capability.h`).
+const CAP_IPC_LOCK: u32 = 14;
 
 /// The kernel `tls` module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +148,7 @@ impl Host {
             nics: nics().await,
             busy_poll: BusyPoll::probe(),
             steering: steering(),
+            locked_memory: LockedMemory::probe(),
             kernel,
         }
     }
@@ -153,6 +182,86 @@ impl Host {
             Ok(steering) => steering.report(),
             Err(why) => output::unknown(format!("native: connection steering: {why}")),
         }
+        self.locked_memory.report();
+    }
+}
+
+impl LockedMemory {
+    fn probe() -> Self {
+        use nix::sys::resource::{getrlimit, Resource, RLIM_INFINITY};
+
+        let finite = |limit| (limit != RLIM_INFINITY).then_some(limit);
+        Self {
+            limit: getrlimit(Resource::RLIMIT_MEMLOCK)
+                .map(|(soft, hard)| MemlockLimit {
+                    soft: finite(soft),
+                    hard: finite(hard),
+                })
+                .map_err(|error| Unknown(format!("getrlimit(RLIMIT_MEMLOCK) failed: {error}"))),
+            ipc_lock: read_text(Path::new("/proc/self/status"))
+                .and_then(|status| effective_capability(&status, CAP_IPC_LOCK)),
+        }
+    }
+
+    fn report(&self) {
+        const WHY: &str = "the pages a zero-copy send pins until the peer acknowledges them";
+        let limit = self
+            .limit
+            .as_ref()
+            .map(|limit| {
+                let show = |bytes: Option<u64>| bytes.map_or_else(|| "unlimited".to_owned(), size);
+                (
+                    limit.soft,
+                    format!("{} (hard {})", show(limit.soft), show(limit.hard)),
+                )
+            })
+            .map_err(Clone::clone);
+        match (&self.ipc_lock, &limit) {
+            (Ok(true), _) => output::ok(format!(
+                "native: zero-copy sends: this process has CAP_IPC_LOCK, so {WHY} are not \
+                 charged to RLIMIT_MEMLOCK"
+            )),
+            (Ok(false), Ok((None, shown))) => output::ok(format!(
+                "native: zero-copy sends: RLIMIT_MEMLOCK is {shown}, so {WHY} never reach it"
+            )),
+            (Ok(false), Ok((Some(_), shown))) => output::warn(format!(
+                "native: zero-copy sends: RLIMIT_MEMLOCK is {shown} and this process lacks \
+                 CAP_IPC_LOCK, so {WHY} count against it, and under load a send past it copies \
+                 instead; raise the limit (`LimitMEMLOCK=` in a systemd unit, `ulimit -l`) or \
+                 grant CAP_IPC_LOCK"
+            )),
+            (Err(why), _) | (_, Err(why)) => {
+                output::unknown(format!("native: zero-copy sends: {why}"));
+            }
+        }
+    }
+}
+
+/// Whether capability `cap` is in the effective set a `/proc/<pid>/status` text reports.
+fn effective_capability(status: &str, cap: u32) -> Probe<bool> {
+    let line = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .ok_or_else(|| Unknown("/proc/self/status has no CapEff line".to_owned()))?;
+    let set = u64::from_str_radix(line.trim(), 16).map_err(|error| {
+        Unknown(format!(
+            "/proc/self/status's CapEff `{}` is not a hex set: {error}",
+            line.trim()
+        ))
+    })?;
+    Ok(set >> cap & 1 == 1)
+}
+
+/// `bytes` in the largest binary unit that divides it.
+fn size(bytes: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    const KIB: u64 = 1 << 10;
+    if bytes != 0 && bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes != 0 && bytes % KIB == 0 {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -534,6 +643,36 @@ mod tests {
     use ethtool::EthtoolBit;
 
     use super::*;
+
+    /// `/proc/self/status` of a process whose effective set is `CAP_NET_BIND_SERVICE` (10) and
+    /// `CAP_IPC_LOCK` (14), and of one with none.
+    #[test]
+    fn cap_ipc_lock_is_read_from_the_effective_set() {
+        let holding = "Name:\tskyzen\nCapInh:\t0000000000000000\nCapPrm:\t0000000000004400\n\
+                       CapEff:\t0000000000004400\nCapBnd:\t000001ffffffffff\n";
+        assert_eq!(effective_capability(holding, CAP_IPC_LOCK), Ok(true));
+        let lacking = "CapPrm:\t0000000000004000\nCapEff:\t0000000000000400\n";
+        assert_eq!(effective_capability(lacking, CAP_IPC_LOCK), Ok(false));
+        assert!(effective_capability("Name:\tskyzen\n", CAP_IPC_LOCK).is_err());
+        assert!(effective_capability("CapEff:\tzz\n", CAP_IPC_LOCK).is_err());
+    }
+
+    #[test]
+    fn the_locked_memory_limit_is_shown_in_its_largest_unit() {
+        // Linux's default `MLOCK_LIMIT` since 5.16: 8 MiB.
+        assert_eq!(size(8 << 20), "8 MiB");
+        assert_eq!(size(64 << 10), "64 KiB");
+        assert_eq!(size(1000), "1000 bytes");
+        assert_eq!(size(0), "0 bytes");
+    }
+
+    /// The probe answers for this process: both halves are readable on any Linux.
+    #[test]
+    fn the_locked_memory_probe_reads_this_process() {
+        let probed = LockedMemory::probe();
+        assert!(probed.limit.is_ok(), "{probed:?}");
+        assert!(probed.ipc_lock.is_ok(), "{probed:?}");
+    }
 
     #[test]
     fn the_tls_module_is_found_in_modules_dep() {

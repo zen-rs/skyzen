@@ -32,8 +32,8 @@ pub fn report() -> usize {
 #[cfg(not(target_os = "linux"))]
 pub fn report() -> usize {
     crate::output::off(format!(
-        "native: kernel TLS, NIC TLS offload, header/data split, busy polling and connection \
-         steering are Linux-only; this machine runs {}",
+        "native: kernel TLS, NIC TLS offload, header/data split, busy polling, connection \
+         steering and zero-copy sends are Linux-only; this machine runs {}",
         std::env::consts::OS
     ));
     0
