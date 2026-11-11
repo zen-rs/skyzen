@@ -241,9 +241,12 @@ remain Cloudflare-only, because nothing else has those events.
   trusts, and the proxy's own hop is always written as `Forwarded` and `Via`.
 - Bodies are passed through as `Body` frames and never inspected, except that a chunked upstream
   response to a client without `TE: trailers` fails with `TrailersNotAccepted` at its trailers.
-  Neither HTTP/1.1 writer offers a pipe, so the proxy makes the offer itself (`proxy/body.rs`):
-  every frame of a streamed body is asked for with a `PipeOffer` (the consumer's own when it
-  makes one), and on Linux an HTTP/1.1 source answers with a pipe the other side splices.
+  Every frame of a streamed body is asked for with the consuming writer's own `PipeOffer`, passed
+  through as it came (`proxy/body.rs`); the proxy makes none. An HTTP/1.1 writer — the server's
+  for the response, the upstream connection's for the request — offers exactly when its socket
+  can splice, carrying the pipe it drained last, so on Linux an HTTP/1.1 source answers with a
+  pipe that writer splices and one pipe serves a connection's bodies. A writer that cannot splice
+  (user-space TLS, HTTP/2, HTTP/3) offers nothing and is handed data frames.
 - `Proxy::new` pools on a default `Compio` driver, not on the operator's `IoSettings`: the factory
   that builds it has no handle on the serving thread's driver. `Proxy::on_current_thread` takes
   the driver, resolver and executor explicitly.

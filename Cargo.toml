@@ -194,8 +194,9 @@ rustls = { version = "0.23.46", default-features = false, features = ["std", "tl
 zenwave = { version = "0.12.0", default-features = false, features = ["native-compio"], optional = true }
 # HTTP/3 (`http3` feature): quiche over the same compio threads. quiche builds BoringSSL from
 # source, so only a build that asks for HTTP/3 pays for it; `fs` lets a file-region body (static
-# files) go out over a QUIC stream, and `pipe` reads out the pipe frames a proxied body brings.
-http-kit-h3 = { version = "0.6.1", default-features = false, features = ["quiche", "fs", "pipe"], optional = true }
+# files) go out over a QUIC stream. A QUIC writer offers no pipe, so a proxied body reaches it as
+# data frames and `pipe` is not needed.
+http-kit-h3 = { version = "0.6.1", default-features = false, features = ["quiche", "fs"], optional = true }
 
 # Kernel TLS on Linux: after the handshake the kernel seals and opens the records, so file-region
 # bodies go out through sendfile/splice, and the proxy splices bodies and tunnels between the
