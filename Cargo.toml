@@ -191,7 +191,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["std", "tl
 # each serving thread. zenwave refuses to build without a default backend; `native-compio` is the
 # one whose runtime this crate already links, though the proxy only ever starts pools on the
 # serving thread's own runtime.
-zenwave = { version = "0.10.0", default-features = false, features = ["native-compio"], optional = true }
+zenwave = { version = "0.10.1", default-features = false, features = ["native-compio"], optional = true }
 # HTTP/3 (`http3` feature): quiche over the same compio threads. quiche builds BoringSSL from
 # source, so only a build that asks for HTTP/3 pays for it; `fs` lets a file-region body (static
 # files) go out over a QUIC stream.
