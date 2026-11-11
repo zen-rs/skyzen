@@ -216,12 +216,14 @@ impl KeyValueStore for InMemoryKv {
         ready(self.take_injected_failure().map(|()| {
             let mut data = self.write_purged();
             data.get(key).map(|entry| entry.value.as_slice()) == expected && {
+                // A swap replaces the value, not the record: the deadline the entry already
+                // carried survives, as `replace_if_unchanged` does on Cosmos.
+                let expires_at = data.get(key).and_then(|entry| entry.expires_at);
                 data.insert(
                     key.to_owned(),
                     Entry {
                         value: new.to_vec(),
-                        // A swap re-arms nothing: the winner owns the key outright, as `SET` does.
-                        expires_at: None,
+                        expires_at,
                     },
                 );
                 true
@@ -242,6 +244,44 @@ impl KeyValueStore for InMemoryKv {
             // Keep whatever expiry the counter already had, so an incremented rate-limit
             // window still closes on schedule.
             let expires_at = data.get(key).and_then(|entry| entry.expires_at);
+            data.insert(
+                key.to_owned(),
+                Entry {
+                    value: updated.to_string().into_bytes(),
+                    expires_at,
+                },
+            );
+            drop(data);
+            Ok(updated)
+        }))
+    }
+
+    fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Duration,
+    ) -> impl Future<Output = Result<i64, KvError>> + Send {
+        ready(self.take_injected_failure().and_then(|()| {
+            let expires_at = self.expiry_for(ttl);
+            let mut data = self.write_purged();
+            let current = counter_value(data.get(key))?;
+            // The TTL counter counts from zero upward, so a stored negative is corruption,
+            // not a count: refuse it without a write, the way the real backends do.
+            if current < 0 {
+                return Err(KvError::Decode(format!(
+                    "counter under {key:?} holds the negative value {current}"
+                )));
+            }
+            let updated = current
+                .checked_add(delta)
+                .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
+            // A counter born under the limiter carries its deadline from the first write;
+            // one that already existed keeps whatever expiry it has.
+            let expires_at = data
+                .get(key)
+                .and_then(|entry| entry.expires_at)
+                .or(expires_at);
             data.insert(
                 key.to_owned(),
                 Entry {
@@ -332,7 +372,7 @@ mod tests {
 
     use super::InMemoryKv;
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_returns_keys_in_lexicographic_order() {
         let kv = InMemoryKv::new();
         for key in ["b", "c", "a", "aa"] {
@@ -352,7 +392,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_paginates_with_a_cursor_across_three_pages() {
         let kv = InMemoryKv::new();
         for key in ["a", "b", "c", "d", "e"] {
@@ -382,7 +422,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn zero_ttl_expires_immediately_for_get_exists_and_list() {
         let kv = InMemoryKv::new();
         kv.put("keep", b"forever").await.unwrap();
@@ -400,7 +440,7 @@ mod tests {
         assert_eq!(kv.data.read().unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn positive_ttl_keeps_the_value_visible_until_expiry() {
         let kv = InMemoryKv::new();
         kv.put_with_ttl("session", b"data", Duration::from_hours(1))
@@ -411,7 +451,7 @@ mod tests {
         assert!(kv.exists("session").await.unwrap());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn overwriting_with_plain_put_clears_the_ttl() {
         let kv = InMemoryKv::new();
         kv.put_with_ttl("key", b"ttl", Duration::ZERO)
@@ -422,7 +462,7 @@ mod tests {
         assert_eq!(kv.get("key").await.unwrap(), Some(b"forever".to_vec()));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn strict_cloudflare_rounds_a_short_ttl_up_to_the_platform_floor() {
         let kv = InMemoryKv::strict_cloudflare();
         kv.put_with_ttl("nonce", b"single-use", Duration::from_secs(5))
@@ -441,7 +481,7 @@ mod tests {
         assert_eq!(permissive.get("nonce").await.unwrap(), None);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn put_if_absent_lets_exactly_one_writer_win() {
         let kv = InMemoryKv::new();
 
@@ -454,7 +494,7 @@ mod tests {
         assert!(kv.put_if_absent("lock", b"second").await.unwrap());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn compare_and_swap_reports_a_lost_race_as_ok_false() {
         let kv = InMemoryKv::new();
 
@@ -471,7 +511,7 @@ mod tests {
         assert_eq!(kv.get("doc").await.unwrap(), Some(b"v2".to_vec()));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn increment_counts_from_zero_and_rejects_non_numeric_values() {
         let kv = InMemoryKv::new();
 
@@ -487,7 +527,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn increment_keeps_the_window_a_rate_limiter_already_opened() {
         let kv = InMemoryKv::new();
         kv.put_with_ttl("window", b"1", Duration::ZERO)
@@ -499,7 +539,7 @@ mod tests {
         assert_eq!(kv.increment("window", 1).await.unwrap(), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn expire_re_arms_an_existing_key_and_reports_a_missing_one() {
         let kv = InMemoryKv::new();
         kv.put("session", b"data").await.unwrap();
@@ -513,7 +553,7 @@ mod tests {
         assert!(!kv.expire("absent", Duration::from_hours(1)).await.unwrap());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn wrapper_exposes_the_atomic_primitives_through_dynamic_dispatch() {
         let kv = Kv::new(InMemoryKv::new());
 
@@ -528,7 +568,7 @@ mod tests {
         assert_eq!(kv.list_all(None).await.unwrap(), vec!["hits", "lock"]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn fail_next_with_fails_exactly_one_operation() {
         let kv = InMemoryKv::new();
         kv.put("key", b"value").await.unwrap();

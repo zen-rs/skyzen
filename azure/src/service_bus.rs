@@ -1,6 +1,6 @@
 //! Azure Service Bus implementation of [`MessageQueue`].
 //!
-//! The transport is the [Service Bus REST API] spoken directly on `reqwest`, rather than a client
+//! The transport is the [Service Bus REST API] spoken directly on `zenwave`, rather than a client
 //! library: the only published Service Bus crate, `azure_messaging_servicebus` 0.21, is built on
 //! legacy `azure_core` 0.21, which logs the outgoing `authorization` header value at debug level
 //! (RUSTSEC-2026-0275) and drags `http-types`, `async-std` and `rand 0.7` in behind it. Four
@@ -16,10 +16,6 @@ use core::{fmt, time::Duration};
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac as _};
-use reqwest::{
-    header::{HeaderMap, AUTHORIZATION, RETRY_AFTER},
-    Client, Method, Response, StatusCode,
-};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use skyzen_services::queue::{
@@ -28,8 +24,15 @@ use skyzen_services::queue::{
 };
 use time::{OffsetDateTime, UtcOffset};
 use url::Url;
+use zenwave::{
+    header::{HeaderMap, AUTHORIZATION, CONTENT_LENGTH, RETRY_AFTER},
+    Body, Method, Request, Response, StatusCode,
+};
 
-use crate::status::{classify, retry_after, AzureStatus};
+use crate::{
+    status::{classify, retry_after, AzureStatus},
+    AzureHttp,
+};
 
 /// The message property this client tags a base64-encoded body with.
 ///
@@ -52,14 +55,6 @@ const BROKER_PROPERTIES_HEADER: &str = "brokerproperties";
 
 /// The header Azure services name their own error code in.
 const ERROR_CODE_HEADER: &str = "x-ms-error-code";
-
-/// The body of a request that has none, which is what puts `Content-Length: 0` on the wire.
-///
-/// The REST reference's own peek-lock example sends that header, and
-/// `azure_messaging_servicebus-0.21.0/src/service_bus/mod.rs` set it explicitly "to avoid
-/// truncation errors" — so a bodyless request here declares its length rather than leaving it to
-/// the transport.
-const EMPTY_BODY: &str = "";
 
 /// How long the SAS token minted for one request stays valid.
 ///
@@ -96,11 +91,13 @@ const TOKEN_TTL: time::Duration = time::Duration::seconds(300);
 /// fail, the rest are still delivered and [`QueueError::PartialBatch`] names exactly which entries
 /// were rejected.
 ///
-/// Cloning is cheap — the HTTP client is a handle onto a shared connection pool.
+/// Cloning is cheap — the connection pool lives behind the backend, which is a handle onto shared
+/// state.
 #[derive(Debug, Clone)]
 pub struct ServiceBusQueue {
-    /// The HTTP client every request rides on.
-    http: Client,
+    /// The backend every request rides on. Its connection pool is shared by every clone, so
+    /// cloning the queue keeps one pool.
+    http: AzureHttp,
     /// `https://{namespace}.servicebus.windows.net/{queue}`, the root of every request URL.
     queue_url: Url,
     /// The shared-access policy name that signs requests.
@@ -118,7 +115,7 @@ impl ServiceBusQueue {
     /// # Errors
     ///
     /// [`QueueError::Backend`] when the namespace or queue name could not appear in a Service Bus
-    /// URL, or when the HTTP client could not be built.
+    /// URL.
     pub fn new(
         namespace: &str,
         queue: &str,
@@ -126,13 +123,20 @@ impl ServiceBusQueue {
         signing_key: &str,
     ) -> Result<Self, QueueError> {
         Ok(Self {
-            http: Client::builder().build().map_err(|error| {
-                QueueError::backend_with("failed to build an HTTPS client for Service Bus", error)
-            })?,
+            http: AzureHttp::system(),
             queue_url: queue_url(namespace, queue)?,
             policy_name: policy_name.into(),
             signing_key: SigningKey(signing_key.to_owned()),
         })
+    }
+
+    /// This queue with its requests sent through `http`.
+    ///
+    /// How a thread gets a client whose connections it owns: build the queue once and rebind a
+    /// clone on each thread with an [`AzureHttp::system_on_current_thread`].
+    #[must_use]
+    pub fn with_http(self, http: AzureHttp) -> Self {
+        Self { http, ..self }
     }
 
     /// Create a queue client from a Service Bus connection string.
@@ -220,6 +224,32 @@ impl ServiceBusQueue {
         ))
     }
 
+    /// Send `request` and return the service's answer, an error status included.
+    ///
+    /// The raw backend — a SAS signature is bound to the URI it signs, so a redirect could never
+    /// be honored anyway, and a 3xx surfaces as itself rather than as a replayed hop.
+    async fn send(&self, request: &mut Request) -> Result<Response, zenwave::Error> {
+        self.http.send(request).await
+    }
+
+    /// Build a bodyless request against `url`, signed with that URL's SAS token.
+    ///
+    /// Every bodyless call declares `Content-Length: 0`: the REST reference's own peek-lock
+    /// example sends that header, and `azure_messaging_servicebus-0.21.0/src/service_bus/mod.rs`
+    /// set it explicitly "to avoid truncation errors" — so a bodyless request here declares its
+    /// length rather than leaving it to the transport.
+    fn request(&self, method: Method, url: &Url) -> Result<Request, ServiceBusError> {
+        http::Request::builder()
+            .method(method)
+            .uri(url.as_str())
+            .header(AUTHORIZATION, self.sas_token(url)?)
+            .header(CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .map_err(|error| {
+                ServiceBusError::local_with("failed to build a Service Bus request", error)
+            })
+    }
+
     /// Build the request one send goes out as.
     ///
     /// `POST {queue}/messages`, the body carrying the encoded text. A delay becomes the
@@ -236,27 +266,26 @@ impl ServiceBusQueue {
         &self,
         encoded: EncodedMessage,
         options: &SendOptions,
-    ) -> Result<reqwest::Request, ServiceBusError> {
+    ) -> Result<Request, ServiceBusError> {
         let url = self.message_url(&["messages"])?;
 
-        let mut request = self
-            .http
-            .post(url.clone())
-            .header(AUTHORIZATION, self.sas_token(&url)?)
-            .body(encoded.body);
+        let mut builder = http::Request::builder()
+            .method(Method::POST)
+            .uri(url.as_str())
+            .header(AUTHORIZATION, self.sas_token(&url)?);
 
         if let Some(delay) = options.delay {
-            request = request.header(
+            builder = builder.header(
                 BROKER_PROPERTIES_HEADER,
                 SendBrokerProperties::scheduled_at(scheduled_enqueue_time(delay)?).encode()?,
             );
         }
 
         if encoded.base64 {
-            request = request.header(CONTENT_ENCODING_PROPERTY, property_value(BASE64_ENCODING)?);
+            builder = builder.header(CONTENT_ENCODING_PROPERTY, property_value(BASE64_ENCODING)?);
         }
 
-        request.build().map_err(|error| {
+        builder.body(Body::from(encoded.body)).map_err(|error| {
             ServiceBusError::local_with("failed to build a Service Bus send request", error)
         })
     }
@@ -267,11 +296,10 @@ impl ServiceBusQueue {
         message: &[u8],
         options: SendOptions,
     ) -> Result<(), ServiceBusError> {
-        let request = self.send_request(encode_message(message), &options)?;
+        let mut request = self.send_request(encode_message(message), &options)?;
 
         let response = self
-            .http
-            .execute(request)
+            .send(&mut request)
             .await
             .map_err(|error| ServiceBusError::transport("send", error))?;
 
@@ -293,12 +321,10 @@ impl ServiceBusQueue {
         url.query_pairs_mut()
             .append_pair("timeout", &wait.as_secs().to_string());
 
+        let mut request = self.request(Method::POST, &url).map_err(queue_error)?;
+
         let response = self
-            .http
-            .post(url.clone())
-            .header(AUTHORIZATION, self.sas_token(&url).map_err(queue_error)?)
-            .body(EMPTY_BODY)
-            .send()
+            .send(&mut request)
             .await
             .map_err(|error| queue_error(ServiceBusError::transport("peek-lock", error)))?;
 
@@ -311,7 +337,7 @@ impl ServiceBusQueue {
 
         let properties = broker_properties(&headers)?;
         let encoding = content_encoding(&headers)?;
-        let body = response.bytes().await.map_err(|error| {
+        let body = response.into_body().into_bytes().await.map_err(|error| {
             QueueError::backend_with("failed to read a Service Bus message body", error)
         })?;
         let body = core::str::from_utf8(&body).map_err(|error| {
@@ -340,12 +366,10 @@ impl ServiceBusQueue {
             ])
             .map_err(queue_error)?;
 
+        let mut request = self.request(method, &url).map_err(queue_error)?;
+
         let response = self
-            .http
-            .request(method, url.clone())
-            .header(AUTHORIZATION, self.sas_token(&url).map_err(queue_error)?)
-            .body(EMPTY_BODY)
-            .send()
+            .send(&mut request)
             .await
             .map_err(|error| queue_error(ServiceBusError::transport("settle", error)))?;
 
@@ -847,7 +871,7 @@ impl ServiceBusError {
     }
 
     /// A request that never got an answer: a refused connection, a TLS failure, a timeout.
-    fn transport(operation: &str, source: reqwest::Error) -> Self {
+    fn transport(operation: &str, source: zenwave::Error) -> Self {
         Self {
             answer: None,
             message: format!("the {operation} request to Service Bus failed"),
@@ -864,7 +888,7 @@ impl ServiceBusError {
 
         // Service Bus explains a refusal in the body — an XML `<Error><Code>…</Code>` document —
         // and a body this backend cannot read is no reason to lose the status.
-        let body = response.bytes().await.map_or_else(
+        let body = response.into_body().into_bytes().await.map_or_else(
             |_| String::new(),
             |body| String::from_utf8_lossy(&body).trim().to_owned(),
         );
@@ -1061,14 +1085,14 @@ mod tests {
     };
     use base64::Engine as _;
     use core::time::Duration;
-    use reqwest::{
-        header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE},
-        StatusCode,
-    };
     use skyzen_services::queue::{
         MessageQueue, MessageReceipt, QueueError, QueueRetry, ReceiveOptions, SendOptions,
     };
     use time::OffsetDateTime;
+    use zenwave::{
+        header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE},
+        StatusCode,
+    };
 
     const CONNECTION_STRING: &str = "Endpoint=sb://skyzen-test.servicebus.windows.net/;\
          SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=c2t5emVuLXRlc3Qta2V5";
@@ -1085,6 +1109,124 @@ mod tests {
 
     fn queue() -> ServiceBusQueue {
         ServiceBusQueue::from_connection_string(CONNECTION_STRING, "jobs").expect("should build")
+    }
+
+    /// A message in Chinese, Japanese and Korean.
+    const LOOPBACK_MESSAGE: &str = "订单已付款。注文は支払い済み。주문 결제 완료.";
+
+    /// The queue `jobs` with every request going to `server` instead of the namespace's host.
+    fn loopback_queue(server: &skyzen_test::LoopbackServer) -> ServiceBusQueue {
+        ServiceBusQueue {
+            queue_url: url::Url::parse(&format!("http://{}/jobs", server.addr()))
+                .expect("a loopback URL"),
+            ..queue()
+        }
+    }
+
+    fn assert_no_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+    }
+
+    /// A queue rebound on a thread — what each serving thread does with the clients
+    /// `#[skyzen::main]` builds — sends on connections that thread dials and drives.
+    #[compio::test]
+    async fn a_rebound_queue_sends_on_connections_its_thread_dials() {
+        let (seen, received) = std::sync::mpsc::channel::<skyzen_test::ReceivedRequest>();
+        let server = skyzen_test::LoopbackServer::start(move |request| {
+            seen.send(request).expect("the test is still listening");
+            let mut response = http_kit::Response::new(http_kit::Body::empty());
+            *response.status_mut() = StatusCode::CREATED;
+            response
+        });
+        let (io, dials) = skyzen_test::DialRecorder::new();
+        let queue =
+            loopback_queue(&server).with_http(crate::AzureHttp::system_on_current_thread(io));
+
+        for _ in 0..2 {
+            MessageQueue::send(&queue, LOOPBACK_MESSAGE.as_bytes())
+                .await
+                .expect("the send should succeed");
+        }
+
+        let dials = dials.taken();
+        let this = std::thread::current().id();
+        assert!(
+            !dials.is_empty(),
+            "a send went out, so a connection was dialed"
+        );
+        assert!(
+            dials.iter().all(|dialed| *dialed == this),
+            "every connection was dialed on this thread, not {dials:?}"
+        );
+        let bodies: Vec<_> = received.try_iter().map(http::Request::into_body).collect();
+        assert_eq!(bodies.len(), 2, "both sends reached the server");
+        assert!(bodies
+            .iter()
+            .all(|body| body == LOOPBACK_MESSAGE.as_bytes()));
+    }
+
+    /// A send leaves through zenwave's native backend, signed with the queue's SAS, while the test
+    /// runs on compio with no tokio runtime.
+    #[compio::test]
+    async fn a_send_goes_out_on_zenwave_without_a_tokio_runtime() {
+        assert_no_tokio_runtime();
+        let (seen, received) = std::sync::mpsc::channel::<skyzen_test::ReceivedRequest>();
+        let server = skyzen_test::LoopbackServer::start(move |request| {
+            seen.send(request).expect("the test is still listening");
+            let mut response = http_kit::Response::new(http_kit::Body::empty());
+            *response.status_mut() = StatusCode::CREATED;
+            response
+        });
+
+        MessageQueue::send(&loopback_queue(&server), LOOPBACK_MESSAGE.as_bytes())
+            .await
+            .expect("the send should succeed");
+
+        let request = received.recv().expect("the server saw the send");
+        assert_eq!(request.method(), http::Method::POST);
+        assert_eq!(request.uri().path(), "/jobs/messages");
+        let authorization = request.headers()[AUTHORIZATION]
+            .to_str()
+            .expect("a text header");
+        assert!(
+            authorization.starts_with("SharedAccessSignature "),
+            "{authorization}"
+        );
+        assert_eq!(request.body().as_ref(), LOOPBACK_MESSAGE.as_bytes());
+    }
+
+    /// A `429` is the service's answer, read out of the response: the caller sees a throttle and
+    /// the delay the service asked for, not a transport failure.
+    #[compio::test]
+    async fn a_throttled_send_reports_the_services_retry_delay() {
+        assert_no_tokio_runtime();
+        let server = skyzen_test::LoopbackServer::start(|_| {
+            let mut response = http_kit::Response::new(http_kit::Body::from_bytes(
+                "<Error><Code>429</Code><Detail>The request was throttled.</Detail></Error>",
+            ));
+            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            response
+                .headers_mut()
+                .insert(zenwave::header::RETRY_AFTER, HeaderValue::from_static("30"));
+            response
+        });
+
+        let error = MessageQueue::send(&loopback_queue(&server), LOOPBACK_MESSAGE.as_bytes())
+            .await
+            .expect_err("a throttled send is an error");
+
+        assert!(
+            matches!(
+                error,
+                QueueError::Throttled {
+                    retry_after: Some(delay)
+                } if delay == Duration::from_secs(30)
+            ),
+            "{error:?}"
+        );
     }
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -1201,7 +1343,7 @@ mod tests {
             .expect("should build a send request");
 
         assert_eq!(
-            request.url().as_str(),
+            request.uri().to_string(),
             "https://skyzen-test.servicebus.windows.net/jobs/messages"
         );
         assert!(request.headers().contains_key(AUTHORIZATION));
@@ -1558,7 +1700,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_delayed_retry_is_refused_rather_than_silently_immediate() {
         let error = queue()
             .nack(
@@ -1570,7 +1712,7 @@ mod tests {
         assert!(matches!(error, QueueError::Unsupported(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_per_delivery_visibility_timeout_is_refused() {
         let error = queue()
             .receive(
@@ -1583,7 +1725,7 @@ mod tests {
         assert!(matches!(error, QueueError::Unsupported(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_receive_without_a_wait_is_refused_and_names_the_wait_to_pass() {
         // The default options carry no wait, and Service Bus has no immediate receive to answer
         // them with — so the call says so instead of blocking for the service's own default.

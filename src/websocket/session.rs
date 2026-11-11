@@ -67,16 +67,14 @@ impl<E: Into<Error>> IntoWebSocketOutcome for Result<(), E> {
     }
 }
 
-/// `Send`, except on `wasm32`.
+/// `Send`, except on `wasm32`. Bounds a session *callback*, never its future.
 ///
-/// A session handler on a multi-threaded native runtime has to be `Send`: the executor may poll it
-/// on any thread. Nothing about a WebAssembly isolate makes that true or useful — there is no
-/// second thread — and requiring it there would reject every real edge session, because the socket
-/// itself is built from `Rc`s and JS handles that no `Send` future can hold across an `await`.
+/// Natively the callback travels from the handler to the server inside the `101` response, as a
+/// [`skyzen_core::upgrade::OnUpgrade`] token, and response extensions demand `Send`. The future it
+/// returns runs on the connection's own thread and is never asked to be `Send`.
 ///
-/// The relaxation stops at the builder. What the router stores still has to satisfy
-/// `http_kit::Endpoint`'s unconditional `Send`, which is why the session is carried across that
-/// boundary in a cell whose `unsafe impl Send` is justified by the isolate being single-threaded.
+/// A WebAssembly isolate has no second thread, and the Workers runtime hands the client socket
+/// over through its own response slot, so nothing is asked of the callback there.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait MaybeSend: Send {}
 
@@ -91,71 +89,20 @@ pub trait MaybeSend {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> MaybeSend for T {}
 
-/// `Sync`, except on `wasm32`. The counterpart of [`MaybeSend`], for the session callback itself:
-/// the native upgrade path shares it across threads, a Worker isolate never can.
-#[cfg(not(target_arch = "wasm32"))]
-pub trait MaybeSync: Sync {}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<T: Sync + ?Sized> MaybeSync for T {}
-
-/// `Sync`, except on `wasm32` — where it asks for nothing. See [`MaybeSend`].
-#[cfg(target_arch = "wasm32")]
-pub trait MaybeSync {}
-
-#[cfg(target_arch = "wasm32")]
-impl<T: ?Sized> MaybeSync for T {}
-
-/// Carries a session across the router's `Send + Sync` bounds.
-///
-/// Native sessions already are `Send + Sync`, so this is a plain newtype there.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone)]
-struct SessionCell<S>(S);
-
-/// Carries a session across the router's `Send + Sync` bounds.
-///
-/// A wasm session is routinely `!Send`: it holds the socket's `Rc<RefCell<..>>` event closures and
-/// raw JS handles across every `await`. The bound it has to cross is not the framework's to relax
-/// — `http_kit::Endpoint` requires `Send` unconditionally, and the router's type erasure boxes
-/// every endpoint future as `dyn Send + Future` — so the session is carried through it in this
-/// cell instead of being rejected at compile time on the one target the framework exists for.
-#[cfg(target_arch = "wasm32")]
-#[derive(Clone)]
-struct SessionCell<S>(S);
-
-// SAFETY: a `wasm32` Worker (and every other WinterCG isolate Skyzen targets) is single-threaded:
-// there is no second thread for the value to be sent to or shared with, so the `Send`/`Sync` these
-// bounds ask for cannot be observed. The cell is private and never leaves this crate, so the only
-// values it ever carries are session callbacks the router immediately runs on the same isolate.
-#[cfg(target_arch = "wasm32")]
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<S> Send for SessionCell<S> {}
-
-// SAFETY: see the `Send` implementation above.
-#[cfg(target_arch = "wasm32")]
-unsafe impl<S> Sync for SessionCell<S> {}
-
 /// Build the request handler `.ws()` registers: extract the upgrade, then run `session` on the
 /// socket it produces.
-///
-/// The returned closure is what the router type-erases, so it — not the session — is what must
-/// satisfy [`Handler`](crate::handler::Handler)'s `Send + Sync + Clone + 'static`.
 pub fn session_handler<F, Fut>(
     session: F,
 ) -> impl Fn(super::WebSocketUpgrade) -> core::future::Ready<super::WebSocketUpgradeResponder>
        + Clone
-       + Send
-       + Sync
        + 'static
 where
-    F: Fn(WebSocket) -> Fut + Clone + MaybeSend + MaybeSync + 'static,
-    Fut: Future + MaybeSend + 'static,
+    F: Fn(WebSocket) -> Fut + Clone + MaybeSend + 'static,
+    Fut: Future + 'static,
     Fut::Output: IntoWebSocketOutcome + 'static,
 {
-    let session = SessionCell(session);
     move |upgrade: super::WebSocketUpgrade| {
-        let session = session.clone().0;
+        let session = session.clone();
         // The handshake is answered from the request's own headers, so there is nothing to await
         // before the responder is ready; the session itself runs after the `101` is written.
         core::future::ready(upgrade.on_upgrade(session))

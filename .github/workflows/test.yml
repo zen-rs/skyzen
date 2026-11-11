@@ -5,6 +5,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # As in ci.yml: line tables only, so every job's cache fits the repo budget.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   native:
@@ -14,20 +16,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # All features on all platforms
+          # Every feature on every platform, but OpenSSL beside HTTP/3 on Linux
+          # (.github/scripts/ci-features.sh).
           - name: Linux
             os: ubuntu-latest
-            features: "--all-features"
             targets: "--all-targets"
 
           - name: macOS
             os: macos-latest
-            features: "--all-features"
             targets: "--all-targets"
 
           - name: Windows
             os: windows-latest
-            features: "--all-features"
             targets: "--all-targets"
     steps:
       - uses: actions/checkout@v4
@@ -46,13 +46,26 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           cache-on-failure: true
 
+      - name: Select features
+        shell: bash
+        run: echo "FEATURES=$(bash .github/scripts/ci-features.sh)" >> "$GITHUB_ENV"
+
       - name: Run clippy
-        run: cargo clippy --workspace ${{ matrix.targets }} ${{ matrix.features }} -- -D warnings
+        run: cargo clippy --workspace ${{ matrix.targets }} ${{ env.FEATURES }} -- -D warnings
+
+      # The build most applications compile: code behind a feature that is off must lint too.
+      - name: Run clippy (default features)
+        run: cargo clippy --workspace ${{ matrix.targets }} -- -D warnings
 
       - uses: taiki-e/install-action@nextest
 
+      # The native TLS tests assert kernel TLS on Linux.
+      - name: Load the kernel TLS module
+        if: runner.os == 'Linux'
+        run: sudo modprobe tls
+
       - name: Run tests
-        run: cargo nextest run --workspace ${{ matrix.targets }} ${{ matrix.features }}
+        run: cargo nextest run --workspace ${{ matrix.targets }} ${{ env.FEATURES }}
 
   wasm-build:
     name: WASM Build Check
@@ -77,6 +90,28 @@ jobs:
 
       - name: Check WASM build (with ws)
         run: cargo check -p skyzen --target wasm32-unknown-unknown --no-default-features --features json,ws
+
+  wasm-clippy:
+    name: WASM Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-wasm
+          # Only dev pushes save (see ci.yml); other runs restore the
+          # default-branch entry without writing their own.
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
+
+      - name: Clippy skyzen-cloudflare (wasm32)
+        run: cargo clippy -p skyzen-cloudflare --target wasm32-unknown-unknown -- -D warnings
 
   wasm-workerd:
     name: WASM (workerd)

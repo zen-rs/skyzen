@@ -139,6 +139,31 @@ service_extractor!(
     "Durable KV store not configured. Ensure a DurableKvStore implementation is injected."
 );
 
+/// `&DurableKv` access shared by the bare handle and typed binding wrappers.
+///
+/// The bare handle is what the Cloudflare runtime injects into extensions; the wrappers are
+/// typed `Deref<Target = DurableKv>` bindings. Consumers bound on this trait rather than
+/// `Deref` and accept both.
+pub trait AsDurableKv {
+    /// The underlying handle.
+    fn as_durable_kv(&self) -> &DurableKv;
+}
+
+impl AsDurableKv for DurableKv {
+    fn as_durable_kv(&self) -> &DurableKv {
+        self
+    }
+}
+
+impl<T> AsDurableKv for T
+where
+    T: core::ops::Deref<Target = DurableKv>,
+{
+    fn as_durable_kv(&self) -> &DurableKv {
+        self
+    }
+}
+
 impl DurableKv {
     /// Create a new `DurableKv` from any [`DurableKvStore`] implementation.
     pub fn new(store: impl DurableKvStore) -> Self {
@@ -409,7 +434,7 @@ mod tests {
         user: String,
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn wrapper_supports_crud_listing_and_json_helpers() {
         let kv = DurableKv::new(InMemoryDurableKvStore::default());
 
@@ -474,7 +499,7 @@ mod tests {
         assert!(remaining.is_empty(), "{remaining:?}");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn get_json_surfaces_deserialization_errors() {
         let kv = DurableKv::new(InMemoryDurableKvStore::default());
         kv.put("session", b"not-json").await.unwrap();
@@ -484,7 +509,7 @@ mod tests {
         assert!(matches!(error, DurableKvError::Serialization(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn middleware_injects_durable_kv_for_downstream_endpoint_and_extractor() {
         let store = InMemoryDurableKvStore::default();
         store.put("message", b"hello").await.unwrap();
@@ -504,7 +529,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn extractor_returns_internal_server_error_when_durable_kv_is_missing() {
         let mut request = http_kit::Request::new(Body::empty());
 

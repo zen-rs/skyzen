@@ -159,6 +159,22 @@ impl SqsQueue {
         Self::new(Self::env_client().await, queue_url)
     }
 
+    /// Create a `SqsQueue` for a standard queue whose client is built from `config`.
+    ///
+    /// Clients built from one configuration share its credentials provider and cache; see
+    /// [`crate::sdk::load_config`].
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError::Backend`] when `queue_url` names a FIFO queue — see
+    /// [`new`](SqsQueue::new).
+    pub fn from_config(
+        config: &crate::sdk::SdkConfig,
+        queue_url: impl Into<String>,
+    ) -> Result<Self, QueueError> {
+        Self::new(Client::new(config), queue_url)
+    }
+
     /// Create a `SqsQueue` for a FIFO queue from environment configuration.
     ///
     /// # Errors
@@ -170,6 +186,21 @@ impl SqsQueue {
         message_group_id: impl Into<String>,
     ) -> Result<Self, QueueError> {
         Self::fifo(Self::env_client().await, queue_url, message_group_id)
+    }
+
+    /// This queue with its requests sent through `http`, its client otherwise configured as it
+    /// was — credentials, region, endpoint, retries.
+    ///
+    /// How a thread gets a client whose connections it owns: build the queue once and rebind a
+    /// clone on each thread with [`crate::sdk::ZenwaveHttpClient::system_on_current_thread`].
+    #[must_use]
+    pub fn with_http_client(
+        mut self,
+        http: impl aws_sdk_sqs::config::HttpClient + 'static,
+    ) -> Self {
+        self.client =
+            Client::from_conf(self.client.config().to_builder().http_client(http).build());
+        self
     }
 
     /// Send `message_group_id` with every message, making this a FIFO queue.
@@ -210,9 +241,10 @@ impl SqsQueue {
         Ok(self)
     }
 
-    /// The default SDK client, built from environment configuration.
+    /// The default SDK client, built from the ambient configuration [`crate::sdk::load_config`]
+    /// loads on [`crate::sdk::ZenwaveHttpClient::system`].
     async fn env_client() -> Client {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = crate::sdk::load_config(crate::sdk::ZenwaveHttpClient::system()).await;
         Client::new(&config)
     }
 
@@ -736,6 +768,7 @@ mod tests {
                 .behavior_version(BehaviorVersion::latest())
                 .region(Region::new("us-east-1"))
                 .credentials_provider(Credentials::new("AKIDTEST", "secret", None, None, "tests"))
+                .sleep_impl(crate::sdk::AsyncIoSleep)
                 .build(),
         )
     }
@@ -1059,7 +1092,7 @@ mod tests {
         assert!(retry_visibility_seconds(QueueRetry::new().with_delay_seconds(u32::MAX)).is_err());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_fifo_queue_refuses_a_per_message_delay() {
         use skyzen_services::queue::{MessageQueue, SendOptions};
 

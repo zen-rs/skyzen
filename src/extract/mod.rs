@@ -14,9 +14,18 @@ mod typed_header;
 pub use typed_header::{TypedHeader, TypedHeaderError};
 
 pub mod client_ip;
-pub use client_ip::{ClientIp, PeerAddr};
+pub use client_ip::{ClientIp, PeerAddr, TrustedProxies};
 
 #[cfg(feature = "auth")]
 pub mod auth;
 #[cfg(feature = "auth")]
 pub use auth::BearerToken;
+
+#[cfg(feature = "validate")]
+mod valid;
+#[cfg(feature = "validate")]
+pub use valid::{
+    FieldViolation, Valid, ValidContext, ValidRejection, ValidatePayload, ValidationRejection,
+};
+mod preconditions;
+pub use preconditions::{PreconditionFailed, PreconditionRequired, Preconditions};

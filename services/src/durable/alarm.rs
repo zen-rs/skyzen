@@ -171,7 +171,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn wrapper_supports_set_get_and_delete_alarm() {
         let alarm = Alarm::new(InMemoryAlarmScheduler::default());
 
@@ -182,7 +182,7 @@ mod tests {
         assert_eq!(alarm.get_alarm().await.unwrap(), None);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn middleware_injects_alarm_for_downstream_endpoint_and_extractor() {
         let scheduler = InMemoryAlarmScheduler::default();
         scheduler.set_alarm(1337).await.unwrap();
@@ -199,7 +199,7 @@ mod tests {
         assert_eq!(extracted.get_alarm().await.unwrap(), Some(1337));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn extractor_returns_internal_server_error_when_alarm_is_missing() {
         let mut request = http_kit::Request::new(Body::empty());
 

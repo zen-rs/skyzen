@@ -156,7 +156,7 @@ mod tests {
     }
 
     /// Pins the documented contract: `start` is **exclusive**.
-    #[tokio::test]
+    #[compio::test]
     async fn list_start_bound_is_exclusive() {
         let kv = seeded().await;
         let entries = kv
@@ -170,7 +170,7 @@ mod tests {
     }
 
     /// Pins the documented contract: `end` is **exclusive**.
-    #[tokio::test]
+    #[compio::test]
     async fn list_end_bound_is_exclusive() {
         let kv = seeded().await;
         let entries = kv
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(keys(entries), vec!["a", "b"]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_reverse_returns_descending_order() {
         let kv = seeded().await;
         let entries = kv
@@ -198,7 +198,7 @@ mod tests {
 
     /// `limit` applies after ordering, so a reverse listing keeps the
     /// **highest** keys.
-    #[tokio::test]
+    #[compio::test]
     async fn list_limit_truncates_after_ordering() {
         let kv = seeded().await;
 
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(keys(descending), vec!["d", "c"]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_combines_prefix_bounds_and_reverse() {
         let kv = InMemoryDurableKv::new();
         for key in ["p:1", "p:2", "p:3", "q:1"] {

@@ -2,13 +2,14 @@
 //! HTTP/1.1 client and assert on the bytes that actually go over the wire.
 
 use core::future::Future;
-use executor_core::smol::SmolGlobal;
 use http_kit::error::BoxHttpError;
 use http_kit::{http_error, Body, Request, Response, StatusCode};
+use http_kit_io::{async_io::AsyncIo, Io};
 use skyzen_core::{Endpoint, Server};
 use skyzen_hyper::Hyper;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
-use smol::net::{SocketAddr, TcpListener, TcpStream};
+use smol::net::{SocketAddr, TcpStream};
+use std::rc::Rc;
 
 http_error!(
     /// Client error whose message must reach the client.
@@ -25,8 +26,12 @@ http_error!(
 );
 
 /// Trivial endpoint covering a fixed-size success body, a 4xx error, and a 5xx error.
+///
+/// It holds an `Rc`, so it is `!Send`: the server drives it on the thread that built it.
 #[derive(Clone)]
-struct TestEndpoint;
+struct TestEndpoint {
+    greeting: Rc<str>,
+}
 
 impl Endpoint for TestEndpoint {
     type Error = BoxHttpError;
@@ -34,37 +39,36 @@ impl Endpoint for TestEndpoint {
     fn respond(
         &mut self,
         request: &mut Request,
-    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Response, Self::Error>> {
         core::future::ready(match request.uri().path() {
-            "/hello" => Ok(Response::new(Body::from_bytes("hello world"))),
+            "/hello" => Ok(Response::new(Body::from(self.greeting.to_string()))),
             "/teapot" => Err(Box::new(TeapotError::new()) as Self::Error),
             _ => Err(Box::new(SecretDbError::new()) as Self::Error),
         })
     }
 }
 
-/// Bind a localhost listener, spawn `Hyper::serve` on it, and return the bound address.
-async fn start_server() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test listener");
+/// Bind a localhost listener, serve it with `Hyper` on a thread of its own, and return the bound
+/// address. The endpoint is built on that thread, as a thread-per-core runtime builds its router.
+fn start_server() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("local addr");
 
-    let connections = Box::pin(futures_util::stream::unfold(
-        listener,
-        |listener| async move {
-            let result = listener.accept().await.map(|(stream, _)| stream);
-            Some((result, listener))
-        },
-    ));
-
-    smol::spawn(Hyper.serve(
-        SmolGlobal,
-        |error: std::io::Error| panic!("accept failed: {error}"),
-        connections,
-        TestEndpoint,
-    ))
-    .detach();
+    std::thread::spawn(move || {
+        let executor = Rc::new(async_executor::LocalExecutor::new());
+        let listener = AsyncIo.tcp_listener(listener).expect("register listener");
+        let endpoint = TestEndpoint {
+            greeting: Rc::from("hello world"),
+        };
+        let serve = Hyper.serve(
+            AsyncIo,
+            Rc::clone(&executor),
+            listener,
+            endpoint,
+            core::future::pending(),
+        );
+        futures_lite::future::block_on(executor.run(serve));
+    });
 
     addr
 }
@@ -105,7 +109,7 @@ fn header_value<'a>(headers: &'a [String], name: &str) -> Option<&'a str> {
 #[test]
 fn fixed_size_response_has_content_length() {
     smol::block_on(async {
-        let addr = start_server().await;
+        let addr = start_server();
         let (status_line, headers, body) = raw_get(addr, "/hello").await;
 
         assert!(status_line.starts_with("HTTP/1.1 200"), "{status_line}");
@@ -118,7 +122,7 @@ fn fixed_size_response_has_content_length() {
 #[test]
 fn server_error_body_is_redacted_json() {
     smol::block_on(async {
-        let addr = start_server().await;
+        let addr = start_server();
         let (status_line, headers, body) = raw_get(addr, "/boom").await;
 
         assert!(status_line.starts_with("HTTP/1.1 500"), "{status_line}");
@@ -137,7 +141,7 @@ fn server_error_body_is_redacted_json() {
 #[test]
 fn client_error_keeps_its_message() {
     smol::block_on(async {
-        let addr = start_server().await;
+        let addr = start_server();
         let (status_line, headers, body) = raw_get(addr, "/teapot").await;
 
         assert!(status_line.starts_with("HTTP/1.1 418"), "{status_line}");

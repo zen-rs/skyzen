@@ -2,9 +2,13 @@
 //!
 //! A middleware observes a request on its way in, decides whether the rest of the chain runs, and
 //! post-processes whatever comes back. Unlike the `http-kit` trait it replaces, [`Middleware`]
-//! takes `&self`: the router stores every middleware behind an [`Arc`] and never clones it per
+//! takes `&self`: the router stores every middleware behind an [`Rc`] and never clones it per
 //! request, so a counter, a rate limiter or a connection cache written the obvious way actually
 //! keeps its state across requests.
+//!
+//! Nothing here is `Send`. A router lives on the thread that built it — each serving thread builds
+//! its own from a `Send` factory — so a middleware may hold an `Rc` or a `Cell`, and the future it
+//! returns may keep them across an `.await`.
 //!
 //! ```rust
 //! use core::sync::atomic::{AtomicUsize, Ordering};
@@ -46,7 +50,7 @@
 //! });
 //! ```
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, vec::Vec};
 use core::{
     any::{type_name, TypeId},
     fmt::{self, Debug},
@@ -59,14 +63,16 @@ use http_kit::{Endpoint, Request, Response};
 use crate::error::Error;
 
 /// A boxed future produced by the object-safe halves of the middleware machinery.
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+///
+/// It is not `Send`: a middleware chain runs on the thread that built its router.
+pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Processes a request on its way to the endpoint and the response on its way back.
 ///
 /// Implementors take `&self`, so a middleware value is shared by every request that passes through
-/// it. Keep mutable state in an atomic, a lock-free structure or a channel rather than in `&mut
+/// it on its thread. Keep mutable state in a `Cell`, an atomic or a channel rather than in `&mut
 /// self`, which this trait deliberately does not offer.
-pub trait Middleware: Send + Sync + 'static {
+pub trait Middleware: 'static {
     /// Handle one request, optionally running the rest of the chain via [`Next::run`].
     ///
     /// # Errors
@@ -76,7 +82,7 @@ pub trait Middleware: Send + Sync + 'static {
         &self,
         request: &mut Request,
         next: Next<'_>,
-    ) -> impl Future<Output = Result<Response, Error>> + Send;
+    ) -> impl Future<Output = Result<Response, Error>>;
 
     /// Types this middleware inserts into the request, for build-time wiring validation.
     ///
@@ -93,12 +99,12 @@ pub trait Middleware: Send + Sync + 'static {
 ///
 /// Blanket-implemented for every [`Middleware`]; never implement it directly.
 #[doc(hidden)]
-pub trait MiddlewareObj: Send + Sync + 'static {
+pub trait MiddlewareObj: 'static {
     fn handle_dyn<'a>(
         &'a self,
         request: &'a mut Request,
         next: Next<'a>,
-    ) -> BoxFuture<'a, Result<Response, Error>>;
+    ) -> LocalBoxFuture<'a, Result<Response, Error>>;
 
     fn provisions_dyn(&self) -> Vec<TypeId>;
 
@@ -110,7 +116,7 @@ impl<T: Middleware> MiddlewareObj for T {
         &'a self,
         request: &'a mut Request,
         next: Next<'a>,
-    ) -> BoxFuture<'a, Result<Response, Error>> {
+    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
         Box::pin(self.handle(request, next))
     }
 
@@ -123,13 +129,13 @@ impl<T: Middleware> MiddlewareObj for T {
     }
 }
 
-/// A middleware stored behind a trait object, ready to be shared across requests.
-pub type BoxMiddleware = Arc<dyn MiddlewareObj>;
+/// A middleware stored behind a trait object, shared by the requests its thread serves.
+pub type BoxMiddleware = Rc<dyn MiddlewareObj>;
 
 /// Wrap a middleware for storage in a chain.
 #[must_use]
 pub fn boxed(middleware: impl Middleware) -> BoxMiddleware {
-    Arc::new(middleware)
+    Rc::new(middleware)
 }
 
 /// The innermost step of a middleware chain: whatever produces the response once every
@@ -138,8 +144,11 @@ pub fn boxed(middleware: impl Middleware) -> BoxMiddleware {
 /// Implemented by the router (route matching plus the endpoint) and by
 /// endpoint adapters; never implement it directly.
 #[doc(hidden)]
-pub trait Dispatch: Send + Sync {
-    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>>;
+pub trait Dispatch {
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a mut Request,
+    ) -> LocalBoxFuture<'a, Result<Response, Error>>;
 }
 
 /// The remainder of a middleware chain.
@@ -209,7 +218,7 @@ pub async fn apply<M, E>(
 ) -> Result<Response, Error>
 where
     M: Middleware,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
 {
     let terminal = CloneEndpoint(endpoint);
     middleware.handle(request, Next::new(&[], &terminal)).await
@@ -220,9 +229,12 @@ struct CloneEndpoint<E>(E);
 
 impl<E> Dispatch for CloneEndpoint<E>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
 {
-    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a mut Request,
+    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
             let mut endpoint = self.0.clone();
             endpoint.respond(request).await.map_err(Error::from)
@@ -236,17 +248,12 @@ where
 /// return type and cannot name a different anonymous future per request lifetime. Write the body
 /// as `Box::pin(async move { .. })`; to reuse an existing `async fn`, wrap the call the same way.
 pub trait MiddlewareFn:
-    for<'a> Fn(&'a mut Request, Next<'a>) -> BoxFuture<'a, Result<Response, Error>>
-    + Send
-    + Sync
-    + 'static
+    for<'a> Fn(&'a mut Request, Next<'a>) -> LocalBoxFuture<'a, Result<Response, Error>> + 'static
 {
 }
 
 impl<F> MiddlewareFn for F where
-    F: for<'a> Fn(&'a mut Request, Next<'a>) -> BoxFuture<'a, Result<Response, Error>>
-        + Send
-        + Sync
+    F: for<'a> Fn(&'a mut Request, Next<'a>) -> LocalBoxFuture<'a, Result<Response, Error>>
         + 'static
 {
 }
@@ -255,7 +262,7 @@ impl<F> MiddlewareFn for F where
 ///
 /// The closure receives the request and the rest of the chain, exactly like
 /// [`Middleware::handle`]. Because the value is shared rather than cloned per request, a closure
-/// capturing an `Arc` of shared state behaves the way it reads.
+/// capturing an `Rc` or an `Arc` of shared state behaves the way it reads.
 ///
 /// ```rust
 /// use skyzen_core::middleware::{from_fn, Next};
@@ -288,7 +295,7 @@ impl<F: MiddlewareFn> Middleware for FromFn<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::{boxed, from_fn, BoxFuture, BoxMiddleware, Dispatch, Middleware, Next};
+    use super::{boxed, from_fn, BoxMiddleware, Dispatch, LocalBoxFuture, Middleware, Next};
     use crate::error::Error;
     use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -301,7 +308,7 @@ mod tests {
         fn dispatch<'a>(
             &'a self,
             _request: &'a mut Request,
-        ) -> BoxFuture<'a, Result<Response, Error>> {
+        ) -> LocalBoxFuture<'a, Result<Response, Error>> {
             Box::pin(async { Ok(Response::new(Body::from("ok"))) })
         }
     }

@@ -238,7 +238,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn execute_validates_placeholder_count() {
         let db = DurableDb::new(RecordingBackend);
         let error = db
@@ -256,7 +256,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn matching_placeholder_count_executes() {
         let db = DurableDb::new(RecordingBackend);
         db.query("INSERT INTO t (a) VALUES (?)")
@@ -328,11 +328,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn sync_stays_pending_until_the_backend_barrier_resolves() {
         let (backend, mut entered_rx, release_tx) = GatedBackend::pair();
         let db = DurableDb::new(backend);
-        let handle = tokio::spawn(async move { db.sync().await });
+        let handle = compio::runtime::spawn(async move { db.sync().await });
 
         entered_rx
             .recv()
@@ -352,10 +352,10 @@ mod tests {
             .expect("sync should resolve once the barrier releases");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn sync_propagates_the_backend_failure() {
         let (backend, mut entered_rx, release_tx) = GatedBackend::pair();
-        let handle = tokio::spawn(async move { DurableDb::new(backend).sync().await });
+        let handle = compio::runtime::spawn(async move { DurableDb::new(backend).sync().await });
 
         entered_rx
             .recv()

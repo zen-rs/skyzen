@@ -3,12 +3,13 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     fmt::{Debug, Formatter},
+    rc::Rc,
     sync::Arc,
 };
 
 use super::{
-    join_path, BoxEndpoint, EndpointFactory, MethodFilter, NestedRouter, Params, Route, RouteNode,
-    RouteNodeType,
+    join_path, BoxEndpoint, EndpointFactory, MatchedPath, MethodFilter, MountPrefix, Mounted,
+    Params, Route, RouteNode, RouteNodeType,
 };
 #[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
@@ -19,7 +20,7 @@ use http_kit::http_error;
 use matchit::Match;
 use skyzen_core::{
     error_response,
-    middleware::{boxed, BoxFuture, BoxMiddleware, Dispatch, Middleware, Next},
+    middleware::{boxed, BoxMiddleware, Dispatch, LocalBoxFuture, Middleware, Next},
     Error, Extractor, RequestBodyLimit, Requirement,
 };
 use tracing::debug;
@@ -52,13 +53,20 @@ struct MethodTable {
     entries: Vec<(Method, App)>,
     /// Handler registered with `.any`, answering whatever the exact entries do not.
     any: Option<App>,
+    /// The route template this table was registered under, e.g. `"/users/{id}"` —
+    /// `matchit` reports params but not the pattern that produced them, so the router
+    /// keeps it to expose as [`MatchedPath`].
+    path: Arc<str>,
 }
 
 /// Chain terminal that serves a request from a freshly built endpoint.
 struct FactoryDispatch<'a>(&'a EndpointFactory);
 
 impl Dispatch for FactoryDispatch<'_> {
-    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a mut Request,
+    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
             let mut endpoint = (self.0)();
             endpoint.respond(request).await.map_err(Error::from)
@@ -70,15 +78,20 @@ impl Dispatch for FactoryDispatch<'_> {
 struct MatchDispatch<'r>(&'r Router);
 
 impl Dispatch for MatchDispatch<'_> {
-    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a mut Request,
+    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
         Box::pin(self.0.dispatch_matched(request))
     }
 }
 
 /// An HTTP router returned by [`Route::build`](crate::routing::Route::build).
 ///
-/// `Router` stores its routing tree inside an [`Arc`], so it can be cloned cheaply and shared
-/// across threads.
+/// `Router` stores its routing tree behind an [`Rc`], so a clone is cheap. It is not `Send`: its
+/// handlers, middleware and their state may hold `Rc`s, so a router lives on the thread that built
+/// it. A server running on several threads builds one router per thread from a `Send` factory —
+/// see [`Server`](skyzen_core::Server).
 ///
 /// ```
 /// use skyzen::{routing::{CreateRouteNode, Route, Router}, Result};
@@ -93,17 +106,16 @@ impl Dispatch for MatchDispatch<'_> {
 /// ```
 #[derive(Clone)]
 pub struct Router {
-    inner: Arc<matchit::Router<MethodTable>>,
+    inner: Rc<matchit::Router<MethodTable>>,
     /// Middleware wrapping the entire dispatch, outermost first.
-    layers: Arc<Vec<BoxMiddleware>>,
+    layers: Rc<Vec<BoxMiddleware>>,
     fallback: Option<EndpointFactory>,
     method_not_allowed: Option<EndpointFactory>,
-    routes: Arc<Vec<(MethodFilter, String)>>,
-    already_router_enabled: bool,
+    routes: Rc<Vec<(MethodFilter, String)>>,
     /// Optional alarm handler for Durable Object alarm events.
     pub(crate) alarm_handler: Option<EndpointFactory>,
     #[cfg(feature = "openapi")]
-    openapi_entries: Arc<Vec<RouteOpenApiEntry>>,
+    openapi_entries: Rc<Vec<RouteOpenApiEntry>>,
 }
 
 #[allow(clippy::missing_fields_in_debug)] // the endpoint factories have nothing to render
@@ -115,7 +127,6 @@ impl Debug for Router {
             .field("layers", &self.layers.len())
             .field("has_fallback", &self.fallback.is_some())
             .field("has_method_not_allowed", &self.method_not_allowed.is_some())
-            .field("already_router_enabled", &self.already_router_enabled)
             .field("has_alarm_handler", &self.alarm_handler.is_some());
         #[cfg(feature = "openapi")]
         {
@@ -187,9 +198,15 @@ enum RouteLookup<'app> {
         app: &'app App,
         head_fallback: bool,
         params: Vec<(String, String)>,
+        /// The route template the matchit match came from.
+        path: &'app Arc<str>,
     },
     /// The path matched but no registered method did.
-    MethodNotAllowed(Vec<Method>),
+    MethodNotAllowed {
+        allow: Vec<Method>,
+        /// The route template the path match came from.
+        path: &'app Arc<str>,
+    },
     /// No route matched the path.
     Unmatched,
 }
@@ -221,7 +238,10 @@ impl Router {
             .or_else(|| value.any.as_ref().map(|app| (app, false)));
 
         found.map_or_else(
-            || RouteLookup::MethodNotAllowed(allowed_methods(&value.entries)),
+            || RouteLookup::MethodNotAllowed {
+                allow: allowed_methods(&value.entries),
+                path: &value.path,
+            },
             |(app, head_fallback)| RouteLookup::Endpoint {
                 app,
                 head_fallback,
@@ -229,6 +249,7 @@ impl Router {
                     .iter()
                     .map(|(key, value)| (key.to_owned(), percent_decode(value)))
                     .collect(),
+                path: &value.path,
             },
         )
     }
@@ -244,7 +265,10 @@ impl Router {
                 app,
                 head_fallback,
                 params,
+                path,
             } => {
+                let matched = Self::matched_path(request, path);
+                request.extensions_mut().insert(matched);
                 request.extensions_mut().insert(Params::new(params));
                 let mut response = app.run(request).await?;
                 if head_fallback {
@@ -252,7 +276,9 @@ impl Router {
                 }
                 Ok(response)
             }
-            RouteLookup::MethodNotAllowed(allow) => {
+            RouteLookup::MethodNotAllowed { allow, path } => {
+                let matched = Self::matched_path(request, path);
+                request.extensions_mut().insert(matched);
                 let allow = AllowedMethods(allow);
                 match &self.method_not_allowed {
                     Some(factory) => {
@@ -269,6 +295,22 @@ impl Router {
         }
     }
 
+    /// The `MatchedPath` to record for `path` — prefix-joined when the request reached this
+    /// router through a nested mount, so inner handlers extract the complete route template
+    /// (`/api` + `/users/{id}`), not the inner fragment.
+    fn matched_path(request: &Request, path: &Arc<str>) -> MatchedPath {
+        request.extensions().get::<MountPrefix>().map_or_else(
+            || MatchedPath::new(Arc::clone(path)),
+            |prefix| {
+                MatchedPath::new(if &**path == "/" {
+                    prefix.0.clone()
+                } else {
+                    join_path(&prefix.0, path)
+                })
+            },
+        )
+    }
+
     async fn call(&self, request: &mut Request) -> Result<Response, Error> {
         debug!(
             method = request.method().as_str(),
@@ -276,9 +318,6 @@ impl Router {
             "request received"
         );
 
-        if self.already_router_enabled {
-            request.extensions_mut().insert(self.clone());
-        }
         // Insert-if-absent: a router mounted as an endpoint inside another router must not clear
         // the outer router's `BodyLimit`.
         if request.extensions().get::<RequestBodyLimit>().is_none() {
@@ -314,7 +353,7 @@ impl Router {
     /// wiring validation [`Route::try_build`](crate::routing::Route::try_build) performs.
     #[must_use]
     pub fn layer<M: Middleware>(mut self, middleware: M) -> Self {
-        Arc::make_mut(&mut self.layers).insert(0, boxed(middleware));
+        Rc::make_mut(&mut self.layers).insert(0, boxed(middleware));
         self
     }
 
@@ -322,16 +361,6 @@ impl Router {
     #[must_use]
     pub fn routes(&self) -> &[(MethodFilter, String)] {
         &self.routes
-    }
-
-    /// Enable extraction of the current router through [`Extractor`](skyzen_core::Extractor).
-    ///
-    /// When enabled, the router instance is stored in the request extensions for each call and can
-    /// be retrieved inside handlers via `Router::extract(request).await`.
-    #[must_use]
-    pub const fn enable_programmable_router(mut self) -> Self {
-        self.already_router_enabled = true;
-        self
     }
 
     /// Build an [`OpenApi`] definition containing every route registered on this router.
@@ -426,23 +455,6 @@ const fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-http_error!(pub RouterNotExist, StatusCode::INTERNAL_SERVER_ERROR, "Router not available in request extensions. Call `enable_programmable_router()` when building the route.");
-
-impl Extractor for Router {
-    type Error = RouterNotExist;
-    // Reading the router back out of the extensions is a synchronous clone, so the future is ready
-    // on creation rather than an `async` block with nothing to await.
-    fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
-        ready(
-            request
-                .extensions()
-                .get::<Self>()
-                .cloned()
-                .ok_or(RouterNotExist::new()),
-        )
-    }
-}
-
 /// Errors produced when constructing a [`Router`] from a [`Route`](crate::routing::Route).
 #[derive(Debug)]
 #[non_exhaustive]
@@ -464,8 +476,8 @@ pub enum RouteBuildError {
         /// The path as the route tree assembled it.
         path: String,
     },
-    /// A router was mounted under a prefix containing a pattern segment.
-    NestedPatternPrefix {
+    /// A router or endpoint was mounted under a prefix containing a pattern segment.
+    MountPatternPrefix {
         /// The mount prefix that cannot be stripped.
         path: String,
     },
@@ -498,9 +510,9 @@ impl std::fmt::Display for RouteBuildError {
                 "route path `{path}` cannot match any request: every mount prefix must start \
                  with `/`"
             ),
-            Self::NestedPatternPrefix { path } => write!(
+            Self::MountPatternPrefix { path } => write!(
                 f,
-                "a router cannot be mounted at `{path}`: the prefix is removed from the request \
+                "nothing can be mounted at `{path}`: the prefix is removed from the request \
                  path literally, so it must not contain a `{{name}}` segment"
             ),
             Self::MissingProvision {
@@ -599,29 +611,56 @@ fn flatten(
                 // The prefix is removed from the raw request path by string comparison, so a
                 // pattern segment in it would leave no stable prefix to remove.
                 if path.contains('{') {
-                    return Err(RouteBuildError::NestedPatternPrefix { path });
+                    return Err(RouteBuildError::MountPatternPrefix { path });
                 }
 
                 #[cfg(feature = "openapi")]
                 openapi_entries.extend(super::prefixed_openapi_entries(&path, &router));
 
-                let nested = NestedRouter::new(&path, router);
+                let nested = Mounted::new(Arc::from(path.as_str()), router);
                 // The mount point itself and everything beneath it, for every method: the inner
                 // router decides which of them it answers, including its own 404 and 405.
-                for mounted in [path.clone(), join_path(&path, "/{*skyzen_nested}")] {
-                    let endpoint = nested.clone();
-                    buf.entry(mounted).or_default().push(FlatEndpoint {
-                        method: MethodFilter::Any,
-                        factory: Arc::new(move || BoxEndpoint::new(endpoint.clone())),
-                        middleware: middleware.clone(),
-                        requirements: Vec::new(),
-                    });
+                mount(&path, buf, &middleware, move || {
+                    BoxEndpoint::new(nested.clone())
+                });
+            }
+            RouteNodeType::Mounted {
+                endpoint_factory,
+                middleware,
+            } => {
+                if !path.starts_with('/') {
+                    return Err(RouteBuildError::InvalidPath { path });
                 }
+                if path.contains('{') {
+                    return Err(RouteBuildError::MountPatternPrefix { path });
+                }
+                let prefix: Arc<str> = Arc::from(path.as_str());
+                mount(&path, buf, &middleware, move || {
+                    BoxEndpoint::new(Mounted::new(Arc::clone(&prefix), endpoint_factory()))
+                });
             }
         }
     }
 
     Ok(())
+}
+
+/// Register `factory` at `path` and at every path beneath it, for every method.
+fn mount(
+    path: &str,
+    buf: &mut FlattenBuf,
+    middleware: &[BoxMiddleware],
+    factory: impl Fn() -> BoxEndpoint + 'static,
+) {
+    let factory: EndpointFactory = Rc::new(factory);
+    for mounted in [path.to_owned(), join_path(path, "/{*skyzen_nested}")] {
+        buf.entry(mounted).or_default().push(FlatEndpoint {
+            method: MethodFilter::Any,
+            factory: Rc::clone(&factory),
+            middleware: middleware.to_vec(),
+            requirements: Vec::new(),
+        });
+    }
 }
 
 /// Build a [`Router`] from the provided [`Route`].
@@ -677,15 +716,14 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     });
 
     Ok(Router {
-        inner: Arc::new(matcher),
-        layers: Arc::new(layers),
+        inner: Rc::new(matcher),
+        layers: Rc::new(layers),
         fallback: fallback.map(|entry| entry.factory),
         method_not_allowed: method_not_allowed.map(|entry| entry.factory),
-        routes: Arc::new(routes),
-        already_router_enabled: false,
+        routes: Rc::new(routes),
         alarm_handler: None,
         #[cfg(feature = "openapi")]
-        openapi_entries: Arc::new(openapi_entries),
+        openapi_entries: Rc::new(openapi_entries),
     })
 }
 
@@ -696,7 +734,10 @@ fn build_method_table(
     global_provisions: &HashSet<std::any::TypeId>,
     routes: &mut Vec<(MethodFilter, String)>,
 ) -> Result<MethodTable, RouteBuildError> {
-    let mut table = MethodTable::default();
+    let mut table = MethodTable {
+        path: Arc::from(path),
+        ..MethodTable::default()
+    };
     let mut seen = HashSet::new();
 
     for endpoint in endpoints {
@@ -1684,11 +1725,58 @@ mod tests {
         }
     }
 
+    /// Answers with the method and the URI it was handed.
+    #[derive(Clone)]
+    struct UriEcho;
+
+    impl crate::Endpoint for UriEcho {
+        type Error = std::convert::Infallible;
+        fn respond(
+            &mut self,
+            request: &mut crate::Request,
+        ) -> impl core::future::Future<Output = std::result::Result<crate::Response, Self::Error>>
+        {
+            core::future::ready(Ok(crate::Response::new(crate::Body::from(format!(
+                "{} {}",
+                request.method(),
+                request.uri()
+            )))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mounted_endpoint_answers_every_method_beneath_its_prefix() {
+        let router = build(Route::new(("/api".mount(UriEcho),))).unwrap();
+
+        for (method, path, seen) in [
+            (Method::GET, "/api/users?page=2", "GET /users?page=2"),
+            (Method::DELETE, "/api/users/7", "DELETE /users/7"),
+            (Method::PATCH, "/api", "PATCH /"),
+        ] {
+            let response = router
+                .clone()
+                .go(request_with_method(path, method))
+                .await
+                .unwrap();
+            let body = response.into_body().into_string().await.unwrap();
+            assert_eq!(body, seen);
+        }
+
+        let missed = router.clone().go(get_request("/apix")).await.unwrap();
+        assert_eq!(missed.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn an_endpoint_cannot_be_mounted_under_a_pattern_prefix() {
+        let error = build(Route::new(("/tenants/{tenant}".mount(UriEcho),))).unwrap_err();
+        assert!(matches!(error, RouteBuildError::MountPatternPrefix { .. }));
+    }
+
     #[test]
     fn a_router_cannot_be_mounted_under_a_pattern_prefix() {
         let inner = build(Route::new(("/x".at(|| async { Result::Ok("x") }),))).unwrap();
         let error = build(Route::new(("/tenants/{tenant}".nest(inner),))).unwrap_err();
-        assert!(matches!(error, RouteBuildError::NestedPatternPrefix { .. }));
+        assert!(matches!(error, RouteBuildError::MountPatternPrefix { .. }));
     }
 
     #[test]

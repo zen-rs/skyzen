@@ -149,6 +149,25 @@ where
     }
 }
 
+/// Return the error responses an extractor declares, if `OpenAPI` metadata is available.
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
+pub fn extractor_responses_of<T>() -> Option<Vec<ResponseSchema>>
+where
+    T: Extractor,
+{
+    #[cfg(feature = "openapi")]
+    {
+        <T as Extractor>::openapi_responses()
+    }
+
+    #[cfg(not(feature = "openapi"))]
+    {
+        let _ = core::marker::PhantomData::<T>;
+        None
+    }
+}
+
 /// Return the responder schemas for `T` if it exposes `OpenAPI` metadata.
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
@@ -824,7 +843,7 @@ impl Endpoint for OpenApiUiEndpoint {
     fn respond(
         &mut self,
         _request: &mut Request,
-    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Response, Self::Error>> {
         let content_type = self.content_type;
         ready(self.body.as_ref().map_or_else(
             || Err(OpenApiUiDisabledError::new()),

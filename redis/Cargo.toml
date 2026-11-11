@@ -13,16 +13,39 @@ categories = ["web-programming::http-server", "database"]
 skyzen-services = { path = "../services", version = "0.3.1", default-features = false }
 # `script` is what `compare_and_swap` runs on: Redis has no compare-and-swap command, and a
 # GET/SET pair is not atomic. It brings in `sha1_smol` for the EVALSHA cache key.
-redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "script"], optional = true }
+#
+# `smol-comp` is redis's runtime-neutral runtime: its sockets and timers are async-io's, which keeps
+# a reactor thread of its own, so the connection manager works under whatever executor polls it —
+# compio's thread-per-core runtime included — with no tokio context. redis's connection must be
+# `Send` (its driver is a spawned task), so it cannot live on a thread-per-core driver.
+redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "script", "smol-comp"] }
+# Upstream `tls-rustls` deliberately enables no crypto provider — `rustls/std` and
+# system roots only — so without this dep a `rediss://` URL parses but
+# `ClientConfig::builder()` panics at connect. Cargo feature unification hands
+# the provider to the same `rustls` package redis links; aws-lc-rs matches the
+# rest of the workspace.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "aws_lc_rs"] }
 
 [features]
-default = ["runtime-tokio"]
-# User selects async runtime in their application. The `redis` dependency is
-# only pulled in once a runtime is picked: `redis`'s `aio` support does not
-# compile without one of its `*-comp` features, so with neither runtime
-# selected this crate compiles to an empty shell instead of failing to build.
-runtime-tokio = ["dep:redis", "redis/tokio-comp"]
-runtime-smol = ["dep:redis", "redis/smol-comp"]
+# `rediss://` URLs negotiate TLS through rustls, on the same smol runtime. rustls only, matching
+# the rest of the workspace; there is no `native-tls` variant.
+tls = ["dep:rustls", "redis/smol-rustls-comp"]
+
+[dev-dependencies]
+# Enables `ring` alongside `aws_lc_rs` on the shared `rustls` in test builds, so
+# the provider test lives in the multi-provider world a consumer can land in —
+# where a bare `ClientConfig::builder()` panics without an installed default.
+# `--no-dev-deps` builds are unaffected.
+rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.14"
+# The tests run on a compio runtime, the one the native server runs; tokio is here only to assert
+# that no tokio runtime is running.
+compio = { version = "0.19.2", default-features = false, features = ["runtime", "time", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# `tls-rustls-insecure` lets the handshake test accept a self-signed peer via
+# `rediss://…#insecure`; verification stays on for every other URL. Upstream `tls-rustls` requires
+# a rustls comp for the enabled runtime, so `cargo test` without `tls` needs `smol-rustls-comp`.
+redis = { version = "1", features = ["smol-rustls-comp", "tls-rustls-insecure"] }
 
 [lints]
 workspace = true

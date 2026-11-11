@@ -7,7 +7,8 @@
 //! - [`Extractor`] — Pull typed data from HTTP requests
 //! - [`Responder`] — Convert types into HTTP responses
 //! - [`Middleware`] — Wrap request handling, sharing one value across every request
-//! - [`Server`] — HTTP server backend trait (implemented by `skyzen-hyper`)
+//! - [`Server`] — HTTP protocol implementations serving one thread's endpoint over `http-kit-io`
+//!   listeners (implemented by `skyzen-h1` and `skyzen-hyper`)
 //!
 //! Also re-exports HTTP primitives from `http-kit`: [`Request`], [`Response`],
 //! [`Body`], [`Endpoint`], [`StatusCode`], and more.
@@ -41,12 +42,19 @@ pub mod middleware;
 pub use middleware::Middleware;
 mod responder;
 pub use responder::Responder;
+#[cfg(feature = "std")]
 mod server;
-pub use server::Server;
+#[cfg(feature = "std")]
+pub use server::{EndpointFactory, Server};
 #[cfg(feature = "std")]
 mod net;
 #[cfg(feature = "std")]
-pub use net::{error_response, log_endpoint_error, panic_message, MissingRemoteAddr, PeerAddr};
+pub mod upgrade;
+#[cfg(feature = "std")]
+pub use net::{
+    apply_pending_headers, error_response, log_endpoint_error, panic_message, ErrorDetails,
+    MissingRemoteAddr, PeerAddr, PeerAddress, PendingResponseHeaders, PlatformRequestId,
+};
 #[cfg(feature = "std")]
 mod secret;
 #[cfg(feature = "std")]
@@ -67,7 +75,7 @@ pub const OPENAPI_DUMP_ENV: &str = "SKYZEN_OPENAPI_DUMP";
 
 pub use http_kit::{
     endpoint, header, method, uri, version, Body, BodyError, Endpoint, Extensions, Method, Request,
-    Response, StatusCode, Uri, Version,
+    Response, SendEndpoint, StatusCode, Uri, Version,
 };
 
 /// Error types used in skyzen.

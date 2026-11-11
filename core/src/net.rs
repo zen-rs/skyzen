@@ -52,6 +52,29 @@ impl PeerAddr {
     }
 }
 
+/// The peer address an `http-kit-io` [`Listener`](http_kit_io::Listener) reports, as the socket
+/// address a request's [`PeerAddr`] carries.
+///
+/// A TCP peer has one. A unix-domain peer is a path, or nothing, and has none: requests on its
+/// connections carry no [`PeerAddr`].
+pub trait PeerAddress {
+    /// The peer's socket address, when it has one.
+    fn socket_addr(&self) -> Option<SocketAddr>;
+}
+
+impl PeerAddress for SocketAddr {
+    fn socket_addr(&self) -> Option<SocketAddr> {
+        Some(*self)
+    }
+}
+
+#[cfg(unix)]
+impl PeerAddress for std::os::unix::net::SocketAddr {
+    fn socket_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+}
+
 impl core::ops::Deref for PeerAddr {
     type Target = SocketAddr;
     fn deref(&self) -> &Self::Target {
@@ -72,10 +95,76 @@ impl Extractor for PeerAddr {
     }
 }
 
+/// The identifier the hosting platform assigned to this invocation.
+///
+/// Serverless adapters insert it from the invocation context before the endpoint runs —
+/// `skyzen-lambda` copies `lambda_runtime::Context::request_id` — so a request-id layer can
+/// reuse the platform's own identifier instead of minting one no trace will ever join back
+/// to the invocation. Defining the type here lets any adapter populate it without depending
+/// on the top-level `skyzen` crate.
+#[derive(Debug, Clone)]
+pub struct PlatformRequestId(pub alloc::string::String);
+
+impl core::ops::Deref for PlatformRequestId {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Response headers that must survive an endpoint error.
+///
+/// Middleware like `skyzen::middleware::RequestId` puts headers here when the client needs
+/// them even when the endpoint returns `Err` — a request id is the motivating case. The
+/// backend renders an `Err` into a fresh response with [`error_response`], outside any
+/// middleware's reach, so the headers travel on the request instead and every backend merges
+/// them at its error boundary with [`apply_pending_headers`].
+#[derive(Debug, Default, Clone)]
+pub struct PendingResponseHeaders(pub header::HeaderMap);
+
+/// Copy [`PendingResponseHeaders`] from `request` onto `response`.
+///
+/// Backends call this where they turn an endpoint `Err` into a response — alongside
+/// [`error_response`] — so headers middleware marked as must-deliver survive errors.
+pub fn apply_pending_headers(request: &Request, response: &mut Response) {
+    if let Some(pending) = request.extensions().get::<PendingResponseHeaders>() {
+        for (name, value) in &pending.0 {
+            // Multi-value headers (`Set-Cookie`) must append — each carries its own
+            // directive and a first-value-wins rule would silently drop one. Everything
+            // else is a default: a response that set its own wins.
+            if *name == header::SET_COOKIE {
+                response.headers_mut().append(name.clone(), value.clone());
+            } else {
+                response
+                    .headers_mut()
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
 }
+
+/// Machine-readable detail an error carries in its `source()` chain.
+///
+/// [`error_response`] upgrades a body carrying one to an RFC 9457 problem document
+/// (`application/problem+json`), merging the value's members in as extensions. An error
+/// reports one by storing it as its `source()`; it is not itself an `HttpError`, so it never
+/// sets the status.
+#[derive(Debug)]
+pub struct ErrorDetails(pub serde_json::Value);
+
+impl core::fmt::Display for ErrorDetails {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("error details")
+    }
+}
+
+impl core::error::Error for ErrorDetails {}
 
 /// Emit the endpoint-error log line that every Skyzen backend shares.
 ///
@@ -122,16 +211,52 @@ pub fn error_response(error: &dyn HttpError) -> Response {
         error.to_string()
     };
 
-    let payload = serde_json::to_vec(&ErrorBody {
-        error: &body_message,
-    })
-    .unwrap_or_else(|_| br#"{"error":"Internal server error"}"#.to_vec());
+    // Structured detail rides in the `source()` chain — the only channel `dyn HttpError`
+    // offers beyond `status` and `Display`. Server errors keep the same silence they have
+    // always kept: a detail node could expose internals the redaction exists to hide.
+    let details = (!status.is_server_error())
+        .then(|| {
+            std::iter::successors(error.source(), |source| source.source())
+                .find_map(|source| source.downcast_ref::<ErrorDetails>())
+                .map(|details| details.0.clone())
+        })
+        .flatten();
+    let (payload, content_type) = details.map_or_else(
+        || {
+            (
+                serde_json::to_vec(&ErrorBody {
+                    error: &body_message,
+                })
+                .unwrap_or_else(|_| br#"{"error":"Internal server error"}"#.to_vec()),
+                "application/json",
+            )
+        },
+        // An error that published machine-readable detail gets the RFC 9457 problem
+        // document; the detail object's members merge in as extensions.
+        |mut details| {
+            let mut problem = serde_json::json!({
+                "type": "about:blank",
+                "title": status.canonical_reason(),
+                "status": status.as_u16(),
+                "detail": body_message,
+            });
+            if let (Some(problem), Some(details)) =
+                (problem.as_object_mut(), details.as_object_mut())
+            {
+                problem.append(details);
+            }
+            (
+                serde_json::to_vec(&problem).unwrap_or_else(|_| br#"{"title":"error"}"#.to_vec()),
+                "application/problem+json",
+            )
+        },
+    );
 
     let mut response = Response::new(Body::from(payload));
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/json"),
+        header::HeaderValue::from_static(content_type),
     );
     response
 }

@@ -104,3 +104,7 @@ mod tests {
         );
     }
 }
+
+pub mod conditional;
+pub use crate::utils::conditional::EntityTag;
+pub use conditional::{Conditional, Lazy};

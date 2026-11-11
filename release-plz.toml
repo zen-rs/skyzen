@@ -21,34 +21,73 @@ version_group = "skyzen"
 git_release_name = "v{{ version }}"
 git_tag_name = "v{{ version }}"
 
+#
+# Every other crate is tagged `<dir>/v<version>`, `<dir>` being its top-level directory. The
+# main crate's `v<version>` tag is the one that triggers the CLI's binaries: cargo-dist reads a
+# `<name>/v<version>` tag as a package name that must be a Cargo package, and `<dir>` is not.
 [[package]]
 name = "skyzen-cli"
 version_group = "skyzen"
+git_tag_name = "cli/v{{ version }}"
 
 [[package]]
 name = "skyzen-cloudflare"
 version_group = "skyzen"
+git_tag_name = "cloudflare/v{{ version }}"
 
 [[package]]
 name = "skyzen-cloudflare-admin"
 version_group = "skyzen"
+git_tag_name = "cloudflare-admin/v{{ version }}"
 
 [[package]]
 name = "skyzen-core"
-git_tag_name = "core-v{{ version }}"
+git_tag_name = "core/v{{ version }}"
+
+[[package]]
+name = "skyzen-h1"
+git_tag_name = "h1/v{{ version }}"
 
 [[package]]
 name = "skyzen-hyper"
-git_tag_name = "hyper-v{{ version }}"
+git_tag_name = "hyper/v{{ version }}"
 
 [[package]]
 name = "skyzen-lambda"
-git_tag_name = "lambda-v{{ version }}"
+git_tag_name = "lambda/v{{ version }}"
 
 [[package]]
 name = "skyzen-macros"
 version_group = "skyzen"
-git_tag_name = "macros-v{{ version }}"
+git_tag_name = "macros/v{{ version }}"
+
+[[package]]
+name = "skyzen-manifest"
+git_tag_name = "manifest/v{{ version }}"
+
+[[package]]
+name = "skyzen-services"
+git_tag_name = "services/v{{ version }}"
+
+[[package]]
+name = "skyzen-test"
+git_tag_name = "test/v{{ version }}"
+
+[[package]]
+name = "skyzen-redis"
+git_tag_name = "redis/v{{ version }}"
+
+[[package]]
+name = "skyzen-s3"
+git_tag_name = "s3/v{{ version }}"
+
+[[package]]
+name = "skyzen-aws"
+git_tag_name = "aws/v{{ version }}"
+
+[[package]]
+name = "skyzen-azure"
+git_tag_name = "azure/v{{ version }}"
 
 # A runnable example, not a published crate: it must not get a version bump, a tag or a changelog.
 #

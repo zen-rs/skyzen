@@ -96,6 +96,8 @@ pub struct DynamoKv {
     key_attribute: String,
     ttl_attribute: String,
     consistent_reads: bool,
+    /// Lazily probed `DescribeTimeToLive` result — `None` until a TTL-dependent call asks.
+    ttl_enabled: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
 }
 
 impl DynamoKv {
@@ -111,16 +113,43 @@ impl DynamoKv {
             key_attribute: key_attribute.into(),
             ttl_attribute: "expires_at".to_owned(),
             consistent_reads: false,
+            ttl_enabled: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Create a new `DynamoKv` whose client is built from `config`, with a key attribute of
+    /// `"pk"`.
+    ///
+    /// Clients built from one configuration share its credentials provider and cache; see
+    /// [`crate::sdk::load_config`].
+    #[must_use]
+    pub fn from_config(config: &crate::sdk::SdkConfig, table_name: impl Into<String>) -> Self {
+        Self::new(Client::new(config), table_name, "pk")
     }
 
     /// Create a new `DynamoKv` from environment configuration.
     ///
-    /// Uses the default AWS SDK configuration loader and a default key attribute of `"pk"`.
+    /// Loads the ambient AWS configuration through [`crate::sdk::load_config`] on
+    /// [`ZenwaveHttpClient::system`](crate::sdk::ZenwaveHttpClient::system) and builds the store
+    /// with [`from_config`](Self::from_config).
     pub async fn from_env(table_name: impl Into<String>) -> Self {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = Client::new(&config);
-        Self::new(client, table_name, "pk")
+        let config = crate::sdk::load_config(crate::sdk::ZenwaveHttpClient::system()).await;
+        Self::from_config(&config, table_name)
+    }
+
+    /// This store with its requests sent through `http`, its client otherwise configured as it
+    /// was — credentials, region, endpoint, retries.
+    ///
+    /// How a thread gets a client whose connections it owns: build the store once and rebind a
+    /// clone on each thread with [`crate::sdk::ZenwaveHttpClient::system_on_current_thread`].
+    #[must_use]
+    pub fn with_http_client(
+        mut self,
+        http: impl aws_sdk_dynamodb::config::HttpClient + 'static,
+    ) -> Self {
+        self.client =
+            Client::from_conf(self.client.config().to_builder().http_client(http).build());
+        self
     }
 
     /// Set the attribute used to store expiry timestamps (default `"expires_at"`).
@@ -153,6 +182,38 @@ impl DynamoKv {
             self.key_attribute.clone(),
             AttributeValue::S(cursor.to_owned()),
         )])
+    }
+
+    /// Whether the table's TTL feature is enabled on [`Self::ttl_attribute`], probed once
+    /// with `DescribeTimeToLive` and cached for the lifetime of the client.
+    ///
+    /// `DynamoDB` only sweeps an expired item when the feature is on for the attribute the
+    /// item writes — a disabled or mismatched table would retain every record forever, so
+    /// TTL-dependent calls check this rather than trusting the write.
+    async fn ttl_enabled(&self) -> Result<bool, KvError> {
+        let cached = *self
+            .ttl_enabled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(enabled) = cached {
+            return Ok(enabled);
+        }
+        let description = self
+            .client
+            .describe_time_to_live()
+            .table_name(&self.table_name)
+            .send()
+            .await
+            .map_err(sdk_error)?;
+        let enabled = description.time_to_live_description().is_some_and(|ttl| {
+            ttl.time_to_live_status() == Some(&aws_sdk_dynamodb::types::TimeToLiveStatus::Enabled)
+                && ttl.attribute_name() == Some(self.ttl_attribute.as_str())
+        });
+        *self
+            .ttl_enabled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(enabled);
+        Ok(enabled)
     }
 
     /// The current time as seconds since the Unix epoch.
@@ -333,7 +394,7 @@ fn extract_value(item: &HashMap<String, AttributeValue>, key: &str) -> Result<Ve
         .and_then(|v| v.as_b().ok())
         .map(|b| b.as_ref().to_vec())
         .ok_or_else(|| {
-            KvError::backend(format!(
+            KvError::Decode(format!(
                 "item for key {key:?} exists but its `{VALUE_ATTRIBUTE}` attribute is missing or \
                  not binary"
             ))
@@ -353,6 +414,67 @@ fn counter_value(stored: Option<&[u8]>) -> Result<i64, KvError> {
         .map_err(|error| KvError::Decode(format!("counter is not valid UTF-8: {error}")))?;
     text.parse()
         .map_err(|error| KvError::Decode(format!("counter {text:?} is not an integer: {error}")))
+}
+
+impl DynamoKv {
+    /// The CAS loop behind [`increment`](KeyValueStore::increment) and
+    /// [`increment_with_ttl`](KeyValueStore::increment_with_ttl): `ttl` arms the TTL
+    /// attribute only when the item is created — an existing item keeps the deadline it
+    /// already carries.
+    async fn increment_inner(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<core::time::Duration>,
+    ) -> Result<i64, KvError> {
+        for _ in 0..MAX_INCREMENT_ATTEMPTS {
+            let item = self.read_item(key, true, Projection::WholeItem).await?;
+            let stored = item
+                .as_ref()
+                .map(|item| extract_value(item, key))
+                .transpose()?;
+
+            let current = counter_value(stored.as_deref())?;
+            // `increment_with_ttl` counts from zero upward, so a stored negative is
+            // corruption, not a count: it is refused here without a write and keeps
+            // rejecting every hit until the item's deadline removes it.
+            if ttl.is_some() && current < 0 {
+                return Err(KvError::Decode(format!(
+                    "counter under {key:?} holds the negative value {current}"
+                )));
+            }
+            let updated = current
+                .checked_add(delta)
+                .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
+
+            // A counter born under a caller-supplied TTL carries its deadline from the
+            // first write; one that already existed keeps whatever expiry it has.
+            let expires_at = match (
+                item.as_ref()
+                    .and_then(|item| item_expires_at(item, &self.ttl_attribute)),
+                ttl,
+            ) {
+                (None, Some(ttl)) => {
+                    Some(expires_at_epoch_seconds(Self::now_epoch_seconds()?, ttl)?)
+                }
+                (existing, _) => existing,
+            };
+
+            if self
+                .conditional_put(
+                    key,
+                    stored.as_deref(),
+                    updated.to_string().as_bytes(),
+                    expires_at,
+                )
+                .await?
+            {
+                return Ok(updated);
+            }
+        }
+
+        Err(KvError::Conflict)
+    }
 }
 
 impl KeyValueStore for DynamoKv {
@@ -385,6 +507,12 @@ impl KeyValueStore for DynamoKv {
         value: &[u8],
         ttl: core::time::Duration,
     ) -> Result<(), KvError> {
+        if !self.ttl_enabled().await? {
+            return Err(KvError::Unsupported(
+                "DynamoDB time-to-live is not enabled on this table's TTL attribute, so the \
+                 record would never expire; enable TimeToLive on the table",
+            ));
+        }
         let expires_at = expires_at_epoch_seconds(Self::now_epoch_seconds()?, ttl)?;
         self.client
             .put_item()
@@ -411,15 +539,25 @@ impl KeyValueStore for DynamoKv {
 
     /// Swap the value under `key` with a condition expression on its current bytes.
     ///
-    /// The winner owns the key outright: like `SET` on Redis and like `InMemoryKv`, a swap re-arms
-    /// no expiry, so the item is written without a TTL attribute.
+    /// A swap replaces the value, not the record: the deadline an existing item already
+    /// carries is written forward, as `replace_if_unchanged` does on Cosmos.
     async fn compare_and_swap(
         &self,
         key: &str,
         expected: Option<&[u8]>,
         new: &[u8],
     ) -> Result<bool, KvError> {
-        self.conditional_put(key, expected, new, None).await
+        // A swap replaces the value, not the record: the deadline an existing item already
+        // carries is read forward into the conditional write, as `replace_if_unchanged`
+        // does on Cosmos. When the caller expects absence there is no item to inherit from.
+        let expires_at = match expected {
+            Some(_) => self
+                .read_item(key, true, Projection::WholeItem)
+                .await?
+                .and_then(|item| item_expires_at(&item, &self.ttl_attribute)),
+            None => None,
+        };
+        self.conditional_put(key, expected, new, expires_at).await
     }
 
     /// Add `delta` to a counter by reading it and writing it back under a condition.
@@ -437,36 +575,25 @@ impl KeyValueStore for DynamoKv {
     /// `i64`, and [`KvError::Conflict`] if the swap lost its race
     /// [`MAX_INCREMENT_ATTEMPTS`] times running.
     async fn increment(&self, key: &str, delta: i64) -> Result<i64, KvError> {
-        for _ in 0..MAX_INCREMENT_ATTEMPTS {
-            let item = self.read_item(key, true, Projection::WholeItem).await?;
-            let stored = item
-                .as_ref()
-                .map(|item| extract_value(item, key))
-                .transpose()?;
+        self.increment_inner(key, delta, None).await
+    }
 
-            let updated = counter_value(stored.as_deref())?
-                .checked_add(delta)
-                .ok_or_else(|| KvError::Decode(format!("counter {key:?} overflowed an i64")))?;
-
-            // A counter that had already expired starts a fresh, unexpiring one.
-            let expires_at = item
-                .as_ref()
-                .and_then(|item| item_expires_at(item, &self.ttl_attribute));
-
-            if self
-                .conditional_put(
-                    key,
-                    stored.as_deref(),
-                    updated.to_string().as_bytes(),
-                    expires_at,
-                )
-                .await?
-            {
-                return Ok(updated);
-            }
+    /// Add `delta` to the counter under `key`, arming the TTL attribute in the same
+    /// `UpdateItem` when the item is created — an existing item keeps the deadline it
+    /// already carries.
+    async fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: core::time::Duration,
+    ) -> Result<i64, KvError> {
+        if !self.ttl_enabled().await? {
+            return Err(KvError::Unsupported(
+                "DynamoDB time-to-live is not enabled on this table's TTL attribute, so a \
+                 counter would never expire; enable TimeToLive on the table",
+            ));
         }
-
-        Err(KvError::Conflict)
+        self.increment_inner(key, delta, Some(ttl)).await
     }
 
     /// Re-arm the expiry of a key that still holds a value, with `UpdateItem`.
@@ -474,6 +601,12 @@ impl KeyValueStore for DynamoKv {
     /// Returns `false` when no live item holds the key — including one whose TTL has already
     /// passed, which the portable contract already treats as absent.
     async fn expire(&self, key: &str, ttl: core::time::Duration) -> Result<bool, KvError> {
+        if !self.ttl_enabled().await? {
+            return Err(KvError::Unsupported(
+                "DynamoDB time-to-live is not enabled on this table's TTL attribute, so the \
+                 record would never expire; enable TimeToLive on the table",
+            ));
+        }
         let now_secs = Self::now_epoch_seconds()?;
         let expires_at = expires_at_epoch_seconds(now_secs, ttl)?;
 

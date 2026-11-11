@@ -1,7 +1,9 @@
-//! Native (tokio/hyper) WebSocket upgrader and helpers.
+//! Native WebSocket upgrader and helpers.
 //!
 //! Handlers can request a protocol switch by extracting [`WebSocketUpgrade`]
-//! and returning the result of [`WebSocketUpgrade::on_upgrade`]:
+//! and returning the result of [`WebSocketUpgrade::on_upgrade`]. The responder places the session
+//! in the `101` response as an [`OnUpgrade`] token; whichever server wrote the response runs it on
+//! the connection, so this module knows nothing about the protocol implementation underneath:
 //! ```
 //! use futures_util::StreamExt;
 //! use skyzen::{websocket::{WebSocketMessage, WebSocketUpgrade}, Responder};
@@ -41,25 +43,19 @@ use async_tungstenite::{
     WebSocketStream,
 };
 use core::future::{ready, Future};
-use executor_core::{AnyExecutor, Executor};
 use futures_channel::oneshot;
 use futures_core::Stream;
 use futures_util::Sink;
-use http_kit::utils::{AsyncRead, AsyncWrite};
 use http_kit::{
     utils::{ByteStr, Bytes},
     ws::{WebSocketConfig, WebSocketMessage},
 };
-use hyper::{
-    rt::{Read, ReadBuf, Write},
-    upgrade::{OnUpgrade, Upgraded},
-};
 use serde::Serialize;
 use skyzen_core::{
-    error::{Error, ErrorChain},
+    error::ErrorChain,
+    upgrade::{OnUpgrade, UpgradeAvailable, Upgraded},
     Extractor, Responder,
 };
-use std::sync::Arc;
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -98,13 +94,10 @@ pub enum WebSocketUpgradeError {
     /// The `Sec-WebSocket-Version` header is not `13`.
     #[error("Unsupported Sec-WebSocket-Version. Only version 13 is accepted")]
     UnsupportedVersion,
-    /// The `OnUpgrade` extension is missing.
-    #[error("Missing OnUpgrade extension", status = StatusCode::UPGRADE_REQUIRED)]
-    MissingOnUpgrade,
-
-    /// The async executor was not injected by the HTTP backend, so the upgrade cannot be driven.
-    #[error("WebSocket runtime executor is unavailable", status = StatusCode::INTERNAL_SERVER_ERROR)]
-    MissingExecutor,
+    /// The server cannot hand this request's connection over — it is an HTTP/2 stream, or no
+    /// server is involved at all — so a `101` would leave the client with nobody to talk to.
+    #[error("This connection cannot be upgraded", status = StatusCode::UPGRADE_REQUIRED)]
+    UpgradeUnavailable,
 }
 
 fn header_has_token(value: &header::HeaderValue, token: &str) -> bool {
@@ -128,50 +121,7 @@ fn compute_accept_header(key: &header::HeaderValue) -> header::HeaderValue {
     header::HeaderValue::from_str(&encoded).expect("Fail to create Sec-WebSocket-Accept header")
 }
 
-/// Upgraded connection wrapper that implements `futures_io` traits.
-#[derive(Debug)]
-pub struct UpgradedIo(Upgraded);
-
-impl AsyncRead for UpgradedIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let this = self.get_mut();
-        let mut hyper_buf = ReadBuf::uninit(unsafe {
-            // SAFETY: We're converting &mut [u8] to &mut [MaybeUninit<u8>]
-            // This is safe because MaybeUninit<u8> has the same layout as u8
-            std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len())
-        });
-        let cursor = hyper_buf.unfilled();
-        match Pin::new(&mut this.0).poll_read(cx, cursor) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(hyper_buf.filled().len())),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for UpgradedIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.get_mut().0).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
-    }
-}
-
-type NativeIo = UpgradedIo;
+type NativeIo = Upgraded;
 
 /// Stream representing a WebSocket connection handled by `async-tungstenite`.
 pub struct WebSocket {
@@ -640,11 +590,9 @@ impl Stream for WebSocketReceiver {
 /// Helper that contains the state required to accept a WebSocket connection.
 pub struct WebSocketUpgrade {
     key: header::HeaderValue,
-    on_upgrade: OnUpgrade,
     requested_protocols: Vec<String>,
     response_protocol: Option<header::HeaderValue>,
     config: WebSocketConfig,
-    executor: Option<Arc<AnyExecutor>>,
 }
 
 impl std::fmt::Debug for WebSocketUpgrade {
@@ -743,44 +691,37 @@ impl WebSocketUpgrade {
     ///     })
     /// }
     /// ```
+    ///
+    /// The callback travels to the server inside the `101` response, so it has to be `Send`; the
+    /// future it returns runs on the connection's own thread and does not.
     pub fn on_upgrade<F, Fut, R>(self, callback: F) -> WebSocketUpgradeResponder
     where
-        F: FnOnce(WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = R> + Send + 'static,
+        F: FnOnce(WebSocket) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = R> + 'static,
         R: IntoWebSocketOutcome + 'static,
     {
+        let config = self.config.clone();
         WebSocketUpgradeResponder {
+            session: OnUpgrade::new(move |io| run_session(io, config, callback)),
             upgrade: self,
-            callback: Some(Box::new(move |socket| {
-                Box::pin(async move { callback(socket).await.into_outcome() })
-                    as WebSocketCallbackFuture
-            })),
         }
     }
 }
 
-type WebSocketCallbackFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send>>;
-type DynCallback = Box<dyn FnOnce(WebSocket) -> WebSocketCallbackFuture + Send + Sync>;
-
 /// Drive one upgraded connection: build the socket, hand it to the session, and report how the
 /// session ended.
-async fn run_session(on_upgrade: OnUpgrade, config: WebSocketConfig, callback: DynCallback) {
-    let upgraded = match on_upgrade.await {
-        Ok(upgraded) => upgraded,
-        Err(error) => {
-            error!("WebSocket upgrade failed: {error}");
-            return;
-        }
-    };
-
+async fn run_session<F, Fut, R>(io: Upgraded, config: WebSocketConfig, callback: F)
+where
+    F: FnOnce(WebSocket) -> Fut,
+    Fut: std::future::Future<Output = R>,
+    R: IntoWebSocketOutcome,
+{
     let (release, released) = oneshot::channel();
-    let socket =
-        WebSocket::from_raw_socket(UpgradedIo(upgraded), Role::Server, config, Some(release)).await;
+    let socket = WebSocket::from_raw_socket(io, Role::Server, config, Some(release)).await;
 
     // The session future is dropped at the end of this statement, and dropping the socket with it
     // is what hands the stream back through `released`.
-    let outcome = callback(socket).await;
+    let outcome = callback(socket).await.into_outcome();
 
     if let Err(error) = outcome {
         error!(error = %ErrorChain(&error), "websocket session handler failed");
@@ -853,31 +794,10 @@ fn validate_upgrade(
     Ok((key, requested_protocols))
 }
 
-fn upgrade(request: &mut Request) -> Result<WebSocketUpgrade, WebSocketUpgradeError> {
-    let (key, requested_protocols) = validate_upgrade(request)?;
-    let on_upgrade = request
-        .extensions_mut()
-        .remove::<OnUpgrade>()
-        .ok_or(WebSocketUpgradeError::MissingOnUpgrade)?;
-
-    // Extract executor from request extensions (injected by the runtime)
-    let executor = request.extensions_mut().remove::<Arc<AnyExecutor>>();
-
-    Ok(WebSocketUpgrade {
-        key,
-        on_upgrade,
-        requested_protocols,
-        response_protocol: None,
-        config: WebSocketConfig::default(),
-        executor,
-    })
-}
-
-/// Build an upgrade from a responder that only receives a shared request reference.
+/// Validate the handshake of a request whose connection the server can hand over.
 ///
-/// Hibernating Durable Object upgrades are responders rather than extractors. Hyper's upgrade
-/// handle and the executor are cloneable, so they can share the same validated handshake path
-/// without duplicating the protocol implementation.
+/// Hibernating Durable Object upgrades are responders rather than extractors, so they only hold a
+/// shared request reference; the handshake needs nothing more.
 // `websocket::mod` re-exports this module with a glob, so `pub` here would put an internal
 // handshake helper in the public API; `pub(crate)` is load-bearing rather than redundant.
 #[allow(clippy::redundant_pub_crate)]
@@ -885,20 +805,16 @@ pub(crate) fn upgrade_from_request(
     request: &Request,
 ) -> Result<WebSocketUpgrade, WebSocketUpgradeError> {
     let (key, requested_protocols) = validate_upgrade(request)?;
-    let on_upgrade = request
+    request
         .extensions()
-        .get::<OnUpgrade>()
-        .cloned()
-        .ok_or(WebSocketUpgradeError::MissingOnUpgrade)?;
-    let executor = request.extensions().get::<Arc<AnyExecutor>>().cloned();
+        .get::<UpgradeAvailable>()
+        .ok_or(WebSocketUpgradeError::UpgradeUnavailable)?;
 
     Ok(WebSocketUpgrade {
         key,
-        on_upgrade,
         requested_protocols,
         response_protocol: None,
         config: WebSocketConfig::default(),
-        executor,
     })
 }
 
@@ -907,7 +823,7 @@ impl Extractor for WebSocketUpgrade {
     // The handshake is validated from the request's own headers, so the future is ready on
     // creation rather than an `async` block with nothing to await.
     fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
-        let result = upgrade(request);
+        let result = upgrade_from_request(request);
 
         if let Err(ref error) = result {
             error!("WebSocket upgrade failed: {error}");
@@ -920,25 +836,20 @@ impl Extractor for WebSocketUpgrade {
 /// [`Responder`] returned from [`WebSocketUpgrade::on_upgrade`].
 pub struct WebSocketUpgradeResponder {
     upgrade: WebSocketUpgrade,
-    callback: Option<DynCallback>,
+    session: OnUpgrade,
 }
 
 impl std::fmt::Debug for WebSocketUpgradeResponder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebSocketUpgradeResponder")
             .field("response_protocol", &self.upgrade.response_protocol)
-            .field("has_callback", &self.callback.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl Responder for WebSocketUpgradeResponder {
     type Error = WebSocketUpgradeError;
-    fn respond_to(
-        mut self,
-        _request: &Request,
-        response: &mut Response,
-    ) -> Result<(), Self::Error> {
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
         let accept = compute_accept_header(&self.upgrade.key);
         *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
 
@@ -959,21 +870,9 @@ impl Responder for WebSocketUpgradeResponder {
             }
         }
 
-        if let Some(callback) = self.callback.take() {
-            let on_upgrade = self.upgrade.on_upgrade.clone();
-            let config = self.upgrade.config.clone();
-            // Fail closed if the backend never injected an executor, rather than panicking on the
-            // request path.
-            let executor = self
-                .upgrade
-                .executor
-                .take()
-                .ok_or(WebSocketUpgradeError::MissingExecutor)?;
-
-            executor
-                .spawn(run_session(on_upgrade, config, callback))
-                .detach();
-        }
+        // The server takes this back out once the `101` is on the wire and runs the session on
+        // the connection.
+        response.extensions_mut().insert(self.session);
 
         Ok(())
     }
@@ -1054,60 +953,6 @@ fn to_tungstenite_config(config: &WebSocketConfig) -> TungsteniteConfig {
 mod tests {
     use super::*;
     use crate::Body;
-    use executor_core::Task;
-    use std::future::Future;
-
-    type Error = Box<dyn std::any::Any + Send>;
-
-    /// Test executor that uses `tokio::spawn` to dispatch tasks
-    struct TestTokioExecutor;
-
-    impl executor_core::Executor for TestTokioExecutor {
-        type Task<T: Send + 'static> = TestTokioTask<T>;
-
-        fn spawn<Fut>(&self, fut: Fut) -> Self::Task<Fut::Output>
-        where
-            Fut: std::future::Future<Output: Send> + Send + 'static,
-        {
-            TestTokioTask(tokio::spawn(fut))
-        }
-    }
-
-    struct TestTokioTask<T>(tokio::task::JoinHandle<T>);
-
-    impl<T: Send + 'static> Future for TestTokioTask<T> {
-        type Output = T;
-        fn poll(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Self::Output> {
-            use std::task::Poll;
-            match std::pin::Pin::new(&mut self.0).poll(cx) {
-                Poll::Ready(Ok(v)) => Poll::Ready(v),
-                Poll::Ready(Err(e)) => std::panic::resume_unwind(e.into_panic()),
-                Poll::Pending => Poll::Pending,
-            }
-        }
-    }
-
-    impl<T: Send + 'static> Task<T> for TestTokioTask<T> {
-        fn poll_result(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<T, Error>> {
-            use std::task::Poll;
-            match std::pin::Pin::new(&mut self.0).poll(cx) {
-                Poll::Ready(Ok(v)) => Poll::Ready(Ok(v)),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e.into_panic())),
-                Poll::Pending => Poll::Pending,
-            }
-        }
-    }
-
-    fn create_executor() -> Arc<AnyExecutor> {
-        // For tests running on tokio, we use the current tokio runtime via tokio::spawn
-        Arc::new(AnyExecutor::new(TestTokioExecutor))
-    }
 
     fn build_request() -> Request {
         let mut request = Request::new(Body::empty());
@@ -1133,10 +978,8 @@ mod tests {
             header::SEC_WEBSOCKET_VERSION,
             hyper::header::HeaderValue::from_static("13"),
         );
-        let on_upgrade = hyper::upgrade::on(&mut request);
-        request.extensions_mut().insert(on_upgrade);
-        // Insert executor like an HTTP backend would
-        request.extensions_mut().insert(create_executor());
+        // What a server inserts on a connection it can hand over.
+        request.extensions_mut().insert(UpgradeAvailable);
         let upgrade = WebSocketUpgrade::extract(&mut request).await.unwrap();
         (upgrade, request)
     }

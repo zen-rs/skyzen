@@ -41,9 +41,13 @@
 
 mod body_limit;
 mod cors;
+mod decompression;
 mod error_handling;
+mod request_id;
+mod session;
 #[cfg(not(target_arch = "wasm32"))]
 mod timeout;
+mod trace;
 
 pub mod auth;
 pub mod compression;
@@ -52,20 +56,39 @@ use std::fmt::{self, Debug};
 
 use http_kit::{Endpoint, Request, Response};
 use skyzen_core::{
-    middleware::{boxed, BoxFuture, Dispatch},
+    middleware::{boxed, Dispatch, LocalBoxFuture},
     Error,
 };
 
 pub use body_limit::BodyLimit;
 pub use compression::{CompressionEncoding, CompressionLevel, CompressionMiddleware};
 pub use cors::{AllowOrigin, Cors, CorsConfigError};
+pub use decompression::{DecompressionEncoding, DecompressionMiddleware};
 pub use error_handling::ErrorHandlingMiddleware;
+pub use request_id::{MissingRequestId, RequestId};
+pub use session::{
+    Session, SessionData, SessionError, SessionStore, Sessions, SessionsLayer, TypedSession,
+};
 #[doc(inline)]
 pub use skyzen_core::middleware::{
     apply, from_fn, BoxMiddleware, FromFn, Middleware, MiddlewareFn, Next,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use timeout::Timeout;
+pub use trace::Trace;
+
+/// Whole milliseconds in a `js_sys::Date` reading or difference.
+///
+/// # Panics
+///
+/// Panics when `millis` is negative or not finite: a clock that reports that is broken, and
+/// every caller would otherwise carry a nonsense timestamp onward.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn js_millis(millis: f64) -> u64 {
+    let duration = core::time::Duration::try_from_secs_f64(millis / 1000.0)
+        .expect("js_sys::Date reported a negative or non-finite time");
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// An [`Endpoint`] wrapped in one [`Middleware`].
 ///
@@ -112,7 +135,7 @@ impl<E> Layered<E> {
 /// validation.
 pub fn layer<E, M>(endpoint: E, middleware: M) -> Layered<E>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     M: Middleware,
 {
     Layered {
@@ -123,7 +146,7 @@ where
 
 impl<E> Endpoint for Layered<E>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
 {
     type Error = http_kit::error::BoxHttpError;
 
@@ -141,9 +164,12 @@ struct CloneEndpoint<'e, E>(&'e E);
 
 impl<E> Dispatch for CloneEndpoint<'_, E>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
 {
-    fn dispatch<'a>(&'a self, request: &'a mut Request) -> BoxFuture<'a, Result<Response, Error>> {
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a mut Request,
+    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
         Box::pin(async move {
             let mut endpoint = self.0.clone();
             endpoint.respond(request).await.map_err(Error::from)
@@ -198,3 +224,12 @@ mod tests {
         assert_eq!(stamps, ["inner", "outer"]);
     }
 }
+
+mod csrf;
+pub use csrf::{Csrf, CsrfRejected};
+mod auto_etag;
+pub use auto_etag::AutoETag;
+mod security_headers;
+pub use security_headers::SecurityHeaders;
+mod rate_limit;
+pub use rate_limit::{RateLimit, RateLimitUnavailable, RateLimited};

@@ -12,9 +12,7 @@ use flate2::{
     Compression as FlateCompression,
 };
 use http::{
-    header::{
-        ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING, VARY,
-    },
+    header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING, VARY},
     HeaderMap, HeaderValue, Method, StatusCode,
 };
 use http_kit::{http_error, Body, Request, Response};
@@ -23,6 +21,8 @@ use skyzen_core::{
     Error,
 };
 use smallvec::{smallvec, SmallVec};
+
+use crate::utils::accept_encoding::{AcceptEncoding, Preference};
 
 type EncodingList = SmallVec<[CompressionEncoding; 3]>;
 
@@ -73,25 +73,13 @@ impl CompressionMiddleware {
     }
 
     fn negotiate_encoding(&self, request: &Request) -> Option<CompressionEncoding> {
-        let supported = &self.config.encodings;
-        // Per RFC 9110 a specific token takes precedence over `*`; the wildcard
-        // only applies to encodings the client did not list explicitly.
-        let mut specific: SmallVec<[Option<(f32, usize)>; 3]> = smallvec![None; supported.len()];
-        let mut wildcard: Option<(f32, usize)> = None;
-        let mut position = 0usize;
-        for value in &request.headers().get_all(ACCEPT_ENCODING) {
-            let Ok(raw) = value.to_str() else { continue };
-            parse_header_value(raw, supported, &mut position, &mut specific, &mut wildcard);
-        }
-
+        let accept = AcceptEncoding::from_headers(request.headers());
         let mut best: Option<Candidate> = None;
-        for (idx, encoding) in supported.iter().enumerate() {
-            let Some((quality, position)) = specific[idx].or(wildcard) else {
+        for (idx, encoding) in self.config.encodings.iter().enumerate() {
+            let Some(Preference { quality, position }) = accept.preference(encoding.tokens())
+            else {
                 continue;
             };
-            if quality <= 0.0 {
-                continue;
-            }
             consider_candidate(
                 &mut best,
                 Candidate {
@@ -212,49 +200,6 @@ struct Candidate {
     supported_order: usize,
 }
 
-/// Record the qualities announced by one `Accept-Encoding` header value.
-///
-/// Specific tokens land in `specific` (keyed by supported-encoding index) and
-/// `*` lands in `wildcard`; the first occurrence of a token wins. Zero
-/// qualities are recorded too, so an explicit `gzip;q=0` shadows a wildcard.
-fn parse_header_value(
-    value: &str,
-    supported: &[CompressionEncoding],
-    position: &mut usize,
-    specific: &mut [Option<(f32, usize)>],
-    wildcard: &mut Option<(f32, usize)>,
-) {
-    for part in value.split(',') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let (token, quality) = parse_part(trimmed);
-        let current_position = *position;
-        *position += 1;
-
-        match token {
-            ParsedEncoding::Specific(encoding) => {
-                if let Some(idx) = supported
-                    .iter()
-                    .position(|candidate| *candidate == encoding)
-                {
-                    if specific[idx].is_none() {
-                        specific[idx] = Some((quality, current_position));
-                    }
-                }
-            }
-            ParsedEncoding::Wildcard => {
-                if wildcard.is_none() {
-                    *wildcard = Some((quality, current_position));
-                }
-            }
-            ParsedEncoding::Identity | ParsedEncoding::Unsupported => {}
-        }
-    }
-}
-
 /// Pragmatic skip list of content types that are already compressed.
 fn is_compressible_content_type(headers: &HeaderMap) -> bool {
     const PRE_COMPRESSED: &[&str] = &[
@@ -322,71 +267,6 @@ fn consider_candidate(best: &mut Option<Candidate>, candidate: Candidate) {
     }
 }
 
-fn parse_part(part: &str) -> (ParsedEncoding, f32) {
-    let mut sections = part.split(';');
-    let encoding = sections.next().unwrap_or_default().trim();
-    let mut quality = 1.0_f32;
-
-    for parameter in sections {
-        let parameter = parameter.trim();
-        if parameter.is_empty() {
-            continue;
-        }
-
-        if let Some((key, value)) = parameter.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("q") {
-                if let Some(parsed) = parse_quality(value) {
-                    quality = parsed;
-                } else {
-                    quality = 0.0;
-                }
-                break;
-            }
-        }
-    }
-
-    (ParsedEncoding::from_token(encoding), quality)
-}
-
-fn parse_quality(raw: &str) -> Option<f32> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let value = trimmed.parse::<f32>().ok()?;
-    if !(0.0..=1.0).contains(&value) {
-        return None;
-    }
-
-    Some(value)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParsedEncoding {
-    Specific(CompressionEncoding),
-    Wildcard,
-    Identity,
-    Unsupported,
-}
-
-impl ParsedEncoding {
-    fn from_token(token: &str) -> Self {
-        let token = token.trim();
-        if token.eq_ignore_ascii_case("gzip") || token.eq_ignore_ascii_case("x-gzip") {
-            Self::Specific(CompressionEncoding::Gzip)
-        } else if token.eq_ignore_ascii_case("deflate") {
-            Self::Specific(CompressionEncoding::Deflate)
-        } else if token == "*" {
-            Self::Wildcard
-        } else if token.eq_ignore_ascii_case("identity") {
-            Self::Identity
-        } else {
-            Self::Unsupported
-        }
-    }
-}
-
 fn set_content_length(response: &mut Response, len: usize) {
     response
         .headers_mut()
@@ -434,6 +314,14 @@ pub enum CompressionEncoding {
 }
 
 impl CompressionEncoding {
+    /// The `Accept-Encoding` tokens that name this coding; `x-gzip` is gzip's registered alias.
+    const fn tokens(self) -> &'static [&'static str] {
+        match self {
+            Self::Gzip => &["gzip", "x-gzip"],
+            Self::Deflate => &["deflate"],
+        }
+    }
+
     const fn header_value(self) -> HeaderValue {
         match self {
             Self::Gzip => HeaderValue::from_static("gzip"),
@@ -489,7 +377,10 @@ mod tests {
     use crate::middleware::apply;
     use core::future::{ready, Future};
     use flate2::read::{GzDecoder, ZlibDecoder};
-    use http::{header::CONTENT_ENCODING, HeaderValue};
+    use http::{
+        header::{ACCEPT_ENCODING, CONTENT_ENCODING},
+        HeaderValue,
+    };
     use http_kit::Endpoint;
     use std::{convert::Infallible, io::Read};
 
@@ -526,7 +417,7 @@ mod tests {
         fn respond(
             &mut self,
             _request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             let mut response = Response::new(self.response_body());
             if let Some(value) = self.vary.clone() {
                 response.headers_mut().insert(VARY, value);
@@ -657,7 +548,7 @@ mod tests {
         fn respond(
             &mut self,
             _request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             ready(Ok((self.0)()))
         }
     }

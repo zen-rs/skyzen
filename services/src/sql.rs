@@ -2593,12 +2593,7 @@ mod fallback_tests {
     }
 }
 
-#[cfg(all(
-    test,
-    not(target_arch = "wasm32"),
-    feature = "sqlite",
-    any(feature = "runtime-tokio", feature = "runtime-async-std")
-))]
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "sqlite"))]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -2608,6 +2603,30 @@ mod tests {
         sqlite::{self, SqliteBackend},
         BatchStatement, Db, DbError,
     };
+
+    /// The pool, its timers and its worker threads need no tokio context: a database opens and
+    /// answers on the compio runtime every serving thread runs, with no tokio runtime on it.
+    #[compio::test]
+    async fn a_database_answers_on_compio_without_a_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+        let db = Db::connect_sqlite_memory()
+            .await
+            .expect("in-memory sqlite should connect");
+        create_entries(&db).await;
+        db.query("INSERT INTO entries (value) VALUES (7)")
+            .execute()
+            .await
+            .expect("insert should succeed");
+        let value = db
+            .query("SELECT value FROM entries")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("read should succeed");
+        assert_eq!(value, 7);
+    }
 
     /// Settings for a new file database in `dir`, created in WAL mode.
     fn wal_options(dir: &tempfile::TempDir) -> sqlite::SqliteConnectOptions {
@@ -2624,7 +2643,7 @@ mod tests {
             .expect("schema should be created");
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[compio::test]
     async fn reads_run_while_a_write_transaction_holds_the_writer_in_wal_mode() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Db::connect_sqlite_with(wal_options(&dir))
@@ -2644,7 +2663,7 @@ mod tests {
 
         // `tx` holds the only read-write connection until it commits below, so a read that
         // needed it would never finish inside the timeout.
-        let during = tokio::time::timeout(
+        let during = compio::time::timeout(
             Duration::from_secs(2),
             db.query("SELECT COUNT(*) FROM entries")
                 .fetch_scalar::<i64>(),
@@ -2663,7 +2682,7 @@ mod tests {
         assert_eq!(after, 2, "a read after the commit sees it");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_reader_connection_refuses_writes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let backend = SqliteBackend::connect(wal_options(&dir))
@@ -2694,7 +2713,7 @@ mod tests {
         assert_eq!(code, "8", "{error}");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn without_wal_every_statement_runs_on_the_writer() {
         let dir = tempfile::tempdir().expect("tempdir");
         let rollback_journal = wal_options(&dir).journal_mode(sqlite::SqliteJournalMode::Delete);
@@ -2713,7 +2732,7 @@ mod tests {
         assert!(memory.readers().is_none());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn connect_sqlite_with_applies_the_callers_busy_timeout() {
         const BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -2753,7 +2772,7 @@ mod tests {
             .expect("outside connection should roll back");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn connect_sqlite_memory_keeps_one_private_database() {
         let db = Db::connect_sqlite_memory()
             .await
@@ -2824,25 +2843,22 @@ mod tests {
             .await
             .expect("schema should be created");
 
-        let mut writers = tokio::task::JoinSet::new();
-        for writer in 0..WRITERS {
-            let db = db.clone();
-            writers.spawn(async move {
-                for round in 0..ROUNDS {
-                    let mut tx = db.begin().await?;
-                    tx.query("INSERT INTO claims (writer, round) VALUES (?, ?)")
-                        .bind(writer)
-                        .bind(round)
-                        .execute()
-                        .await?;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    tx.commit().await?;
-                }
-                Ok::<(), DbError>(())
-            });
-        }
-        let failures = writers
-            .join_all()
+        // Joined on one thread: the writers contend for the pool's connection, which is what is
+        // under test, and every one of them is in flight at once.
+        let writers = (0..WRITERS).map(|writer| async move {
+            for round in 0..ROUNDS {
+                let mut tx = db.begin().await?;
+                tx.query("INSERT INTO claims (writer, round) VALUES (?, ?)")
+                    .bind(writer)
+                    .bind(round)
+                    .execute()
+                    .await?;
+                compio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tx.commit().await?;
+            }
+            Ok::<(), DbError>(())
+        });
+        let failures = futures_util::future::join_all(writers)
             .await
             .into_iter()
             .filter_map(Result::err)
@@ -2862,7 +2878,7 @@ mod tests {
         assert_eq!(count, WRITERS * ROUNDS);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[compio::test]
     async fn contended_writers_on_a_wal_database_all_commit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let options = file_database(&dir, sqlite::SqliteJournalMode::Wal).await;
@@ -2872,7 +2888,7 @@ mod tests {
         assert_contended_writers_all_commit(&db).await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[compio::test]
     async fn contended_writers_on_a_rollback_journal_database_all_commit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let options = file_database(&dir, sqlite::SqliteJournalMode::Delete).await;
@@ -2882,7 +2898,7 @@ mod tests {
         assert_contended_writers_all_commit(&db).await;
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn execute_batch_commits_every_statement_and_returns_selected_rows() {
         let db = Db::connect_sqlite_memory()
             .await
@@ -2913,7 +2929,7 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn execute_batch_rolls_back_every_statement_when_one_fails() {
         let db = Db::connect_sqlite_memory()
             .await
@@ -2939,7 +2955,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn execute_batch_checks_placeholders_against_bound_values() {
         let db = Db::connect_sqlite_memory()
             .await
@@ -2961,7 +2977,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn sqlite_transaction_commit_persists_changes() {
         let db = Db::connect_sqlite_memory()
             .await
@@ -2987,7 +3003,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn sqlite_transaction_rollback_discards_changes() {
         let db = Db::connect_sqlite_memory()
             .await
@@ -3013,7 +3029,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn sqlite_binds_the_rich_parameter_types() {
         use bigdecimal::BigDecimal;
         use chrono::{DateTime, Utc};
@@ -3056,7 +3072,7 @@ mod tests {
         assert_eq!(row["amount"], serde_json::json!("19.99"));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn fetch_optional_stops_at_the_first_row() {
         let db = Db::connect_sqlite_memory()
             .await
@@ -3092,7 +3108,7 @@ mod tests {
 
     /// The read half of the typed bind path: what `.bind()` wrote comes back as the same Rust
     /// type, through whatever JSON shape `SQLite` happened to render it as.
-    #[tokio::test]
+    #[compio::test]
     async fn typed_values_round_trip_through_a_real_backend() {
         use super::{FromRow, Row, RowError};
         use bigdecimal::BigDecimal;
@@ -3166,7 +3182,7 @@ mod tests {
         assert_eq!(order, expected);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn sqlite_rows_convert_to_json_covering_all_storage_classes() {
         let db = Db::connect_sqlite_memory()
             .await

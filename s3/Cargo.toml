@@ -11,18 +11,16 @@ categories = ["web-programming::http-server", "database"]
 
 [dependencies]
 skyzen-services = { path = "../services", version = "0.3.1", default-features = false }
-# Disable the SDK default `rustls` feature: it pulls the legacy `tls-rustls` connector
-# (rustls 0.21 / hyper-rustls 0.24), which is redundant with the modern `default-https-client`
-# (rustls-aws-lc) and carries unpatched RustSec advisories. The default HTTPS client is unaffected.
-aws-sdk-s3 = { version = "1", default-features = false, features = [
-    "sigv4a",
-    "default-https-client",
-    "rt-tokio",
-] }
-aws-config = { version = "1" }
+# The SDK's I/O: `skyzen_aws::sdk` sends requests on zenwave's runtime-neutral native backend and
+# runs the SDK's timers on async-io, so no tokio context is needed. No service of `skyzen-aws` is
+# wanted, only that module.
+skyzen-aws = { path = "../aws", version = "0.3.1", default-features = false }
+# No `rt-tokio` and no `default-https-client` (hyper on tokio): the HTTP client and the sleep come
+# from `skyzen_aws::sdk`.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a"] }
 # `byte-stream-poll-next` exposes `ByteStream::poll_next`, which is what lets `get_stream` wrap a
 # response body in a `futures_core::Stream` newtype instead of buffering the whole object.
-aws-smithy-types = { version = "1", features = ["byte-stream-poll-next"] }
+aws-smithy-types = { version = "1.9.4", default-features = false, features = ["byte-stream-poll-next"] }
 base64 = "0.22"
 bytes = "1"
 futures-core = "0.3"
@@ -30,7 +28,11 @@ http-kit.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+# The tests run on a compio runtime, the one the native server runs, against a loopback server;
+# tokio is here only to assert that no tokio runtime is running.
+compio = { version = "0.19.2", default-features = false, features = ["runtime", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
+skyzen-test = { workspace = true, features = ["loopback"] }
 
 [lints]
 workspace = true

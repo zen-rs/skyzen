@@ -3,7 +3,7 @@
 //! `OpenDAL` moves the bytes, but three things it cannot do are what a storage backend needs:
 //! listing from a server-side `marker` (its lister owns its own paging and cannot resume from an
 //! outside cursor), minting a shared access signature, and setting a blob's access tier. All three
-//! are ordinary Azure REST calls, so this module issues them on the same `reqwest` client and the
+//! are ordinary Azure REST calls, so this module issues them on the same `zenwave` client and the
 //! same `reqsign` signer `OpenDAL`'s own azblob service is built on — the request is signed exactly
 //! the way the data-plane requests beside it are.
 
@@ -16,8 +16,12 @@ use reqsign_core::{Context, SignRequest as _};
 use serde::Deserialize;
 use skyzen_services::storage::StorageError;
 use url::Url;
+use zenwave::{Body, Request};
 
-use crate::status::{classify, retry_after, AzureStatus};
+use crate::{
+    status::{classify, retry_after, AzureStatus},
+    AzureHttp,
+};
 
 /// The Azure Storage REST version this client speaks.
 ///
@@ -39,8 +43,8 @@ pub(super) const WRITE_PERMISSION: &str = "cw";
 
 /// The Azure Blob REST endpoint of one container.
 pub(super) struct BlobRest {
-    /// The HTTP client the requests go out on.
-    client: reqwest::Client,
+    /// The backend the requests go out on; clones share its connection pool.
+    http: AzureHttp,
     /// The signer, which turns a request into a signed one or a URL into a presigned one.
     signer: RequestSigner,
     /// `reqsign`'s ambient context. Shared-key signing needs nothing from it.
@@ -62,6 +66,7 @@ impl core::fmt::Debug for BlobRest {
 impl BlobRest {
     /// Bind to the container at `endpoint`, authenticating with `credential`.
     pub(super) fn new(
+        http: AzureHttp,
         endpoint: &str,
         container: &str,
         credential: Credential,
@@ -82,12 +87,23 @@ impl BlobRest {
             .push(container);
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            http,
             signer: RequestSigner::new(),
             context: Context::new(),
             credential,
             container_url,
         })
+    }
+
+    /// This endpoint with its requests sent through `http`.
+    pub(super) fn with_http(&self, http: AzureHttp) -> Self {
+        Self {
+            http,
+            signer: RequestSigner::new(),
+            context: self.context.clone(),
+            credential: self.credential.clone(),
+            container_url: self.container_url.clone(),
+        }
     }
 
     /// Whether this endpoint can mint a shared access signature of its own.
@@ -234,10 +250,11 @@ impl BlobRest {
                 StorageError::backend_with("failed to sign an Azure Blob request", error)
             })?;
 
-        let request = reqwest::Request::try_from(http::Request::from_parts(parts, body))
-            .map_err(|error| StorageError::backend_with("failed to build a request", error))?;
+        let mut request = Request::from_parts(parts, Body::from(body));
 
-        let response = self.client.execute(request).await.map_err(|error| {
+        // The raw backend: a `reqsign` signature is bound to the URI it signs, so a redirect could
+        // never be honored anyway, and a 3xx surfaces as itself rather than as a replayed hop.
+        let response = self.http.send(&mut request).await.map_err(|error| {
             StorageError::backend_with(format!("the {method} request to Azure failed"), error)
         })?;
 
@@ -249,7 +266,12 @@ impl BlobRest {
             .map(ToOwned::to_owned);
 
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .into_body()
+                .into_string()
+                .await
+                .map(|body| body.to_string())
+                .unwrap_or_default();
             return Err(status_error(
                 status,
                 &method,
@@ -258,7 +280,7 @@ impl BlobRest {
             ));
         }
 
-        response.bytes().await.map_err(|error| {
+        response.into_body().into_bytes().await.map_err(|error| {
             StorageError::backend_with("failed to read Azure's response body", error)
         })
     }
@@ -396,6 +418,7 @@ mod tests {
 
     fn rest() -> BlobRest {
         BlobRest::new(
+            crate::AzureHttp::system(),
             "https://skyzentest.blob.core.windows.net",
             "uploads",
             Credential::SharedKey {
@@ -472,6 +495,7 @@ mod tests {
         assert!(rest().can_presign());
 
         let sas = BlobRest::new(
+            crate::AzureHttp::system(),
             "https://skyzentest.blob.core.windows.net",
             "uploads",
             Credential::SasToken {
@@ -483,7 +507,7 @@ mod tests {
         assert!(!sas.can_presign());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_presigned_url_carries_the_signature_the_service_verifies() {
         let url = rest()
             .presign(

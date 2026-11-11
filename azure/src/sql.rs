@@ -4,8 +4,8 @@
 //! T-SQL driver, so the [`Db`](skyzen_services::Db) API's native path covers `PostgreSQL`, `MySQL`
 //! and `SQLite` and stops there. Azure Database for `PostgreSQL` and for `MySQL` are already served by
 //! that path — they speak the same wire protocols as anywhere else — and only Azure SQL, which
-//! speaks TDS, needed one of its own. This is it, built on [`tiberius`] behind a
-//! [`deadpool`](deadpool_tiberius::deadpool) connection pool.
+//! speaks TDS, needed one of its own. This is it, built on [`tiberius`] behind a [`deadpool`]
+//! connection pool.
 //!
 //! # Placeholders and single-row bounds
 //!
@@ -69,9 +69,9 @@
 //!
 //! # Runtime
 //!
-//! tiberius is Tokio-based, like the rest of `skyzen-azure`: this backend must be built and used
-//! from inside a Tokio runtime, which `#[skyzen::main]` and `skyzen-lambda` both provide. TLS is
-//! `rustls`.
+//! Each connection is tiberius over an `async-net` TCP stream, whose reactor is async-io's (see
+//! [`pool`]), so the backend is built and used under any executor — compio's thread-per-core
+//! runtime included — with no tokio context. TLS is the platform's, through `native-tls`.
 //!
 //! # Example
 //!
@@ -85,15 +85,15 @@
 
 pub mod connection_string;
 pub mod errors;
+pub mod pool;
 pub mod values;
 
 use core::fmt;
 
-use deadpool_tiberius::{
-    deadpool::managed::{Object, PoolError},
-    tiberius::{error::Error as TiberiusError, Query},
-    Client, Manager, Pool,
-};
+use deadpool::managed::{Object, PoolError};
+use tiberius::{error::Error as TiberiusError, Query};
+
+use self::pool::{Client, Manager, Pool};
 use skyzen_services::sql::{
     BatchStatement, DbBackend, DbDialect, DbError, DbExecResult, DbTransaction,
     DbTransactionBackend, DbValue,
@@ -214,9 +214,9 @@ impl AzureSqlDb {
             connection_string,
             max_pool_size,
         } = config;
-        let pool = connection_string::manager(&connection_string)?
+        let pool = Pool::builder(connection_string::manager(&connection_string)?)
             .max_size(max_pool_size)
-            .create_pool()
+            .build()
             .map_err(|error| {
                 DbError::backend_with(
                     format!("failed to build the Azure SQL connection pool: {error}"),
@@ -604,5 +604,41 @@ mod tests {
         )
         .expect_err("39 digits is more than `numeric` holds");
         assert!(error.to_string().contains("38 digits"), "{error}");
+    }
+
+    /// A query dials the server and opens TDS with a pre-login packet while the test runs on compio
+    /// with no tokio runtime; a server that then hangs up is a backend error, not a panic.
+    #[compio::test]
+    async fn a_connection_opens_tds_on_compio_without_a_tokio_runtime() {
+        use std::io::Read as _;
+
+        /// The TDS packet type of a pre-login message (MS-TDS §2.2.3.1.1).
+        const PRELOGIN: u8 = 0x12;
+
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("a bound address").port();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the backend dials");
+            let mut header = [0_u8; 8];
+            stream.read_exact(&mut header).expect("a TDS packet header");
+            header
+        });
+
+        let db = AzureSqlDb::new(AzureSqlConfig::new(format!(
+            "Server=tcp:127.0.0.1,{port};Database=skyzen;User ID=skyzen_app;Password=s3cr3t;\
+             Encrypt=True;TrustServerCertificate=True;"
+        )))
+        .expect("the pool should build");
+        let error = db
+            .query("SELECT 1", &[])
+            .await
+            .expect_err("the peer hangs up after the pre-login packet");
+
+        assert_eq!(peer.join().expect("the peer thread")[0], PRELOGIN);
+        assert!(matches!(error, DbError::Backend { .. }), "{error:?}");
     }
 }

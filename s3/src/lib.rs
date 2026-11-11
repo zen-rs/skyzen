@@ -26,10 +26,25 @@
 //! the rest, and [`presign_get`](ObjectStorage::presign_get) /
 //! [`presign_put`](ObjectStorage::presign_put) hand the client a URL that keeps the transfer off
 //! the application server entirely.
+//!
+//! # Runtime
+//!
+//! The SDK client does its I/O through `skyzen_aws::sdk`: requests on zenwave's runtime-neutral
+//! native backend, timers on async-io. [`S3Storage`] works under any executor — compio's
+//! thread-per-core runtime included — and needs no tokio context. A client built by hand for
+//! [`S3Storage::new`] gets the same by loading its configuration through
+//! `skyzen_aws::sdk::config_loader`. [`S3Storage::with_http_client`] with a
+//! [`ZenwaveHttpClient::system_on_current_thread`] moves a storage's connections onto the calling
+//! thread's own compio runtime.
 
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::collections::HashMap;
+
+/// The SDK's HTTP client this crate's storages send on, and the loader of the configuration
+/// [`S3Storage::from_config`] takes, re-exported so a storage can be built from one configuration
+/// and rebound to a thread's own pools without naming `skyzen-aws`.
+pub use skyzen_aws::sdk::{load_config, SdkConfig, ZenwaveHttpClient};
 
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder;
@@ -119,25 +134,46 @@ impl S3Storage {
 
     /// Create a new `S3Storage` from environment configuration.
     ///
-    /// Uses the default AWS SDK configuration loader, which reads
-    /// from environment variables, config files, and instance metadata.
+    /// Loads the ambient AWS configuration — environment variables, config files and instance
+    /// metadata — through [`load_config`] on [`ZenwaveHttpClient::system`], and builds the storage
+    /// with [`from_config`](Self::from_config).
     pub async fn from_env(bucket: impl Into<String>) -> Self {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = Client::new(&config);
-        Self::new(client, bucket)
+        let config = load_config(ZenwaveHttpClient::system()).await;
+        Self::from_config(&config, bucket)
+    }
+
+    /// Create a new `S3Storage` whose client is built from `config`.
+    ///
+    /// Clients built from one configuration share its credentials provider and cache; see
+    /// [`load_config`].
+    #[must_use]
+    pub fn from_config(config: &SdkConfig, bucket: impl Into<String>) -> Self {
+        Self::new(Client::new(config), bucket)
     }
 
     /// Create a new `S3Storage` with a custom endpoint URL.
     ///
     /// Use this for S3-compatible services like `MinIO` or local development.
     pub async fn with_endpoint(bucket: impl Into<String>, endpoint_url: impl Into<String>) -> Self {
-        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let shared_config = load_config(ZenwaveHttpClient::system()).await;
         let s3_config = S3ConfigBuilder::from(&shared_config)
             .endpoint_url(endpoint_url)
             .force_path_style(true)
             .build();
         let client = Client::from_conf(s3_config);
         Self::new(client, bucket)
+    }
+
+    /// This storage with its requests sent through `http`, its client otherwise configured as it
+    /// was — credentials, region, endpoint, retries.
+    ///
+    /// How a thread gets a client whose connections it owns: build the storage once and rebind a
+    /// clone on each thread with `skyzen_aws::sdk::ZenwaveHttpClient::system_on_current_thread`.
+    #[must_use]
+    pub fn with_http_client(mut self, http: impl aws_sdk_s3::config::HttpClient + 'static) -> Self {
+        self.client =
+            Client::from_conf(self.client.config().to_builder().http_client(http).build());
+        self
     }
 
     /// Upload a body S3 will not take in one request, as a multipart upload.
@@ -1008,10 +1044,164 @@ mod tests {
                     .credentials_provider(Credentials::new(
                         "AKIDTEST", "secret", None, None, "tests",
                     ))
+                    .sleep_impl(skyzen_aws::sdk::AsyncIoSleep)
                     .build(),
             ),
             "skyzen-tests",
         )
+    }
+
+    /// An object in Chinese, Japanese and Korean, under a key in all three.
+    const LOOPBACK_KEY: &str = "订单/注文/주문.txt";
+    const LOOPBACK_BODY: &str = "一杯茶。お茶を一杯。차 한 잔.";
+
+    /// S3's answer for a key the bucket does not hold.
+    const NO_SUCH_KEY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>";
+
+    /// A storage whose SDK client loads its configuration through `skyzen_aws::sdk` and sends every
+    /// request to `server`, path-style as an S3-compatible endpoint expects.
+    async fn loopback_storage(server: &skyzen_test::LoopbackServer) -> S3Storage {
+        let shared = skyzen_aws::sdk::config_loader(skyzen_aws::sdk::ZenwaveHttpClient::system())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                "AKIDLOOPBACK",
+                "loopback-secret",
+                None,
+                None,
+                "loopback",
+            ))
+            .endpoint_url(format!("http://{}", server.addr()))
+            .load()
+            .await;
+        let config = aws_sdk_s3::config::Builder::from(&shared)
+            .force_path_style(true)
+            .build();
+        S3Storage::new(Client::from_conf(config), "skyzen-tests")
+    }
+
+    /// One in-memory object served the way S3 serves it: `PUT` stores it, `GET` returns it, and a
+    /// `GET` before any `PUT` is `NoSuchKey`.
+    fn object_server(
+        seen: std::sync::mpsc::Sender<skyzen_test::ReceivedRequest>,
+    ) -> skyzen_test::LoopbackServer {
+        let mut stored: Option<Bytes> = None;
+        skyzen_test::LoopbackServer::start(move |request| {
+            let method = request.method().clone();
+            let body = request.body().clone();
+            seen.send(request).expect("the test is still listening");
+            let mut response = match (method, &stored) {
+                (http_kit::Method::PUT, _) => {
+                    stored = Some(body);
+                    http_kit::Response::new(http_kit::Body::empty())
+                }
+                (http_kit::Method::GET, Some(object)) => {
+                    http_kit::Response::new(http_kit::Body::from_bytes(object.clone()))
+                }
+                (http_kit::Method::GET, None) => {
+                    let mut missing =
+                        http_kit::Response::new(http_kit::Body::from_bytes(NO_SUCH_KEY));
+                    *missing.status_mut() = http_kit::StatusCode::NOT_FOUND;
+                    missing.headers_mut().insert(
+                        http_kit::header::CONTENT_TYPE,
+                        http_kit::header::HeaderValue::from_static("application/xml"),
+                    );
+                    missing
+                }
+                (method, _) => panic!("unexpected {method}"),
+            };
+            response.headers_mut().insert(
+                http_kit::header::ETAG,
+                http_kit::header::HeaderValue::from_static("\"loopback\""),
+            );
+            response
+        })
+    }
+
+    fn assert_no_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+    }
+
+    /// An object goes up and comes back through zenwave's native backend, path-style and
+    /// signed, while the test runs on compio with no tokio runtime.
+    #[compio::test]
+    async fn an_object_round_trips_on_zenwave_without_a_tokio_runtime() {
+        assert_no_tokio_runtime();
+        let (seen, received) = std::sync::mpsc::channel();
+        let server = object_server(seen);
+        let storage = loopback_storage(&server).await;
+
+        storage
+            .put(LOOPBACK_KEY, LOOPBACK_BODY.as_bytes().to_vec())
+            .await
+            .expect("the put should succeed");
+        let object = storage
+            .get(LOOPBACK_KEY)
+            .await
+            .expect("the get should succeed")
+            .expect("the object was stored");
+
+        assert_eq!(object.body, LOOPBACK_BODY.as_bytes());
+        assert_eq!(object.metadata.etag.as_deref(), Some("\"loopback\""));
+        let put = received.recv().expect("the server saw the put");
+        assert_eq!(put.method(), http_kit::Method::PUT);
+        assert!(
+            put.uri().path().starts_with("/skyzen-tests/"),
+            "{}",
+            put.uri()
+        );
+        assert!(
+            put.headers().contains_key(http_kit::header::AUTHORIZATION),
+            "the request should be signed"
+        );
+        assert_eq!(put.body().as_ref(), LOOPBACK_BODY.as_bytes());
+    }
+
+    /// A streamed read hands the response body over as it arrives.
+    #[compio::test]
+    async fn a_streamed_get_reads_the_body_on_zenwave() {
+        assert_no_tokio_runtime();
+        let (seen, _received) = std::sync::mpsc::channel();
+        let server = object_server(seen);
+        let storage = loopback_storage(&server).await;
+        storage
+            .put(LOOPBACK_KEY, LOOPBACK_BODY.as_bytes().to_vec())
+            .await
+            .expect("the put should succeed");
+
+        let mut stream = storage
+            .get_stream(LOOPBACK_KEY)
+            .await
+            .expect("the get should succeed")
+            .expect("the object was stored");
+        let mut body = Vec::new();
+        while let Some(chunk) =
+            core::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await
+        {
+            body.extend_from_slice(&chunk.expect("the body reads"));
+        }
+
+        assert_eq!(body, LOOPBACK_BODY.as_bytes());
+    }
+
+    /// S3's `404 NoSuchKey` reaches the SDK as the service's error response, so a missing key
+    /// is absent rather than a transport failure.
+    #[compio::test]
+    async fn a_missing_key_is_absent_not_an_error() {
+        assert_no_tokio_runtime();
+        let (seen, _received) = std::sync::mpsc::channel();
+        let server = object_server(seen);
+
+        let object = loopback_storage(&server)
+            .await
+            .get(LOOPBACK_KEY)
+            .await
+            .expect("a missing key is not an error");
+
+        assert!(object.is_none());
     }
 
     #[test]
@@ -1061,7 +1251,7 @@ mod tests {
         assert_eq!(total_from_content_range("nonsense"), None);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn take_chunk_stops_at_the_target_and_reports_the_end_of_the_stream() {
         let mut stream = stream_of(&[b"abc", b"def", b"ghi"]);
 
@@ -1080,14 +1270,14 @@ mod tests {
         assert!(exhausted);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn take_chunk_reports_an_empty_stream_as_exhausted_immediately() {
         let (buffer, exhausted) = take_chunk(&mut stream_of(&[]), 16).await.unwrap();
         assert!(buffer.is_empty(), "{buffer:?}");
         assert!(exhausted);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn take_chunk_propagates_a_stream_failure() {
         struct Failing;
 
@@ -1156,7 +1346,7 @@ mod tests {
         assert_eq!(content_md5_header(&digest), "1B2M2Y8AsgTpgAmY7PhCfg==");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn presign_get_signs_a_get_the_client_can_follow() {
         let presigned = storage()
             .presign_get("reports/q3.pdf", core::time::Duration::from_mins(15))
@@ -1187,7 +1377,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn presign_put_signs_a_put_and_carries_the_headers_the_client_must_send() {
         let presigned = storage()
             .presign_put(
@@ -1226,7 +1416,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn presigning_refuses_a_lifetime_sigv4_cannot_sign() {
         let error = storage()
             .presign_get("reports/q3.pdf", core::time::Duration::from_hours(24 * 8))

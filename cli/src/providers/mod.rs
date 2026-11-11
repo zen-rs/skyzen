@@ -280,6 +280,9 @@ pub enum RunMode {
 /// What one provider decided to do.
 #[derive(Debug, Default)]
 pub struct ProviderPlan {
+    /// The work to perform before the build, in order — anything the compiled application reads,
+    /// such as the precompressed siblings an `embed_dir!` picks up.
+    pub prepare: Vec<Step>,
     /// The work to perform after the build, in order.
     pub steps: Vec<Step>,
     /// Files to write first.
@@ -421,14 +424,32 @@ pub fn prepare(
     let project = Project::load(manifest.root_dir())?;
     capabilities::ensure_present(manifest.data(), &project)?;
 
-    match provider {
+    let mut plan = match provider {
         Provider::Native => native::prepare(action, &manifest),
         Provider::Cloudflare => {
             cloudflare::prepare(action, &manifest, &project, environment, dry_run)
         }
         Provider::Aws => aws::prepare(action, &manifest, &project),
         Provider::Azure => azure::prepare(action, &manifest, &project),
-    }
+    }?;
+    plan.prepare
+        .extend(precompress_step(action, provider, &manifest));
+    Ok(plan)
+}
+
+/// `[static_files] precompress`, for every action that compiles the application for a native
+/// target. `dev` is left out — brotli at quality 11 on every save would stall the loop, and
+/// `StaticDir` already refuses a sibling older than its file — and so is Cloudflare, whose asset
+/// server negotiates encodings itself.
+fn precompress_step(action: &Action, provider: Provider, manifest: &Manifest) -> Option<Step> {
+    let compiles = matches!(action, Action::Build { .. } | Action::Deploy { .. });
+    let section = manifest.data().static_files.as_ref()?;
+    (compiles && provider != Provider::Cloudflare && !section.precompress.is_empty()).then(|| {
+        Step::Task(Box::new(crate::precompress::Precompress::new(
+            manifest.root_dir(),
+            &section.precompress,
+        )))
+    })
 }
 
 /// Load the manifest, or synthesize an empty one when the project has none.
@@ -974,6 +995,38 @@ fn ensure_declared_secret(manifest: &SkyzenManifest, name: &VarName) -> Result<(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn precompression_runs_before_native_builds_only() {
+        use super::precompress_step;
+
+        let manifest = skyzen_manifest::Manifest::parse(
+            "[static_files]\nprecompress = [\"public\"]\n",
+            "Skyzen.toml",
+            "/tmp/app",
+        )
+        .expect("valid manifest");
+        let build = Action::Build { release: true };
+        let step = precompress_step(&build, Provider::Native, &manifest).expect("a native build");
+        let dir = std::path::Path::new("/tmp/app").join("public");
+        assert!(
+            step.describe().contains(&dir.display().to_string()),
+            "{}",
+            step.describe()
+        );
+        assert!(precompress_step(&build, Provider::Aws, &manifest).is_some());
+        assert!(
+            precompress_step(&build, Provider::Cloudflare, &manifest).is_none(),
+            "the Workers asset server negotiates encodings itself"
+        );
+        let dev = Action::Dev {
+            runner_args: Vec::new(),
+        };
+        assert!(precompress_step(&dev, Provider::Native, &manifest).is_none());
+
+        let without = skyzen_manifest::Manifest::parse("", "Skyzen.toml", "/tmp/app").unwrap();
+        assert!(precompress_step(&build, Provider::Native, &without).is_none());
+    }
 
     #[test]
     fn a_compatibility_date_within_what_the_cli_targets_is_not_reported() {

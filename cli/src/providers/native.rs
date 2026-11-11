@@ -57,6 +57,7 @@ pub fn prepare(action: &Action, manifest: &Manifest) -> Result<ProviderPlan> {
     };
 
     Ok(ProviderPlan {
+        prepare: Vec::new(),
         steps: vec![Step::Command(CommandPlan {
             program: "cargo".to_owned(),
             args,

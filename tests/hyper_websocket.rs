@@ -1,4 +1,4 @@
-//! WebSocket integration tests for the Skyzen Hyper backend.
+//! WebSocket integration tests for the Skyzen Hyper backend, served through [`skyzen::Server`].
 
 use async_tungstenite::{
     client_async,
@@ -8,161 +8,80 @@ use async_tungstenite::{
     },
     WebSocketStream,
 };
-use executor_core::AnyExecutor;
 use futures_util::StreamExt;
+use http_kit_io::{async_io::AsyncIo, Io};
 use hyper::header::SEC_WEBSOCKET_PROTOCOL;
-use hyper::server::conn::http1;
 use skyzen::{
+    hyper::Hyper,
     routing::{CreateRouteNode, Route},
     websocket::WebSocketUpgrade,
+    Server,
 };
-use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use tokio::io::duplex;
 
-type Error = Box<dyn std::any::Any + Send>;
-
-/// Test executor that uses `tokio::spawn` to dispatch tasks within the current runtime
-struct TestTokioExecutor;
-
-impl executor_core::Executor for TestTokioExecutor {
-    type Task<T: Send + 'static> = TestTokioTask<T>;
-
-    fn spawn<Fut>(&self, fut: Fut) -> Self::Task<Fut::Output>
-    where
-        Fut: std::future::Future<Output: Send> + Send + 'static,
-    {
-        TestTokioTask(tokio::spawn(fut))
-    }
+/// A [`Hyper`] server running on a thread of its own; dropping it stops the accept loop.
+struct ServerHandle {
+    _stop: async_channel::Sender<()>,
 }
 
-struct TestTokioTask<T>(tokio::task::JoinHandle<T>);
-
-impl<T: Send + 'static> std::future::Future for TestTokioTask<T> {
-    type Output = T;
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        use std::task::Poll;
-        match std::pin::Pin::new(&mut self.0).poll(cx) {
-            Poll::Ready(Ok(v)) => Poll::Ready(v),
-            Poll::Ready(Err(e)) => std::panic::resume_unwind(e.into_panic()),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<T: Send + 'static> executor_core::Task<T> for TestTokioTask<T> {
-    fn poll_result(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<T, Error>> {
-        use std::future::Future;
-        use std::task::Poll;
-        match std::pin::Pin::new(&mut self.0).poll(cx) {
-            Poll::Ready(Ok(v)) => Poll::Ready(Ok(v)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into_panic())),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-fn create_executor() -> Arc<AnyExecutor> {
-    // For tests running on tokio, we use the current tokio runtime via tokio::spawn
-    Arc::new(AnyExecutor::new(TestTokioExecutor))
-}
-
-/// Wrapper to adapt tokio's `DuplexStream` to hyper's Read/Write traits
-struct TokioIo(tokio::io::DuplexStream);
-
-impl hyper::rt::Read for TokioIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        use tokio::io::AsyncRead;
-        let inner = &mut self.get_mut().0;
-        let mut read_buf = tokio::io::ReadBuf::uninit(unsafe { buf.as_mut() });
-        match Pin::new(inner).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => {
-                let filled = read_buf.filled().len();
-                unsafe { buf.advance(filled) };
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl hyper::rt::Write for TokioIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        use tokio::io::AsyncWrite;
-        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        use tokio::io::AsyncWrite;
-        Pin::new(&mut self.get_mut().0).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        use tokio::io::AsyncWrite;
-        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
-    }
-}
-
-async fn spawn_router<Req>(
-    router: Route,
+/// Serve the routes `build` describes on a localhost listener and open a WebSocket to it.
+///
+/// The router is `!Send`, so it is built on the serving thread — the way a thread-per-core runtime
+/// builds one per thread — and every upgraded session runs on that thread too.
+async fn spawn_router<Build, Req>(
+    build: Build,
     request: Req,
 ) -> (
-    WebSocketStream<TokioAdapter<tokio::io::DuplexStream>>,
+    WebSocketStream<TokioAdapter<tokio::net::TcpStream>>,
     ClientResponse,
-    tokio::task::JoinHandle<()>,
+    ServerHandle,
 )
 where
+    Build: FnOnce() -> Route + Send + 'static,
     Req: IntoClientRequest + Unpin,
 {
-    let router = router.build();
-    let executor = create_executor();
-    let (client_stream, server_stream) = duplex(1024);
-    let handle = tokio::spawn(async move {
-        let io = TokioIo(server_stream);
-        let service = skyzen_hyper::IntoService::new(router, executor);
-        let builder = http1::Builder::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr");
+    let (stop, stopped) = async_channel::bounded::<()>(1);
 
-        if let Err(error) = builder.serve_connection(io, service).with_upgrades().await {
-            panic!("websocket server failure: {error}");
-        }
+    std::thread::spawn(move || {
+        let executor = Rc::new(async_executor::LocalExecutor::new());
+        let listener = AsyncIo.tcp_listener(listener).expect("register listener");
+        let serve = Hyper.serve(
+            AsyncIo,
+            Rc::clone(&executor),
+            listener,
+            build().build(),
+            async move {
+                let _ = stopped.recv().await;
+            },
+        );
+        futures_lite::future::block_on(executor.run(serve));
     });
 
-    let (client, response) = client_async(request, TokioAdapter::new(client_stream))
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to the test server");
+    let (client, response) = client_async(request, TokioAdapter::new(stream))
         .await
         .expect("connect to websocket server");
 
-    (client, response, handle)
+    (client, response, ServerHandle { _stop: stop })
 }
 
 #[tokio::test]
 async fn websocket_roundtrip_over_hyper() {
     let (mut client, _, handle) = spawn_router(
-        Route::new(("/ws".ws(|mut socket| async move {
-            while let Some(Ok(message)) = socket.next().await {
-                if let Some(text) = message.into_text() {
-                    let _ = socket.send_text(text).await;
+        move || {
+            Route::new(("/ws".ws(|mut socket| async move {
+                while let Some(Ok(message)) = socket.next().await {
+                    if let Some(text) = message.into_text() {
+                        let _ = socket.send_text(text).await;
+                    }
                 }
-            }
-        }),)),
+            }),))
+        },
         "ws://localhost/ws",
     )
     .await;
@@ -179,8 +98,7 @@ async fn websocket_roundtrip_over_hyper() {
     assert_eq!(reply.into_text().unwrap(), "hello");
 
     let _ = client.close(None).await;
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 #[tokio::test]
@@ -196,13 +114,15 @@ async fn websocket_negotiates_protocol_with_standard_client() {
     );
 
     let (mut client, response, handle) = spawn_router(
-        Route::new(("/protocols".at(|upgrade: WebSocketUpgrade| async move {
-            upgrade
-                .protocols(["chat", "superchat"])
-                .on_upgrade(|mut socket| async move {
-                    let _ = socket.send_text("protocol-ok").await;
-                })
-        }),)),
+        move || {
+            Route::new(("/protocols".at(|upgrade: WebSocketUpgrade| async move {
+                upgrade
+                    .protocols(["chat", "superchat"])
+                    .on_upgrade(|mut socket| async move {
+                        let _ = socket.send_text("protocol-ok").await;
+                    })
+            }),))
+        },
         request,
     )
     .await;
@@ -221,24 +141,25 @@ async fn websocket_negotiates_protocol_with_standard_client() {
     assert_eq!(first.into_text().unwrap(), "protocol-ok");
 
     let _ = client.close(None).await;
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 #[tokio::test]
 async fn websocket_uses_custom_max_message_size() {
     let (mut client, _, handle) = spawn_router(
-        Route::new(("/config".at(|upgrade: WebSocketUpgrade| async move {
-            upgrade
-                .max_message_size(Some(4))
-                .on_upgrade(|mut socket| async move {
-                    let limit = socket
-                        .get_config()
-                        .max_message_size
-                        .map_or_else(|| "none".to_owned(), |value| value.to_string());
-                    let _ = socket.send_text(limit).await;
-                })
-        }),)),
+        move || {
+            Route::new(("/config".at(|upgrade: WebSocketUpgrade| async move {
+                upgrade
+                    .max_message_size(Some(4))
+                    .on_upgrade(|mut socket| async move {
+                        let limit = socket
+                            .get_config()
+                            .max_message_size
+                            .map_or_else(|| "none".to_owned(), |value| value.to_string());
+                        let _ = socket.send_text(limit).await;
+                    })
+            }),))
+        },
         "ws://localhost/config",
     )
     .await;
@@ -251,8 +172,7 @@ async fn websocket_uses_custom_max_message_size() {
     assert_eq!(first.into_text().unwrap(), "4");
 
     let _ = client.close(None).await;
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 #[tokio::test]
@@ -263,27 +183,29 @@ async fn websocket_rejects_messages_exceeding_max_message_size() {
     let error_tx = Arc::new(std::sync::Mutex::new(Some(error_tx)));
 
     let (mut client, _, handle) = spawn_router(
-        Route::new(("/limited".at(move |upgrade: WebSocketUpgrade| {
-            let error_tx = Arc::clone(&error_tx);
-            async move {
-                upgrade
-                    .max_message_size(Some(8))
-                    .on_upgrade(move |mut socket| async move {
-                        while let Some(result) = socket.next().await {
-                            match result {
-                                Ok(_) => {}
-                                Err(error) => {
-                                    let sender = error_tx.lock().unwrap().take();
-                                    if let Some(tx) = sender {
-                                        let _ = tx.send(error);
+        move || {
+            Route::new(("/limited".at(move |upgrade: WebSocketUpgrade| {
+                let error_tx = Arc::clone(&error_tx);
+                async move {
+                    upgrade
+                        .max_message_size(Some(8))
+                        .on_upgrade(move |mut socket| async move {
+                            while let Some(result) = socket.next().await {
+                                match result {
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        let sender = error_tx.lock().unwrap().take();
+                                        if let Some(tx) = sender {
+                                            let _ = tx.send(error);
+                                        }
+                                        break;
                                     }
-                                    break;
                                 }
                             }
-                        }
-                    })
-            }
-        }),)),
+                        })
+                }
+            }),))
+        },
         "ws://localhost/limited",
     )
     .await;
@@ -307,8 +229,7 @@ async fn websocket_rejects_messages_exceeding_max_message_size() {
     );
 
     let _ = client.close(None).await;
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 #[tokio::test]
@@ -322,17 +243,19 @@ async fn websocket_json_convenience_methods() {
     }
 
     let (mut client, _, handle) = spawn_router(
-        Route::new(("/json".ws(|mut socket| async move {
-            // Use recv_json() convenience method
-            while let Some(Ok(msg)) = socket.recv_json::<TestMessage>().await {
-                // Use send() convenience method for JSON
-                let response = TestMessage {
-                    value: msg.value * 2,
-                    text: format!("Echo: {}", msg.text),
-                };
-                let _ = socket.send(&response).await;
-            }
-        }),)),
+        move || {
+            Route::new(("/json".ws(|mut socket| async move {
+                // Use recv_json() convenience method
+                while let Some(Ok(msg)) = socket.recv_json::<TestMessage>().await {
+                    // Use send() convenience method for JSON
+                    let response = TestMessage {
+                        value: msg.value * 2,
+                        text: format!("Echo: {}", msg.text),
+                    };
+                    let _ = socket.send(&response).await;
+                }
+            }),))
+        },
         "ws://localhost/json",
     )
     .await;
@@ -360,23 +283,24 @@ async fn websocket_json_convenience_methods() {
     assert_eq!(received.text, "Echo: hello");
 
     let _ = client.close(None).await;
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 #[tokio::test]
 async fn websocket_binary_convenience_methods() {
     let (mut client, _, handle) = spawn_router(
-        Route::new(("/binary".ws(|mut socket| async move {
-            while let Some(Ok(message)) = socket.next().await {
-                if let Some(data) = message.into_bytes() {
-                    // Use send_binary() convenience method
-                    let mut response = vec![0xFF];
-                    response.extend_from_slice(&data);
-                    let _ = socket.send_binary(response).await;
+        move || {
+            Route::new(("/binary".ws(|mut socket| async move {
+                while let Some(Ok(message)) = socket.next().await {
+                    if let Some(data) = message.into_bytes() {
+                        // Use send_binary() convenience method
+                        let mut response = vec![0xFF];
+                        response.extend_from_slice(&data);
+                        let _ = socket.send_binary(response).await;
+                    }
                 }
-            }
-        }),)),
+            }),))
+        },
         "ws://localhost/binary",
     )
     .await;
@@ -401,19 +325,20 @@ async fn websocket_binary_convenience_methods() {
     assert_eq!(&received[1..], &test_data[..]);
 
     let _ = client.close(None).await;
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 #[tokio::test]
 async fn websocket_session_failure_closes_with_internal_error() {
     let (mut client, _, handle) = spawn_router(
-        Route::new(("/boom".ws(|mut socket| async move {
-            // Take one message so the client is certainly connected, then fail the session the way
-            // a handler would when a downstream call it depends on gives up.
-            let _ = socket.next().await;
-            Err::<(), _>(skyzen::Error::msg("the session gave up"))
-        }),)),
+        move || {
+            Route::new(("/boom".ws(|mut socket| async move {
+                // Take one message so the client is certainly connected, then fail the session the way
+                // a handler would when a downstream call it depends on gives up.
+                let _ = socket.next().await;
+                Err::<(), _>(skyzen::Error::msg("the session gave up"))
+            }),))
+        },
         "ws://localhost/boom",
     )
     .await;
@@ -438,17 +363,18 @@ async fn websocket_session_failure_closes_with_internal_error() {
         other => panic!("expected a close frame after a failed session, got {other:?}"),
     }
 
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 #[tokio::test]
 async fn websocket_session_success_leaves_the_connection_alone() {
     let (mut client, _, handle) = spawn_router(
-        Route::new(("/done".ws(|mut socket| async move {
-            socket.send_text("bye").await?;
-            Ok::<_, skyzen::Error>(())
-        }),)),
+        move || {
+            Route::new(("/done".ws(|mut socket| async move {
+                socket.send_text("bye").await?;
+                Ok::<_, skyzen::Error>(())
+            }),))
+        },
         "ws://localhost/done",
     )
     .await;
@@ -471,8 +397,7 @@ async fn websocket_session_success_leaves_the_connection_alone() {
         );
     }
 
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 // ── Durable Object hibernation sockets, natively ──
@@ -562,19 +487,21 @@ async fn durable_object_delivers_websocket_messages_natively() {
     let namespace = skyzen::durable::NativeDurableNamespace::<RelayObject>::new();
 
     let (mut client, _, handle) = spawn_router(
-        Route::new((
-            "/relay".at(move |ForwardedRequest(request): ForwardedRequest| {
-                let namespace = namespace.clone();
-                async move {
-                    namespace
-                        .get_by_name("lobby")
-                        .expect("stub for the lobby object")
-                        .fetch(request)
-                        .await
-                        .expect("durable object fetch")
-                }
-            }),
-        )),
+        move || {
+            Route::new((
+                "/relay".at(move |ForwardedRequest(request): ForwardedRequest| {
+                    let namespace = namespace.clone();
+                    async move {
+                        namespace
+                            .get_by_name("lobby")
+                            .expect("stub for the lobby object")
+                            .fetch(request)
+                            .await
+                            .expect("durable object fetch")
+                    }
+                }),
+            ))
+        },
         "ws://localhost/relay",
     )
     .await;
@@ -592,8 +519,7 @@ async fn durable_object_delivers_websocket_messages_natively() {
     assert_eq!(reply.into_text().unwrap(), "relay/1/hello");
 
     let _ = client.close(None).await;
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 /// A hibernating socket that authenticates the way a browser has to.
@@ -636,19 +562,21 @@ async fn durable_object_echoes_the_authenticating_subprotocol() {
 
     let namespace = skyzen::durable::NativeDurableNamespace::<RelayObject>::new();
     let (mut client, response, handle) = spawn_router(
-        Route::new((
-            "/authenticated".at(move |ForwardedRequest(request): ForwardedRequest| {
-                let namespace = namespace.clone();
-                async move {
-                    namespace
-                        .get_by_name("lobby")
-                        .expect("stub for the lobby object")
-                        .fetch(request)
-                        .await
-                        .expect("durable object fetch")
-                }
-            }),
-        )),
+        move || {
+            Route::new((
+                "/authenticated".at(move |ForwardedRequest(request): ForwardedRequest| {
+                    let namespace = namespace.clone();
+                    async move {
+                        namespace
+                            .get_by_name("lobby")
+                            .expect("stub for the lobby object")
+                            .fetch(request)
+                            .await
+                            .expect("durable object fetch")
+                    }
+                }),
+            ))
+        },
         request,
     )
     .await;
@@ -675,8 +603,7 @@ async fn durable_object_echoes_the_authenticating_subprotocol() {
     assert_eq!(reply.into_text().unwrap(), "relay/1/hello");
 
     let _ = client.close(None).await;
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }
 
 #[tokio::test]
@@ -692,22 +619,24 @@ async fn websocket_answers_a_credential_bearing_subprotocol_verbatim() {
     );
 
     let (mut client, response, handle) = spawn_router(
-        Route::new(("/token".at(|upgrade: WebSocketUpgrade| async move {
-            // A fixed list of supported names cannot match a token, so the offer is read and
-            // answered verbatim instead.
-            let answer = upgrade
-                .requested_protocols()
-                .iter()
-                .find(|protocol| protocol.starts_with("app.bearer."))
-                .and_then(|protocol| skyzen::header::HeaderValue::from_str(protocol).ok())
-                .expect("the client offered a bearer subprotocol");
+        move || {
+            Route::new(("/token".at(|upgrade: WebSocketUpgrade| async move {
+                // A fixed list of supported names cannot match a token, so the offer is read and
+                // answered verbatim instead.
+                let answer = upgrade
+                    .requested_protocols()
+                    .iter()
+                    .find(|protocol| protocol.starts_with("app.bearer."))
+                    .and_then(|protocol| skyzen::header::HeaderValue::from_str(protocol).ok())
+                    .expect("the client offered a bearer subprotocol");
 
-            upgrade
-                .protocol(answer)
-                .on_upgrade(|mut socket| async move {
-                    let _ = socket.send_text("authenticated").await;
-                })
-        }),)),
+                upgrade
+                    .protocol(answer)
+                    .on_upgrade(|mut socket| async move {
+                        let _ = socket.send_text("authenticated").await;
+                    })
+            }),))
+        },
         request,
     )
     .await;
@@ -728,6 +657,5 @@ async fn websocket_answers_a_credential_bearing_subprotocol_verbatim() {
     assert_eq!(first.into_text().unwrap(), "authenticated");
 
     let _ = client.close(None).await;
-    handle.abort();
-    let _ = handle.await;
+    drop(handle);
 }

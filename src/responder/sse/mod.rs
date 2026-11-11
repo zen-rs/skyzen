@@ -33,6 +33,8 @@ pub use channel::{SendError, Sender};
 use futures_util::TryStreamExt;
 use itoa::Buffer;
 
+#[cfg(not(target_arch = "wasm32"))]
+use http_kit::BodyFrame;
 use http_kit::{
     header::{self, HeaderValue},
     utils::Stream,
@@ -285,7 +287,7 @@ impl Sse {
     #[must_use]
     pub fn keep_alive(self, interval: Duration) -> Self {
         Self {
-            stream: Body::from_stream(KeepAlive::new(self.stream, interval)),
+            stream: Body::from_frames(KeepAlive::new(self.stream, interval)),
         }
     }
 }
@@ -340,7 +342,9 @@ impl Stream for KeepAlive {
         }
 
         match Pin::new(&mut *this.timer).poll_next(cx) {
-            Poll::Ready(_) => Poll::Ready(Some(Ok(Event::comment("").finalize().into()))),
+            Poll::Ready(_) => Poll::Ready(Some(Ok(BodyFrame::Data(
+                Event::comment("").finalize().into(),
+            )))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -491,7 +495,7 @@ mod tests {
             .unwrap();
 
         // Nothing has been sent, so the only thing that can arrive is the heartbeat.
-        let mut body = response.into_body();
+        let mut body = response.into_body().into_data_stream();
         let chunk = body
             .next()
             .await

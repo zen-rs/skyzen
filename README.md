@@ -207,7 +207,7 @@ before it binds anything, and the `wasm32` build is the Worker:
 
 | Target | How it is selected | Entry point |
 |---|---|---|
-| Native server | nothing else matched | Tokio + Hyper, `--port` / `--host` / `--listen` |
+| Native server | nothing else matched | One compio runtime per core serving HTTP/1.1, `--port` / `--host` / `--listen` |
 | AWS Lambda | `AWS_LAMBDA_RUNTIME_API` is set (needs the `lambda` feature) | `lambda_http` for HTTP, partial-batch responses for SQS |
 | Azure Functions | `FUNCTIONS_CUSTOMHANDLER_PORT` is set | custom handler; HTTP triggers reach the router, queue triggers reach `#[skyzen::queue]` |
 | Cloudflare Workers | compiled to `wasm32-unknown-unknown` | the WinterCG `fetch` export |
@@ -238,6 +238,7 @@ Most of what you reach for has a direct equivalent:
 | `tower_http::cors::CorsLayer` | `skyzen::middleware::Cors` | |
 | `tower_http::limit::RequestBodyLimitLayer` | `skyzen::middleware::BodyLimit` | On by default at 2 MiB — see below |
 | `tower_http::compression` | `skyzen::middleware::CompressionMiddleware` | |
+| `tower_http::decompression` | `skyzen::middleware::DecompressionMiddleware` | Per-codec features, all on by default |
 | `tower_http::timeout` | `skyzen::middleware::Timeout` | Native targets only |
 | `axum::response::sse` | `skyzen::responder::Sse` | With keep-alives |
 | `axum::extract::ws` | `.ws(handler)` on a route | One API over `async-tungstenite` natively and `WebSocketPair` on wasm |
@@ -603,6 +604,7 @@ whose registered methods are `GET`/`POST`, so it has to be answered before the r
 |---|---|
 | `Cors` | Answers preflights and decorates cross-origin responses; rejects credentials + wildcard origin at construction |
 | `CompressionMiddleware` | gzip/deflate negotiation, skipping HEAD and unknown-length streams |
+| `DecompressionMiddleware` | Decodes `Content-Encoding` request bodies (gzip/deflate/br/zstd), `415` + `Accept-Encoding` for the rest |
 | `BodyLimit` | Sets the request body cap for the routes it covers (2 MiB applies with no middleware at all) |
 | `Timeout` | Abandons a request that outruns its budget with `408` (native targets only) |
 | `ErrorHandlingMiddleware` | Renders endpoint errors into responses |

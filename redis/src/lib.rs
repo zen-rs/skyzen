@@ -14,15 +14,15 @@
 //! kv.put("key", b"value").await?;
 //! ```
 //!
+//! # Runtime
+//!
+//! The connection runs on redis's smol runtime, whose sockets and timers are async-io's, so a
+//! [`Redis`] works under any executor — compio's thread-per-core runtime included — and needs no
+//! tokio context.
+//!
 //! # Feature Flags
 //!
-//! - `runtime-tokio` — Use Tokio as the async runtime
-//! - `runtime-smol` — Use Smol as the async runtime
-//!
-//! At least one of them must be enabled; with neither, this crate exposes
-//! nothing (the upstream `redis` crate cannot build its async support without
-//! a runtime).
-#![cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
+//! - `tls` — `rediss://` URLs, through rustls
 
 use std::sync::Arc;
 
@@ -44,6 +44,12 @@ const URL_ENV: &str = "REDIS_URL";
 
 /// The compare-and-swap script, kept in its own file so the Lua stays readable and reviewable.
 const COMPARE_AND_SWAP: &str = include_str!("compare_and_swap.lua");
+
+/// The `INCRBY` + `PEXPIRE` pair [`KeyValueStore::increment_with_ttl`] runs as one script.
+const INCREMENT_WITH_TTL: &str = include_str!("increment_with_ttl.lua");
+
+/// The reply code [`INCREMENT_WITH_TTL`] raises on a stored negative or non-integer value.
+const CORRUPT_COUNTER_CODE: &str = "CORRUPT";
 
 /// The [`COMPARE_AND_SWAP`] flag meaning "the key must hold the expected bytes".
 const EXPECTS_VALUE: &str = "1";
@@ -89,6 +95,8 @@ pub struct Redis {
     /// Shared so cloning a `Redis` per request does not re-hash the script body each time; the
     /// script is immutable, so an `Arc` is all the sharing it needs.
     compare_and_swap: Arc<Script>,
+    /// Same sharing story as [`Self::compare_and_swap`].
+    increment_with_ttl: Arc<Script>,
 }
 
 impl Redis {
@@ -99,6 +107,7 @@ impl Redis {
     /// Returns [`KvError::Backend`] if the connection cannot be established.
     pub async fn connect(url: &str) -> Result<Self, KvError> {
         let client = Client::open(url).map_err(backend_error)?;
+        install_tls_provider(&client);
         let conn = client
             .get_connection_manager()
             .await
@@ -110,7 +119,8 @@ impl Redis {
     ///
     /// Matches the `from_env` constructor every other Skyzen backend offers, so a deployment
     /// configures Redis the same way it configures S3 or `DynamoDB`. Credentials and TLS travel in
-    /// the URL, as `rediss://user:password@host:6379/0`.
+    /// the URL, as `rediss://user:password@host:6379/0` — a `rediss://` URL needs the `tls`
+    /// feature, which is what turns the scheme into an actual rustls handshake.
     ///
     /// # Errors
     ///
@@ -134,6 +144,7 @@ impl Redis {
         Self {
             conn,
             compare_and_swap: Arc::new(Script::new(COMPARE_AND_SWAP)),
+            increment_with_ttl: Arc::new(Script::new(INCREMENT_WITH_TTL)),
         }
     }
 }
@@ -224,6 +235,7 @@ fn backend_error(error: RedisError) -> KvError {
 /// exact strings Redis sends.
 fn is_not_a_counter(code: Option<&str>, detail: Option<&str>) -> bool {
     code == Some(WRONG_TYPE_CODE)
+        || code == Some(CORRUPT_COUNTER_CODE)
         || detail.is_some_and(|detail| {
             NOT_A_COUNTER_DETAILS
                 .iter()
@@ -330,6 +342,30 @@ impl KeyValueStore for Redis {
         conn.incr(key, delta).await.map_err(counter_error)
     }
 
+    /// `INCRBY` + `PEXPIRE` as one script — a counter is born carrying its deadline, so a
+    /// transient failure between the two plain commands can never leave a TTL-less record.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::Decode`] when the key holds something that is not a counter, or when the
+    /// result would leave the `i64` range.
+    async fn increment_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: core::time::Duration,
+    ) -> Result<i64, KvError> {
+        let millis = expire_millis(ttl)?;
+        let mut conn = self.conn.clone();
+        self.increment_with_ttl
+            .key(key)
+            .arg(delta)
+            .arg(millis)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(counter_error)
+    }
+
     /// Re-arm a key's expiry with `PEXPIRE`, at the same millisecond precision as
     /// [`put_with_ttl`](KeyValueStore::put_with_ttl).
     ///
@@ -393,6 +429,31 @@ impl KeyValueStore for Redis {
         }
     }
 }
+
+/// redis-rs builds its client config through `ClientConfig::builder()`, which
+/// picks the *process-default* `CryptoProvider` — ambiguous, and therefore a
+/// panic, when another dependency also enables `ring`. Pin aws-lc-rs once, and
+/// only for a `rediss://` address: a plaintext connect must not decide the
+/// provider for unrelated TLS clients in the process. An `Err` from
+/// `install_default` only means a default already exists — the app's own
+/// choice wins, which is fine.
+#[cfg(feature = "tls")]
+fn install_tls_provider(client: &redis::Client) {
+    if matches!(
+        client.get_connection_info().addr(),
+        redis::ConnectionAddr::TcpTls { .. }
+    ) {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = rustls::crypto::CryptoProvider::install_default(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            );
+        });
+    }
+}
+
+#[cfg(not(feature = "tls"))]
+const fn install_tls_provider(_client: &redis::Client) {}
 
 #[cfg(test)]
 mod tests {
@@ -611,5 +672,233 @@ mod tests {
 
         let io = RedisError::from((ErrorKind::Io, "connection reset"));
         assert!(matches!(backend_error(io), KvError::Backend { .. }));
+    }
+
+    /// `Client::open` is where a `rediss://` URL used to die — with `tls` on,
+    /// the scheme parses to a TLS connection instead of failing.
+    #[test]
+    #[cfg(feature = "tls")]
+    fn a_rediss_url_parses_with_tls_enabled() {
+        assert!(redis::Client::open("rediss://user:password@127.0.0.1:6379/0").is_ok());
+    }
+
+    /// Without `tls` the provider install is a no-op, so `builder()` — the
+    /// call upstream's connect path makes — still panics in this test's
+    /// dual-provider world. That is the disabled state, observable: `connect`
+    /// installs nothing the caller did not ask for.
+    #[test]
+    #[cfg(not(feature = "tls"))]
+    fn without_tls_no_provider_is_installed() {
+        let client = redis::Client::open("rediss://127.0.0.1:6379/0").expect("parses");
+        super::install_tls_provider(&client);
+        assert!(
+            std::panic::catch_unwind(rustls::ClientConfig::builder).is_err(),
+            "builder() must still panic — no provider was installed"
+        );
+    }
+
+    /// `builder()` resolves through the process default — exactly what redis's
+    /// connect path calls — and must not panic even with two providers on the
+    /// shared rustls: the dev-dependency's `ring` puts this test in that world.
+    /// `connect` installs aws-lc-rs for a `rediss://` address first.
+    #[test]
+    #[cfg(feature = "tls")]
+    fn the_process_default_provider_is_installed_for_rediss() {
+        let client = redis::Client::open("rediss://127.0.0.1:6379/0").expect("parses");
+        super::install_tls_provider(&client);
+        let _ = rustls::ClientConfig::builder();
+    }
+
+    /// A throwaway TLS peer on a std thread: a rustls server with a self-signed cert that
+    /// completes the handshake, then answers the client's RESP commands (`+OK` for each
+    /// `CLIENT`, `+PONG` for each `PING`, which is all redis-rs's connection setup sends for a URL
+    /// without a password or database) until the client closes, and returns the decrypted bytes
+    /// it received. The handle yields `Err` if the handshake fails (the client rejecting the
+    /// certificate surfaces here) or any later I/O fails; the client closing the socket after the
+    /// handshake is the normal end of the session.
+    #[cfg(all(feature = "tls", unix))]
+    fn self_signed_peer() -> (u16, std::thread::JoinHandle<std::io::Result<Vec<u8>>>) {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed cert");
+        let config = rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+        )
+        .expect("server config");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept()?;
+            let mut conn = rustls::ServerConnection::new(std::sync::Arc::new(config))
+                .map_err(std::io::Error::other)?;
+            while conn.is_handshaking() {
+                conn.complete_io(&mut sock)?;
+            }
+            serve_setup(&mut rustls::StreamOwned::new(conn, sock))
+        });
+        (port, handle)
+    }
+
+    /// Answer the RESP commands redis-rs's connection setup sends over `stream` (`+OK` for each
+    /// `CLIENT`, `+PONG` for each `PING`) until the peer closes it, and return the bytes read.
+    fn serve_setup(stream: &mut (impl std::io::Read + std::io::Write)) -> std::io::Result<Vec<u8>> {
+        use std::io::ErrorKind;
+
+        fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+            haystack
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        let mut received = Vec::new();
+        let (mut clients, mut pings) = (0, 0);
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                // A plain TCP close after a TLS handshake carries no close_notify.
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+            let seen_clients = occurrences(&received, b"CLIENT");
+            let seen_pings = occurrences(&received, b"PING");
+            for _ in clients..seen_clients {
+                stream.write_all(b"+OK\r\n")?;
+            }
+            for _ in pings..seen_pings {
+                stream.write_all(b"+PONG\r\n")?;
+            }
+            (clients, pings) = (seen_clients, seen_pings);
+            stream.flush()?;
+        }
+        Ok(received)
+    }
+
+    /// A connection opens its socket and completes its setup on redis's smol runtime under a
+    /// compio runtime, with no tokio runtime anywhere: a plain TCP peer on a std thread answers
+    /// the RESP the connection manager sends on connect, and receives it.
+    #[compio::test]
+    async fn a_connection_writes_its_handshake_on_compio_without_a_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept()?;
+            serve_setup(&mut socket)
+        });
+
+        // The same manager `connect` builds, with its 1 s per-attempt bound lifted: under load an
+        // attempt can outlast it, and the peer serves exactly one connection. The outer 60 s
+        // bound only guards against a hang.
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}/")).expect("parses");
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(std::time::Duration::from_secs(60)))
+            .set_response_timeout(Some(std::time::Duration::from_secs(60)));
+        let manager = compio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.get_connection_manager_with_config(config),
+        )
+        .await
+        .expect("connect hung for 60 s")
+        .expect("connect to a peer that answers its setup must succeed");
+        // Closing the client ends the peer's session.
+        drop(super::Redis::from_connection_manager(manager));
+        let received = peer
+            .join()
+            .expect("peer thread panicked")
+            .expect("peer I/O failed");
+        assert_eq!(
+            received.first(),
+            Some(&b'*'),
+            "the peer should receive a RESP command array, got {received:?}"
+        );
+    }
+
+    /// `#insecure` turns off verification upstream, so a self-signed peer is a
+    /// real handshake: `connect` must return `Ok`, and the peer must have
+    /// received the decrypted RESP commands redis's connection setup sends
+    /// (`CLIENT SETINFO`), proving the TLS session carried data.
+    #[compio::test]
+    #[cfg(all(feature = "tls", unix))]
+    async fn a_rediss_connection_completes_a_tls_handshake() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+        let (port, peer) = self_signed_peer();
+        let url = format!("rediss://127.0.0.1:{port}/#insecure");
+        // `Redis::connect` uses redis-rs's defaults: each connection attempt (TCP, TLS handshake
+        // and setup, including loading the system roots) is cut off after 1 s and retried, and the
+        // peer serves exactly one connection. Under load an attempt can outlast that second, so
+        // the test builds the same manager `connect` does with the attempt bound lifted; the
+        // outer 60 s bound only guards against a hang.
+        let client = redis::Client::open(url).expect("parses");
+        super::install_tls_provider(&client);
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(std::time::Duration::from_secs(60)))
+            .set_response_timeout(Some(std::time::Duration::from_secs(60)));
+        let manager = compio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.get_connection_manager_with_config(config),
+        )
+        .await
+        .expect("connect hung for 60 s")
+        .expect("connect over a self-signed peer with #insecure must succeed");
+        let redis = super::Redis::from_connection_manager(manager);
+        // Closing the client ends the peer's session.
+        drop(redis);
+        let decrypted = peer
+            .join()
+            .expect("peer thread panicked")
+            .expect("peer I/O failed");
+        assert!(
+            decrypted.windows(6).any(|window| window == b"CLIENT"),
+            "the peer should have received the setup commands, got {:?}",
+            String::from_utf8_lossy(&decrypted)
+        );
+    }
+
+    /// Without `#insecure` the same self-signed peer must be *rejected*:
+    /// certificate verification is on and rustls-native-certs does not know
+    /// it. A single-shot connect, not the manager — the manager retries a
+    /// failed handshake forever, and "keeps retrying" is not the failure being
+    /// asserted here.
+    #[compio::test]
+    #[cfg(all(feature = "tls", unix))]
+    async fn a_rediss_connection_rejects_an_untrusted_certificate() {
+        let (port, peer) = self_signed_peer();
+        let url = format!("rediss://127.0.0.1:{port}/");
+        let client = redis::Client::open(url).expect("parses");
+        // Same provider install `connect` performs — a `rediss://` client
+        // without it panics on `builder()` in a multi-provider world, which is
+        // the failure mode being prevented, not tested.
+        super::install_tls_provider(&client);
+        let result = compio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get_multiplexed_async_connection(),
+        )
+        .await;
+        let outcome = result.expect("certificate rejection should be an error, not a hang");
+        assert!(
+            outcome.is_err(),
+            "an untrusted certificate must not connect"
+        );
+        // The rejection must have happened in the handshake: the peer never got to read data.
+        drop(client);
+        assert!(
+            peer.join().expect("peer thread panicked").is_err(),
+            "the peer's handshake should have failed when the client rejected its certificate"
+        );
     }
 }

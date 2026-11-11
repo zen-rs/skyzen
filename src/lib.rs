@@ -6,7 +6,7 @@
 //! in-process fakes from `skyzen-test` in a plain `cargo test`, with no sockets and no emulator.
 //! Those types live in [`skyzen_services`](https://docs.rs/skyzen-services).
 //!
-//! The HTTP layer is portable in the same way: one `#[skyzen::main]` serves a native Tokio/Hyper
+//! The HTTP layer is portable in the same way: one `#[skyzen::main]` serves a native thread-per-core
 //! server, an AWS Lambda, an Azure Functions custom handler, and a Cloudflare Worker, chosen by
 //! what the process finds in its environment rather than by anything in the application.
 //!
@@ -35,6 +35,7 @@
 //! - [`static_files`] — Streamed file serving with `ETag`, `Range` and SPA fallback (requires
 //!   `static-files`)
 //! - [`websocket`] — Unified WebSocket API across native and WASM (requires `ws` feature)
+//! - `proxy` — A reverse-proxy endpoint, mounted on a router (requires `proxy`, native only)
 //!
 //! # Safe by default
 //!
@@ -88,6 +89,9 @@ pub use skyzen_macros::{
     sql, tail, test, Column, FromRow, HttpError,
 };
 
+#[cfg(all(feature = "proxy", not(target_arch = "wasm32")))]
+pub mod proxy;
+
 /// Static asset helpers for building file servers.
 #[cfg(feature = "static-files")]
 pub mod static_files;
@@ -128,8 +132,11 @@ pub use middleware::Middleware;
 #[doc(inline)]
 pub use routing::{CreateRouteNode, Route};
 pub use skyzen_core::error::*;
-pub use skyzen_core::Server;
-pub use skyzen_core::{error_response, log_endpoint_error, ErrorChain, RequestBodyLimit, Secret};
+pub use skyzen_core::{
+    apply_pending_headers, error_response, log_endpoint_error, ErrorChain, PendingResponseHeaders,
+    RequestBodyLimit, Secret,
+};
+pub use skyzen_core::{EndpointFactory, Server};
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub use wasm_bindgen;
@@ -171,7 +178,7 @@ pub mod __private {
     /// request without the route tree having to know about them.
     pub fn with_middleware<E, M>(endpoint: E, middleware: M) -> Layered<E>
     where
-        E: Endpoint + Clone + Send + Sync + 'static,
+        E: Endpoint + Clone + 'static,
         M: Middleware,
     {
         layer(endpoint, middleware)

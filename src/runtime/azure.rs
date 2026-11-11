@@ -113,7 +113,27 @@ pub fn mount<E, C>(
     triggers: &'static [QueueTrigger],
 ) -> Result<FunctionsHost<E, C>, MountError>
 where
-    E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
+    E: Endpoint + ServedRoutes + Clone + 'static,
+    C: ConsumerSet,
+{
+    mount_shared(endpoint, Arc::new(consumers), triggers)
+}
+
+/// [`mount`] over a consumer set that is already shared.
+///
+/// The thread-per-core runtime mounts one endpoint per serving thread, and every one of them
+/// reaches the application's single queue handler through the same set.
+///
+/// # Errors
+///
+/// The same as [`mount`].
+pub fn mount_shared<E, C>(
+    endpoint: E,
+    consumers: Arc<C>,
+    triggers: &'static [QueueTrigger],
+) -> Result<FunctionsHost<E, C>, MountError>
+where
+    E: Endpoint + ServedRoutes + Clone + 'static,
     C: ConsumerSet,
 {
     let mut seen = BTreeMap::new();
@@ -139,7 +159,7 @@ where
 
     Ok(FunctionsHost {
         endpoint,
-        consumers: Arc::new(consumers),
+        consumers,
         triggers,
     })
 }
@@ -222,7 +242,7 @@ impl<E, C> FunctionsHost<E, C> {
 
 impl<E, C> Endpoint for FunctionsHost<E, C>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     C: ConsumerSet,
 {
     type Error = E::Error;
@@ -238,7 +258,7 @@ where
 
 impl<E, C> FunctionsHost<E, C>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     C: ConsumerSet,
 {
     /// Drive the queue handler for one invocation and answer the host.
@@ -552,7 +572,7 @@ mod tests {
         fn respond(
             &mut self,
             _request: &mut Request,
-        ) -> impl core::future::Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl core::future::Future<Output = Result<Response, Self::Error>> {
             core::future::ready(Ok(Response::new(crate::Body::from_bytes("router"))))
         }
     }

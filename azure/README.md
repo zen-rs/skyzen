@@ -35,9 +35,15 @@ skyzen-azure = "0.1"
 |---------|---------|-------------|
 | `cosmos` | Yes | Cosmos DB `KeyValueStore` via `azure_data_cosmos` |
 | `blob` | Yes | Blob Storage `ObjectStorage` via Apache OpenDAL, plus the REST calls OpenDAL does not cover |
-| `servicebus` | Yes | Service Bus `MessageQueue`, speaking the Service Bus REST API on `reqwest` |
+| `servicebus` | Yes | Service Bus `MessageQueue`, speaking the Service Bus REST API on zenwave |
 | `storage-queue` | Yes | Azure Storage queue `MessageQueue` via `azure_storage_queue` |
 | `sql` | Yes | Azure SQL `DbBackend` via `tiberius` behind a `deadpool` pool |
+
+Blob Storage, Service Bus and Storage queues send their requests on zenwave's runtime-neutral
+native backend, and Azure SQL runs on async-io, so none of them needs a Tokio runtime. Cosmos DB
+still does: its SDK builds its own reqwest transport and runs background tasks on Tokio, with no
+public way to replace either. Its `tokio` feature also makes Tokio `azure_core`'s process-wide
+async runtime, so with `cosmos` enabled a retried Storage queue request sleeps on Tokio too.
 
 Disable unused features to reduce compile times:
 
@@ -245,9 +251,8 @@ own retry delay when the message states one; a deadlock victim (`1205`) becomes 
 Error `40613` — the database is resuming from a serverless pause — is deliberately *not* throttling:
 it is transient, but telling a caller to back off would be the wrong diagnosis.
 
-**Runtime.** tiberius is Tokio-based, like the rest of this crate, so the backend must be built and
-used inside a Tokio runtime (`#[skyzen::main]` and `skyzen-lambda` both provide one). TLS is
-`rustls`. The pool validates a connection before handing it out, which costs one extra round trip
+**Runtime.** tiberius runs on an `async-net` TCP stream, whose reactor is async-io's, so the
+backend works under any executor with no Tokio context. TLS is the platform's (`native-tls`). The pool validates a connection before handing it out, which costs one extra round trip
 per checkout and is what keeps Azure's idle-connection reaping from surfacing as a failed query.
 There is no wait timeout: a request that arrives while every connection is checked out waits for one
 rather than failing fast, so bound request time with Skyzen's `Timeout` middleware and size

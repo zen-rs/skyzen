@@ -223,7 +223,9 @@ impl<E: Endpoint> RequestBuilder<E> {
             Ok(resp) => resp,
             Err(err) => {
                 skyzen_core::log_endpoint_error(&err, &method, path.as_str());
-                skyzen_core::error_response(&err)
+                let mut response = skyzen_core::error_response(&err);
+                skyzen_core::apply_pending_headers(&request, &mut response);
+                response
             }
         };
 
@@ -261,7 +263,7 @@ mod tests {
         fn respond(
             &mut self,
             _request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             ready(Err(BackendBroken::new()))
         }
     }
@@ -275,7 +277,7 @@ mod tests {
         fn respond(
             &mut self,
             _request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             ready(Err(BadInput::new()))
         }
     }
@@ -310,7 +312,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn server_errors_are_redacted_like_production() {
         let response = TestContext::new()
             .client(ServerErrorEndpoint)
@@ -322,7 +324,7 @@ mod tests {
         assert_eq!(response.body_text(), r#"{"error":"Internal server error"}"#);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn client_errors_keep_their_message_like_production() {
         let response = TestContext::new()
             .client(ClientErrorEndpoint)
@@ -337,7 +339,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn append_header_builds_multi_value_headers() {
         let response = TestContext::new()
             .client(EchoEndpoint)
@@ -351,7 +353,7 @@ mod tests {
         response.assert_body_contains("tags=one,two;");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn header_replaces_previous_value() {
         let response = TestContext::new()
             .client(EchoEndpoint)
@@ -374,12 +376,12 @@ mod tests {
         fn respond(
             &mut self,
             request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             ready(Ok(Response::new(Body::from(request.method().to_string()))))
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn head_and_options_reach_the_endpoint() {
         let client = TestContext::new().client(MethodEchoEndpoint);
 
@@ -391,7 +393,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn request_builds_a_method_the_verb_helpers_do_not_cover() {
         let response = TestContext::new()
             .client(MethodEchoEndpoint)
@@ -403,9 +405,9 @@ mod tests {
         assert_eq!(response.body_text(), "TRACE");
     }
 
-    // `InMemoryDurableDb` is SQLite over sqlx, which exists only with `runtime-tokio`.
-    #[cfg(feature = "runtime-tokio")]
-    #[tokio::test]
+    // `InMemoryDurableDb` is SQLite over sqlx, which exists only with `sqlite`.
+    #[cfg(feature = "sqlite")]
+    #[compio::test]
     async fn durable_services_ride_the_context_into_the_request() {
         use skyzen_services::durable::{Alarm, DurableDb, DurableKv};
 
@@ -479,7 +481,7 @@ mod tests {
         assert_eq!(alarm.scheduled_time(), Some(1337));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn form_sets_urlencoded_body_and_content_type() {
         #[derive(serde::Serialize)]
         struct Login {

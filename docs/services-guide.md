@@ -352,6 +352,11 @@ let kv = Kv::new(Redis::connect("redis://localhost:6379").await?);
 let storage = Storage::new(S3Storage::from_env("my-bucket").await);
 ```
 
+A `rediss://` URL negotiates TLS through rustls once `skyzen-redis`'s `tls`
+feature is on; without it the scheme fails at `Client::open` before it can
+connect. The connection runs on redis's smol runtime under any executor, with
+no tokio context.
+
 ### Cloudflare Workers (KV + R2)
 
 On WASM targets, services are created from the Workers environment bindings inside the request handler or startup:
@@ -527,11 +532,11 @@ A column the query did not select, or one holding something the field's type doe
 error naming the column and what was expected. Nothing is defaulted, and only an `Option<T>` field
 accepts `NULL`.
 
-Enable the required runtime and database features:
+Enable the required TLS and database features:
 
 ```toml
 [dependencies]
-skyzen-services = { version = "0.1", features = ["runtime-tokio", "tls-rustls", "postgres"] }
+skyzen-services = { version = "0.1", features = ["tls-rustls", "postgres"] }
 ```
 
 Portable SQL is intentionally the minimum common surface. When you need provider-specific features such as Durable Object local SQLite or D1-specific metadata, drop down to the provider APIs explicitly.

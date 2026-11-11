@@ -95,7 +95,7 @@ Features:
 
 - Demonstrates embedding Skyzen into a custom runtime without the `#[skyzen::main]` macro.
 - Uses `smol` as the async runtime instead of Tokio.
-- Shows direct use of `Hyper.serve()` with a custom executor and TCP listener.
+- Shows direct use of `Hyper.serve()` with an `http-kit-io` listener, a thread-local executor and a shutdown signal.
 
 Requires the `hyper` feature:
 

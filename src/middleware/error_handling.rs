@@ -54,6 +54,9 @@ where
                 (self.f)(error.into_boxed_http_error())
                     .await
                     .respond_to(request, &mut response)?;
+                // Headers a layer upstream marked as must-deliver survive the error path —
+                // the same stamp the backends apply at their own error boundary.
+                skyzen_core::apply_pending_headers(request, &mut response);
                 Ok(response)
             }
         }

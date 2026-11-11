@@ -17,14 +17,18 @@ path = "src/main.rs"
 anyhow = "1"
 askama = "0.16"
 # The Lambda environment is delivered in-process rather than through `cargo lambda`, so a value
-# never reaches a command line. Same feature selection as `skyzen-aws`, so the workspace resolves
-# one HTTP stack: the SDK default `rustls` feature pulls the legacy connector (rustls 0.21 /
+# never reaches a command line. The CLI runs on tokio, so it keeps the SDK's tokio client; the SDK
+# default `rustls` feature stays off because it pulls the legacy connector (rustls 0.21 /
 # hyper-rustls 0.24) alongside the modern `default-https-client`, and carries unpatched advisories.
 aws-config = "1"
 aws-sdk-lambda = { version = "1", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
+# `[static_files] precompress`: the `.br` and `.zst` siblings `skyzen build` writes beside each
+# file `StaticDir` serves (`.gz` comes from `flate2`, below).
+brotli = { version = "9.1.1", default-features = false, features = ["std"] }
+zstd = { version = "0.14.3", default-features = false }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 ctrlc = "3.5"
@@ -38,8 +42,9 @@ open = "5"
 pathdiff = "0.2"
 regex = "1"
 # The Azure app settings are read and written over ARM, which has no Rust SDK for the Web Apps
-# provider; same rustls-only selection as `skyzen-azure` so the workspace resolves one TLS stack.
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# provider; zenwave is the workspace's HTTP client — hyper over async-io with rustls verified
+# against the OS trust store, the same selection `skyzen-azure` makes.
+zenwave = { version = "0.10.1", default-features = false, features = ["hyper-backend", "rustls", "http2"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -48,10 +53,9 @@ serde_json = "1"
 skyzen-core.workspace = true
 skyzen-manifest.workspace = true
 # `skyzen migrate --provider native` applies migrations itself rather than shelling out, so the CLI
-# links the same runner and the same sqlx drivers the application would use. `runtime-tokio`
-# plus `tls-rustls` pick sqlx's primary runtime and TLS stack; the CLI drives them on a
-# current-thread runtime of its own.
-skyzen-services = { workspace = true, features = ["postgres", "mysql", "sqlite", "runtime-tokio", "tls-rustls"] }
+# links the same runner and the same sqlx drivers the application would use. `tls-rustls` picks
+# sqlx's TLS stack; sqlx's runtime-neutral runtime runs under the CLI's own current-thread runtime.
+skyzen-services = { workspace = true, features = ["postgres", "mysql", "sqlite", "tls-rustls"] }
 tokio = { version = "1.49", features = ["rt", "net", "time"] }
 toml = "1.0"
 toml_edit = "0.22"

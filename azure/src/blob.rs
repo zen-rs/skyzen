@@ -1,13 +1,14 @@
 //! Azure Blob Storage implementation of [`ObjectStorage`].
 
 mod rest;
+mod transport;
 
 use core::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use futures_util::StreamExt as _;
 use http::{header::HeaderName, HeaderValue, Method};
-use opendal::{services::Azblob, ErrorKind, Operator};
+use opendal::{services::Azblob, ErrorKind, HttpTransporter, OperationContext, Operator};
 use reqsign_azure_storage::Credential;
 use skyzen_services::storage::{
     ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest, PutOption,
@@ -15,6 +16,8 @@ use skyzen_services::storage::{
 };
 
 use self::rest::{BlobRest, READ_PERMISSION, WRITE_PERMISSION};
+use self::transport::ZenwaveTransport;
+use crate::AzureHttp;
 
 /// The environment variable [`AzureBlobConfig::from_env`] reads its connection string from.
 const CONNECTION_STRING_ENV: &str = "AZURE_STORAGE_CONNECTION_STRING";
@@ -305,13 +308,30 @@ impl AzureBlob {
             AzureBlobAuth::SasToken(token) => builder.sas_token(token),
         };
 
-        let operator = Operator::new(builder).map_err(storage_error)?;
-        let rest = BlobRest::new(&endpoint, &container, credential)?;
+        // The operator's HTTP traffic rides the same zenwave backend the REST calls beside it use.
+        let http = AzureHttp::system();
+        let operator = Operator::new(builder)
+            .map_err(storage_error)?
+            .with_context(operation_context(http.clone()));
+        let rest = BlobRest::new(http, &endpoint, &container, credential)?;
 
         Ok(Self {
             operator,
             rest: Arc::new(rest),
         })
+    }
+
+    /// This container with its requests — the bytes and the REST calls alike — sent through
+    /// `http`.
+    ///
+    /// How a thread gets a client whose connections it owns: build the container once and rebind a
+    /// clone on each thread with an [`AzureHttp::system_on_current_thread`].
+    #[must_use]
+    pub fn with_http(self, http: AzureHttp) -> Self {
+        Self {
+            operator: self.operator.with_context(operation_context(http.clone())),
+            rest: Arc::new(self.rest.with_http(http)),
+        }
     }
 
     /// Reach a container using the connection string in `AZURE_STORAGE_CONNECTION_STRING`.
@@ -796,6 +816,14 @@ fn size_of(length: usize) -> Result<u64, StorageError> {
         .map_err(|error| StorageError::backend_with("Azure blob size overflow", error))
 }
 
+/// The `OpenDAL` context whose HTTP transport sends through `http`.
+///
+/// The transport is an extension point, and leaving it unset makes every data-plane request fail
+/// with "default HTTP transport is not installed".
+fn operation_context(http: AzureHttp) -> OperationContext {
+    OperationContext::new().with_http_transport(HttpTransporter::new(ZenwaveTransport::new(http)))
+}
+
 /// Map an `OpenDAL` error onto the portable taxonomy, keeping its source chain.
 fn storage_error(error: opendal::Error) -> StorageError {
     match error.kind() {
@@ -824,6 +852,130 @@ mod tests {
     fn store() -> AzureBlob {
         AzureBlob::from_connection_string(CONNECTION_STRING, "uploads")
             .expect("the connection string should build a store")
+    }
+
+    /// A blob in Chinese, Japanese and Korean, under a name in all three.
+    const LOOPBACK_KEY: &str = "订单/注文/주문.txt";
+    const LOOPBACK_BODY: &str = "一杯茶。お茶を一杯。차 한 잔.";
+
+    /// A store whose requests all go to `server`, as Azurite is addressed: the account in the path.
+    fn loopback_store(server: &skyzen_test::LoopbackServer) -> AzureBlob {
+        AzureBlob::new(
+            AzureBlobConfig::new(
+                "devstoreaccount1",
+                "uploads",
+                AzureBlobAuth::AccountKey("c2t5emVuLXRlc3Qta2V5".to_owned()),
+            )
+            .with_endpoint(format!("http://{}/devstoreaccount1", server.addr())),
+        )
+        .expect("the loopback endpoint should build a store")
+    }
+
+    /// One in-memory blob served the way Blob Storage serves it: `PUT` stores it, `GET` and
+    /// `HEAD` describe it, and either before any `PUT` is `404 BlobNotFound`.
+    fn blob_server(
+        seen: std::sync::mpsc::Sender<skyzen_test::ReceivedRequest>,
+    ) -> skyzen_test::LoopbackServer {
+        use http::{header, HeaderValue, Method, StatusCode};
+
+        let mut stored: Option<bytes::Bytes> = None;
+        skyzen_test::LoopbackServer::start(move |request| {
+            let method = request.method().clone();
+            let body = request.body().clone();
+            seen.send(request).expect("the test is still listening");
+            let (status, body) = match (method, &stored) {
+                (Method::PUT, _) => {
+                    stored = Some(body);
+                    (StatusCode::CREATED, bytes::Bytes::new())
+                }
+                (Method::GET | Method::HEAD, Some(blob)) => (StatusCode::OK, blob.clone()),
+                (Method::GET | Method::HEAD, None) => (StatusCode::NOT_FOUND, bytes::Bytes::new()),
+                (method, _) => panic!("unexpected {method}"),
+            };
+            let length = body.len();
+            let mut response = http_kit::Response::new(http_kit::Body::from_bytes(body));
+            *response.status_mut() = status;
+            let headers = response.headers_mut();
+            if status == StatusCode::NOT_FOUND {
+                headers.insert("x-ms-error-code", HeaderValue::from_static("BlobNotFound"));
+            } else {
+                headers.insert(header::CONTENT_LENGTH, length.into());
+                headers.insert(
+                    header::ETAG,
+                    HeaderValue::from_static("\"0x8DE1F1A2B3C4D5E\""),
+                );
+                headers.insert(
+                    header::LAST_MODIFIED,
+                    HeaderValue::from_static("Tue, 10 Nov 2026 15:00:00 GMT"),
+                );
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain; charset=utf-8"),
+                );
+            }
+            response
+        })
+    }
+
+    fn assert_no_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+    }
+
+    /// A blob goes up and comes back through `OpenDAL` on zenwave's native backend, signed, while
+    /// the test runs on compio with no tokio runtime.
+    #[compio::test]
+    async fn a_blob_round_trips_on_zenwave_without_a_tokio_runtime() {
+        assert_no_tokio_runtime();
+        let (seen, received) = std::sync::mpsc::channel();
+        let server = blob_server(seen);
+        let store = loopback_store(&server);
+
+        store
+            .put(LOOPBACK_KEY, LOOPBACK_BODY.as_bytes().to_vec())
+            .await
+            .expect("the put should succeed");
+        let object = store
+            .get(LOOPBACK_KEY)
+            .await
+            .expect("the get should succeed")
+            .expect("the blob was stored");
+
+        assert_eq!(object.body, LOOPBACK_BODY.as_bytes());
+        assert_eq!(
+            object.metadata.etag.as_deref(),
+            Some("\"0x8DE1F1A2B3C4D5E\"")
+        );
+        let put = received.recv().expect("the server saw the put");
+        assert_eq!(put.method(), http::Method::PUT);
+        assert!(
+            put.uri().path().starts_with("/devstoreaccount1/uploads/"),
+            "{}",
+            put.uri()
+        );
+        assert!(
+            put.headers().contains_key(http::header::AUTHORIZATION),
+            "the request should be signed"
+        );
+        assert_eq!(put.body().as_ref(), LOOPBACK_BODY.as_bytes());
+    }
+
+    /// Blob Storage's `404` reaches `OpenDAL` as the service's answer, which is how it learns a blob
+    /// is absent; a missing blob is `None`, not a transport failure.
+    #[compio::test]
+    async fn a_missing_blob_is_absent_not_an_error() {
+        assert_no_tokio_runtime();
+        let (seen, _received) = std::sync::mpsc::channel();
+        let server = blob_server(seen);
+
+        let object = loopback_store(&server)
+            .get(LOOPBACK_KEY)
+            .await
+            .expect("a missing blob is not an error");
+
+        assert!(object.is_none());
     }
 
     #[test]
@@ -910,7 +1062,7 @@ mod tests {
         assert!(rendered.contains("redacted"), "{rendered}");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_put_option_this_backend_would_drop_is_refused() {
         let store = store();
 
@@ -959,7 +1111,7 @@ mod tests {
         assert!(names.contains(&"x-ms-meta-owner"));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn presigning_under_a_shared_signature_is_refused_rather_than_leaking_the_account_one() {
         let store = AzureBlob::new(AzureBlobConfig::new(
             "skyzentest",
@@ -975,7 +1127,7 @@ mod tests {
         assert!(matches!(error, StorageError::Unsupported(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_presigned_download_is_a_url_the_client_can_follow() {
         let request = store()
             .presign_get("photos/one.png", core::time::Duration::from_mins(15))

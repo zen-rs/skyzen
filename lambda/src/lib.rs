@@ -61,6 +61,7 @@
 //!     }
 //! }
 //!
+//! // The endpoint is built and driven on the adapter's single thread, so it need not be `Send`.
 //! # fn main() -> Result<(), skyzen_lambda::Error> {
 //! // `NoQueueHandler` is what an application with no `#[skyzen::queue]` handler passes: an SQS
 //! // event that reaches it fails the invocation rather than acknowledging messages nothing read.
@@ -85,7 +86,8 @@ use aws_lambda_events::sqs::SqsEvent;
 use futures_util::FutureExt as _;
 use http_kit::Endpoint;
 use lambda_http::{
-    request::LambdaRequest, Adapter, LambdaEvent, Request as LambdaHttpRequest, Response, Service,
+    request::{LambdaRequest, RequestContext},
+    Adapter, LambdaEvent, Request as LambdaHttpRequest, RequestExt, Response, Service,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -96,7 +98,8 @@ use tracing::{debug, error, info};
 /// function, until the runtime shuts the environment down.
 ///
 /// `factory` is run inside this crate's Tokio runtime, so the services it constructs are built in
-/// the reactor that will later drive them.
+/// the reactor that will later drive them. The runtime is single-threaded and the endpoint never
+/// leaves it, so neither the endpoint nor the futures it returns have to be `Send`.
 ///
 /// # Errors
 ///
@@ -113,14 +116,16 @@ pub fn run<Factory, Fut, E, D>(factory: Factory) -> Result<(), Error>
 where
     Factory: FnOnce() -> Fut,
     Fut: Future<Output = (E, D)>,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     D: QueueDispatch,
 {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
-    runtime.block_on(async move {
+    // The endpoint's requests are spawned on this set: see `HttpService`.
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async move {
         let (endpoint, dispatch) = factory().await;
         info!(queue_handler = D::DECLARED, "Skyzen starting on AWS Lambda");
         lambda_runtime::run(Invocation {
@@ -157,12 +162,12 @@ struct RecordKind<'a> {
 
 impl<E, D> Service<LambdaEvent<Box<RawValue>>> for Invocation<E, D>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
     D: QueueDispatch,
 {
     type Response = serde_json::Value;
     type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
 
     fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -306,11 +311,29 @@ fn settle(
     response
 }
 
+/// The client address the platform itself observed — `requestContext.http.sourceIp` on HTTP
+/// APIs, `identity.sourceIp` on REST APIs. Other event sources (ALB, WebSocket, VPC Lattice)
+/// record no equivalent; their requests arrive peer-less and forwarding headers stay
+/// unverifiable there, by design.
+fn lambda_source_ip(request: &LambdaHttpRequest) -> Option<std::net::IpAddr> {
+    let context = request.extensions().get::<RequestContext>()?;
+    let raw = match context {
+        RequestContext::ApiGatewayV2(context) => context.http.source_ip.as_deref(),
+        RequestContext::ApiGatewayV1(context) => context.identity.source_ip.as_deref(),
+        _ => None,
+    };
+    raw.and_then(|raw| raw.parse().ok())
+}
+
 /// The inner service [`lambda_http`]'s adapter drives: a normalized request in, a response out.
 ///
 /// Its error type is [`Infallible`](core::convert::Infallible) by construction — an endpoint error
 /// is rendered into a response here, through the same helpers the native and Worker backends use,
 /// so a 4xx keeps its message and a 5xx does not leak one.
+///
+/// The adapter asks for a `Send` future, which a `!Send` endpoint cannot give it, so the request
+/// is served by a task spawned on the runtime's `LocalSet` — the same, only, thread — and the
+/// future the adapter holds merely waits for the response, which is `Send`.
 #[derive(Debug, Clone)]
 struct HttpService<E> {
     endpoint: E,
@@ -318,7 +341,7 @@ struct HttpService<E> {
 
 impl<E> Service<LambdaHttpRequest> for HttpService<E>
 where
-    E: Endpoint + Clone + Send + Sync + 'static,
+    E: Endpoint + Clone + 'static,
 {
     type Response = Response<lambda_http::Body>;
     type Error = core::convert::Infallible;
@@ -329,49 +352,76 @@ where
     }
 
     fn call(&mut self, request: LambdaHttpRequest) -> Self::Future {
-        let mut endpoint = self.endpoint.clone();
-
+        let served = tokio::task::spawn_local(serve_http(self.endpoint.clone(), request));
         Box::pin(async move {
-            let mut request: http_kit::Request = request.map(convert::into_skyzen_body);
-            let method = request.method().clone();
-            let path = request.uri().path().to_owned();
-
-            let response = match endpoint.respond(&mut request).await {
-                Ok(response) => {
-                    info!(
-                        method = method.as_str(),
-                        path = path.as_str(),
-                        status = response.status().as_u16(),
-                        "request completed"
-                    );
-                    response
-                }
-                Err(error) => {
-                    skyzen_core::log_endpoint_error(&error, &method, path.as_str());
-                    skyzen_core::error_response(&error)
-                }
-            };
-
-            let (parts, body) = response.into_parts();
-            let body = match convert::into_lambda_body(body).await {
-                Ok(body) => body,
-                Err(error) => {
-                    // The response stream failed after the status line was decided. Lambda has no
-                    // partial responses, so the client gets the framework's 500 instead of a
-                    // truncated body that would look like a complete one.
-                    error!(
-                        method = method.as_str(),
-                        path = path.as_str(),
-                        error = %error,
-                        "response body failed part way through"
-                    );
-                    return Ok(body_failure_response().await);
-                }
-            };
-
-            Ok(Response::from_parts(parts, body))
+            Ok(served
+                .await
+                .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic())))
         })
     }
+}
+
+/// Serve one normalized HTTP request with `endpoint`.
+async fn serve_http<E: Endpoint>(
+    mut endpoint: E,
+    mut request: LambdaHttpRequest,
+) -> Response<lambda_http::Body> {
+    let request_id = request
+        .lambda_context_ref()
+        .map(|ctx| ctx.request_id.clone());
+    // API Gateway's recorded sourceIp is the platform-verified connection peer — the same
+    // authority PeerAddr carries on a socket server, so ClientIp can answer on Lambda instead of
+    // finding no peer and no trusted header at all.
+    if let Some(ip) = lambda_source_ip(&request) {
+        request
+            .extensions_mut()
+            .insert(skyzen_core::PeerAddr(std::net::SocketAddr::new(ip, 0)));
+    }
+    let mut request: http_kit::Request = request.map(convert::into_skyzen_body);
+    if let Some(request_id) = request_id {
+        request
+            .extensions_mut()
+            .insert(skyzen_core::PlatformRequestId(request_id));
+    }
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+
+    let response = match endpoint.respond(&mut request).await {
+        Ok(response) => {
+            info!(
+                method = method.as_str(),
+                path = path.as_str(),
+                status = response.status().as_u16(),
+                "request completed"
+            );
+            response
+        }
+        Err(error) => {
+            skyzen_core::log_endpoint_error(&error, &method, path.as_str());
+            let mut response = skyzen_core::error_response(&error);
+            skyzen_core::apply_pending_headers(&request, &mut response);
+            response
+        }
+    };
+
+    let (parts, body) = response.into_parts();
+    let body = match convert::into_lambda_body(body).await {
+        Ok(body) => body,
+        Err(error) => {
+            // The response stream failed after the status line was decided. Lambda has no partial
+            // responses, so the client gets the framework's 500 instead of a truncated body that
+            // would look like a complete one.
+            error!(
+                method = method.as_str(),
+                path = path.as_str(),
+                error = %error,
+                "response body failed part way through"
+            );
+            return body_failure_response().await;
+        }
+    };
+
+    Response::from_parts(parts, body)
 }
 
 /// The response sent when a response body fails after its headers were decided.
@@ -423,11 +473,13 @@ mod tests {
     const FUNCTION_URL: &str = include_str!("../tests/fixtures/apigw-v2-function-url.json");
     const S3: &str = include_str!("../tests/fixtures/s3-put.json");
 
+    /// Drive `future` the way [`super::run`] does: on a current-thread runtime, inside the
+    /// `LocalSet` the HTTP path spawns its requests on.
     fn block_on<T>(future: impl Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("a current-thread runtime")
-            .block_on(future)
+            .expect("a current-thread runtime");
+        tokio::task::LocalSet::new().block_on(&runtime, future)
     }
 
     fn sqs_event() -> SqsEvent {
@@ -453,7 +505,7 @@ mod tests {
         fn respond(
             &mut self,
             request: &mut Request,
-        ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             let answered = if self.fail.is_some() {
                 Err(EchoFailed::new())
             } else {

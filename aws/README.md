@@ -8,7 +8,7 @@ AWS platform implementations for the [Skyzen](https://github.com/zen-rs/skyzen) 
 
 ## Overview
 
-`skyzen-aws` provides high-performance, async-ready implementations of Skyzen service traits using the official AWS SDK for Rust. It enables your Skyzen applications to interact with AWS services like DynamoDB, SQS, and S3 using platform-agnostic abstractions.
+`skyzen-aws` provides high-performance, async-ready implementations of Skyzen service traits using the official AWS SDK for Rust. It enables your Skyzen applications to interact with AWS services like DynamoDB, SQS and Aurora using platform-agnostic abstractions; `skyzen-s3` builds S3 on the same SDK runtime.
 
 ## Services Provided
 
@@ -29,7 +29,6 @@ AWS platform implementations for the [Skyzen](https://github.com/zen-rs/skyzen) 
     as `QueueError::PartialBatch` with each failure's index in the caller's slice.
   - FIFO queues via `SqsQueue::fifo`, which sends a `MessageGroupId` with every message; a `.fifo`
     URL without a group id (or a standard URL with one) is refused at construction.
-- **`S3Storage`**: Amazon S3 implementation of `ObjectStorage` (re-exported from `skyzen-s3`).
 - **`RdsDataDb`**: A `DbBackend` implementation running SQL on Aurora through the RDS Data API — an
   HTTP endpoint, so it needs no connection and no pool, which is what makes it usable from a Lambda
   or any runtime that cannot hold a socket open.
@@ -59,12 +58,15 @@ skyzen-aws = "0.1"
 
 - `dynamodb`: Enables DynamoDB support (default)
 - `sqs`: Enables SQS support (default)
-- `s3`: Enables S3 support (default)
 - `rds-data`: Enables Aurora RDS Data API support (default)
 
 ## Configuration
 
-All services provide a `from_env()` constructor that uses `aws_config::load_defaults` to resolve credentials, region, and endpoints from environment variables, IAM roles, or AWS profile files.
+All services provide a `from_env()` constructor that loads the ambient configuration through `skyzen_aws::sdk::load_config` to resolve credentials, region, and endpoints from environment variables, IAM roles, or AWS profile files.
+
+## Runtime
+
+The SDK clients do their I/O through the `sdk` module: requests go out on zenwave's runtime-neutral native backend, whose connection pool runs on a compio driver, and the SDK's timers run on async-io. The services work under any executor — compio's thread-per-core runtime included — and need no tokio context. A client built by hand gets the same by loading its configuration through `skyzen_aws::sdk::config_loader`. A profile that names a `credential_process` is not supported, because aws-config runs it through `tokio::process`.
 
 ### Skyzen.toml Example
 

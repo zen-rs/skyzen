@@ -3,8 +3,8 @@
 //! Routes are defined by combining nodes produced by the [`CreateRouteNode`] extension. Path
 //! literals gain builder methods such as `.at(handler)` (GET), `.post(handler)`, `.put(handler)`,
 //! `.patch(handler)`, `.delete(handler)`, `.head(handler)`, `.options(handler)`,
-//! `.trace(handler)`, `.on(method, handler)`, `.any(handler)`, `.ws(handler)`, `.route(children)`
-//! and `.nest(router)` so you can describe the full tree declaratively. Once a tree is assembled,
+//! `.trace(handler)`, `.on(method, handler)`, `.any(handler)`, `.ws(handler)`, `.route(children)`,
+//! `.nest(router)` and `.mount(endpoint)` so you can describe the full tree declaratively. Once a tree is assembled,
 //! call [`Route::build`] to obtain a [`Router`] that can be mounted on a server or invoked
 //! directly from tests.
 //!
@@ -129,12 +129,12 @@
 //! Middleware is applied from the outermost route to the innermost endpoint, so errors bubble up
 //! until they are handled.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, rc::Rc};
 
 #[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
 #[cfg(feature = "ws")]
-use crate::websocket::{MaybeSend, MaybeSync, WebSocket};
+use crate::websocket::{MaybeSend, WebSocket};
 use crate::{handler, handler::Handler, middleware::Middleware, openapi, openapi::OpenApi};
 use http_kit::endpoint::AnyEndpoint;
 use http_kit::{Endpoint, Method};
@@ -145,8 +145,11 @@ use skyzen_core::{
 use std::future::Future;
 
 /// Type alias for dynamically dispatched endpoints stored in the routing tree.
+///
+/// The local erased form: a router lives on the thread that built it, so neither an endpoint nor
+/// the future it returns has to be `Send`.
 pub type BoxEndpoint = AnyEndpoint;
-pub(crate) type EndpointFactory = Arc<dyn Fn() -> BoxEndpoint + Send + Sync>;
+pub(crate) type EndpointFactory = Rc<dyn Fn() -> BoxEndpoint>;
 
 // Export param types
 mod param;
@@ -156,8 +159,12 @@ pub use param::{MissingParam, Params};
 mod router;
 pub use router::{build, AllowedMethods, NotFound, RouteBuildError, Router};
 
+mod matched_path;
+pub(crate) use matched_path::MountPrefix;
+pub use matched_path::{MatchedPath, NoMatchedPath};
+
 mod nest;
-pub use nest::{NestedPathError, NestedRouter};
+pub use nest::{MountPathError, Mounted};
 
 /// An endpoint that can say which routes it serves.
 ///
@@ -290,6 +297,13 @@ pub enum RouteNodeType {
         /// Middleware wrapping the mounted router, outermost first.
         middleware: Vec<BoxMiddleware>,
     },
+    /// An endpoint answering every method at the node's path and everything beneath it.
+    Mounted {
+        /// Factory producing the mounted endpoint, which sees paths with the mount prefix removed.
+        endpoint_factory: EndpointFactory,
+        /// Middleware wrapping the mounted endpoint, outermost first.
+        middleware: Vec<BoxMiddleware>,
+    },
 }
 
 impl fmt::Debug for RouteNodeType {
@@ -306,6 +320,10 @@ impl fmt::Debug for RouteNodeType {
             Self::Nested { router, middleware } => f
                 .debug_struct("Nested")
                 .field("router", router)
+                .field("middleware", &middleware.len())
+                .finish(),
+            Self::Mounted { middleware, .. } => f
+                .debug_struct("Mounted")
                 .field("middleware", &middleware.len())
                 .finish(),
         }
@@ -338,7 +356,7 @@ impl Route {
         let endpoint = handler::into_endpoint(handler);
         RouteWithAlarm {
             route: self,
-            alarm_endpoint: Arc::new(move || AnyEndpoint::new(endpoint.clone())),
+            alarm_endpoint: Rc::new(move || AnyEndpoint::new(endpoint.clone())),
         }
     }
 
@@ -555,10 +573,9 @@ impl RouteNode {
         requirements: Vec<Requirement>,
     ) -> Self
     where
-        E: Endpoint + Clone + Send + Sync + 'static,
+        E: Endpoint + Clone + 'static,
     {
-        let endpoint_factory: EndpointFactory =
-            Arc::new(move || AnyEndpoint::new(endpoint.clone()));
+        let endpoint_factory: EndpointFactory = Rc::new(move || AnyEndpoint::new(endpoint.clone()));
         Self {
             path: path.into(),
             node_type: RouteNodeType::Endpoint {
@@ -592,6 +609,22 @@ impl RouteNode {
         }
     }
 
+    /// Construct a node mounting `endpoint` under `path`, for every method and every path beneath.
+    #[must_use]
+    pub(crate) fn new_mounted<E>(path: impl Into<String>, endpoint: E) -> Self
+    where
+        E: Endpoint + Clone + 'static,
+    {
+        let endpoint_factory: EndpointFactory = Rc::new(move || AnyEndpoint::new(endpoint.clone()));
+        Self {
+            path: path.into(),
+            node_type: RouteNodeType::Mounted {
+                endpoint_factory,
+                middleware: Vec::new(),
+            },
+        }
+    }
+
     fn apply_middleware(&mut self, middleware: &BoxMiddleware) {
         match &mut self.node_type {
             RouteNodeType::Route(route) => route.apply_middleware(middleware),
@@ -600,7 +633,10 @@ impl RouteNode {
             }
             | RouteNodeType::Nested {
                 middleware: stack, ..
-            } => stack.insert(0, Arc::clone(middleware)),
+            }
+            | RouteNodeType::Mounted {
+                middleware: stack, ..
+            } => stack.insert(0, Rc::clone(middleware)),
         }
     }
 
@@ -752,7 +788,7 @@ impl RouteNode {
     #[must_use]
     pub fn endpoint<E>(self, method: Method, endpoint: E) -> Self
     where
-        E: Endpoint + Clone + Send + Sync + 'static,
+        E: Endpoint + Clone + 'static,
     {
         self.extend_with_nodes(vec![Self::new_endpoint(
             "",
@@ -777,8 +813,8 @@ impl RouteNode {
     #[must_use]
     pub fn ws<F, Fut>(self, session: F) -> Self
     where
-        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + MaybeSync + 'static,
-        Fut: Future + MaybeSend + 'static,
+        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + 'static,
+        Fut: Future + 'static,
         Fut::Output: crate::websocket::IntoWebSocketOutcome + 'static,
     {
         self.at(crate::websocket::session_handler(session))
@@ -802,11 +838,24 @@ impl RouteNode {
         self.extend_with_nodes(vec![Self::new_nested("", router)])
     }
 
+    /// Mount an endpoint under the current path, for every method and every path beneath it.
+    ///
+    /// See [`CreateRouteNode::mount`] for what the mounted endpoint sees.
+    #[must_use]
+    pub fn mount<E>(self, endpoint: E) -> Self
+    where
+        E: Endpoint + Clone + 'static,
+    {
+        self.extend_with_nodes(vec![Self::new_mounted("", endpoint)])
+    }
+
     fn extend_with_nodes(self, mut additional: Vec<Self>) -> Self {
         let path = self.path;
         let mut nodes = match self.node_type {
             RouteNodeType::Route(route) => route.into_mounted_nodes(),
-            terminal @ (RouteNodeType::Endpoint { .. } | RouteNodeType::Nested { .. }) => {
+            terminal @ (RouteNodeType::Endpoint { .. }
+            | RouteNodeType::Nested { .. }
+            | RouteNodeType::Mounted { .. }) => {
                 vec![Self {
                     path: String::new(),
                     node_type: terminal,
@@ -920,7 +969,7 @@ where
 {
     let endpoint = handler::into_endpoint(handler);
     EndpointEntry {
-        factory: Arc::new(move || AnyEndpoint::new(endpoint.clone())),
+        factory: Rc::new(move || AnyEndpoint::new(endpoint.clone())),
         requirements: T::requirements(),
     }
 }
@@ -991,6 +1040,9 @@ fn collect_openapi_entries(
             RouteNodeType::Nested { router, .. } => {
                 buf.extend(prefixed_openapi_entries(&path, router));
             }
+            // A mounted endpoint answers every method under its prefix, so it has no single
+            // operation to document.
+            RouteNodeType::Mounted { .. } => {}
         }
     }
 }
@@ -1119,13 +1171,41 @@ pub trait CreateRouteNode: Sized {
     /// case where the router is already built and its internals are no longer reachable.
     fn nest(self, router: Router) -> RouteNode;
 
+    /// Mount an endpoint under the current path segment, answering every method at the path and
+    /// every path beneath it.
+    ///
+    /// Like [`nest`](Self::nest), the prefix is stripped before the endpoint sees the request and
+    /// put back afterwards, so an endpoint mounted at `/api` receives `/api/users?page=2` as
+    /// `/users?page=2`. This is how a reverse proxy is hung on a router.
+    ///
+    /// ```rust
+    /// use std::convert::Infallible;
+    ///
+    /// use skyzen::{routing::{CreateRouteNode, Route}, Body, Endpoint, Request, Response};
+    ///
+    /// #[derive(Clone)]
+    /// struct Echo;
+    ///
+    /// impl Endpoint for Echo {
+    ///     type Error = Infallible;
+    ///     async fn respond(&mut self, request: &mut Request) -> Result<Response, Infallible> {
+    ///         Ok(Response::new(Body::from(request.uri().to_string())))
+    ///     }
+    /// }
+    ///
+    /// let router = Route::new(("/api".mount(Echo),)).build();
+    /// ```
+    fn mount<E>(self, endpoint: E) -> RouteNode
+    where
+        E: Endpoint + Clone + 'static;
+
     /// Attach an endpoint at the specified method and path.
     ///
     /// Note: This is a low-level method; prefer using `.at`, `.post`, etc. for common HTTP methods.
     /// Especially when using `OpenAPI`, those methods will automatically generate documentation.
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
     where
-        E: Endpoint + Clone + Send + Sync + 'static;
+        E: Endpoint + Clone + 'static;
 
     /// Attach a WebSocket handler that automatically performs the upgrade handshake.
     ///
@@ -1154,8 +1234,8 @@ pub trait CreateRouteNode: Sized {
     #[cfg(feature = "ws")]
     fn ws<F, Fut>(self, session: F) -> RouteNode
     where
-        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + MaybeSync + 'static,
-        Fut: Future + MaybeSend + 'static,
+        F: Fn(WebSocket) -> Fut + Clone + MaybeSend + 'static,
+        Fut: Future + 'static,
         Fut::Output: crate::websocket::IntoWebSocketOutcome + 'static,
     {
         self.at(crate::websocket::session_handler(session))
@@ -1258,7 +1338,7 @@ where
 
     fn endpoint<E>(self, method: Method, endpoint: E) -> RouteNode
     where
-        E: Endpoint + Clone + Send + Sync + 'static,
+        E: Endpoint + Clone + 'static,
     {
         RouteNode::new_endpoint(
             self,
@@ -1275,5 +1355,12 @@ where
 
     fn nest(self, router: Router) -> RouteNode {
         RouteNode::new_nested(self.into(), router)
+    }
+
+    fn mount<E>(self, endpoint: E) -> RouteNode
+    where
+        E: Endpoint + Clone + 'static,
+    {
+        RouteNode::new_mounted(self.into(), endpoint)
     }
 }

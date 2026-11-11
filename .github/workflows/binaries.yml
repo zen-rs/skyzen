@@ -9,6 +9,7 @@
 #   cascade into this workflow — release.yml dispatches here instead.
 # * every checkout uses `ref: inputs.tag || github.sha` so a dispatch builds
 #   the tagged commit.
+# * the tag push trigger matches only `v<version>` (see `on.push.tags`).
 # * the "Create GitHub Release" step uploads into the existing release when
 #   release-plz already created one for the tag.
 #
@@ -54,11 +55,13 @@ on:
   pull_request:
   push:
     tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
+      # Only the main crate's `v<version>` tag: member crates are tagged `<dir>/v<version>`, which
+      # dist would read as a package name that is not a Cargo package and fail on.
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build binaries for (e.g. skyzen-cli-v0.3.1)"
+        description: "Release tag to build binaries for (e.g. v0.3.1)"
         required: true
         type: string
 

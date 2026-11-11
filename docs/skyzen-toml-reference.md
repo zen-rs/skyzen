@@ -535,6 +535,21 @@ input (every `wrangler` invocation) or inside a request body (Lambda, ARM). A fi
 values is created owner-only, and `--dry-run` reports it as `write <path> (secret values, not
 shown)` instead of its contents.
 
+## Static Files
+
+```toml
+[static_files]
+precompress = ["public"]   # relative to Skyzen.toml
+```
+
+`skyzen build` and `skyzen deploy` write `.br`, `.zst` and `.gz` siblings beside every file below
+each directory, before the application is compiled, so an `embed_dir!` of the same directory picks
+them up too. `StaticDir` and `EmbeddedStaticDir` serve a sibling to a client whose
+`Accept-Encoding` takes it, with `Vary: Accept-Encoding`. A sibling that would not be smaller than
+its file is not written; one newer than its file is kept, so an unchanged tree recompresses
+nothing; one older than its file is never served. `skyzen dev` and Cloudflare builds skip the step —
+on Workers the asset server negotiates encodings itself.
+
 ## Cloudflare Section
 
 ```toml

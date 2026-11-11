@@ -4,9 +4,16 @@
 //! defined in `skyzen-services`:
 //!
 //! - [`DynamoKv`] — Amazon `DynamoDB` (implements [`KeyValueStore`])
-//! - [`S3Storage`] — Amazon S3 (re-exported from `skyzen-s3`, implements [`ObjectStorage`])
 //! - [`SqsQueue`] — Amazon SQS (implements [`MessageQueue`])
 //! - [`RdsDataDb`] — Aurora through the RDS Data API (implements [`DbBackend`])
+//!
+//! Amazon S3 is `skyzen-s3`'s `S3Storage`, built on this crate's [`sdk`] module.
+//!
+//! # Runtime
+//!
+//! The SDK clients do their I/O through [`sdk`]: requests on zenwave's runtime-neutral native
+//! backend, timers on async-io. Every backend here works under any executor — compio's
+//! thread-per-core runtime included — and needs no tokio context.
 //!
 //! # Example
 //!
@@ -29,18 +36,20 @@
 #[cfg(any(feature = "dynamodb", feature = "rds-data", feature = "sqs"))]
 mod errors;
 
+pub mod credential_process;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 #[cfg(feature = "rds-data")]
 pub mod rds_data;
+pub mod sdk;
 #[cfg(feature = "sqs")]
 pub mod sqs;
+#[cfg(all(test, any(unix, feature = "dynamodb")))]
+mod test_env;
 
 #[cfg(feature = "dynamodb")]
 pub use dynamodb::DynamoKv;
 #[cfg(feature = "rds-data")]
 pub use rds_data::{RdsDataDb, RdsDataTransaction, RdsEngine};
-#[cfg(feature = "s3")]
-pub use skyzen_s3::S3Storage;
 #[cfg(feature = "sqs")]
 pub use sqs::{SqsDeduplication, SqsQueue};

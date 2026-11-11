@@ -1,193 +1,34 @@
 use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    pin::Pin,
-    ptr,
+    num::NonZeroUsize,
     sync::Arc,
-    task::{Context, Poll},
 };
 
 use crate::{
-    extract::PeerAddr,
     routing::ServedRoutes,
     runtime::{
         azure,
         consumer::{ConsumerFatal, ConsumerSet},
-        context::ShutdownGuard,
-        WorkerContext,
     },
     Endpoint,
 };
 use async_channel::{bounded, Receiver, Sender};
-#[cfg(unix)]
-use async_net::unix::{UnixListener, UnixStream};
-use async_net::TcpListener;
 use core::convert::Infallible;
-use executor_core::{
-    smol::SmolGlobal, try_init_global_executor, AnyExecutor, Executor as CoreExecutor, Task,
-};
-use futures_util::{future::FutureExt, stream::MapOk, Stream, StreamExt, TryStreamExt};
-use http_body_util::{BodyDataStream, StreamBody};
-use http_kit::{
-    error::BoxHttpError,
-    utils::{AsyncRead, AsyncReadExt, AsyncWrite},
-    BodyError,
-};
-use hyper::{
-    body::{Frame, Incoming},
-    server::conn::{http1, http2},
-    service::Service,
-};
-use skyzen_hyper::AsyncIoTimer;
+use executor_core::{compio::Runtime, smol::SmolGlobal, try_init_global_executor, AnyExecutor};
+use futures_util::future::FutureExt;
+use skyzen_core::EndpointFactory;
 use tracing::{debug, error, info, warn};
 use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
 
-type BoxFuture<T> = Pin<Box<dyn Send + Future<Output = T> + 'static>>;
+mod cores;
+mod handoff;
+mod http3;
+mod tls;
 
-struct HyperExecutor<E>(Arc<E>);
-
-impl<E> Clone for HyperExecutor<E> {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl<E> std::fmt::Debug for HyperExecutor<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HyperExecutor").finish_non_exhaustive()
-    }
-}
-
-impl<Fut, E> hyper::rt::Executor<Fut> for HyperExecutor<E>
-where
-    Fut: Future + Send + 'static,
-    Fut::Output: Send + 'static,
-    E: CoreExecutor + 'static,
-{
-    fn execute(&self, fut: Fut) {
-        self.0.spawn(fut).detach();
-    }
-}
-
-struct ConnectionWrapper<C>(C);
-
-impl<C: Unpin + AsyncRead> hyper::rt::Read for ConnectionWrapper<C> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let inner = &mut self.get_mut().0;
-
-        // SAFETY: `buf.as_mut()` gives a `&mut [MaybeUninit<u8>]`. `AsyncRead` expects
-        // initialized memory, so we first zero every slot; only then is viewing the slice as
-        // `&mut [u8]` sound (a cast without initialization would be UB). We advance the buffer
-        // by the number of bytes written to maintain correctness.
-        let buffer = unsafe {
-            let unfilled = buf.as_mut();
-            for byte in unfilled.iter_mut() {
-                byte.write(0);
-            }
-            &mut *(ptr::from_mut(unfilled) as *mut [u8])
-        };
-
-        match Pin::new(inner).poll_read(cx, buffer) {
-            Poll::Ready(Ok(n)) => {
-                unsafe {
-                    buf.advance(n);
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<C: AsyncWrite + Unpin> hyper::rt::Write for ConnectionWrapper<C> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let inner = &mut self.get_mut().0;
-        Pin::new(inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        let inner = &mut self.get_mut().0;
-        Pin::new(inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let inner = &mut self.get_mut().0;
-        Pin::new(inner).poll_close(cx)
-    }
-}
-
-#[derive(Debug)]
-struct Prefixed<C> {
-    buffer: Vec<u8>,
-    pos: usize,
-    inner: C,
-}
-
-impl<C> Prefixed<C> {
-    const fn new(inner: C, buffer: Vec<u8>) -> Self {
-        Self {
-            buffer,
-            pos: 0,
-            inner,
-        }
-    }
-}
-
-impl<C: Unpin> Unpin for Prefixed<C> {}
-
-impl<C: AsyncRead + Unpin> AsyncRead for Prefixed<C> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let this = self.get_mut();
-        if this.pos < this.buffer.len() {
-            let available = this.buffer.len() - this.pos;
-            let n = available.min(buf.len());
-            buf[..n].copy_from_slice(&this.buffer[this.pos..this.pos + n]);
-            this.pos += n;
-            if this.pos == this.buffer.len() {
-                this.buffer.clear();
-                this.pos = 0;
-            }
-            return Poll::Ready(Ok(n));
-        }
-
-        Pin::new(&mut this.inner).poll_read(cx, buf)
-    }
-}
-
-impl<C: AsyncWrite + Unpin> AsyncWrite for Prefixed<C> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_close(cx)
-    }
-}
+use http3::{Http3, Http3Error};
+use tls::{ServerTls, TlsError};
 
 /// Initialize the tracing subscriber + color-eyre once per process.
 /// # Panics
@@ -241,8 +82,8 @@ pub fn init_logging() {
 /// a `host:port` socket address is TCP, and a `unix:`-prefixed path is a filesystem unix
 /// domain socket. `unix:///abs/path` is accepted too; the empty authority is ignored.
 ///
-/// A unix socket peer has no `SocketAddr`, so `PeerAddr` and `ClientIp` do not resolve on
-/// connections accepted that way — a fronting proxy reports its client through
+/// A unix socket peer has no `SocketAddr`, so `PeerAddr` and `ClientIp` do not resolve
+/// on connections accepted that way — a fronting proxy reports its client through
 /// `Forwarded`/`X-Forwarded-For` instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenAddr {
@@ -467,6 +308,193 @@ pub fn apply_cli_overrides(args: impl IntoIterator<Item = String>) -> Option<Lis
     })
 }
 
+/// A `--tls-cert`/`--tls-key` flag that reached us at all promised TLS; a
+/// missing value is not ignorable — swallowing it would serve cleartext under
+/// a flag that promised encryption, which is worse than any panic.
+fn flag_value(flag: &str, value: Option<String>) -> String {
+    match value {
+        Some(value) if !value.is_empty() && !value.starts_with('-') => value,
+        _ => panic!("{flag} expects a PEM path after it"),
+    }
+}
+
+/// The PEM files the native server terminates TLS with.
+///
+/// One grammar everywhere — `--tls-cert`/`--tls-key` and the `SKYZEN_TLS_CERT`/
+/// `SKYZEN_TLS_KEY` environment variables name the same pair of files, and each
+/// flag wins over its variable independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsFiles {
+    /// PEM file holding the certificate chain, leaf certificate first.
+    pub cert: std::path::PathBuf,
+    /// PEM file holding the private key matching the leaf certificate.
+    pub key: std::path::PathBuf,
+}
+
+/// Parse `--tls-cert`/`--tls-key`, falling back per file to `SKYZEN_TLS_CERT`/
+/// `SKYZEN_TLS_KEY`.
+///
+/// Returns `None` when TLS is not configured at all; the server then serves
+/// cleartext, as it always has.
+///
+/// # Panics
+///
+/// A pair that is only half supplied — or that names an empty path — kills the
+/// process at startup, for the same reason an invalid `SKYZEN_ADDRESS` does:
+/// half a TLS setup is a configuration error, not a hint to serve plaintext
+/// under flags that promised encryption.
+#[must_use]
+pub fn apply_tls_overrides(args: impl IntoIterator<Item = String>) -> Option<TlsFiles> {
+    const CERT_ENV: &str = "SKYZEN_TLS_CERT";
+    const KEY_ENV: &str = "SKYZEN_TLS_KEY";
+
+    let mut args = args.into_iter();
+    let _ = args.next(); // binary name
+    let mut cert_flag = None;
+    let mut key_flag = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--tls-cert=") {
+            cert_flag = Some(value.to_owned());
+        } else if let Some(value) = arg.strip_prefix("--tls-key=") {
+            key_flag = Some(value.to_owned());
+        } else {
+            match arg.as_str() {
+                "--tls-cert" => cert_flag = Some(flag_value("--tls-cert", args.next())),
+                "--tls-key" => key_flag = Some(flag_value("--tls-key", args.next())),
+                _ => {}
+            }
+        }
+    }
+
+    // `var_os`, not `var`: a non-UTF-8 path is still a configured TLS file, and
+    // `var`'s `.ok()` would read it as absent and boot the server plaintext —
+    // the worst outcome under a configuration that promised encryption.
+    let cert = cert_flag
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os(CERT_ENV).map(std::path::PathBuf::from));
+    let key = key_flag
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os(KEY_ENV).map(std::path::PathBuf::from));
+    match (cert, key) {
+        (None, None) => None,
+        (Some(cert), Some(key)) => {
+            assert!(
+                !cert.as_os_str().is_empty(),
+                "an empty path is not a TLS certificate"
+            );
+            assert!(
+                !key.as_os_str().is_empty(),
+                "an empty path is not a TLS key"
+            );
+            info!(
+                "Configured TLS certificate {} with key {}",
+                cert.display(),
+                key.display()
+            );
+            Some(TlsFiles { cert, key })
+        }
+        (Some(_), None) => panic!(
+            "a TLS certificate was configured without a key; pass --tls-key or set {KEY_ENV}"
+        ),
+        (None, Some(_)) => panic!(
+            "a TLS key was configured without a certificate; pass --tls-cert or set {CERT_ENV}"
+        ),
+    }
+}
+
+/// The server that answers cleartext HTTP on the serving threads.
+///
+/// TLS is not a choice: `skyzen-h1` serves cleartext only, so a TLS listener is always hyper's,
+/// with ALPN choosing HTTP/1.1 or HTTP/2.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HttpServer {
+    /// Skyzen's own HTTP/1.1 server on owned-buffer I/O (`skyzen-h1`), the default.
+    #[default]
+    H1,
+    /// Hyper: HTTP/1.1 and prior-knowledge HTTP/2 (h2c), over the compio stream's copying
+    /// poll-style bridge. Without the per-thread connection limit the default server applies.
+    Hyper,
+}
+
+impl std::str::FromStr for HttpServer {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "h1" => Ok(Self::H1),
+            "hyper" => Ok(Self::Hyper),
+            other => Err(format!("`{other}` is not a server; use `h1` or `hyper`")),
+        }
+    }
+}
+
+/// Parse `--server`, falling back to `SKYZEN_SERVER`, and to the default [`HttpServer::H1`].
+///
+/// # Panics
+///
+/// A value that names no server kills the process at startup: silently serving the other
+/// protocol set than the one asked for is worse than not starting.
+#[must_use]
+pub fn apply_server_override(args: impl IntoIterator<Item = String>) -> HttpServer {
+    const ENV: &str = "SKYZEN_SERVER";
+
+    let mut args = args.into_iter();
+    let _ = args.next(); // binary name
+    let mut flag = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--server=") {
+            flag = Some(value.to_owned());
+        } else if arg == "--server" {
+            flag = Some(
+                args.next()
+                    .unwrap_or_else(|| panic!("--server expects `h1` or `hyper` after it")),
+            );
+        }
+    }
+
+    let value = flag.or_else(|| std::env::var(ENV).ok());
+    let Some(value) = value else {
+        return HttpServer::default();
+    };
+    let server = value
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid server: {error}"));
+    info!("Configured HTTP server: {value}");
+    server
+}
+
+/// Whether `--http3` or `SKYZEN_HTTP3` asks for HTTP/3, which the server then refuses to start
+/// without.
+///
+/// The flag stands alone; the variable is `true`/`1` or `false`/`0`, and the flag wins.
+///
+/// # Panics
+///
+/// A variable that is neither kills the process at startup, like every other malformed setting.
+#[must_use]
+pub fn apply_http3_override(args: impl IntoIterator<Item = String>) -> bool {
+    const ENV: &str = "SKYZEN_HTTP3";
+
+    if args.into_iter().skip(1).any(|arg| arg == "--http3") {
+        info!("HTTP/3 requested by --http3");
+        return true;
+    }
+    let Some(value) = std::env::var_os(ENV) else {
+        return false;
+    };
+    match value.to_str() {
+        Some("true" | "1") => {
+            info!("HTTP/3 requested by {ENV}");
+            true
+        }
+        Some("false" | "0") => false,
+        _ => panic!(
+            "{ENV} must be `true`, `1`, `false` or `0`, not {}",
+            value.to_string_lossy()
+        ),
+    }
+}
+
 fn shutdown_signal() -> Receiver<()> {
     let (tx, rx) = bounded(1);
     if let Err(error) = ctrlc::set_handler(move || {
@@ -477,30 +505,36 @@ fn shutdown_signal() -> Receiver<()> {
     rx
 }
 
-/// How long outstanding work is given to finish after the accept loop stops.
+/// How long outstanding work is given to finish after the accept loops stop.
 ///
 /// A request still streaming a response — or a queue consumer still settling the batch it is
 /// holding — when the deadline elapses is severed; the runtime says so in its final log line
 /// rather than claiming a graceful shutdown.
 pub const SHUTDOWN_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What the accept loop had left to clean up when it stopped.
+/// What the serving threads had left to clean up when they stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shutdown {
-    /// Connections and consumer batches still in flight when the grace period elapsed, and
-    /// therefore cut off.
+    /// Open connections, requests, post-response tasks and consumer batches still in flight when
+    /// the grace period elapsed, and therefore cut off.
     pub severed: usize,
 }
 
 /// Why the runtime stopped before it could shut down on its own terms.
 #[derive(Debug)]
 enum RuntimeFailure {
-    /// The listener could not be bound, or the accept loop failed.
+    /// The listener could not be bound, or a serving thread could not start.
     Listener(std::io::Error),
     /// A declared queue consumer cannot run at all against the backend it was pointed at.
     QueueConsumer(ConsumerFatal),
     /// The Azure Functions triggers cannot be mounted over this application.
     Mount(azure::MountError),
+    /// A serving thread died instead of reporting that it was accepting.
+    ThreadExited,
+    /// TLS was configured but cannot be provided on this listener or this build.
+    Tls(TlsError),
+    /// HTTP/3 was requested and cannot be served, or its endpoint cannot start.
+    Http3(Http3Error),
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -517,6 +551,9 @@ impl std::fmt::Display for RuntimeFailure {
                 write!(f, "the queue consumer for `{queue}` cannot run: {reason}")
             }
             Self::Mount(error) => write!(f, "{error}"),
+            Self::ThreadExited => write!(f, "a serving thread exited before it was accepting"),
+            Self::Tls(error) => write!(f, "{error}"),
+            Self::Http3(error) => write!(f, "{error}"),
         }
     }
 }
@@ -526,7 +563,9 @@ impl std::error::Error for RuntimeFailure {
         match self {
             Self::Listener(error) => Some(error),
             Self::Mount(error) => Some(error),
-            Self::QueueConsumer(_) => None,
+            Self::Tls(error) => Some(error),
+            Self::Http3(error) => Some(error),
+            Self::QueueConsumer(_) | Self::ThreadExited => None,
         }
     }
 }
@@ -539,6 +578,18 @@ impl std::error::Error for RuntimeFailure {
 pub struct LaunchOptions {
     /// The address a command-line flag asked for, if any.
     pub listen: Option<ListenOverride>,
+    /// The TLS certificate/key pair the server terminates TLS with, from
+    /// `--tls-cert`/`--tls-key` or `SKYZEN_TLS_CERT`/`SKYZEN_TLS_KEY`.
+    /// `None` serves cleartext, as the runtime always has.
+    pub tls: Option<TlsFiles>,
+    /// Whether `--http3` or `SKYZEN_HTTP3` insisted on HTTP/3.
+    ///
+    /// HTTP/3 is served on UDP beside the TLS listener whenever TLS is configured and the `http3`
+    /// feature is compiled in; asking for it makes every case where that cannot happen a refusal
+    /// to start instead of a TLS-only server.
+    pub http3: bool,
+    /// The server that answers cleartext connections, from `--server` or `SKYZEN_SERVER`.
+    pub server: HttpServer,
     /// The `[[azure.queue_triggers]]` entries this application declares.
     ///
     /// Empty for everything that is not an Azure Functions app, which is the only case where they
@@ -589,7 +640,10 @@ where
         return false;
     };
 
-    let document = smol::block_on(factory()).openapi_document();
+    let document = Runtime::new()
+        .expect("a compio runtime to build the router on")
+        .block_on(factory())
+        .openapi_document();
     if !document.is_enabled() {
         error!(
             "{OPENAPI_DUMP_ENV} was set, but this binary was built without skyzen's `openapi` \
@@ -689,12 +743,65 @@ impl std::fmt::Display for StartupError {
 
 impl std::error::Error for StartupError {}
 
-/// Build the executor, serve the provided endpoint over Hyper, and run the declared queue
-/// consumers beside it.
+/// Where the HTTP service clients `#[skyzen::main]` builds — the AWS and Azure backends, on
+/// zenwave — keep their connections, as the platform decides.
 ///
-/// `factory` produces the endpoint together with its [`ConsumerSet`] — `()` for an application
-/// that declares no `[[native.queue_consumer]]` — so both are built from the same service
-/// instances rather than from two independent connections to one backend.
+/// On a thread-per-core server, and under the Azure Functions host that is one, every thread runs
+/// a compio runtime, and each rebinds its clients to a connection pool of its own: a service
+/// request made on a serving thread is sent on a connection that thread's runtime drives. The
+/// coordinating thread does the same for the clients the queue consumers poll with, and owns the
+/// pools the AWS credentials are fetched on: setup, which runs there, loads the one AWS
+/// configuration every AWS client is built from on [`driver`](Self::driver), so a credentials
+/// refresh a serving thread's call starts goes out on the coordinating thread's connections,
+/// which outlive the drain. Under AWS Lambda the one thread runs the adapter's tokio runtime, so
+/// the clients and the credentials keep the pools zenwave runs on its own driver thread.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct ServicePools {
+    per_thread: bool,
+}
+
+impl ServicePools {
+    /// The calling thread's compio driver, to pool on, where the platform's threads run compio;
+    /// `None` where they do not, and a client keeps zenwave's own driver thread.
+    #[must_use]
+    pub const fn driver(self) -> Option<http_kit_io::compio::Compio> {
+        if self.per_thread {
+            Some(http_kit_io::compio::Compio)
+        } else {
+            None
+        }
+    }
+
+    /// `service` as the calling thread uses it: `rebind` hands it the thread's
+    /// [`driver`](Self::driver) to pool on where there is one; otherwise it is returned as built.
+    ///
+    /// # Panics
+    ///
+    /// `rebind` panics when it runs on a thread that is not running a compio runtime, which on a
+    /// platform that pools per thread is a thread Skyzen did not start.
+    pub fn on_this_thread<S>(
+        self,
+        service: S,
+        rebind: impl FnOnce(S, http_kit_io::compio::Compio) -> S,
+    ) -> S {
+        match self.driver() {
+            Some(io) => rebind(service, io),
+            None => service,
+        }
+    }
+}
+
+/// Serve the application on one compio runtime per core, and run the declared queue consumers
+/// beside them.
+///
+/// `setup` builds the application's services once and returns an [`EndpointFactory`] that
+/// captures them together with the [`ConsumerSet`] — `()` for an application that declares no
+/// `[[native.queue_consumer]]` — so both are built from the same service instances rather than
+/// from two independent connections to one backend. Every serving thread calls the factory on
+/// itself, so each has a router of its own and the router and everything it holds may be `!Send`.
+/// `setup` is handed the platform's [`ServicePools`], which the factory carries to each thread so
+/// the thread rebinds its HTTP service clients to connection pools of its own.
 ///
 /// # Where this ends up running
 ///
@@ -716,10 +823,20 @@ impl std::error::Error for StartupError {}
 /// execution environment without telling the process, so there is no moment at which a cleanup
 /// hook could be called and be believed.
 ///
-/// After `Ctrl+C` the listener stops accepting and the consumers stop initiating receives;
-/// outstanding connections and in-flight batches are awaited for up to
+/// # Threads
+///
+/// One thread per unit of [`std::thread::available_parallelism`] serves, each on a compio
+/// runtime of its own with its own listener (`SO_REUSEPORT` where the platform has it), its own
+/// router, and its own connections: a connection never leaves the thread that accepted it. HTTP/1.1
+/// is served by `skyzen-h1`. The coordinating thread, which runs `setup`, the consumers and the
+/// shutdown, does not serve.
+///
+/// After `Ctrl+C` every listener stops accepting and the consumers stop initiating receives;
+/// outstanding connections, post-response tasks and in-flight batches are awaited for up to
 /// [`SHUTDOWN_GRACE_PERIOD`], and only then does `on_shutdown` run — so a cleanup hook observes a
-/// server with no requests and no batches still in flight.
+/// server with no requests and no batches still in flight. A serving thread keeps its runtime
+/// running until then, so a post-response task still reaches the connection pools of the thread
+/// whose request spawned it.
 ///
 /// A consumer that can never receive at all, and a listener that cannot be bound, both end the
 /// process with a non-zero status once `on_shutdown` has run: a misconfigured deployment should
@@ -727,14 +844,15 @@ impl std::error::Error for StartupError {}
 ///
 /// # Panics
 ///
-/// Panics if the global executor fails to initialize.
-pub fn launch<Fut, E, C, Hook, HookFut>(
+/// Panics if the coordinating thread's runtime cannot be created.
+pub fn launch<Setup, F, C, Hook, HookFut>(
     options: LaunchOptions,
-    factory: impl FnOnce() -> Fut,
+    setup: impl FnOnce(ServicePools) -> Setup,
     on_shutdown: Hook,
 ) where
-    Fut: Future<Output = (E, C)> + Send + 'static,
-    E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
+    Setup: Future<Output = (F, C)>,
+    F: EndpointFactory,
+    F::Endpoint: ServedRoutes,
     C: ConsumerSet,
     Hook: FnOnce() -> HookFut,
     HookFut: Future<Output = ()>,
@@ -747,36 +865,68 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
         }
     };
 
+    // TLS is only meaningful on the path that owns a socket: both serverless hosts
+    // terminate it upstream, so a configured pair there can only be a leftover that
+    // would silently go dead. Refuse rather than start under flags that promise TLS.
+    if options.tls.is_some() && !matches!(platform, Platform::Server) {
+        error!(
+            "Skyzen cannot start: TLS is configured (--tls-cert/--tls-key or \
+             SKYZEN_TLS_CERT/SKYZEN_TLS_KEY), but this platform terminates TLS \
+             upstream; unset them or run where they apply"
+        );
+        std::process::exit(1);
+    }
+
+    // The same holds for HTTP/3: a serverless host owns the UDP side, if it has one.
+    if options.http3 && !matches!(platform, Platform::Server) {
+        error!("Skyzen cannot start: {}", http3::not_a_server());
+        std::process::exit(1);
+    }
+
     if platform == Platform::Lambda {
         // Lambda's runtime is Tokio's and the adapter owns it, so this path never touches the
         // executor, the listener or the shutdown drain below.
         // `run_on_lambda` never returns `Ok`: it either hands over for the life of the process
         // or explains why it could not.
-        let Err(error) = run_on_lambda(options, factory);
+        let Err(error) = run_on_lambda(options, setup);
         error!("Skyzen cannot start: {error}");
         std::process::exit(1);
     }
 
-    let executor = SmolGlobal;
-    if try_init_global_executor(executor).is_err() {
+    // The global executor runs `Send` background work: queue consumers and post-response tasks.
+    if try_init_global_executor(SmolGlobal).is_err() {
         debug!("Global executor already initialized; reusing existing instance");
     }
 
-    let failed = smol::block_on(async move {
+    // This thread coordinates: it builds the services, starts the serving threads and waits for
+    // the signal to stop them.
+    let runtime = Runtime::new().expect("a compio runtime for the coordinating thread");
+    let failed = runtime.block_on(async move {
         tracing::info!("Skyzen application starting up");
 
-        let (endpoint, consumers) = factory().await;
+        // Every thread this path runs services on — this one and each serving thread — runs a
+        // compio runtime its clients can pool on.
+        let (factory, consumers) = setup(ServicePools { per_thread: true }).await;
         let outcome = match platform {
-            Platform::Lambda => unreachable!("handed over before the executor was built"),
+            Platform::Lambda => unreachable!("handed over before the runtime was built"),
             Platform::Server => {
                 let addr = options
                     .listen
                     .as_ref()
                     .map_or_else(server_addr, |listen| listen.addr.clone());
-                run_server(executor, endpoint, consumers, addr).await
+                let secured = tls::build(options.tls.as_ref(), &addr).and_then(|tls| {
+                    let http3 = http3::build(options.http3, tls.as_ref(), &addr)?;
+                    Ok((tls, http3))
+                });
+                match secured {
+                    Ok((tls, http3)) => {
+                        serve_cores(factory, Ok, consumers, addr, options.server, tls, http3).await
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Platform::AzureFunctions { port } => {
-                serve_functions_host(executor, endpoint, consumers, &options, port).await
+                serve_functions_host(factory, consumers, &options, port).await
             }
         };
         let failed = match outcome {
@@ -807,11 +957,13 @@ pub fn launch<Fut, E, C, Hook, HookFut>(
     }
 }
 
-/// Wait for every connection task to finish, or for the grace period to elapse.
+/// Wait for every holder of the drain channel's sender to finish, or for the grace period to
+/// elapse.
 ///
-/// Each connection task holds a clone of the channel's sender, so `recv` resolves — with a
-/// closed-channel error, since nothing is ever sent — exactly when the last one is dropped. The
-/// senders still alive at the deadline are the connections being cut off.
+/// The serving threads, the requests in flight on them, post-response tasks and queue-consumer
+/// batches each hold a clone of the sender, so `recv` resolves — with a closed-channel error,
+/// since nothing is ever sent — exactly when the last one is dropped. The senders still alive at
+/// the deadline are the work being cut off.
 async fn drain_connections(
     connections: &Receiver<Infallible>,
     grace_period: std::time::Duration,
@@ -825,7 +977,7 @@ async fn drain_connections(
     }
 }
 
-/// The channels tying the accept loop to the queue consumers it started.
+/// The channels tying the coordinator to the queue consumers it started.
 ///
 /// Dropping the whole thing is what tells every consumer slot to stop initiating receives, so the
 /// shutdown path cannot forget one of the two halves.
@@ -835,7 +987,7 @@ struct ConsumerChannels {
     _stop: Sender<Infallible>,
     /// Where a consumer that can never receive reports itself.
     fatal_rx: Receiver<ConsumerFatal>,
-    /// The accept loop's own sender, kept alive so [`Self::fatal_rx`] stays open: a closed
+    /// The coordinator's own sender, kept alive so [`Self::fatal_rx`] stays open: a closed
     /// channel would resolve immediately and read as a failure for an application that declares
     /// no consumers at all.
     _fatal_tx: Sender<ConsumerFatal>,
@@ -843,7 +995,7 @@ struct ConsumerChannels {
 
 impl ConsumerChannels {
     /// Start `consumers` on `executor`, each slot holding a clone of the drain `guard`.
-    fn start<Exec: CoreExecutor + 'static, C: ConsumerSet>(
+    fn start<Exec: executor_core::Executor + 'static, C: ConsumerSet>(
         consumers: C,
         executor: &Exec,
         guard: &Sender<Infallible>,
@@ -860,66 +1012,148 @@ impl ConsumerChannels {
     }
 }
 
-/// A connection the listener accepted, with the peer address the transport can report.
+/// Bind `addr`, start one serving thread per core, and run until `Ctrl+C`, a fatal consumer
+/// report, or the serving threads' own end.
 ///
-/// A unix socket peer has no `SocketAddr`, so `peer_addr` is `None` there and `PeerAddr` /
-/// `ClientIp` do not resolve — a fronting proxy reports its client through
-/// `Forwarded`/`X-Forwarded-For` instead.
-#[derive(Debug)]
-struct Accepted<C> {
-    stream: C,
-    peer_addr: Option<SocketAddr>,
-}
-
-async fn run_server<Exec, E, C>(
-    executor: Exec,
-    endpoint: E,
+/// `wrap` turns a thread's freshly built router into the endpoint that thread serves — the
+/// identity for an ordinary server, the queue-trigger mount under the Azure Functions host. It
+/// runs on the serving thread, so what it returns need not be `Send`.
+async fn serve_cores<F, A, W, C>(
+    factory: F,
+    wrap: W,
     consumers: C,
     addr: ListenAddr,
+    server: HttpServer,
+    tls: Option<ServerTls>,
+    http3: Option<Http3>,
 ) -> Result<Shutdown, RuntimeFailure>
 where
-    Exec: CoreExecutor + 'static,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    F: EndpointFactory,
+    A: Endpoint + Clone + 'static,
+    W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
     C: ConsumerSet,
 {
-    match addr {
-        ListenAddr::Tcp(addr) => {
-            let listener = TcpListener::bind(addr).await?;
-            let local_addr = listener.local_addr()?;
-            info!("Skyzen listening on http://{local_addr}");
-            let incoming = listener.incoming().map_ok(|stream| Accepted {
-                peer_addr: stream.peer_addr().ok(),
-                stream,
-            });
-            serve_connections(executor, endpoint, consumers, incoming).await
+    let threads = std::thread::available_parallelism()?;
+    let mut bound = cores::bind(&addr, threads)?;
+    // QUIC takes the port TLS has on TCP, so a client that follows `Alt-Svc` stays on the host
+    // and port it came to. Bound here, with the TCP sockets, so a port that cannot be had fails
+    // the start before any thread exists.
+    let http3_port = match (
+        &http3,
+        bound.sockets.first().and_then(cores::Socket::tcp_addr),
+    ) {
+        (Some(http3), Some(local)) => {
+            let local = local?;
+            bound.udp = http3.bind(local, threads)?;
+            Some(local.port())
         }
-        #[cfg(unix)]
-        ListenAddr::Unix(path) => {
-            let listener = bind_unix_listener(&path).await.map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("could not bind unix socket {}: {error}", path.display()),
-                )
-            })?;
-            info!("Skyzen listening on unix:{}", path.display());
-            let incoming = listener.incoming().map_ok(|stream| Accepted {
-                peer_addr: None,
-                stream,
-            });
-            let outcome = serve_connections(executor, endpoint, consumers, incoming).await;
-            // The socket file is ours: left behind it becomes the stale path the next bind
-            // has to probe, and a dead process gets no later chance to clean it up. Already
-            // gone is not a failure — the cleanup goal is met either way.
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    warn!("Failed to remove unix socket {}: {error}", path.display());
-                }
+        _ => None,
+    };
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let http3_note = http3_port.map_or_else(String::new, |port| format!(" (HTTP/3 on udp/{port})"));
+    let listening = match bound.sockets.first().and_then(cores::Socket::tcp_addr) {
+        Some(local) => format!("{scheme}://{}", local?),
+        None => addr.to_string(),
+    };
+
+    // A drain token for everything that must finish before the process may stop, and the
+    // broadcast that tells the threads to begin, and the one that lets them end once the drain is
+    // over. Nothing is sent through any of them.
+    let (drain, connections) = bounded::<Infallible>(1);
+    let (stop, stopping) = bounded::<Infallible>(1);
+    let (release, released) = bounded::<Infallible>(1);
+
+    let queue_consumers = ConsumerChannels::start(consumers, &SmolGlobal, &drain);
+
+    let plan = cores::Plan {
+        factory,
+        wrap,
+        executor: Arc::new(AnyExecutor::new(SmolGlobal)),
+        max_connections: NonZeroUsize::new(MAX_CONNECTIONS.div_ceil(threads.get()))
+            .unwrap_or(NonZeroUsize::MIN),
+        server,
+        tls,
+        http3: http3.zip(http3_port).map(|(http3, port)| cores::Http3Plan {
+            http3,
+            alt_svc: skyzen_hyper::AltSvc::h3(port),
+        }),
+    };
+    let started = cores::start(plan, bound, &stopping, &drain, &released)?;
+
+    let mut failure = None;
+    for _ in 0..started.threads {
+        match started.ready.recv().await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                failure = Some(error);
+                break;
             }
-            outcome
+            Err(_) => {
+                failure = Some(RuntimeFailure::ThreadExited);
+                break;
+            }
         }
     }
+
+    if failure.is_none() {
+        info!(
+            threads = started.threads,
+            "Skyzen listening on {listening}{http3_note}"
+        );
+
+        let shutdown_rx = shutdown_signal();
+        let shutdown = shutdown_rx.recv().fuse();
+        let exited = started.exited.recv().fuse();
+        futures_util::pin_mut!(shutdown, exited);
+        loop {
+            futures_util::select! {
+                _ = shutdown => {
+                    info!("Ctrl+C received, stopping the accept loops");
+                    break;
+                }
+                report = queue_consumers.fatal_rx.recv().fuse() => {
+                    if let Ok(report) = report {
+                        error!(
+                            queue = report.queue.as_str(),
+                            reason = report.reason,
+                            "A declared queue consumer cannot run; stopping"
+                        );
+                        failure = Some(RuntimeFailure::QueueConsumer(report));
+                        break;
+                    }
+                }
+                _ = exited => {
+                    failure = Some(RuntimeFailure::ThreadExited);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Tell the consumers to stop polling and the threads to wind down, then release the
+    // coordinator's own handle so only live threads, requests and batches keep the drain channel
+    // open.
+    drop(queue_consumers);
+    drop(stop);
+    drop(drain);
+    let severed = drain_connections(&connections, SHUTDOWN_GRACE_PERIOD).await;
+    // Nothing that could still send on a serving thread's connection pools is left, or it was
+    // just cut off: the threads may stop their runtimes.
+    drop(release);
+
+    // The socket file is ours: left behind it becomes the stale path the next bind has to probe,
+    // and a dead process gets no later chance to clean it up. Already gone is not a failure — the
+    // cleanup goal is met either way.
+    #[cfg(unix)]
+    if let ListenAddr::Unix(path) = &addr {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!("Failed to remove unix socket {}: {error}", path.display()),
+        }
+    }
+
+    failure.map_or(Ok(Shutdown { severed }), Err)
 }
 
 /// Bind a filesystem unix socket, removing a leftover only when nothing answers on it.
@@ -931,16 +1165,21 @@ where
 /// not be stolen, while a refused connection means nothing is listening and the file is safe
 /// to remove. Any other outcome retries the bind unchanged — either the path raced away, or
 /// the probe proved nothing and the first error is the honest one.
+///
+/// A failure names the path, since the OS error alone does not.
 #[cfg(unix)]
-async fn bind_unix_listener(path: &std::path::Path) -> std::io::Result<UnixListener> {
-    use std::io::ErrorKind;
+fn bind_unix_socket(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::{
+        io::ErrorKind,
+        os::unix::net::{UnixListener, UnixStream},
+    };
 
-    match UnixListener::bind(path) {
+    let bound = match UnixListener::bind(path) {
         Err(bind_error) if bind_error.kind() == ErrorKind::AddrInUse => {
-            match UnixStream::connect(path).await {
+            match UnixStream::connect(path) {
                 Ok(_) => Err(std::io::Error::new(
                     ErrorKind::AddrInUse,
-                    format!("a server is already listening on {}", path.display()),
+                    "a server is already listening on it",
                 )),
                 Err(connect_error) => match connect_error.kind() {
                     ErrorKind::ConnectionRefused => {
@@ -954,140 +1193,12 @@ async fn bind_unix_listener(path: &std::path::Path) -> std::io::Result<UnixListe
             }
         }
         result => result,
-    }
-}
-
-/// Serve every connection `incoming` yields until shutdown or a fatal consumer report.
-///
-/// The transport is invisible past this point: TCP and unix connections get the same
-/// protocol sniff, the same Hyper builders and the same drain accounting.
-async fn serve_connections<Exec, E, C, Conn, S>(
-    executor: Exec,
-    endpoint: E,
-    consumers: C,
-    mut incoming: S,
-) -> Result<Shutdown, RuntimeFailure>
-where
-    Exec: CoreExecutor + 'static,
-    E: Endpoint + Clone + Send + Sync + 'static,
-    C: ConsumerSet,
-    Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    S: Stream<Item = std::io::Result<Accepted<Conn>>> + Unpin,
-{
-    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
-    let executor = Arc::new(executor);
-    let hyper_executor = HyperExecutor(Arc::clone(&executor));
-    let shared_executor: Arc<AnyExecutor> = Arc::new(AnyExecutor::new(Arc::clone(&executor)));
-
-    // Nothing is ever sent through this channel: it exists so that dropping the last sender
-    // tells the accept loop every connection task has finished.
-    let (connection_guard, connections) = bounded::<Infallible>(1);
-
-    let queue_consumers = ConsumerChannels::start(consumers, executor.as_ref(), &connection_guard);
-
-    let shutdown_rx = shutdown_signal();
-    let shutdown = shutdown_rx.recv().fuse();
-    futures_util::pin_mut!(shutdown);
-    let mut fatal = None;
-
-    loop {
-        futures_util::select! {
-            _ = shutdown => {
-                info!("Ctrl+C received, stopping accept loop");
-                break;
-            }
-            report = queue_consumers.fatal_rx.recv().fuse() => {
-                if let Ok(report) = report {
-                    error!(
-                        queue = report.queue.as_str(),
-                        reason = report.reason,
-                        "A declared queue consumer cannot run; stopping"
-                    );
-                    fatal = Some(report);
-                    break;
-                }
-            }
-            connection = incoming.next().fuse() => {
-                match connection {
-                    Some(Ok(accepted)) => {
-                        let Accepted { stream, peer_addr } = accepted;
-                        if let Some(peer) = peer_addr {
-                            debug!("Accepted connection from {peer}");
-                        }
-                        let endpoint = endpoint.clone();
-                        let shared_executor = shared_executor.clone();
-                        let hyper_executor = hyper_executor.clone();
-                        let guard = connection_guard.clone();
-                        // A second token, handed to the request's `WorkerContext` so post-response
-                        // work it spawns keeps shutdown waiting too — the connection's own token
-                        // is released as soon as the connection closes.
-                        let guard_token = connection_guard.clone();
-
-                        // Spawn the per-connection task *before* sniffing the protocol preface.
-                        // Awaiting client bytes inline here would let a single idle client stall
-                        // the accept loop for everyone.
-                        executor
-                            .spawn(async move {
-                                // Held for the lifetime of the connection so the shutdown path
-                                // can tell when the last one has finished.
-                                let _guard = guard;
-                                let (stream, is_h2) =
-                                    match sniff_protocol_with_timeout(stream, HTTP2_PREFACE).await {
-                                        Ok(result) => result,
-                                        Err(error) => {
-                                            error!("Failed to read connection preface: {error}");
-                                            return;
-                                        }
-                                    };
-
-                                let service = IntoService::new(
-                                    endpoint,
-                                    shared_executor,
-                                    peer_addr,
-                                    ShutdownGuard(guard_token),
-                                );
-                                if is_h2 {
-                                    let mut builder = http2::Builder::new(hyper_executor);
-                                    // Without a timer hyper silently disables its h2 keep-alive.
-                                    builder.timer(AsyncIoTimer);
-                                    if let Err(error) = builder
-                                        .serve_connection(ConnectionWrapper(stream), service)
-                                        .await
-                                    {
-                                        error!("Hyper h2 connection error: {error}");
-                                    }
-                                } else {
-                                    let mut builder = http1::Builder::new();
-                                    // Without a timer hyper silently disables its header read
-                                    // timeout, so a slow-loris client would hold the connection.
-                                    builder.timer(AsyncIoTimer);
-                                    if let Err(error) = builder
-                                        .serve_connection(ConnectionWrapper(stream), service)
-                                        .with_upgrades()
-                                        .await
-                                    {
-                                        error!("Hyper h1 connection error: {error}");
-                                    }
-                                }
-                            })
-                            .detach();
-                    }
-                    Some(Err(error)) => error!("Accept error: {error}"),
-                    None => break,
-                }
-            }
-        }
-    }
-
-    // Tell the consumers to stop polling, then release the accept loop's own handle so only live
-    // connections and in-flight batches keep the drain channel open.
-    drop(queue_consumers);
-    drop(connection_guard);
-    let severed = drain_connections(&connections, SHUTDOWN_GRACE_PERIOD).await;
-
-    fatal.map_or(Ok(Shutdown { severed }), |report| {
-        Err(RuntimeFailure::QueueConsumer(report))
+    };
+    bound.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("could not bind unix socket {}: {error}", path.display()),
+        )
     })
 }
 
@@ -1097,18 +1208,21 @@ where
 /// refuse: a Skyzen server that binds a socket inside Lambda is a function that times out on every
 /// invocation with nothing in its logs to explain why.
 #[cfg(feature = "lambda")]
-fn run_on_lambda<Fut, E, C>(
+fn run_on_lambda<Setup, F, C>(
     _options: LaunchOptions,
-    factory: impl FnOnce() -> Fut,
+    setup: impl FnOnce(ServicePools) -> Setup,
 ) -> Result<core::convert::Infallible, StartupError>
 where
-    Fut: Future<Output = (E, C)> + Send + 'static,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    Setup: Future<Output = (F, C)>,
+    F: EndpointFactory,
     C: ConsumerSet,
 {
+    // The adapter's runtime is single-threaded, so the endpoint is built once, on the thread that
+    // serves every invocation. That thread runs tokio, which zenwave's per-thread pools cannot run
+    // on, so the HTTP service clients stay on zenwave's driver thread.
     skyzen_lambda::run(|| async move {
-        let (endpoint, consumers) = factory().await;
-        (endpoint, LambdaConsumers(consumers))
+        let (factory, consumers) = setup(ServicePools { per_thread: false }).await;
+        (factory.endpoint().await, LambdaConsumers(consumers))
     })
     .map_err(|error| StartupError::Lambda(error.to_string()))?;
 
@@ -1121,13 +1235,13 @@ where
 
 #[cfg(not(feature = "lambda"))]
 #[allow(clippy::needless_pass_by_value)]
-fn run_on_lambda<Fut, E, C>(
+fn run_on_lambda<Setup, F, C>(
     _options: LaunchOptions,
-    _factory: impl FnOnce() -> Fut,
+    _setup: impl FnOnce(ServicePools) -> Setup,
 ) -> Result<core::convert::Infallible, StartupError>
 where
-    Fut: Future<Output = (E, C)> + Send + 'static,
-    E: Endpoint + Clone + Send + Sync + 'static,
+    Setup: Future<Output = (F, C)>,
+    F: EndpointFactory,
     C: ConsumerSet,
 {
     Err(StartupError::LambdaFeatureMissing)
@@ -1160,16 +1274,15 @@ impl<C: ConsumerSet> skyzen_lambda::QueueDispatch for LambdaConsumers<C> {
 /// default and over `--host`/`--port`. An explicit `--listen` still wins over the host — that is
 /// someone running the binary by hand, and silently ignoring what they typed would be worse than
 /// serving somewhere the host is not listening.
-async fn serve_functions_host<Exec, E, C>(
-    executor: Exec,
-    endpoint: E,
+async fn serve_functions_host<F, C>(
+    factory: F,
     consumers: C,
     options: &LaunchOptions,
     port: u16,
 ) -> Result<Shutdown, RuntimeFailure>
 where
-    Exec: CoreExecutor + 'static,
-    E: Endpoint + ServedRoutes + Clone + Send + Sync + 'static,
+    F: EndpointFactory,
+    F::Endpoint: ServedRoutes,
     C: ConsumerSet,
 {
     let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -1195,12 +1308,26 @@ where
         "Serving the Azure Functions host as a custom handler"
     );
 
-    let endpoint = azure::mount(endpoint, consumers, options.azure_queue_triggers)
-        .map_err(RuntimeFailure::Mount)?;
-
-    // The consumer set moved into the mounted endpoint: under the Functions host the platform
-    // pushes every message, so nothing here polls.
-    run_server(executor, endpoint, (), addr).await
+    // Every thread mounts the triggers over its own router and reaches the one queue handler
+    // through the shared set. Under the Functions host the platform pushes every message, so
+    // nothing here polls.
+    let consumers = Arc::new(consumers);
+    let triggers = options.azure_queue_triggers;
+    serve_cores(
+        factory,
+        move |endpoint| {
+            azure::mount_shared(endpoint, Arc::clone(&consumers), triggers)
+                .map_err(RuntimeFailure::Mount)
+        },
+        (),
+        addr,
+        options.server,
+        // `launch` refused a TLS pair before this path runs, since the Functions host speaks
+        // plaintext to its custom handler, and refuses HTTP/3 the same way.
+        None,
+        None,
+    )
+    .await
 }
 
 fn server_addr() -> ListenAddr {
@@ -1214,168 +1341,22 @@ fn server_addr() -> ListenAddr {
     )
 }
 
-/// How long a freshly accepted connection may take to send its protocol preface before the
-/// connection is dropped. Prevents idle clients from pinning per-connection tasks forever.
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Run [`sniff_protocol`] with a handshake timeout so a client that connects but never sends
-/// any bytes cannot hold a connection task open indefinitely.
-async fn sniff_protocol_with_timeout<C>(
-    stream: C,
-    preface: &[u8],
-) -> std::io::Result<(Prefixed<C>, bool)>
-where
-    C: AsyncRead + AsyncWrite + Unpin,
-{
-    use futures_util::future::{select, Either};
-
-    let sniff = sniff_protocol(stream, preface);
-    futures_util::pin_mut!(sniff);
-    let timer = async_io::Timer::after(HANDSHAKE_TIMEOUT);
-    futures_util::pin_mut!(timer);
-
-    match select(sniff, timer).await {
-        Either::Left((result, _)) => result,
-        Either::Right((_deadline, _)) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out waiting for connection preface",
-        )),
-    }
-}
-
-async fn sniff_protocol<C>(mut stream: C, preface: &[u8]) -> std::io::Result<(Prefixed<C>, bool)>
-where
-    C: AsyncRead + AsyncWrite + Unpin,
-{
-    // A single `read` may return fewer bytes than the full HTTP/2 preface (it can arrive across
-    // several TCP segments). Keep reading until we have enough bytes to decide, the bytes so far
-    // already diverge from the preface (so it is HTTP/1), or we hit EOF. Whatever we consumed is
-    // replayed by `Prefixed`, so no data is lost regardless of the outcome.
-    let mut buf = vec![0u8; preface.len()];
-    let mut filled = 0;
-    while filled < preface.len() {
-        if buf[..filled] != preface[..filled] {
-            break;
-        }
-        let n = stream.read(&mut buf[filled..]).await?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    buf.truncate(filled);
-    let is_h2 = buf.starts_with(preface);
-    Ok((Prefixed::new(stream, buf), is_h2))
-}
-
-#[derive(Debug)]
-struct IntoService<E> {
-    endpoint: E,
-    executor: Arc<AnyExecutor>,
-    peer_addr: Option<SocketAddr>,
-    /// A clone of the accept loop's drain token, so [`WorkerContext::wait_until`] can register
-    /// post-response work with graceful shutdown.
-    shutdown_guard: ShutdownGuard,
-}
-
-impl<E: Endpoint + Clone> IntoService<E> {
-    const fn new(
-        endpoint: E,
-        executor: Arc<AnyExecutor>,
-        peer_addr: Option<SocketAddr>,
-        shutdown_guard: ShutdownGuard,
-    ) -> Self {
-        Self {
-            endpoint,
-            executor,
-            peer_addr,
-            shutdown_guard,
-        }
-    }
-}
-
-impl<E: Endpoint + Send + Sync + Clone + 'static> Service<hyper::Request<Incoming>>
-    for IntoService<E>
-{
-    type Response = hyper::Response<
-        StreamBody<MapOk<crate::Body, fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>>>,
-    >;
-    type Error = BoxHttpError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn call(&self, mut req: hyper::Request<Incoming>) -> Self::Future {
-        let mut endpoint = self.endpoint.clone();
-        let executor = self.executor.clone();
-        let peer_addr = self.peer_addr;
-        let context = WorkerContext::new(self.executor.clone(), self.shutdown_guard.clone());
-        let fut = async move {
-            let on_upgrade = hyper::upgrade::on(&mut req);
-            let method = req.method().clone();
-            let path = req.uri().path().to_owned();
-            let mut request: crate::Request =
-                crate::Request::from(req.map(BodyDataStream::new).map(|body| {
-                    crate::Body::from_stream(
-                        body.map_err(|error| BodyError::Other(Box::new(error))),
-                    )
-                }));
-            request.extensions_mut().insert(on_upgrade);
-            request.extensions_mut().insert(executor);
-            request.extensions_mut().insert(context);
-            if let Some(peer_addr) = peer_addr {
-                request.extensions_mut().insert(PeerAddr(peer_addr));
-            }
-
-            // Convert errors to HTTP responses at the runtime level
-            let response: crate::Response = match endpoint.respond(&mut request).await {
-                Ok(response) => {
-                    info!(
-                        method = method.as_str(),
-                        path = path.as_str(),
-                        status = response.status().as_u16(),
-                        "request completed"
-                    );
-                    response
-                }
-                Err(err) => {
-                    // Log and render through the shared helpers so every backend emits the same
-                    // fields and applies the same 4xx/5xx redaction policy.
-                    skyzen_core::log_endpoint_error(&err, &method, path.as_str());
-                    skyzen_core::error_response(&err)
-                }
-            };
-
-            Ok(response.map(|body| {
-                let body: MapOk<
-                    crate::Body,
-                    fn(crate::utils::Bytes) -> Frame<crate::utils::Bytes>,
-                > = body.map_ok(Frame::data);
-                StreamBody::new(body)
-            }))
-        };
-
-        Box::pin(fut)
-    }
-}
+/// How many native connections may be open at once, across every serving thread. Each thread
+/// takes an equal share and closes a connection accepted past it instead of queueing unbounded
+/// tasks.
+const MAX_CONNECTIONS: usize = 8_192;
 
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::UnixListener;
+    use super::bind_unix_socket;
     use super::{
-        apply_cli_overrides, drain_connections, server_addr, sniff_protocol, ListenAddr,
-        ListenAddrError, ListenOverride, Platform, Prefixed, StartupError, LAMBDA_RUNTIME_API_ENV,
+        apply_cli_overrides, drain_connections, server_addr, ListenAddr, ListenAddrError,
+        ListenOverride, Platform, StartupError, LAMBDA_RUNTIME_API_ENV,
     };
     use crate::runtime::azure::CUSTOM_HANDLER_PORT_ENV;
-    use http_kit::utils::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use serial_test::serial;
-    use std::{
-        io::{Cursor, Read},
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        pin::Pin,
-        task::{Context, Poll},
-    };
-
-    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     /// One environment variable, restored to whatever it was when the guard is dropped.
     ///
@@ -1429,59 +1410,6 @@ mod tests {
                     std::env::remove_var(self.name);
                 },
             }
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct TestStream {
-        read: Cursor<Vec<u8>>,
-        written: Vec<u8>,
-        closed: bool,
-    }
-
-    impl TestStream {
-        fn new(bytes: impl Into<Vec<u8>>) -> Self {
-            Self {
-                read: Cursor::new(bytes.into()),
-                written: Vec::new(),
-                closed: false,
-            }
-        }
-    }
-
-    impl AsyncRead for TestStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<Result<usize, std::io::Error>> {
-            Poll::Ready(Read::read(&mut self.read, buf))
-        }
-    }
-
-    impl AsyncWrite for TestStream {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<Result<usize, std::io::Error>> {
-            self.written.extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), std::io::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), std::io::Error>> {
-            self.closed = true;
-            Poll::Ready(Ok(()))
         }
     }
 
@@ -1777,8 +1705,8 @@ mod tests {
 
     #[tokio::test]
     async fn wait_until_keeps_shutdown_waiting_for_post_response_work() {
-        use super::{ShutdownGuard, WorkerContext};
-        use executor_core::{smol::SmolGlobal, AnyExecutor};
+        use super::{AnyExecutor, SmolGlobal};
+        use crate::runtime::{context::ShutdownGuard, WorkerContext};
         use std::sync::Arc;
 
         let (guard, connections) = async_channel::bounded::<std::convert::Infallible>(1);
@@ -1811,154 +1739,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sniff_protocol_detects_http2_preface_and_replays_buffered_bytes() {
-        let payload = [HTTP2_PREFACE, b"rest"].concat();
-        let (mut stream, is_h2) = sniff_protocol(TestStream::new(payload.clone()), HTTP2_PREFACE)
-            .await
-            .unwrap();
-
-        assert!(is_h2);
-
-        let mut read = Vec::new();
-        stream.read_to_end(&mut read).await.unwrap();
-        assert_eq!(read, payload);
-    }
-
-    #[tokio::test]
-    async fn sniff_protocol_distinguishes_http1_and_preserves_writes() {
-        let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
-        let (mut stream, is_h2) = sniff_protocol(TestStream::new(payload.clone()), HTTP2_PREFACE)
-            .await
-            .unwrap();
-
-        assert!(!is_h2);
-
-        let mut read = Vec::new();
-        stream.read_to_end(&mut read).await.unwrap();
-        assert_eq!(read, payload);
-
-        stream.write_all(b"pong").await.unwrap();
-        stream.flush().await.unwrap();
-        stream.close().await.unwrap();
-        assert_eq!(stream.inner.written, b"pong".to_vec());
-        assert!(stream.inner.closed);
-    }
-
-    #[tokio::test]
-    async fn prefixed_reads_buffer_before_inner_stream() {
-        let mut stream = Prefixed::new(TestStream::new(b"tail".to_vec()), b"head".to_vec());
-
-        let mut read = Vec::new();
-        stream.read_to_end(&mut read).await.unwrap();
-
-        assert_eq!(read, b"headtail".to_vec());
-    }
-
-    // A stream that yields its bytes in caller-chosen chunks, to exercise `sniff_protocol`'s
-    // short-read handling (the HTTP/2 preface arriving across multiple reads).
-    struct ChunkedStream {
-        chunks: std::collections::VecDeque<Vec<u8>>,
-        written: Vec<u8>,
-    }
-
-    impl ChunkedStream {
-        fn new(chunks: Vec<Vec<u8>>) -> Self {
-            Self {
-                chunks: std::collections::VecDeque::from(chunks),
-                written: Vec::new(),
-            }
-        }
-    }
-
-    impl AsyncRead for ChunkedStream {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<std::io::Result<usize>> {
-            let this = self.get_mut();
-            if buf.is_empty() {
-                return Poll::Ready(Ok(0));
-            }
-            match this.chunks.pop_front() {
-                Some(mut chunk) => {
-                    let n = chunk.len().min(buf.len());
-                    buf[..n].copy_from_slice(&chunk[..n]);
-                    if n < chunk.len() {
-                        chunk.drain(..n);
-                        this.chunks.push_front(chunk);
-                    }
-                    Poll::Ready(Ok(n))
-                }
-                None => Poll::Ready(Ok(0)),
-            }
-        }
-    }
-
-    impl AsyncWrite for ChunkedStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            let this = self.get_mut();
-            this.written.extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    async fn read_all<R: AsyncRead + Unpin>(mut reader: R) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 16];
-        loop {
-            let n = reader.read(&mut buf).await.expect("read failed");
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
-        }
-        out
-    }
-
-    #[tokio::test]
-    async fn sniff_detects_split_http2_preface() {
-        let chunks = vec![
-            HTTP2_PREFACE[..5].to_vec(),
-            HTTP2_PREFACE[5..12].to_vec(),
-            HTTP2_PREFACE[12..].to_vec(),
-        ];
-        let stream = ChunkedStream::new(chunks);
-
-        let (_prefixed, is_h2) = sniff_protocol(stream, HTTP2_PREFACE).await.unwrap();
-        assert!(is_h2);
-    }
-
-    #[tokio::test]
-    async fn sniff_preserves_bytes_on_split_mismatch() {
-        let payload = b"GET / HTTP/1.1\r\n\r\n".to_vec();
-        let chunks = vec![
-            payload[..3].to_vec(),
-            payload[3..10].to_vec(),
-            payload[10..].to_vec(),
-        ];
-        let stream = ChunkedStream::new(chunks);
-
-        let (prefixed, is_h2) = sniff_protocol(stream, HTTP2_PREFACE).await.unwrap();
-        assert!(!is_h2);
-
-        let restored = read_all(prefixed).await;
-        assert_eq!(restored, payload);
-    }
-
     /// A socket path no other test or run is using, short enough for the platform's limit.
     #[cfg(unix)]
     fn unique_socket_path() -> std::path::PathBuf {
@@ -1969,48 +1749,238 @@ mod tests {
         std::env::temp_dir().join(format!("skyzen-test-{}-{nanos}.sock", std::process::id()))
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(unix)]
-    async fn bind_unix_listener_takes_a_fresh_path() {
+    fn bind_unix_socket_takes_a_fresh_path() {
         let path = unique_socket_path();
 
-        let listener = super::bind_unix_listener(&path)
-            .await
-            .expect("nothing is in the way");
+        let listener = bind_unix_socket(&path).expect("nothing is in the way");
 
         drop(listener);
         std::fs::remove_file(&path).expect("the test created the socket");
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(unix)]
-    async fn bind_unix_listener_reclaims_a_stale_socket() {
+    fn bind_unix_socket_reclaims_a_stale_socket() {
         let path = unique_socket_path();
         // A dead listener's socket file stays on the filesystem; connect refuses, so the
         // bind must remove it and take the path rather than report `AddrInUse`.
-        drop(UnixListener::bind(&path).expect("bind"));
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
 
-        let listener = super::bind_unix_listener(&path)
-            .await
-            .expect("a stale socket is reclaimed");
+        let listener = bind_unix_socket(&path).expect("a stale socket is reclaimed");
 
         drop(listener);
         std::fs::remove_file(&path).expect("the test created the socket");
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(unix)]
-    async fn bind_unix_listener_never_steals_a_live_socket() {
+    fn bind_unix_socket_never_steals_a_live_socket() {
         let path = unique_socket_path();
-        let listener = UnixListener::bind(&path).expect("bind");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
 
-        let error = super::bind_unix_listener(&path)
-            .await
-            .expect_err("a live server keeps its socket");
+        let error = bind_unix_socket(&path).expect_err("a live server keeps its socket");
 
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
         assert!(path.exists(), "the live socket must not be unlinked");
         drop(listener);
         std::fs::remove_file(&path).expect("the test created the socket");
+    }
+
+    fn server_override(args: &[&str]) -> super::HttpServer {
+        super::apply_server_override(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    #[serial]
+    fn the_default_server_is_h1() {
+        let _env = EnvGuard::clear_var("SKYZEN_SERVER");
+        assert_eq!(server_override(&["app"]), super::HttpServer::H1);
+    }
+
+    #[test]
+    #[serial]
+    fn the_server_flag_beats_the_environment() {
+        let _env = EnvGuard::set_var("SKYZEN_SERVER", "h1");
+        assert_eq!(
+            server_override(&["app", "--server", "hyper"]),
+            super::HttpServer::Hyper
+        );
+        assert_eq!(
+            server_override(&["app", "--server=hyper"]),
+            super::HttpServer::Hyper
+        );
+        assert_eq!(server_override(&["app"]), super::HttpServer::H1);
+    }
+
+    #[test]
+    #[serial]
+    fn the_server_environment_variable_selects_hyper() {
+        let _env = EnvGuard::set_var("SKYZEN_SERVER", "hyper");
+        assert_eq!(server_override(&["app"]), super::HttpServer::Hyper);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "not a server")]
+    fn an_unknown_server_stops_the_process() {
+        let _env = EnvGuard::clear_var("SKYZEN_SERVER");
+        let _ = server_override(&["app", "--server", "apache"]);
+    }
+
+    /// `apply_tls_overrides` through the same iterator shape `#[skyzen::main]` hands it:
+    /// a leading binary name followed by the real arguments.
+    fn tls_overrides(args: &[&str]) -> Option<super::TlsFiles> {
+        super::apply_tls_overrides(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    #[serial]
+    fn tls_overrides_unset_means_cleartext() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        assert_eq!(tls_overrides(&["app"]), None);
+    }
+
+    #[test]
+    #[serial]
+    fn tls_overrides_reads_the_env_pair() {
+        let _cert = EnvGuard::set_var("SKYZEN_TLS_CERT", "cert.pem");
+        let _key = EnvGuard::set_var("SKYZEN_TLS_KEY", "key.pem");
+        assert_eq!(
+            tls_overrides(&["app"]),
+            Some(super::TlsFiles {
+                cert: "cert.pem".into(),
+                key: "key.pem".into(),
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn tls_overrides_flags_beat_env() {
+        let _cert = EnvGuard::set_var("SKYZEN_TLS_CERT", "env-cert.pem");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        assert_eq!(
+            tls_overrides(&["app", "--tls-cert", "flag.pem", "--tls-key=k.pem"]),
+            Some(super::TlsFiles {
+                cert: "flag.pem".into(),
+                key: "k.pem".into(),
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn tls_overrides_falls_back_per_file() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::set_var("SKYZEN_TLS_KEY", "env-key.pem");
+        assert_eq!(
+            tls_overrides(&["app", "--tls-cert=c.pem"]),
+            Some(super::TlsFiles {
+                cert: "c.pem".into(),
+                key: "env-key.pem".into(),
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "without a key")]
+    fn tls_overrides_cert_without_key_panics() {
+        let _cert = EnvGuard::set_var("SKYZEN_TLS_CERT", "cert.pem");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        let _ = tls_overrides(&["app"]);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "without a certificate")]
+    fn tls_overrides_key_without_cert_panics() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::set_var("SKYZEN_TLS_KEY", "key.pem");
+        let _ = tls_overrides(&["app"]);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "expects a PEM path")]
+    fn tls_overrides_cert_flag_without_a_value_panics() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        let _ = tls_overrides(&["app", "--tls-cert"]);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "expects a PEM path")]
+    fn tls_overrides_key_flag_without_a_value_panics() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        let _ = tls_overrides(&["app", "--tls-key"]);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "expects a PEM path")]
+    fn tls_overrides_flag_eating_another_flag_panics() {
+        let _cert = EnvGuard::clear_var("SKYZEN_TLS_CERT");
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        let _ = tls_overrides(&["app", "--tls-cert", "--tls-key", "k.pem"]);
+    }
+
+    /// A non-UTF-8 path is still a configured TLS file: reading it as absent would boot the
+    /// server plaintext under a configuration that promised encryption. The path is unusable but
+    /// it must still register as a TLS setting: either a pair or a startup error, never `None`.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_non_utf8_tls_env_value_still_counts_as_configured() {
+        use std::os::unix::ffi::OsStrExt;
+        let _key = EnvGuard::clear_var("SKYZEN_TLS_KEY");
+        std::env::set_var(
+            "SKYZEN_TLS_CERT",
+            std::ffi::OsStr::from_bytes(b"\xff\xfe.pem"),
+        );
+        let pair = tls_overrides(&["app", "--tls-key", "k.pem"]);
+        std::env::remove_var("SKYZEN_TLS_CERT");
+        let pair = pair.expect("a non-UTF-8 path is still a certificate setting");
+        assert_eq!(pair.cert.as_os_str().as_bytes(), b"\xff\xfe.pem");
+    }
+
+    fn http3_requested(args: &[&str]) -> bool {
+        super::apply_http3_override(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    #[serial]
+    fn http3_is_not_requested_by_default() {
+        let _env = EnvGuard::clear_var("SKYZEN_HTTP3");
+        assert!(!http3_requested(&["app"]));
+    }
+
+    #[test]
+    #[serial]
+    fn http3_is_requested_by_the_flag_or_the_variable() {
+        let cleared = EnvGuard::clear_var("SKYZEN_HTTP3");
+        assert!(http3_requested(&["app", "--http3"]));
+        drop(cleared);
+        for value in ["true", "1"] {
+            let _env = EnvGuard::set_var("SKYZEN_HTTP3", value);
+            assert!(http3_requested(&["app"]), "{value}");
+        }
+        for value in ["false", "0"] {
+            let _env = EnvGuard::set_var("SKYZEN_HTTP3", value);
+            assert!(!http3_requested(&["app"]), "{value}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "SKYZEN_HTTP3 must be")]
+    fn a_malformed_http3_variable_stops_the_process() {
+        let _env = EnvGuard::set_var("SKYZEN_HTTP3", "maybe");
+        let _ = http3_requested(&["app"]);
     }
 }

@@ -24,6 +24,72 @@ use syn::{
     spanned::Spanned,
 };
 
+/// The native setup future and the wasm endpoint factory `#[skyzen::main]` hands its runtimes.
+///
+/// Natively the services are built once and the queue consumers from those same instances; the
+/// router is built by a `Send` factory that each serving thread calls on itself, layering clones
+/// of the services around that thread's endpoint — a service on zenwave rebound first to pools on
+/// that thread, as the `ServicePools` the runtime hands the setup says. The router never leaves its
+/// thread, so nothing the entry function builds has to be `Send`.
+///
+/// On wasm the factory receives the `WinterCG` env explicitly (as `__skyzen_wasm_env`), so endpoint
+/// construction never depends on an ambient thread-local that concurrent invocations could race.
+/// The platform owns event delivery there, so there are no consumers.
+fn endpoint_factories(
+    entry_call: &proc_macro2::TokenStream,
+    shared: &proc_macro2::TokenStream,
+    injections: &[Injection],
+    consumers: &proc_macro2::TokenStream,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let bindings: Vec<_> = injections
+        .iter()
+        .map(|injection| &injection.binding)
+        .collect();
+    let layers: Vec<_> = injections
+        .iter()
+        .map(|injection| &injection.layer)
+        .collect();
+    let captured: Vec<_> = injections
+        .iter()
+        .map(|injection| &injection.captured)
+        .collect();
+    let per_thread: Vec<_> = injections
+        .iter()
+        .map(|injection| &injection.per_thread)
+        .collect();
+    // `__skyzen_pools` is the platform's `ServicePools`, the parameter of the closure this setup
+    // is the body of; it is `Copy`, so the factory carries its own to every thread.
+    let native_setup = quote! {
+        async move {
+            #shared
+            #(#bindings)*
+            let __skyzen_consumers = #consumers;
+            let __skyzen_endpoint_factory = move || {
+                #(let #captured = ::std::clone::Clone::clone(&#captured);)*
+                async move {
+                    #(#per_thread)*
+                    let endpoint = #entry_call;
+                    #(#layers)*
+                    endpoint
+                }
+            };
+            (__skyzen_endpoint_factory, __skyzen_consumers)
+        }
+    };
+    let wasm_factory = quote! {
+        move |__skyzen_wasm_env: ::skyzen::runtime::wasm::Env| {
+            let _ = &__skyzen_wasm_env;
+            async move {
+                let endpoint = #entry_call;
+                #(#bindings)*
+                #(#layers)*
+                endpoint
+            }
+        }
+    };
+    (native_setup, wasm_factory)
+}
+
 /// Attribute macro that boots a Skyzen Endpoint on native or wasm runtimes.
 #[proc_macro_attribute]
 pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -55,36 +121,17 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(wiring) => wiring,
         Err(error) => return error.to_compile_error().into(),
     };
-    let PortableWiring { steps, consumers } = wiring;
+    let PortableWiring {
+        shared,
+        injections,
+        consumers,
+    } = wiring;
     let azure_queue_triggers = match azure_queue_trigger_tokens() {
         Ok(triggers) => triggers,
         Err(error) => return error.to_compile_error().into(),
     };
-    // Natively the factory yields the endpoint *and* the queue consumers, both built from the one
-    // set of service instances; on wasm the platform owns event delivery, so it yields only the
-    // endpoint and this whole arm is stripped.
-    let factory_body = quote! {
-        async move {
-            let endpoint = #entry_call;
-            #(#steps)*
-            {
-                #[cfg(not(target_arch = "wasm32"))]
-                { (endpoint, #consumers) }
-                #[cfg(target_arch = "wasm32")]
-                { endpoint }
-            }
-        }
-    };
-    let native_factory = factory_body.clone();
-    // On wasm the factory receives the WinterCG env explicitly (as `__skyzen_wasm_env`), so
-    // endpoint construction never depends on an ambient thread-local that concurrent
-    // invocations could race.
-    let wasm_factory = quote! {
-        move |__skyzen_wasm_env: ::skyzen::runtime::wasm::Env| {
-            let _ = &__skyzen_wasm_env;
-            #factory_body
-        }
-    };
+    let (native_setup, wasm_factory) =
+        endpoint_factories(&entry_call, &shared, &injections, &consumers);
 
     let init_logging = if options.default_logger {
         quote! { ::skyzen::runtime::native::init_logging(); }
@@ -122,9 +169,12 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::skyzen::runtime::native::launch(
                 ::skyzen::runtime::native::LaunchOptions {
                     listen: ::skyzen::runtime::native::apply_cli_overrides(::std::env::args()),
+                    tls: ::skyzen::runtime::native::apply_tls_overrides(::std::env::args()),
+                    http3: ::skyzen::runtime::native::apply_http3_override(::std::env::args()),
+                    server: ::skyzen::runtime::native::apply_server_override(::std::env::args()),
                     azure_queue_triggers: #azure_queue_triggers,
                 },
-                || #native_factory,
+                |__skyzen_pools: ::skyzen::runtime::native::ServicePools| #native_setup,
                 #shutdown_hook,
             );
         }
@@ -604,11 +654,17 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     let mut assertions = Vec::new();
     let mut parameter_schema_fns = Vec::new();
     let mut parameter_name_lists = Vec::new();
+    let mut param_response_extends = Vec::new();
     let mut schema_collector_idents = Vec::new();
     let mut schema_collector_defs = Vec::new();
 
     for (included_idx, meta) in parameter_schemas.iter().enumerate() {
         let ty = &meta.ty;
+        param_response_extends.push(quote! {
+            responses.extend(
+                ::skyzen::openapi::extractor_responses_of::<#ty>().unwrap_or_default(),
+            );
+        });
         let schema_ident = format_ident!(
             "__SKYZEN_OPENAPI_PARAM_SCHEMA_{}_{}",
             fn_ident.to_string().to_uppercase(),
@@ -712,11 +768,10 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     );
     schema_collector_idents.push(response_collector_ident.clone());
 
-    let response_schema_fn =
-        if let Some((payload_ty, content_type)) = documented_response_payload(&response_ty)? {
-            let content_type_lit = LitStr::new(content_type, fn_ident.span());
-            assertions.push(quote! { let _ = ::skyzen::openapi::schema_of::<#payload_ty>; });
-            schema_collector_defs.push(quote! {
+    if let Some((payload_ty, content_type)) = documented_response_payload(&response_ty)? {
+        let content_type_lit = LitStr::new(content_type, fn_ident.span());
+        assertions.push(quote! { let _ = ::skyzen::openapi::schema_of::<#payload_ty>; });
+        schema_collector_defs.push(quote! {
             fn #response_schema_ident() -> Option<Vec<::skyzen::openapi::ResponseSchema>> {
                 let mut responses = ::skyzen::openapi::responder_schemas_of::<#response_ty>()
                     .unwrap_or_default();
@@ -739,6 +794,8 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                     });
                 }
 
+                #(#param_response_extends)*
+
                 Some(responses)
             }
 
@@ -749,20 +806,28 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                 ::skyzen::openapi::register_schema_for::<#payload_ty>(schemas);
             }
         });
-            quote! { Some(#response_schema_ident) }
-        } else {
-            let response_assert =
-                quote! { let _ = ::skyzen::openapi::responder_schemas_of::<#response_ty>; };
-            assertions.push(response_assert);
-            schema_collector_defs.push(quote! {
-                fn #response_collector_ident(
-                    schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
-                ) {
-                    ::skyzen::openapi::register_responder_schemas_for::<#response_ty>(schemas);
-                }
-            });
-            quote! { Some(::skyzen::openapi::responder_schemas_of::<#response_ty>) }
-        };
+    } else {
+        let response_assert =
+            quote! { let _ = ::skyzen::openapi::responder_schemas_of::<#response_ty>; };
+        assertions.push(response_assert);
+        schema_collector_defs.push(quote! {
+            fn #response_collector_ident(
+                schemas: &mut ::std::collections::BTreeMap<String, ::skyzen::openapi::SchemaRef>
+            ) {
+                ::skyzen::openapi::register_responder_schemas_for::<#response_ty>(schemas);
+            }
+        });
+        schema_collector_defs.push(quote! {
+            fn #response_schema_ident() -> Option<Vec<::skyzen::openapi::ResponseSchema>> {
+                let mut responses =
+                    ::skyzen::openapi::responder_schemas_of::<#response_ty>()
+                        .unwrap_or_default();
+                #(#param_response_extends)*
+                Some(responses)
+            }
+        });
+    }
+    let response_schema_fn = quote! { Some(#response_schema_ident) };
 
     let schema_collectors = if schema_collector_idents.is_empty() {
         quote! { &[] }
@@ -2597,12 +2662,38 @@ fn manifest_tracking_tokens() -> proc_macro2::TokenStream {
 
 /// What `#[skyzen::main]` inserts between building the endpoint and launching it.
 struct PortableWiring {
-    /// One group of statements per manifest entry: bind the service, then wrap the endpoint with
-    /// the middleware that injects it.
-    steps: Vec<proc_macro2::TokenStream>,
+    /// Bound natively before any injection: what several backends are built from — the one AWS
+    /// configuration — or nothing.
+    shared: proc_macro2::TokenStream,
+    /// One entry per manifest entry, in declaration order.
+    injections: Vec<Injection>,
     /// The `ConsumerSet` the native runtime is launched with — `()` when the manifest declares no
     /// `[[native.queue_consumer]]`.
     consumers: proc_macro2::TokenStream,
+}
+
+/// How one manifest entry reaches the application.
+///
+/// The two halves run at different times natively: the service is bound **once**, before any
+/// serving thread starts, and the factory each thread builds its router with layers a clone of it
+/// around that thread's endpoint. The service is `Send + Sync`; the router it is layered onto
+/// never has to be.
+///
+/// A service whose client speaks HTTP through zenwave is the exception: what the factory captures
+/// is the backend as setup built it, and each serving thread rebinds a clone of it to connection
+/// pools on its own runtime (`per_thread`) before layering it, so a request a thread serves sends
+/// its service calls on connections that thread drives.
+struct Injection {
+    /// `let <local> = <init>;`, the local the service is held in.
+    binding: proc_macro2::TokenStream,
+    /// The local the native factory captures and clones onto each serving thread: the service's
+    /// own, or the backend `per_thread` rebinds into the service's there.
+    captured: proc_macro2::Ident,
+    /// Run natively on each serving thread before `layer`; empty for a service every thread
+    /// shares as setup built it.
+    per_thread: proc_macro2::TokenStream,
+    /// Wrap `endpoint` with the middleware that injects a clone of `<ident>`.
+    layer: proc_macro2::TokenStream,
 }
 
 fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
@@ -2616,7 +2707,8 @@ fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
 /// Nothing to bind: the endpoint is launched exactly as the entry function built it.
 fn empty_portable_wiring() -> PortableWiring {
     PortableWiring {
-        steps: Vec::new(),
+        shared: quote! {},
+        injections: Vec::new(),
         consumers: quote! { () },
     }
 }
@@ -2636,7 +2728,7 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
     }
     let default_database = default_database_index(databases)?;
 
-    let mut steps = Vec::with_capacity(services.len() + databases.len() + secrets.len() + 1);
+    let mut injections = Vec::with_capacity(services.len() + databases.len() + secrets.len());
     let service_type_counts = service_type_counts(services);
     let mut service_bindings = HashMap::new();
 
@@ -2652,12 +2744,19 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
         // The bare `Kv`/`Storage`/`Queue` extractor names whichever service of that type is the
         // only one, so it is injected exactly when the type is unambiguous.
         let inject_bare = service_type_counts[&service.service_type] == 1;
-        steps.push(named_injection_tokens(
-            &binding,
-            &ident,
-            &native_init,
-            &cloudflare_init,
-            inject_bare,
+        injections.push(native_http_service(service, manifest).map_or_else(
+            || {
+                named_injection_tokens(
+                    &binding,
+                    &ident,
+                    &native_init,
+                    &cloudflare_init,
+                    inject_bare,
+                )
+            },
+            |backend| {
+                http_injection_tokens(&binding, &ident, &backend, &cloudflare_init, inject_bare)
+            },
         ));
         service_bindings.insert(service.name.clone(), binding);
     }
@@ -2668,12 +2767,19 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
         let native_init = generate_native_database_init(database, manifest);
         let cloudflare_init = generate_cloudflare_database_init(database, manifest);
         let inject_bare = default_database == Some(index);
-        steps.push(named_injection_tokens(
-            &binding,
-            &ident,
-            &native_init,
-            &cloudflare_init,
-            inject_bare,
+        injections.push(native_http_database(database, manifest).map_or_else(
+            || {
+                named_injection_tokens(
+                    &binding,
+                    &ident,
+                    &native_init,
+                    &cloudflare_init,
+                    inject_bare,
+                )
+            },
+            |backend| {
+                http_injection_tokens(&binding, &ident, &backend, &cloudflare_init, inject_bare)
+            },
         ));
     }
 
@@ -2684,7 +2790,7 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
         let cloudflare_init = generate_cloudflare_secret_init(document, &secret.name)?;
         // There is no unambiguous bare secret: `Secret` names a value, not a capability, so a
         // single `[[secret]]` is still reached through its own generated type.
-        steps.push(named_injection_tokens(
+        injections.push(named_injection_tokens(
             &binding,
             &ident,
             &native_init,
@@ -2695,7 +2801,11 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
 
     let consumers = queue_consumer_tokens(manifest, &service_bindings)?;
 
-    Ok(PortableWiring { steps, consumers })
+    Ok(PortableWiring {
+        shared: aws_config_tokens(manifest),
+        injections,
+        consumers,
+    })
 }
 
 /// The local binding that holds one manifest entry's service for the length of the factory.
@@ -2876,6 +2986,79 @@ fn named_injection_tokens(
     native_init: &proc_macro2::TokenStream,
     cloudflare_init: &proc_macro2::TokenStream,
     inject_bare: bool,
+) -> Injection {
+    Injection {
+        binding: quote! {
+            let #binding = {
+                #[cfg(not(target_arch = "wasm32"))]
+                { #native_init }
+                #[cfg(target_arch = "wasm32")]
+                { #cloudflare_init }
+            };
+        },
+        captured: binding.clone(),
+        per_thread: quote! {},
+        layer: injection_layer_tokens(binding, ident, inject_bare),
+    }
+}
+
+/// A native backend whose client speaks HTTP through zenwave, and so is rebound on each thread.
+struct HttpBackend {
+    /// The backend as setup builds it, once.
+    init: proc_macro2::TokenStream,
+    /// The portable wrapper it is injected as.
+    wrapper: proc_macro2::TokenStream,
+    /// A closure taking the backend and the thread's compio driver, and returning the backend on
+    /// connection pools that driver runs.
+    rebind: proc_macro2::TokenStream,
+}
+
+/// [`named_injection_tokens`] for a backend on zenwave: setup builds it once, as `backend`; the
+/// queue consumers get it rebound to the coordinating thread's pools, and every serving thread
+/// rebinds its own clone before wrapping and layering it.
+fn http_injection_tokens(
+    binding: &proc_macro2::Ident,
+    ident: &proc_macro2::Ident,
+    backend: &HttpBackend,
+    cloudflare_init: &proc_macro2::TokenStream,
+    inject_bare: bool,
+) -> Injection {
+    let HttpBackend {
+        init,
+        wrapper,
+        rebind,
+    } = backend;
+    let raw = format_ident!("{binding}_backend");
+    Injection {
+        binding: quote! {
+            #[cfg(not(target_arch = "wasm32"))]
+            let #raw = { #init };
+            let #binding = {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    #wrapper::new(__skyzen_pools.on_this_thread(
+                        ::std::clone::Clone::clone(&#raw),
+                        #rebind,
+                    ))
+                }
+                #[cfg(target_arch = "wasm32")]
+                { #cloudflare_init }
+            };
+        },
+        captured: raw.clone(),
+        per_thread: quote! {
+            let #binding = #wrapper::new(__skyzen_pools.on_this_thread(#raw, #rebind));
+        },
+        layer: injection_layer_tokens(binding, ident, inject_bare),
+    }
+}
+
+/// Wrap `endpoint` with the middleware that injects a clone of `binding` as its named newtype
+/// `ident`, and as the bare wrapper too when `inject_bare`.
+fn injection_layer_tokens(
+    binding: &proc_macro2::Ident,
+    ident: &proc_macro2::Ident,
+    inject_bare: bool,
 ) -> proc_macro2::TokenStream {
     let bare = if inject_bare {
         quote! {
@@ -2887,14 +3070,7 @@ fn named_injection_tokens(
     } else {
         quote! {}
     };
-
     quote! {
-        let #binding = {
-            #[cfg(not(target_arch = "wasm32"))]
-            { #native_init }
-            #[cfg(target_arch = "wasm32")]
-            { #cloudflare_init }
-        };
         let endpoint = ::skyzen::__private::with_middleware(
             endpoint,
             #ident::new(::std::clone::Clone::clone(&#binding)),
@@ -3109,11 +3285,12 @@ fn native_kv_tokens(name: &str, wiring: &NativeServiceSection) -> Option<proc_ma
         }
         NativeServiceSection::DynamoDb(dynamodb) => {
             // No environment variable: the table is named in the manifest, and the credentials and
-            // region come from the ambient AWS chain `DynamoKv::from_env` loads. The two options
-            // are applied only when the manifest asks for them, so the constructor's own defaults
-            // stay the defaults.
+            // region come from the one ambient AWS configuration setup loads. The two options are
+            // applied only when the manifest asks for them, so the constructor's own defaults stay
+            // the defaults.
             let table = LitStr::new(&dynamodb.table, proc_macro2::Span::call_site());
-            let mut build = quote! { ::skyzen_aws::DynamoKv::from_env(#table).await };
+            let config = aws_config_ident();
+            let mut build = quote! { ::skyzen_aws::DynamoKv::from_config(&#config, #table) };
             if let Some(ttl_attribute) = &dynamodb.ttl_attribute {
                 let ttl_lit = LitStr::new(ttl_attribute, proc_macro2::Span::call_site());
                 build = quote! { #build.with_ttl_attribute(#ttl_lit) };
@@ -3154,7 +3331,8 @@ fn native_storage_tokens(
     Some(match wiring {
         NativeServiceSection::S3(s3) => {
             let bucket = env_value_expr("service", name, &s3.bucket_env);
-            quote! { ::skyzen_s3::S3Storage::from_env(&#bucket).await }
+            let config = aws_config_ident();
+            quote! { ::skyzen_s3::S3Storage::from_config(&#config, &#bucket) }
         }
         NativeServiceSection::Blob(blob) => {
             let connection = env_value_expr("service", name, &blob.connection_env);
@@ -3183,16 +3361,16 @@ fn native_queue_tokens(
     Some(match wiring {
         NativeServiceSection::Sqs(sqs) => {
             let url = env_value_expr("service", name, &sqs.url_env);
-            // `SqsQueue::from_env` builds a *standard* queue and refuses a `.fifo` URL, which
+            // `SqsQueue::from_config` builds a *standard* queue and refuses a `.fifo` URL, which
             // needs a message group id on every send. A FIFO queue is wired in code with
             // `SqsQueue::fifo`, so the manifest path reports the mismatch rather than hiding it.
             let failure = connect_failure_lit(
                 name,
                 &format!("use the SQS queue named by `{}`", sqs.url_env),
             );
+            let config = aws_config_ident();
             quote! {
-                ::skyzen_aws::SqsQueue::from_env(&#url)
-                    .await
+                ::skyzen_aws::SqsQueue::from_config(&#config, &#url)
                     .unwrap_or_else(|error| panic!("{}: {error}", #failure))
             }
         }
@@ -3330,19 +3508,7 @@ fn generate_native_database_init(
             }};
         }
         (DatabaseType::Sql, NativeDatabaseSection::RdsData(rds)) => {
-            // Either the wiring names all four values a Data API call is addressed by, and they
-            // are handed straight to `from_parts`, or it names none and `from_env` reads them.
-            // A half-written wiring never reaches here — the manifest parse rejects it — and is
-            // reported rather than assumed, so the rule has one implementation.
-            let parts = match rds.parts() {
-                Ok(parts) => parts,
-                Err(error) => {
-                    return compile_error_block(&format!("[native.database.{name}] {error}"));
-                }
-            };
-
-            let build = parts.map_or_else(|| rds_from_env_tokens(name), rds_from_parts_tokens);
-
+            let build = rds_data_tokens(name, rds);
             return quote! {{
                 let backend = #build;
                 ::skyzen::__services::Db::new(backend)
@@ -3363,6 +3529,88 @@ fn generate_native_database_init(
     }}
 }
 
+/// The RDS Data API backend one wiring builds.
+///
+/// Either the wiring names all four values a Data API call is addressed by, and they are handed
+/// straight to `from_config`, or it names none and `from_config_and_env` reads them. Either way the
+/// client is built from setup's one AWS configuration. A half-written wiring
+/// never reaches here — the manifest parse rejects it — and is reported rather than assumed, so the
+/// rule has one implementation.
+fn rds_data_tokens(name: &str, rds: &skyzen_manifest::RdsDataWiring) -> proc_macro2::TokenStream {
+    match rds.parts() {
+        Ok(parts) => parts.map_or_else(|| rds_from_env_tokens(name), rds_from_parts_tokens),
+        Err(error) => compile_error_block(&format!("[native.database.{name}] {error}")),
+    }
+}
+
+/// The backend of a portable service whose native client speaks HTTP through zenwave, or `None`
+/// for one that shares a client of another kind — or whose wiring is wrong, which
+/// [`generate_native_service_init`] reports.
+fn native_http_service(service: &ServiceEntry, manifest: &SkyzenManifest) -> Option<HttpBackend> {
+    let wiring = native_service_wiring(manifest, &service.name)?;
+    let rebind = http_rebind_tokens(&service.name, wiring)?;
+    Some(HttpBackend {
+        init: native_backend_tokens(service, wiring)?,
+        wrapper: service_wrapper_path(service.service_type),
+        rebind,
+    })
+}
+
+/// [`native_http_service`] for a portable database: the RDS Data API is the one on zenwave.
+fn native_http_database(
+    database: &DatabaseEntry,
+    manifest: &SkyzenManifest,
+) -> Option<HttpBackend> {
+    let wiring = native_database_wiring(manifest, &database.name)?;
+    let (DatabaseType::Sql, NativeDatabaseSection::RdsData(rds)) = (database.database_type, wiring)
+    else {
+        return None;
+    };
+    Some(HttpBackend {
+        init: rds_data_tokens(&database.name, rds),
+        wrapper: quote! { ::skyzen::__services::Db },
+        rebind: quote! {
+            |backend, io| backend.with_http_client(
+                ::skyzen_aws::sdk::ZenwaveHttpClient::system_on_current_thread(io),
+            )
+        },
+    })
+}
+
+/// The closure that rebinds one service backend to the calling thread's connection pools, for the
+/// backends whose client speaks HTTP through zenwave.
+fn http_rebind_tokens(
+    name: &str,
+    wiring: &NativeServiceSection,
+) -> Option<proc_macro2::TokenStream> {
+    Some(match wiring {
+        NativeServiceSection::S3(_) => quote! {
+            |backend, io| backend.with_http_client(
+                ::skyzen_s3::ZenwaveHttpClient::system_on_current_thread(io),
+            )
+        },
+        NativeServiceSection::DynamoDb(_) | NativeServiceSection::Sqs(_) => quote! {
+            |backend, io| backend.with_http_client(
+                ::skyzen_aws::sdk::ZenwaveHttpClient::system_on_current_thread(io),
+            )
+        },
+        NativeServiceSection::Blob(_) | NativeServiceSection::ServiceBus(_) => quote! {
+            |backend, io| backend.with_http(::skyzen_azure::AzureHttp::system_on_current_thread(io))
+        },
+        NativeServiceSection::StorageQueue(_) => {
+            let failure = connect_failure_lit(name, "rebind its Azure Storage queue client");
+            quote! {
+                |backend, io| backend
+                    .with_http(::skyzen_azure::AzureHttp::system_on_current_thread(io))
+                    .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+            }
+        }
+        NativeServiceSection::Redis(_)
+        | NativeServiceSection::Cosmos(_)
+        | NativeServiceSection::Memory(_) => return None,
+    })
+}
+
 /// The RDS Data API backend built from the four values a wiring names.
 ///
 /// Infallible: nothing is read and nothing is parsed here, so there is no failure to report — the
@@ -3372,8 +3620,11 @@ fn rds_from_parts_tokens(parts: skyzen_manifest::RdsDataParts<'_>) -> proc_macro
     let secret_arn = LitStr::new(parts.secret_arn, proc_macro2::Span::call_site());
     let database = LitStr::new(parts.database, proc_macro2::Span::call_site());
     let engine = rds_engine_tokens(parts.engine);
+    let config = aws_config_ident();
     quote! {
-        ::skyzen_aws::RdsDataDb::from_parts(#resource_arn, #secret_arn, #database, #engine).await
+        ::skyzen_aws::RdsDataDb::from_config(
+            &#config, #resource_arn, #secret_arn, #database, #engine,
+        )
     }
 }
 
@@ -3383,10 +3634,76 @@ fn rds_from_env_tokens(name: &str) -> proc_macro2::TokenStream {
         &format!("portable database `{name}` failed to reach Aurora through the RDS Data API"),
         proc_macro2::Span::call_site(),
     );
+    let config = aws_config_ident();
     quote! {
-        ::skyzen_aws::RdsDataDb::from_env()
-            .await
+        ::skyzen_aws::RdsDataDb::from_config_and_env(&#config)
             .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+    }
+}
+
+/// The local setup holds the one AWS configuration in, which every AWS backend's client is built
+/// from; [`aws_config_tokens`] binds it.
+fn aws_config_ident() -> proc_macro2::Ident {
+    format_ident!("__skyzen_aws_config")
+}
+
+/// Which crate names `load_config` for an application whose AWS backends are wired: `skyzen-aws`
+/// when any of them is one of its own, or `skyzen-s3`, which re-exports it, when S3 is the only
+/// one — the application then depends on that crate alone. `None` when no backend is on AWS.
+fn aws_sdk_path(manifest: &SkyzenManifest) -> Option<proc_macro2::TokenStream> {
+    let services = manifest
+        .service
+        .iter()
+        .filter_map(|service| native_service_wiring(manifest, &service.name));
+    let mut s3 = false;
+    let mut aws = false;
+    for wiring in services {
+        match wiring {
+            NativeServiceSection::S3(_) => s3 = true,
+            NativeServiceSection::DynamoDb(_) | NativeServiceSection::Sqs(_) => aws = true,
+            _ => {}
+        }
+    }
+    aws |= manifest.database.iter().any(|database| {
+        matches!(
+            (
+                database.database_type,
+                native_database_wiring(manifest, &database.name)
+            ),
+            (DatabaseType::Sql, Some(NativeDatabaseSection::RdsData(_)))
+        )
+    });
+    if aws {
+        Some(quote! { ::skyzen_aws::sdk })
+    } else if s3 {
+        Some(quote! { ::skyzen_s3 })
+    } else {
+        None
+    }
+}
+
+/// The native setup's one AWS configuration, loaded once, before any backend is built, when the
+/// manifest wires one on AWS.
+///
+/// Its credentials provider and cache are shared by every client built from it, on every thread,
+/// so the process fetches credentials once. Setup runs on the coordinating thread, and the
+/// configuration is loaded on that thread's pools where the platform pools per thread: a refresh a
+/// serving thread's call starts goes out on the coordinating thread's connections, never on
+/// zenwave's shared driver thread. Under Lambda it keeps that driver thread.
+fn aws_config_tokens(manifest: &SkyzenManifest) -> proc_macro2::TokenStream {
+    let Some(sdk) = aws_sdk_path(manifest) else {
+        return quote! {};
+    };
+    let config = aws_config_ident();
+    quote! {
+        let #config = match __skyzen_pools.driver() {
+            ::std::option::Option::Some(io) => {
+                #sdk::load_config(#sdk::ZenwaveHttpClient::system_on_current_thread(io)).await
+            }
+            ::std::option::Option::None => {
+                #sdk::load_config(#sdk::ZenwaveHttpClient::system()).await
+            }
+        };
     }
 }
 
@@ -4164,7 +4481,7 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        DatabaseEntry, DatabaseType, HashMap, ServiceType, SkyzenManifest,
+        DatabaseEntry, DatabaseType, HashMap, ServiceType, SkyzenManifest, aws_config_tokens,
         database_ident_from_name, default_database_index, documented_extractor_payload,
         documented_response_payload, first_generic_type, generate_cloudflare_database_init,
         generate_native_database_init, generate_native_service_init, single_generic_type,
@@ -4257,7 +4574,7 @@ type = "sql"
             (
                 "kv",
                 "backend = \"dynamodb\"\ntable = \"skyzen-sessions\"",
-                "skyzen_aws :: DynamoKv :: from_env",
+                "skyzen_aws :: DynamoKv :: from_config (& __skyzen_aws_config",
             ),
             (
                 "kv",
@@ -4267,7 +4584,7 @@ type = "sql"
             (
                 "storage",
                 "backend = \"s3\"\nbucket_env = \"UPLOADS_BUCKET\"",
-                "skyzen_s3 :: S3Storage :: from_env",
+                "skyzen_s3 :: S3Storage :: from_config (& __skyzen_aws_config",
             ),
             (
                 "storage",
@@ -4277,7 +4594,7 @@ type = "sql"
             (
                 "queue",
                 "backend = \"sqs\"\nurl_env = \"JOBS_QUEUE_URL\"",
-                "skyzen_aws :: SqsQueue :: from_env",
+                "skyzen_aws :: SqsQueue :: from_config (& __skyzen_aws_config",
             ),
             (
                 "queue",
@@ -4367,18 +4684,20 @@ type = "sql"
     fn the_async_constructors_are_awaited_and_the_synchronous_ones_are_not() {
         // Getting this wrong is a type error in the generated code rather than a wrong result, but
         // the error lands in a user's crate — so it is asserted here, where it is cheap.
+        let cosmos = service_init(
+            "kv",
+            "backend = \"cosmos\"\ndatabase = \"appdb\"\ncontainer = \"sessions\"",
+        );
+        assert!(cosmos.contains(". await"), "{cosmos}");
+
+        // The AWS backends are built from the configuration setup has already loaded.
         for (kind, wiring) in [
             ("kv", "backend = \"dynamodb\"\ntable = \"sessions\""),
             (
-                "kv",
-                "backend = \"cosmos\"\ndatabase = \"appdb\"\ncontainer = \"sessions\"",
+                "storage",
+                "backend = \"s3\"\nbucket_env = \"UPLOADS_BUCKET\"",
             ),
-        ] {
-            let generated = service_init(kind, wiring);
-            assert!(generated.contains(". await"), "{wiring}: {generated}");
-        }
-
-        for (kind, wiring) in [
+            ("queue", "backend = \"sqs\"\nurl_env = \"JOBS_QUEUE_URL\""),
             ("storage", "backend = \"blob\"\ncontainer = \"uploads\""),
             ("queue", "backend = \"servicebus\"\nqueue = \"jobs\""),
             (
@@ -4391,18 +4710,86 @@ type = "sql"
         }
     }
 
+    /// Every AWS backend is built from one configuration, loaded once on the pools the platform
+    /// picks, so the process has one credentials provider and one cache, fetched on the
+    /// coordinating thread's connections where threads pool their own.
+    #[test]
+    fn the_aws_backends_share_one_configuration_loaded_on_the_platforms_pools() {
+        let both = manifest(
+            "[[service]]\nname = \"sessions\"\ntype = \"kv\"\n\n\
+             [[service]]\nname = \"uploads\"\ntype = \"storage\"\n\n\
+             [native.service.sessions]\nbackend = \"dynamodb\"\ntable = \"sessions\"\n\n\
+             [native.service.uploads]\nbackend = \"s3\"\nbucket_env = \"UPLOADS_BUCKET\"\n",
+        );
+        let generated = aws_config_tokens(&both).to_string();
+        assert_eq!(
+            generated
+                .matches("skyzen_aws :: sdk :: load_config")
+                .count(),
+            2,
+            "one load, written once per arm of the pools match: {generated}"
+        );
+        assert!(
+            generated.contains("__skyzen_pools . driver ()"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains(
+                "Some (io) => { :: skyzen_aws :: sdk :: load_config (:: skyzen_aws :: sdk :: \
+                 ZenwaveHttpClient :: system_on_current_thread (io))"
+            ),
+            "{generated}"
+        );
+        assert!(
+            generated.contains(
+                "None => { :: skyzen_aws :: sdk :: load_config (:: skyzen_aws :: sdk :: \
+                 ZenwaveHttpClient :: system ())"
+            ),
+            "{generated}"
+        );
+
+        // An application whose only AWS backend is S3 may depend on `skyzen-s3` alone.
+        let s3_only = manifest(
+            "[[service]]\nname = \"uploads\"\ntype = \"storage\"\n\n\
+             [native.service.uploads]\nbackend = \"s3\"\nbucket_env = \"UPLOADS_BUCKET\"\n",
+        );
+        let generated = aws_config_tokens(&s3_only).to_string();
+        assert!(
+            generated.contains(":: skyzen_s3 :: load_config"),
+            "{generated}"
+        );
+        assert!(!generated.contains(":: skyzen_aws"), "{generated}");
+
+        let rds = manifest(
+            "[[database]]\nname = \"main\"\ntype = \"sql\"\n\n\
+             [native.database.main]\nbackend = \"rds-data\"\n",
+        );
+        assert!(
+            aws_config_tokens(&rds)
+                .to_string()
+                .contains("skyzen_aws :: sdk :: load_config")
+        );
+
+        let none = manifest(
+            "[[service]]\nname = \"cache\"\ntype = \"kv\"\n\n\
+             [native.service.cache]\nbackend = \"redis\"\nurl_env = \"CACHE_URL\"\n",
+        );
+        assert!(aws_config_tokens(&none).is_empty());
+    }
+
     #[test]
     fn the_rds_data_api_is_built_from_its_own_environment_and_wrapped_in_a_db() {
         let generated = database_init("backend = \"rds-data\"");
         assert!(
-            generated.contains("skyzen_aws :: RdsDataDb :: from_env ()"),
+            generated
+                .contains("skyzen_aws :: RdsDataDb :: from_config_and_env (& __skyzen_aws_config)"),
             "{generated}"
         );
         assert!(
             generated.contains("skyzen :: __services :: Db :: new"),
             "{generated}"
         );
-        assert!(generated.contains(". await"), "{generated}");
+        assert!(!generated.contains(". await"), "{generated}");
         // It reads its four variables itself, so the expansion reads none.
         assert!(!generated.contains("env :: var"), "{generated}");
     }
@@ -4417,7 +4804,7 @@ type = "sql"
         );
 
         assert!(
-            generated.contains("skyzen_aws :: RdsDataDb :: from_parts"),
+            generated.contains("skyzen_aws :: RdsDataDb :: from_config (& __skyzen_aws_config"),
             "{generated}"
         );
         assert!(
@@ -4429,7 +4816,7 @@ type = "sql"
             generated.contains("skyzen :: __services :: Db :: new"),
             "{generated}"
         );
-        assert!(generated.contains(". await"), "{generated}");
+        assert!(!generated.contains(". await"), "{generated}");
         // The values are in the manifest, so neither constructor reads a variable.
         assert!(!generated.contains("from_env"), "{generated}");
         assert!(!generated.contains("env :: var"), "{generated}");
@@ -4770,19 +5157,20 @@ binding = "DB"
 
         let wiring =
             portable_wiring(&document("[[secret]]\nname = \"STRIPE_KEY\"\n")).expect("wiring");
-        assert_eq!(wiring.steps.len(), 1);
+        assert_eq!(wiring.injections.len(), 1);
 
-        let step = wiring.steps[0].to_string();
-        assert!(step.contains(":: skyzen :: Secret :: new"), "{step}");
-        assert!(step.contains("\"STRIPE_KEY\""), "{step}");
+        let binding = wiring.injections[0].binding.to_string();
+        assert!(binding.contains(":: skyzen :: Secret :: new"), "{binding}");
+        assert!(binding.contains("\"STRIPE_KEY\""), "{binding}");
         assert!(
-            step.contains("portable secret `STRIPE_KEY` missing native env var `STRIPE_KEY`"),
-            "{step}"
+            binding.contains("portable secret `STRIPE_KEY` missing native env var `STRIPE_KEY`"),
+            "{binding}"
         );
-        assert!(step.contains("StripeKey :: new"), "{step}");
+        let layer = wiring.injections[0].layer.to_string();
+        assert!(layer.contains("StripeKey :: new"), "{layer}");
         // `Secret` names a value rather than a capability, so there is no bare wrapper to inject
         // even when the manifest declares exactly one secret.
-        assert_eq!(step.matches("with_middleware").count(), 1, "{step}");
+        assert_eq!(layer.matches("with_middleware").count(), 1, "{layer}");
     }
 
     #[test]
@@ -4899,8 +5287,18 @@ type = "storage"
         let native = quote! { ::skyzen::__services::Kv::new(backend) };
         let cloudflare = quote! { ::skyzen::__services::Kv::new(cf_backend) };
 
-        let unambiguous =
-            named_injection_tokens(&binding, &ident, &native, &cloudflare, true).to_string();
+        let expand = |injection: super::Injection| {
+            let super::Injection { binding, layer, .. } = injection;
+            quote! { #binding #layer }.to_string()
+        };
+
+        let unambiguous = expand(named_injection_tokens(
+            &binding,
+            &ident,
+            &native,
+            &cloudflare,
+            true,
+        ));
         assert!(unambiguous.contains("Cache :: new"));
         // The service is bound once and cloned into each layer, never built twice.
         assert!(unambiguous.contains("let __skyzen_service_cache"));
@@ -4908,8 +5306,13 @@ type = "storage"
         // Both the newtype and the bare wrapper are layered on.
         assert_eq!(unambiguous.matches("with_middleware").count(), 2);
 
-        let ambiguous =
-            named_injection_tokens(&binding, &ident, &native, &cloudflare, false).to_string();
+        let ambiguous = expand(named_injection_tokens(
+            &binding,
+            &ident,
+            &native,
+            &cloudflare,
+            false,
+        ));
         assert!(ambiguous.contains("Cache :: new"));
         assert_eq!(ambiguous.matches("with_middleware").count(), 1);
     }
