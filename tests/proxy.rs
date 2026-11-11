@@ -925,8 +925,8 @@ mod kernel_tls {
                 let accepted = Rc::clone(&accepted);
                 let io = io.clone();
                 compio::runtime::spawn(async move {
-                    let stream = acceptor
-                        .accept(stream, &io)
+                    // Boxed: with kernel TLS state the handshake's future is over 16 KiB.
+                    let stream = Box::pin(acceptor.accept(stream, &io))
                         .await
                         .expect("the server handshake");
                     accepted.borrow_mut().push(stream.negotiated().mode());
