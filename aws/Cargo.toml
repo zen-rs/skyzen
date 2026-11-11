@@ -24,7 +24,7 @@ zenwave = { version = "0.12.0", default-features = false, features = ["native-co
 # A client pooled on its own thread (`ZenwaveHttpClient::on_current_thread`) keeps a task on that
 # thread's compio runtime, which builds a pool for each set of timeouts the SDK asks for; requests
 # reach it over a channel.
-compio = { version = "0.19.2", default-features = false, features = ["runtime"] }
+compio = { workspace = true, features = ["runtime"] }
 async-channel = { version = "2.5", default-features = false, features = ["std"] }
 http-kit.workspace = true
 async-io.workspace = true
@@ -50,7 +50,7 @@ aws-types = { version = "1.7.0", default-features = false }
 [dev-dependencies]
 # The tests run on a compio runtime, the one the native server runs, against a loopback server;
 # tokio is here only to assert that no tokio runtime is running.
-compio = { version = "0.19.2", default-features = false, features = ["runtime", "macros"] }
+compio = { workspace = true, features = ["runtime", "macros"] }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 skyzen-test = { workspace = true, features = ["loopback"] }
 base64 = "0.22"

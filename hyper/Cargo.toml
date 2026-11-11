@@ -44,7 +44,7 @@ futures-rustls = "0.26"
 rcgen = "0.14"
 hyper = { version = "1.8", default-features = false, features = ["client", "http1", "http2"] }
 smol-hyper = "0.1"
-http-kit-h3 = { version = "0.6.1", features = ["quiche"] }
+http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", features = ["quiche"] }
 
 [lints]
 workspace = true

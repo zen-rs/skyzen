@@ -21,7 +21,10 @@
 //! options when they are bound.
 //!
 //! The ring is fixed when a thread builds its runtime: compio registers it with the kernel then,
-//! and a provided buffer ring cannot be resized. The other two are shared handles, like
+//! and a provided buffer ring cannot be resized. The ring is registered for incremental
+//! consumption (`IOU_PBUF_RING_INC`): a receive takes only the bytes it needs from a buffer and
+//! the next continues in it, so many small reads share one buffer. Kernels before Linux 6.12
+//! reject that, and compio's fork then registers the ring consuming whole buffers. The other two are shared handles, like
 //! [`StaticCacheSettings`](crate::static_files::StaticCacheSettings): every serving thread's
 //! driver holds a clone of the same two, and a handler that extracts [`IoSettings`] changes them
 //! for every thread at once. A new zero-copy threshold applies to the next write of every
@@ -279,6 +282,11 @@ impl IoSettings {
         proactor
             .buffer_pool_size(self.recv_ring.buffers)
             .buffer_pool_buffer_len(self.recv_ring.buffer_len.get());
+        // Incremental consumption: a receive fills only the part of a buffer it needs, so small
+        // reads share one buffer. A kernel before 6.12 rejects the flag and compio's fork
+        // registers the ring whole-buffer instead.
+        #[cfg(target_os = "linux")]
+        proactor.buffer_pool_flag(io_uring::types::IOU_PBUF_RING_INC as u16);
         let runtime = compio::runtime::Runtime::builder()
             .with_proactor(proactor)
             .build()?;

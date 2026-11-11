@@ -16,9 +16,12 @@ skyzen-test = { path = "test", version = "0.4.0" }
 skyzen-redis = { path = "redis", version = "0.4.0" }
 skyzen-s3 = { path = "s3", version = "0.4.0" }
 
-http-kit = "0.8.1"
-http-kit-io = { version = "0.6.1", default-features = false }
-http-kit-h1 = { version = "0.6.1", default-features = false }
+# http-kit is taken from git because its main carries the compio fork's incremental buffer ring;
+# every compio crate in the workspace names the same fork branch, so the lockfile holds one copy.
+compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false }
+http-kit = { git = "https://github.com/zen-rs/http-kit", branch = "main" }
+http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
+http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
 executor-core = { version = "0.7.2", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper", version = "0.3.0" }
 skyzen-h1 = { path = "h1", version = "0.1.0" }
@@ -155,7 +158,7 @@ executor-core = { workspace = true, features = ["smol", "compio"] }
 # One compio runtime per core serves the application over `http-kit-io`'s compio driver; `net`
 # is for the unix-socket transport that driver has no listener for, `time` for the runtime's
 # own timers.
-compio = { version = "0.19.2", default-features = false, features = ["runtime", "net", "time", "io", "fs"] }
+compio = { workspace = true, features = ["runtime", "net", "time", "io", "fs"] }
 http-kit-io = { workspace = true, features = ["compio"] }
 skyzen-h1.workspace = true
 # One `SO_REUSEPORT` listener per serving thread, which `std` cannot configure.
@@ -184,7 +187,7 @@ skyzen-lambda = { workspace = true, optional = true }
 # TLS termination (`server-tls` feature): rustls driven straight over the owned-buffer streams by
 # `http-kit-tls`. The `aws_lc_rs` provider matches the AWS SDK's TLS stack, so the workspace
 # resolves one crypto backend; the certificate/key pair is loaded with rustls's own PEM support.
-http-kit-tls = { version = "0.4.1", default-features = false, optional = true }
+http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
 # The reverse proxy's upstream client (`proxy`): zenwave's native backend, HTTP/1.1 on
 # `http-kit-h1` over the same `http-kit-io` sockets the server runs on, with a connection pool on
@@ -196,7 +199,7 @@ zenwave = { version = "0.12.0", default-features = false, features = ["native-co
 # source, so only a build that asks for HTTP/3 pays for it; `fs` lets a file-region body (static
 # files) go out over a QUIC stream. A QUIC writer offers no pipe, so a proxied body reaches it as
 # data frames and `pipe` is not needed.
-http-kit-h3 = { version = "0.6.1", default-features = false, features = ["quiche", "fs"], optional = true }
+http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, features = ["quiche", "fs"], optional = true }
 
 # Kernel TLS on Linux: after the handshake the kernel seals and opens the records, so file-region
 # bodies go out through sendfile/splice, and the proxy splices bodies and tunnels between the
@@ -206,8 +209,10 @@ http-kit-h3 = { version = "0.6.1", default-features = false, features = ["quiche
 # busy-poll socket options; whether to steer is `skyzen-core`'s `steering`, and the busy-poll ring
 # registration its `busy-poll`, both of which `skyzen doctor` reads too.
 libc = "0.2"
+# `IOU_PBUF_RING_INC`, the flag the serving threads' receive ring registers with.
+io-uring = { version = "0.7.16", default-features = false }
 skyzen-core = { workspace = true, features = ["steering", "busy-poll"] }
-http-kit-tls = { version = "0.4.1", default-features = false, features = ["kernel"], optional = true }
+http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, features = ["kernel"], optional = true }
 zenwave = { version = "0.12.0", default-features = false, features = ["native-compio", "native-kernel-tls"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
@@ -413,3 +418,20 @@ required-features = ["hyper"]
 
 [lints]
 workspace = true
+
+# zenwave and executor-core name compio and http-kit from crates.io. Redirecting them to the
+# sources the workspace itself names keeps one copy of each in the lockfile, so the types zenwave
+# hands over are the types the serving threads' runtimes use.
+[patch.crates-io]
+compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
+compio-buf = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
+compio-driver = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
+compio-executor = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
+compio-io = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
+compio-log = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
+compio-net = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
+compio-runtime = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
+http-kit = { git = "https://github.com/zen-rs/http-kit", branch = "main" }
+http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main" }
+http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main" }
+http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main" }
