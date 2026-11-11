@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/skyzen/compare/test/v0.3.2...test/v0.4.0) - 2026-11-11
+
+### Added
+
+- *(test)* record the thread each connection is dialed on
+- *(test)* add LoopbackServer for end-to-end backend tests
+- [**breaking**] bound on SendEndpoint where an endpoint's future crosses threads
+- *(middleware)* RateLimit — fixed-window counter over portable KV ([#169](https://github.com/zen-rs/skyzen/pull/169))
+- *(middleware)* RequestId, Trace and MatchedPath ([#162](https://github.com/zen-rs/skyzen/pull/162))
+
+### Fixed
+
+- *(services)* [**breaking**] run sqlx on its runtime-neutral smol runtime
+
 ## [0.3.2](https://github.com/zen-rs/skyzen/compare/skyzen-test-v0.3.1...skyzen-test-v0.3.2) - 2026-11-05
 
 ### Fixed

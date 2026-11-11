@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/skyzen/compare/services/v0.3.1...services/v0.4.0) - 2026-11-11
+
+### Added
+
+- [**breaking**] Server over http-kit-io listeners with per-thread !Send routers
+- [**breaking**] bound on SendEndpoint where an endpoint's future crosses threads
+- *(middleware)* RateLimit — fixed-window counter over portable KV ([#169](https://github.com/zen-rs/skyzen/pull/169))
+- *(middleware)* sessions on KV, the cookie itself, or process memory ([#170](https://github.com/zen-rs/skyzen/pull/170))
+
+### Fixed
+
+- *(services)* [**breaking**] run sqlx on its runtime-neutral smol runtime
+- satisfy current clippy across the workspace
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into chore/http-kit-31-body-frames
+
 ## [0.3.1](https://github.com/zen-rs/skyzen/compare/skyzen-services-v0.3.0...skyzen-services-v0.3.1) - 2026-11-05
 
 ### Added

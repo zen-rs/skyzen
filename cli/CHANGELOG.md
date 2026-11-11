@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/skyzen/compare/cli/v0.5.2...cli/v0.6.0) - 2026-11-11
+
+### Added
+
+- *(cli)* precompress static files in skyzen build
+
+### Fixed
+
+- *(azure)* take an error status from zenwave 0.10 as the response it is
+- *(aws)* [**breaking**] do the AWS SDK's I/O on zenwave's native backend
+- *(services)* [**breaking**] run sqlx on its runtime-neutral smol runtime
+
+### Other
+
+- move zenwave to 0.10.1
+- *(cli)* build the expected precompress path with the platform separator
+- depend on http-kit 0.5 and zenwave 0.9
+- *(azure)* dogfood zenwave for outbound HTTP ([#159](https://github.com/zen-rs/skyzen/pull/159))
+
 ## [0.5.2](https://github.com/zen-rs/skyzen/compare/skyzen-cli-v0.5.1...skyzen-cli-v0.5.2) - 2026-11-05
 
 ### Fixed

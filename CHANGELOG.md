@@ -7,6 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/skyzen/compare/v0.5.2...v0.6.0) - 2026-11-11
+
+### Added
+
+- *(azure)* pool a client's connections on the thread that uses it
+- *(aws)* pool an SDK client's connections on the thread that uses it
+- *(test)* record the thread each connection is dialed on
+- *(proxy)* tunnel protocol upgrades to the upstream
+- *(aws)* restore the credential_process credentials source without tokio
+- *(test)* add LoopbackServer for end-to-end backend tests
+- *(proxy)* reverse-proxy endpoint
+- *(routing)* mount any endpoint under a prefix
+- *(runtime)* serve HTTP/3 on quiche beside the TLS listener
+- *(h1)* advertise an alternative service on every response
+- *(cli)* precompress static files in skyzen build
+- *(static-files)* cached file regions, precompressed variants
+- *(runtime)* terminate TLS with http-kit-tls over owned-buffer streams
+- *(runtime)* [**breaking**] serve unix sockets through http-kit-io, hyper included
+- [**breaking**] #[skyzen::main] serves one compio runtime per core over skyzen-h1
+- *(h1)* serve any acceptor, with an optional connection limit
+- *(hyper)* [**breaking**] serve h1, h2 and upgrades on every http-kit-io driver, compio included
+- [**breaking**] Server over http-kit-io listeners with per-thread !Send routers
+- [**breaking**] bound on SendEndpoint where an endpoint's future crosses threads
+- [**breaking**] adapt to http-kit's frame-based Body
+- *(middleware)* RateLimit — fixed-window counter over portable KV ([#169](https://github.com/zen-rs/skyzen/pull/169))
+- *(middleware)* sessions on KV, the cookie itself, or process memory ([#170](https://github.com/zen-rs/skyzen/pull/170))
+- *(middleware)* SecurityHeaders — the standard hardening headers ([#167](https://github.com/zen-rs/skyzen/pull/167))
+- *(web)* conditional requests — Conditional<R>, Preconditions, AutoETag ([#166](https://github.com/zen-rs/skyzen/pull/166))
+- *(extract)* Valid<E> — garde validation on decoded payloads ([#165](https://github.com/zen-rs/skyzen/pull/165))
+- *(middleware)* RequestId, Trace and MatchedPath ([#162](https://github.com/zen-rs/skyzen/pull/162))
+- *(middleware)* Csrf — origin checks for cookie-authenticated writes ([#168](https://github.com/zen-rs/skyzen/pull/168))
+- *(cookies)* signed and private jars behind CookieKeys ([#163](https://github.com/zen-rs/skyzen/pull/163))
+- *(runtime)* terminate TLS in the native server ([#144](https://github.com/zen-rs/skyzen/pull/144))
+- request body decompression middleware
+
+### Fixed
+
+- *(aws)* [**breaking**] fetch credentials on the coordinating thread's pools
+- *(runtime)* [**breaking**] build HTTP service clients on each serving thread
+- *(aws)* report a transport that cannot be built as a connector error
+- *(aws)* hand the SDK's connect and read timeouts to zenwave
+- *(aws)* honor the SDK's connect and read timeouts on the zenwave client
+- *(azure)* take an error status from zenwave 0.10 as the response it is
+- *(runtime)* lint clean with default features
+- *(runtime)* refuse http3 beside OpenSSL-backed native-tls and box a large test join
+- *(azure)* [**breaking**] run blob, Service Bus, Storage queue and SQL without a tokio runtime
+- *(s3)* do the S3 client's I/O on zenwave's native backend
+- *(aws)* [**breaking**] do the AWS SDK's I/O on zenwave's native backend
+- *(redis)* [**breaking**] run the connection on redis's smol runtime
+- *(services)* [**breaking**] run sqlx on its runtime-neutral smol runtime
+- *(runtime)* treat a request without its QUIC connection info as a broken contract
+- *(runtime)* serve accepted TCP connections with TCP_NODELAY
+- *(static-files)* read files with std on Windows; gate Identity on static-files
+- *(runtime)* stop shortening the TLS handshake deadline in tests
+- *(runtime)* compile the per-thread TCP listener out on Windows
+- *(runtime)* deal connections from one acceptor on Windows
+- *(runtime)* one IOCP port for every serving thread on Windows
+- *(runtime)* Socket::tcp lints clean where only TCP exists
+- *(test)* build the native example in the test; match Socket without an irrefutable pattern
+- *(release)* tag member crates <dir>/v<version>
+- pass wasm32 clippy and run it in CI
+- satisfy current clippy across the workspace
+- *(extract)* [**breaking**] trust proxy headers only from configured proxies ([#160](https://github.com/zen-rs/skyzen/pull/160))
+- *(redis)* make rediss:// actually negotiate TLS ([#145](https://github.com/zen-rs/skyzen/pull/145))
+
+### Other
+
+- move zenwave to 0.10.1
+- Merge remote-tracking branch 'origin/dev' into fix/185-runtime-neutral-services
+- *(proxy)* read the Upgrade fields in one place
+- *(proxy)* stream an HTTP/3 request through the proxy to an HTTP/1.1 origin
+- *(redis)* make the compio handshake test assert what it claims
+- *(proxy)* move to zenwave 0.10
+- Merge remote-tracking branch 'origin/dev' into feat/184-reverse-proxy
+- Merge remote-tracking branch 'origin/dev' into fix/185-runtime-neutral-services
+- *(redis)* make the rediss handshake test deterministic
+- give cargo-hack the feature selection per package
+- keep the feature checks off the http3 and OpenSSL pair
+- *(routing)* make the mount wrapper's constructor const
+- *(agents)* record the reverse proxy's invariants
+- Merge remote-tracking branch 'origin/dev' into feat/181-h3-server
+- *(static-files)* share the cached file with each region through an Arc
+- *(deps)* bump http-kit to 0.6, http-kit-io 0.4, http-kit-h1 0.3, http-kit-h3 0.3 and http-kit-tls 0.2
+- *(cli)* build the expected precompress path with the platform separator
+- static file cache and [static_files] precompress
+- *(middleware)* read Accept-Encoding through one shared parser
+- *(runtime)* box the TLS test joins that kernel TLS state makes large
+- load the kernel TLS module before the Linux tests
+- Merge pull request #201 from zen-rs/ci/198-cache-budget
+- drop the duplicate clippy run and coverage debuginfo from the cache budget
+- Merge pull request #197 from zen-rs/feat/179-thread-per-core
+- *(hyper)* test against http-kit-h3 0.2
+- give every compiling job its own cache key and keep caches under the repo budget
+- Merge origin/dev into feat/179-thread-per-core
+- Merge pull request #196 from zen-rs/feat/180-hyper-server
+- Merge remote-tracking branch 'origin/dev' into feat/178-server-trait
+- *(release)* tag skyzen-h1 as h1/v<version>
+- per-thread routers, the upgrade handover and the new Server call
+- Merge remote-tracking branch 'origin/dev' into chore/http-kit-31-body-frames
+- run cargo audit directly instead of the audit-check reporter
+- depend on http-kit 0.5 and zenwave 0.9
+- *(azure)* dogfood zenwave for outbound HTTP ([#159](https://github.com/zen-rs/skyzen/pull/159))
+
 ## [0.5.2](https://github.com/zen-rs/skyzen/compare/v0.5.1...v0.5.2) - 2026-11-05
 
 ### Fixed

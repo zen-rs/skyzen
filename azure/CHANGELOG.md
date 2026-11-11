@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/zen-rs/skyzen/compare/azure/v0.4.1...azure/v0.5.0) - 2026-11-11
+
+### Added
+
+- *(azure)* pool a client's connections on the thread that uses it
+- [**breaking**] adapt to http-kit's frame-based Body
+- *(middleware)* RateLimit — fixed-window counter over portable KV ([#169](https://github.com/zen-rs/skyzen/pull/169))
+
+### Fixed
+
+- *(azure)* take an error status from zenwave 0.10 as the response it is
+- *(azure)* [**breaking**] run blob, Service Bus, Storage queue and SQL without a tokio runtime
+
+### Other
+
+- move zenwave to 0.10.1
+- depend on http-kit 0.5 and zenwave 0.9
+- *(azure)* dogfood zenwave for outbound HTTP ([#159](https://github.com/zen-rs/skyzen/pull/159))
+
 ## [0.4.1](https://github.com/zen-rs/skyzen/compare/skyzen-azure-v0.4.0...skyzen-azure-v0.4.1) - 2026-11-05
 
 ### Other

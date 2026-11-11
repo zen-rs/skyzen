@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/skyzen/compare/hyper/v0.2.1...hyper/v0.3.0) - 2026-11-11
+
+### Added
+
+- *(h1)* advertise an alternative service on every response
+- *(runtime)* terminate TLS with http-kit-tls over owned-buffer streams
+- *(runtime)* [**breaking**] serve unix sockets through http-kit-io, hyper included
+- *(hyper)* [**breaking**] serve h1, h2 and upgrades on every http-kit-io driver, compio included
+- [**breaking**] Server over http-kit-io listeners with per-thread !Send routers
+- [**breaking**] bound on SendEndpoint where an endpoint's future crosses threads
+- [**breaking**] adapt to http-kit's frame-based Body
+- *(middleware)* RequestId, Trace and MatchedPath ([#162](https://github.com/zen-rs/skyzen/pull/162))
+- *(runtime)* terminate TLS in the native server ([#144](https://github.com/zen-rs/skyzen/pull/144))
+
+### Other
+
+- *(deps)* bump http-kit to 0.6, http-kit-io 0.4, http-kit-h1 0.3, http-kit-h3 0.3 and http-kit-tls 0.2
+- *(hyper)* test against http-kit-h3 0.2
+- per-thread routers, the upgrade handover and the new Server call
+
 ## [0.2.1](https://github.com/zen-rs/skyzen/compare/hyper-v0.2.0...hyper-v0.2.1) - 2026-09-05
 
 ### Other

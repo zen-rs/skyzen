@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/skyzen/compare/s3/v0.3.1...s3/v0.4.0) - 2026-11-11
+
+### Added
+
+- *(aws)* pool an SDK client's connections on the thread that uses it
+
+### Fixed
+
+- *(aws)* [**breaking**] fetch credentials on the coordinating thread's pools
+- *(s3)* do the S3 client's I/O on zenwave's native backend
+
 ## [0.3.1](https://github.com/zen-rs/skyzen/compare/skyzen-s3-v0.3.0...skyzen-s3-v0.3.1) - 2026-11-05
 
 ### Other
