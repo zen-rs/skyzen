@@ -237,7 +237,7 @@ impl Proxy {
     /// thread with.
     ///
     /// Its pool is built on the first request, with the driver of the serving thread that request
-    /// names in its [`IoSettings`](crate::runtime::native::IoSettings), so upstream sockets follow
+    /// names in its `skyzen::runtime::native::IoSettings`, so upstream sockets follow
     /// the operator's zero-copy threshold and file table; a request without them (an embedding
     /// host, a test client) comes from no runtime with operator settings, and gets a default
     /// driver.
