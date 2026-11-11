@@ -161,7 +161,7 @@ impl std::error::Error for ListenAddrError {
 }
 
 /// The prefix a filesystem unix socket path carries in `--listen`/`SKYZEN_ADDRESS`.
-const UNIX_SCHEME: &str = "unix:";
+const UNIX_SCHEME: &str = skyzen_core::UNIX_ADDRESS_PREFIX;
 
 impl std::str::FromStr for ListenAddr {
     type Err = ListenAddrError;
@@ -1422,7 +1422,7 @@ where
 }
 
 fn server_addr() -> ListenAddr {
-    std::env::var("SKYZEN_ADDRESS").map_or_else(
+    std::env::var(skyzen_core::ADDRESS_ENV).map_or_else(
         |_| ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
         |addr| {
             // Use the provided address by default

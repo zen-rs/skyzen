@@ -77,6 +77,25 @@ pub mod steering;
 /// and a flag skyzen reserved could collide with one the application already defines.
 pub const OPENAPI_DUMP_ENV: &str = "SKYZEN_OPENAPI_DUMP";
 
+/// The native server's listen address.
+///
+/// A TCP `host:port`, or [`UNIX_ADDRESS_PREFIX`] and a socket path. Read by the runtime and
+/// written by the systemd unit `skyzen deploy --provider native` installs, so neither spells it
+/// independently.
+pub const ADDRESS_ENV: &str = "SKYZEN_ADDRESS";
+
+/// What marks an [`ADDRESS_ENV`] value as a filesystem unix socket path.
+pub const UNIX_ADDRESS_PREFIX: &str = "unix:";
+
+/// How long the native server busy-polls before it sleeps, in microseconds.
+pub const BUSY_POLL_ENV: &str = "SKYZEN_BUSY_POLL";
+
+/// Whether the native server's busy polling sets `prefer_busy_poll` (`true` or `false`).
+pub const BUSY_POLL_PREFER_ENV: &str = "SKYZEN_BUSY_POLL_PREFER";
+
+/// How many packets one busy poll of a socket processes.
+pub const BUSY_POLL_BUDGET_ENV: &str = "SKYZEN_BUSY_POLL_BUDGET";
+
 pub use http_kit::{
     endpoint, header, method, uri, version, Body, BodyError, Endpoint, Extensions, Method, Request,
     Response, SendEndpoint, StatusCode, Uri, Version,
