@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/zen-rs/skyzen/compare/macros/v0.6.0...macros/v0.6.1) - 2026-11-11
+
+### Added
+
+- *(runtime)* steer each connection to the thread on the CPU that received it
+
 ## [0.6.0](https://github.com/zen-rs/skyzen/compare/macros/v0.5.2...macros/v0.6.0) - 2026-11-11
 
 ### Added

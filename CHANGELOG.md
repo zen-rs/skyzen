@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/zen-rs/skyzen/compare/v0.6.0...v0.6.1) - 2026-11-11
+
+### Added
+
+- *(runtime)* steer each connection to the thread on the CPU that received it
+
+### Fixed
+
+- make connection steering pass clippy on Linux
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/227-steering
+- build the skyzen CLI before uploading it
+- Merge remote-tracking branch 'origin/main' into ci/219-cli-artifacts
+- Merge remote-tracking branch 'origin/main' into ci/222-cargo-dist-0.34
+- Merge remote-tracking branch 'origin/main' into ci/219-cli-artifacts
+- build binaries with cargo-dist 0.34
+- release from main and retire dev
+- upload the skyzen CLI each native test job builds
+
 ## [0.6.0](https://github.com/zen-rs/skyzen/compare/v0.5.2...v0.6.0) - 2026-11-11
 
 ### Added
