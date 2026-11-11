@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use tracing_log::log::LevelFilter as LogLevelFilter;
 use tracing_subscriber::EnvFilter;
 
+mod busy_poll;
 mod cores;
 mod handoff;
 mod http3;
@@ -29,6 +30,8 @@ mod io_settings;
 pub mod steering;
 mod tls;
 
+use busy_poll::BusyPollError;
+pub use busy_poll::{BusyPoll, BusyPollTimeout};
 pub use io_settings::{
     apply_io_overrides, IoOptions, IoSettings, IoSettingsNotConfigured, RecvRing,
 };
@@ -545,6 +548,8 @@ enum RuntimeFailure {
     Http3(Http3Error),
     /// Connection steering was forced on and cannot be had, or a thread cannot be pinned.
     Steering(SteeringError),
+    /// Busy polling was turned on and cannot be had.
+    BusyPoll(BusyPollError),
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -565,6 +570,7 @@ impl std::fmt::Display for RuntimeFailure {
             Self::Tls(error) => write!(f, "{error}"),
             Self::Http3(error) => write!(f, "{error}"),
             Self::Steering(error) => write!(f, "{error}"),
+            Self::BusyPoll(error) => write!(f, "{error}"),
         }
     }
 }
@@ -577,6 +583,7 @@ impl std::error::Error for RuntimeFailure {
             Self::Tls(error) => Some(error),
             Self::Http3(error) => Some(error),
             Self::Steering(error) => Some(error),
+            Self::BusyPoll(error) => Some(error),
             Self::QueueConsumer(_) | Self::ThreadExited => None,
         }
     }
@@ -883,27 +890,11 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
         }
     };
 
-    // TLS is only meaningful on the path that owns a socket: both serverless hosts
-    // terminate it upstream, so a configured pair there can only be a leftover that
-    // would silently go dead. Refuse rather than start under flags that promise TLS.
-    if options.tls.is_some() && !matches!(platform, Platform::Server) {
-        error!(
-            "Skyzen cannot start: TLS is configured (--tls-cert/--tls-key or \
-             SKYZEN_TLS_CERT/SKYZEN_TLS_KEY), but this platform terminates TLS \
-             upstream; unset them or run where they apply"
-        );
-        std::process::exit(1);
-    }
-
-    // The same holds for HTTP/3: a serverless host owns the UDP side, if it has one.
-    if options.http3 && !matches!(platform, Platform::Server) {
-        error!("Skyzen cannot start: {}", http3::not_a_server());
-        std::process::exit(1);
-    }
-
-    if options.steering == Steering::On && !matches!(platform, Platform::Server) {
-        error!("Skyzen cannot start: {}", SteeringError::NotServer);
-        std::process::exit(1);
+    if platform != Platform::Server {
+        if let Some(refusal) = socket_settings_refusal(&options) {
+            error!("Skyzen cannot start: {refusal}");
+            std::process::exit(1);
+        }
     }
 
     if platform == Platform::Lambda {
@@ -997,6 +988,31 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
     if failed {
         std::process::exit(1);
     }
+}
+
+/// Why `options` cannot start on a serverless host, which owns the sockets: a setting that only
+/// the path binding its own sockets applies would silently go dead there, so it is refused.
+fn socket_settings_refusal(options: &LaunchOptions) -> Option<String> {
+    // Both serverless hosts terminate TLS upstream, so a configured pair there can only be a
+    // leftover.
+    if options.tls.is_some() {
+        return Some(
+            "TLS is configured (--tls-cert/--tls-key or SKYZEN_TLS_CERT/SKYZEN_TLS_KEY), but \
+             this platform terminates TLS upstream; unset them or run where they apply"
+                .to_owned(),
+        );
+    }
+    // The same holds for HTTP/3: a serverless host owns the UDP side, if it has one.
+    if options.http3 {
+        return Some(http3::not_a_server().to_string());
+    }
+    if options.steering == Steering::On {
+        return Some(SteeringError::NotServer.to_string());
+    }
+    if options.io.busy_poll.is_some() {
+        return Some(BusyPollError::NotServer.to_string());
+    }
+    None
 }
 
 /// Wait for every holder of the drain channel's sender to finish, or for the grace period to
@@ -1112,7 +1128,8 @@ where
     let threads = std::thread::available_parallelism()?;
     let pins =
         steering::decide(steering, threads.get(), &addr).map_err(RuntimeFailure::Steering)?;
-    let mut bound = cores::bind(&addr, threads, pins)?;
+    busy_poll::check(io.busy_poll.as_ref(), &addr).map_err(RuntimeFailure::BusyPoll)?;
+    let mut bound = cores::bind(&addr, threads, pins, io.busy_poll.as_ref())?;
     // QUIC takes the port TLS has on TCP, so a client that follows `Alt-Svc` stays on the host
     // and port it came to. Bound here, with the TCP sockets, so a port that cannot be had fails
     // the start before any thread exists.
@@ -1122,7 +1139,7 @@ where
     ) {
         (Some(http3), Some(local)) => {
             let local = local?;
-            bound.udp = http3.bind(local, threads)?;
+            bound.udp = http3.bind(local, threads, io.busy_poll.as_ref())?;
             Some(local.port())
         }
         _ => None,
@@ -1150,7 +1167,7 @@ where
         wrap,
         executor: Arc::new(AnyExecutor::new(SmolGlobal)),
         max_connections,
-        io: IoSettings::new(driver, io.recv_ring(max_connections)),
+        io: IoSettings::new(driver, io.recv_ring(max_connections), io.busy_poll),
         server,
         tls,
         http3: http3.zip(http3_port).map(|(http3, port)| cores::Http3Plan {

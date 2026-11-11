@@ -1,6 +1,6 @@
 //! The operator's settings for the serving threads' I/O: the provided buffer ring each thread's
-//! compio runtime receives into, the size from which a write is sent zero-copy, and the size of
-//! each ring's registered file table.
+//! compio runtime receives into, the size from which a write is sent zero-copy, the size of
+//! each ring's registered file table, and busy polling.
 //!
 //! Each is set like every other startup setting of the native runtime, by a flag that beats an
 //! environment variable (`--steering`/`SKYZEN_STEERING`):
@@ -11,6 +11,14 @@
 //! | `--recv-buffer-len <bytes>` | `SKYZEN_RECV_BUFFER_LEN` | compio's, 8 KiB |
 //! | `--zero-copy-threshold <bytes>` | `SKYZEN_ZERO_COPY_THRESHOLD` | [`ZeroCopySend::DEFAULT_THRESHOLD`] |
 //! | `--file-table-slots <count>` | `SKYZEN_FILE_TABLE_SLOTS` | [`FileTable::DEFAULT_SLOTS`] |
+//! | `--busy-poll <µs>` | `SKYZEN_BUSY_POLL` | off |
+//! | `--busy-poll-prefer <true\|false>` | `SKYZEN_BUSY_POLL_PREFER` | `false` |
+//! | `--busy-poll-budget <packets>` | `SKYZEN_BUSY_POLL_BUDGET` | the kernel's, 8 |
+//!
+//! Busy polling (see [`BusyPoll`]) is on exactly when `--busy-poll` sets its timeout; the other
+//! two refine it, and setting either without it stops startup. It is fixed for the life of the
+//! process: each thread registers its ring when it builds its runtime, and the sockets take their
+//! options when they are bound.
 //!
 //! The ring is fixed when a thread builds its runtime: compio registers it with the kernel then,
 //! and a provided buffer ring cannot be resized. The other two are shared handles, like
@@ -21,7 +29,8 @@
 //! a serving thread does when its first connection arrives, so on a running server only `0` (no
 //! slots for connections created afterwards) still changes anything.
 //!
-//! All of it matters on Linux over `io_uring` only; elsewhere the values are accepted and unused.
+//! All of it matters on Linux over `io_uring` only; elsewhere the values are accepted and unused,
+//! except busy polling, which refuses to start where it cannot be had.
 
 use core::{
     future::{ready, Future},
@@ -35,6 +44,7 @@ use http_kit_io::compio::{Compio, FileTable, ZeroCopySend};
 use skyzen_core::Extractor;
 use tracing::info;
 
+use super::{busy_poll::BusyPoll, RuntimeFailure};
 use crate::StatusCode;
 
 /// The I/O settings the flags and environment asked for, before the runtime starts.
@@ -50,6 +60,8 @@ pub struct IoOptions {
     pub zero_copy_threshold: Option<usize>,
     /// How many sockets each ring's file table holds (`--file-table-slots`).
     pub file_table_slots: Option<u32>,
+    /// Busy polling, when `--busy-poll` turns it on; `None` is off.
+    pub busy_poll: Option<BusyPoll>,
 }
 
 /// compio's own buffer length (`ProactorBuilder`'s `buffer_pool_buffer_len` default), which the
@@ -95,15 +107,30 @@ impl IoOptions {
 ///
 /// # Panics
 ///
-/// A value that does not parse kills the process at startup, like every other malformed setting.
+/// A value that does not parse kills the process at startup, like every other malformed setting,
+/// as does a busy-poll preference or budget without `--busy-poll`.
 #[must_use]
 pub fn apply_io_overrides(args: impl IntoIterator<Item = String>) -> IoOptions {
     let args: Vec<String> = args.into_iter().skip(1).collect();
+    let prefer = setting(&args, "--busy-poll-prefer", "SKYZEN_BUSY_POLL_PREFER");
+    let budget = setting(&args, "--busy-poll-budget", "SKYZEN_BUSY_POLL_BUDGET");
+    let timeout = setting(&args, "--busy-poll", "SKYZEN_BUSY_POLL");
+    assert!(
+        timeout.is_some() || (prefer.is_none() && budget.is_none()),
+        "--busy-poll-prefer and --busy-poll-budget refine busy polling, which is off: set its \
+         timeout with --busy-poll or SKYZEN_BUSY_POLL"
+    );
+    let busy_poll = timeout.map(|timeout| BusyPoll {
+        timeout,
+        prefer: prefer.unwrap_or(false),
+        budget,
+    });
     IoOptions {
         recv_buffers: setting(&args, "--recv-buffers", "SKYZEN_RECV_BUFFERS"),
         recv_buffer_len: setting(&args, "--recv-buffer-len", "SKYZEN_RECV_BUFFER_LEN"),
         zero_copy_threshold: setting(&args, "--zero-copy-threshold", "SKYZEN_ZERO_COPY_THRESHOLD"),
         file_table_slots: setting(&args, "--file-table-slots", "SKYZEN_FILE_TABLE_SLOTS"),
+        busy_poll,
     }
 }
 
@@ -183,6 +210,7 @@ impl RecvRing {
 pub struct IoSettings {
     driver: Compio,
     recv_ring: RecvRing,
+    busy_poll: Option<BusyPoll>,
 }
 
 http_error!(
@@ -194,9 +222,17 @@ http_error!(
 );
 
 impl IoSettings {
-    /// The settings a runtime with `driver` and `recv_ring` serves on.
-    pub(crate) const fn new(driver: Compio, recv_ring: RecvRing) -> Self {
-        Self { driver, recv_ring }
+    /// The settings a runtime with `driver`, `recv_ring` and `busy_poll` serves on.
+    pub(crate) const fn new(
+        driver: Compio,
+        recv_ring: RecvRing,
+        busy_poll: Option<BusyPoll>,
+    ) -> Self {
+        Self {
+            driver,
+            recv_ring,
+            busy_poll,
+        }
     }
 
     /// The threshold from which a write is sent zero-copy, shared by every serving thread.
@@ -217,25 +253,49 @@ impl IoSettings {
         self.recv_ring
     }
 
+    /// Busy polling as every serving thread's ring and socket runs it; `None` is off.
+    #[must_use]
+    pub const fn busy_poll(&self) -> Option<BusyPoll> {
+        self.busy_poll
+    }
+
     /// The driver a serving thread's sockets are created and adopted with, and a proxy's upstream
     /// sockets dialed with.
     pub(crate) fn driver(&self) -> Compio {
         self.driver.clone()
     }
 
-    /// A serving thread's runtime, its buffer ring sized as [`recv_ring`](Self::recv_ring) says.
+    /// A serving thread's runtime, its buffer ring sized as [`recv_ring`](Self::recv_ring) says,
+    /// and its `io_uring` registered to busy-poll when [`busy_poll`](Self::busy_poll) is on.
+    ///
+    /// Called on the thread that runs the runtime, which is the only one its ring takes a
+    /// registration from.
     ///
     /// # Errors
     ///
-    /// The runtime cannot be created.
-    pub(super) fn runtime(&self) -> std::io::Result<executor_core::compio::Runtime> {
+    /// The runtime cannot be created, or busy polling is on and the ring cannot be registered.
+    pub(super) fn runtime(&self) -> Result<executor_core::compio::Runtime, RuntimeFailure> {
         let mut proactor = compio::driver::ProactorBuilder::new();
         proactor
             .buffer_pool_size(self.recv_ring.buffers)
             .buffer_pool_buffer_len(self.recv_ring.buffer_len.get());
-        compio::runtime::Runtime::builder()
+        let runtime = compio::runtime::Runtime::builder()
             .with_proactor(proactor)
-            .build()
+            .build()?;
+        if let Some(busy_poll) = &self.busy_poll {
+            #[cfg(target_os = "linux")]
+            busy_poll
+                .register(&runtime)
+                .map_err(RuntimeFailure::BusyPoll)?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = busy_poll;
+                return Err(RuntimeFailure::BusyPoll(
+                    super::busy_poll::BusyPollError::NotLinux,
+                ));
+            }
+        }
+        Ok(runtime)
     }
 }
 
@@ -263,6 +323,7 @@ mod tests {
     use serial_test::serial;
 
     use super::{apply_io_overrides, IoOptions};
+    use crate::runtime::native::{BusyPoll, BusyPollTimeout};
 
     fn args(list: &[&str]) -> Vec<String> {
         core::iter::once("app")
@@ -300,6 +361,11 @@ mod tests {
             "--zero-copy-threshold",
             "0",
             "--file-table-slots=65536",
+            "--busy-poll",
+            "50",
+            "--busy-poll-prefer=true",
+            "--busy-poll-budget",
+            "64",
         ]));
         assert_eq!(
             options,
@@ -308,6 +374,11 @@ mod tests {
                 recv_buffer_len: NonZeroUsize::new(16_384),
                 zero_copy_threshold: Some(0),
                 file_table_slots: Some(65_536),
+                busy_poll: Some(BusyPoll {
+                    timeout: BusyPollTimeout::from_micros(50).unwrap(),
+                    prefer: true,
+                    budget: NonZeroU16::new(64),
+                }),
             }
         );
         assert_eq!(
@@ -325,7 +396,7 @@ mod tests {
         let options = IoOptions::default();
         let driver = options.driver();
         let ring = options.recv_ring(NonZeroUsize::new(64).unwrap());
-        let settings = super::IoSettings::new(driver.clone(), ring);
+        let settings = super::IoSettings::new(driver.clone(), ring, None);
         settings.zero_copy().set_threshold(usize::MAX);
         settings.file_table().set_slots(0);
         let thread = settings.driver();
@@ -350,8 +421,75 @@ mod tests {
         let settings = super::IoSettings::new(
             options.driver(),
             options.recv_ring(NonZeroUsize::new(1).unwrap()),
+            None,
         );
         let runtime = settings.runtime().expect("a runtime with a sized ring");
         runtime.block_on(async {});
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "refine busy polling, which is off")]
+    fn a_busy_poll_preference_without_busy_polling_stops_the_process() {
+        let _ = apply_io_overrides(args(&["--busy-poll-prefer", "true"]));
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "invalid --busy-poll `0`")]
+    fn a_busy_poll_timeout_of_zero_stops_the_process() {
+        let _ = apply_io_overrides(args(&["--busy-poll", "0"]));
+    }
+
+    /// The ring settings a serving thread's runtime was built with, read back by registering
+    /// polling off, which hands back what the ring had.
+    #[cfg(target_os = "linux")]
+    fn ring_polling(busy_poll: Option<BusyPoll>) -> skyzen_core::busy_poll::NapiPolling {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+
+        let options = IoOptions {
+            busy_poll,
+            ..IoOptions::default()
+        };
+        let settings = super::IoSettings::new(
+            options.driver(),
+            options.recv_ring(NonZeroUsize::new(1).unwrap()),
+            options.busy_poll,
+        );
+        let runtime = settings.runtime().expect("a runtime");
+        // SAFETY: `runtime` outlives the borrow of its ring's descriptor.
+        let ring = unsafe { BorrowedFd::borrow_raw(runtime.as_raw_fd()) };
+        skyzen_core::busy_poll::NapiPolling::default()
+            .register(ring)
+            .expect("the kernel has NAPI registration")
+    }
+
+    /// With busy polling on, a serving thread's ring is registered with its timeout and
+    /// preference, which no capability guards at the ring.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_busy_polling_runtime_registers_its_ring() {
+        let polling = ring_polling(Some(BusyPoll {
+            timeout: BusyPollTimeout::from_micros(75).unwrap(),
+            prefer: true,
+            budget: None,
+        }));
+        assert_eq!(
+            polling,
+            skyzen_core::busy_poll::NapiPolling {
+                timeout_micros: 75,
+                prefer: true,
+            }
+        );
+    }
+
+    /// With busy polling off, the ring is left as `io_uring` creates it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runtime_without_busy_polling_leaves_its_ring_alone() {
+        assert_eq!(
+            ring_polling(None),
+            skyzen_core::busy_poll::NapiPolling::default()
+        );
     }
 }

@@ -44,7 +44,7 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 
 **Framework Core:**
 - **`skyzen`** (`/`) - Main framework crate: routing, extractors, responders, middleware, static files, the reverse proxy (`proxy` feature), and runtime helpers.
-- **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`, `EndpointFactory`) reusable by alternative runtimes, the `upgrade` handover between a server and a WebSocket handler, plus `Secret`, the one runtime representation of a `[[secret]]` value, and (`steering` feature, Linux) the read of the CPU affinity mask and NIC receive-queue layout that decides automatic connection steering, so the runtime and `skyzen doctor` cannot disagree about it. Supports `no_std` when `std` feature is disabled (`Server`, `upgrade`, `Secret` and `steering` are `std`-only).
+- **`skyzen-core`** (`core/`) - Foundational traits (`Extractor`, `Responder`, `Server`, `EndpointFactory`) reusable by alternative runtimes, the `upgrade` handover between a server and a WebSocket handler, plus `Secret`, the one runtime representation of a `[[secret]]` value, and (`steering` feature, Linux) the read of the CPU affinity mask and NIC receive-queue layout that decides automatic connection steering, so the runtime and `skyzen doctor` cannot disagree about it, and (`busy-poll` feature, Linux) the `io_uring` NAPI registration (`IORING_REGISTER_NAPI`, a raw `io_uring_register(2)` on a ring compio owns, the crate's one `unsafe_code` exception) that each serving thread makes under `--busy-poll` and the doctor makes on a probe ring. Supports `no_std` when `std` feature is disabled (`Server`, `upgrade`, `Secret`, `steering` and `busy_poll` are `std`-only).
 - **`skyzen-macros`** (`macros/`) - Procedural macros: `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::scheduled]`, `#[skyzen::email]`, `#[skyzen::tail]`, `#[skyzen::durable_object]`, `#[skyzen::test]`, `#[derive(HttpError)]`, plus the function-like `import_config!` (one named extractor per `[[service]]`, `[[database]]` and `[[secret]]`) and `embed_migrations!`.
 - **`skyzen-manifest`** (`manifest/`) - The one typed `Skyzen.toml` schema, consumed by **both** `skyzen-macros` (at compile time) and `skyzen-cli` (at deploy time), so a section can never be accepted by one and rejected by the other. Every struct carries `deny_unknown_fields` and the `type`/`backend` discriminants are enums, so a typo or an unsupported value fails at parse time.
 - **`skyzen-hyper`** (`hyper/`) - Hyper server adapter implementing the `Server` trait from `skyzen-core`: HTTP/1 and HTTP/2 (prior-knowledge sniffed), on every `http-kit-io` backend, `compio` included (there hyper reads through the bridge's `CopyingPoll`, which copies). Nothing it drives is `Send`: an HTTP/1 upgrade goes through hyper's `without_shutdown` and the stream it hands back, never `with_upgrades()`, and h2 streams spawn on the `LocalExecutor`. `AltSvc` advertises an HTTP/3 endpoint beside a TLS TCP listener. Its `serve_connection`/`IntoService` are also what the native runtime drives each connection with.
@@ -262,6 +262,21 @@ remain Cloudflare-only, because nothing else has those events.
   thread running the proxy's pool, and it holds because both servers run the session on the
   connection's thread, the one that built the router. `CONNECT` is refused with
   `ProxyError::Connect` (501).
+
+### 5f. Busy Polling (native, Linux)
+- An operator setting in `src/runtime/native/io_settings.rs`, off unless `--busy-poll <µs>` /
+  `SKYZEN_BUSY_POLL` sets its timeout; `--busy-poll-prefer` and `--busy-poll-budget` refine it and
+  are a startup panic without it. All three are fixed for the process: a `SINGLE_ISSUER` ring takes
+  a registration only from its own thread.
+- The mechanism is the ring's NAPI registration (`src/runtime/native/busy_poll.rs`, made in
+  `IoSettings::runtime` on the serving thread through `skyzen_core::busy_poll`), not `SO_BUSY_POLL`,
+  which polls once for a non-blocking receive. Tracking is dynamic, the only mode Linux 6.9 has.
+- The sockets still carry `SO_BUSY_POLL`, `SO_PREFER_BUSY_POLL` and `SO_BUSY_POLL_BUDGET`: set on
+  every TCP listener before `listen` (accepted connections inherit them through `sk_clone_lock`)
+  and on every QUIC socket before `bind`. Prefer and a raised budget need `CAP_NET_ADMIN`; the
+  bind fails naming it.
+- Asking for it off Linux, on a unix socket, under a serverless host, on a runtime compio put on
+  `epoll`, or on a kernel without NAPI registration is a refusal to start.
 
 ### 6. Error Handling & Log Security
 - `#[skyzen::error]` generates `Display`, `Error`, and `HttpError` implementations with status code attributes.

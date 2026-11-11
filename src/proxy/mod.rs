@@ -517,6 +517,7 @@ mod tests {
         let settings = IoSettings::new(
             options.driver(),
             options.recv_ring(NonZeroUsize::new(8).unwrap()),
+            None,
         );
         let mut request = Request::new(Body::empty());
         request.extensions_mut().insert(settings.clone());

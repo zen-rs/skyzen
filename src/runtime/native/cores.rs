@@ -34,6 +34,7 @@ use skyzen_hyper::{AltSvc, Hyper};
 use tracing::error;
 
 use super::{
+    busy_poll::BusyPoll,
     handoff::{Acceptor, Incoming},
     http3::Http3,
     steering::Pins,
@@ -110,17 +111,24 @@ impl Socket {
 /// the start before any thread exists, and so that an address with port `0` resolves to one port
 /// that every listener then joins.
 ///
+/// With `busy_poll`, every TCP listener carries its socket options before it listens, so every
+/// connection it accepts inherits them; [`super::busy_poll::check`] has already refused it
+/// everywhere but on a Linux TCP address.
+///
 /// # Errors
 ///
-/// The address cannot be bound, or a socket cannot be duplicated.
+/// The address cannot be bound, a socket cannot be duplicated, or the kernel refuses a busy-poll
+/// option.
 pub(super) fn bind(
     addr: &super::ListenAddr,
     threads: NonZeroUsize,
     pins: Pins,
+    busy_poll: Option<&BusyPoll>,
 ) -> io::Result<Bound> {
     match addr {
         #[cfg(windows)]
         super::ListenAddr::Tcp(addr) => {
+            let _ = busy_poll;
             let (incoming, acceptor) = super::handoff::bind(*addr, threads.get())?;
             Ok(Bound {
                 sockets: incoming.into_iter().map(Socket::Handoff).collect(),
@@ -131,7 +139,7 @@ pub(super) fn bind(
         }
         #[cfg(not(windows))]
         super::ListenAddr::Tcp(addr) => Ok(Bound {
-            sockets: bind_tcp(*addr, threads.get(), &pins)?
+            sockets: bind_tcp(*addr, threads.get(), &pins, busy_poll)?
                 .into_iter()
                 .map(Socket::Tcp)
                 .collect(),
@@ -141,6 +149,10 @@ pub(super) fn bind(
         }),
         #[cfg(unix)]
         super::ListenAddr::Unix(path) => {
+            debug_assert!(
+                busy_poll.is_none(),
+                "busy polling is refused on a unix socket"
+            );
             let listener = super::bind_unix_socket(path)?;
             // The descriptors share one open socket, so connections queue once and whichever
             // thread is idle takes the next.
@@ -167,6 +179,7 @@ fn bind_tcp(
     addr: std::net::SocketAddr,
     threads: usize,
     pins: &Pins,
+    busy_poll: Option<&BusyPoll>,
 ) -> io::Result<Vec<std::net::TcpListener>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -181,8 +194,13 @@ fn bind_tcp(
             if let Some(cpu) = pins.cpu(index) {
                 super::steering::set_incoming_cpu(&socket, cpu)?;
             }
+            // Before `listen`, so no connection is accepted without them.
+            #[cfg(target_os = "linux")]
+            if let Some(busy_poll) = busy_poll {
+                busy_poll.set_on(&socket)?;
+            }
             #[cfg(not(target_os = "linux"))]
-            let _ = (pins, index);
+            let _ = (pins, index, busy_poll);
             socket.bind(&addr.into())?;
             socket.listen(BACKLOG)?;
             Ok(socket.into())
@@ -205,6 +223,7 @@ fn bind_tcp(
     addr: std::net::SocketAddr,
     threads: usize,
     _pins: &Pins,
+    _busy_poll: Option<&BusyPoll>,
 ) -> io::Result<Vec<std::net::TcpListener>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -368,7 +387,7 @@ fn work<F, A, W>(
     let runtime = match plan.io.runtime() {
         Ok(runtime) => Rc::new(runtime),
         Err(error) => {
-            let _ = ready.send_blocking(Err(error.into()));
+            let _ = ready.send_blocking(Err(error));
             return;
         }
     };
@@ -621,7 +640,7 @@ mod tests {
     use super::{bind, start, Bound, Cores, Pins, Plan, Socket};
     use crate::runtime::native::handoff;
     use crate::{
-        runtime::native::{HttpServer, IoOptions, IoSettings, ListenAddr},
+        runtime::native::{HttpServer, IoOptions, IoSettings, ListenAddr, RuntimeFailure},
         Endpoint, Request, Response,
     };
 
@@ -644,17 +663,31 @@ mod tests {
             server: HttpServer,
             factory: F,
         ) -> Self {
+            Self::start_io(bound, server, factory, IoOptions::default())
+                .expect("every thread is serving")
+        }
+
+        /// Start the threads on `options`, or report the first that could not start.
+        fn start_io<F: skyzen_core::EndpointFactory>(
+            bound: Bound,
+            server: HttpServer,
+            factory: F,
+            options: IoOptions,
+        ) -> Result<Self, RuntimeFailure> {
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
             let (release, released) = bounded::<Infallible>(1);
             let max_connections = NonZeroUsize::new(64).unwrap();
-            let options = IoOptions::default();
             let plan = Plan {
                 factory,
                 wrap: Ok,
                 executor: Arc::new(AnyExecutor::new(SmolGlobal)),
                 max_connections,
-                io: IoSettings::new(options.driver(), options.recv_ring(max_connections)),
+                io: IoSettings::new(
+                    options.driver(),
+                    options.recv_ring(max_connections),
+                    options.busy_poll,
+                ),
                 server,
                 tls: None,
                 http3: None,
@@ -662,19 +695,15 @@ mod tests {
             let cores =
                 start(plan, bound, &stopping, &drain, &released).expect("start the threads");
             for _ in 0..cores.threads {
-                cores
-                    .ready
-                    .recv_blocking()
-                    .expect("a thread reports")
-                    .expect("and is serving");
+                cores.ready.recv_blocking().expect("a thread reports")?;
             }
-            Self {
+            Ok(Self {
                 stop,
                 drain,
                 drained,
                 release,
                 cores,
-            }
+            })
         }
 
         /// Stop every thread, wait until each has released its drain token, then let them exit
@@ -764,6 +793,7 @@ mod tests {
             &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
             NonZeroUsize::new(1).unwrap(),
             Pins::default(),
+            None,
         )
         .expect("bind");
         let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
@@ -792,6 +822,7 @@ mod tests {
             &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
             threads,
             Pins::default(),
+            None,
         )
         .expect("bind");
         let addr = bound.sockets[0]
@@ -854,6 +885,7 @@ mod tests {
             &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
             NonZeroUsize::new(served.len()).unwrap(),
             cpus,
+            None,
         )
         .expect("bind with steering");
         let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
@@ -876,6 +908,135 @@ mod tests {
         serving.stop();
     }
 
+    /// The busy polling a test turns on: options any process may set, so the test holds without
+    /// `CAP_NET_ADMIN`.
+    #[cfg(target_os = "linux")]
+    fn busy_poll() -> crate::runtime::native::BusyPoll {
+        crate::runtime::native::BusyPoll {
+            timeout: crate::runtime::native::BusyPollTimeout::from_micros(50).unwrap(),
+            prefer: false,
+            budget: None,
+        }
+    }
+
+    /// With busy polling on, every serving thread's listener carries the busy-poll options, a
+    /// connection it accepts inherits them, and the threads, whose rings register, serve.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn with_busy_polling_on_every_serving_socket_carries_the_options() {
+        use crate::runtime::native::busy_poll::read_socket_options;
+
+        let busy_poll = busy_poll();
+        let tcp = ListenAddr::Tcp("127.0.0.1:0".parse().unwrap());
+
+        let accepting = bind(
+            &tcp,
+            NonZeroUsize::new(1).unwrap(),
+            Pins::default(),
+            Some(&busy_poll),
+        )
+        .expect("bind");
+        let Socket::Tcp(listener) = &accepting.sockets[0] else {
+            unreachable!("a Linux TCP address binds a listener per thread")
+        };
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("dial");
+        let (accepted, _) = listener.accept().expect("accept");
+        assert_eq!(read_socket_options(&accepted), (50, false));
+
+        let bound = bind(
+            &tcp,
+            NonZeroUsize::new(4).unwrap(),
+            Pins::default(),
+            Some(&busy_poll),
+        )
+        .expect("bind");
+        for socket in &bound.sockets {
+            let Socket::Tcp(listener) = socket else {
+                unreachable!("a Linux TCP address binds a listener per thread")
+            };
+            assert_eq!(read_socket_options(listener), (50, false));
+        }
+        let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
+        let serving = Serving::start_io(
+            bound,
+            HttpServer::H1,
+            || async { ServingThread },
+            IoOptions {
+                busy_poll: Some(busy_poll),
+                ..IoOptions::default()
+            },
+        )
+        .expect("every thread registers its ring");
+        let body = exchange(std::net::TcpStream::connect(addr).expect("connect"));
+        serving.stop();
+        assert!(body.starts_with("skyzen-"), "{body}");
+    }
+
+    /// With busy polling off, a listener keeps the kernel's own `SO_BUSY_POLL`, which a socket
+    /// starts at from `net.core.busy_read`, and does not prefer busy polling.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn with_busy_polling_off_the_listeners_keep_the_kernel_defaults() {
+        use crate::runtime::native::busy_poll::read_socket_options;
+
+        let busy_read: u32 = std::fs::read_to_string("/proc/sys/net/core/busy_read")
+            .expect("read net.core.busy_read")
+            .trim()
+            .parse()
+            .expect("a number");
+        let bound = bind(
+            &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
+            NonZeroUsize::new(2).unwrap(),
+            Pins::default(),
+            None,
+        )
+        .expect("bind");
+        for socket in &bound.sockets {
+            let Socket::Tcp(listener) = socket else {
+                unreachable!("a Linux TCP address binds a listener per thread")
+            };
+            assert_eq!(read_socket_options(listener), (busy_read, false));
+        }
+    }
+
+    /// Preferring busy polling needs `CAP_NET_ADMIN`: with it the listeners carry the preference,
+    /// and without it the bind fails naming the capability.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn preferring_busy_polling_needs_cap_net_admin() {
+        use crate::runtime::native::busy_poll::read_socket_options;
+
+        // `CAP_NET_ADMIN` is bit 12 of `CapEff` (`include/uapi/linux/capability.h`).
+        let status = std::fs::read_to_string("/proc/self/status").expect("read the status");
+        let effective = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .expect("a CapEff line");
+        let net_admin = u64::from_str_radix(effective.trim(), 16).expect("hex") & (1 << 12) != 0;
+
+        let busy_poll = crate::runtime::native::BusyPoll {
+            prefer: true,
+            ..busy_poll()
+        };
+        let bound = bind(
+            &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
+            NonZeroUsize::new(1).unwrap(),
+            Pins::default(),
+            Some(&busy_poll),
+        );
+        if net_admin {
+            let bound = bound.expect("a process with CAP_NET_ADMIN may prefer busy polling");
+            let Socket::Tcp(listener) = &bound.sockets[0] else {
+                unreachable!("a Linux TCP address binds a listener per thread")
+            };
+            assert_eq!(read_socket_options(listener), (50, true));
+        } else {
+            let error = bound.expect_err("only CAP_NET_ADMIN may prefer busy polling");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("CAP_NET_ADMIN"), "{error}");
+        }
+    }
+
     /// A unix socket is served by the same threads under either server, and the file goes away
     /// with the socket's owner, not with a connection.
     #[test]
@@ -888,6 +1049,7 @@ mod tests {
                 &ListenAddr::Unix(path.clone()),
                 NonZeroUsize::new(2).unwrap(),
                 Pins::default(),
+                None,
             )
             .expect("bind the unix socket");
             let serving = Serving::start(sockets, server);
