@@ -345,8 +345,16 @@ pub(super) async fn serve<L, E>(
             .spawn_local(
                 async move {
                     let _slot = slot;
-                    let Some(accepted) =
-                        negotiate(stream, &tls, &io, HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT).await
+                    // Boxed: with kernel TLS state on Linux the handshake's future is larger than
+                    // the connection task should carry inline for the connection's whole life.
+                    let Some(accepted) = Box::pin(negotiate(
+                        stream,
+                        &tls,
+                        &io,
+                        HANDSHAKE_TIMEOUT,
+                        HANDSHAKE_TIMEOUT,
+                    ))
+                    .await
                     else {
                         return;
                     };
@@ -842,13 +850,13 @@ mod tests {
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                negotiate(
+                Box::pin(negotiate(
                     stream,
                     &tls,
                     &Compio::default(),
                     HANDSHAKE_TIMEOUT,
                     SHORT_PREFACE,
-                )
+                ))
                 .await
                 .is_none()
             };
@@ -885,13 +893,13 @@ mod tests {
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                negotiate(
+                Box::pin(negotiate(
                     stream,
                     &tls,
                     &Compio::default(),
                     HANDSHAKE_TIMEOUT,
                     HANDSHAKE_TIMEOUT,
-                )
+                ))
                 .await
             };
             let request = async {
@@ -921,13 +929,13 @@ mod tests {
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                negotiate(
+                Box::pin(negotiate(
                     stream,
                     &tls,
                     &Compio::default(),
                     HANDSHAKE_TIMEOUT,
                     HANDSHAKE_TIMEOUT,
-                )
+                ))
                 .await
                 .is_none()
             };

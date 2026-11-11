@@ -256,9 +256,9 @@ fn effective_capability(status: &str, cap: u32) -> Probe<bool> {
 fn size(bytes: u64) -> String {
     const MIB: u64 = 1 << 20;
     const KIB: u64 = 1 << 10;
-    if bytes != 0 && bytes % MIB == 0 {
+    if bytes != 0 && bytes.is_multiple_of(MIB) {
         format!("{} MiB", bytes / MIB)
-    } else if bytes != 0 && bytes % KIB == 0 {
+    } else if bytes != 0 && bytes.is_multiple_of(KIB) {
         format!("{} KiB", bytes / KIB)
     } else {
         format!("{bytes} bytes")
