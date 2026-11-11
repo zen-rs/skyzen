@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/zen-rs/skyzen/compare/cli/v0.6.0...cli/v0.6.1) - 2026-11-11
+
+### Other
+
+- release v0.6.1
+
 ## [0.6.0](https://github.com/zen-rs/skyzen/compare/cli/v0.5.2...cli/v0.6.0) - 2026-11-11
 
 ### Added
