@@ -11,6 +11,8 @@ use crate::{
         prepare_child_environment, Action, CommandPlan, CommandStdin, ProviderPlan, RunMode, Step,
     },
 };
+#[cfg(target_os = "linux")]
+use anyhow::Context as _;
 use anyhow::Result;
 use skyzen_manifest::Manifest;
 
@@ -32,7 +34,6 @@ use skyzen_manifest::Manifest;
 #[cfg(target_os = "linux")]
 pub fn deploy(manifest: &Manifest, project: &Project, dry_run: bool) -> Result<ProviderPlan> {
     use crate::providers::{resolve_variables, FileContents, GeneratedFile};
-    use anyhow::Context as _;
     use skyzen_manifest::NativeDatabaseBackend;
 
     let name = project.binary_target_name()?;
