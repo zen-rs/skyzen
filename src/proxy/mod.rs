@@ -39,6 +39,10 @@
 //! it asked for them with `TE: trailers`; a response that brings trailers to a client that did not
 //! ends with [`ProxyError::TrailersNotAccepted`] rather than losing them.
 //!
+//! On Linux, where both connections are plain sockets or kernel TLS ones, the bytes of an HTTP/1.1
+//! body and of the tunnel below never enter user space: they are spliced from one socket to the
+//! other through a pipe. Elsewhere, and over a TLS session in user space, they are copied.
+//!
 //! A request that asks to switch protocols (`Connection: upgrade` with `Upgrade`, a WebSocket
 //! handshake for one) keeps those two fields on its way upstream when its connection can be handed
 //! over, which is an HTTP/1.1 one. When the upstream answers `101 Switching Protocols`, the
@@ -47,18 +51,13 @@
 //! stream), the request goes upstream without them, as an intermediary that does not take part in
 //! an upgrade sends it (RFC 9110 §7.8). `CONNECT` is refused with [`ProxyError::Connect`].
 
+mod body;
 mod headers;
 mod tunnel;
 
-use std::{
-    fmt,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::{fmt, sync::Arc};
 
 use executor_core::LocalExecutor;
-use futures_core::Stream;
 use http::{
     uri::{Authority, PathAndQuery, Scheme},
     Version,
@@ -73,7 +72,7 @@ pub use zenwave::Transport;
 use crate::{
     extract::TrustedProxies,
     header::{self, HeaderValue},
-    Body, BodyError, Endpoint, Request, Response, StatusCode, Uri,
+    Body, Endpoint, Request, Response, StatusCode, Uri,
 };
 use headers::{ForwardedElement, ViaMember};
 use skyzen_core::{upgrade::UpgradeAvailable, PeerAddr};
@@ -345,7 +344,7 @@ impl Proxy {
             .body_mut()
             .take()
             .map_err(|_| ProxyError::BodyConsumed)?;
-        let mut forwarded = Request::new(body);
+        let mut forwarded = Request::new(body::forward(body, false));
         *forwarded.method_mut() = request.method().clone();
         *forwarded.uri_mut() = self.upstream.target(request.uri().path_and_query())?;
         *forwarded.version_mut() = Version::HTTP_11;
@@ -384,10 +383,8 @@ impl Proxy {
             .to_value(),
         );
         // Only a chunked body has a trailer section to bring.
-        if chunked && !accepts_trailers {
-            let body = core::mem::replace(response.body_mut(), Body::empty());
-            *response.body_mut() = Body::from_frames(RefuseTrailers(Some(body)));
-        }
+        let body = core::mem::replace(response.body_mut(), Body::empty());
+        *response.body_mut() = body::forward(body, chunked && !accepts_trailers);
         response
     }
 }
@@ -409,32 +406,6 @@ impl Endpoint for Proxy {
             Err(error) => return Err(ProxyError::Upstream(error)),
         };
         Ok(self.returned_response(response, accepts_trailers))
-    }
-}
-
-/// A response body that fails when the upstream ends it with trailers the client did not accept,
-/// instead of dropping them.
-struct RefuseTrailers(Option<Body>);
-
-impl Stream for RefuseTrailers {
-    type Item = Result<http_kit::BodyFrame, BodyError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let Some(body) = self.0.as_mut() else {
-            return Poll::Ready(None);
-        };
-        match Pin::new(body).poll_next(cx) {
-            Poll::Ready(Some(Ok(http_kit::BodyFrame::Trailers(_)))) => {
-                self.0 = None;
-                tracing::error!(
-                    "the upstream ended its response with trailers the client did not accept"
-                );
-                Poll::Ready(Some(Err(BodyError::Other(Box::new(
-                    ProxyError::TrailersNotAccepted,
-                )))))
-            }
-            poll => poll,
-        }
     }
 }
 

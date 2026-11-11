@@ -9,24 +9,23 @@
 //! `http-kit-h1` rather than through request extensions, because a socket on a thread-per-core
 //! driver is not `Send`. The endpoint's response carries an
 //! [`OnUpgrade`](skyzen_core::upgrade::OnUpgrade) token instead, and the server runs that
-//! session on the connection once the `101` is written.
+//! session on the connection once the `101` is written, handing it the connection's own halves,
+//! so a session that forwards the connection elsewhere can splice it.
+//!
+//! On Linux and Android a request body is moved through a pipe when its consumer offers one, and
+//! a pipe frame in a response body is spliced into the socket.
 
-use core::{
-    future::Future,
-    pin::{pin, Pin},
-    task::{Context, Poll},
-};
-use std::{cell::Cell, convert::Infallible, io, net::SocketAddr, num::NonZeroUsize, rc::Rc};
+use core::{future::Future, pin::pin};
+use std::{cell::Cell, convert::Infallible, net::SocketAddr, num::NonZeroUsize, rc::Rc};
 
 use executor_core::{LocalExecutor, Task};
 use futures_util::future::{select, Either};
 use http_kit::{
     header::{self, HeaderValue},
-    utils::{AsyncRead, AsyncWrite, Bytes},
     Request, Response,
 };
 use http_kit_h1::{ServerConfig, ServerConnection, ServerOutcome, Service};
-use http_kit_io::{CopyingPoll, Io, Listener, Read, SendFile, Split, Timer, Write};
+use http_kit_io::{Io, Listener, SendFile, SpliceRead, SpliceWrite, Split, Timer};
 use skyzen_core::{
     apply_pending_headers, error_response, log_endpoint_error,
     upgrade::{OnUpgrade, UpgradeAvailable, Upgraded},
@@ -100,7 +99,8 @@ impl Drop for Slot {
 impl<I> Server<I> for H1
 where
     I: Io,
-    <I::TcpStream as Split>::WriteHalf: SendFile,
+    <I::TcpStream as Split>::ReadHalf: SpliceRead,
+    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
 {
     type Listeners = I::TcpListener;
 
@@ -139,7 +139,8 @@ impl H1 {
         L: Listener,
         L::Stream: Split + 'static,
         L::Addr: PeerAddress,
-        <L::Stream as Split>::WriteHalf: SendFile,
+        <L::Stream as Split>::ReadHalf: SpliceRead,
+        <L::Stream as Split>::WriteHalf: SendFile + SpliceWrite,
         Ex: LocalExecutor + 'static,
         E: Endpoint + Clone + 'static,
     {
@@ -215,7 +216,8 @@ impl H1 {
     ) where
         T: Timer + Clone + 'static,
         S: Split + 'static,
-        <S as Split>::WriteHalf: SendFile,
+        <S as Split>::ReadHalf: SpliceRead,
+        <S as Split>::WriteHalf: SendFile + SpliceWrite,
         E: Endpoint + Clone + 'static,
     {
         let (read, write) = stream.split();
@@ -235,14 +237,9 @@ impl H1 {
                 mut response,
             }) => match response.extensions.remove::<OnUpgrade>() {
                 Some(session) => {
-                    let stream = Replay {
-                        buffered: upgraded.read_buf,
-                        inner: CopyingPoll::new(Halves {
-                            read: upgraded.read,
-                            write: upgraded.write,
-                        }),
-                    };
-                    session.run(Upgraded::new(stream)).await;
+                    let connection =
+                        Upgraded::from_halves(upgraded.read_buf, upgraded.read, upgraded.write);
+                    session.run(connection).await;
                 }
                 None => {
                     error!(
@@ -297,60 +294,5 @@ impl<E: Endpoint + Clone> Service for H1Service<E> {
                 .or_insert_with(|| alt_svc.clone());
         }
         response
-    }
-}
-
-/// The two halves `http-kit-h1` hands back, put together again for [`CopyingPoll`].
-struct Halves<R, W> {
-    read: R,
-    write: W,
-}
-
-impl<R: Read + 'static, W: Write + 'static> Split for Halves<R, W> {
-    type ReadHalf = R;
-    type WriteHalf = W;
-
-    fn split(self) -> (R, W) {
-        (self.read, self.write)
-    }
-}
-
-/// An upgraded stream that first replays what the client sent after its upgrade request.
-struct Replay<S> {
-    buffered: Bytes,
-    inner: S,
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for Replay<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if this.buffered.is_empty() {
-            return Pin::new(&mut this.inner).poll_read(cx, buf);
-        }
-        let n = buf.len().min(this.buffered.len());
-        buf[..n].copy_from_slice(&this.buffered.split_to(n));
-        Poll::Ready(Ok(n))
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for Replay<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_close(cx)
     }
 }
