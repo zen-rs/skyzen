@@ -16,9 +16,9 @@ skyzen-test = { path = "test", version = "0.4.0" }
 skyzen-redis = { path = "redis", version = "0.4.0" }
 skyzen-s3 = { path = "s3", version = "0.4.0" }
 
-http-kit = "0.8.1"
-http-kit-io = { version = "0.6.1", default-features = false }
-http-kit-h1 = { version = "0.6.1", default-features = false }
+http-kit = "0.8.2"
+http-kit-io = { version = "0.6.2", default-features = false }
+http-kit-h1 = { version = "0.6.2", default-features = false }
 executor-core = { version = "0.7.2", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper", version = "0.3.0" }
 skyzen-h1 = { path = "h1", version = "0.1.0" }
@@ -184,7 +184,7 @@ skyzen-lambda = { workspace = true, optional = true }
 # TLS termination (`server-tls` feature): rustls driven straight over the owned-buffer streams by
 # `http-kit-tls`. The `aws_lc_rs` provider matches the AWS SDK's TLS stack, so the workspace
 # resolves one crypto backend; the certificate/key pair is loaded with rustls's own PEM support.
-http-kit-tls = { version = "0.4.1", default-features = false, optional = true }
+http-kit-tls = { version = "0.4.2", default-features = false, optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
 # The reverse proxy's upstream client (`proxy`): zenwave's native backend, HTTP/1.1 on
 # `http-kit-h1` over the same `http-kit-io` sockets the server runs on, with a connection pool on
@@ -196,7 +196,7 @@ zenwave = { version = "0.12.0", default-features = false, features = ["native-co
 # source, so only a build that asks for HTTP/3 pays for it; `fs` lets a file-region body (static
 # files) go out over a QUIC stream. A QUIC writer offers no pipe, so a proxied body reaches it as
 # data frames and `pipe` is not needed.
-http-kit-h3 = { version = "0.6.1", default-features = false, features = ["quiche", "fs"], optional = true }
+http-kit-h3 = { version = "0.6.2", default-features = false, features = ["quiche", "fs"], optional = true }
 
 # Kernel TLS on Linux: after the handshake the kernel seals and opens the records, so file-region
 # bodies go out through sendfile/splice, and the proxy splices bodies and tunnels between the
@@ -207,7 +207,7 @@ http-kit-h3 = { version = "0.6.1", default-features = false, features = ["quiche
 # registration its `busy-poll`, both of which `skyzen doctor` reads too.
 libc = "0.2"
 skyzen-core = { workspace = true, features = ["steering", "busy-poll"] }
-http-kit-tls = { version = "0.4.1", default-features = false, features = ["kernel"], optional = true }
+http-kit-tls = { version = "0.4.2", default-features = false, features = ["kernel"], optional = true }
 zenwave = { version = "0.12.0", default-features = false, features = ["native-compio", "native-kernel-tls"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
