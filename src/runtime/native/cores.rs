@@ -20,12 +20,13 @@ use std::{io, num::NonZeroUsize, rc::Rc, sync::Arc, thread};
 
 use async_channel::{bounded, Receiver, Sender};
 use executor_core::{compio::Runtime, AnyExecutor};
+#[cfg(not(windows))]
+use http_kit_io::FromStd as _;
 #[cfg(unix)]
 use http_kit_io::FromStdUnix as _;
 use http_kit_io::{
     compio::{Compio, TcpStream},
-    FromStd as _, IntoPoll, Listener, ReadOwned, SendFile, SpliceRead, SpliceWrite, Split,
-    TcpOptions,
+    IntoPoll, Listener, ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions,
 };
 use skyzen_core::{EndpointFactory, PeerAddress};
 use skyzen_h1::H1;
@@ -87,7 +88,9 @@ impl Socket {
         not(unix),
         expect(
             clippy::unnecessary_wraps,
-            reason = "the `None` arm is the unix socket, which only unix compiles"
+            clippy::missing_const_for_fn,
+            reason = "the `None` arm is the unix socket and the `local_addr` call the TCP \
+                      listener, neither of which Windows compiles"
         )
     )]
     pub(super) fn tcp_addr(&self) -> Option<io::Result<std::net::SocketAddr>> {
