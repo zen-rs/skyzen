@@ -17,7 +17,7 @@
 use core::{fmt, time::Duration};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use aws_config::{
@@ -93,31 +93,28 @@ impl ZenwaveHttpClient {
         Self::new(Transport::builder)
     }
 
-    /// The backend for `timeouts`, built on first use.
-    ///
-    /// # Panics
-    ///
-    /// If the transport cannot be built, for instance when the system trust store cannot be
-    /// initialised, or zenwave cannot start its driver thread.
-    fn backend(&self, timeouts: Timeouts) -> NativeBackend {
-        self.backends
-            .lock()
-            .expect("a panic while building a backend leaves the cache unusable")
-            .entry(timeouts)
-            .or_insert_with(|| {
-                let mut transport = (self.transport)();
-                if let Some(connect) = timeouts.connect {
-                    transport = transport.connect_timeout(connect);
-                }
-                if let Some(read) = timeouts.read {
-                    transport = transport.read_timeout(read);
-                }
-                let transport = transport.build().unwrap_or_else(|error| {
-                    panic!("the AWS SDK's transport cannot be built: {error}")
-                });
-                NativeBackend::new(transport)
-            })
-            .clone()
+    /// The backend for `timeouts`, built on first use. A transport that cannot be built, such as
+    /// one whose system trust store cannot be read, is not cached: the error is returned, and the
+    /// next connector the SDK asks for tries again.
+    fn backend(&self, timeouts: Timeouts) -> Result<NativeBackend, Arc<zenwave::Error>> {
+        // The map is never left half-written, so a lock poisoned by an unrelated panic is still
+        // a consistent cache.
+        let mut backends = self.backends.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(backend) = backends.get(&timeouts) {
+            return Ok(backend.clone());
+        }
+        let mut transport = (self.transport)();
+        if let Some(connect) = timeouts.connect {
+            transport = transport.connect_timeout(connect);
+        }
+        if let Some(read) = timeouts.read {
+            transport = transport.read_timeout(read);
+        }
+        // Built under the lock, so two threads asking for the same settings build one backend.
+        let backend = NativeBackend::new(transport.build().map_err(Arc::new)?);
+        backends.insert(timeouts, backend.clone());
+        drop(backends);
+        Ok(backend)
     }
 }
 
@@ -135,24 +132,36 @@ impl HttpClient for ZenwaveHttpClient {
         settings: &HttpConnectorSettings,
         _components: &RuntimeComponents,
     ) -> SharedHttpConnector {
-        SharedHttpConnector::new(ZenwaveConnector {
-            backend: self.backend(Timeouts {
-                connect: settings.connect_timeout(),
-                read: settings.read_timeout(),
-            }),
-        })
+        let backend = self.backend(Timeouts {
+            connect: settings.connect_timeout(),
+            read: settings.read_timeout(),
+        });
+        if let Err(error) = &backend {
+            tracing::error!("the AWS SDK's transport cannot be built: {error}");
+        }
+        SharedHttpConnector::new(ZenwaveConnector { backend })
     }
 }
 
-/// An [`HttpConnector`] on the [`NativeBackend`] built for one set of [`HttpConnectorSettings`].
+/// An [`HttpConnector`] on the [`NativeBackend`] built for one set of [`HttpConnectorSettings`],
+/// or the error that kept it from being built, which every call then fails with.
 #[derive(Debug, Clone)]
 struct ZenwaveConnector {
-    backend: NativeBackend,
+    backend: Result<NativeBackend, Arc<zenwave::Error>>,
 }
 
 impl HttpConnector for ZenwaveConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        let mut backend = self.backend.clone();
+        let mut backend = match &self.backend {
+            Ok(backend) => backend.clone(),
+            Err(error) => {
+                let error = Arc::clone(error);
+                return HttpConnectorFuture::ready(Err(ConnectorError::other(
+                    Box::new(TransportUnavailable(error)),
+                    None,
+                )));
+            }
+        };
         HttpConnectorFuture::new(async move {
             let mut request = request
                 .try_into_http1x()
@@ -165,6 +174,22 @@ impl HttpConnector for ZenwaveConnector {
             HttpResponse::try_from(response.map(SdkBody::from_body_1_x))
                 .map_err(|error| ConnectorError::other(error.into(), None))
         })
+    }
+}
+
+/// The transport for a connector could not be built, so no request on it was sent.
+#[derive(Debug)]
+struct TransportUnavailable(Arc<zenwave::Error>);
+
+impl fmt::Display for TransportUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the AWS SDK's transport cannot be built: {}", self.0)
+    }
+}
+
+impl core::error::Error for TransportUnavailable {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&*self.0)
     }
 }
 
