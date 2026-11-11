@@ -1,7 +1,6 @@
 # Written by `skyzen deploy --provider native`, which rewrites it on every deployment.
-# Change the service with a drop-in (`systemctl edit {{ name }}`): a `User=`, the variables
-# the application reads (`EnvironmentFile=`), or `SKYZEN_STEERING` to force connection
-# steering on or off.
+# Change the service with a drop-in (`systemctl edit {{ name }}`), for example
+# `SKYZEN_STEERING` to force connection steering on or off.
 [Unit]
 Description={{ name }}, deployed by skyzen
 Wants=network-online.target
@@ -11,10 +10,32 @@ After=network-online.target
 Type=exec
 WorkingDirectory={{ working_directory }}
 # Applies `[native.linux]` before every start, so a reboot brings the host's kernel and NIC
-# settings back before the application serves. `+` runs it as root whatever `User=` says.
+# settings back before the application serves. `+` runs it as root, outside the sandbox below.
 ExecStartPre=+{% for arg in host_apply %}{% if !loop.first %} {% endif %}{{ arg }}{% endfor %}
 ExecStart={% for arg in exec_start %}{% if !loop.first %} {% endif %}{{ arg }}{% endfor %}
 Restart=on-failure
-
+# The application's variables, [[secret]] values included: root-owned, mode 0600.
+EnvironmentFile={{ environment_file }}
+{% for assignment in environment -%}
+Environment={{ assignment }}
+{% endfor -%}
+# A transient user, with only the privileges [native.server] needs.
+DynamicUser=yes
+{% if !sandbox.capabilities.is_empty() -%}
+AmbientCapabilities={{ sandbox.capability_list() }}
+{% endif -%}
+CapabilityBoundingSet={{ sandbox.capability_list() }}
+# Zero-copy sends pin pages against RLIMIT_MEMLOCK.
+LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+{% if sandbox.state_directory -%}
+StateDirectory={{ name }}
+{% endif -%}
+{% if sandbox.runtime_directory -%}
+RuntimeDirectory={{ name }}
+{% endif %}
 [Install]
 WantedBy=multi-user.target

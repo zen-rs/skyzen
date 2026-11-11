@@ -7,12 +7,12 @@ use crate::{
     environment::VariableKind,
     project::Project,
     providers::{
-        prepare_child_environment, Action, CommandPlan, CommandStdin, FileContents, GeneratedFile,
-        ProviderPlan, RunMode, Step,
+        prepare_child_environment, resolve_variables, Action, CommandPlan, CommandStdin,
+        FileContents, GeneratedFile, ProviderPlan, RunMode, Step,
     },
 };
 use anyhow::{Context, Result};
-use skyzen_manifest::Manifest;
+use skyzen_manifest::{Manifest, NativeDatabaseBackend};
 
 /// The plan of `skyzen deploy --provider native`: bring this host to `[native.linux]`, install
 /// the systemd unit that starts the release binary and re-applies those settings before every
@@ -24,7 +24,9 @@ use skyzen_manifest::Manifest;
 ///
 /// # Errors
 ///
-/// Fails off Linux, when the release binary has not been built, when `[native.linux]` asks for a
+/// Fails off Linux, when the release binary has not been built or the service's transient user
+/// could not reach it, when `[native.server]` names no listen address or one the service cannot
+/// use, when a variable the application reads is set nowhere, when `[native.linux]` asks for a
 /// facility this host lacks or does not report, and when the deployment would change something
 /// and the CLI is not root.
 pub fn deploy(manifest: &Manifest, project: &Project, dry_run: bool) -> Result<ProviderPlan> {
@@ -46,7 +48,43 @@ pub fn deploy(manifest: &Manifest, project: &Project, dry_run: bool) -> Result<P
     let skyzen = std::env::current_exe().context("cannot locate the skyzen executable")?;
     let manifest_path = std::path::absolute(manifest.path())
         .with_context(|| format!("cannot make {} an absolute path", manifest.path().display()))?;
-    let unit = systemd::Unit::new(name, manifest.root_dir(), &binary, &skyzen, &manifest_path)?;
+    let root = std::path::absolute(manifest.root_dir()).with_context(|| {
+        format!(
+            "cannot make {} an absolute path",
+            manifest.root_dir().display()
+        )
+    })?;
+    let binary = std::path::absolute(&binary)
+        .with_context(|| format!("cannot make {} an absolute path", binary.display()))?;
+    #[cfg(unix)]
+    {
+        ensure_reachable(&root, false)?;
+        ensure_reachable(&binary, true)?;
+    }
+    let native = manifest.data().native.as_ref();
+    let sqlite = native.is_some_and(|native| {
+        native
+            .database
+            .values()
+            .any(|database| database.backend() == NativeDatabaseBackend::Sqlite)
+    });
+    let sandbox = systemd::Sandbox::of(
+        name,
+        native.and_then(|native| native.server.as_ref()),
+        unprivileged_port_start()?,
+        sqlite,
+    )?;
+    let unit = systemd::Unit::new(
+        name,
+        &systemd::Paths {
+            root: &root,
+            binary: &binary,
+            skyzen: &skyzen,
+            manifest: &manifest_path,
+        },
+        sandbox,
+    )?;
+    let variables = resolve_variables(manifest, VariableKind::ALL, |_| true)?;
     if !dry_run {
         crate::host::ensure_root("`skyzen deploy --provider native`")?;
     }
@@ -69,12 +107,78 @@ pub fn deploy(manifest: &Manifest, project: &Project, dry_run: bool) -> Result<P
 
     Ok(ProviderPlan {
         steps,
-        generated_files: vec![GeneratedFile {
-            path: unit.path(),
-            contents: FileContents::Public(unit.contents()?),
-        }],
+        generated_files: vec![
+            GeneratedFile {
+                path: unit.environment_file().to_path_buf(),
+                contents: FileContents::Secret(systemd::environment_file_contents(&variables)?),
+            },
+            GeneratedFile {
+                path: unit.path(),
+                contents: FileContents::Public(unit.contents()?),
+            },
+        ],
         ..ProviderPlan::default()
     })
+}
+
+/// Where the kernel says unprivileged processes may start binding ports
+/// (`ip-sysctl.rst`, `ip_unprivileged_port_start`).
+const UNPRIVILEGED_PORT_START: &str = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
+
+/// The lowest port a process without `CAP_NET_BIND_SERVICE` may bind on this host.
+fn unprivileged_port_start() -> Result<u16> {
+    let value = std::fs::read_to_string(UNPRIVILEGED_PORT_START)
+        .with_context(|| format!("cannot read {UNPRIVILEGED_PORT_START}"))?;
+    value
+        .trim()
+        .parse()
+        .with_context(|| format!("{UNPRIVILEGED_PORT_START} holds {value:?}, not a port"))
+}
+
+/// Refuse a path the service's transient user cannot reach: every ancestor directory has to be
+/// searchable by others, and the path itself searchable (a directory) or readable and executable
+/// (the binary), since `DynamicUser=` runs the service as a user that owns nothing.
+#[cfg(unix)]
+fn ensure_reachable(path: &std::path::Path, executable: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// `S_IXOTH` and `S_IROTH` (`inode(7)`).
+    const OTHERS_EXECUTE: u32 = 0o001;
+    const OTHERS_READ: u32 = 0o004;
+
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode())
+            .with_context(|| format!("cannot read the permissions of {}", path.display()))
+    };
+    for ancestor in path.ancestors().skip(1) {
+        if mode(ancestor)? & OTHERS_EXECUTE == 0 {
+            anyhow::bail!(
+                "{} is not searchable by other users, so the service's transient user cannot \
+                 reach {}; `chmod o+x {}` or deploy from a directory others can reach",
+                ancestor.display(),
+                path.display(),
+                ancestor.display()
+            );
+        }
+    }
+    let needed = if executable {
+        OTHERS_READ | OTHERS_EXECUTE
+    } else {
+        OTHERS_EXECUTE
+    };
+    if mode(path)? & needed != needed {
+        anyhow::bail!(
+            "{} is not {} by other users, so the service's transient user cannot use it",
+            path.display(),
+            if executable {
+                "readable and executable"
+            } else {
+                "searchable"
+            }
+        );
+    }
+    Ok(())
 }
 
 /// The plan of `skyzen deploy --provider native --host-only`: bring this host to
