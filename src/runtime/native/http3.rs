@@ -432,6 +432,7 @@ mod tests {
         stop: async_channel::Sender<Infallible>,
         drain: async_channel::Sender<Infallible>,
         drained: async_channel::Receiver<Infallible>,
+        release: async_channel::Sender<Infallible>,
         cores: Cores,
     }
 
@@ -456,6 +457,7 @@ mod tests {
 
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
+            let (release, released) = bounded::<Infallible>(1);
             let plan = Plan {
                 factory,
                 wrap: Ok,
@@ -468,7 +470,8 @@ mod tests {
                     alt_svc: AltSvc::h3(local.port()),
                 }),
             };
-            let cores = start(plan, bound, &stopping, &drain).expect("start the threads");
+            let cores =
+                start(plan, bound, &stopping, &drain, &released).expect("start the threads");
             for _ in 0..cores.threads {
                 cores
                     .ready
@@ -481,6 +484,7 @@ mod tests {
                 stop,
                 drain,
                 drained,
+                release,
                 cores,
             }
         }
@@ -489,8 +493,9 @@ mod tests {
         fn stop(self) {
             drop(self.stop);
             drop(self.drain);
-            assert!(self.cores.exited.recv_blocking().is_err());
             assert!(self.drained.recv_blocking().is_err());
+            drop(self.release);
+            assert!(self.cores.exited.recv_blocking().is_err());
         }
     }
 

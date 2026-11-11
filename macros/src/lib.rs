@@ -28,8 +28,9 @@ use syn::{
 ///
 /// Natively the services are built once and the queue consumers from those same instances; the
 /// router is built by a `Send` factory that each serving thread calls on itself, layering clones
-/// of the services around that thread's endpoint. The router never leaves its thread, so nothing
-/// the entry function builds has to be `Send`.
+/// of the services around that thread's endpoint — a service on zenwave rebound first to pools on
+/// that thread, as the `ServicePools` the runtime hands the setup says. The router never leaves its
+/// thread, so nothing the entry function builds has to be `Send`.
 ///
 /// On wasm the factory receives the `WinterCG` env explicitly (as `__skyzen_wasm_env`), so endpoint
 /// construction never depends on an ambient thread-local that concurrent invocations could race.
@@ -49,8 +50,14 @@ fn endpoint_factories(
         .collect();
     let captured: Vec<_> = injections
         .iter()
-        .map(|injection| &injection.ident)
+        .map(|injection| &injection.captured)
         .collect();
+    let per_thread: Vec<_> = injections
+        .iter()
+        .map(|injection| &injection.per_thread)
+        .collect();
+    // `__skyzen_pools` is the platform's `ServicePools`, the parameter of the closure this setup
+    // is the body of; it is `Copy`, so the factory carries its own to every thread.
     let native_setup = quote! {
         async move {
             #(#bindings)*
@@ -58,6 +65,7 @@ fn endpoint_factories(
             let __skyzen_endpoint_factory = move || {
                 #(let #captured = ::std::clone::Clone::clone(&#captured);)*
                 async move {
+                    #(#per_thread)*
                     let endpoint = #entry_call;
                     #(#layers)*
                     endpoint
@@ -162,7 +170,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
                     server: ::skyzen::runtime::native::apply_server_override(::std::env::args()),
                     azure_queue_triggers: #azure_queue_triggers,
                 },
-                || #native_setup,
+                |__skyzen_pools: ::skyzen::runtime::native::ServicePools| #native_setup,
                 #shutdown_hook,
             );
         }
@@ -2663,11 +2671,20 @@ struct PortableWiring {
 /// serving thread starts, and the factory each thread builds its router with layers a clone of it
 /// around that thread's endpoint. The service is `Send + Sync`; the router it is layered onto
 /// never has to be.
+///
+/// A service whose client speaks HTTP through zenwave is the exception: what the factory captures
+/// is the backend as setup built it, and each serving thread rebinds a clone of it to connection
+/// pools on its own runtime (`per_thread`) before layering it, so a request a thread serves sends
+/// its service calls on connections that thread drives.
 struct Injection {
-    /// The local the service is held in.
-    ident: proc_macro2::Ident,
-    /// `let <ident> = <init>;`
+    /// `let <local> = <init>;`, the local the service is held in.
     binding: proc_macro2::TokenStream,
+    /// The local the native factory captures and clones onto each serving thread: the service's
+    /// own, or the backend `per_thread` rebinds into the service's there.
+    captured: proc_macro2::Ident,
+    /// Run natively on each serving thread before `layer`; empty for a service every thread
+    /// shares as setup built it.
+    per_thread: proc_macro2::TokenStream,
     /// Wrap `endpoint` with the middleware that injects a clone of `<ident>`.
     layer: proc_macro2::TokenStream,
 }
@@ -2719,12 +2736,19 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
         // The bare `Kv`/`Storage`/`Queue` extractor names whichever service of that type is the
         // only one, so it is injected exactly when the type is unambiguous.
         let inject_bare = service_type_counts[&service.service_type] == 1;
-        injections.push(named_injection_tokens(
-            &binding,
-            &ident,
-            &native_init,
-            &cloudflare_init,
-            inject_bare,
+        injections.push(native_http_service(service, manifest).map_or_else(
+            || {
+                named_injection_tokens(
+                    &binding,
+                    &ident,
+                    &native_init,
+                    &cloudflare_init,
+                    inject_bare,
+                )
+            },
+            |backend| {
+                http_injection_tokens(&binding, &ident, &backend, &cloudflare_init, inject_bare)
+            },
         ));
         service_bindings.insert(service.name.clone(), binding);
     }
@@ -2735,12 +2759,19 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
         let native_init = generate_native_database_init(database, manifest);
         let cloudflare_init = generate_cloudflare_database_init(database, manifest);
         let inject_bare = default_database == Some(index);
-        injections.push(named_injection_tokens(
-            &binding,
-            &ident,
-            &native_init,
-            &cloudflare_init,
-            inject_bare,
+        injections.push(native_http_database(database, manifest).map_or_else(
+            || {
+                named_injection_tokens(
+                    &binding,
+                    &ident,
+                    &native_init,
+                    &cloudflare_init,
+                    inject_bare,
+                )
+            },
+            |backend| {
+                http_injection_tokens(&binding, &ident, &backend, &cloudflare_init, inject_bare)
+            },
         ));
     }
 
@@ -2947,6 +2978,79 @@ fn named_injection_tokens(
     cloudflare_init: &proc_macro2::TokenStream,
     inject_bare: bool,
 ) -> Injection {
+    Injection {
+        binding: quote! {
+            let #binding = {
+                #[cfg(not(target_arch = "wasm32"))]
+                { #native_init }
+                #[cfg(target_arch = "wasm32")]
+                { #cloudflare_init }
+            };
+        },
+        captured: binding.clone(),
+        per_thread: quote! {},
+        layer: injection_layer_tokens(binding, ident, inject_bare),
+    }
+}
+
+/// A native backend whose client speaks HTTP through zenwave, and so is rebound on each thread.
+struct HttpBackend {
+    /// The backend as setup builds it, once.
+    init: proc_macro2::TokenStream,
+    /// The portable wrapper it is injected as.
+    wrapper: proc_macro2::TokenStream,
+    /// A closure taking the backend and the thread's compio driver, and returning the backend on
+    /// connection pools that driver runs.
+    rebind: proc_macro2::TokenStream,
+}
+
+/// [`named_injection_tokens`] for a backend on zenwave: setup builds it once, as `backend`; the
+/// queue consumers get it rebound to the coordinating thread's pools, and every serving thread
+/// rebinds its own clone before wrapping and layering it.
+fn http_injection_tokens(
+    binding: &proc_macro2::Ident,
+    ident: &proc_macro2::Ident,
+    backend: &HttpBackend,
+    cloudflare_init: &proc_macro2::TokenStream,
+    inject_bare: bool,
+) -> Injection {
+    let HttpBackend {
+        init,
+        wrapper,
+        rebind,
+    } = backend;
+    let raw = format_ident!("{binding}_backend");
+    Injection {
+        binding: quote! {
+            #[cfg(not(target_arch = "wasm32"))]
+            let #raw = { #init };
+            let #binding = {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    #wrapper::new(__skyzen_pools.on_this_thread(
+                        ::std::clone::Clone::clone(&#raw),
+                        #rebind,
+                    ))
+                }
+                #[cfg(target_arch = "wasm32")]
+                { #cloudflare_init }
+            };
+        },
+        captured: raw.clone(),
+        per_thread: quote! {
+            let #binding = #wrapper::new(__skyzen_pools.on_this_thread(#raw, #rebind));
+        },
+        layer: injection_layer_tokens(binding, ident, inject_bare),
+    }
+}
+
+/// Wrap `endpoint` with the middleware that injects a clone of `binding` as its named newtype
+/// `ident`, and as the bare wrapper too when `inject_bare`.
+fn injection_layer_tokens(
+    binding: &proc_macro2::Ident,
+    ident: &proc_macro2::Ident,
+    inject_bare: bool,
+) -> proc_macro2::TokenStream {
     let bare = if inject_bare {
         quote! {
             let endpoint = ::skyzen::__private::with_middleware(
@@ -2957,24 +3061,12 @@ fn named_injection_tokens(
     } else {
         quote! {}
     };
-
-    Injection {
-        ident: binding.clone(),
-        binding: quote! {
-            let #binding = {
-                #[cfg(not(target_arch = "wasm32"))]
-                { #native_init }
-                #[cfg(target_arch = "wasm32")]
-                { #cloudflare_init }
-            };
-        },
-        layer: quote! {
-            let endpoint = ::skyzen::__private::with_middleware(
-                endpoint,
-                #ident::new(::std::clone::Clone::clone(&#binding)),
-            );
-            #bare
-        },
+    quote! {
+        let endpoint = ::skyzen::__private::with_middleware(
+            endpoint,
+            #ident::new(::std::clone::Clone::clone(&#binding)),
+        );
+        #bare
     }
 }
 
@@ -3405,19 +3497,7 @@ fn generate_native_database_init(
             }};
         }
         (DatabaseType::Sql, NativeDatabaseSection::RdsData(rds)) => {
-            // Either the wiring names all four values a Data API call is addressed by, and they
-            // are handed straight to `from_parts`, or it names none and `from_env` reads them.
-            // A half-written wiring never reaches here — the manifest parse rejects it — and is
-            // reported rather than assumed, so the rule has one implementation.
-            let parts = match rds.parts() {
-                Ok(parts) => parts,
-                Err(error) => {
-                    return compile_error_block(&format!("[native.database.{name}] {error}"));
-                }
-            };
-
-            let build = parts.map_or_else(|| rds_from_env_tokens(name), rds_from_parts_tokens);
-
+            let build = rds_data_tokens(name, rds);
             return quote! {{
                 let backend = #build;
                 ::skyzen::__services::Db::new(backend)
@@ -3436,6 +3516,87 @@ fn generate_native_database_init(
             .await
             .unwrap_or_else(|error| panic!("{}: {error}", #connect_message))
     }}
+}
+
+/// The RDS Data API backend one wiring builds.
+///
+/// Either the wiring names all four values a Data API call is addressed by, and they are handed
+/// straight to `from_parts`, or it names none and `from_env` reads them. A half-written wiring
+/// never reaches here — the manifest parse rejects it — and is reported rather than assumed, so the
+/// rule has one implementation.
+fn rds_data_tokens(name: &str, rds: &skyzen_manifest::RdsDataWiring) -> proc_macro2::TokenStream {
+    match rds.parts() {
+        Ok(parts) => parts.map_or_else(|| rds_from_env_tokens(name), rds_from_parts_tokens),
+        Err(error) => compile_error_block(&format!("[native.database.{name}] {error}")),
+    }
+}
+
+/// The backend of a portable service whose native client speaks HTTP through zenwave, or `None`
+/// for one that shares a client of another kind — or whose wiring is wrong, which
+/// [`generate_native_service_init`] reports.
+fn native_http_service(service: &ServiceEntry, manifest: &SkyzenManifest) -> Option<HttpBackend> {
+    let wiring = native_service_wiring(manifest, &service.name)?;
+    let rebind = http_rebind_tokens(&service.name, wiring)?;
+    Some(HttpBackend {
+        init: native_backend_tokens(service, wiring)?,
+        wrapper: service_wrapper_path(service.service_type),
+        rebind,
+    })
+}
+
+/// [`native_http_service`] for a portable database: the RDS Data API is the one on zenwave.
+fn native_http_database(
+    database: &DatabaseEntry,
+    manifest: &SkyzenManifest,
+) -> Option<HttpBackend> {
+    let wiring = native_database_wiring(manifest, &database.name)?;
+    let (DatabaseType::Sql, NativeDatabaseSection::RdsData(rds)) = (database.database_type, wiring)
+    else {
+        return None;
+    };
+    Some(HttpBackend {
+        init: rds_data_tokens(&database.name, rds),
+        wrapper: quote! { ::skyzen::__services::Db },
+        rebind: quote! {
+            |backend, io| backend.with_http_client(
+                ::skyzen_aws::sdk::ZenwaveHttpClient::system_on_current_thread(io),
+            )
+        },
+    })
+}
+
+/// The closure that rebinds one service backend to the calling thread's connection pools, for the
+/// backends whose client speaks HTTP through zenwave.
+fn http_rebind_tokens(
+    name: &str,
+    wiring: &NativeServiceSection,
+) -> Option<proc_macro2::TokenStream> {
+    Some(match wiring {
+        NativeServiceSection::S3(_) => quote! {
+            |backend, io| backend.with_http_client(
+                ::skyzen_s3::ZenwaveHttpClient::system_on_current_thread(io),
+            )
+        },
+        NativeServiceSection::DynamoDb(_) | NativeServiceSection::Sqs(_) => quote! {
+            |backend, io| backend.with_http_client(
+                ::skyzen_aws::sdk::ZenwaveHttpClient::system_on_current_thread(io),
+            )
+        },
+        NativeServiceSection::Blob(_) | NativeServiceSection::ServiceBus(_) => quote! {
+            |backend, io| backend.with_http(::skyzen_azure::AzureHttp::system_on_current_thread(io))
+        },
+        NativeServiceSection::StorageQueue(_) => {
+            let failure = connect_failure_lit(name, "rebind its Azure Storage queue client");
+            quote! {
+                |backend, io| backend
+                    .with_http(::skyzen_azure::AzureHttp::system_on_current_thread(io))
+                    .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+            }
+        }
+        NativeServiceSection::Redis(_)
+        | NativeServiceSection::Cosmos(_)
+        | NativeServiceSection::Memory(_) => return None,
+    })
 }
 
 /// The RDS Data API backend built from the four values a wiring names.

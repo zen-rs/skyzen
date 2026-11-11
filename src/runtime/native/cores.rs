@@ -230,7 +230,10 @@ pub(super) struct Cores {
 /// there is one.
 ///
 /// Every thread stops accepting when `stop` closes, lets its open connections finish, and holds a
-/// clone of `drain` for as long as it or any request on it is alive.
+/// clone of `drain` for as long as it or any request on it is alive. It then keeps its runtime
+/// running until `release` closes — once the process has drained — because the work it handed the
+/// global executor, a post-response task, may still be sending on the connection pools that
+/// runtime drives.
 ///
 /// # Errors
 ///
@@ -240,6 +243,7 @@ pub(super) fn start<F, A, W>(
     bound: Bound,
     stop: &Receiver<Infallible>,
     drain: &Sender<Infallible>,
+    release: &Receiver<Infallible>,
 ) -> io::Result<Cores>
 where
     F: EndpointFactory,
@@ -273,13 +277,14 @@ where
         let plan = Arc::clone(&plan);
         let stop = stop.clone();
         let drain = drain.clone();
+        let release = release.clone();
         let ready = ready_tx.clone();
         let exited = exited_tx.clone();
         let udp = udp.next().flatten();
         thread::Builder::new()
             .name(format!("skyzen-{index}"))
             .spawn(move || {
-                work(&plan, socket, udp, stop, drain, &ready);
+                work(&plan, socket, udp, stop, drain, &release, &ready);
                 drop(exited);
             })?;
     }
@@ -291,13 +296,15 @@ where
     })
 }
 
-/// The body of one serving thread: a compio runtime that serves until `stop` closes.
+/// The body of one serving thread: a compio runtime that serves until `stop` closes and runs until
+/// `release` does.
 fn work<F, A, W>(
     plan: &Arc<Plan<F, W>>,
     socket: Socket,
     udp: Option<std::net::UdpSocket>,
     stop: Receiver<Infallible>,
     drain: Sender<Infallible>,
+    release: &Receiver<Infallible>,
     ready: &Sender<Result<(), RuntimeFailure>>,
 ) where
     F: EndpointFactory,
@@ -399,6 +406,9 @@ fn work<F, A, W>(
             }
         };
         futures_util::future::join(tcp, h3).await;
+        // Both servers have returned, and with them the endpoint and the drain token it held.
+        // Resolves with an error once the coordinator drops the sender.
+        let _ = release.recv().await;
     });
 }
 
@@ -548,6 +558,7 @@ mod tests {
         stop: async_channel::Sender<Infallible>,
         drain: async_channel::Sender<Infallible>,
         drained: async_channel::Receiver<Infallible>,
+        release: async_channel::Sender<Infallible>,
         cores: Cores,
     }
 
@@ -555,6 +566,7 @@ mod tests {
         fn start(bound: Bound, server: HttpServer) -> Self {
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
+            let (release, released) = bounded::<Infallible>(1);
             let plan = Plan {
                 factory: || async { ServingThread },
                 wrap: Ok,
@@ -564,7 +576,8 @@ mod tests {
                 tls: None,
                 http3: None,
             };
-            let cores = start(plan, bound, &stopping, &drain).expect("start the threads");
+            let cores =
+                start(plan, bound, &stopping, &drain, &released).expect("start the threads");
             for _ in 0..cores.threads {
                 cores
                     .ready
@@ -576,16 +589,19 @@ mod tests {
                 stop,
                 drain,
                 drained,
+                release,
                 cores,
             }
         }
 
-        /// Stop every thread and wait until each has exited and released its drain token.
+        /// Stop every thread, wait until each has released its drain token, then let them exit
+        /// and wait until each has.
         fn stop(self) {
             drop(self.stop);
             drop(self.drain);
-            assert!(self.cores.exited.recv_blocking().is_err());
             assert!(self.drained.recv_blocking().is_err());
+            drop(self.release);
+            assert!(self.cores.exited.recv_blocking().is_err());
         }
     }
 

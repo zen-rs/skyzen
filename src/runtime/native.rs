@@ -743,6 +743,42 @@ impl std::fmt::Display for StartupError {
 
 impl std::error::Error for StartupError {}
 
+/// Where the HTTP service clients `#[skyzen::main]` builds — the AWS and Azure backends, on
+/// zenwave — keep their connections, as the platform decides.
+///
+/// On a thread-per-core server, and under the Azure Functions host that is one, every thread runs
+/// a compio runtime, and each rebinds its clients to a connection pool of its own: a service
+/// request made on a serving thread is sent on a connection that thread's runtime drives. The
+/// coordinating thread does the same for the clients the queue consumers poll with. Under AWS
+/// Lambda the one thread runs the adapter's tokio runtime, so the clients keep the pools zenwave
+/// runs on its own driver thread.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct ServicePools {
+    per_thread: bool,
+}
+
+impl ServicePools {
+    /// `service` as the calling thread uses it: `rebind` hands it the thread's compio driver to
+    /// pool on where the platform's threads run compio; otherwise it is returned as built.
+    ///
+    /// # Panics
+    ///
+    /// `rebind` panics when it runs on a thread that is not running a compio runtime, which on a
+    /// platform that pools per thread is a thread Skyzen did not start.
+    pub fn on_this_thread<S>(
+        self,
+        service: S,
+        rebind: impl FnOnce(S, http_kit_io::compio::Compio) -> S,
+    ) -> S {
+        if self.per_thread {
+            rebind(service, http_kit_io::compio::Compio)
+        } else {
+            service
+        }
+    }
+}
+
 /// Serve the application on one compio runtime per core, and run the declared queue consumers
 /// beside them.
 ///
@@ -751,6 +787,8 @@ impl std::error::Error for StartupError {}
 /// `[[native.queue_consumer]]` — so both are built from the same service instances rather than
 /// from two independent connections to one backend. Every serving thread calls the factory on
 /// itself, so each has a router of its own and the router and everything it holds may be `!Send`.
+/// `setup` is handed the platform's [`ServicePools`], which the factory carries to each thread so
+/// the thread rebinds its HTTP service clients to connection pools of its own.
 ///
 /// # Where this ends up running
 ///
@@ -781,9 +819,11 @@ impl std::error::Error for StartupError {}
 /// shutdown, does not serve.
 ///
 /// After `Ctrl+C` every listener stops accepting and the consumers stop initiating receives;
-/// outstanding connections and in-flight batches are awaited for up to
+/// outstanding connections, post-response tasks and in-flight batches are awaited for up to
 /// [`SHUTDOWN_GRACE_PERIOD`], and only then does `on_shutdown` run — so a cleanup hook observes a
-/// server with no requests and no batches still in flight.
+/// server with no requests and no batches still in flight. A serving thread keeps its runtime
+/// running until then, so a post-response task still reaches the connection pools of the thread
+/// whose request spawned it.
 ///
 /// A consumer that can never receive at all, and a listener that cannot be bound, both end the
 /// process with a non-zero status once `on_shutdown` has run: a misconfigured deployment should
@@ -794,7 +834,7 @@ impl std::error::Error for StartupError {}
 /// Panics if the coordinating thread's runtime cannot be created.
 pub fn launch<Setup, F, C, Hook, HookFut>(
     options: LaunchOptions,
-    setup: impl FnOnce() -> Setup,
+    setup: impl FnOnce(ServicePools) -> Setup,
     on_shutdown: Hook,
 ) where
     Setup: Future<Output = (F, C)>,
@@ -851,7 +891,9 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
     let failed = runtime.block_on(async move {
         tracing::info!("Skyzen application starting up");
 
-        let (factory, consumers) = setup().await;
+        // Every thread this path runs services on — this one and each serving thread — runs a
+        // compio runtime its clients can pool on.
+        let (factory, consumers) = setup(ServicePools { per_thread: true }).await;
         let outcome = match platform {
             Platform::Lambda => unreachable!("handed over before the runtime was built"),
             Platform::Server => {
@@ -1002,9 +1044,11 @@ where
     };
 
     // A drain token for everything that must finish before the process may stop, and the
-    // broadcast that tells the threads to begin. Nothing is sent through either.
+    // broadcast that tells the threads to begin, and the one that lets them end once the drain is
+    // over. Nothing is sent through any of them.
     let (drain, connections) = bounded::<Infallible>(1);
     let (stop, stopping) = bounded::<Infallible>(1);
+    let (release, released) = bounded::<Infallible>(1);
 
     let queue_consumers = ConsumerChannels::start(consumers, &SmolGlobal, &drain);
 
@@ -1021,7 +1065,7 @@ where
             alt_svc: skyzen_hyper::AltSvc::h3(port),
         }),
     };
-    let started = cores::start(plan, bound, &stopping, &drain)?;
+    let started = cores::start(plan, bound, &stopping, &drain, &released)?;
 
     let mut failure = None;
     for _ in 0..started.threads {
@@ -1080,6 +1124,9 @@ where
     drop(stop);
     drop(drain);
     let severed = drain_connections(&connections, SHUTDOWN_GRACE_PERIOD).await;
+    // Nothing that could still send on a serving thread's connection pools is left, or it was
+    // just cut off: the threads may stop their runtimes.
+    drop(release);
 
     // The socket file is ours: left behind it becomes the stale path the next bind has to probe,
     // and a dead process gets no later chance to clean it up. Already gone is not a failure — the
@@ -1150,7 +1197,7 @@ fn bind_unix_socket(path: &std::path::Path) -> std::io::Result<std::os::unix::ne
 #[cfg(feature = "lambda")]
 fn run_on_lambda<Setup, F, C>(
     _options: LaunchOptions,
-    setup: impl FnOnce() -> Setup,
+    setup: impl FnOnce(ServicePools) -> Setup,
 ) -> Result<core::convert::Infallible, StartupError>
 where
     Setup: Future<Output = (F, C)>,
@@ -1158,9 +1205,10 @@ where
     C: ConsumerSet,
 {
     // The adapter's runtime is single-threaded, so the endpoint is built once, on the thread that
-    // serves every invocation.
+    // serves every invocation. That thread runs tokio, which zenwave's per-thread pools cannot run
+    // on, so the HTTP service clients stay on zenwave's driver thread.
     skyzen_lambda::run(|| async move {
-        let (factory, consumers) = setup().await;
+        let (factory, consumers) = setup(ServicePools { per_thread: false }).await;
         (factory.endpoint().await, LambdaConsumers(consumers))
     })
     .map_err(|error| StartupError::Lambda(error.to_string()))?;
@@ -1176,7 +1224,7 @@ where
 #[allow(clippy::needless_pass_by_value)]
 fn run_on_lambda<Setup, F, C>(
     _options: LaunchOptions,
-    _setup: impl FnOnce() -> Setup,
+    _setup: impl FnOnce(ServicePools) -> Setup,
 ) -> Result<core::convert::Infallible, StartupError>
 where
     Setup: Future<Output = (F, C)>,
