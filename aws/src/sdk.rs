@@ -14,12 +14,10 @@
 //! configuration through it — what every `from_env` constructor in this crate and in `skyzen-s3`
 //! calls.
 
-use core::{
-    fmt,
-    future::Future as _,
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
+use core::{fmt, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
 };
 
 use aws_config::{
@@ -38,53 +36,96 @@ use aws_smithy_runtime_api::client::{
 };
 use aws_smithy_types::body::SdkBody;
 use http_kit::{Body, Endpoint as _};
-use pin_project_lite::pin_project;
-use zenwave::{backend::NativeBackend, Transport};
+use zenwave::{backend::NativeBackend, Transport, TransportBuilder};
 
 use crate::credential_process::CredentialProcessProvider;
 
-/// The AWS SDK's [`HttpClient`], on a zenwave [`NativeBackend`].
+/// The AWS SDK's [`HttpClient`], on zenwave [`NativeBackend`]s.
 ///
-/// Clones share the backend's connection pool. A `4xx` or `5xx` answer is handed to the SDK as the
-/// response it is, so the SDK reads the service's error from its body as it does on any client.
+/// Clones share the backends and their connection pools. A `4xx` or `5xx` answer is handed to the
+/// SDK as the response it is, so the SDK reads the service's error from its body as it does on any
+/// client.
 ///
 /// # Timeouts
 ///
 /// The SDK's operation and attempt timeouts run on [`AsyncIoSleep`] and bound every call. The
-/// connect and read timeouts in the [`HttpConnectorSettings`] the SDK passes are applied here, on
-/// async-io timers, though zenwave's native backend exposes no per-socket timeout: the response
-/// head must arrive within the connect timeout plus the read timeout (one alone bounds it by
-/// itself), and then no body chunk may take longer than the read timeout.
+/// connect and read timeouts in the [`HttpConnectorSettings`] the SDK passes are zenwave's own:
+/// each distinct pair gets a [`NativeBackend`] over a [`Transport`] carrying exactly those
+/// timeouts, built on first use and kept, so the SDK's clients with equal settings share one pool,
+/// as they do on aws-smithy's own hyper client. Each backend runs its own driver thread.
+///
+/// - The connect timeout bounds one connection attempt: DNS, TCP, a proxy tunnel and TLS. It
+///   reaches the SDK as a [`ConnectorError`] timeout.
+/// - The read timeout bounds each wait for bytes of the response, head and body. A head that
+///   takes longer is a [`ConnectorError`] timeout; a body that stalls fails its read with an
+///   [`std::io::ErrorKind::TimedOut`] error wrapping [`zenwave::Error::Timeout`].
 #[derive(Clone)]
 pub struct ZenwaveHttpClient {
-    backend: NativeBackend,
+    /// Describes the base transport, proxy and trust roots, each backend's timeouts go on top of.
+    transport: Arc<dyn Fn() -> TransportBuilder + Send + Sync>,
+    /// One backend per distinct settings. The SDK calls [`HttpClient::http_connector`] from its
+    /// own threads, so the map needs a lock; it is held only to look up or build one backend.
+    backends: Arc<Mutex<HashMap<Timeouts, NativeBackend>>>,
+}
+
+/// The part of [`HttpConnectorSettings`] a backend depends on, which is not `Hash` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Timeouts {
+    connect: Option<Duration>,
+    read: Option<Duration>,
 }
 
 impl ZenwaveHttpClient {
-    /// A client sending its requests through `backend`.
+    /// A client whose backends are built on the transport `transport` describes, with the SDK's
+    /// timeouts added. `transport` runs once per distinct set of timeouts.
     #[must_use]
-    pub const fn new(backend: NativeBackend) -> Self {
-        Self { backend }
+    pub fn new(transport: impl Fn() -> TransportBuilder + Send + Sync + 'static) -> Self {
+        Self {
+            transport: Arc::new(transport),
+            backends: Arc::default(),
+        }
     }
 
-    /// A client on the system transport — the OS proxy settings and trust store — whose pool
-    /// runs on zenwave's own compio driver thread, shared with every other user of that
-    /// transport.
+    /// A client on the system transport — the OS proxy settings and trust store — whose pools
+    /// run on zenwave's compio driver threads.
+    #[must_use]
+    pub fn system() -> Self {
+        Self::new(Transport::builder)
+    }
+
+    /// The backend for `timeouts`, built on first use.
     ///
     /// # Panics
     ///
-    /// If zenwave cannot start its driver thread.
-    #[must_use]
-    pub fn system() -> Self {
-        Self::new(NativeBackend::new(Transport::system()))
+    /// If the transport cannot be built, for instance when the system trust store cannot be
+    /// initialised, or zenwave cannot start its driver thread.
+    fn backend(&self, timeouts: Timeouts) -> NativeBackend {
+        self.backends
+            .lock()
+            .expect("a panic while building a backend leaves the cache unusable")
+            .entry(timeouts)
+            .or_insert_with(|| {
+                let mut transport = (self.transport)();
+                if let Some(connect) = timeouts.connect {
+                    transport = transport.connect_timeout(connect);
+                }
+                if let Some(read) = timeouts.read {
+                    transport = transport.read_timeout(read);
+                }
+                let transport = transport.build().unwrap_or_else(|error| {
+                    panic!("the AWS SDK's transport cannot be built: {error}")
+                });
+                NativeBackend::new(transport)
+            })
+            .clone()
     }
 }
 
 impl fmt::Debug for ZenwaveHttpClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ZenwaveHttpClient")
-            .field("backend", &self.backend)
-            .finish()
+            .field("backends", &self.backends)
+            .finish_non_exhaustive()
     }
 }
 
@@ -95,111 +136,35 @@ impl HttpClient for ZenwaveHttpClient {
         _components: &RuntimeComponents,
     ) -> SharedHttpConnector {
         SharedHttpConnector::new(ZenwaveConnector {
-            backend: self.backend.clone(),
-            head_timeout: head_timeout(settings),
-            read_timeout: settings.read_timeout(),
+            backend: self.backend(Timeouts {
+                connect: settings.connect_timeout(),
+                read: settings.read_timeout(),
+            }),
         })
     }
 }
 
-/// How long a response head may take: the connect timeout plus the read timeout, or whichever of
-/// the two is set. `None` when neither is.
-fn head_timeout(settings: &HttpConnectorSettings) -> Option<Duration> {
-    match (settings.connect_timeout(), settings.read_timeout()) {
-        (Some(connect), Some(read)) => Some(connect.saturating_add(read)),
-        (connect, read) => connect.or(read),
-    }
-}
-
-/// An [`HttpConnector`] bound to one set of [`HttpConnectorSettings`].
+/// An [`HttpConnector`] on the [`NativeBackend`] built for one set of [`HttpConnectorSettings`].
 #[derive(Debug, Clone)]
 struct ZenwaveConnector {
     backend: NativeBackend,
-    /// The most the response head may take, connecting included.
-    head_timeout: Option<Duration>,
-    /// The most a wait for the next body chunk may take.
-    read_timeout: Option<Duration>,
 }
 
 impl HttpConnector for ZenwaveConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let mut backend = self.backend.clone();
-        let head_timeout = self.head_timeout;
-        let read_timeout = self.read_timeout;
         HttpConnectorFuture::new(async move {
             let mut request = request
                 .try_into_http1x()
                 .map_err(|error| ConnectorError::user(error.into()))?
                 .map(Body::new);
-            let answer = async { backend.respond(&mut request).await.map_err(connector_error) };
-            let response = match head_timeout {
-                Some(limit) => {
-                    futures_lite::future::or(answer, async {
-                        async_io::Timer::after(limit).await;
-                        Err(connector_error(zenwave::Error::Timeout))
-                    })
-                    .await?
-                }
-                None => answer.await?,
-            };
-            HttpResponse::try_from(response.map(|body| {
-                SdkBody::from_body_1_x(ReadTimeout {
-                    body,
-                    limit: read_timeout,
-                    timer: None,
-                })
-            }))
-            .map_err(|error| ConnectorError::other(error.into(), None))
+            let response = backend
+                .respond(&mut request)
+                .await
+                .map_err(connector_error)?;
+            HttpResponse::try_from(response.map(SdkBody::from_body_1_x))
+                .map_err(|error| ConnectorError::other(error.into(), None))
         })
-    }
-}
-
-pin_project! {
-    /// A response body whose wait for each frame is bounded by `limit`.
-    struct ReadTimeout<B> {
-        #[pin]
-        body: B,
-        limit: Option<Duration>,
-        // The running timer of the frame being waited for.
-        timer: Option<async_io::Timer>,
-    }
-}
-
-impl<B> http_body::Body for ReadTimeout<B>
-where
-    B: http_body::Body,
-    B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
-{
-    type Data = B::Data;
-    type Error = Box<dyn core::error::Error + Send + Sync>;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let this = self.project();
-        if let Poll::Ready(frame) = this.body.poll_frame(cx) {
-            *this.timer = None;
-            return Poll::Ready(frame.map(|frame| frame.map_err(Into::into)));
-        }
-        if let Some(limit) = *this.limit {
-            let timer = this
-                .timer
-                .get_or_insert_with(|| async_io::Timer::after(limit));
-            if Pin::new(timer).poll(cx).is_ready() {
-                *this.timer = None;
-                return Poll::Ready(Some(Err(Box::new(zenwave::Error::Timeout))));
-            }
-        }
-        Poll::Pending
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.body.size_hint()
     }
 }
 
@@ -309,6 +274,11 @@ mod tests {
         timeouts: TimeoutConfig,
         retries: RetryConfig,
     ) -> DynamoKv {
+        kv_at(format!("http://{}", server.addr()), timeouts, retries).await
+    }
+
+    /// [`kv_with`], sending its requests to `endpoint`.
+    async fn kv_at(endpoint: String, timeouts: TimeoutConfig, retries: RetryConfig) -> DynamoKv {
         let config = config_loader(ZenwaveHttpClient::system())
             .timeout_config(timeouts)
             .retry_config(retries)
@@ -320,7 +290,7 @@ mod tests {
                 None,
                 "loopback",
             ))
-            .endpoint_url(format!("http://{}", server.addr()))
+            .endpoint_url(endpoint)
             .load()
             .await;
         DynamoKv::new(aws_sdk_dynamodb::Client::new(&config), "orders", "pk")
@@ -423,29 +393,20 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2, "one failure, one retry");
     }
 
-    /// A server that stalls for `delay` before answering, read by a client configured with
-    /// `timeouts`: the call fails as a timeout, within the limit plus slack and well before the
-    /// answer would have come.
-    async fn assert_stalled_call_times_out(timeouts: TimeoutConfig, limit: Duration) {
-        const DELAY: Duration = Duration::from_secs(5);
-        assert_no_tokio_runtime();
-        let server = LoopbackServer::start(|_| {
-            std::thread::sleep(DELAY);
-            answer(StatusCode::OK, &serde_json::json!({}))
-        });
+    /// How much later than its limit a timed-out call may fail: signing, scheduling and the
+    /// timer's own granularity.
+    const SLACK: Duration = Duration::from_millis(700);
 
-        let started = Instant::now();
-        let error = kv_with(&server, timeouts, RetryConfig::disabled())
-            .await
-            .get(KEY)
-            .await
-            .expect_err("a stalled server must time the call out");
-
-        let elapsed = started.elapsed();
-        assert!(elapsed >= limit, "failed after {elapsed:?}: {error}");
+    /// Fails unless `call` ended as a timeout no sooner than `limit` and within `SLACK` after it,
+    /// with `elapsed` measured from the call's start.
+    fn assert_timed_out_at(limit: Duration, elapsed: Duration, error: &impl std::fmt::Debug) {
         assert!(
-            elapsed < DELAY,
-            "waited out the stall ({elapsed:?}): {error}"
+            elapsed >= limit,
+            "failed early, after {elapsed:?}: {error:?}"
+        );
+        assert!(
+            elapsed < limit + SLACK,
+            "failed late, after {elapsed:?}: {error:?}"
         );
         assert!(
             format!("{error:?}").to_lowercase().contains("timeout"),
@@ -454,77 +415,102 @@ mod tests {
     }
 
     /// The read timeout set on the SDK's configuration reaches the connector and bounds the wait
-    /// for the response.
+    /// for the response head, which a server stalls for far longer.
     #[compio::test]
     async fn a_configured_read_timeout_bounds_a_stalled_response() {
+        assert_no_tokio_runtime();
         let limit = Duration::from_millis(300);
-        // The connect timeout is set too, since aws-config defaults it to seconds and the head's
-        // bound is the two together.
-        assert_stalled_call_times_out(
-            TimeoutConfig::builder()
-                .connect_timeout(Duration::from_millis(100))
-                .read_timeout(limit)
-                .build(),
-            limit,
-        )
-        .await;
-    }
-
-    /// The connect timeout alone bounds the response head too: zenwave has no separate connect
-    /// phase to apply it to.
-    #[compio::test]
-    async fn a_configured_connect_timeout_bounds_a_stalled_response() {
-        let limit = Duration::from_millis(300);
-        assert_stalled_call_times_out(
-            TimeoutConfig::builder().connect_timeout(limit).build(),
-            limit,
-        )
-        .await;
-    }
-
-    /// A body that never produces a frame.
-    struct Stalled;
-
-    impl http_body::Body for Stalled {
-        type Data = http_kit::utils::Bytes;
-        type Error = std::convert::Infallible;
-
-        fn poll_frame(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-            std::task::Poll::Pending
-        }
-    }
-
-    /// A body that stalls mid-transfer fails with a timeout once the read timeout passes, instead
-    /// of waiting forever.
-    #[compio::test]
-    async fn a_stalled_body_times_out_after_the_read_timeout() {
-        use std::pin::pin;
-
-        let limit = Duration::from_millis(200);
-        let mut body = pin!(super::ReadTimeout {
-            body: Stalled,
-            limit: Some(limit),
-            timer: None,
+        let server = LoopbackServer::start(|_| {
+            std::thread::sleep(Duration::from_secs(5));
+            answer(StatusCode::OK, &serde_json::json!({}))
         });
 
         let started = Instant::now();
-        let frame =
-            futures_lite::future::poll_fn(|cx| http_body::Body::poll_frame(body.as_mut(), cx))
-                .await
-                .expect("the stall ends in an error, not the end of the body");
+        let error = kv_with(
+            &server,
+            TimeoutConfig::builder().read_timeout(limit).build(),
+            RetryConfig::disabled(),
+        )
+        .await
+        .get(KEY)
+        .await
+        .expect_err("a stalled server must time the call out");
 
-        assert!(started.elapsed() >= limit);
-        let error = frame.expect_err("a stalled body is an error");
-        assert!(
-            matches!(
-                error.downcast_ref::<zenwave::Error>(),
-                Some(zenwave::Error::Timeout)
-            ),
-            "{error}"
-        );
+        assert_timed_out_at(limit, started.elapsed(), &error);
+    }
+
+    /// The connect timeout bounds a connection that never completes its TLS handshake: a peer that
+    /// accepts the TCP connection and says nothing.
+    #[compio::test]
+    async fn a_configured_connect_timeout_bounds_a_stalled_response() {
+        assert_no_tokio_runtime();
+        let limit = Duration::from_millis(300);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a silent listener");
+        let addr = listener.local_addr().expect("the listener has an address");
+        // Holds every accepted connection open and silent until the test ends.
+        let (stop, stopped) = mpsc::channel::<()>();
+        let silent = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            listener
+                .set_nonblocking(true)
+                .expect("a non-blocking listener");
+            while stopped.try_recv() == Err(mpsc::TryRecvError::Empty) {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            drop(held);
+        });
+
+        let started = Instant::now();
+        let error = kv_at(
+            format!("https://{addr}"),
+            TimeoutConfig::builder().connect_timeout(limit).build(),
+            RetryConfig::disabled(),
+        )
+        .await
+        .get(KEY)
+        .await
+        .expect_err("a handshake that never completes must time the call out");
+        let elapsed = started.elapsed();
+
+        drop(stop);
+        silent.join().expect("the silent listener thread ends");
+        assert_timed_out_at(limit, elapsed, &error);
+    }
+
+    /// A body that stalls mid-transfer fails with a timeout once the read timeout passes, instead
+    /// of waiting forever: the server announces a thousand bytes, sends ten and goes quiet.
+    #[compio::test]
+    async fn a_stalled_body_times_out_after_the_read_timeout() {
+        use futures_lite::stream::{self, StreamExt as _};
+
+        assert_no_tokio_runtime();
+        let limit = Duration::from_millis(300);
+        let server = LoopbackServer::start(|_| {
+            let first = stream::once(Ok::<_, std::io::Error>(
+                http_kit::utils::Bytes::from_static(b"{\"Item\":{\""),
+            ));
+            let mut response = Response::new(Body::from_stream(first.chain(stream::pending())));
+            response
+                .headers_mut()
+                .insert(http_kit::header::CONTENT_LENGTH, 1000.into());
+            response
+        });
+
+        let started = Instant::now();
+        let error = kv_with(
+            &server,
+            TimeoutConfig::builder().read_timeout(limit).build(),
+            RetryConfig::disabled(),
+        )
+        .await
+        .get(KEY)
+        .await
+        .expect_err("a body that stalls must time the call out");
+
+        assert_timed_out_at(limit, started.elapsed(), &error);
     }
 
     /// A `4xx` is the service's answer, not a transport failure: the SDK reads the error code from
