@@ -6,19 +6,19 @@
 //! threads the native server runs on do not have.
 //!
 //! - [`ZenwaveHttpClient`] sends each request through a zenwave [`NativeBackend`]: a `Send + Sync`
-//!   handle onto a connection pool that lives on one thread's compio driver, so an SDK future —
-//!   which must be `Send` — stays `Send` while every socket stays on that driver.
+//!   handle onto a connection pool that lives on one thread's compio runtime, so an SDK future —
+//!   which must be `Send` — stays `Send` while every socket stays on that runtime. The pools run on
+//!   zenwave's own driver thread ([`ZenwaveHttpClient::system`]) or on the thread that built the
+//!   client ([`ZenwaveHttpClient::system_on_current_thread`]), which is how each of Skyzen's
+//!   serving threads keeps connections of its own.
 //! - [`AsyncIoSleep`] waits on an async-io timer, which any executor can poll.
 //!
 //! [`config_loader`] wires both into aws-config's loader, and [`load_config`] loads the ambient
 //! configuration through it — what every `from_env` constructor in this crate and in `skyzen-s3`
 //! calls.
 
-use core::{fmt, time::Duration};
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, PoisonError},
-};
+use core::{fmt, future::Future, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use aws_config::{
     environment::EnvironmentVariableCredentialsProvider,
@@ -36,7 +36,10 @@ use aws_smithy_runtime_api::client::{
 };
 use aws_smithy_types::body::SdkBody;
 use http_kit::{Body, Endpoint as _};
-use zenwave::{backend::NativeBackend, Transport, TransportBuilder};
+use zenwave::{
+    backend::{NativeBackend, NativeIo},
+    Transport, TransportBuilder,
+};
 
 use crate::credential_process::CredentialProcessProvider;
 
@@ -46,13 +49,26 @@ use crate::credential_process::CredentialProcessProvider;
 /// SDK as the response it is, so the SDK reads the service's error from its body as it does on any
 /// client.
 ///
+/// # Where the connections live
+///
+/// `P` names the thread the connection pools run on:
+///
+/// - [`SharedDriver`] ([`system`](Self::system), [`new`](Self::new)): a zenwave driver thread,
+///   started by the first request, for callers on no runtime of their own.
+/// - [`ThreadPools`] ([`system_on_current_thread`](Self::system_on_current_thread),
+///   [`on_current_thread`](Self::on_current_thread)): the compio runtime of the thread that built
+///   the client. A thread-per-core server builds one on each serving thread, and a request made
+///   there never leaves it. A request made on another thread — a background task on the global
+///   executor — still reaches the pool, over a channel to its thread; once that thread's runtime
+///   has stopped, it fails.
+///
 /// # Timeouts
 ///
 /// The SDK's operation and attempt timeouts run on [`AsyncIoSleep`] and bound every call. The
 /// connect and read timeouts in the [`HttpConnectorSettings`] the SDK passes are zenwave's own:
 /// each distinct pair gets a [`NativeBackend`] over a [`Transport`] carrying exactly those
 /// timeouts, built on first use and kept, so the SDK's clients with equal settings share one pool,
-/// as they do on aws-smithy's own hyper client. Each backend runs its own driver thread.
+/// as they do on aws-smithy's own hyper client.
 ///
 /// - The connect timeout bounds one connection attempt: DNS, TCP, a proxy tunnel and TLS. It
 ///   reaches the SDK as a [`ConnectorError`] timeout.
@@ -60,19 +76,226 @@ use crate::credential_process::CredentialProcessProvider;
 ///   takes longer is a [`ConnectorError`] timeout; a body that stalls fails its read with an
 ///   [`std::io::ErrorKind::TimedOut`] error wrapping [`zenwave::Error::Timeout`].
 #[derive(Clone)]
-pub struct ZenwaveHttpClient {
+pub struct ZenwaveHttpClient<P = SharedDriver> {
     /// Describes the base transport, proxy and trust roots, each backend's timeouts go on top of.
     transport: Arc<dyn Fn() -> TransportBuilder + Send + Sync>,
-    /// One backend per distinct settings. The SDK calls [`HttpClient::http_connector`] from its
-    /// own threads, so the map needs a lock; it is held only to look up or build one backend.
-    backends: Arc<Mutex<HashMap<Timeouts, NativeBackend>>>,
+    /// One backend per distinct settings, shared by every clone.
+    backends: Backends,
+    /// Where a backend's pool is started.
+    pools: P,
 }
 
-/// The part of [`HttpConnectorSettings`] a backend depends on, which is not `Hash` itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Timeouts {
-    connect: Option<Duration>,
-    read: Option<Duration>,
+impl<P: fmt::Debug> fmt::Debug for ZenwaveHttpClient<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZenwaveHttpClient")
+            .field("backends", &self.backends)
+            .field("pools", &self.pools)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a [`ZenwaveHttpClient`]'s connection pools run: [`SharedDriver`] or [`ThreadPools`].
+pub trait Pools: sealed::Sealed {}
+
+/// What the sealed half of [`Pools`] names: public items no path outside this module reaches.
+mod sealed {
+    use core::{fmt, future::Future, time::Duration};
+    use std::{
+        collections::{hash_map::Entry, HashMap},
+        sync::{Arc, Mutex, PoisonError},
+    };
+
+    use zenwave::{backend::NativeBackend, Transport};
+
+    /// How a pool is started; sealed, because the two kinds are the only two places a pool runs.
+    pub trait Sealed: Clone + fmt::Debug + Send + Sync + 'static {
+        /// The backend for `timeouts`: the one in `backends`, or one built over `transport()` and
+        /// kept there.
+        fn backend(
+            &self,
+            backends: &Backends,
+            timeouts: Timeouts,
+            transport: impl FnOnce() -> Result<Transport, Unavailable> + Send,
+        ) -> impl Future<Output = Result<NativeBackend, Unavailable>> + Send + 'static;
+    }
+
+    /// The part of `HttpConnectorSettings` a backend depends on, which is not `Hash` itself.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Timeouts {
+        pub connect: Option<Duration>,
+        pub read: Option<Duration>,
+    }
+
+    /// One backend per distinct settings. The SDK runs a call on whichever thread polls it, so the
+    /// map needs a lock; it is held only to look up, insert, or build one backend.
+    #[derive(Clone, Debug, Default)]
+    pub struct Backends(Arc<Mutex<HashMap<Timeouts, NativeBackend>>>);
+
+    impl Backends {
+        /// The backend for `timeouts`, if one was built.
+        pub fn get(&self, timeouts: Timeouts) -> Option<NativeBackend> {
+            // The map is never left half-written, so a lock poisoned by an unrelated panic is
+            // still a consistent cache.
+            let backends = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            backends.get(&timeouts).cloned()
+        }
+
+        /// The backend for `timeouts`, built by `build` under the lock when there is none, so two
+        /// threads asking for the same settings build one backend. A failed build is not cached.
+        pub fn get_or_build(
+            &self,
+            timeouts: Timeouts,
+            build: impl FnOnce() -> Result<NativeBackend, Unavailable>,
+        ) -> Result<NativeBackend, Unavailable> {
+            let mut backends = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            match backends.entry(timeouts) {
+                Entry::Occupied(entry) => Ok(entry.get().clone()),
+                Entry::Vacant(entry) => Ok(entry.insert(build()?).clone()),
+            }
+        }
+
+        /// Keep `backend` for `timeouts` unless another was kept first, and return the one kept.
+        pub fn keep(&self, timeouts: Timeouts, backend: NativeBackend) -> NativeBackend {
+            let mut backends = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            backends.entry(timeouts).or_insert(backend).clone()
+        }
+    }
+
+    /// Why a connector has no backend to send on.
+    #[derive(Debug, Clone)]
+    pub enum Unavailable {
+        /// The transport could not be built, such as when the system trust store cannot be read.
+        Transport(Arc<zenwave::Error>),
+        /// The thread the client's pools run on has stopped its runtime.
+        Stopped,
+    }
+
+    impl fmt::Display for Unavailable {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Transport(error) => {
+                    write!(f, "the AWS SDK's transport cannot be built: {error}")
+                }
+                Self::Stopped => f.write_str(
+                    "the thread whose runtime runs this client's connection pools has stopped",
+                ),
+            }
+        }
+    }
+
+    impl core::error::Error for Unavailable {
+        fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+            match self {
+                Self::Transport(error) => Some(&**error),
+                Self::Stopped => None,
+            }
+        }
+    }
+}
+
+use sealed::{Backends, Timeouts, Unavailable};
+
+/// Pools on zenwave's own driver thread, one per transport, started by the first request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SharedDriver;
+
+impl Pools for SharedDriver {}
+
+impl sealed::Sealed for SharedDriver {
+    fn backend(
+        &self,
+        backends: &Backends,
+        timeouts: Timeouts,
+        transport: impl FnOnce() -> Result<Transport, Unavailable> + Send,
+    ) -> impl Future<Output = Result<NativeBackend, Unavailable>> + Send + 'static {
+        // Built synchronously, under the lock: every backend starts a driver thread of its own,
+        // so two racing requests must not build two.
+        let backend = backends.get_or_build(timeouts, || Ok(NativeBackend::new(transport()?)));
+        core::future::ready(backend)
+    }
+}
+
+/// Pools on the compio runtime of the thread a client was built on.
+///
+/// A task on that runtime builds each pool, so a pool for settings first asked for later — or
+/// from another thread — still starts there.
+#[derive(Debug, Clone)]
+pub struct ThreadPools {
+    builds: async_channel::Sender<Build>,
+}
+
+/// A request to the pool-building task for one set of settings.
+struct Build {
+    timeouts: Timeouts,
+    transport: Transport,
+    reply: async_channel::Sender<NativeBackend>,
+}
+
+impl ThreadPools {
+    /// Start the pool-building task on the current thread's compio runtime, its pools driven by
+    /// `io`.
+    fn start<I: NativeIo>(io: I) -> Self {
+        let (builds, requests) = async_channel::unbounded::<Build>();
+        // The task holds no handle to the runtime it runs on, which would keep that runtime from
+        // ever being torn down; it reaches it through `with_current` whenever it builds. It ends
+        // when the last client clone is dropped.
+        compio::runtime::spawn(async move {
+            let mut built = HashMap::new();
+            while let Ok(Build {
+                timeouts,
+                transport,
+                reply,
+            }) = requests.recv().await
+            {
+                let backend = built
+                    .entry(timeouts)
+                    .or_insert_with(|| {
+                        compio::runtime::Runtime::with_current(|runtime| {
+                            NativeBackend::on_current_thread(transport, io.clone(), runtime)
+                        })
+                    })
+                    .clone();
+                // A caller that gave up waiting has nothing left to hand the backend to.
+                let _ = reply.try_send(backend);
+            }
+        })
+        .detach();
+        Self { builds }
+    }
+}
+
+impl Pools for ThreadPools {}
+
+impl sealed::Sealed for ThreadPools {
+    fn backend(
+        &self,
+        backends: &Backends,
+        timeouts: Timeouts,
+        transport: impl FnOnce() -> Result<Transport, Unavailable> + Send,
+    ) -> impl Future<Output = Result<NativeBackend, Unavailable>> + Send + 'static {
+        // The cached backend, or the transport to build one over: built here, so the future
+        // holds no closure.
+        let lookup = backends.get(timeouts).ok_or_else(transport);
+        let builds = self.builds.clone();
+        let backends = backends.clone();
+        async move {
+            let transport = match lookup {
+                Ok(backend) => return Ok(backend),
+                Err(transport) => transport?,
+            };
+            let (reply, built) = async_channel::bounded(1);
+            builds
+                .send(Build {
+                    timeouts,
+                    transport,
+                    reply,
+                })
+                .await
+                .map_err(|_| Unavailable::Stopped)?;
+            let backend = built.recv().await.map_err(|_| Unavailable::Stopped)?;
+            Ok(backends.keep(timeouts, backend))
+        }
+    }
 }
 
 impl ZenwaveHttpClient {
@@ -82,7 +305,8 @@ impl ZenwaveHttpClient {
     pub fn new(transport: impl Fn() -> TransportBuilder + Send + Sync + 'static) -> Self {
         Self {
             transport: Arc::new(transport),
-            backends: Arc::default(),
+            backends: Backends::default(),
+            pools: SharedDriver,
         }
     }
 
@@ -92,17 +316,42 @@ impl ZenwaveHttpClient {
     pub fn system() -> Self {
         Self::new(Transport::builder)
     }
+}
 
-    /// The backend for `timeouts`, built on first use. A transport that cannot be built, such as
-    /// one whose system trust store cannot be read, is not cached: the error is returned, and the
-    /// next connector the SDK asks for tries again.
-    fn backend(&self, timeouts: Timeouts) -> Result<NativeBackend, Arc<zenwave::Error>> {
-        // The map is never left half-written, so a lock poisoned by an unrelated panic is still
-        // a consistent cache.
-        let mut backends = self.backends.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(backend) = backends.get(&timeouts) {
-            return Ok(backend.clone());
+impl ZenwaveHttpClient<ThreadPools> {
+    /// A client whose backends are built on the transport `transport` describes, with the SDK's
+    /// timeouts added, and whose pools run on the current thread's compio runtime, driven by `io`.
+    ///
+    /// # Panics
+    ///
+    /// When the current thread is not running a compio runtime.
+    #[must_use]
+    pub fn on_current_thread<I: NativeIo>(
+        transport: impl Fn() -> TransportBuilder + Send + Sync + 'static,
+        io: I,
+    ) -> Self {
+        Self {
+            transport: Arc::new(transport),
+            backends: Backends::default(),
+            pools: ThreadPools::start(io),
         }
+    }
+
+    /// [`on_current_thread`](Self::on_current_thread) on the system transport.
+    ///
+    /// # Panics
+    ///
+    /// When the current thread is not running a compio runtime.
+    #[must_use]
+    pub fn system_on_current_thread<I: NativeIo>(io: I) -> Self {
+        Self::on_current_thread(Transport::builder, io)
+    }
+}
+
+impl<P: Pools> ZenwaveHttpClient<P> {
+    /// The transport for `timeouts`. One that cannot be built, such as one whose system trust
+    /// store cannot be read, is not cached: the error is returned, and the next call tries again.
+    fn transport(&self, timeouts: Timeouts) -> Result<Transport, Unavailable> {
         let mut transport = (self.transport)();
         if let Some(connect) = timeouts.connect {
             transport = transport.connect_timeout(connect);
@@ -110,59 +359,58 @@ impl ZenwaveHttpClient {
         if let Some(read) = timeouts.read {
             transport = transport.read_timeout(read);
         }
-        // Built under the lock, so two threads asking for the same settings build one backend.
-        let backend = NativeBackend::new(transport.build().map_err(Arc::new)?);
-        backends.insert(timeouts, backend.clone());
-        drop(backends);
-        Ok(backend)
+        transport
+            .build()
+            .map_err(|error| Unavailable::Transport(Arc::new(error)))
+    }
+
+    /// The backend for `timeouts`, built on first use.
+    fn backend(
+        &self,
+        timeouts: Timeouts,
+    ) -> impl Future<Output = Result<NativeBackend, Unavailable>> + Send + 'static + use<'_, P>
+    {
+        // `transport` runs before this returns, so the future borrows nothing.
+        sealed::Sealed::backend(&self.pools, &self.backends, timeouts, move || {
+            self.transport(timeouts)
+        })
     }
 }
 
-impl fmt::Debug for ZenwaveHttpClient {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ZenwaveHttpClient")
-            .field("backends", &self.backends)
-            .finish_non_exhaustive()
-    }
-}
-
-impl HttpClient for ZenwaveHttpClient {
+impl<P: Pools> HttpClient for ZenwaveHttpClient<P> {
     fn http_connector(
         &self,
         settings: &HttpConnectorSettings,
         _components: &RuntimeComponents,
     ) -> SharedHttpConnector {
-        let backend = self.backend(Timeouts {
-            connect: settings.connect_timeout(),
-            read: settings.read_timeout(),
-        });
-        if let Err(error) = &backend {
-            tracing::error!("the AWS SDK's transport cannot be built: {error}");
-        }
-        SharedHttpConnector::new(ZenwaveConnector { backend })
+        SharedHttpConnector::new(ZenwaveConnector {
+            client: self.clone(),
+            timeouts: Timeouts {
+                connect: settings.connect_timeout(),
+                read: settings.read_timeout(),
+            },
+        })
     }
 }
 
-/// An [`HttpConnector`] on the [`NativeBackend`] built for one set of [`HttpConnectorSettings`],
-/// or the error that kept it from being built, which every call then fails with.
+/// An [`HttpConnector`] on the [`NativeBackend`] for one set of [`HttpConnectorSettings`], looked
+/// up — and built on first use — by each call.
 #[derive(Debug, Clone)]
-struct ZenwaveConnector {
-    backend: Result<NativeBackend, Arc<zenwave::Error>>,
+struct ZenwaveConnector<P> {
+    client: ZenwaveHttpClient<P>,
+    timeouts: Timeouts,
 }
 
-impl HttpConnector for ZenwaveConnector {
+impl<P: Pools> HttpConnector for ZenwaveConnector<P> {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        let mut backend = match &self.backend {
-            Ok(backend) => backend.clone(),
-            Err(error) => {
-                let error = Arc::clone(error);
-                return HttpConnectorFuture::ready(Err(ConnectorError::other(
-                    Box::new(TransportUnavailable(error)),
-                    None,
-                )));
-            }
-        };
+        let backend = self.client.backend(self.timeouts);
         HttpConnectorFuture::new(async move {
+            let mut backend = backend.await.map_err(|unavailable| {
+                if let Unavailable::Transport(error) = &unavailable {
+                    tracing::error!("the AWS SDK's transport cannot be built: {error}");
+                }
+                ConnectorError::other(Box::new(unavailable), None)
+            })?;
             let mut request = request
                 .try_into_http1x()
                 .map_err(|error| ConnectorError::user(error.into()))?
@@ -174,22 +422,6 @@ impl HttpConnector for ZenwaveConnector {
             HttpResponse::try_from(response.map(SdkBody::from_body_1_x))
                 .map_err(|error| ConnectorError::other(error.into(), None))
         })
-    }
-}
-
-/// The transport for a connector could not be built, so no request on it was sent.
-#[derive(Debug)]
-struct TransportUnavailable(Arc<zenwave::Error>);
-
-impl fmt::Display for TransportUnavailable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "the AWS SDK's transport cannot be built: {}", self.0)
-    }
-}
-
-impl core::error::Error for TransportUnavailable {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        Some(&*self.0)
     }
 }
 
@@ -339,6 +571,99 @@ mod tests {
             tokio::runtime::Handle::try_current().is_err(),
             "the test must run with no tokio runtime"
         );
+    }
+
+    /// Every dial in `dials` was made on `thread`, and there was at least one.
+    fn assert_dialed_on(dials: &[std::thread::ThreadId], thread: std::thread::ThreadId) {
+        assert!(
+            !dials.is_empty(),
+            "a request went out, so a connection was dialed"
+        );
+        assert!(
+            dials.iter().all(|dialed| *dialed == thread),
+            "every connection was dialed on {thread:?}, not {dials:?}"
+        );
+    }
+
+    /// A store built once and rebound on each of two threads — what a serving thread does with
+    /// the clients `#[skyzen::main]` builds — sends every request on a connection that thread
+    /// dialed and drives, and the server sees every request.
+    #[compio::test]
+    async fn each_thread_sends_on_connections_it_dials_itself() {
+        let (seen, received) = mpsc::channel::<ReceivedRequest>();
+        let server = LoopbackServer::start(move |request| {
+            seen.send(request).expect("the test is still listening");
+            answer(StatusCode::OK, &serde_json::json!({}))
+        });
+        let shared = kv(&server).await;
+
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    let runtime = compio::runtime::Runtime::new().expect("a compio runtime");
+                    runtime.block_on(async move {
+                        let (io, dials) = skyzen_test::DialRecorder::new();
+                        let kv = shared
+                            .with_http_client(ZenwaveHttpClient::system_on_current_thread(io));
+                        for _ in 0..2 {
+                            kv.put(KEY, VALUE.as_bytes())
+                                .await
+                                .expect("the put should succeed");
+                        }
+                        (std::thread::current().id(), dials.taken())
+                    })
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            let (sender, dials) = thread.join().expect("the thread finishes");
+            assert_dialed_on(&dials, sender);
+        }
+        let seen = received.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 4, "two puts from each thread");
+        for request in seen {
+            let item: serde_json::Value =
+                serde_json::from_slice(request.body()).expect("the body is DynamoDB JSON");
+            assert_eq!(item["Item"]["pk"]["S"], KEY);
+        }
+    }
+
+    /// A request made on a thread other than the one a client's pools run on — a post-response
+    /// task on the global executor — still succeeds, on a connection the owning thread dials.
+    #[compio::test]
+    async fn a_request_from_another_thread_goes_out_on_the_owning_threads_pool() {
+        let server = LoopbackServer::start(|_| answer(StatusCode::OK, &serde_json::json!({})));
+        let shared = kv(&server).await;
+        let (built, handed) = mpsc::channel();
+        let (stop, stopped) = async_channel::bounded::<core::convert::Infallible>(1);
+
+        let owner = std::thread::spawn(move || {
+            let runtime = compio::runtime::Runtime::new().expect("a compio runtime");
+            runtime.block_on(async move {
+                let (io, dials) = skyzen_test::DialRecorder::new();
+                built
+                    .send(shared.with_http_client(ZenwaveHttpClient::system_on_current_thread(io)))
+                    .expect("the test is waiting for the store");
+                // The owner keeps its runtime, and so its pools, running until the test is done.
+                let _ = stopped.recv().await;
+                (std::thread::current().id(), dials.taken())
+            })
+        });
+
+        let kv = handed.recv().expect("the owner built the store");
+        // This thread runs no compio runtime: it is one of the global executor's.
+        std::thread::spawn(move || {
+            futures_lite::future::block_on(kv.put(KEY, VALUE.as_bytes()))
+                .expect("the put should succeed from another thread");
+        })
+        .join()
+        .expect("the other thread finishes");
+
+        drop(stop);
+        let (owner_thread, dials) = owner.join().expect("the owner finishes");
+        assert_dialed_on(&dials, owner_thread);
     }
 
     /// A write leaves through zenwave's native backend, signed and shaped by the SDK, while the
