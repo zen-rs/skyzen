@@ -1,8 +1,8 @@
 //! The queue client's `azure_core` [`HttpClient`], on zenwave's native backend.
 //!
 //! `azure_core` sends every request through the [`Transport`] in its client options; its default is
-//! reqwest on tokio. [`ZenwaveHttpClient`] answers it through a zenwave [`NativeBackend`] instead,
-//! so the queue's requests need no tokio context.
+//! reqwest on tokio. [`ZenwaveHttpClient`] answers it through zenwave's native backend instead, an
+//! [`AzureHttp`], so the queue's requests need no tokio context.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -20,17 +20,19 @@ use azure_core::{
     Error, Result,
 };
 use futures_util::TryStreamExt as _;
-use zenwave::{backend::NativeBackend, header, Body, Request};
+use zenwave::{header, Body, Request};
 
-/// An `azure_core` [`HttpClient`] sending its requests through a zenwave [`NativeBackend`].
+use crate::AzureHttp;
+
+/// An `azure_core` [`HttpClient`] sending its requests through an [`AzureHttp`].
 #[derive(Debug)]
 pub(super) struct ZenwaveHttpClient {
-    http: NativeBackend,
+    http: AzureHttp,
 }
 
 impl ZenwaveHttpClient {
     /// The `azure_core` transport that sends its requests through `http`.
-    pub(super) fn transport(http: NativeBackend) -> Transport {
+    pub(super) fn transport(http: AzureHttp) -> Transport {
         Transport::new(Arc::new(Self { http }))
     }
 }
@@ -41,16 +43,14 @@ impl HttpClient for ZenwaveHttpClient {
         let mut outgoing = zenwave_request(request)?;
         // azure_core reads an error status out of the response: its retry policy decides on the
         // status, and its error type on the body.
-        let response = crate::http::send(&mut self.http.clone(), &mut outgoing)
-            .await
-            .map_err(|error| {
-                let kind = if error.is_transient() {
-                    ErrorKind::Io
-                } else {
-                    ErrorKind::Connection
-                };
-                Error::with_error(kind, error, "the request to Azure Storage failed")
-            })?;
+        let response = self.http.send(&mut outgoing).await.map_err(|error| {
+            let kind = if error.is_transient() {
+                ErrorKind::Io
+            } else {
+                ErrorKind::Connection
+            };
+            Error::with_error(kind, error, "the request to Azure Storage failed")
+        })?;
 
         let (parts, body) = response.into_parts();
         let headers = parts

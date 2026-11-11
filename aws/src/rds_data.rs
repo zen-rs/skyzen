@@ -330,6 +330,21 @@ impl RdsDataDb {
         Ok(Self::from_parts(resource_arn, secret_arn, database, engine).await)
     }
 
+    /// This backend with its requests sent through `http`, its client otherwise configured as it
+    /// was — credentials, region, endpoint, retries.
+    ///
+    /// How a thread gets a client whose connections it owns: build the backend once and rebind a
+    /// clone on each thread with [`crate::sdk::ZenwaveHttpClient::system_on_current_thread`].
+    #[must_use]
+    pub fn with_http_client(
+        mut self,
+        http: impl aws_sdk_rdsdata::config::HttpClient + 'static,
+    ) -> Self {
+        self.client =
+            Client::from_conf(self.client.config().to_builder().http_client(http).build());
+        self
+    }
+
     /// Let a statement keep running server-side after the Data API's 45-second call timeout.
     ///
     /// Off by default, matching the service. Turn it on for DDL: AWS recommends it there because a

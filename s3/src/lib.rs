@@ -33,11 +33,17 @@
 //! native backend, timers on async-io. [`S3Storage`] works under any executor — compio's
 //! thread-per-core runtime included — and needs no tokio context. A client built by hand for
 //! [`S3Storage::new`] gets the same by loading its configuration through
-//! `skyzen_aws::sdk::config_loader`.
+//! `skyzen_aws::sdk::config_loader`. [`S3Storage::with_http_client`] with a
+//! [`ZenwaveHttpClient::system_on_current_thread`] moves a storage's connections onto the calling
+//! thread's own compio runtime.
 
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::collections::HashMap;
+
+/// The SDK's HTTP client this crate's storages send on, re-exported so a storage can be rebound
+/// to a thread's own pools without naming `skyzen-aws`.
+pub use skyzen_aws::sdk::ZenwaveHttpClient;
 
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder;
@@ -146,6 +152,18 @@ impl S3Storage {
             .build();
         let client = Client::from_conf(s3_config);
         Self::new(client, bucket)
+    }
+
+    /// This storage with its requests sent through `http`, its client otherwise configured as it
+    /// was — credentials, region, endpoint, retries.
+    ///
+    /// How a thread gets a client whose connections it owns: build the storage once and rebind a
+    /// clone on each thread with `skyzen_aws::sdk::ZenwaveHttpClient::system_on_current_thread`.
+    #[must_use]
+    pub fn with_http_client(mut self, http: impl aws_sdk_s3::config::HttpClient + 'static) -> Self {
+        self.client =
+            Client::from_conf(self.client.config().to_builder().http_client(http).build());
+        self
     }
 
     /// Upload a body S3 will not take in one request, as a multipart upload.

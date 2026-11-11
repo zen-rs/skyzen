@@ -17,6 +17,7 @@ use skyzen_services::storage::{
 
 use self::rest::{BlobRest, READ_PERMISSION, WRITE_PERMISSION};
 use self::transport::ZenwaveTransport;
+use crate::AzureHttp;
 
 /// The environment variable [`AzureBlobConfig::from_env`] reads its connection string from.
 const CONNECTION_STRING_ENV: &str = "AZURE_STORAGE_CONNECTION_STRING";
@@ -307,20 +308,30 @@ impl AzureBlob {
             AzureBlobAuth::SasToken(token) => builder.sas_token(token),
         };
 
-        // The operator's HTTP traffic rides the same zenwave backend the REST calls beside it
-        // use: OpenDAL's transport is an extension point, and leaving it unset would make every
-        // data-plane request fail with "default HTTP transport is not installed".
-        let http = crate::http::system_backend();
-        let operator = Operator::new(builder).map_err(storage_error)?.with_context(
-            OperationContext::new()
-                .with_http_transport(HttpTransporter::new(ZenwaveTransport::new(http.clone()))),
-        );
+        // The operator's HTTP traffic rides the same zenwave backend the REST calls beside it use.
+        let http = AzureHttp::system();
+        let operator = Operator::new(builder)
+            .map_err(storage_error)?
+            .with_context(operation_context(http.clone()));
         let rest = BlobRest::new(http, &endpoint, &container, credential)?;
 
         Ok(Self {
             operator,
             rest: Arc::new(rest),
         })
+    }
+
+    /// This container with its requests — the bytes and the REST calls alike — sent through
+    /// `http`.
+    ///
+    /// How a thread gets a client whose connections it owns: build the container once and rebind a
+    /// clone on each thread with an [`AzureHttp::system_on_current_thread`].
+    #[must_use]
+    pub fn with_http(self, http: AzureHttp) -> Self {
+        Self {
+            operator: self.operator.with_context(operation_context(http.clone())),
+            rest: Arc::new(self.rest.with_http(http)),
+        }
     }
 
     /// Reach a container using the connection string in `AZURE_STORAGE_CONNECTION_STRING`.
@@ -803,6 +814,14 @@ fn stat_metadata(key: &str, metadata: &opendal::Metadata) -> ObjectMetadata {
 fn size_of(length: usize) -> Result<u64, StorageError> {
     u64::try_from(length)
         .map_err(|error| StorageError::backend_with("Azure blob size overflow", error))
+}
+
+/// The `OpenDAL` context whose HTTP transport sends through `http`.
+///
+/// The transport is an extension point, and leaving it unset makes every data-plane request fail
+/// with "default HTTP transport is not installed".
+fn operation_context(http: AzureHttp) -> OperationContext {
+    OperationContext::new().with_http_transport(HttpTransporter::new(ZenwaveTransport::new(http)))
 }
 
 /// Map an `OpenDAL` error onto the portable taxonomy, keeping its source chain.

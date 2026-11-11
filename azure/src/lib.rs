@@ -74,6 +74,8 @@ pub mod storage_queue;
 pub use blob::{AzureBlob, AzureBlobAuth, AzureBlobConfig};
 #[cfg(feature = "cosmos")]
 pub use cosmos::{CosmosKv, CosmosKvBuilder, PartitionStrategy};
+#[cfg(any(feature = "blob", feature = "servicebus", feature = "storage-queue"))]
+pub use http::AzureHttp;
 #[cfg(feature = "servicebus")]
 pub use service_bus::ServiceBusQueue;
 #[cfg(feature = "sql")]

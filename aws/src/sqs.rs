@@ -172,6 +172,21 @@ impl SqsQueue {
         Self::fifo(Self::env_client().await, queue_url, message_group_id)
     }
 
+    /// This queue with its requests sent through `http`, its client otherwise configured as it
+    /// was — credentials, region, endpoint, retries.
+    ///
+    /// How a thread gets a client whose connections it owns: build the queue once and rebind a
+    /// clone on each thread with [`crate::sdk::ZenwaveHttpClient::system_on_current_thread`].
+    #[must_use]
+    pub fn with_http_client(
+        mut self,
+        http: impl aws_sdk_sqs::config::HttpClient + 'static,
+    ) -> Self {
+        self.client =
+            Client::from_conf(self.client.config().to_builder().http_client(http).build());
+        self
+    }
+
     /// Send `message_group_id` with every message, making this a FIFO queue.
     ///
     /// # Errors
