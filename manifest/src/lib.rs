@@ -56,18 +56,19 @@ pub use interpolate::{expand, expand_table, process_env, EnvLookup, InterpolateE
 pub use merge::deep_merge;
 pub use migrations::{MigrationFile, MigrationsError, DEFAULT_MIGRATIONS_DIR};
 pub use schema::{
-    AwsSection, AzureHttpMode, AzureQueueTrigger, AzureSection, BlobWiring, CfAssets,
-    CfAssetsNotFoundHandling, CfD1Database, CfDurableBinding, CfDurableMigration, CfDurableObjects,
-    CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer, CfQueueProducer, CfQueues,
-    CfR2Bucket, CfServiceBinding, CfTriggers, CloudflareDatabaseSection, CloudflareSecretSection,
-    CloudflareSection, CloudflareServiceSection, CosmosWiring, DatabaseEntry, DatabaseType,
-    DynamoDbWiring, InvalidVarName, KernelTlsState, LambdaArchitecture, MemoryWiring,
-    NativeDatabaseBackend, NativeDatabaseSection, NativeLinuxNic, NativeLinuxSection,
-    NativeQueueConsumer, NativeSection, NativeServiceBackend, NativeServiceSection,
-    PartialRdsDataWiring, QueueTriggerError, RdsDataParts, RdsDataWiring, RdsEngine, RedisWiring,
-    RxIrqPlacement, S3Wiring, SecretEntry, ServiceBusWiring, ServiceEntry, ServiceType,
-    SkyzenManifest, SqlUrlWiring, SqsWiring, StaticFilesSection, StorageQueueWiring, VarName,
-    WiringEnvVar, HTTP_FUNCTION_NAME, PLAINTEXT_VARIABLE_TABLES,
+    AwsSection, AzureHttpMode, AzureQueueTrigger, AzureSection, BlobWiring, BusyPollMicros,
+    CfAssets, CfAssetsNotFoundHandling, CfD1Database, CfDurableBinding, CfDurableMigration,
+    CfDurableObjects, CfDurableRenamedClass, CfHandlers, CfKvNamespace, CfQueueConsumer,
+    CfQueueProducer, CfQueues, CfR2Bucket, CfServiceBinding, CfTriggers, CloudflareDatabaseSection,
+    CloudflareSecretSection, CloudflareSection, CloudflareServiceSection, CosmosWiring,
+    DatabaseEntry, DatabaseType, DynamoDbWiring, InvalidVarName, KernelTlsState,
+    LambdaArchitecture, ListenSetting, MemoryWiring, NativeDatabaseBackend, NativeDatabaseSection,
+    NativeLinuxNic, NativeLinuxSection, NativeQueueConsumer, NativeSection, NativeServerSection,
+    NativeServiceBackend, NativeServiceSection, PartialRdsDataWiring, QueueTriggerError,
+    RdsDataParts, RdsDataWiring, RdsEngine, RedisWiring, RxIrqPlacement, S3Wiring, SecretEntry,
+    ServiceBusWiring, ServiceEntry, ServiceType, SkyzenManifest, SqlUrlWiring, SqsWiring,
+    StaticFilesSection, StorageQueueWiring, VarName, WiringEnvVar, HTTP_FUNCTION_NAME,
+    PLAINTEXT_VARIABLE_TABLES,
 };
 pub use secrets::{scan_table, SecretError, SecretFinding, SecretReport};
 
@@ -584,9 +585,9 @@ fn take_environment_overlays(
 #[cfg(test)]
 mod tests {
     use super::{
-        InterpolateError, KernelTlsState, Manifest, ManifestError, NativeDatabaseBackend,
-        NativeDatabaseSection, NativeLinuxNic, NativeServiceBackend, NativeServiceSection,
-        RdsEngine, RxIrqPlacement, ServiceType, VarName,
+        BusyPollMicros, InterpolateError, KernelTlsState, ListenSetting, Manifest, ManifestError,
+        NativeDatabaseBackend, NativeDatabaseSection, NativeLinuxNic, NativeServiceBackend,
+        NativeServiceSection, RdsEngine, RxIrqPlacement, ServiceType, VarName,
     };
     use std::time::Duration;
 
@@ -1048,6 +1049,51 @@ mod tests {
                 rx_irqs: Some(RxIrqPlacement::Serving),
             }
         );
+    }
+
+    #[test]
+    fn the_server_section_types_its_address_and_busy_polling() {
+        let server = |source: &str| {
+            parse(source).map(|manifest| manifest.data().native.clone().and_then(|n| n.server))
+        };
+        let tcp = server(
+            "[native.server]\nlisten = \"0.0.0.0:443\"\nbusy_poll = 50\nbusy_poll_prefer = true\n\
+             busy_poll_budget = 64\n",
+        )
+        .expect("parses")
+        .expect("[native.server]");
+        assert_eq!(
+            tcp.listen,
+            Some(ListenSetting::Tcp(
+                "0.0.0.0:443".parse().expect("an address")
+            ))
+        );
+        assert_eq!(tcp.busy_poll.map(BusyPollMicros::get), Some(50));
+        assert!(tcp.busy_poll_prefer);
+        assert_eq!(
+            tcp.busy_poll_budget.map(std::num::NonZeroU16::get),
+            Some(64)
+        );
+
+        let unix = server("[native.server]\nlisten = { unix = \"/run/api/api.sock\" }\n")
+            .expect("parses")
+            .expect("[native.server]");
+        assert_eq!(
+            unix.listen,
+            Some(ListenSetting::Unix {
+                unix: "/run/api/api.sock".into()
+            })
+        );
+
+        for source in [
+            "[native.server]\nlisten = \"localhost\"\n",
+            "[native.server]\nbusy_poll = 0\n",
+            "[native.server]\nbusy_poll = 3000000000\n",
+            "[native.server]\nbusy_poll_budget = 0\n",
+            "[native.server]\nport = 80\n",
+        ] {
+            assert!(server(source).is_err(), "{source}");
+        }
     }
 
     #[test]

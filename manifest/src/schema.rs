@@ -338,6 +338,75 @@ pub struct NativeSection {
     /// the Linux host it runs on.
     #[serde(default)]
     pub linux: Option<NativeLinuxSection>,
+    /// `[native.server]` — how the service `skyzen deploy --provider native` installs serves.
+    #[serde(default)]
+    pub server: Option<NativeServerSection>,
+}
+
+/// `[native.server]` — the serving settings of a native deployment.
+///
+/// They reach the runtime as its own environment variables (`SKYZEN_ADDRESS`, `SKYZEN_BUSY_POLL`,
+/// …) in the installed systemd unit, and they decide which privileges that unit grants: binding a
+/// port below 1024 takes `CAP_NET_BIND_SERVICE`, and `busy_poll_prefer` or a `busy_poll_budget`
+/// take `CAP_NET_ADMIN`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeServerSection {
+    /// Where the server listens: a TCP `host:port`, or `{ unix = "<path>" }`.
+    #[serde(default)]
+    pub listen: Option<ListenSetting>,
+    /// How long a wait busy-polls before it sleeps, in microseconds; unset is off.
+    #[serde(default)]
+    pub busy_poll: Option<BusyPollMicros>,
+    /// Whether the kernel defers the queues' softirq processing to the polling.
+    #[serde(default)]
+    pub busy_poll_prefer: bool,
+    /// How many packets one poll of a socket processes; unset is the kernel's own.
+    #[serde(default)]
+    pub busy_poll_budget: Option<std::num::NonZeroU16>,
+}
+
+/// Where a native server listens.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum ListenSetting {
+    /// A TCP socket address, `"0.0.0.0:443"`.
+    Tcp(std::net::SocketAddr),
+    /// A filesystem unix socket, `{ unix = "/run/app/app.sock" }`.
+    Unix {
+        /// The socket path.
+        unix: PathBuf,
+    },
+}
+
+/// A busy-poll timeout: at least 1 µs and at most `i32::MAX`, since `SO_BUSY_POLL` takes an `int`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "u32")]
+pub struct BusyPollMicros(std::num::NonZeroU32);
+
+impl BusyPollMicros {
+    /// The timeout in microseconds.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl TryFrom<u32> for BusyPollMicros {
+    type Error = String;
+
+    fn try_from(micros: u32) -> Result<Self, Self::Error> {
+        i32::try_from(micros)
+            .ok()
+            .and_then(|_| std::num::NonZeroU32::new(micros))
+            .map(Self)
+            .ok_or_else(|| {
+                format!(
+                    "busy_poll is between 1 and {} microseconds, not {micros}",
+                    i32::MAX
+                )
+            })
+    }
 }
 
 /// `[native.linux]` — the machine-side acceleration of a Linux serving host.
