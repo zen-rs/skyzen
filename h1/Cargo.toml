@@ -19,7 +19,11 @@ fs = ["http-kit-h1/fs"]
 skyzen-core.workspace = true
 http-kit.workspace = true
 http-kit-io.workspace = true
-http-kit-h1.workspace = true
+# `pipe`: a request body splices into a consumer that offers a pipe, and a pipe frame in a
+# response body splices into the socket. It costs no dependency `http-kit-io` does not already
+# bring, and without it a pipe frame (a proxied body, once any crate in the build enables
+# `http-kit/pipe`) would fail its connection.
+http-kit-h1 = { workspace = true, features = ["pipe"] }
 executor-core.workspace = true
 tracing.workspace = true
 futures-util = { version = "0.3.32", default-features = false }

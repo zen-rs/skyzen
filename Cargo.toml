@@ -16,9 +16,9 @@ skyzen-test = { path = "test", version = "0.4.0" }
 skyzen-redis = { path = "redis", version = "0.4.0" }
 skyzen-s3 = { path = "s3", version = "0.4.0" }
 
-http-kit = "0.6.0"
-http-kit-io = { version = "0.4.0", default-features = false }
-http-kit-h1 = { version = "0.3.0", default-features = false }
+http-kit = "0.7.0"
+http-kit-io = { version = "0.5.0", default-features = false }
+http-kit-h1 = { version = "0.5.0", default-features = false }
 executor-core = { version = "0.7.2", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper", version = "0.3.0" }
 skyzen-h1 = { path = "h1", version = "0.1.0" }
@@ -184,25 +184,27 @@ skyzen-lambda = { workspace = true, optional = true }
 # TLS termination (`server-tls` feature): rustls driven straight over the owned-buffer streams by
 # `http-kit-tls`. The `aws_lc_rs` provider matches the AWS SDK's TLS stack, so the workspace
 # resolves one crypto backend; the certificate/key pair is loaded with rustls's own PEM support.
-http-kit-tls = { version = "0.2.0", default-features = false, optional = true }
-rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
+http-kit-tls = { version = "0.3.0", default-features = false, optional = true }
+rustls ={ version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
 # The reverse proxy's upstream client (`proxy`): zenwave's native backend, HTTP/1.1 on
 # `http-kit-h1` over the same `http-kit-io` sockets the server runs on, with a connection pool on
 # each serving thread. zenwave refuses to build without a default backend; `native-compio` is the
 # one whose runtime this crate already links, though the proxy only ever starts pools on the
 # serving thread's own runtime.
-zenwave = { version = "0.10.1", default-features = false, features = ["native-compio"], optional = true }
+zenwave = { version = "0.11.0", default-features = false, features = ["native-compio"], optional = true }
 # HTTP/3 (`http3` feature): quiche over the same compio threads. quiche builds BoringSSL from
 # source, so only a build that asks for HTTP/3 pays for it; `fs` lets a file-region body (static
-# files) go out over a QUIC stream.
-http-kit-h3 = { version = "0.3.0", default-features = false, features = ["quiche", "fs"], optional = true }
+# files) go out over a QUIC stream, and `pipe` reads out the pipe frames a proxied body brings.
+http-kit-h3 = { version = "0.5.0", default-features = false, features = ["quiche", "fs", "pipe"], optional = true }
 
 # Kernel TLS on Linux: after the handshake the kernel seals and opens the records, so file-region
-# bodies go out through sendfile/splice.
+# bodies go out through sendfile/splice, and the proxy splices bodies and tunnels between the
+# client's connection and the upstream's.
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pinning serving threads and steering connections to the CPU that received them.
 libc = "0.2"
-http-kit-tls = { version = "0.2.0", default-features = false, features = ["kernel"], optional = true }
+http-kit-tls = { version = "0.3.0", default-features = false, features = ["kernel"], optional = true }
+zenwave = { version = "0.11.0", default-features = false, features = ["native-compio", "native-kernel-tls"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The `Server` tests and `examples/embed_hyper.rs` run their own smol executor.

@@ -20,7 +20,9 @@ use std::{io, num::NonZeroUsize, rc::Rc, sync::Arc, thread};
 
 use async_channel::{bounded, Receiver, Sender};
 use executor_core::{compio::Runtime, AnyExecutor};
-use http_kit_io::{compio::Compio, IntoPoll, Io, Listener, SendFile, Split, TcpOptions};
+use http_kit_io::{
+    compio::Compio, IntoPoll, Io, Listener, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions,
+};
 use skyzen_core::{EndpointFactory, PeerAddress};
 use skyzen_h1::H1;
 use skyzen_hyper::{AltSvc, Hyper};
@@ -531,7 +533,8 @@ async fn serve_cleartext<L, E>(
     L: Listener,
     L::Stream: Split + IntoPoll + 'static,
     <L::Stream as IntoPoll>::Poll: 'static,
-    <L::Stream as Split>::WriteHalf: SendFile,
+    <L::Stream as Split>::ReadHalf: SpliceRead,
+    <L::Stream as Split>::WriteHalf: SendFile + SpliceWrite,
     L::Addr: PeerAddress,
     E: Endpoint + Clone + 'static,
 {
