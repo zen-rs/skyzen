@@ -42,6 +42,73 @@ const CHUNKS: usize = 1024;
 /// both legs account for a few MiB; a proxy that held the body whole would reach all 64.
 const IN_FLIGHT_BOUND: usize = 16 * 1024 * 1024;
 
+/// How many times [`ORDER`] repeats in the bodies the splice tests send: about 4 MiB, far more
+/// than one read past a message head can buffer, so most of it is still in the socket when its
+/// consumer asks for it.
+const BULK_REPEATS: usize = 64 * 1024;
+
+/// The body the splice tests send through the proxy.
+fn bulk() -> Vec<u8> {
+    ORDER.repeat(BULK_REPEATS).into_bytes()
+}
+
+thread_local! {
+    /// What this thread logged since [`run_logged`] started capturing it; `None` while nothing
+    /// captures.
+    static CAPTURED: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+/// Writes each event into the logging thread's [`CAPTURED`] buffer, or nowhere.
+struct ThreadLog;
+
+impl std::io::Write for ThreadLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURED.with_borrow_mut(|captured| {
+            if let Some(captured) = captured {
+                captured.extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// [`run`] the scenario, and return what its thread logged, at every level.
+///
+/// One subscriber serves the whole test binary, installed by the first capture. A subscriber
+/// scoped to each test's thread would race the others on tracing's process-wide callsite cache,
+/// which can disable a callsite for every thread while one test swaps its subscriber.
+fn run_logged<F: Future>(scenario: F) -> (F::Output, String) {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(|| ThreadLog)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the one subscriber");
+    });
+    CAPTURED.set(Some(Vec::new()));
+    let output = run(scenario);
+    let log = CAPTURED.take().expect("the capture this call started");
+    (output, String::from_utf8(log).expect("a UTF-8 log"))
+}
+
+/// The bytes the HTTP/1.1 writers in `log` spliced from a pipe into their socket: `http-kit-h1`
+/// records `sending a pipe` with its length exactly where it does.
+fn spliced(log: &str) -> usize {
+    log.lines()
+        .filter(|line| line.contains("sending a pipe"))
+        .map(|line| {
+            let (_, len) = line.rsplit_once("len=").expect("a pipe's length");
+            len.trim().parse::<usize>().expect("a numeric length")
+        })
+        .sum()
+}
+
 /// What the origin received.
 #[derive(Debug, Clone)]
 struct Seen {
@@ -128,6 +195,14 @@ impl Endpoint for Origin {
                 Ok(Response::new(Body::from(taken.to_string())))
             }
             "/v1/firehose" => Ok(Response::new(counted_body(Arc::clone(&self.produced)))),
+            "/v1/upload" => {
+                let (data, trailers) = read_frames(body).await;
+                self.record(request, data, trailers);
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = StatusCode::NO_CONTENT;
+                Ok(response)
+            }
+            "/v1/download" => Ok(Response::new(Body::from(bulk()))),
             "/v1/refuse-upgrade" => {
                 self.record(request, Vec::new(), None);
                 let mut response = Response::new(Body::from(REFUSAL));
@@ -140,6 +215,17 @@ impl Endpoint for Origin {
 }
 
 impl Origin {
+    /// An origin that has seen nothing, and the sender that releases its `/v1/slow-reader`.
+    fn new() -> (Self, async_channel::Sender<()>) {
+        let (release, released) = async_channel::unbounded();
+        let origin = Self {
+            seen: Rc::default(),
+            release: released,
+            produced: Arc::default(),
+        };
+        (origin, release)
+    }
+
     fn record(&self, request: &Request, body: Vec<u8>, trailers: Option<HeaderMap>) {
         self.seen.borrow_mut().push(Seen {
             method: request.method().clone(),
@@ -190,12 +276,7 @@ struct Stage {
 /// An origin, and a proxy mounted at `/api` forwarding to it under `/v1`, with `configure` applied
 /// to the proxy's route.
 fn stage(configure: impl FnOnce(Route) -> Route) -> Stage {
-    let (release, released) = async_channel::unbounded();
-    let origin = Origin {
-        seen: Rc::default(),
-        release: released,
-        produced: Arc::default(),
-    };
+    let (origin, release) = Origin::new();
     let origin_addr = serve(origin.clone());
     let target = format!("http://{origin_addr}/v1")
         .parse()
@@ -541,39 +622,42 @@ mod websocket {
     use http_kit_io::{compio::Compio, poll::CopyingPoll, IntoPoll as _, Io};
     use skyzen::{
         proxy::{Proxy, Upstream},
-        routing::{CreateRouteNode, Route},
+        routing::{CreateRouteNode, Route, Router},
         websocket::WebSocketMessage,
     };
 
-    use super::{run, serve};
+    use super::{run, run_logged, serve};
 
     /// The text messages: Chinese, Japanese and Korean.
-    const GREETINGS: [&str; 3] = ["你好世界", "こんにちは", "안녕하세요"];
+    pub const GREETINGS: [&str; 3] = ["你好世界", "こんにちは", "안녕하세요"];
     /// The message that makes the origin close the connection itself.
     const FAREWELL: &str = "再见 / さようなら / 안녕히 가세요";
 
     type Client = WebSocketStream<CopyingPoll<<Compio as Io>::TcpStream>>;
 
+    /// A WebSocket origin echoing every message at `/v1/echo` until it receives [`FAREWELL`].
+    pub fn echo_origin() -> Router {
+        Route::new(("/v1/echo".ws(|mut socket| async move {
+            while let Some(Ok(message)) = socket.next().await {
+                let sent = match message {
+                    WebSocketMessage::Text(text) if &*text == FAREWELL => break,
+                    WebSocketMessage::Text(text) => socket.send_text(text).await,
+                    WebSocketMessage::Binary(data) => socket.send_binary(data).await,
+                    _ => Ok(()),
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.close(None).await;
+        }),))
+        .build()
+    }
+
     /// A WebSocket echo origin, and a proxy mounted at `/api` forwarding to it under `/v1`;
     /// returns the client's connection through the proxy, and the `Via` of its `101`.
     async fn connect() -> (Client, String) {
-        let origin = serve(
-            Route::new(("/v1/echo".ws(|mut socket| async move {
-                while let Some(Ok(message)) = socket.next().await {
-                    let sent = match message {
-                        WebSocketMessage::Text(text) if &*text == FAREWELL => break,
-                        WebSocketMessage::Text(text) => socket.send_text(text).await,
-                        WebSocketMessage::Binary(data) => socket.send_binary(data).await,
-                        _ => Ok(()),
-                    };
-                    if sent.is_err() {
-                        return;
-                    }
-                }
-                let _ = socket.close(None).await;
-            }),))
-            .build(),
-        );
+        let origin = serve(echo_origin());
         let target = format!("http://{origin}/v1").parse().expect("upstream URI");
         let upstream = Upstream::new(&target).expect("upstream");
         let proxy = serve(Route::new(("/api".mount(Proxy::new(&upstream)),)).build());
@@ -595,9 +679,11 @@ mod websocket {
             .map(|message| message.expect("a WebSocket frame"))
     }
 
+    /// Messages cross the tunnel both ways, which on Linux splices the two connections together
+    /// and elsewhere copies between them.
     #[test]
     fn text_and_binary_messages_round_trip_through_the_tunnel() {
-        run(async {
+        let ((), log) = run_logged(async {
             let (mut client, via) = connect().await;
             assert_eq!(via, "1.1 skyzen");
 
@@ -628,6 +714,13 @@ mod websocket {
                 assert!(message.is_close(), "after the close: {message:?}");
             }
         });
+        // The proxy records the path before the first byte crosses.
+        let path = if cfg!(any(target_os = "linux", target_os = "android")) {
+            "splicing a proxied upgrade"
+        } else {
+            "copying a proxied upgrade"
+        };
+        assert!(log.contains(path), "the tunnel did not record {path:?}");
     }
 
     #[test]
@@ -646,6 +739,58 @@ mod websocket {
             );
         });
     }
+}
+
+/// On Linux most of a body of `len` bytes went through pipes, the rest having been read with a
+/// message head; elsewhere none did.
+fn assert_spliced(log: &str, len: usize) {
+    let spliced = spliced(log);
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        assert!(
+            spliced >= len / 2 && spliced <= len,
+            "{spliced} of the body's {len} bytes were spliced"
+        );
+    } else {
+        assert_eq!(spliced, 0, "a platform without pipes spliced");
+    }
+}
+
+/// A request body goes from the client's socket into the upstream's through pipes. The response
+/// has no body, so every pipe the log shows is the request's.
+#[test]
+fn an_upload_is_spliced_upstream() {
+    let ((), log) = run_logged(async {
+        let stage = stage(|route| route);
+        let send = connect(stage.proxy).await;
+        let response = send
+            .send(request(Method::PUT, "/api/upload", Body::from(bulk())))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            stage.origin.last().body == bulk(),
+            "the upload arrived changed"
+        );
+    });
+    assert_spliced(&log, bulk().len());
+}
+
+/// A response body goes from the upstream's socket into the client's through pipes. The request
+/// has no body, so every pipe the log shows is the response's.
+#[test]
+fn a_download_is_spliced_to_the_client() {
+    let ((), log) = run_logged(async {
+        let stage = stage(|route| route);
+        let send = connect(stage.proxy).await;
+        let response = send
+            .send(request(Method::GET, "/api/download", Body::empty()))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let (data, _) = read_frames(response.into_body()).await;
+        assert!(data == bulk(), "the download arrived changed");
+    });
+    assert_spliced(&log, bulk().len());
 }
 
 #[test]
@@ -704,4 +849,234 @@ fn a_slow_client_paces_the_origin_download() {
         }
         assert_eq!(read, CHUNK * CHUNKS);
     });
+}
+
+/// The proxy between two kernel TLS connections (Linux, with the kernel's `tls` module loaded, as
+/// CI loads it): its bodies and its tunnel splice exactly as they do between plain sockets, the
+/// records sealed and opened by the kernel on both sides.
+#[cfg(all(target_os = "linux", feature = "server-tls"))]
+mod kernel_tls {
+    use std::{cell::RefCell, net::SocketAddr, rc::Rc, sync::Arc};
+
+    use http_kit_io::{compio::Compio, Io, Listener as _};
+    use http_kit_tls::{
+        rustls::{
+            self,
+            pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+        },
+        Client, KernelTls, Mode, TlsAcceptor, TlsConnector, TlsStream,
+    };
+    use skyzen::{
+        proxy::{transport, Proxy, Transport, Upstream},
+        routing::{CreateRouteNode, Route},
+        Body, Endpoint, Method, StatusCode,
+    };
+    use skyzen_h1::H1;
+
+    use super::{assert_spliced, bulk, read_frames, request, run_logged, Origin};
+
+    /// The record-layer mode of every connection a TLS server accepted.
+    type Modes = Rc<RefCell<Vec<Mode>>>;
+
+    /// A self-signed `localhost` identity: an acceptor presenting it, which hands every
+    /// connection's records to the kernel, and the certificate for a client to trust.
+    fn identity() -> (TlsAcceptor, Vec<u8>) {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("rcgen");
+        let der = certified.cert.der().to_vec();
+        let key =
+            PrivateKeyDer::try_from(certified.signing_key.serialize_der()).expect("a PKCS#8 key");
+        let config = rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![CertificateDer::from(der.clone())], key)
+        .expect("the generated pair");
+        let acceptor = TlsAcceptor::new(Arc::new(config))
+            .with_kernel_tls(KernelTls::probe().expect("the kernel probes"));
+        (acceptor, der)
+    }
+
+    /// Serve `endpoint` with `H1` over TLS on a loopback listener of the current runtime: its
+    /// address, the modes its connections settled on, and the certificate to trust.
+    fn serve_tls<E: Endpoint + Clone + 'static>(endpoint: E) -> (SocketAddr, Modes, Vec<u8>) {
+        let (acceptor, der) = identity();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let listener = Compio.tcp_listener(listener).expect("register listener");
+        let modes = Modes::default();
+        let accepted = Rc::clone(&modes);
+        compio::runtime::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let endpoint = endpoint.clone();
+                let accepted = Rc::clone(&accepted);
+                compio::runtime::spawn(async move {
+                    let stream = acceptor
+                        .accept(stream, &Compio)
+                        .await
+                        .expect("the server handshake");
+                    accepted.borrow_mut().push(stream.negotiated().mode());
+                    H1::default()
+                        .serve_connection(
+                            Compio,
+                            stream,
+                            Some(peer),
+                            endpoint,
+                            core::future::pending(),
+                            (),
+                        )
+                        .await;
+                })
+                .detach();
+            }
+        })
+        .detach();
+        (addr, modes, der)
+    }
+
+    /// A proxy over TLS, mounted at `/api`, forwarding to the TLS `origin` under `/v1`, whose
+    /// certificate is `origin_der`.
+    fn proxy_to(origin: SocketAddr, origin_der: Vec<u8>) -> (SocketAddr, Modes, Vec<u8>) {
+        let transport = Transport::builder()
+            .proxy(transport::Proxy::none())
+            .extra_root_certificate_der(origin_der)
+            .build()
+            .expect("the upstream transport");
+        let target = format!("https://localhost:{}/v1", origin.port())
+            .parse()
+            .expect("upstream URI");
+        let upstream = Upstream::new(&target)
+            .expect("upstream")
+            .transport(transport);
+        serve_tls(Route::new(("/api".mount(Proxy::new(&upstream)),)).build())
+    }
+
+    /// A TLS connection to `addr` trusting `der`, encrypted in user space.
+    async fn tls_connect(
+        addr: SocketAddr,
+        der: &[u8],
+    ) -> TlsStream<<Compio as Io>::TcpStream, Client> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(der.to_vec()))
+            .expect("the generated certificate is a root");
+        let config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let stream = Compio.connect(addr).await.expect("connect");
+        TlsConnector::new(Arc::new(config))
+            .connect(
+                ServerName::try_from("localhost").expect("a DNS name"),
+                stream,
+                &Compio,
+            )
+            .await
+            .expect("the client handshake")
+    }
+
+    /// A fresh HTTP/1.1 connection over TLS to `addr`.
+    async fn connect(addr: SocketAddr, der: &[u8]) -> http_kit_h1::SendRequest {
+        let stream = tls_connect(addr, der).await;
+        let (send, connection) =
+            http_kit_h1::handshake_stream(stream, Compio, http_kit_h1::ClientConfig::default());
+        compio::runtime::spawn(async move {
+            let _ = connection.run().await;
+        })
+        .detach();
+        send
+    }
+
+    /// Every connection `modes` records moved its records to the kernel.
+    fn assert_kernel(modes: &Modes, server: &str) {
+        let modes = modes.borrow();
+        assert!(
+            !modes.is_empty() && modes.iter().all(|mode| *mode == Mode::Kernel),
+            "the {server}'s connections settled on {modes:?}; is the kernel's `tls` module loaded?"
+        );
+    }
+
+    /// A request body goes from the client's kernel TLS socket into the upstream's through pipes.
+    #[test]
+    fn an_upload_is_spliced_between_kernel_tls_connections() {
+        let ((), log) = run_logged(async {
+            let (origin, _release) = Origin::new();
+            let (origin_addr, origin_modes, origin_der) = serve_tls(origin.clone());
+            let (proxy, proxy_modes, proxy_der) = proxy_to(origin_addr, origin_der);
+            let send = connect(proxy, &proxy_der).await;
+            let response = send
+                .send(request(Method::PUT, "/api/upload", Body::from(bulk())))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(origin.last().body == bulk(), "the upload arrived changed");
+            assert_kernel(&origin_modes, "origin");
+            assert_kernel(&proxy_modes, "proxy");
+        });
+        assert_spliced(&log, bulk().len());
+    }
+
+    /// A response body goes from the upstream's kernel TLS socket into the client's through pipes.
+    #[test]
+    fn a_download_is_spliced_between_kernel_tls_connections() {
+        let ((), log) = run_logged(async {
+            let (origin, _release) = Origin::new();
+            let (origin_addr, origin_modes, origin_der) = serve_tls(origin);
+            let (proxy, proxy_modes, proxy_der) = proxy_to(origin_addr, origin_der);
+            let send = connect(proxy, &proxy_der).await;
+            let response = send
+                .send(request(Method::GET, "/api/download", Body::empty()))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let (data, _) = read_frames(response.into_body()).await;
+            assert!(data == bulk(), "the download arrived changed");
+            assert_kernel(&origin_modes, "origin");
+            assert_kernel(&proxy_modes, "proxy");
+        });
+        assert_spliced(&log, bulk().len());
+    }
+
+    /// A WebSocket tunnel between two kernel TLS connections splices both directions.
+    #[cfg(feature = "ws")]
+    #[test]
+    fn a_tunnel_is_spliced_between_kernel_tls_connections() {
+        use async_tungstenite::{client_async, tungstenite::Message};
+        use futures_util::StreamExt as _;
+        use http_kit_io::poll::CopyingPoll;
+
+        use super::websocket::{echo_origin, GREETINGS};
+
+        let ((), log) = run_logged(async {
+            let (origin_addr, origin_modes, origin_der) = serve_tls(echo_origin());
+            let (proxy, proxy_modes, proxy_der) = proxy_to(origin_addr, origin_der);
+            let stream = CopyingPoll::new(tls_connect(proxy, &proxy_der).await);
+            let (mut client, response) = client_async("wss://localhost/api/echo", stream)
+                .await
+                .expect("the WebSocket handshake through the proxy");
+            assert_eq!(response.status(), 101);
+            for greeting in GREETINGS {
+                client.send(Message::text(greeting)).await.expect("send");
+                let echoed = client
+                    .next()
+                    .await
+                    .expect("an echo")
+                    .expect("a WebSocket frame");
+                assert_eq!(echoed.into_text().expect("text").as_str(), greeting);
+            }
+            client.close(None).await.expect("close");
+            assert_kernel(&origin_modes, "origin");
+            assert_kernel(&proxy_modes, "proxy");
+        });
+        assert!(
+            log.contains("splicing a proxied upgrade"),
+            "the tunnel between kernel TLS connections was copied"
+        );
+    }
 }

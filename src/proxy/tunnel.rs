@@ -4,7 +4,11 @@
 //! Both ends live on one thread. The server runs an [`OnUpgrade`] session on the thread that served
 //! the connection, and that thread built the router, so it built the [`Proxy`](super::Proxy) and
 //! its backend's pool. That is the one thread where the upstream's [`Switched`] stream can be
-//! claimed, so the session claims it and copies both ways right there, owning both streams.
+//! claimed, so the session claims it and forwards both ways right there, owning both streams.
+//!
+//! On Linux and Android, when both connections can splice (plain sockets, or kernel TLS), each
+//! direction goes from one socket to the other through a pipe and never enters user space;
+//! otherwise each direction is copied through a buffer.
 
 use std::{
     future::Future,
@@ -14,6 +18,8 @@ use std::{
 };
 
 use http_kit::utils::{AsyncRead, AsyncWrite};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use http_kit_io::splice::SpliceDuplex;
 use skyzen_core::upgrade::{OnUpgrade, Upgraded};
 use zenwave::backend::{Switched, Upgrade};
 
@@ -30,10 +36,48 @@ pub(super) fn session(upgrade: Upgrade) -> OnUpgrade {
                 return;
             }
         };
-        if let Err(error) = Joined::new(client, upstream).await {
+        if let Err(error) = forward(client, upstream).await {
             tracing::debug!("a proxied upgrade ended with an error: {error}");
         }
     })
+}
+
+/// Forward between the two connections until both sides have closed: spliced where both can be,
+/// copied otherwise.
+async fn forward(client: Upgraded, upstream: Switched) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let (client, upstream) = match splice_ends(client, upstream) {
+        Ok((client, upstream)) => {
+            tracing::debug!("splicing a proxied upgrade");
+            let (up, down) = client.join(upstream).await?;
+            tracing::debug!(up, down, "a spliced upgrade ended");
+            return Ok(());
+        }
+        Err(ends) => ends,
+    };
+    tracing::debug!("copying a proxied upgrade");
+    Joined::new(client, upstream).await
+}
+
+/// Both connections as the ends of a spliced tunnel, or both given back when either cannot
+/// splice.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn splice_ends(
+    client: Upgraded,
+    upstream: Switched,
+) -> Result<(SpliceDuplex, SpliceDuplex), (Upgraded, Switched)> {
+    // The upstream is asked first, since converting the client cannot be undone.
+    if !upstream.can_splice() {
+        return Err((client, upstream));
+    }
+    let client = match client.into_splice() {
+        Ok(client) => client,
+        Err(client) => return Err((client, upstream)),
+    };
+    let Ok(upstream) = upstream.into_splice() else {
+        unreachable!("the upstream said it can splice");
+    };
+    Ok((client, upstream))
 }
 
 /// One direction of the tunnel: what was read from one side and not yet written to the other.

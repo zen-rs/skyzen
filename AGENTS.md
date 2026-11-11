@@ -93,7 +93,7 @@ What crosses threads is the recipe. `skyzen_core::EndpointFactory` (`Send + Sync
 
 An adapter whose host requires a `Send` future (lambda_http's `Adapter`) runs the router on a `LocalSet` and hands the host only the `JoinHandle`.
 
-**The upgrade handover.** An upgraded connection is `!Send` on a thread-per-core driver and so cannot travel in `Extensions` either. The server inserts the `skyzen_core::upgrade::UpgradeAvailable` marker on requests that can upgrade (HTTP/1); `WebSocketUpgrade` refuses with `426` without it. The handler answers `101` with an `OnUpgrade` token in the *response* extensions — a one-slot channel carrying the `Send` session closure — and the server, once the connection is handed back (`ServerOutcome::Upgraded` in `skyzen-h1`, hyper's upgrade future in `skyzen-hyper`), runs that session on its own thread over the erased `Upgraded` stream, replaying any bytes read past the handshake.
+**The upgrade handover.** An upgraded connection is `!Send` on a thread-per-core driver and so cannot travel in `Extensions` either. The server inserts the `skyzen_core::upgrade::UpgradeAvailable` marker on requests that can upgrade (HTTP/1); `WebSocketUpgrade` refuses with `426` without it. The handler answers `101` with an `OnUpgrade` token in the *response* extensions — a one-slot channel carrying the `Send` session closure — and the server, once the connection is handed back (`ServerOutcome::Upgraded` in `skyzen-h1`, hyper's upgrade future in `skyzen-hyper`), runs that session on its own thread over `Upgraded`, which replays any bytes read past the handshake. `Upgraded` is one type for both servers, built the way zenwave builds its `Switched`: `skyzen-h1` hands over the connection's concrete halves (`Upgraded::from_halves`), which on Linux `into_splice` turns into a `SpliceDuplex` end; hyper hands over a poll-style stream (`Upgraded::from_stream`), which cannot splice and says so through `can_splice`. Reading or writing it through `futures_io` first converts the halves into a `CopyingPoll`, after which it no longer splices.
 
 `MaybeSend` survives in exactly one place, `src/websocket/session.rs`: it bounds a *user's WebSocket session closure* — `Send` natively, because the token carrying it sits in `Extensions`; nothing on wasm, where a session is built from `Rc`s and JS handles and `on_upgrade` starts it with `wasm_bindgen_futures::spawn_local` on the `WebSocketPair` it already holds. Do not reintroduce the pattern anywhere else.
 
@@ -241,9 +241,14 @@ remain Cloudflare-only, because nothing else has those events.
   trusts, and the proxy's own hop is always written as `Forwarded` and `Via`.
 - Bodies are passed through as `Body` frames and never inspected, except that a chunked upstream
   response to a client without `TE: trailers` fails with `TrailersNotAccepted` at its trailers.
+  Neither HTTP/1.1 writer offers a pipe, so the proxy makes the offer itself (`proxy/body.rs`):
+  every frame of a streamed body is asked for with a `PipeOffer` (the consumer's own when it
+  makes one), and on Linux an HTTP/1.1 source answers with a pipe the other side splices.
 - An upgrade keeps `Upgrade` and `Connection: upgrade` upstream only when the request carries
   `UpgradeAvailable`; on a `101` the response carries an `OnUpgrade` whose session claims
-  zenwave's `Switched` and copies both ways (`proxy/tunnel.rs`). That claim is only legal on the
+  zenwave's `Switched` and forwards both ways (`proxy/tunnel.rs`): `SpliceDuplex::join` when both
+  it and the client's `Upgraded` can splice (Linux, plain or kernel TLS sockets, handed over as
+  halves by `skyzen-h1`), the copy loop otherwise. That claim is only legal on the
   thread running the proxy's pool, and it holds because both servers run the session on the
   connection's thread, the one that built the router. `CONNECT` is refused with
   `ProxyError::Connect` (501).
