@@ -25,8 +25,13 @@ use tracing_subscriber::EnvFilter;
 mod cores;
 mod handoff;
 mod http3;
+mod io_settings;
 pub mod steering;
 mod tls;
+
+pub use io_settings::{
+    apply_io_overrides, IoOptions, IoSettings, IoSettingsNotConfigured, RecvRing,
+};
 
 use http3::{Http3, Http3Error};
 use steering::SteeringError;
@@ -598,6 +603,9 @@ pub struct LaunchOptions {
     /// Whether connections are steered to the thread on the CPU that received them, from
     /// `--steering` or `SKYZEN_STEERING`.
     pub steering: Steering,
+    /// The serving threads' receive ring, zero-copy threshold and file-table size, from their
+    /// flags and variables (see [`IoSettings`]).
+    pub io: IoOptions,
     /// The server that answers cleartext connections, from `--server` or `SKYZEN_SERVER`.
     pub server: HttpServer,
     /// The `[[azure.queue_triggers]]` entries this application declares.
@@ -765,22 +773,22 @@ impl std::error::Error for StartupError {}
 /// refresh a serving thread's call starts goes out on the coordinating thread's connections,
 /// which outlive the drain. Under AWS Lambda the one thread runs the adapter's tokio runtime, so
 /// the clients and the credentials keep the pools zenwave runs on its own driver thread.
+///
+/// The driver a client pools on is the one the serving threads' own sockets run on, carrying the
+/// operator's [`IoSettings`]: a ring's registered file table belongs to every stream of that
+/// ring, and a client's large writes are sent zero-copy from the same threshold as a response's.
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ServicePools {
-    per_thread: bool,
+    driver: Option<http_kit_io::compio::Compio>,
 }
 
 impl ServicePools {
     /// The calling thread's compio driver, to pool on, where the platform's threads run compio;
     /// `None` where they do not, and a client keeps zenwave's own driver thread.
     #[must_use]
-    pub const fn driver(self) -> Option<http_kit_io::compio::Compio> {
-        if self.per_thread {
-            Some(http_kit_io::compio::Compio)
-        } else {
-            None
-        }
+    pub fn driver(&self) -> Option<http_kit_io::compio::Compio> {
+        self.driver.clone()
     }
 
     /// `service` as the calling thread uses it: `rebind` hands it the thread's
@@ -791,7 +799,7 @@ impl ServicePools {
     /// `rebind` panics when it runs on a thread that is not running a compio runtime, which on a
     /// platform that pools per thread is a thread Skyzen did not start.
     pub fn on_this_thread<S>(
-        self,
+        &self,
         service: S,
         rebind: impl FnOnce(S, http_kit_io::compio::Compio) -> S,
     ) -> S {
@@ -920,8 +928,13 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
         tracing::info!("Skyzen application starting up");
 
         // Every thread this path runs services on — this one and each serving thread — runs a
-        // compio runtime its clients can pool on.
-        let (factory, consumers) = setup(ServicePools { per_thread: true }).await;
+        // compio runtime its clients can pool on, with the driver the serving threads' sockets
+        // run on.
+        let driver = options.io.driver();
+        let (factory, consumers) = setup(ServicePools {
+            driver: Some(driver.clone()),
+        })
+        .await;
         let outcome = match platform {
             Platform::Lambda => unreachable!("handed over before the runtime was built"),
             Platform::Server => {
@@ -945,6 +958,8 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
                                 tls,
                                 http3,
                                 steering: options.steering,
+                                io: options.io,
+                                driver,
                             },
                         )
                         .await
@@ -953,7 +968,7 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
                 }
             }
             Platform::AzureFunctions { port } => {
-                serve_functions_host(factory, consumers, &options, port).await
+                serve_functions_host(factory, consumers, &options, driver, port).await
             }
         };
         let failed = match outcome {
@@ -1061,6 +1076,10 @@ struct ListenerSetup {
     http3: Option<Http3>,
     /// Whether connections are steered to the CPU that received them.
     steering: Steering,
+    /// The operator's I/O settings, of which the receive ring is sized here.
+    io: IoOptions,
+    /// The driver every serving thread's sockets run on, the one the service clients pool on.
+    driver: http_kit_io::compio::Compio,
 }
 
 /// Bind `addr`, start one serving thread per core, and run until `Ctrl+C`, a fatal consumer
@@ -1087,6 +1106,8 @@ where
         tls,
         http3,
         steering,
+        io,
+        driver,
     } = setup;
     let threads = std::thread::available_parallelism()?;
     let pins =
@@ -1122,12 +1143,14 @@ where
 
     let queue_consumers = ConsumerChannels::start(consumers, &SmolGlobal, &drain);
 
+    let max_connections =
+        NonZeroUsize::new(MAX_CONNECTIONS.div_ceil(threads.get())).unwrap_or(NonZeroUsize::MIN);
     let plan = cores::Plan {
         factory,
         wrap,
         executor: Arc::new(AnyExecutor::new(SmolGlobal)),
-        max_connections: NonZeroUsize::new(MAX_CONNECTIONS.div_ceil(threads.get()))
-            .unwrap_or(NonZeroUsize::MIN),
+        max_connections,
+        io: IoSettings::new(driver, io.recv_ring(max_connections)),
         server,
         tls,
         http3: http3.zip(http3_port).map(|(http3, port)| cores::Http3Plan {
@@ -1265,7 +1288,7 @@ where
     // serves every invocation. That thread runs tokio, which zenwave's per-thread pools cannot run
     // on, so the HTTP service clients stay on zenwave's driver thread.
     skyzen_lambda::run(|| async move {
-        let (factory, consumers) = setup(ServicePools { per_thread: false }).await;
+        let (factory, consumers) = setup(ServicePools { driver: None }).await;
         (factory.endpoint().await, LambdaConsumers(consumers))
     })
     .map_err(|error| StartupError::Lambda(error.to_string()))?;
@@ -1322,6 +1345,7 @@ async fn serve_functions_host<F, C>(
     factory: F,
     consumers: C,
     options: &LaunchOptions,
+    driver: http_kit_io::compio::Compio,
     port: u16,
 ) -> Result<Shutdown, RuntimeFailure>
 where
@@ -1373,6 +1397,8 @@ where
             http3: None,
             // The host owns the sockets, so nothing here is steered; `launch` refuses forcing it.
             steering: Steering::Off,
+            io: options.io,
+            driver,
         },
     )
     .await

@@ -58,7 +58,7 @@ fn endpoint_factories(
         .map(|injection| &injection.per_thread)
         .collect();
     // `__skyzen_pools` is the platform's `ServicePools`, the parameter of the closure this setup
-    // is the body of; it is `Copy`, so the factory carries its own to every thread.
+    // is the body of; the factory hands a clone of it to every thread.
     let native_setup = quote! {
         async move {
             #shared
@@ -66,6 +66,7 @@ fn endpoint_factories(
             let __skyzen_consumers = #consumers;
             let __skyzen_endpoint_factory = move || {
                 #(let #captured = ::std::clone::Clone::clone(&#captured);)*
+                let __skyzen_pools = ::std::clone::Clone::clone(&__skyzen_pools);
                 async move {
                     #(#per_thread)*
                     let endpoint = #entry_call;
@@ -172,6 +173,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
                     tls: ::skyzen::runtime::native::apply_tls_overrides(::std::env::args()),
                     http3: ::skyzen::runtime::native::apply_http3_override(::std::env::args()),
                     steering: ::skyzen::runtime::native::apply_steering_override(::std::env::args()),
+                    io: ::skyzen::runtime::native::apply_io_overrides(::std::env::args()),
                     server: ::skyzen::runtime::native::apply_server_override(::std::env::args()),
                     azure_queue_triggers: #azure_queue_triggers,
                 },

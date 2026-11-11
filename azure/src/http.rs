@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use zenwave::{
     backend::{NativeBackend, NativeIo},
+    dns::Getaddrinfo,
     Endpoint as _, Request, Response, Transport,
 };
 
@@ -42,7 +43,8 @@ impl AzureHttp {
     #[must_use]
     pub fn system_on_current_thread<I: NativeIo>(io: I) -> Self {
         let backend = compio::runtime::Runtime::with_current(|runtime| {
-            NativeBackend::on_current_thread(Transport::system(), io, runtime)
+            // The system resolver, as on zenwave's own driver thread.
+            NativeBackend::on_current_thread(Transport::system(), io, Getaddrinfo, runtime)
         });
         Self(Arc::new(OnceLock::from(backend)))
     }

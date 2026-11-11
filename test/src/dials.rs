@@ -13,14 +13,16 @@ use std::{
     time::Instant,
 };
 
-use http_kit_io::{compio::Compio, time::Timer, Io};
+use http_kit_io::{compio::Compio, time::Timer, Datagram, Dial};
 
 /// compio's `http-kit-io` driver, reporting the thread every connection is dialed on.
 ///
-/// Everything but the report is [`Compio`]'s own, so it runs wherever compio does: on a thread
-/// running a compio runtime.
+/// It offers what a client dials with — TCP and Unix-domain connections, datagram sockets for
+/// QUIC, and a timer — and everything but the report is [`Compio`]'s own, so it runs wherever
+/// compio does: on a thread running a compio runtime.
 #[derive(Debug, Clone)]
 pub struct DialRecorder {
+    io: Compio,
     report: Sender<ThreadId>,
 }
 
@@ -33,7 +35,13 @@ impl DialRecorder {
     #[must_use]
     pub fn new() -> (Self, Dials) {
         let (report, dials) = mpsc::channel();
-        (Self { report }, Dials(dials))
+        (
+            Self {
+                io: Compio::default(),
+                report,
+            },
+            Dials(dials),
+        )
     }
 
     fn record(&self) {
@@ -53,46 +61,36 @@ impl Dials {
 
 impl Timer for DialRecorder {
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
-        Compio.sleep_until(deadline)
+        self.io.sleep_until(deadline)
     }
 }
 
-impl Io for DialRecorder {
-    type TcpStream = <Compio as Io>::TcpStream;
-    type TcpListener = <Compio as Io>::TcpListener;
-    #[cfg(unix)]
-    type UnixStream = <Compio as Io>::UnixStream;
-    #[cfg(unix)]
-    type UnixListener = <Compio as Io>::UnixListener;
-    type UdpSocket = <Compio as Io>::UdpSocket;
+impl Dial for DialRecorder {
+    type Connection = <Compio as Dial>::Connection;
 
-    fn connect(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::TcpStream>> {
+    fn connect(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Connection>> {
         self.record();
-        Compio.connect(addr)
+        self.io.connect(addr)
     }
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+impl http_kit_io::DialUnix for DialRecorder {
+    type UnixConnection = <Compio as http_kit_io::DialUnix>::UnixConnection;
+
     fn connect_unix(
         &self,
         path: &std::path::Path,
-    ) -> impl Future<Output = io::Result<Self::UnixStream>> {
+    ) -> impl Future<Output = io::Result<Self::UnixConnection>> {
         self.record();
-        Compio.connect_unix(path)
+        self.io.connect_unix(path)
     }
+}
 
-    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<Self::TcpListener> {
-        Compio.tcp_listener(listener)
-    }
+impl Datagram for DialRecorder {
+    type UdpSocket = <Compio as Datagram>::UdpSocket;
 
-    #[cfg(unix)]
-    fn unix_listener(
-        &self,
-        listener: std::os::unix::net::UnixListener,
-    ) -> io::Result<Self::UnixListener> {
-        Compio.unix_listener(listener)
-    }
-
-    fn udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Self::UdpSocket> {
-        Compio.udp_socket(socket)
+    fn bind_udp(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::UdpSocket>> {
+        self.io.bind_udp(addr)
     }
 }

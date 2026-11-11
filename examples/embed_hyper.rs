@@ -44,7 +44,7 @@
 //! Run with: `cargo run --example embed_hyper`
 
 use async_executor::LocalExecutor;
-use http_kit_io::{async_io::AsyncIo, Io};
+use http_kit_io::{async_io::AsyncIo, FromStd as _};
 use serde::Serialize;
 use skyzen::{
     hyper::Hyper,

@@ -11,7 +11,7 @@ use std::{cell::RefCell, net::SocketAddr, rc::Rc, thread};
 use async_channel::Sender;
 use executor_core::compio::Runtime;
 use http_kit::{error::BoxHttpError, utils::Bytes, Body, Endpoint, Request, Response};
-use http_kit_io::{compio::Compio, Io as _};
+use http_kit_io::{compio::Compio, FromStd as _};
 use skyzen_core::Server as _;
 use skyzen_h1::H1;
 
@@ -53,7 +53,8 @@ impl LoopbackServer {
                 let runtime = Rc::new(Runtime::new().expect("a compio runtime for the server"));
                 let executor = Rc::clone(&runtime);
                 runtime.block_on(async move {
-                    let listener = Compio
+                    let io = Compio::default();
+                    let listener = io
                         .tcp_listener(listener)
                         .expect("register the listener with compio");
                     let endpoint = Answer(Rc::new(RefCell::new(answer)));
@@ -62,7 +63,7 @@ impl LoopbackServer {
                         let _ = stopped.recv().await;
                     };
                     H1::default()
-                        .serve(Compio, executor, listener, endpoint, shutdown)
+                        .serve(io, executor, listener, endpoint, shutdown)
                         .await;
                 });
             })

@@ -44,7 +44,7 @@ regex = "1"
 # The Azure app settings are read and written over ARM, which has no Rust SDK for the Web Apps
 # provider; zenwave is the workspace's HTTP client — hyper over async-io with rustls verified
 # against the OS trust store, the same selection `skyzen-azure` makes.
-zenwave = { version = "0.11.0", default-features = false, features = ["hyper-backend", "rustls", "http2"] }
+zenwave = { version = "0.12.0", default-features = false, features = ["hyper-backend", "rustls", "http2"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -81,6 +81,8 @@ futures-util = { version = "0.3.31", default-features = false }
 io-uring = { version = "0.7.16", default-features = false }
 # The steering decision, read exactly as the runtime reads it.
 skyzen-core = { workspace = true, features = ["steering"] }
+# `RLIMIT_MEMLOCK` through `getrlimit(2)`, which bounds the pages zero-copy sends pin.
+nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -4,7 +4,7 @@
 use core::future::Future;
 use http_kit::error::BoxHttpError;
 use http_kit::{http_error, Body, Request, Response, StatusCode};
-use http_kit_io::{async_io::AsyncIo, Io};
+use http_kit_io::{async_io::AsyncIo, FromStd as _};
 use skyzen_core::{Endpoint, Server};
 use skyzen_hyper::Hyper;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
