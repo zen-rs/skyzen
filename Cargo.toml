@@ -62,7 +62,7 @@ clippy.future_not_send = { level = "allow", priority = 1 }
 # the deliberate rename. To regenerate: drop the `allow-dirty` line, run
 # `dist generate`, rename the emitted file to `binaries.yml`, restore the line.
 [workspace.metadata.dist]
-cargo-dist-version = "0.33.0"
+cargo-dist-version = "0.34.0"
 ci = ["github"]
 installers = ["shell", "powershell"]
 targets = [
