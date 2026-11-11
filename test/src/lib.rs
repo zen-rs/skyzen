@@ -34,6 +34,8 @@ pub mod client;
 pub mod context;
 pub mod events;
 pub mod fixtures;
+#[cfg(all(feature = "loopback", not(target_arch = "wasm32")))]
+pub mod loopback;
 pub mod mock;
 pub mod snapshot;
 
@@ -41,4 +43,6 @@ pub use assertions::TestResponse;
 pub use client::TestClient;
 pub use context::TestContext;
 pub use events::{queue_batch, queue_message, scheduled_tick};
+#[cfg(all(feature = "loopback", not(target_arch = "wasm32")))]
+pub use loopback::{LoopbackServer, ReceivedRequest};
 pub use snapshot::SnapshotExt;

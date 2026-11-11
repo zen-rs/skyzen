@@ -210,9 +210,10 @@ impl SqsQueue {
         Ok(self)
     }
 
-    /// The default SDK client, built from environment configuration.
+    /// The default SDK client, built from the ambient configuration [`crate::sdk::load_config`]
+    /// loads.
     async fn env_client() -> Client {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = crate::sdk::load_config().await;
         Client::new(&config)
     }
 
@@ -736,6 +737,7 @@ mod tests {
                 .behavior_version(BehaviorVersion::latest())
                 .region(Region::new("us-east-1"))
                 .credentials_provider(Credentials::new("AKIDTEST", "secret", None, None, "tests"))
+                .sleep_impl(crate::sdk::AsyncIoSleep)
                 .build(),
         )
     }
@@ -1059,7 +1061,7 @@ mod tests {
         assert!(retry_visibility_seconds(QueueRetry::new().with_delay_seconds(u32::MAX)).is_err());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_fifo_queue_refuses_a_per_message_delay() {
         use skyzen_services::queue::{MessageQueue, SendOptions};
 

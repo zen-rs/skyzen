@@ -11,36 +11,48 @@ categories = ["web-programming::http-server", "database"]
 
 [dependencies]
 skyzen-services = { path = "../services", version = "0.3.1", default-features = false }
-skyzen-s3 = { path = "../s3", version = "0.3.1", optional = true }
-aws-config = "1"
-# Disable the SDK default `rustls` feature: it pulls the legacy `tls-rustls` connector
-# (rustls 0.21 / hyper-rustls 0.24), which is redundant with the modern `default-https-client`
-# (rustls-aws-lc) and carries unpatched RustSec advisories. The default HTTPS client is unaffected.
-aws-sdk-dynamodb = { version = "1", optional = true, default-features = false, features = [
-    "default-https-client",
-    "rt-tokio",
-] }
-aws-sdk-sqs = { version = "1", optional = true, default-features = false, features = [
-    "default-https-client",
-    "rt-tokio",
-] }
-aws-sdk-rdsdata = { version = "1", optional = true, default-features = false, features = [
-    "default-https-client",
-    "rt-tokio",
-] }
-aws-smithy-types = { version = "1", optional = true }
+# The SDK's I/O (`sdk`): requests go out on zenwave's runtime-neutral native backend, whose
+# connection pool runs on a compio driver, and the SDK's timers on async-io's. Neither needs a tokio
+# context, so the SDK's own `rt-tokio` and `default-https-client` (hyper on tokio) are off
+# everywhere, aws-config's included; aws-config's `credentials-process` is off too, because it
+# runs the process through `tokio::process`; `credential_process` replaces it.
+aws-config = { version = "1.13.1", default-features = false, features = ["sso"] }
+aws-smithy-runtime-api = { version = "1.21.0", default-features = false, features = ["client", "http-1x"] }
+aws-smithy-async = { version = "1.3.1", default-features = false }
+aws-smithy-types = { version = "1.9.4", default-features = false, features = ["http-body-1-x"] }
+zenwave = { version = "0.10.1", default-features = false, features = ["native-compio"] }
+http-kit.workspace = true
+async-io.workspace = true
+aws-sdk-dynamodb = { version = "1", optional = true, default-features = false }
+aws-sdk-sqs = { version = "1", optional = true, default-features = false }
+aws-sdk-rdsdata = { version = "1", optional = true, default-features = false }
 base64 = { version = "0.22", optional = true }
 # Only for `SqsDeduplication::ContentHash`, which needs a stable digest of a message body to build
 # a FIFO `MessageDeduplicationId`.
 sha2 = { version = "0.10", optional = true }
-serde_json = { version = "1", optional = true }
-tracing = { workspace = true, optional = true }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+tracing.workspace = true
+# The `credential_process` provider (`credential_process`): aws-config's own runs the process through
+# `tokio::process`, so the command runs on async-process, which needs no tokio context.
+async-process = { version = "2.5.0", default-features = false }
+aws-credential-types = { version = "1.3.1", default-features = false }
+aws-runtime = { version = "1.10.3", default-features = false }
+aws-types = { version = "1.7.0", default-features = false }
 # Note: no direct `sqlparser` dependency. The RDS Data API's second rewriting pass uses the
 # tokenizer `skyzen-services` re-exports, so the two passes cannot end up on different versions of
 # it and disagree about what a string literal is.
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+# The tests run on a compio runtime, the one the native server runs, against a loopback server;
+# tokio is here only to assert that no tokio runtime is running.
+compio = { version = "0.19.2", default-features = false, features = ["runtime", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
+skyzen-test = { workspace = true, features = ["loopback"] }
+base64 = "0.22"
+# A response body that stalls mid-transfer.
+futures-lite = { version = "2.6", default-features = false }
+tempfile = "3.25"
+serial_test = "3.2"
 # The parameter types `DbValue` carries, needed to build one of every variant in the mapping tests.
 # Versions match `skyzen-services`, so the types are the same ones its `DbValue` holds.
 bigdecimal = "0.4"
@@ -48,16 +60,10 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = "1"
 
 [features]
-default = ["dynamodb", "rds-data", "s3", "sqs"]
-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-smithy-types"]
-rds-data = [
-    "dep:aws-sdk-rdsdata",
-    "dep:aws-smithy-types",
-    "dep:serde_json",
-    "dep:tracing",
-]
-s3 = ["dep:skyzen-s3"]
-sqs = ["dep:aws-sdk-sqs", "dep:aws-smithy-types", "dep:base64", "dep:sha2"]
+default = ["dynamodb", "rds-data", "sqs"]
+dynamodb = ["dep:aws-sdk-dynamodb"]
+rds-data = ["dep:aws-sdk-rdsdata"]
+sqs = ["dep:aws-sdk-sqs", "dep:base64", "dep:sha2"]
 
 [lints]
 workspace = true

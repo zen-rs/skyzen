@@ -1,4 +1,9 @@
 //! Azure Storage queue implementation of [`MessageQueue`].
+//!
+//! The SDK client's requests go out on zenwave's native backend ([`transport`]), so the queue needs
+//! no tokio context.
+
+mod transport;
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -6,7 +11,7 @@ use std::sync::Arc;
 use azure_core::{
     credentials::TokenCredential,
     error::ErrorKind,
-    http::{headers::HeaderName, RequestContent, Url},
+    http::{headers::HeaderName, ClientOptions, RequestContent, Url},
     Error as AzureError,
 };
 use azure_storage_queue::{
@@ -15,7 +20,7 @@ use azure_storage_queue::{
         QueueClientSendMessageOptions, QueueClientUpdateMessageOptions, QueueMessage,
         ReceivedMessage as StorageQueueMessage,
     },
-    QueueClient,
+    QueueClient, QueueClientOptions,
 };
 use serde::{Deserialize, Serialize};
 use skyzen_services::queue::{
@@ -109,7 +114,8 @@ impl AzureStorageQueue {
         credential: Arc<dyn TokenCredential>,
     ) -> Result<Self, QueueError> {
         let url = queue_url(account_url, queue)?;
-        let client = QueueClient::new(url, Some(credential), None).map_err(azure_error)?;
+        let client =
+            QueueClient::new(url, Some(credential), Some(client_options())).map_err(azure_error)?;
         Ok(Self::new(client))
     }
 
@@ -133,7 +139,7 @@ impl AzureStorageQueue {
             )));
         }
 
-        let client = QueueClient::new(url, None, None).map_err(azure_error)?;
+        let client = QueueClient::new(url, None, Some(client_options())).map_err(azure_error)?;
         Ok(Self::new(client))
     }
 
@@ -253,6 +259,20 @@ where
         }
 
         async_io::Timer::after(POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
+/// The options every constructor here builds the SDK client with: its requests on zenwave's
+/// native backend rather than `azure_core`'s default reqwest-on-tokio transport.
+fn client_options() -> QueueClientOptions {
+    QueueClientOptions {
+        client_options: ClientOptions {
+            transport: Some(transport::ZenwaveHttpClient::transport(
+                crate::http::system_backend(),
+            )),
+            ..ClientOptions::default()
+        },
+        ..QueueClientOptions::default()
     }
 }
 
@@ -609,6 +629,133 @@ mod tests {
     // `skyzen_services::queue::envelope`. What is tested here is what this backend adds to it:
     // the platform's size cap, and that a malformed envelope surfaces as a `QueueError`.
 
+    /// A message in Chinese, Japanese and Korean.
+    const LOOPBACK_MESSAGE: &str = "订单已付款。注文は支払い済み。주문 결제 완료.";
+
+    /// The service's answer to `Put Message`.
+    const PUT_MESSAGE_ANSWER: &str =
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?><QueueMessagesList>\
+        <QueueMessage><MessageId>5974b586-0df3-4e2d-ad0c-18e3892bfca2</MessageId>\
+        <InsertionTime>Tue, 10 Nov 2026 15:00:00 GMT</InsertionTime>\
+        <ExpirationTime>Tue, 17 Nov 2026 15:00:00 GMT</ExpirationTime>\
+        <PopReceipt>YzQ4Yzg1MDItYTc0Ny00OWNjLTkxYTUtZGM0MDFiZDAwYzEw</PopReceipt>\
+        <TimeNextVisible>Tue, 10 Nov 2026 15:00:00 GMT</TimeNextVisible>\
+        </QueueMessage></QueueMessagesList>";
+
+    /// The queue `orders`, signed with a SAS, with every request going to `server`.
+    fn loopback_queue(server: &skyzen_test::LoopbackServer) -> AzureStorageQueue {
+        AzureStorageQueue::from_sas_url(&format!(
+            "http://{}/devstoreaccount1/orders?sv=2024-11-04&sp=raup&sig=bG9vcGJhY2s%3D",
+            server.addr()
+        ))
+        .expect("a signed loopback URL")
+    }
+
+    /// An answer with `status` and, when there is one, the `Put Message` body.
+    fn answer(status: http::StatusCode, body: &'static str) -> http_kit::Response {
+        let mut response = http_kit::Response::new(http_kit::Body::from_bytes(body));
+        *response.status_mut() = status;
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/xml"),
+        );
+        response
+    }
+
+    fn assert_no_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the test must run with no tokio runtime"
+        );
+    }
+
+    /// A send leaves through the SDK client on zenwave's native backend, while the test runs on
+    /// compio with no tokio runtime.
+    #[compio::test]
+    async fn a_send_goes_out_on_zenwave_without_a_tokio_runtime() {
+        use skyzen_services::queue::MessageQueue as _;
+
+        assert_no_tokio_runtime();
+        let (seen, received) = std::sync::mpsc::channel::<skyzen_test::ReceivedRequest>();
+        let server = skyzen_test::LoopbackServer::start(move |request| {
+            seen.send(request).expect("the test is still listening");
+            answer(http::StatusCode::CREATED, PUT_MESSAGE_ANSWER)
+        });
+
+        loopback_queue(&server)
+            .send(LOOPBACK_MESSAGE.as_bytes())
+            .await
+            .expect("the send should succeed");
+
+        let request = received.recv().expect("the server saw the send");
+        assert_eq!(request.method(), http::Method::POST);
+        assert_eq!(request.uri().path(), "/devstoreaccount1/orders/messages");
+        assert!(
+            request
+                .uri()
+                .query()
+                .is_some_and(|query| query.contains("sig=")),
+            "the SAS rides the query: {}",
+            request.uri()
+        );
+        let body = core::str::from_utf8(request.body()).expect("the body is XML text");
+        assert!(body.contains(LOOPBACK_MESSAGE), "{body}");
+    }
+
+    /// A `403` is the service's answer, read out of the response by `azure_core`: the caller sees
+    /// that its signature was refused, not a transport failure.
+    #[compio::test]
+    async fn a_refused_signature_is_unauthorized() {
+        use skyzen_services::queue::MessageQueue as _;
+
+        assert_no_tokio_runtime();
+        let server = skyzen_test::LoopbackServer::start(|_| {
+            answer(
+                http::StatusCode::FORBIDDEN,
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?><Error>\
+                 <Code>AuthenticationFailed</Code><Message>Signature did not match.</Message></Error>",
+            )
+        });
+
+        let error = loopback_queue(&server)
+            .send(LOOPBACK_MESSAGE.as_bytes())
+            .await
+            .expect_err("a refused signature is an error");
+
+        assert!(matches!(error, QueueError::Unauthorized), "{error:?}");
+    }
+
+    /// A `503` is retried after `azure_core`'s back-off sleep, and the retry's answer is the result.
+    ///
+    /// Not compiled with `cosmos`: the Cosmos SDK switches on `azure_core`'s `tokio` feature, which
+    /// makes `azure_core`'s process-wide default async runtime tokio's, and its back-off sleep then
+    /// needs a tokio context — so with `cosmos` in the build, a retried storage-queue request
+    /// does too.
+    #[cfg(not(feature = "cosmos"))]
+    #[compio::test]
+    async fn a_server_error_is_retried_and_the_retry_answers() {
+        use skyzen_services::queue::MessageQueue as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        assert_no_tokio_runtime();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&calls);
+        let server = skyzen_test::LoopbackServer::start(move |_| {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                answer(http::StatusCode::SERVICE_UNAVAILABLE, "")
+            } else {
+                answer(http::StatusCode::CREATED, PUT_MESSAGE_ANSWER)
+            }
+        });
+
+        loopback_queue(&server)
+            .send(LOOPBACK_MESSAGE.as_bytes())
+            .await
+            .expect("the retried send should succeed");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one failure, one retry");
+    }
+
     #[test]
     fn a_message_beyond_the_platform_cap_is_refused_before_it_is_sent() {
         let payload = vec![b'a'; MAX_MESSAGE_BYTES + 1];
@@ -758,7 +905,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn an_emulated_long_poll_returns_as_soon_as_a_message_arrives() {
         let polls = std::cell::Cell::new(0);
 
@@ -780,7 +927,7 @@ mod tests {
         assert_eq!(polls.get(), 3, "it stopped as soon as it had a message");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn an_emulated_long_poll_gives_up_empty_once_the_wait_elapses() {
         let polls = std::cell::Cell::new(0);
         let started = std::time::Instant::now();
@@ -798,7 +945,7 @@ mod tests {
         assert!(started.elapsed() >= wait, "it waited out the whole poll");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn an_emulated_long_poll_surfaces_a_failure_instead_of_retrying_it() {
         let error = long_poll(Duration::from_secs(30), || async {
             Err(QueueError::backend("the queue is gone"))

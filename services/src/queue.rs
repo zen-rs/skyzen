@@ -797,7 +797,7 @@ mod tests {
         assert!(matches!(error, QueueError::Serialization(_)));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn wrapper_sends_raw_and_json_messages() {
         let backend = InMemoryMessageQueue::default();
         let queue = Queue::new(backend.clone());
@@ -828,7 +828,7 @@ mod tests {
         assert!(std::str::from_utf8(&messages[3]).unwrap().contains("push"));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn middleware_injects_queue_for_downstream_endpoint_and_extractor() {
         let backend = InMemoryMessageQueue::default();
         let queue = Queue::new(backend.clone());
@@ -850,7 +850,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn send_with_forwards_a_plain_send_and_refuses_an_unsupported_delay() {
         let backend = InMemoryMessageQueue::default();
         let queue = Queue::new(backend.clone());
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(backend.messages.read().unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn pull_consumption_defaults_to_unsupported_on_a_push_only_backend() {
         let queue = Queue::new(InMemoryMessageQueue::default());
         let receipt = MessageReceipt::new("lease-1");
@@ -927,7 +927,7 @@ mod tests {
         assert!(ReceiveOptions::default().wait.is_none());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn extractor_returns_internal_server_error_when_queue_is_missing() {
         let mut request = http_kit::Request::new(Body::empty());
 

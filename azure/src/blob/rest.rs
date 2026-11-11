@@ -16,7 +16,7 @@ use reqsign_core::{Context, SignRequest as _};
 use serde::Deserialize;
 use skyzen_services::storage::StorageError;
 use url::Url;
-use zenwave::{Body, DefaultClient, Endpoint as _, Request, Transport};
+use zenwave::{backend::NativeBackend, Body, Request};
 
 use crate::status::{classify, retry_after, AzureStatus};
 
@@ -40,9 +40,8 @@ pub(super) const WRITE_PERMISSION: &str = "cw";
 
 /// The Azure Blob REST endpoint of one container.
 pub(super) struct BlobRest {
-    /// The transport the requests go out on; the per-origin connection pool lives on it, so
-    /// clients built from it share connections.
-    transport: Transport,
+    /// The backend the requests go out on; clones share its connection pool.
+    http: NativeBackend,
     /// The signer, which turns a request into a signed one or a URL into a presigned one.
     signer: RequestSigner,
     /// `reqsign`'s ambient context. Shared-key signing needs nothing from it.
@@ -64,6 +63,7 @@ impl core::fmt::Debug for BlobRest {
 impl BlobRest {
     /// Bind to the container at `endpoint`, authenticating with `credential`.
     pub(super) fn new(
+        http: NativeBackend,
         endpoint: &str,
         container: &str,
         credential: Credential,
@@ -84,23 +84,12 @@ impl BlobRest {
             .push(container);
 
         Ok(Self {
-            transport: Transport::system(),
+            http,
             signer: RequestSigner::new(),
             context: Context::new(),
             credential,
             container_url,
         })
-    }
-
-    /// The client one request goes out on.
-    ///
-    /// One is built per request because the connection pool lives on the `Transport`: clients
-    /// over a clone of the same transport share connections, so this costs a struct wrap, not a
-    /// pool. It is the raw backend — a `reqsign` signature is bound to the URI it signs, so a
-    /// redirect could never be honored anyway, and a 3xx should surface as itself rather than as
-    /// a replayed hop.
-    fn client(&self) -> zenwave::backend::DefaultBackend {
-        DefaultClient::raw(self.transport.clone())
     }
 
     /// Whether this endpoint can mint a shared access signature of its own.
@@ -249,10 +238,13 @@ impl BlobRest {
 
         let mut request = Request::from_parts(parts, Body::from(body));
 
-        let mut client = self.client();
-        let response = client.respond(&mut request).await.map_err(|error| {
-            StorageError::backend_with(format!("the {method} request to Azure failed"), error)
-        })?;
+        // The raw backend: a `reqsign` signature is bound to the URI it signs, so a redirect could
+        // never be honored anyway, and a 3xx surfaces as itself rather than as a replayed hop.
+        let response = crate::http::send(&mut self.http.clone(), &mut request)
+            .await
+            .map_err(|error| {
+                StorageError::backend_with(format!("the {method} request to Azure failed"), error)
+            })?;
 
         let status = response.status();
         let retry_after_header = response
@@ -414,6 +406,7 @@ mod tests {
 
     fn rest() -> BlobRest {
         BlobRest::new(
+            crate::http::system_backend(),
             "https://skyzentest.blob.core.windows.net",
             "uploads",
             Credential::SharedKey {
@@ -490,6 +483,7 @@ mod tests {
         assert!(rest().can_presign());
 
         let sas = BlobRest::new(
+            crate::http::system_backend(),
             "https://skyzentest.blob.core.windows.net",
             "uploads",
             Credential::SasToken {
@@ -501,7 +495,7 @@ mod tests {
         assert!(!sas.can_presign());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_presigned_url_carries_the_signature_the_service_verifies() {
         let url = rest()
             .presign(

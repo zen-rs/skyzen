@@ -21,8 +21,10 @@ skyzen-redis = "0.1"
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `runtime-tokio` | Yes | Use Tokio as the async runtime |
-| `runtime-smol` | No | Use Smol as the async runtime |
+| `tls` | No | `rediss://` URLs, through rustls |
+
+The connection runs on redis's smol runtime, whose sockets and timers are async-io's, so it works
+under any executor — compio's thread-per-core runtime included — with no tokio context.
 
 ## Usage
 

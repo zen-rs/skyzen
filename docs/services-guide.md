@@ -354,10 +354,8 @@ let storage = Storage::new(S3Storage::from_env("my-bucket").await);
 
 A `rediss://` URL negotiates TLS through rustls once `skyzen-redis`'s `tls`
 feature is on; without it the scheme fails at `Client::open` before it can
-connect. `tls` pulls the rustls glue for both runtimes — upstream requires a
-TLS comp per enabled runtime, so a single feature is what keeps every feature
-combination buildable; a `runtime-smol`-only build still pins `prefer_smol` at
-first connect so the declared runtime wins.
+connect. The connection runs on redis's smol runtime under any executor, with
+no tokio context.
 
 ### Cloudflare Workers (KV + R2)
 
@@ -534,11 +532,11 @@ A column the query did not select, or one holding something the field's type doe
 error naming the column and what was expected. Nothing is defaulted, and only an `Option<T>` field
 accepts `NULL`.
 
-Enable the required runtime and database features:
+Enable the required TLS and database features:
 
 ```toml
 [dependencies]
-skyzen-services = { version = "0.1", features = ["runtime-tokio", "tls-rustls", "postgres"] }
+skyzen-services = { version = "0.1", features = ["tls-rustls", "postgres"] }
 ```
 
 Portable SQL is intentionally the minimum common surface. When you need provider-specific features such as Durable Object local SQLite or D1-specific metadata, drop down to the provider APIs explicitly.

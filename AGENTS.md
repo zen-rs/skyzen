@@ -57,10 +57,10 @@ Skyzen is a router-first HTTP framework targeting both native servers (Tokio + H
 
 **Platform Implementations:**
 - **`skyzen-redis`** (`redis/`) - Redis implementation of `KeyValueStore`, atomics included.
-- **`skyzen-s3`** (`s3/`) - S3-compatible implementation of `ObjectStorage`, with streaming, ranges, multipart and presigning.
+- **`skyzen-s3`** (`s3/`) - S3-compatible implementation of `ObjectStorage`, with streaming, ranges, multipart and presigning, on `skyzen-aws`'s `sdk` module (no service features).
 - **`skyzen-cloudflare`** (`cloudflare/`) - Cloudflare Workers implementations for KV, R2, Queues, D1 SQL, Durable Objects, the secrets store, `WorkerContext`/`CfProperties`, and the email/tail events (**wasm32-only**).
 - **`skyzen-cloudflare-admin`** (`cloudflare-admin/`) - The shared Cloudflare control-plane types: the `{success, errors, result}` response envelope and `TokenSource`. No HTTP transport and no endpoint wrappers, and nothing in this workspace depends on it — `skyzen provision` drives wrangler.
-- **`skyzen-aws`** (`aws/`) - AWS implementations: DynamoDB (`DynamoKv`), SQS (`SqsQueue`, FIFO and consume side), the Aurora Data API (`RdsDataDb`, with real transactions), and `S3Storage` re-exported from `skyzen-s3`.
+- **`skyzen-aws`** (`aws/`) - AWS implementations: DynamoDB (`DynamoKv`), SQS (`SqsQueue`, FIFO and consume side), the Aurora Data API (`RdsDataDb`, with real transactions), and `sdk`, the AWS SDK's I/O for every AWS backend: requests on zenwave's runtime-neutral native backend (a `Send` handle onto a connection pool on a compio driver), timers on async-io, so no SDK client needs a tokio context.
 - **`skyzen-azure`** (`azure/`) - Azure implementations: Cosmos DB (`CosmosKv`), Blob Storage (`AzureBlob`), Service Bus (`ServiceBusQueue`), Azure Storage queues (`AzureStorageQueue`).
 
 **Tooling:**

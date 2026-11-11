@@ -14,8 +14,8 @@
 
 use core::time::Duration;
 
-use deadpool_tiberius::tiberius::error::Error as TiberiusError;
 use skyzen_services::DbError;
+use tiberius::error::Error as TiberiusError;
 
 /// What a SQL Server error number means for the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

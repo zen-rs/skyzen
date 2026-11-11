@@ -59,11 +59,9 @@ use core::fmt::Display;
 
 use bigdecimal::{BigDecimal, ToPrimitive as _};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
-use deadpool_tiberius::tiberius::{
-    numeric::Numeric, Column, ColumnData, FromSql as _, IntoSql, Row,
-};
 use serde_json::{Map, Number, Value};
 use skyzen_services::{DbError, DbValue};
+use tiberius::{numeric::Numeric, Column, ColumnData, FromSql as _, IntoSql, Row};
 
 /// T-SQL's largest `numeric` precision, in digits.
 const MAX_PRECISION: usize = 38;
@@ -256,12 +254,12 @@ where
 }
 
 /// The bound [`rendered`] needs, named so the `where` clause stays readable.
-trait FromSqlDisplay<'a>: deadpool_tiberius::tiberius::FromSql<'a> + Display {}
+trait FromSqlDisplay<'a>: tiberius::FromSql<'a> + Display {}
 
-impl<'a, T> FromSqlDisplay<'a> for T where T: deadpool_tiberius::tiberius::FromSql<'a> + Display {}
+impl<'a, T> FromSqlDisplay<'a> for T where T: tiberius::FromSql<'a> + Display {}
 
 /// The error a value the driver cannot read back reports.
-fn undecodable(described: &str, error: deadpool_tiberius::tiberius::error::Error) -> DbError {
+fn undecodable(described: &str, error: tiberius::error::Error) -> DbError {
     DbError::backend_with(
         format!("Azure SQL returned {described} the driver could not decode: {error}"),
         error,
@@ -339,9 +337,9 @@ mod tests {
         ColumnData, Numeric,
     };
     use core::str::FromStr as _;
-    use deadpool_tiberius::tiberius::{ColumnType, FromSql as _, IntoSql as _, Uuid};
     use serde_json::json;
     use skyzen_services::{DbError, DbValue};
+    use tiberius::{ColumnType, FromSql as _, IntoSql as _, Uuid};
 
     fn column(name: &str) -> Column {
         Column::new(name.to_owned(), ColumnType::NVarchar)

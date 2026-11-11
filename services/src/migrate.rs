@@ -593,12 +593,7 @@ mod tests {
 /// `SQLite` is what makes this a genuine end-to-end test rather than a mock: it is a real SQL
 /// engine with real transactions and a real primary key, and it needs no server, so the atomicity
 /// and race behaviour being asserted here is the database's, not a stand-in's.
-#[cfg(all(
-    test,
-    not(target_arch = "wasm32"),
-    feature = "sqlite",
-    any(feature = "runtime-tokio", feature = "runtime-async-std")
-))]
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "sqlite"))]
 mod runner_tests {
     use super::{AppliedMigration, Migration, Migrations};
     use crate::sql::{Db, DbError};
@@ -642,7 +637,7 @@ mod runner_tests {
             .expect("bookkeeping table should be readable")
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_fresh_database_runs_every_migration_and_records_it() {
         let db = db().await;
         let migrations = Migrations::from_owned(vec![create_users(), seed_users()]);
@@ -670,7 +665,7 @@ mod runner_tests {
         assert_eq!(count, 2);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_second_run_applies_nothing() {
         let db = db().await;
         let migrations = Migrations::from_owned(vec![create_users(), seed_users()]);
@@ -682,7 +677,7 @@ mod runner_tests {
         assert_eq!(applied(&db).await.len(), 2);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn an_edited_migration_is_refused_by_its_checksum() {
         let db = db().await;
         db.migrate(&Migrations::from_owned(vec![create_users()]))
@@ -714,7 +709,7 @@ mod runner_tests {
         assert_eq!(applied(&db).await.len(), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_failing_migration_leaves_nothing_behind_and_stays_pending() {
         let db = db().await;
         let broken = migration(
@@ -745,7 +740,7 @@ mod runner_tests {
             .expect_err("the rolled-back table must not exist");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_lost_race_is_reported_as_a_conflict() {
         let db = db().await;
         // A migration that can be re-run without failing on its own SQL, so the only thing that
@@ -771,7 +766,7 @@ mod runner_tests {
         assert_eq!(applied(&db).await.len(), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_migration_holding_no_statements_is_refused() {
         let db = db().await;
         let empty = migration(1, "empty", "-- nothing to do here\n", 1);
@@ -785,7 +780,7 @@ mod runner_tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn status_on_an_unmigrated_database_reports_everything_pending() {
         let db = db().await;
         let migrations = Migrations::from_owned(vec![create_users(), seed_users()]);
@@ -799,7 +794,7 @@ mod runner_tests {
         assert_eq!(status.pending[0].name(), "create_users");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn a_version_the_build_does_not_embed_is_left_alone() {
         // A rollback to an older build: the database is ahead. Refusing to start would turn a
         // routine rollback into an outage, so the extra version is reported and ignored.

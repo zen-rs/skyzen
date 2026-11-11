@@ -372,7 +372,7 @@ mod tests {
 
     use super::InMemoryKv;
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_returns_keys_in_lexicographic_order() {
         let kv = InMemoryKv::new();
         for key in ["b", "c", "a", "aa"] {
@@ -392,7 +392,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_paginates_with_a_cursor_across_three_pages() {
         let kv = InMemoryKv::new();
         for key in ["a", "b", "c", "d", "e"] {
@@ -422,7 +422,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn zero_ttl_expires_immediately_for_get_exists_and_list() {
         let kv = InMemoryKv::new();
         kv.put("keep", b"forever").await.unwrap();
@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(kv.data.read().unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn positive_ttl_keeps_the_value_visible_until_expiry() {
         let kv = InMemoryKv::new();
         kv.put_with_ttl("session", b"data", Duration::from_hours(1))
@@ -451,7 +451,7 @@ mod tests {
         assert!(kv.exists("session").await.unwrap());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn overwriting_with_plain_put_clears_the_ttl() {
         let kv = InMemoryKv::new();
         kv.put_with_ttl("key", b"ttl", Duration::ZERO)
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(kv.get("key").await.unwrap(), Some(b"forever".to_vec()));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn strict_cloudflare_rounds_a_short_ttl_up_to_the_platform_floor() {
         let kv = InMemoryKv::strict_cloudflare();
         kv.put_with_ttl("nonce", b"single-use", Duration::from_secs(5))
@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(permissive.get("nonce").await.unwrap(), None);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn put_if_absent_lets_exactly_one_writer_win() {
         let kv = InMemoryKv::new();
 
@@ -494,7 +494,7 @@ mod tests {
         assert!(kv.put_if_absent("lock", b"second").await.unwrap());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn compare_and_swap_reports_a_lost_race_as_ok_false() {
         let kv = InMemoryKv::new();
 
@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(kv.get("doc").await.unwrap(), Some(b"v2".to_vec()));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn increment_counts_from_zero_and_rejects_non_numeric_values() {
         let kv = InMemoryKv::new();
 
@@ -527,7 +527,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn increment_keeps_the_window_a_rate_limiter_already_opened() {
         let kv = InMemoryKv::new();
         kv.put_with_ttl("window", b"1", Duration::ZERO)
@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(kv.increment("window", 1).await.unwrap(), 1);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn expire_re_arms_an_existing_key_and_reports_a_missing_one() {
         let kv = InMemoryKv::new();
         kv.put("session", b"data").await.unwrap();
@@ -553,7 +553,7 @@ mod tests {
         assert!(!kv.expire("absent", Duration::from_hours(1)).await.unwrap());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn wrapper_exposes_the_atomic_primitives_through_dynamic_dispatch() {
         let kv = Kv::new(InMemoryKv::new());
 
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(kv.list_all(None).await.unwrap(), vec!["hits", "lock"]);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn fail_next_with_fails_exactly_one_operation() {
         let kv = InMemoryKv::new();
         kv.put("key", b"value").await.unwrap();

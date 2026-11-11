@@ -26,6 +26,14 @@
 //! probably already have. Both implement [`MessageQueue`] in full, so the choice is a
 //! configuration one rather than a code one.
 //!
+//! # Runtime
+//!
+//! Blob Storage, Service Bus and Storage queues send their requests on zenwave's runtime-neutral
+//! native backend, whose connection pool runs on a compio driver behind a `Send` handle; Azure SQL
+//! reads and writes an async-io TCP stream. None of them needs a tokio context. Cosmos DB does: its
+//! SDK builds its own reqwest transport and runs background loops on tokio, with no public way to
+//! hand it another one.
+//!
 //! # Example
 //!
 //! ```ignore
@@ -46,6 +54,8 @@
 pub mod blob;
 #[cfg(feature = "cosmos")]
 pub mod cosmos;
+#[cfg(any(feature = "blob", feature = "servicebus", feature = "storage-queue"))]
+mod http;
 #[cfg(feature = "servicebus")]
 pub mod service_bus;
 #[cfg(feature = "sql")]

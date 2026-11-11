@@ -119,9 +119,10 @@ impl DynamoKv {
 
     /// Create a new `DynamoKv` from environment configuration.
     ///
-    /// Uses the default AWS SDK configuration loader and a default key attribute of `"pk"`.
+    /// Loads the ambient AWS configuration through [`crate::sdk::load_config`] and uses a default
+    /// key attribute of `"pk"`.
     pub async fn from_env(table_name: impl Into<String>) -> Self {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = crate::sdk::load_config().await;
         let client = Client::new(&config);
         Self::new(client, table_name, "pk")
     }

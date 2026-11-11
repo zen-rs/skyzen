@@ -941,7 +941,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn wrapper_supports_crud_list_and_head_operations() {
         let storage = Storage::new(InMemoryObjectStorage::default());
 
@@ -972,7 +972,7 @@ mod tests {
         assert!(storage.get("prefix:a.txt").await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn middleware_injects_storage_for_downstream_endpoint_and_extractor() {
         let backend = InMemoryObjectStorage::default();
         backend.put("file.txt", b"hello".to_vec()).await.unwrap();
@@ -1010,13 +1010,13 @@ mod tests {
         assert_eq!(ByteRange::from_start(0).resolve(0), None);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn storage_stream_round_trips_a_buffered_chunk() {
         let stream = StorageStream::once(b"hello".to_vec());
         assert_eq!(stream.into_bytes().await.unwrap(), b"hello".to_vec());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn streaming_range_and_presign_default_to_unsupported() {
         let storage = Storage::new(InMemoryObjectStorage::default());
 
@@ -1097,7 +1097,7 @@ mod tests {
         assert!(PutOptions::new().is_empty());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn extractor_returns_internal_server_error_when_storage_is_missing() {
         let mut request = http_kit::Request::new(Body::empty());
 
