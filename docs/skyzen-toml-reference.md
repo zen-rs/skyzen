@@ -502,7 +502,7 @@ wiring variable; the Lambda and the Functions binaries *are* the native binary, 
 
 | Provider | `dev` | `deploy` | `secret set NAME` / `secret push` | `secret list` |
 |---|---|---|---|---|
-| native | secrets and wiring must resolve; the `.env` entries the shell does not already hold are added to the child's environment | — | refused: nothing remote to write to | refused |
+| native | secrets and wiring must resolve; the `.env` entries the shell does not already hold are added to the child's environment | — (the installed unit carries none; an `EnvironmentFile=` drop-in supplies them, see [Deploying](#deploying)) | refused: nothing remote to write to | refused |
 | cloudflare | every secret must resolve. Classic ones are written to `.skyzen/gen/.dev.vars` (`.dev.vars.<env>` under `--env`); store-backed ones are seeded into wrangler's *local* store, which starts out empty however full the account's is | `wrangler deploy`, then the classic secrets through `wrangler secret bulk`. Store-backed ones are neither needed nor written | `set`: `wrangler secret put`, or a write to the account's store for a store-backed name. `push`: the same `secret bulk` the deploy runs | `wrangler secret list` |
 | aws | — (run it as an ordinary server with `skyzen dev`) | `cargo lambda deploy`, then `UpdateFunctionConfiguration` with `[aws.env]` plus the secrets and wiring variables | the same call, without the build | the function environment's names |
 | azure | — (`func start` over a built bundle) | `func azure functionapp publish`, then the application settings — which *are* the custom handler's environment — set to the secrets and wiring variables | the same call, without the publish | the app settings' names |
@@ -542,7 +542,8 @@ shown)` instead of its contents.
 precompress = ["public"]   # relative to Skyzen.toml
 ```
 
-`skyzen build` and `skyzen deploy` write `.br`, `.zst` and `.gz` siblings beside every file below
+`skyzen build` and every `skyzen deploy` that compiles (all but the native one, which installs
+what `skyzen build` left) write `.br`, `.zst` and `.gz` siblings beside every file below
 each directory, before the application is compiled, so an `embed_dir!` of the same directory picks
 them up too. `StaticDir` and `EmbeddedStaticDir` serve a sibling to a client whose
 `Accept-Encoding` takes it, with `Vary: Accept-Encoding`. A sibling that would not be smaller than
@@ -782,6 +783,83 @@ renamed_classes = [{ from = "Old", to = "New" }]
 | `new_sqlite_classes` | string[] | Classes to create (SQLite-backed Durable Object storage) |
 | `deleted_classes` | string[] | Classes to remove |
 | `renamed_classes` | object[] | Classes to rename (`{ from = "Old", to = "New" }`) |
+
+## Native Linux Host
+
+`[native.linux]` states the kernel and NIC settings of the Linux host a native deployment serves
+from. `skyzen deploy --provider native` applies them live on the host it runs on, and the systemd
+unit it installs applies them again before every start, so they survive a reboot. Each key is a
+value the host is to have, in the kernel's own names and units — the ones `skyzen doctor` reports;
+a key left out is not touched.
+
+```toml
+[native.linux]
+kernel_tls = "loaded"          # the kernel `tls` module
+busy_poll = 50                 # net.core.busy_poll, µs; 0 is off
+busy_read = 50                 # net.core.busy_read, µs; 0 is off
+
+[native.linux.nic.eth0]        # one section per physical interface, by name
+tls_hw_tx_offload = true       # the tls-hw-tx-offload feature
+tls_hw_rx_offload = true       # the tls-hw-rx-offload feature
+tcp_data_split = true          # header/data split, for zero-copy receive
+napi_defer_hard_irqs = 2       # empty polls before the queue interrupt is re-enabled
+gro_flush_timeout = 200000     # ns a deferred interrupt waits
+rx_irqs = "serving"            # one receive-queue interrupt per serving CPU
+```
+
+| Key | Type | Applied through |
+|-----|------|-----------------|
+| `kernel_tls` | `"loaded"` | `setsockopt(TCP_ULP, "tls")` on a TCP socket, which makes the kernel load the module aliased `tcp-ulp-tls` exactly as the runtime's first kernel-TLS connection would. There is no `"unloaded"`: sockets using the module hold it |
+| `busy_poll`, `busy_read` | integer, µs | `/proc/sys/net/core/busy_poll`, `/proc/sys/net/core/busy_read` |
+| `tls_hw_tx_offload`, `tls_hw_rx_offload` | boolean | ethtool netlink `ETHTOOL_MSG_FEATURES_SET` |
+| `tcp_data_split` | boolean | ethtool netlink `ETHTOOL_MSG_RINGS_SET` (`ETHTOOL_A_RINGS_TCP_DATA_SPLIT`) |
+| `napi_defer_hard_irqs` | integer | `/sys/class/net/<nic>/napi_defer_hard_irqs` |
+| `gro_flush_timeout` | integer, ns | `/sys/class/net/<nic>/gro_flush_timeout` |
+| `rx_irqs` | `"serving"` | `/proc/irq/<irq>/smp_affinity_list`, one CPU each |
+
+Everything is read and written through netlink, sysfs and procfs; no tool's output is parsed. A
+facility the host lacks — no `tls` module, a NIC that cannot offload TLS, an interface that is not
+there — or one it does not report, such as a driver that does not say whether it splits headers,
+fails the deployment naming it, before anything is changed. Nothing is skipped and nothing is
+guessed.
+
+`rx_irqs = "serving"` delivers the interface's receive-queue interrupts, in order, to the CPUs the
+serving threads are pinned to — the first `available_parallelism` CPUs of the process's affinity
+mask — wrapping around when there are more queues than CPUs. When every serving CPU then takes one,
+connection steering turns itself on at the next start; when there are fewer queues than serving
+CPUs it stays off, and `skyzen doctor` says which CPUs take none. The unit's `ExecStartPre` runs in
+the service's own CPU affinity, so a `CPUAffinity=` drop-in moves the placement with the threads.
+`irqbalance` moves interrupts on its own schedule: stop it, or ban these interrupts from it.
+
+### Deploying
+
+```sh
+skyzen build --provider native --release      # as the project's owner
+sudo -E env "PATH=$PATH" skyzen deploy --provider native
+skyzen deploy --provider native --dry-run        # print every operation and the unit, change nothing
+```
+
+The deployment compiles nothing — a build run as root would leave `target/` owned by root — and
+refuses when `target/release/<bin>` is missing. It runs `cargo metadata` to find the binary, hence
+the toolchain's `PATH`. Then, in order:
+
+1. one operation for each `[native.linux]` setting the host does not have yet, and a closing read
+   that every setting now holds, followed by the connection-steering decision when `rx_irqs` is
+   set;
+2. `/etc/systemd/system/<bin>.service`, which starts the binary in the project root and runs
+   `skyzen deploy --provider native --host-only` before every start (with `+`, so as root whatever
+   `User=` says);
+3. `systemctl daemon-reload`, `systemctl enable <bin>.service`, `systemctl restart <bin>.service`.
+
+Running it again changes nothing on the host and prints each setting as already in place. It needs
+root whenever it writes; `--dry-run` reads the host as any user and prints the operations it would
+perform, with the kernel interface each one writes. `--host-only` is step 1 alone, and needs no
+toolchain, no project and no `.env`.
+
+The unit is rewritten on every deployment, so changes to the service go in a drop-in
+(`systemctl edit <bin>`): `User=`, an `EnvironmentFile=` holding the secrets and wiring variables
+the application reads, or `Environment=SKYZEN_STEERING=on` (or `off`) to force connection steering
+either way.
 
 ## AWS Section
 
@@ -1028,6 +1106,7 @@ The `skyzen` CLI generates provider-specific config files from `Skyzen.toml`:
 
 | Provider | Generated Config | `dev` Command | `deploy` Command |
 |----------|-----------------|---------------|-----------------|
+| Native | `/etc/systemd/system/<bin>.service` | `cargo run` | `[native.linux]` applied to this host, then `systemctl daemon-reload`, `enable`, `restart` |
 | Cloudflare | `.skyzen/gen/wrangler.toml`, `.skyzen/gen/.dev.vars`, `dist/worker.js`, `dist/worker_bg.js`, `dist/worker_bg.wasm` | `wrangler dev --local` | `wrangler deploy`, then `wrangler secret bulk` |
 | AWS | none — the flags are derived from `[aws]` | — (run it as a server with `skyzen dev`) | `cargo lambda build` then `cargo lambda deploy`, then the function environment |
 | Azure | `.skyzen/gen/azure/{host.json, local.settings.json, <function>/function.json}` plus the staged binary | — (`func start` over a built bundle) | `func azure functionapp publish`, then the app settings |
