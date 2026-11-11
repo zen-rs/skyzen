@@ -27,6 +27,13 @@ const CJK: &str = "你好，世界。こんにちは、世界。안녕하세요,
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);
 
+impl Captured {
+    /// Everything the server thread has recorded so far.
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("log lock").clone()).expect("UTF-8 log")
+    }
+}
+
 impl std::io::Write for Captured {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.lock().expect("log lock").extend_from_slice(buf);
@@ -121,7 +128,13 @@ fn file_regions_and_their_ranges_go_through_send_file() {
 
     let (head, body) = get(addr, &format!("/s/{encoded}"), "");
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    assert!(body == payload, "the region arrived changed");
+    assert!(
+        body == payload,
+        "the region arrived changed: {} bytes for {}; the server recorded:\n{}",
+        body.len(),
+        payload.len(),
+        log.text()
+    );
 
     let (head, body) = get(
         addr,
@@ -131,10 +144,12 @@ fn file_regions_and_their_ranges_go_through_send_file() {
     assert!(head.starts_with("HTTP/1.1 206"), "{head}");
     assert!(
         body == payload[1000..51000],
-        "the ranged region arrived changed"
+        "the ranged region arrived changed: {} bytes for 50000; the server recorded:\n{}",
+        body.len(),
+        log.text()
     );
 
-    let log = String::from_utf8(log.0.lock().expect("log lock").clone()).expect("UTF-8 log");
+    let log = log.text();
     let regions: Vec<&str> = log
         .lines()
         .filter(|line| line.contains("sending a file region"))
