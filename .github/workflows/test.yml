@@ -41,9 +41,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-${{ matrix.os }}
-          # Only dev pushes save (see ci.yml); other runs restore the
+          # Only main pushes save (see ci.yml); other runs restore the
           # default-branch entry without writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
       - name: Select features
@@ -80,9 +80,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-wasm
-          # Only dev pushes save (see ci.yml); other runs restore the
+          # Only main pushes save (see ci.yml); other runs restore the
           # default-branch entry without writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
       - name: Check WASM build (minimal)
@@ -105,9 +105,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-wasm
-          # Only dev pushes save (see ci.yml); other runs restore the
+          # Only main pushes save (see ci.yml); other runs restore the
           # default-branch entry without writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
       - name: Clippy skyzen-cloudflare (wasm32)
@@ -126,9 +126,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-wasm
-          # Only dev pushes save (see ci.yml); other runs restore the
+          # Only main pushes save (see ci.yml); other runs restore the
           # default-branch entry without writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
       - name: Install wasm-bindgen CLI
