@@ -61,7 +61,7 @@ http_kit::http_error!(
     "No route matched this request"
 );
 
-/// The mount prefix accumulated across nested routers, pushed by `NestedRouter` before it
+/// The mount prefix accumulated across nested routers, pushed by `Mounted` before it
 /// dispatches into the mounted router. `dispatch_matched` composes it with the registered
 /// template so every `MatchedPath` is already the full route (`/api` + `/users/{id}`) at
 /// insertion time — inner handlers extract the complete template, not the inner fragment.
