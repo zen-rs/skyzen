@@ -32,6 +32,8 @@
 pub mod assertions;
 pub mod client;
 pub mod context;
+#[cfg(all(feature = "loopback", not(target_arch = "wasm32")))]
+pub mod dials;
 pub mod events;
 pub mod fixtures;
 #[cfg(all(feature = "loopback", not(target_arch = "wasm32")))]
@@ -42,6 +44,8 @@ pub mod snapshot;
 pub use assertions::TestResponse;
 pub use client::TestClient;
 pub use context::TestContext;
+#[cfg(all(feature = "loopback", not(target_arch = "wasm32")))]
+pub use dials::{DialRecorder, Dials};
 pub use events::{queue_batch, queue_message, scheduled_tick};
 #[cfg(all(feature = "loopback", not(target_arch = "wasm32")))]
 pub use loopback::{LoopbackServer, ReceivedRequest};
