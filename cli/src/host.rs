@@ -78,7 +78,7 @@ pub fn apply_steps(_section: &NativeLinuxSection, _dry_run: bool) -> Result<Vec<
 /// # Errors
 ///
 /// The effective user is not root.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn ensure_root(what: &str) -> Result<()> {
     if nix::unistd::geteuid().is_root() {
         Ok(())
@@ -87,14 +87,4 @@ pub fn ensure_root(what: &str) -> Result<()> {
             "{what} needs root; run it with sudo, or pass --dry-run to see what it would do"
         )
     }
-}
-
-/// Refuse `what`: only a Unix host has a root.
-///
-/// # Errors
-///
-/// Always.
-#[cfg(not(unix))]
-pub fn ensure_root(what: &str) -> Result<()> {
-    anyhow::bail!("{what} needs a Linux host")
 }

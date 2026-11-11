@@ -1,18 +1,18 @@
 //! The native provider: run the application as an ordinary binary, and deploy it as a systemd
 //! service on the Linux host the CLI runs on.
 
+#[cfg(target_os = "linux")]
 mod systemd;
 
 use crate::{
     environment::VariableKind,
     project::Project,
     providers::{
-        prepare_child_environment, resolve_variables, Action, CommandPlan, CommandStdin,
-        FileContents, GeneratedFile, ProviderPlan, RunMode, Step,
+        prepare_child_environment, Action, CommandPlan, CommandStdin, ProviderPlan, RunMode, Step,
     },
 };
-use anyhow::{Context, Result};
-use skyzen_manifest::{Manifest, NativeDatabaseBackend};
+use anyhow::Result;
+use skyzen_manifest::Manifest;
 
 /// The plan of `skyzen deploy --provider native`: bring this host to `[native.linux]`, install
 /// the systemd unit that starts the release binary and re-applies those settings before every
@@ -29,14 +29,12 @@ use skyzen_manifest::{Manifest, NativeDatabaseBackend};
 /// use, when a variable the application reads is set nowhere, when `[native.linux]` asks for a
 /// facility this host lacks or does not report, and when the deployment would change something
 /// and the CLI is not root.
+#[cfg(target_os = "linux")]
 pub fn deploy(manifest: &Manifest, project: &Project, dry_run: bool) -> Result<ProviderPlan> {
-    if !cfg!(target_os = "linux") {
-        anyhow::bail!(
-            "`skyzen deploy --provider native` installs a systemd service on the Linux host it \
-             runs on; this machine runs {}",
-            std::env::consts::OS
-        );
-    }
+    use crate::providers::{resolve_variables, FileContents, GeneratedFile};
+    use anyhow::Context as _;
+    use skyzen_manifest::NativeDatabaseBackend;
+
     let name = project.binary_target_name()?;
     let binary = project.target_directory().join("release").join(name);
     if !binary.is_file() {
@@ -56,7 +54,6 @@ pub fn deploy(manifest: &Manifest, project: &Project, dry_run: bool) -> Result<P
     })?;
     let binary = std::path::absolute(&binary)
         .with_context(|| format!("cannot make {} an absolute path", binary.display()))?;
-    #[cfg(unix)]
     {
         ensure_reachable(&root, false)?;
         ensure_reachable(&binary, true)?;
@@ -121,10 +118,26 @@ pub fn deploy(manifest: &Manifest, project: &Project, dry_run: bool) -> Result<P
     })
 }
 
+/// `skyzen deploy --provider native` installs a systemd unit, which only a Linux host has.
+///
+/// # Errors
+///
+/// Always.
+#[cfg(not(target_os = "linux"))]
+pub fn deploy(_manifest: &Manifest, _project: &Project, _dry_run: bool) -> Result<ProviderPlan> {
+    anyhow::bail!(
+        "`skyzen deploy --provider native` installs a systemd service on the Linux host it \
+         runs on; this machine runs {}",
+        std::env::consts::OS
+    )
+}
+
+#[cfg(target_os = "linux")]
 /// Where the kernel says unprivileged processes may start binding ports
 /// (`ip-sysctl.rst`, `ip_unprivileged_port_start`).
 const UNPRIVILEGED_PORT_START: &str = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
 
+#[cfg(target_os = "linux")]
 /// The lowest port a process without `CAP_NET_BIND_SERVICE` may bind on this host.
 fn unprivileged_port_start() -> Result<u16> {
     let value = std::fs::read_to_string(UNPRIVILEGED_PORT_START)
@@ -138,7 +151,7 @@ fn unprivileged_port_start() -> Result<u16> {
 /// Refuse a path the service's transient user cannot reach: every ancestor directory has to be
 /// searchable by others, and the path itself searchable (a directory) or readable and executable
 /// (the binary), since `DynamicUser=` runs the service as a user that owns nothing.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn ensure_reachable(path: &std::path::Path, executable: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
