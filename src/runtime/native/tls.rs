@@ -345,14 +345,8 @@ pub(super) async fn serve<L, E>(
             .spawn_local(
                 async move {
                     let _slot = slot;
-                    let Some(accepted) = Box::pin(negotiate(
-                        stream,
-                        &tls,
-                        &io,
-                        HANDSHAKE_TIMEOUT,
-                        HANDSHAKE_TIMEOUT,
-                    ))
-                    .await
+                    let Some(accepted) =
+                        negotiate(stream, &tls, &io, HANDSHAKE_TIMEOUT, HANDSHAKE_TIMEOUT).await
                     else {
                         return;
                     };
@@ -461,10 +455,25 @@ enum Accepted<S: http_kit_tls::Transport> {
 /// `None` means the connection is already dead — a failed handshake or an `h2` client that never
 /// sent its preface — having been logged here rather than by the caller.
 ///
-/// Callers box the future: with kernel TLS state on Linux it is about 17 KiB, more than a
-/// connection task should carry inline for the connection's whole life.
+/// The handshake runs boxed: with kernel TLS state on Linux its future is about 17 KiB, more than
+/// a connection task should carry inline for the connection's whole life.
 #[cfg(feature = "server-tls")]
 async fn negotiate<S>(
+    stream: S,
+    tls: &ServerTls,
+    timer: &Compio,
+    handshake: std::time::Duration,
+    preface: std::time::Duration,
+) -> Option<Accepted<S>>
+where
+    S: http_kit_tls::Transport,
+{
+    Box::pin(handshake_and_sniff(stream, tls, timer, handshake, preface)).await
+}
+
+/// [`negotiate`]'s body, unboxed.
+#[cfg(feature = "server-tls")]
+async fn handshake_and_sniff<S>(
     stream: S,
     tls: &ServerTls,
     timer: &Compio,
@@ -851,13 +860,13 @@ mod tests {
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                Box::pin(negotiate(
+                negotiate(
                     stream,
                     &tls,
                     &Compio::default(),
                     HANDSHAKE_TIMEOUT,
                     SHORT_PREFACE,
-                ))
+                )
                 .await
                 .is_none()
             };
@@ -894,13 +903,13 @@ mod tests {
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                Box::pin(negotiate(
+                negotiate(
                     stream,
                     &tls,
                     &Compio::default(),
                     HANDSHAKE_TIMEOUT,
                     HANDSHAKE_TIMEOUT,
-                ))
+                )
                 .await
             };
             let request = async {
@@ -930,13 +939,13 @@ mod tests {
 
             let serve = async {
                 let (stream, _peer) = listener.accept().await.expect("accept");
-                Box::pin(negotiate(
+                negotiate(
                     stream,
                     &tls,
                     &Compio::default(),
                     HANDSHAKE_TIMEOUT,
                     HANDSHAKE_TIMEOUT,
-                ))
+                )
                 .await
                 .is_none()
             };
