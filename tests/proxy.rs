@@ -864,7 +864,10 @@ fn a_slow_client_paces_the_origin_download() {
 mod kernel_tls {
     use std::{cell::RefCell, net::SocketAddr, rc::Rc, sync::Arc};
 
-    use http_kit_io::{compio::Compio, Io, Listener as _};
+    use http_kit_io::{
+        compio::{Compio, TcpStream},
+        Dial as _, FromStd as _, Listener as _,
+    };
     use http_kit_tls::{
         rustls::{
             self,
@@ -911,7 +914,8 @@ mod kernel_tls {
         let (acceptor, der) = identity();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local address");
-        let listener = Compio.tcp_listener(listener).expect("register listener");
+        let io = Compio::default();
+        let listener = io.tcp_listener(listener).expect("register listener");
         let modes = Modes::default();
         let accepted = Rc::clone(&modes);
         compio::runtime::spawn(async move {
@@ -919,15 +923,16 @@ mod kernel_tls {
                 let acceptor = acceptor.clone();
                 let endpoint = endpoint.clone();
                 let accepted = Rc::clone(&accepted);
+                let io = io.clone();
                 compio::runtime::spawn(async move {
                     let stream = acceptor
-                        .accept(stream, &Compio)
+                        .accept(stream, &io)
                         .await
                         .expect("the server handshake");
                     accepted.borrow_mut().push(stream.negotiated().mode());
                     H1::default()
                         .serve_connection(
-                            Compio,
+                            io,
                             stream,
                             Some(peer),
                             endpoint,
@@ -961,10 +966,7 @@ mod kernel_tls {
     }
 
     /// A TLS connection to `addr` trusting `der`, encrypted in user space.
-    async fn tls_connect(
-        addr: SocketAddr,
-        der: &[u8],
-    ) -> TlsStream<<Compio as Io>::TcpStream, Client> {
+    async fn tls_connect(addr: SocketAddr, der: &[u8]) -> TlsStream<TcpStream, Client> {
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(CertificateDer::from(der.to_vec()))
@@ -976,12 +978,13 @@ mod kernel_tls {
         .expect("default protocol versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
-        let stream = Compio.connect(addr).await.expect("connect");
+        let io = Compio::default();
+        let stream = io.connect(addr).await.expect("connect");
         TlsConnector::new(Arc::new(config))
             .connect(
                 ServerName::try_from("localhost").expect("a DNS name"),
                 stream,
-                &Compio,
+                &io,
             )
             .await
             .expect("the client handshake")
@@ -990,8 +993,11 @@ mod kernel_tls {
     /// A fresh HTTP/1.1 connection over TLS to `addr`.
     async fn connect(addr: SocketAddr, der: &[u8]) -> http_kit_h1::SendRequest {
         let stream = tls_connect(addr, der).await;
-        let (send, connection) =
-            http_kit_h1::handshake_stream(stream, Compio, http_kit_h1::ClientConfig::default());
+        let (send, connection) = http_kit_h1::handshake_stream(
+            stream,
+            Compio::default(),
+            http_kit_h1::ClientConfig::default(),
+        );
         compio::runtime::spawn(async move {
             let _ = connection.run().await;
         })
