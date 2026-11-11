@@ -35,6 +35,7 @@ skyzen-core = { version = "0.1", default-features = false }
 | `std` | Yes | Standard library support |
 | `openapi` | No | OpenAPI schema generation (requires `std`) |
 | `steering` | No | `steering`: whether the native runtime steers connections on this Linux machine (requires `std`; Linux only) |
+| `busy-poll` | No | `busy_poll`: registering an `io_uring` for NAPI busy polling, as the native runtime and `skyzen doctor` both do (requires `std`; Linux only) |
 
 ## Usage
 

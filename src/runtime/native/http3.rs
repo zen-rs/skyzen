@@ -37,7 +37,7 @@ compile_error!(
 
 use std::future::Future;
 
-use super::{tls::ServerTls, ListenAddr, RuntimeFailure};
+use super::{busy_poll::BusyPoll, tls::ServerTls, ListenAddr, RuntimeFailure};
 
 /// The largest request header or trailer section QUIC accepts, in bytes: what the HTTP/1.1 server
 /// accepts as a message head by default.
@@ -208,7 +208,8 @@ pub(super) const fn not_a_server() -> RuntimeFailure {
 #[cfg(feature = "http3")]
 impl Http3 {
     /// One UDP socket per serving thread on `local`'s address, or `None` for the threads that do
-    /// not run QUIC; see the module documentation for which are which.
+    /// not run QUIC; see the module documentation for which are which. With `busy_poll`, each
+    /// carries its socket options.
     #[expect(
         clippy::unused_self,
         reason = "the call exists without the feature too, where the receiver proves it unreachable"
@@ -217,8 +218,9 @@ impl Http3 {
         &self,
         local: std::net::SocketAddr,
         threads: std::num::NonZeroUsize,
+        busy_poll: Option<&BusyPoll>,
     ) -> Result<Vec<Option<std::net::UdpSocket>>, RuntimeFailure> {
-        bind_sockets(local, threads.get())
+        bind_sockets(local, threads.get(), busy_poll)
             .map_err(|error| RuntimeFailure::Http3(Http3Error::Bind { addr: local, error }))
     }
 
@@ -244,6 +246,7 @@ impl Http3 {
         &self,
         _local: std::net::SocketAddr,
         _threads: std::num::NonZeroUsize,
+        _busy_poll: Option<&BusyPoll>,
     ) -> Result<Vec<Option<std::net::UdpSocket>>, RuntimeFailure> {
         match self.0 {}
     }
@@ -261,6 +264,7 @@ impl Http3 {
 fn bind_sockets(
     local: std::net::SocketAddr,
     threads: usize,
+    busy_poll: Option<&BusyPoll>,
 ) -> std::io::Result<Vec<Option<std::net::UdpSocket>>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -269,6 +273,13 @@ fn bind_sockets(
             let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
             socket.set_reuse_address(true)?;
             socket.set_reuse_port(true)?;
+            // Before `bind`, so no datagram is received without them.
+            #[cfg(target_os = "linux")]
+            if let Some(busy_poll) = busy_poll {
+                busy_poll.set_on(&socket)?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = busy_poll;
             socket.bind(&local.into())?;
             Ok(Some(socket.into()))
         })
@@ -282,6 +293,7 @@ fn bind_sockets(
 fn bind_sockets(
     local: std::net::SocketAddr,
     threads: usize,
+    _busy_poll: Option<&BusyPoll>,
 ) -> std::io::Result<Vec<Option<std::net::UdpSocket>>> {
     let mut sockets = Vec::with_capacity(threads);
     sockets.push(Some(std::net::UdpSocket::bind(local)?));
@@ -455,11 +467,12 @@ mod tests {
                 &addr,
                 threads,
                 crate::runtime::native::steering::Pins::default(),
+                None,
             )
             .expect("bind TCP");
             let local = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
             bound.udp = http3
-                .bind(local, threads)
+                .bind(local, threads, None)
                 .expect("bind UDP on the TCP port");
 
             let (stop, stopping) = bounded::<Infallible>(1);
@@ -475,6 +488,7 @@ mod tests {
                 io: crate::runtime::native::IoSettings::new(
                     options.driver(),
                     options.recv_ring(max_connections),
+                    None,
                 ),
                 server: HttpServer::H1,
                 tls,
@@ -912,13 +926,33 @@ mod tests {
         let local = held.local_addr().unwrap();
 
         let error = http3
-            .bind(local, NonZeroUsize::new(2).unwrap())
+            .bind(local, NonZeroUsize::new(2).unwrap(), None)
             .expect_err("the port is taken");
         assert!(
             matches!(error, RuntimeFailure::Http3(Http3Error::Bind { addr, .. }) if addr == local),
             "{error}"
         );
         assert!(error.to_string().contains(&local.to_string()), "{error}");
+    }
+
+    /// With busy polling on, every thread's QUIC socket carries the busy-poll options.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_quic_socket_carries_the_busy_poll_options() {
+        use crate::runtime::native::busy_poll::{read_socket_options, BusyPoll, BusyPollTimeout};
+
+        let busy_poll = BusyPoll {
+            timeout: BusyPollTimeout::from_micros(50).unwrap(),
+            prefer: false,
+            budget: None,
+        };
+        let sockets =
+            super::bind_sockets("127.0.0.1:0".parse().unwrap(), 2, Some(&busy_poll)).expect("bind");
+        assert_eq!(sockets.len(), 2);
+        for socket in sockets {
+            let socket = socket.expect("every Linux thread runs QUIC");
+            assert_eq!(read_socket_options(&socket), (50, false));
+        }
     }
 }
 

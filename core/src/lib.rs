@@ -59,6 +59,8 @@ pub use net::{
 mod secret;
 #[cfg(feature = "std")]
 pub use secret::Secret;
+#[cfg(all(feature = "busy-poll", target_os = "linux"))]
+pub mod busy_poll;
 #[cfg(feature = "openapi")]
 pub mod openapi;
 #[cfg(all(feature = "steering", target_os = "linux"))]

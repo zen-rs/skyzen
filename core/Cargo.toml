@@ -26,6 +26,11 @@ async-channel = { version = "2.5", optional = true, default-features = false, fe
 # The process's CPU affinity mask, which `steering` judges the NIC queue layout against.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", optional = true, default-features = false, features = ["sched"] }
+# `busy_poll`: the `struct io_uring_napi` a ring is registered with and the probe ring `skyzen
+# doctor` registers; `libc` makes the `io_uring_register(2)` call on a ring the runtime's compio
+# driver owns, which `io-uring`'s `Submitter` cannot be built for.
+io-uring = { version = "0.7.16", optional = true, default-features = false, features = ["io_safety"] }
+libc = { version = "0.2.191", optional = true, default-features = false }
 
 [dev-dependencies]
 futures-lite = "2.6"
@@ -43,3 +48,6 @@ openapi = ["std", "dep:utoipa"]
 # `steering`: whether the native runtime steers connections on this machine, shared by the runtime
 # and `skyzen doctor`. Linux only; elsewhere it enables nothing.
 steering = ["std", "dep:nix"]
+# `busy-poll`: registering an io_uring for NAPI busy polling, shared by the native runtime and
+# `skyzen doctor`. Linux only; elsewhere it enables nothing.
+busy-poll = ["std", "dep:io-uring", "dep:libc"]
