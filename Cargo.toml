@@ -185,7 +185,7 @@ skyzen-lambda = { workspace = true, optional = true }
 # `http-kit-tls`. The `aws_lc_rs` provider matches the AWS SDK's TLS stack, so the workspace
 # resolves one crypto backend; the certificate/key pair is loaded with rustls's own PEM support.
 http-kit-tls = { version = "0.3.0", default-features = false, optional = true }
-rustls ={ version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
 # The reverse proxy's upstream client (`proxy`): zenwave's native backend, HTTP/1.1 on
 # `http-kit-h1` over the same `http-kit-io` sockets the server runs on, with a connection pool on
 # each serving thread. zenwave refuses to build without a default backend; `native-compio` is the
