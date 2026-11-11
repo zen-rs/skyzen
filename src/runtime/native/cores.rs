@@ -29,6 +29,7 @@ use tracing::error;
 use super::{
     handoff::{Acceptor, Incoming},
     http3::Http3,
+    steering::Pins,
     tls::{Protocols, ServerTls},
     HttpServer, RuntimeFailure,
 };
@@ -66,6 +67,8 @@ pub(super) struct Bound {
     /// The UDP socket each thread serves HTTP/3 on, in the order of `sockets`; `None` for a
     /// thread that does not run QUIC. Empty when HTTP/3 is not served.
     pub(super) udp: Vec<Option<std::net::UdpSocket>>,
+    /// The CPU each thread is pinned to when connections are steered; empty otherwise.
+    pub(super) pins: Pins,
 }
 
 impl Socket {
@@ -101,7 +104,11 @@ impl Socket {
 /// # Errors
 ///
 /// The address cannot be bound, or a socket cannot be duplicated.
-pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Result<Bound> {
+pub(super) fn bind(
+    addr: &super::ListenAddr,
+    threads: NonZeroUsize,
+    pins: Pins,
+) -> io::Result<Bound> {
     match addr {
         #[cfg(windows)]
         super::ListenAddr::Tcp(addr) => {
@@ -110,16 +117,18 @@ pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Resul
                 sockets: incoming.into_iter().map(Socket::Handoff).collect(),
                 acceptor: Some(acceptor),
                 udp: Vec::new(),
+                pins,
             })
         }
         #[cfg(not(windows))]
         super::ListenAddr::Tcp(addr) => Ok(Bound {
-            sockets: bind_tcp(*addr, threads.get())?
+            sockets: bind_tcp(*addr, threads.get(), &pins)?
                 .into_iter()
                 .map(Socket::Tcp)
                 .collect(),
             acceptor: None,
             udp: Vec::new(),
+            pins,
         }),
         #[cfg(unix)]
         super::ListenAddr::Unix(path) => {
@@ -135,6 +144,7 @@ pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Resul
                 sockets,
                 acceptor: None,
                 udp: Vec::new(),
+                pins,
             })
         }
     }
@@ -144,30 +154,49 @@ pub(super) fn bind(addr: &super::ListenAddr, threads: NonZeroUsize) -> io::Resul
 pub(super) const BACKLOG: i32 = i32::MAX;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn bind_tcp(addr: std::net::SocketAddr, threads: usize) -> io::Result<Vec<std::net::TcpListener>> {
+fn bind_tcp(
+    addr: std::net::SocketAddr,
+    threads: usize,
+    pins: &Pins,
+) -> io::Result<Vec<std::net::TcpListener>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
-    let listener = |addr: std::net::SocketAddr| -> io::Result<std::net::TcpListener> {
-        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_reuse_address(true)?;
-        socket.set_reuse_port(true)?;
-        socket.bind(&addr.into())?;
-        socket.listen(BACKLOG)?;
-        Ok(socket.into())
-    };
+    // Listener `index` joins the reuseport group `index`-th, which is the number the steering
+    // program answers with.
+    let listener =
+        |addr: std::net::SocketAddr, index: usize| -> io::Result<std::net::TcpListener> {
+            let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_reuse_address(true)?;
+            socket.set_reuse_port(true)?;
+            #[cfg(target_os = "linux")]
+            if let Some(cpu) = pins.cpu(index) {
+                super::steering::set_incoming_cpu(&socket, cpu)?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = (pins, index);
+            socket.bind(&addr.into())?;
+            socket.listen(BACKLOG)?;
+            Ok(socket.into())
+        };
 
-    let first = listener(addr)?;
+    let first = listener(addr, 0)?;
     // Port 0 asked the system for a port; the other listeners join the one it chose.
     let addr = first.local_addr()?;
     let mut listeners = vec![first];
-    for _ in 1..threads {
-        listeners.push(listener(addr)?);
+    for index in 1..threads {
+        listeners.push(listener(addr, index)?);
     }
+    #[cfg(target_os = "linux")]
+    pins.attach(&listeners)?;
     Ok(listeners)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
-fn bind_tcp(addr: std::net::SocketAddr, threads: usize) -> io::Result<Vec<std::net::TcpListener>> {
+fn bind_tcp(
+    addr: std::net::SocketAddr,
+    threads: usize,
+    _pins: &Pins,
+) -> io::Result<Vec<std::net::TcpListener>> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
@@ -254,7 +283,12 @@ where
         sockets,
         acceptor,
         udp,
+        pins,
     } = bound;
+    #[cfg(target_os = "linux")]
+    let pins = Arc::new(pins);
+    #[cfg(not(target_os = "linux"))]
+    let _ = pins;
     let mut udp = udp.into_iter();
     let threads = sockets.len();
     let plan = Arc::new(plan);
@@ -281,9 +315,17 @@ where
         let ready = ready_tx.clone();
         let exited = exited_tx.clone();
         let udp = udp.next().flatten();
+        #[cfg(target_os = "linux")]
+        let pins = Arc::clone(&pins);
         thread::Builder::new()
             .name(format!("skyzen-{index}"))
             .spawn(move || {
+                // Before the runtime exists, so everything the thread creates starts on its CPU.
+                #[cfg(target_os = "linux")]
+                if let Err(error) = pins.pin(index) {
+                    let _ = ready.send_blocking(Err(RuntimeFailure::Steering(error)));
+                    return;
+                }
                 work(&plan, socket, udp, stop, drain, &release, &ready);
                 drop(exited);
             })?;
@@ -546,7 +588,7 @@ mod tests {
     use executor_core::{smol::SmolGlobal, AnyExecutor};
     use http_kit::{error::BoxHttpError, Body};
 
-    use super::{bind, start, Bound, Cores, Plan, Socket};
+    use super::{bind, start, Bound, Cores, Pins, Plan, Socket};
     use crate::runtime::native::handoff;
     use crate::{
         runtime::native::{HttpServer, ListenAddr},
@@ -632,9 +674,11 @@ mod tests {
             _request: &mut Request,
         ) -> impl core::future::Future<Output = Result<Response, Self::Error>> {
             let thread = std::thread::current();
-            core::future::ready(Ok(Response::new(Body::from(
-                thread.name().unwrap_or("unnamed").to_owned(),
-            ))))
+            let name = thread.name().unwrap_or("unnamed");
+            // On Linux the CPU the thread is on follows the name, as `name@cpu`.
+            #[cfg(target_os = "linux")]
+            let name = format!("{name}@{}", unsafe { libc::sched_getcpu() });
+            core::future::ready(Ok(Response::new(Body::from(name))))
         }
     }
 
@@ -653,7 +697,12 @@ mod tests {
 
     fn connections_spread_over_threads(server: HttpServer) {
         let threads = NonZeroUsize::new(4).unwrap();
-        let bound = bind(&ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()), threads).expect("bind");
+        let bound = bind(
+            &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
+            threads,
+            Pins::default(),
+        )
+        .expect("bind");
         let addr = bound.sockets[0]
             .tcp_addr()
             .expect("a TCP address binds TCP sockets")
@@ -673,6 +722,7 @@ mod tests {
                 sockets: incoming.into_iter().map(Socket::Handoff).collect(),
                 acceptor: Some(acceptor),
                 udp: Vec::new(),
+                pins: Pins::default(),
             };
             let addr = bound.sockets[0]
                 .tcp_addr()
@@ -697,6 +747,44 @@ mod tests {
         assert!(served_by.iter().all(|name| name.starts_with("skyzen-")));
     }
 
+    /// A connection made from CPU `c` is accepted by the thread pinned to `c`, whatever the
+    /// kernel's hash would have chosen: the client is pinned, and on loopback the SYN is
+    /// processed on the sender's CPU, as the kernel's own `reuseport_bpf_cpu` selftest relies on.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn steered_connections_are_served_by_the_thread_on_the_cpu_that_received_them() {
+        use crate::runtime::native::steering::pin_current_thread;
+
+        let threads = 4.min(std::thread::available_parallelism().unwrap().get());
+        let cpus = Pins::from_affinity(threads).expect("the process may run on its CPUs");
+        let served: Vec<usize> = (0..threads).map(|index| cpus.cpu(index).unwrap()).collect();
+        assert!(served.len() >= 2, "steering is only visible with two CPUs");
+        let bound = bind(
+            &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
+            NonZeroUsize::new(served.len()).unwrap(),
+            cpus,
+        )
+        .expect("bind with steering");
+        let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
+        let serving = Serving::start(bound, HttpServer::H1);
+
+        for (index, &cpu) in served.iter().enumerate() {
+            // A fresh thread per CPU, so pinning it leaves the test's own thread alone.
+            let bodies = std::thread::spawn(move || {
+                pin_current_thread(cpu).expect("pin the client");
+                (0..16)
+                    .map(|_| exchange(std::net::TcpStream::connect(addr).expect("connect")))
+                    .collect::<Vec<_>>()
+            })
+            .join()
+            .expect("client thread");
+            for body in bodies {
+                assert_eq!(body, format!("skyzen-{index}@{cpu}"));
+            }
+        }
+        serving.stop();
+    }
+
     /// A unix socket is served by the same threads under either server, and the file goes away
     /// with the socket's owner, not with a connection.
     #[test]
@@ -708,6 +796,7 @@ mod tests {
             let sockets = bind(
                 &ListenAddr::Unix(path.clone()),
                 NonZeroUsize::new(2).unwrap(),
+                Pins::default(),
             )
             .expect("bind the unix socket");
             let serving = Serving::start(sockets, server);

@@ -200,6 +200,8 @@ http-kit-h3 = { version = "0.3.0", default-features = false, features = ["quiche
 # Kernel TLS on Linux: after the handshake the kernel seals and opens the records, so file-region
 # bodies go out through sendfile/splice.
 [target.'cfg(target_os = "linux")'.dependencies]
+# Pinning serving threads and steering connections to the CPU that received them.
+libc = "0.2"
 http-kit-tls = { version = "0.2.0", default-features = false, features = ["kernel"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

@@ -171,6 +171,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
                     listen: ::skyzen::runtime::native::apply_cli_overrides(::std::env::args()),
                     tls: ::skyzen::runtime::native::apply_tls_overrides(::std::env::args()),
                     http3: ::skyzen::runtime::native::apply_http3_override(::std::env::args()),
+                    steering: ::skyzen::runtime::native::apply_steering_override(::std::env::args()),
                     server: ::skyzen::runtime::native::apply_server_override(::std::env::args()),
                     azure_queue_triggers: #azure_queue_triggers,
                 },
