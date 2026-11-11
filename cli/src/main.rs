@@ -4,6 +4,7 @@ mod capabilities;
 mod cli;
 mod dev;
 mod environment;
+mod host;
 mod migrate;
 mod openapi;
 mod output;

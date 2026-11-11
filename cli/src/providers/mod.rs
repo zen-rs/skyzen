@@ -575,6 +575,10 @@ pub fn doctor(
 
     failures += check_manifest(manifest_path, &providers, environment);
 
+    if providers.contains(&Provider::Native) {
+        failures += crate::host::report();
+    }
+
     if failures == 0 {
         Ok(())
     } else {
