@@ -9,7 +9,7 @@ on:
     # Feature branches are covered by their pull_request run; pushing to a PR
     # branch otherwise fires this whole workflow twice (the concurrency group
     # cannot dedupe it: push refs/heads/<branch> vs pull refs/pull/<n>/merge).
-    branches: ["dev", "main"]
+    branches: ["main"]
   pull_request:
     branches: ["**"]
 
@@ -93,11 +93,11 @@ jobs:
         with:
           # The wasm32 build the test.yml wasm jobs cache under the same key.
           shared-key: ci-wasm
-          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # Only main pushes save. Caches are branch-scoped, and a ~5 GiB save
           # per run against a 10 GiB repo budget was evicting entries before
-          # the next run could restore them. Non-dev runs restore the
+          # the next run could restore them. Other runs restore the
           # default-branch entry (restore-only) instead of writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - run: cargo build -p skyzen --target wasm32-unknown-unknown
 
@@ -118,11 +118,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-coverage
-          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # Only main pushes save. Caches are branch-scoped, and a ~5 GiB save
           # per run against a 10 GiB repo budget was evicting entries before
-          # the next run could restore them. Non-dev runs restore the
+          # the next run could restore them. Other runs restore the
           # default-branch entry (restore-only) instead of writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
@@ -175,11 +175,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-features
-          # Only dev pushes save. Caches are branch-scoped, and a ~5 GiB save
+          # Only main pushes save. Caches are branch-scoped, and a ~5 GiB save
           # per run against a 10 GiB repo budget was evicting entries before
-          # the next run could restore them. Non-dev runs restore the
+          # the next run could restore them. Other runs restore the
           # default-branch entry (restore-only) instead of writing their own.
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - uses: taiki-e/install-action@cargo-hack
       # `--workspace` gives every member its own feature matrix; without it
@@ -209,7 +209,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ci/minimal-consumer
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - name: Build
         run: cargo build --manifest-path ci/minimal-consumer/Cargo.toml
@@ -226,3 +226,22 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     name: Test
     uses: ./.github/workflows/test.yml
+
+  ci-result:
+    # The required check on `main`: green when every job it needs succeeded
+    # or was skipped (a release-plz bump skips everything but this job).
+    name: CI result
+    if: always()
+    needs: [changes, lint, wasm, coverage, audit, unused-deps, feature-checks, minimal-consumer, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ', ') }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "job results: $RESULTS"
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::one or more jobs failed or were cancelled"
+            exit 1
+          fi

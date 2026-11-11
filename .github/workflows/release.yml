@@ -61,6 +61,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # Approving the release PR's held CI runs.
+      actions: write
     concurrency:
       group: release-plz-pr
       cancel-in-progress: false
@@ -75,9 +77,20 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Prepare release pull request
+        id: release-plz
         uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # GitHub holds the pull request runs of a pull request the Actions bot
+      # opened or pushed until they are approved, and the required
+      # `CI result` reports only from those runs.
+      - name: Approve the release PR's CI
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.release-plz.outputs.pr }}
+        run: bash .github/scripts/approve-held-runs.sh "$(jq -er .number <<<"$PR")"
 
