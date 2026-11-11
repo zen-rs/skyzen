@@ -286,7 +286,10 @@ impl IoSettings {
         // reads share one buffer. A kernel before 6.12 rejects the flag and compio's fork
         // registers the ring whole-buffer instead.
         #[cfg(target_os = "linux")]
-        proactor.buffer_pool_flag(io_uring::types::IOU_PBUF_RING_INC as u16);
+        proactor.buffer_pool_flag(
+            u16::try_from(io_uring::types::IOU_PBUF_RING_INC)
+                .expect("`IOU_PBUF_RING_INC` (2) fits `io_uring_buf_reg`'s u16 flags"),
+        );
         let runtime = compio::runtime::Runtime::builder()
             .with_proactor(proactor)
             .build()?;
