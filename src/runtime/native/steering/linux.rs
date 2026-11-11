@@ -16,7 +16,7 @@ use crate::runtime::native::ListenAddr;
 
 /// `SKF_AD_OFF + SKF_AD_CPU`: the ancillary load of the CPU the filter runs on, which for a
 /// reuseport group is the CPU that took the SYN.
-const LOAD_CPU: u32 = (-0x1000_i32 + 36) as u32;
+const LOAD_CPU: u32 = (-0x1000_i32 + 36).cast_unsigned();
 
 /// Pin the calling thread to `cpu`.
 pub(in crate::runtime::native) fn pin_current_thread(cpu: usize) -> io::Result<()> {
@@ -80,10 +80,9 @@ impl Pins {
 
     /// Pin the calling thread, which is serving thread `index`, to its CPU.
     pub(in crate::runtime::native) fn pin(&self, index: usize) -> Result<(), SteeringError> {
-        match self.cpu(index) {
-            Some(cpu) => pin_current_thread(cpu).map_err(|error| SteeringError::Pin { cpu, error }),
-            None => Ok(()),
-        }
+        self.cpu(index).map_or(Ok(()), |cpu| {
+            pin_current_thread(cpu).map_err(|error| SteeringError::Pin { cpu, error })
+        })
     }
 
     /// Attach the program that sends a connection to the listener of the CPU it arrived on.
@@ -98,7 +97,7 @@ impl Pins {
         let Some(first) = listeners.first().filter(|_| self.is_steering()) else {
             return Ok(());
         };
-        let mut program = reuseport_program(&self.cpus);
+        let mut program = reuseport_program(&self.cpus)?;
         let filter = libc::sock_fprog {
             len: u16::try_from(program.len()).map_err(io::Error::other)?,
             filter: program.as_mut_ptr(),
@@ -111,7 +110,8 @@ impl Pins {
                 libc::SOL_SOCKET,
                 libc::SO_ATTACH_REUSEPORT_CBPF,
                 (&raw const filter).cast(),
-                mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+                libc::socklen_t::try_from(mem::size_of::<libc::sock_fprog>())
+                    .map_err(io::Error::other)?,
             )
         };
         if result == 0 {
@@ -125,20 +125,29 @@ impl Pins {
 /// The classic BPF program: load the CPU, and for each served CPU in turn return its listener's
 /// index. A CPU no listener serves returns an index past the group, which makes the kernel fall
 /// back to its hash.
-fn reuseport_program(cpus: &[usize]) -> Vec<libc::sock_filter> {
+///
+/// # Errors
+///
+/// A CPU or listener index does not fit the 32-bit operand of a BPF instruction.
+fn reuseport_program(cpus: &[usize]) -> io::Result<Vec<libc::sock_filter>> {
+    // The BPF opcodes are fixed values below 0x100.
+    #[allow(clippy::cast_possible_truncation)]
     const LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+    #[allow(clippy::cast_possible_truncation)]
     const JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+    #[allow(clippy::cast_possible_truncation)]
     const RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
 
+    let operand = |value: usize| u32::try_from(value).map_err(io::Error::other);
     let insn = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
     let mut program = Vec::with_capacity(2 + 2 * cpus.len());
     program.push(insn(LD_W_ABS, 0, 0, LOAD_CPU));
     for (index, &cpu) in cpus.iter().enumerate() {
-        program.push(insn(JEQ_K, 0, 1, cpu as u32));
-        program.push(insn(RET_K, 0, 0, index as u32));
+        program.push(insn(JEQ_K, 0, 1, operand(cpu)?));
+        program.push(insn(RET_K, 0, 0, operand(index)?));
     }
     program.push(insn(RET_K, 0, 0, u32::MAX));
-    program
+    Ok(program)
 }
 
 /// Report to the kernel that `listener` serves `cpu`.
@@ -162,12 +171,11 @@ pub(super) fn decide(
         return Ok(Pins::default());
     }
     if !matches!(addr, ListenAddr::Tcp(_)) {
-        return match setting {
-            Steering::On => Err(SteeringError::NotTcp),
-            _ => {
-                info!("Connection steering is off: the listener is a unix socket");
-                Ok(Pins::default())
-            }
+        return if setting == Steering::On {
+            Err(SteeringError::NotTcp)
+        } else {
+            info!("Connection steering is off: the listener is a unix socket");
+            Ok(Pins::default())
         };
     }
     let pins = Pins::from_affinity(threads).map_err(SteeringError::Affinity)?;
@@ -337,7 +345,7 @@ fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
     let mut cpus = Vec::new();
     for part in list.split(',').filter(|part| !part.is_empty()) {
         match part.split_once('-') {
-            Some((first, last)) => cpus.extend(first.parse::<usize>().ok()?..=last.parse().ok()?),
+            Some((low, high)) => cpus.extend(low.parse::<usize>().ok()?..=high.parse().ok()?),
             None => cpus.push(part.parse().ok()?),
         }
     }
@@ -357,7 +365,7 @@ mod tests {
 
     #[test]
     fn the_program_maps_each_served_cpu_to_its_listener() {
-        let program = reuseport_program(&[2, 5]);
+        let program = reuseport_program(&[2, 5]).unwrap();
         assert_eq!(program.len(), 6);
         assert_eq!((program[1].k, program[2].k), (2, 0));
         assert_eq!((program[3].k, program[4].k), (5, 1));
@@ -396,7 +404,8 @@ mod tests {
         .unwrap();
 
         let layout = rx_layout_at(&root.join("sys"), &root.join("proc")).unwrap();
-        let cpus: Vec<_> = layout.queues.iter().map(|queue| queue.cpu).collect();
+        let mut cpus: Vec<_> = layout.queues.iter().map(|queue| queue.cpu).collect();
+        cpus.sort_unstable();
         assert_eq!(
             cpus,
             [0, 1],

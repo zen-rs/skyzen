@@ -678,7 +678,7 @@ mod tests {
             // On Linux the CPU the thread is on follows the name, as `name@cpu`.
             #[cfg(target_os = "linux")]
             let name = format!("{name}@{}", unsafe { libc::sched_getcpu() });
-            core::future::ready(Ok(Response::new(Body::from(name.to_owned()))))
+            core::future::ready(Ok(Response::new(Body::from(name))))
         }
     }
 
