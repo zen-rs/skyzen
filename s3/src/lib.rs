@@ -41,9 +41,10 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::collections::HashMap;
 
-/// The SDK's HTTP client this crate's storages send on, re-exported so a storage can be rebound
-/// to a thread's own pools without naming `skyzen-aws`.
-pub use skyzen_aws::sdk::ZenwaveHttpClient;
+/// The SDK's HTTP client this crate's storages send on, and the loader of the configuration
+/// [`S3Storage::from_config`] takes, re-exported so a storage can be built from one configuration
+/// and rebound to a thread's own pools without naming `skyzen-aws`.
+pub use skyzen_aws::sdk::{load_config, SdkConfig, ZenwaveHttpClient};
 
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder;
@@ -134,18 +135,27 @@ impl S3Storage {
     /// Create a new `S3Storage` from environment configuration.
     ///
     /// Loads the ambient AWS configuration — environment variables, config files and instance
-    /// metadata — through `skyzen_aws::sdk::load_config`.
+    /// metadata — through [`load_config`] on [`ZenwaveHttpClient::system`], and builds the storage
+    /// with [`from_config`](Self::from_config).
     pub async fn from_env(bucket: impl Into<String>) -> Self {
-        let config = skyzen_aws::sdk::load_config().await;
-        let client = Client::new(&config);
-        Self::new(client, bucket)
+        let config = load_config(ZenwaveHttpClient::system()).await;
+        Self::from_config(&config, bucket)
+    }
+
+    /// Create a new `S3Storage` whose client is built from `config`.
+    ///
+    /// Clients built from one configuration share its credentials provider and cache; see
+    /// [`load_config`].
+    #[must_use]
+    pub fn from_config(config: &SdkConfig, bucket: impl Into<String>) -> Self {
+        Self::new(Client::new(config), bucket)
     }
 
     /// Create a new `S3Storage` with a custom endpoint URL.
     ///
     /// Use this for S3-compatible services like `MinIO` or local development.
     pub async fn with_endpoint(bucket: impl Into<String>, endpoint_url: impl Into<String>) -> Self {
-        let shared_config = skyzen_aws::sdk::load_config().await;
+        let shared_config = load_config(ZenwaveHttpClient::system()).await;
         let s3_config = S3ConfigBuilder::from(&shared_config)
             .endpoint_url(endpoint_url)
             .force_path_style(true)

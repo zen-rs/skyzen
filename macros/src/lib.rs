@@ -37,6 +37,7 @@ use syn::{
 /// The platform owns event delivery there, so there are no consumers.
 fn endpoint_factories(
     entry_call: &proc_macro2::TokenStream,
+    shared: &proc_macro2::TokenStream,
     injections: &[Injection],
     consumers: &proc_macro2::TokenStream,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
@@ -60,6 +61,7 @@ fn endpoint_factories(
     // is the body of; it is `Copy`, so the factory carries its own to every thread.
     let native_setup = quote! {
         async move {
+            #shared
             #(#bindings)*
             let __skyzen_consumers = #consumers;
             let __skyzen_endpoint_factory = move || {
@@ -120,6 +122,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(error) => return error.to_compile_error().into(),
     };
     let PortableWiring {
+        shared,
         injections,
         consumers,
     } = wiring;
@@ -127,7 +130,8 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(triggers) => triggers,
         Err(error) => return error.to_compile_error().into(),
     };
-    let (native_setup, wasm_factory) = endpoint_factories(&entry_call, &injections, &consumers);
+    let (native_setup, wasm_factory) =
+        endpoint_factories(&entry_call, &shared, &injections, &consumers);
 
     let init_logging = if options.default_logger {
         quote! { ::skyzen::runtime::native::init_logging(); }
@@ -2658,6 +2662,9 @@ fn manifest_tracking_tokens() -> proc_macro2::TokenStream {
 
 /// What `#[skyzen::main]` inserts between building the endpoint and launching it.
 struct PortableWiring {
+    /// Bound natively before any injection: what several backends are built from — the one AWS
+    /// configuration — or nothing.
+    shared: proc_macro2::TokenStream,
     /// One entry per manifest entry, in declaration order.
     injections: Vec<Injection>,
     /// The `ConsumerSet` the native runtime is launched with — `()` when the manifest declares no
@@ -2700,6 +2707,7 @@ fn portable_injection_wrap_steps() -> syn::Result<PortableWiring> {
 /// Nothing to bind: the endpoint is launched exactly as the entry function built it.
 fn empty_portable_wiring() -> PortableWiring {
     PortableWiring {
+        shared: quote! {},
         injections: Vec::new(),
         consumers: quote! { () },
     }
@@ -2794,6 +2802,7 @@ fn portable_wiring(document: &Manifest) -> syn::Result<PortableWiring> {
     let consumers = queue_consumer_tokens(manifest, &service_bindings)?;
 
     Ok(PortableWiring {
+        shared: aws_config_tokens(manifest),
         injections,
         consumers,
     })
@@ -3276,11 +3285,12 @@ fn native_kv_tokens(name: &str, wiring: &NativeServiceSection) -> Option<proc_ma
         }
         NativeServiceSection::DynamoDb(dynamodb) => {
             // No environment variable: the table is named in the manifest, and the credentials and
-            // region come from the ambient AWS chain `DynamoKv::from_env` loads. The two options
-            // are applied only when the manifest asks for them, so the constructor's own defaults
-            // stay the defaults.
+            // region come from the one ambient AWS configuration setup loads. The two options are
+            // applied only when the manifest asks for them, so the constructor's own defaults stay
+            // the defaults.
             let table = LitStr::new(&dynamodb.table, proc_macro2::Span::call_site());
-            let mut build = quote! { ::skyzen_aws::DynamoKv::from_env(#table).await };
+            let config = aws_config_ident();
+            let mut build = quote! { ::skyzen_aws::DynamoKv::from_config(&#config, #table) };
             if let Some(ttl_attribute) = &dynamodb.ttl_attribute {
                 let ttl_lit = LitStr::new(ttl_attribute, proc_macro2::Span::call_site());
                 build = quote! { #build.with_ttl_attribute(#ttl_lit) };
@@ -3321,7 +3331,8 @@ fn native_storage_tokens(
     Some(match wiring {
         NativeServiceSection::S3(s3) => {
             let bucket = env_value_expr("service", name, &s3.bucket_env);
-            quote! { ::skyzen_s3::S3Storage::from_env(&#bucket).await }
+            let config = aws_config_ident();
+            quote! { ::skyzen_s3::S3Storage::from_config(&#config, &#bucket) }
         }
         NativeServiceSection::Blob(blob) => {
             let connection = env_value_expr("service", name, &blob.connection_env);
@@ -3350,16 +3361,16 @@ fn native_queue_tokens(
     Some(match wiring {
         NativeServiceSection::Sqs(sqs) => {
             let url = env_value_expr("service", name, &sqs.url_env);
-            // `SqsQueue::from_env` builds a *standard* queue and refuses a `.fifo` URL, which
+            // `SqsQueue::from_config` builds a *standard* queue and refuses a `.fifo` URL, which
             // needs a message group id on every send. A FIFO queue is wired in code with
             // `SqsQueue::fifo`, so the manifest path reports the mismatch rather than hiding it.
             let failure = connect_failure_lit(
                 name,
                 &format!("use the SQS queue named by `{}`", sqs.url_env),
             );
+            let config = aws_config_ident();
             quote! {
-                ::skyzen_aws::SqsQueue::from_env(&#url)
-                    .await
+                ::skyzen_aws::SqsQueue::from_config(&#config, &#url)
                     .unwrap_or_else(|error| panic!("{}: {error}", #failure))
             }
         }
@@ -3521,7 +3532,8 @@ fn generate_native_database_init(
 /// The RDS Data API backend one wiring builds.
 ///
 /// Either the wiring names all four values a Data API call is addressed by, and they are handed
-/// straight to `from_parts`, or it names none and `from_env` reads them. A half-written wiring
+/// straight to `from_config`, or it names none and `from_config_and_env` reads them. Either way the
+/// client is built from setup's one AWS configuration. A half-written wiring
 /// never reaches here — the manifest parse rejects it — and is reported rather than assumed, so the
 /// rule has one implementation.
 fn rds_data_tokens(name: &str, rds: &skyzen_manifest::RdsDataWiring) -> proc_macro2::TokenStream {
@@ -3608,8 +3620,11 @@ fn rds_from_parts_tokens(parts: skyzen_manifest::RdsDataParts<'_>) -> proc_macro
     let secret_arn = LitStr::new(parts.secret_arn, proc_macro2::Span::call_site());
     let database = LitStr::new(parts.database, proc_macro2::Span::call_site());
     let engine = rds_engine_tokens(parts.engine);
+    let config = aws_config_ident();
     quote! {
-        ::skyzen_aws::RdsDataDb::from_parts(#resource_arn, #secret_arn, #database, #engine).await
+        ::skyzen_aws::RdsDataDb::from_config(
+            &#config, #resource_arn, #secret_arn, #database, #engine,
+        )
     }
 }
 
@@ -3619,10 +3634,76 @@ fn rds_from_env_tokens(name: &str) -> proc_macro2::TokenStream {
         &format!("portable database `{name}` failed to reach Aurora through the RDS Data API"),
         proc_macro2::Span::call_site(),
     );
+    let config = aws_config_ident();
     quote! {
-        ::skyzen_aws::RdsDataDb::from_env()
-            .await
+        ::skyzen_aws::RdsDataDb::from_config_and_env(&#config)
             .unwrap_or_else(|error| panic!("{}: {error}", #failure))
+    }
+}
+
+/// The local setup holds the one AWS configuration in, which every AWS backend's client is built
+/// from; [`aws_config_tokens`] binds it.
+fn aws_config_ident() -> proc_macro2::Ident {
+    format_ident!("__skyzen_aws_config")
+}
+
+/// Which crate names `load_config` for an application whose AWS backends are wired: `skyzen-aws`
+/// when any of them is one of its own, or `skyzen-s3`, which re-exports it, when S3 is the only
+/// one — the application then depends on that crate alone. `None` when no backend is on AWS.
+fn aws_sdk_path(manifest: &SkyzenManifest) -> Option<proc_macro2::TokenStream> {
+    let services = manifest
+        .service
+        .iter()
+        .filter_map(|service| native_service_wiring(manifest, &service.name));
+    let mut s3 = false;
+    let mut aws = false;
+    for wiring in services {
+        match wiring {
+            NativeServiceSection::S3(_) => s3 = true,
+            NativeServiceSection::DynamoDb(_) | NativeServiceSection::Sqs(_) => aws = true,
+            _ => {}
+        }
+    }
+    aws |= manifest.database.iter().any(|database| {
+        matches!(
+            (
+                database.database_type,
+                native_database_wiring(manifest, &database.name)
+            ),
+            (DatabaseType::Sql, Some(NativeDatabaseSection::RdsData(_)))
+        )
+    });
+    if aws {
+        Some(quote! { ::skyzen_aws::sdk })
+    } else if s3 {
+        Some(quote! { ::skyzen_s3 })
+    } else {
+        None
+    }
+}
+
+/// The native setup's one AWS configuration, loaded once, before any backend is built, when the
+/// manifest wires one on AWS.
+///
+/// Its credentials provider and cache are shared by every client built from it, on every thread,
+/// so the process fetches credentials once. Setup runs on the coordinating thread, and the
+/// configuration is loaded on that thread's pools where the platform pools per thread: a refresh a
+/// serving thread's call starts goes out on the coordinating thread's connections, never on
+/// zenwave's shared driver thread. Under Lambda it keeps that driver thread.
+fn aws_config_tokens(manifest: &SkyzenManifest) -> proc_macro2::TokenStream {
+    let Some(sdk) = aws_sdk_path(manifest) else {
+        return quote! {};
+    };
+    let config = aws_config_ident();
+    quote! {
+        let #config = match __skyzen_pools.driver() {
+            ::std::option::Option::Some(io) => {
+                #sdk::load_config(#sdk::ZenwaveHttpClient::system_on_current_thread(io)).await
+            }
+            ::std::option::Option::None => {
+                #sdk::load_config(#sdk::ZenwaveHttpClient::system()).await
+            }
+        };
     }
 }
 
@@ -4400,7 +4481,7 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        DatabaseEntry, DatabaseType, HashMap, ServiceType, SkyzenManifest,
+        DatabaseEntry, DatabaseType, HashMap, ServiceType, SkyzenManifest, aws_config_tokens,
         database_ident_from_name, default_database_index, documented_extractor_payload,
         documented_response_payload, first_generic_type, generate_cloudflare_database_init,
         generate_native_database_init, generate_native_service_init, single_generic_type,
@@ -4493,7 +4574,7 @@ type = "sql"
             (
                 "kv",
                 "backend = \"dynamodb\"\ntable = \"skyzen-sessions\"",
-                "skyzen_aws :: DynamoKv :: from_env",
+                "skyzen_aws :: DynamoKv :: from_config (& __skyzen_aws_config",
             ),
             (
                 "kv",
@@ -4503,7 +4584,7 @@ type = "sql"
             (
                 "storage",
                 "backend = \"s3\"\nbucket_env = \"UPLOADS_BUCKET\"",
-                "skyzen_s3 :: S3Storage :: from_env",
+                "skyzen_s3 :: S3Storage :: from_config (& __skyzen_aws_config",
             ),
             (
                 "storage",
@@ -4513,7 +4594,7 @@ type = "sql"
             (
                 "queue",
                 "backend = \"sqs\"\nurl_env = \"JOBS_QUEUE_URL\"",
-                "skyzen_aws :: SqsQueue :: from_env",
+                "skyzen_aws :: SqsQueue :: from_config (& __skyzen_aws_config",
             ),
             (
                 "queue",
@@ -4603,18 +4684,20 @@ type = "sql"
     fn the_async_constructors_are_awaited_and_the_synchronous_ones_are_not() {
         // Getting this wrong is a type error in the generated code rather than a wrong result, but
         // the error lands in a user's crate — so it is asserted here, where it is cheap.
+        let cosmos = service_init(
+            "kv",
+            "backend = \"cosmos\"\ndatabase = \"appdb\"\ncontainer = \"sessions\"",
+        );
+        assert!(cosmos.contains(". await"), "{cosmos}");
+
+        // The AWS backends are built from the configuration setup has already loaded.
         for (kind, wiring) in [
             ("kv", "backend = \"dynamodb\"\ntable = \"sessions\""),
             (
-                "kv",
-                "backend = \"cosmos\"\ndatabase = \"appdb\"\ncontainer = \"sessions\"",
+                "storage",
+                "backend = \"s3\"\nbucket_env = \"UPLOADS_BUCKET\"",
             ),
-        ] {
-            let generated = service_init(kind, wiring);
-            assert!(generated.contains(". await"), "{wiring}: {generated}");
-        }
-
-        for (kind, wiring) in [
+            ("queue", "backend = \"sqs\"\nurl_env = \"JOBS_QUEUE_URL\""),
             ("storage", "backend = \"blob\"\ncontainer = \"uploads\""),
             ("queue", "backend = \"servicebus\"\nqueue = \"jobs\""),
             (
@@ -4627,18 +4710,86 @@ type = "sql"
         }
     }
 
+    /// Every AWS backend is built from one configuration, loaded once on the pools the platform
+    /// picks, so the process has one credentials provider and one cache, fetched on the
+    /// coordinating thread's connections where threads pool their own.
+    #[test]
+    fn the_aws_backends_share_one_configuration_loaded_on_the_platforms_pools() {
+        let both = manifest(
+            "[[service]]\nname = \"sessions\"\ntype = \"kv\"\n\n\
+             [[service]]\nname = \"uploads\"\ntype = \"storage\"\n\n\
+             [native.service.sessions]\nbackend = \"dynamodb\"\ntable = \"sessions\"\n\n\
+             [native.service.uploads]\nbackend = \"s3\"\nbucket_env = \"UPLOADS_BUCKET\"\n",
+        );
+        let generated = aws_config_tokens(&both).to_string();
+        assert_eq!(
+            generated
+                .matches("skyzen_aws :: sdk :: load_config")
+                .count(),
+            2,
+            "one load, written once per arm of the pools match: {generated}"
+        );
+        assert!(
+            generated.contains("__skyzen_pools . driver ()"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains(
+                "Some (io) => { :: skyzen_aws :: sdk :: load_config (:: skyzen_aws :: sdk :: \
+                 ZenwaveHttpClient :: system_on_current_thread (io))"
+            ),
+            "{generated}"
+        );
+        assert!(
+            generated.contains(
+                "None => { :: skyzen_aws :: sdk :: load_config (:: skyzen_aws :: sdk :: \
+                 ZenwaveHttpClient :: system ())"
+            ),
+            "{generated}"
+        );
+
+        // An application whose only AWS backend is S3 may depend on `skyzen-s3` alone.
+        let s3_only = manifest(
+            "[[service]]\nname = \"uploads\"\ntype = \"storage\"\n\n\
+             [native.service.uploads]\nbackend = \"s3\"\nbucket_env = \"UPLOADS_BUCKET\"\n",
+        );
+        let generated = aws_config_tokens(&s3_only).to_string();
+        assert!(
+            generated.contains(":: skyzen_s3 :: load_config"),
+            "{generated}"
+        );
+        assert!(!generated.contains(":: skyzen_aws"), "{generated}");
+
+        let rds = manifest(
+            "[[database]]\nname = \"main\"\ntype = \"sql\"\n\n\
+             [native.database.main]\nbackend = \"rds-data\"\n",
+        );
+        assert!(
+            aws_config_tokens(&rds)
+                .to_string()
+                .contains("skyzen_aws :: sdk :: load_config")
+        );
+
+        let none = manifest(
+            "[[service]]\nname = \"cache\"\ntype = \"kv\"\n\n\
+             [native.service.cache]\nbackend = \"redis\"\nurl_env = \"CACHE_URL\"\n",
+        );
+        assert!(aws_config_tokens(&none).is_empty());
+    }
+
     #[test]
     fn the_rds_data_api_is_built_from_its_own_environment_and_wrapped_in_a_db() {
         let generated = database_init("backend = \"rds-data\"");
         assert!(
-            generated.contains("skyzen_aws :: RdsDataDb :: from_env ()"),
+            generated
+                .contains("skyzen_aws :: RdsDataDb :: from_config_and_env (& __skyzen_aws_config)"),
             "{generated}"
         );
         assert!(
             generated.contains("skyzen :: __services :: Db :: new"),
             "{generated}"
         );
-        assert!(generated.contains(". await"), "{generated}");
+        assert!(!generated.contains(". await"), "{generated}");
         // It reads its four variables itself, so the expansion reads none.
         assert!(!generated.contains("env :: var"), "{generated}");
     }
@@ -4653,7 +4804,7 @@ type = "sql"
         );
 
         assert!(
-            generated.contains("skyzen_aws :: RdsDataDb :: from_parts"),
+            generated.contains("skyzen_aws :: RdsDataDb :: from_config (& __skyzen_aws_config"),
             "{generated}"
         );
         assert!(
@@ -4665,7 +4816,7 @@ type = "sql"
             generated.contains("skyzen :: __services :: Db :: new"),
             "{generated}"
         );
-        assert!(generated.contains(". await"), "{generated}");
+        assert!(!generated.contains(". await"), "{generated}");
         // The values are in the manifest, so neither constructor reads a variable.
         assert!(!generated.contains("from_env"), "{generated}");
         assert!(!generated.contains("env :: var"), "{generated}");

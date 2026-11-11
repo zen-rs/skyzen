@@ -159,6 +159,22 @@ impl SqsQueue {
         Self::new(Self::env_client().await, queue_url)
     }
 
+    /// Create a `SqsQueue` for a standard queue whose client is built from `config`.
+    ///
+    /// Clients built from one configuration share its credentials provider and cache; see
+    /// [`crate::sdk::load_config`].
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError::Backend`] when `queue_url` names a FIFO queue — see
+    /// [`new`](SqsQueue::new).
+    pub fn from_config(
+        config: &crate::sdk::SdkConfig,
+        queue_url: impl Into<String>,
+    ) -> Result<Self, QueueError> {
+        Self::new(Client::new(config), queue_url)
+    }
+
     /// Create a `SqsQueue` for a FIFO queue from environment configuration.
     ///
     /// # Errors
@@ -226,9 +242,9 @@ impl SqsQueue {
     }
 
     /// The default SDK client, built from the ambient configuration [`crate::sdk::load_config`]
-    /// loads.
+    /// loads on [`crate::sdk::ZenwaveHttpClient::system`].
     async fn env_client() -> Client {
-        let config = crate::sdk::load_config().await;
+        let config = crate::sdk::load_config(crate::sdk::ZenwaveHttpClient::system()).await;
         Client::new(&config)
     }
 

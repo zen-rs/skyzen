@@ -14,15 +14,18 @@
 //! - [`AsyncIoSleep`] waits on an async-io timer, which any executor can poll.
 //!
 //! [`config_loader`] wires both into aws-config's loader, and [`load_config`] loads the ambient
-//! configuration through it — what every `from_env` constructor in this crate and in `skyzen-s3`
-//! calls.
+//! configuration through it. Every `from_config` constructor in this crate and in `skyzen-s3`
+//! builds its client from a configuration loaded once; every `from_env` one loads its own on
+//! [`ZenwaveHttpClient::system`].
 
 use core::{fmt, future::Future, time::Duration};
 use std::{collections::HashMap, sync::Arc};
 
+/// The configuration [`load_config`] loads and every `from_config` constructor takes.
+pub use aws_config::SdkConfig;
 use aws_config::{
     environment::EnvironmentVariableCredentialsProvider,
-    meta::credentials::CredentialsProviderChain, BehaviorVersion, ConfigLoader, SdkConfig,
+    meta::credentials::CredentialsProviderChain, BehaviorVersion, ConfigLoader,
 };
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_smithy_async::rt::sleep::{AsyncSleep, Sleep};
@@ -454,28 +457,44 @@ impl AsyncSleep for AsyncIoSleep {
 /// aws-config's loader for the latest behavior version, with its requests on `http` and its
 /// timers on [`AsyncIoSleep`].
 ///
-/// Every credential and region provider the loader builds — IMDS, SSO, STS — rides the same
-/// client, so the loaded [`SdkConfig`] needs no tokio context anywhere.
+/// Every credential and region provider the loader builds — IMDS, ECS, SSO, STS — keeps `http`
+/// for its own requests, so the loaded [`SdkConfig`] needs no tokio context anywhere, and its
+/// credentials are fetched wherever `http`'s connection pools run.
 #[must_use]
-pub fn config_loader(http: ZenwaveHttpClient) -> ConfigLoader {
+pub fn config_loader(http: impl HttpClient + 'static) -> ConfigLoader {
     aws_config::defaults(BehaviorVersion::latest())
         .http_client(http)
         .sleep_impl(AsyncIoSleep)
 }
 
 /// The ambient AWS configuration — environment, profile files, instance metadata — loaded through
-/// [`config_loader`] with [`ZenwaveHttpClient::system`].
+/// [`config_loader`] on `http`.
 ///
 /// The credentials come from the default chain with [`CredentialProcessProvider`] spliced in
 /// after the environment variables, which the default chain tries first, so a profile's
 /// `credential_process` is honoured and a profile without one falls through to the rest of the
 /// chain. aws-config's own `credential_process` support is compiled out, since it needs tokio.
 ///
+/// # One configuration per process
+///
+/// The configuration carries one credentials provider and one credentials cache, and every client
+/// built from it shares both: a refresh happens once, in the future of whichever call finds the
+/// credentials expired, and its requests go out on `http` whatever thread that call runs on. A
+/// process that loads this once and builds every client from it — what `#[skyzen::main]` does —
+/// fetches its credentials once, however many clients and threads use them. Rebinding a client
+/// with `with_http_client` moves its service requests and leaves the credentials where they are.
+///
+/// `http` therefore decides which thread a credentials fetch runs on:
+/// [`ZenwaveHttpClient::system`] for a caller on no runtime of its own, or
+/// [`ZenwaveHttpClient::system_on_current_thread`] on a thread that runs a compio runtime for as
+/// long as the configuration is used — a server's coordinating thread.
+///
 /// # Panics
 ///
-/// If zenwave cannot start its driver thread.
-pub async fn load_config() -> SdkConfig {
-    let config = config_loader(ZenwaveHttpClient::system()).load().await;
+/// If aws-config's loader returns a configuration without a credentials provider, which it always
+/// installs.
+pub async fn load_config(http: impl HttpClient + 'static) -> SdkConfig {
+    let config = config_loader(http).load().await;
     let default_chain = config
         .credentials_provider()
         .expect("aws-config's loader always installs a credentials provider");
@@ -627,6 +646,169 @@ mod tests {
             let item: serde_json::Value =
                 serde_json::from_slice(request.body()).expect("the body is DynamoDB JSON");
             assert_eq!(item["Item"]["pk"]["S"], KEY);
+        }
+    }
+
+    /// The role and credentials the loopback instance metadata service hands out.
+    const IMDS_ROLE: &str = "skyzen-serving-role";
+    const IMDS_ACCESS_KEY_ID: &str = "ASIAIMDSLOOPBACK";
+    const IMDS_SECRET_ACCESS_KEY: &str = "imds-loopback-secret";
+    const IMDS_SESSION_TOKEN: &str = "imds-loopback-session-token";
+
+    /// The answer of the instance metadata service, version 2, to `request`: a session token, the instance's role, then that role's
+    /// credentials, which expire long after the test.
+    fn imds_answer(request: &ReceivedRequest) -> Response {
+        let role_path = format!("/latest/meta-data/iam/security-credentials/{IMDS_ROLE}");
+        let (status, body) = match (request.method().as_str(), request.uri().path()) {
+            ("PUT", "/latest/api/token") => (StatusCode::OK, "imds-loopback-api-token".to_owned()),
+            ("GET", "/latest/meta-data/iam/security-credentials/") => {
+                (StatusCode::OK, IMDS_ROLE.to_owned())
+            }
+            ("GET", path) if path == role_path => (
+                StatusCode::OK,
+                serde_json::json!({
+                    "Code": "Success",
+                    "LastUpdated": "2026-11-10T12:00:00Z",
+                    "Type": "AWS-HMAC",
+                    "AccessKeyId": IMDS_ACCESS_KEY_ID,
+                    "SecretAccessKey": IMDS_SECRET_ACCESS_KEY,
+                    "Token": IMDS_SESSION_TOKEN,
+                    "Expiration": "2099-01-01T00:00:00Z",
+                })
+                .to_string(),
+            ),
+            _ => (StatusCode::NOT_FOUND, String::new()),
+        };
+        let mut response = Response::new(Body::from_bytes(body.into_bytes()));
+        *response.status_mut() = status;
+        response.headers_mut().insert(
+            "x-aws-ec2-metadata-token-ttl-seconds",
+            http_kit::header::HeaderValue::from_static("21600"),
+        );
+        response
+    }
+
+    /// Credentials from a network source — IMDS — are fetched once for the process, on the pools
+    /// of the thread that loaded the configuration (a server's coordinating thread), although the
+    /// fetch is started by a service call on a serving thread; the service calls then go out on
+    /// each serving thread's own connections, signed with those credentials.
+    #[serial_test::serial]
+    #[test]
+    fn imds_credentials_are_fetched_once_on_the_pools_of_the_thread_that_loaded_them() {
+        let (fetches, fetched) = mpsc::channel::<String>();
+        let imds = LoopbackServer::start(move |request| {
+            fetches
+                .send(format!("{} {}", request.method(), request.uri().path()))
+                .expect("the test is still listening");
+            imds_answer(&request)
+        });
+        let (seen, received) = mpsc::channel::<ReceivedRequest>();
+        let dynamodb = LoopbackServer::start(move |request| {
+            seen.send(request).expect("the test is still listening");
+            answer(StatusCode::OK, &serde_json::json!({}))
+        });
+
+        // No credentials anywhere but the instance metadata service, which is the loopback one.
+        let profiles = tempfile::TempDir::new().expect("a temp directory");
+        let config_file = profiles.path().join("config");
+        let credentials_file = profiles.path().join("credentials");
+        std::fs::write(&config_file, "").expect("write config");
+        std::fs::write(&credentials_file, "").expect("write credentials");
+        let imds_endpoint = format!("http://{}", imds.addr());
+        let environment = crate::test_env::Environment::set(&[
+            ("AWS_CONFIG_FILE", Some(&config_file)),
+            ("AWS_SHARED_CREDENTIALS_FILE", Some(&credentials_file)),
+            ("AWS_PROFILE", None),
+            ("AWS_ACCESS_KEY_ID", None),
+            ("AWS_SECRET_ACCESS_KEY", None),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", None),
+            ("AWS_ROLE_ARN", None),
+            ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None),
+            ("AWS_CONTAINER_CREDENTIALS_FULL_URI", None),
+            ("AWS_EC2_METADATA_DISABLED", None),
+            ("AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE", None),
+            (
+                "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+                Some(std::path::Path::new(&imds_endpoint)),
+            ),
+            ("AWS_REGION", Some(std::path::Path::new("us-east-1"))),
+        ]);
+
+        // The coordinating thread: it loads the one configuration on its own pools, builds the
+        // store from it, and keeps its runtime running until the serving threads are done.
+        let dynamodb_endpoint = format!("http://{}", dynamodb.addr());
+        let (built, handed) = mpsc::channel();
+        let (stop, stopped) = async_channel::bounded::<core::convert::Infallible>(1);
+        let owner = std::thread::spawn(move || {
+            let runtime = compio::runtime::Runtime::new().expect("a compio runtime");
+            runtime.block_on(async move {
+                let (io, dials) = skyzen_test::DialRecorder::new();
+                let config = super::load_config(ZenwaveHttpClient::system_on_current_thread(io))
+                    .await
+                    .into_builder()
+                    .endpoint_url(dynamodb_endpoint)
+                    .build();
+                built
+                    .send(DynamoKv::from_config(&config, "orders"))
+                    .expect("the test is waiting for the store");
+                let _ = stopped.recv().await;
+                (std::thread::current().id(), dials.taken())
+            })
+        });
+        let shared = handed.recv().expect("the owner built the store");
+
+        let serving: Vec<_> = (0..2)
+            .map(|_| {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    let runtime = compio::runtime::Runtime::new().expect("a compio runtime");
+                    runtime.block_on(async move {
+                        let (io, dials) = skyzen_test::DialRecorder::new();
+                        let kv = shared
+                            .with_http_client(ZenwaveHttpClient::system_on_current_thread(io));
+                        for _ in 0..2 {
+                            kv.put(KEY, VALUE.as_bytes())
+                                .await
+                                .expect("the put should succeed with the IMDS credentials");
+                        }
+                        (std::thread::current().id(), dials.taken())
+                    })
+                })
+            })
+            .collect();
+        for thread in serving {
+            let (sender, dials) = thread.join().expect("the serving thread finishes");
+            assert_dialed_on(&dials, sender);
+        }
+        drop(stop);
+        let (owner_thread, owner_dials) = owner.join().expect("the owner finishes");
+        drop(environment);
+
+        assert_dialed_on(&owner_dials, owner_thread);
+        assert_eq!(
+            fetched.try_iter().collect::<Vec<_>>(),
+            [
+                "PUT /latest/api/token".to_owned(),
+                "GET /latest/meta-data/iam/security-credentials/".to_owned(),
+                format!("GET /latest/meta-data/iam/security-credentials/{IMDS_ROLE}"),
+            ],
+            "one credentials fetch for the whole process"
+        );
+        let seen = received.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 4, "two puts from each serving thread");
+        for request in seen {
+            let authorization = request.headers()[http_kit::header::AUTHORIZATION]
+                .to_str()
+                .expect("a signature is ASCII");
+            assert!(
+                authorization.contains(&format!("Credential={IMDS_ACCESS_KEY_ID}/")),
+                "{authorization}"
+            );
+            assert_eq!(
+                request.headers()["x-amz-security-token"],
+                IMDS_SESSION_TOKEN
+            );
         }
     }
 
