@@ -67,10 +67,13 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace ${{ matrix.targets }} ${{ env.FEATURES }}
 
-      # The test build already compiled the CLI `skyzen-cli` releases; keep it
-      # so a pull request's CLI can be tried without building it again.
+      # The CLI `skyzen-cli` releases, on the dependencies the test build already
+      # compiled, kept so a pull request's CLI can be tried without building it.
+      # The test run builds no binary target, so it is built here.
+      - name: Build the skyzen CLI
+        run: cargo build -p skyzen-cli --bin skyzen
+
       - name: Upload the skyzen CLI
-        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: skyzen-cli-${{ runner.os }}-${{ runner.arch }}
