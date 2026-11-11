@@ -502,7 +502,7 @@ wiring variable; the Lambda and the Functions binaries *are* the native binary, 
 
 | Provider | `dev` | `deploy` | `secret set NAME` / `secret push` | `secret list` |
 |---|---|---|---|---|
-| native | secrets and wiring must resolve; the `.env` entries the shell does not already hold are added to the child's environment | — (the installed unit carries none; an `EnvironmentFile=` drop-in supplies them, see [Deploying](#deploying)) | refused: nothing remote to write to | refused |
+| native | secrets and wiring must resolve; the `.env` entries the shell does not already hold are added to the child's environment | secrets and wiring must resolve; they are written to `/etc/skyzen/<bin>.env` (root-owned, 0600), which the installed unit reads as its `EnvironmentFile=` (see [Deploying](#deploying)) | refused: nothing remote to write to | refused |
 | cloudflare | every secret must resolve. Classic ones are written to `.skyzen/gen/.dev.vars` (`.dev.vars.<env>` under `--env`); store-backed ones are seeded into wrangler's *local* store, which starts out empty however full the account's is | `wrangler deploy`, then the classic secrets through `wrangler secret bulk`. Store-backed ones are neither needed nor written | `set`: `wrangler secret put`, or a write to the account's store for a store-backed name. `push`: the same `secret bulk` the deploy runs | `wrangler secret list` |
 | aws | — (run it as an ordinary server with `skyzen dev`) | `cargo lambda deploy`, then `UpdateFunctionConfiguration` with `[aws.env]` plus the secrets and wiring variables | the same call, without the build | the function environment's names |
 | azure | — (`func start` over a built bundle) | `func azure functionapp publish`, then the application settings — which *are* the custom handler's environment — set to the secrets and wiring variables | the same call, without the publish | the app settings' names |
@@ -831,6 +831,26 @@ CPUs it stays off, and `skyzen doctor` says which CPUs take none. The unit's `Ex
 the service's own CPU affinity, so a `CPUAffinity=` drop-in moves the placement with the threads.
 `irqbalance` moves interrupts on its own schedule: stop it, or ban these interrupts from it.
 
+### Serving
+
+`[native.server]` states how the deployed service serves. The installed unit hands each key to the
+runtime as its own variable, and derives the service's privileges from them.
+
+```toml
+[native.server]
+listen = "0.0.0.0:8080"        # or { unix = "/run/<bin>/<bin>.sock" }; required to deploy
+busy_poll = 50                 # SO_BUSY_POLL, µs
+busy_poll_prefer = true        # SO_PREFER_BUSY_POLL; needs busy_poll
+busy_poll_budget = 64          # SO_BUSY_POLL_BUDGET; needs busy_poll
+```
+
+| Key | Runtime variable | Privilege it takes |
+|-----|------------------|--------------------|
+| `listen` | `SKYZEN_ADDRESS` | `CAP_NET_BIND_SERVICE` for a port below the host's `net.ipv4.ip_unprivileged_port_start`; a unix socket must sit directly in `/run/<bin>/`, the service's `RuntimeDirectory=` |
+| `busy_poll` | `SKYZEN_BUSY_POLL` | none |
+| `busy_poll_prefer` | `SKYZEN_BUSY_POLL_PREFER` | `CAP_NET_ADMIN` |
+| `busy_poll_budget` | `SKYZEN_BUSY_POLL_BUDGET` | `CAP_NET_ADMIN`: the kernel requires it for any budget above the socket's, which starts at 0 |
+
 ### Deploying
 
 ```sh
@@ -846,20 +866,32 @@ the toolchain's `PATH`. Then, in order:
 1. one operation for each `[native.linux]` setting the host does not have yet, and a closing read
    that every setting now holds, followed by the connection-steering decision when `rx_irqs` is
    set;
-2. `/etc/systemd/system/<bin>.service`, which starts the binary in the project root and runs
-   `skyzen deploy --provider native --host-only` before every start (with `+`, so as root whatever
-   `User=` says);
-3. `systemctl daemon-reload`, `systemctl enable <bin>.service`, `systemctl restart <bin>.service`.
+2. `/etc/skyzen/<bin>.env`, root-owned and mode 0600: every `[[secret]]` and wiring variable the
+   application reads, resolved from the shell and the `.env` files as for `skyzen dev`. A variable
+   set nowhere fails the deployment, naming it;
+3. `/etc/systemd/system/<bin>.service`, which starts the binary in the project root with that
+   file as its `EnvironmentFile=`, and runs `skyzen deploy --provider native --host-only` before
+   every start (with `+`, so as root and outside the sandbox);
+4. `systemctl daemon-reload`, `systemctl enable <bin>.service`, `systemctl restart <bin>.service`.
 
-Running it again changes nothing on the host and prints each setting as already in place. It needs
-root whenever it writes; `--dry-run` reads the host as any user and prints the operations it would
-perform, with the kernel interface each one writes. `--host-only` is step 1 alone, and needs no
-toolchain, no project and no `.env`.
+The service runs as a transient user (`DynamicUser=yes`) with no capability beyond the ones
+`[native.server]` takes (`AmbientCapabilities=`, and the same `CapabilityBoundingSet=`, empty when
+it takes none), `LimitMEMLOCK=infinity` so zero-copy sends are not cut short, and
+`NoNewPrivileges=`, `ProtectSystem=strict`, `ProtectHome=read-only` and `PrivateTmp=`. The system
+is read-only to it: a `[native.database]` with the `sqlite` backend adds `StateDirectory=<bin>`, so
+its URL names a file under `/var/lib/<bin>/`. Because the transient user owns nothing, the project
+root and the binary have to be reachable by other users (`o+x` on every directory above them,
+`o+rx` on the binary); the deployment refuses otherwise.
+
+Running it again changes nothing on the host, prints each setting as already in place, and
+rewrites the environment file and the unit. It needs root whenever it writes; `--dry-run` reads the
+host as any user and prints the operations it would perform, with the kernel interface each one
+writes, the unit, and `write /etc/skyzen/<bin>.env (secret values, not shown)`. `--host-only` is
+step 1 alone, and needs no toolchain, no project and no `.env`.
 
 The unit is rewritten on every deployment, so changes to the service go in a drop-in
-(`systemctl edit <bin>`): `User=`, an `EnvironmentFile=` holding the secrets and wiring variables
-the application reads, or `Environment=SKYZEN_STEERING=on` (or `off`) to force connection steering
-either way.
+(`systemctl edit <bin>`), for example `Environment=SKYZEN_STEERING=on` (or `off`) to force
+connection steering either way.
 
 ## AWS Section
 
