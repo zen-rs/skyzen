@@ -101,12 +101,17 @@ pub enum Command {
         #[arg(long)]
         no_open: bool,
     },
-    /// Build and deploy.
+    /// Build and deploy; `--provider native` installs the application on this Linux host.
     Deploy {
         /// Upload the new version without deploying it, so traffic can be shifted onto it
         /// gradually (`wrangler versions upload`; Cloudflare only).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "host_only")]
         upload_only: bool,
+
+        /// Apply `[native.linux]` to this host and do nothing else; the systemd unit a native
+        /// deployment installs runs this before every start (native only).
+        #[arg(long)]
+        host_only: bool,
     },
 
     /// Create the cloud resources the manifest declares but has no id for.
@@ -267,7 +272,18 @@ mod tests {
         assert_eq!(parsed.manifest, std::path::PathBuf::from("custom.toml"));
         assert!(matches!(
             parsed.command,
-            Command::Deploy { upload_only: false }
+            Command::Deploy {
+                upload_only: false,
+                host_only: false
+            }
+        ));
+        let host = parse(&["skyzen", "-p", "native", "deploy", "--host-only"]);
+        assert!(matches!(
+            host.command,
+            Command::Deploy {
+                upload_only: false,
+                host_only: true
+            }
         ));
 
         let short = parse(&["skyzen", "-p", "native", "dev"]);

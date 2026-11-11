@@ -329,7 +329,7 @@ fn event_source_hint(function: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{event_source_hint, prepare};
-    use crate::providers::{Action, SecretAction, Step};
+    use crate::providers::{Action, DeployMode, SecretAction, Step};
     use secrecy::SecretString;
     use skyzen_manifest::{Manifest, VarName};
 
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn a_deploy_builds_first_and_then_carries_the_manifests_configuration() {
         let planned = planned(
-            &Action::Deploy { upload_only: false },
+            &Action::Deploy(DeployMode::Full),
             "[aws]\nfunction_name = \"skyzen-api\"\nmemory_mb = 512\ntimeout = \"45s\"\n\n\
              [aws.env]\nRUST_LOG = \"info\"\n",
         );
@@ -399,7 +399,7 @@ mod tests {
         // is printed by every progress line and by `--dry-run`, and is visible in the process
         // table of whatever machine runs the deploy.
         let planned = planned(
-            &Action::Deploy { upload_only: false },
+            &Action::Deploy(DeployMode::Full),
             "[aws]\n\n[aws.env]\nRUST_LOG = \"info\"\n",
         );
 
@@ -421,12 +421,7 @@ mod tests {
         )
         .expect("valid manifest");
 
-        let plan = prepare(
-            &Action::Deploy { upload_only: false },
-            &manifest,
-            &project(),
-        )
-        .expect("plan");
+        let plan = prepare(&Action::Deploy(DeployMode::Full), &manifest, &project()).expect("plan");
         let last = plan
             .steps
             .last()
@@ -444,7 +439,7 @@ mod tests {
     #[test]
     fn a_deploy_refuses_when_a_declared_variable_is_set_nowhere() {
         let error = prepare(
-            &Action::Deploy { upload_only: false },
+            &Action::Deploy(DeployMode::Full),
             &manifest(
                 "[[secret]]\nname = \"SKYZEN_TEST_AWS_UNSET_SECRET\"\n\n\
                  [[service]]\nname = \"cache\"\ntype = \"kv\"\n\n\
@@ -513,10 +508,7 @@ mod tests {
 
     #[test]
     fn turning_the_url_off_removes_it_rather_than_leaving_the_old_one_serving() {
-        let planned = planned(
-            &Action::Deploy { upload_only: false },
-            "[aws]\nurl = false\n",
-        );
+        let planned = planned(&Action::Deploy(DeployMode::Full), "[aws]\nurl = false\n");
 
         assert!(planned[1].contains("--disable-function-url"), "{planned:?}");
         assert!(!planned[1].contains("--enable-function-url"), "{planned:?}");
