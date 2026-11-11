@@ -11,8 +11,8 @@ use crate::{
     environment::ResolvedVariables,
     project::{Project, WASM_TARGET},
     providers::{
-        Action, CommandPlan, CommandStdin, FileContents, GeneratedFile, ProviderPlan, RunMode,
-        SecretAction, Step,
+        Action, CommandPlan, CommandStdin, DeployMode, FileContents, GeneratedFile, ProviderPlan,
+        RunMode, SecretAction, Step,
     },
 };
 
@@ -250,12 +250,12 @@ fn plan_work(request: &WorkRequest<'_>) -> Result<PlannedWork> {
                 })
                 .collect(),
         ),
-        Action::Deploy { upload_only } => {
+        Action::Deploy(mode) => {
             // Resolved before anything is uploaded, and under `--dry-run` too: a deployment that
             // ships half its configuration fails at cold start, where the message is a panic in a
             // log rather than a list of manifest entries.
             let resolved = secrets.classic()?;
-            if *upload_only {
+            if *mode == DeployMode::UploadOnly {
                 upload_only_work(request, &resolved, command)?
             } else {
                 let mut commands = vec![command(
@@ -554,7 +554,9 @@ mod tests {
     };
     use crate::{
         environment,
-        providers::{Action, CommandPlan, CommandStdin, FileContents, SecretAction, Step},
+        providers::{
+            Action, CommandPlan, CommandStdin, DeployMode, FileContents, SecretAction, Step,
+        },
     };
     use secrecy::SecretString;
     use skyzen_manifest::{Manifest, VarName};
@@ -712,7 +714,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_deploy_becomes_a_wrangler_dry_run_rather_than_a_skipped_build() {
-        let deploy = rendered(&Action::Deploy { upload_only: false }, None, true);
+        let deploy = rendered(&Action::Deploy(DeployMode::Full), None, true);
         assert!(deploy.contains("wrangler deploy"), "{deploy}");
         assert!(deploy.contains("--dry-run"), "{deploy}");
     }
@@ -797,13 +799,8 @@ mod tests {
     #[test]
     fn a_deploy_delivers_the_declared_secrets_after_the_upload() {
         let (_dir, manifest) = project(CLASSIC, "STRIPE_KEY=sk_live_123\n");
-        let planned = work(
-            &Action::Deploy { upload_only: false },
-            &manifest,
-            None,
-            false,
-        )
-        .expect("plan");
+        let planned =
+            work(&Action::Deploy(DeployMode::Full), &manifest, None, false).expect("plan");
 
         let commands = commands(&planned);
         assert_eq!(commands.len(), 2, "{planned:?}");
@@ -823,7 +820,7 @@ mod tests {
     fn an_upload_only_deploy_uploads_a_version_with_its_secrets_in_the_same_upload() {
         let (_dir, manifest) = project(CLASSIC, "STRIPE_KEY=sk_live_123\n");
         let planned = work(
-            &Action::Deploy { upload_only: true },
+            &Action::Deploy(DeployMode::UploadOnly),
             &manifest,
             None,
             false,
@@ -860,7 +857,7 @@ mod tests {
     fn an_upload_only_deploy_without_classic_secrets_has_no_secrets_file() {
         let (_dir, manifest) = project(STORE_BACKED, "");
         let planned = work(
-            &Action::Deploy { upload_only: true },
+            &Action::Deploy(DeployMode::UploadOnly),
             &manifest,
             None,
             false,
@@ -878,13 +875,8 @@ mod tests {
     #[test]
     fn a_deploy_refuses_when_a_declared_secret_is_set_nowhere() {
         let (_dir, manifest) = project(CLASSIC, "");
-        let error = work(
-            &Action::Deploy { upload_only: false },
-            &manifest,
-            None,
-            false,
-        )
-        .expect_err("the value is set nowhere, and a Worker without it panics at cold start");
+        let error = work(&Action::Deploy(DeployMode::Full), &manifest, None, false)
+            .expect_err("the value is set nowhere, and a Worker without it panics at cold start");
         let rendered = format!("{error:#}");
         assert!(rendered.contains("STRIPE_KEY"), "{rendered}");
         assert!(rendered.contains("[[secret]] STRIPE_KEY"), "{rendered}");
@@ -899,13 +891,8 @@ mod tests {
              [native.database.main]\nbackend = \"postgres\"\nurl_env = \"JOURNAL_URL\"\n"
         );
         let (_dir, manifest) = project(&source, "");
-        let planned = work(
-            &Action::Deploy { upload_only: false },
-            &manifest,
-            None,
-            false,
-        )
-        .expect("plan");
+        let planned =
+            work(&Action::Deploy(DeployMode::Full), &manifest, None, false).expect("plan");
 
         let commands = commands(&planned);
         assert_eq!(commands.len(), 1, "nothing to deliver: {planned:?}");
@@ -915,13 +902,7 @@ mod tests {
     #[test]
     fn a_dry_run_deploy_uploads_nothing_and_so_delivers_nothing() {
         let (_dir, manifest) = project(CLASSIC, "STRIPE_KEY=sk_live_123\n");
-        let planned = work(
-            &Action::Deploy { upload_only: false },
-            &manifest,
-            None,
-            true,
-        )
-        .expect("plan");
+        let planned = work(&Action::Deploy(DeployMode::Full), &manifest, None, true).expect("plan");
 
         let commands = commands(&planned);
         assert_eq!(commands.len(), 1, "{planned:?}");

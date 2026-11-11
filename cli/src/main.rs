@@ -18,7 +18,7 @@ mod secret_files;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Command, SecretCommand};
-use providers::{Action, FileContents, ProviderPlan, RunMode, SecretAction};
+use providers::{Action, DeployMode, FileContents, ProviderPlan, RunMode, SecretAction};
 use secrecy::{zeroize::Zeroize as _, ExposeSecret as _};
 use std::{
     fs,
@@ -132,9 +132,14 @@ fn action_for(command: &Command) -> Result<Action> {
         Command::Dev { runner_args } => Action::Dev {
             runner_args: runner_args.clone(),
         },
-        Command::Deploy { upload_only } => Action::Deploy {
-            upload_only: *upload_only,
-        },
+        Command::Deploy {
+            upload_only,
+            host_only,
+        } => Action::Deploy(match (upload_only, host_only) {
+            (true, _) => DeployMode::UploadOnly,
+            (_, true) => DeployMode::HostOnly,
+            (false, false) => DeployMode::Full,
+        }),
         Command::Logs { wrangler_args } => Action::Logs {
             wrangler_args: wrangler_args.clone(),
         },

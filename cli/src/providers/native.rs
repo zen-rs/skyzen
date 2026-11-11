@@ -1,13 +1,109 @@
-//! The native provider: run the application as an ordinary binary.
+//! The native provider: run the application as an ordinary binary, and deploy it as a systemd
+//! service on the Linux host the CLI runs on.
+
+mod systemd;
 
 use crate::{
     environment::VariableKind,
+    project::Project,
     providers::{
-        prepare_child_environment, Action, CommandPlan, CommandStdin, ProviderPlan, RunMode, Step,
+        prepare_child_environment, Action, CommandPlan, CommandStdin, FileContents, GeneratedFile,
+        ProviderPlan, RunMode, Step,
     },
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use skyzen_manifest::Manifest;
+
+/// The plan of `skyzen deploy --provider native`: bring this host to `[native.linux]`, install
+/// the systemd unit that starts the release binary and re-applies those settings before every
+/// start, and (re)start it.
+///
+/// Nothing is compiled. A deployment runs as root, and a build run as root would leave the
+/// project's `target/` owned by root; `skyzen build --provider native --release` builds it first,
+/// as its owner.
+///
+/// # Errors
+///
+/// Fails off Linux, when the release binary has not been built, when `[native.linux]` asks for a
+/// facility this host lacks or does not report, and when the deployment would change something
+/// and the CLI is not root.
+pub fn deploy(manifest: &Manifest, project: &Project, dry_run: bool) -> Result<ProviderPlan> {
+    if !cfg!(target_os = "linux") {
+        anyhow::bail!(
+            "`skyzen deploy --provider native` installs a systemd service on the Linux host it \
+             runs on; this machine runs {}",
+            std::env::consts::OS
+        );
+    }
+    let name = project.binary_target_name()?;
+    let binary = project.target_directory().join("release").join(name);
+    if !binary.is_file() {
+        anyhow::bail!(
+            "{} does not exist; build it first with `skyzen build --provider native --release`",
+            binary.display()
+        );
+    }
+    let skyzen = std::env::current_exe().context("cannot locate the skyzen executable")?;
+    let manifest_path = std::path::absolute(manifest.path())
+        .with_context(|| format!("cannot make {} an absolute path", manifest.path().display()))?;
+    let unit = systemd::Unit::new(name, manifest.root_dir(), &binary, &skyzen, &manifest_path)?;
+    if !dry_run {
+        crate::host::ensure_root("`skyzen deploy --provider native`")?;
+    }
+
+    let mut steps = host_steps(manifest, dry_run)?;
+    let systemctl = |args: &[&str]| {
+        Step::Command(CommandPlan {
+            program: "systemctl".to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            cwd: None,
+            stdin: CommandStdin::Inherit,
+        })
+    };
+    let unit_name = unit.unit_name();
+    steps.extend([
+        systemctl(&["daemon-reload"]),
+        systemctl(&["enable", &unit_name]),
+        systemctl(&["restart", &unit_name]),
+    ]);
+
+    Ok(ProviderPlan {
+        steps,
+        generated_files: vec![GeneratedFile {
+            path: unit.path(),
+            contents: FileContents::Public(unit.contents()?),
+        }],
+        ..ProviderPlan::default()
+    })
+}
+
+/// The plan of `skyzen deploy --provider native --host-only`: bring this host to
+/// `[native.linux]`, and nothing else.
+///
+/// # Errors
+///
+/// Fails when `[native.linux]` asks for a facility this host lacks or does not report, and when
+/// a setting has to change and the CLI is not root.
+pub fn host_only(manifest: &Manifest, dry_run: bool) -> Result<ProviderPlan> {
+    Ok(ProviderPlan {
+        steps: host_steps(manifest, dry_run)?,
+        ..ProviderPlan::default()
+    })
+}
+
+/// One step per setting of `[native.linux]` this host does not have yet; none without the
+/// section.
+fn host_steps(manifest: &Manifest, dry_run: bool) -> Result<Vec<Step>> {
+    manifest
+        .data()
+        .native
+        .as_ref()
+        .and_then(|native| native.linux.as_ref())
+        .map_or_else(
+            || Ok(Vec::new()),
+            |section| crate::host::apply_steps(section, dry_run),
+        )
+}
 
 /// Build the plan for one native action.
 ///
@@ -37,8 +133,7 @@ pub fn prepare(action: &Action, manifest: &Manifest) -> Result<ProviderPlan> {
             (args, RunMode::Once)
         }
         other => anyhow::bail!(
-            "`skyzen {}` has no native implementation; native applications are deployed as \
-             ordinary binaries",
+            "`skyzen {}` has no native implementation",
             super::action_name(other)
         ),
     };
@@ -107,12 +202,31 @@ mod tests {
 
     #[test]
     fn a_cloud_only_action_is_refused_with_a_reason() {
-        let error = prepare(&Action::Deploy { upload_only: false }, &manifest(""))
-            .expect_err("native cannot deploy");
+        let error = prepare(
+            &Action::Logs {
+                wrangler_args: Vec::new(),
+            },
+            &manifest(""),
+        )
+        .expect_err("native has no logs");
         assert!(
             error.to_string().contains("no native implementation"),
             "{error}"
         );
+    }
+
+    /// Without the section there is nothing to apply, on any machine; with it, the host the CLI
+    /// runs on has to be Linux.
+    #[test]
+    fn the_host_half_applies_only_what_the_manifest_states() {
+        let plan = super::host_only(&manifest(""), true).expect("nothing to apply");
+        assert!(plan.steps.is_empty());
+
+        if !cfg!(target_os = "linux") {
+            let error = super::host_only(&manifest("[native.linux]\nbusy_poll = 50\n"), true)
+                .expect_err("not Linux");
+            assert!(error.to_string().contains("Linux"), "{error}");
+        }
     }
 
     #[test]

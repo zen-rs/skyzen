@@ -3,6 +3,8 @@
 //! Nothing is parsed from a tool's output, and nothing that cannot be read is guessed: a facility
 //! the machine does not answer for is a [`Probe`] error carrying the reason.
 
+pub mod apply;
+
 use std::{collections::HashMap, fmt, fs, path::Path, str::FromStr};
 
 use ethtool::{
@@ -269,8 +271,8 @@ impl Nic {
     fn report(&self) {
         let name = &self.name;
         for (feature, state) in [
-            ("tls-hw-tx-offload", &self.tls_tx),
-            ("tls-hw-rx-offload", &self.tls_rx),
+            (TLS_HW_TX_OFFLOAD, &self.tls_tx),
+            (TLS_HW_RX_OFFLOAD, &self.tls_rx),
         ] {
             match state {
                 Ok(Offload::Active) => output::ok(format!("native: {name}: {feature} is on")),
@@ -308,19 +310,57 @@ impl Nic {
     }
 }
 
+/// A sysctl, by its name and the procfs file that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sysctl {
+    /// The dotted name `sysctl(8)` uses.
+    pub name: &'static str,
+    /// The file under `/proc/sys`.
+    pub path: &'static str,
+}
+
+/// `net.core.busy_poll`.
+pub const BUSY_POLL: Sysctl = Sysctl {
+    name: "net.core.busy_poll",
+    path: "/proc/sys/net/core/busy_poll",
+};
+
+/// `net.core.busy_read`.
+pub const BUSY_READ: Sysctl = Sysctl {
+    name: "net.core.busy_read",
+    path: "/proc/sys/net/core/busy_read",
+};
+
+/// The interface attribute under `/sys/class/net/<nic>/` holding `napi_defer_hard_irqs`.
+pub const NAPI_DEFER_HARD_IRQS: &str = "napi_defer_hard_irqs";
+
+/// The interface attribute under `/sys/class/net/<nic>/` holding `gro_flush_timeout`.
+pub const GRO_FLUSH_TIMEOUT: &str = "gro_flush_timeout";
+
+/// The ethtool name of the TLS transmit offload feature.
+pub const TLS_HW_TX_OFFLOAD: &str = "tls-hw-tx-offload";
+
+/// The ethtool name of the TLS receive offload feature.
+pub const TLS_HW_RX_OFFLOAD: &str = "tls-hw-rx-offload";
+
+/// The sysfs directory of interface `nic`.
+fn nic_directory(nic: &str) -> std::path::PathBuf {
+    Path::new("/sys/class/net").join(nic)
+}
+
 impl BusyPoll {
     fn probe() -> Self {
         Self {
-            poll_micros: read_number(Path::new("/proc/sys/net/core/busy_poll")),
-            read_micros: read_number(Path::new("/proc/sys/net/core/busy_read")),
+            poll_micros: read_number(Path::new(BUSY_POLL.path)),
+            read_micros: read_number(Path::new(BUSY_READ.path)),
             napi_registration: napi_registration(),
         }
     }
 
     fn report(&self) {
         for (sysctl, value) in [
-            ("net.core.busy_poll", &self.poll_micros),
-            ("net.core.busy_read", &self.read_micros),
+            (BUSY_POLL.name, &self.poll_micros),
+            (BUSY_READ.name, &self.read_micros),
         ] {
             match value {
                 Ok(0) => output::off(format!("native: busy polling: {sysctl} is 0 (off)")),
@@ -456,13 +496,19 @@ fn napi_registration() -> Probe<bool> {
 
 /// The steering decision for as many threads as a start here would run.
 fn steering() -> Probe<Steering> {
-    let threads = std::thread::available_parallelism()
-        .map_err(|error| Unknown(format!("the available parallelism cannot be read: {error}")))?
-        .get();
+    let threads = serving_threads()?;
     Ok(Steering {
         threads,
         placement: Placement::read(threads),
     })
+}
+
+/// How many serving threads a start here would run: this process's available parallelism, as the
+/// runtime counts it.
+fn serving_threads() -> Probe<usize> {
+    std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .map_err(|error| Unknown(format!("the available parallelism cannot be read: {error}")))
 }
 
 /// Each physical interface, its offloads from ethtool netlink and its interrupt deferral from
@@ -474,7 +520,7 @@ async fn nics() -> Probe<Vec<Nic>> {
     Ok(names
         .into_iter()
         .map(|name| {
-            let sys = Path::new("/sys/class/net").join(&name);
+            let sys = nic_directory(&name);
             let (tls_tx, tls_rx, data_split) = match &ethtool {
                 Ok(ethtool) => ethtool.of(&name),
                 Err(why) => (Err(why.clone()), Err(why.clone()), Err(why.clone())),
@@ -483,8 +529,8 @@ async fn nics() -> Probe<Vec<Nic>> {
                 tls_tx,
                 tls_rx,
                 data_split,
-                napi_defer_hard_irqs: read_number(&sys.join("napi_defer_hard_irqs")),
-                gro_flush_timeout: read_number(&sys.join("gro_flush_timeout")),
+                napi_defer_hard_irqs: read_number(&sys.join(NAPI_DEFER_HARD_IRQS)),
+                gro_flush_timeout: read_number(&sys.join(GRO_FLUSH_TIMEOUT)),
                 name,
             }
         })
@@ -569,10 +615,7 @@ async fn tls_features(mut handle: EthtoolHandle) -> Probe<HashMap<String, [Probe
         }
         if let Some(name) = name {
             let state = |feature| offload(hw.as_ref(), active.as_ref(), feature);
-            nics.insert(
-                name,
-                [state("tls-hw-tx-offload"), state("tls-hw-rx-offload")],
-            );
+            nics.insert(name, [state(TLS_HW_TX_OFFLOAD), state(TLS_HW_RX_OFFLOAD)]);
         }
     }
     Ok(nics)

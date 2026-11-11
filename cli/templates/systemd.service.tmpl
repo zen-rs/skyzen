@@ -1,0 +1,20 @@
+# Written by `skyzen deploy --provider native`, which rewrites it on every deployment.
+# Change the service with a drop-in (`systemctl edit {{ name }}`): a `User=`, the variables
+# the application reads (`EnvironmentFile=`), or `SKYZEN_STEERING` to force connection
+# steering on or off.
+[Unit]
+Description={{ name }}, deployed by skyzen
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory={{ working_directory }}
+# Applies `[native.linux]` before every start, so a reboot brings the host's kernel and NIC
+# settings back before the application serves. `+` runs it as root whatever `User=` says.
+ExecStartPre=+{% for arg in host_apply %}{% if !loop.first %} {% endif %}{{ arg }}{% endfor %}
+ExecStart={% for arg in exec_start %}{% if !loop.first %} {% endif %}{{ arg }}{% endfor %}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

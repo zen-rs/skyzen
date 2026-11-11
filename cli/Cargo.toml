@@ -69,19 +69,24 @@ wasm-bindgen-shared = "=0.2.120"
 wasm-opt = "0.116"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["signal", "process"] }
+# `user`: `geteuid`, for the deployment's root check.
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "user"] }
 
-# `skyzen doctor`'s report of the Linux acceleration facilities (`src/host/linux.rs`).
+# `skyzen doctor`'s report of the Linux acceleration facilities (`src/host/linux.rs`), and
+# `skyzen deploy --provider native`'s configuration of them (`src/host/linux/apply.rs`).
 [target.'cfg(target_os = "linux")'.dependencies]
 # NIC features (`tls-hw-*-offload`) and ring parameters (`tcp-data-split`) over ethtool's generic
-# netlink family, on the CLI's tokio runtime; `futures-util` reads its reply streams.
-ethtool = { version = "0.4.0", default-features = false, features = ["tokio_socket"] }
+# netlink family, read and written, on the CLI's tokio runtime; `futures-util` reads its reply
+# streams. ethtool 0.4.0 writes only pause and channel settings; the branch adds the feature and
+# ring set requests a deployment needs, proposed upstream.
+ethtool = { git = "https://github.com/lexoliu/ethtool", branch = "feature-ring-set", default-features = false, features = ["tokio_socket"] }
 futures-util = { version = "0.3.31", default-features = false }
 # The steering decision, and whether an io_uring accepts a NAPI registration, each read exactly as
 # the runtime reads it.
 skyzen-core = { workspace = true, features = ["steering", "busy-poll"] }
-# `RLIMIT_MEMLOCK` through `getrlimit(2)`, which bounds the pages zero-copy sends pin.
-nix = { version = "0.31.3", default-features = false, features = ["resource"] }
+# `RLIMIT_MEMLOCK` through `getrlimit(2)`, which bounds the pages zero-copy sends pin; `socket`
+# and `net`: the `TCP_ULP` option through which the kernel loads its `tls` module.
+nix = { version = "0.31.3", default-features = false, features = ["resource", "socket", "net"] }
 
 [dev-dependencies]
 tempfile = "3"

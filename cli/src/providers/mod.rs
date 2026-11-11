@@ -40,12 +40,8 @@ pub enum Action {
         /// Arguments forwarded verbatim to the underlying runner.
         runner_args: Vec<String>,
     },
-    /// Build and upload.
-    Deploy {
-        /// Upload the version without deploying it (`wrangler versions upload`), for a rollout
-        /// driven outside the CLI.
-        upload_only: bool,
-    },
+    /// Build and upload, or install on this host.
+    Deploy(DeployMode),
     /// Stream logs from the deployed application.
     Logs {
         /// Arguments forwarded verbatim to the provider's log command.
@@ -60,6 +56,19 @@ pub enum Action {
         /// Report what is applied and what is pending instead of applying anything.
         status: bool,
     },
+}
+
+/// How much of a deployment `skyzen deploy` performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployMode {
+    /// The whole deployment.
+    Full,
+    /// Upload the version without deploying it (`wrangler versions upload`), for a rollout driven
+    /// outside the CLI. Cloudflare only.
+    UploadOnly,
+    /// Apply `[native.linux]` to this host and nothing else: what the systemd unit a native
+    /// deployment installs runs before each start. Native only.
+    HostOnly,
 }
 
 /// One `skyzen secret` operation, carrying the value the user piped in when there is one.
@@ -94,10 +103,12 @@ impl Action {
     }
 
     /// Whether the action is meaningless without a cloud provider.
+    ///
+    /// A deployment is not: the native one installs the application on the host it runs on.
     const fn requires_cloud(&self) -> bool {
         matches!(
             self,
-            Self::Deploy { .. } | Self::Logs { .. } | Self::Secret(_) | Self::Migrate { .. }
+            Self::Logs { .. } | Self::Secret(_) | Self::Migrate { .. }
         )
     }
 }
@@ -411,13 +422,24 @@ pub fn prepare(
     }
     // `versions upload` is a Cloudflare notion: AWS and Azure deployments do not have an
     // undeployed artifact to leave behind.
-    if provider != Provider::Cloudflare && matches!(action, Action::Deploy { upload_only: true }) {
+    if provider != Provider::Cloudflare && matches!(action, Action::Deploy(DeployMode::UploadOnly))
+    {
         anyhow::bail!(
             "`skyzen deploy --upload-only` is only implemented by the Cloudflare provider"
         );
     }
 
     let manifest = load_or_empty(manifest_path)?;
+    // The host half of a native deployment runs at every boot, before the application, so it needs
+    // nothing but the manifest: no cargo, no project metadata, no environment.
+    if matches!(action, Action::Deploy(DeployMode::HostOnly)) {
+        if provider != Provider::Native {
+            anyhow::bail!(
+                "`skyzen deploy --host-only` applies `[native.linux]`; pass --provider native"
+            );
+        }
+        return native::host_only(&manifest, dry_run);
+    }
     if let Action::Secret(SecretAction::Set { name, .. }) = action {
         ensure_declared_secret(manifest.data(), name)?;
     }
@@ -425,7 +447,10 @@ pub fn prepare(
     capabilities::ensure_present(manifest.data(), &project)?;
 
     let mut plan = match provider {
-        Provider::Native => native::prepare(action, &manifest),
+        Provider::Native => match action {
+            Action::Deploy(_) => native::deploy(&manifest, &project, dry_run),
+            _ => native::prepare(action, &manifest),
+        },
         Provider::Cloudflare => {
             cloudflare::prepare(action, &manifest, &project, environment, dry_run)
         }
@@ -441,8 +466,14 @@ pub fn prepare(
 /// target. `dev` is left out — brotli at quality 11 on every save would stall the loop, and
 /// `StaticDir` already refuses a sibling older than its file — and so is Cloudflare, whose asset
 /// server negotiates encodings itself.
+///
+/// A native deployment compiles nothing: it installs the binary `skyzen build --release` left.
 fn precompress_step(action: &Action, provider: Provider, manifest: &Manifest) -> Option<Step> {
-    let compiles = matches!(action, Action::Build { .. } | Action::Deploy { .. });
+    let compiles = match action {
+        Action::Build { .. } => true,
+        Action::Deploy(_) => provider != Provider::Native,
+        _ => false,
+    };
     let section = manifest.data().static_files.as_ref()?;
     (compiles && provider != Provider::Cloudflare && !section.precompress.is_empty()).then(|| {
         Step::Task(Box::new(crate::precompress::Precompress::new(
@@ -1053,7 +1084,7 @@ mod tests {
         );
         assert!(problem.contains("wrangler dev"), "{problem}");
     }
-    use super::{Action, CommandPlan, CommandStdin};
+    use super::{Action, CommandPlan, CommandStdin, DeployMode};
     use crate::cli::Provider;
     use skyzen_manifest::VarName;
     use std::path::PathBuf;
@@ -1068,7 +1099,7 @@ mod tests {
             Provider::Native
         );
         assert_eq!(
-            Action::Deploy { upload_only: false }.default_provider(),
+            Action::Deploy(DeployMode::Full).default_provider(),
             Provider::Cloudflare
         );
         assert_eq!(
@@ -1078,8 +1109,8 @@ mod tests {
     }
 
     #[test]
-    fn the_cloud_only_actions_are_the_ones_that_talk_to_an_account() {
-        assert!(Action::Deploy { upload_only: false }.requires_cloud());
+    fn the_cloud_only_actions_are_the_ones_that_need_an_account() {
+        assert!(!Action::Deploy(DeployMode::Full).requires_cloud());
         assert!(Action::Logs {
             wrangler_args: Vec::new()
         }
@@ -1127,7 +1158,7 @@ mod tests {
 
         // The Cloudflare path still fails, but with the message that says what to add.
         let error = super::prepare(
-            &Action::Deploy { upload_only: false },
+            &Action::Deploy(DeployMode::Full),
             &missing,
             Some(Provider::Cloudflare),
             None,
