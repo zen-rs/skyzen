@@ -77,10 +77,9 @@ nix = { version = "0.31.3", default-features = false, features = ["signal", "pro
 # netlink family, on the CLI's tokio runtime; `futures-util` reads its reply streams.
 ethtool = { version = "0.4.0", default-features = false, features = ["tokio_socket"] }
 futures-util = { version = "0.3.31", default-features = false }
-# Probing whether an io_uring accepts a NAPI registration, by making one.
-io-uring = { version = "0.7.16", default-features = false }
-# The steering decision, read exactly as the runtime reads it.
-skyzen-core = { workspace = true, features = ["steering"] }
+# The steering decision, and whether an io_uring accepts a NAPI registration, each read exactly as
+# the runtime reads it.
+skyzen-core = { workspace = true, features = ["steering", "busy-poll"] }
 # `RLIMIT_MEMLOCK` through `getrlimit(2)`, which bounds the pages zero-copy sends pin.
 nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 

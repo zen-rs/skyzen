@@ -3,7 +3,7 @@
 //! Nothing is parsed from a tool's output, and nothing that cannot be read is guessed: a facility
 //! the machine does not answer for is a [`Probe`] error carrying the reason.
 
-use std::{collections::HashMap, fmt, fs, io, path::Path, str::FromStr};
+use std::{collections::HashMap, fmt, fs, path::Path, str::FromStr};
 
 use ethtool::{
     EthtoolAttr, EthtoolBitset, EthtoolBitsetValue, EthtoolError, EthtoolFeatureAttr,
@@ -329,9 +329,13 @@ impl BusyPoll {
             }
         }
         match &self.napi_registration {
-            Ok(true) => output::ok("native: busy polling: io_uring NAPI registration is supported"),
+            Ok(true) => output::ok(
+                "native: busy polling: io_uring NAPI registration is supported, so --busy-poll \
+                 can turn it on",
+            ),
             Ok(false) => output::off(
-                "native: busy polling: this kernel has no io_uring NAPI registration (Linux 6.9)",
+                "native: busy polling: this kernel has no io_uring NAPI registration (Linux 6.9), \
+                 so a start with --busy-poll refuses",
             ),
             Err(why) => {
                 output::unknown(format!(
@@ -443,19 +447,11 @@ fn is_tls_module(line: &str) -> bool {
     })
 }
 
-/// Probe whether an `io_uring` accepts a NAPI registration, by making one.
+/// Probe whether an `io_uring` accepts a NAPI registration, by making one exactly as each serving
+/// thread does with `--busy-poll`.
 fn napi_registration() -> Probe<bool> {
-    let ring = io_uring::IoUring::new(1)
-        .map_err(|error| Unknown(format!("an io_uring cannot be set up here: {error}")))?;
-    match ring
-        .submitter()
-        .register_napi(&mut io_uring::types::Napi::new())
-    {
-        Ok(()) => Ok(true),
-        // An opcode the kernel does not know is EINVAL.
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(false),
-        Err(error) => Err(Unknown(format!("registering NAPI failed: {error}"))),
-    }
+    skyzen_core::busy_poll::napi_registration()
+        .map_err(|error| Unknown(format!("probing NAPI registration failed: {error}")))
 }
 
 /// The steering decision for as many threads as a start here would run.
