@@ -28,7 +28,10 @@ use skyzen_services::queue::{
     ReceiveOptions, ReceivedMessage, SendOptions,
 };
 
-use crate::status::{classify, retry_after, AzureStatus};
+use crate::{
+    status::{classify, retry_after, AzureStatus},
+    AzureHttp,
+};
 
 /// The largest message Azure Storage queues accept, in bytes of encoded text.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -75,13 +78,42 @@ const MAX_VISIBILITY_TIMEOUT_SECONDS: i32 = 604_800;
 pub struct AzureStorageQueue {
     /// The SDK client, which carries the queue URL and its credential.
     client: Arc<QueueClient>,
+    /// What this crate built the client from, kept so [`with_http`](Self::with_http) can build it
+    /// again on another HTTP client; `None` for a caller's own client.
+    origin: Option<Arc<QueueOrigin>>,
+}
+
+/// The queue URL and credential a client this crate builds is made from.
+struct QueueOrigin {
+    url: Url,
+    credential: Option<Arc<dyn TokenCredential>>,
+}
+
+impl QueueOrigin {
+    /// The SDK client for this queue, its requests going out on `http`.
+    fn client(&self, http: AzureHttp) -> Result<QueueClient, QueueError> {
+        QueueClient::new(
+            self.url.clone(),
+            self.credential.clone(),
+            Some(client_options(http)),
+        )
+        .map_err(azure_error)
+    }
+
+    /// The queue on `http`.
+    fn queue(self, http: AzureHttp) -> Result<AzureStorageQueue, QueueError> {
+        Ok(AzureStorageQueue {
+            client: Arc::new(self.client(http)?),
+            origin: Some(Arc::new(self)),
+        })
+    }
 }
 
 impl core::fmt::Debug for AzureStorageQueue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AzureStorageQueue")
             .field("url", &self.client.url().as_str())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -89,12 +121,35 @@ impl AzureStorageQueue {
     /// Wrap an SDK queue client that is already configured.
     ///
     /// The escape hatch for a client this crate's own constructors cannot build — one with custom
-    /// retry policies, or a credential type they do not take.
+    /// retry policies, or a credential type they do not take. Its transport is the caller's, so
+    /// [`with_http`](Self::with_http) refuses it.
     #[must_use]
     pub fn new(client: QueueClient) -> Self {
         Self {
             client: Arc::new(client),
+            origin: None,
         }
+    }
+
+    /// This queue with its requests sent through `http`, its client otherwise built as it was.
+    ///
+    /// How a thread gets a client whose connections it owns: build the queue once and rebind a
+    /// clone on each thread with an [`AzureHttp::system_on_current_thread`].
+    ///
+    /// # Errors
+    ///
+    /// [`QueueError::Unsupported`] for a queue wrapping a caller's own client ([`new`](Self::new)),
+    /// whose transport this crate cannot replace.
+    pub fn with_http(self, http: AzureHttp) -> Result<Self, QueueError> {
+        let Some(origin) = self.origin else {
+            return Err(QueueError::Unsupported(
+                "a queue wrapping a caller's own `QueueClient` keeps that client's transport",
+            ));
+        };
+        Ok(Self {
+            client: Arc::new(origin.client(http)?),
+            origin: Some(origin),
+        })
     }
 
     /// Create a queue client authenticating with an Entra ID token credential.
@@ -113,10 +168,11 @@ impl AzureStorageQueue {
         queue: &str,
         credential: Arc<dyn TokenCredential>,
     ) -> Result<Self, QueueError> {
-        let url = queue_url(account_url, queue)?;
-        let client =
-            QueueClient::new(url, Some(credential), Some(client_options())).map_err(azure_error)?;
-        Ok(Self::new(client))
+        QueueOrigin {
+            url: queue_url(account_url, queue)?,
+            credential: Some(credential),
+        }
+        .queue(AzureHttp::system())
     }
 
     /// Create a queue client from a queue URL that carries a shared access signature.
@@ -139,8 +195,11 @@ impl AzureStorageQueue {
             )));
         }
 
-        let client = QueueClient::new(url, None, Some(client_options())).map_err(azure_error)?;
-        Ok(Self::new(client))
+        QueueOrigin {
+            url,
+            credential: None,
+        }
+        .queue(AzureHttp::system())
     }
 
     /// Create a queue client from the signed queue URL held in an environment variable.
@@ -263,13 +322,11 @@ where
 }
 
 /// The options every constructor here builds the SDK client with: its requests on zenwave's
-/// native backend rather than `azure_core`'s default reqwest-on-tokio transport.
-fn client_options() -> QueueClientOptions {
+/// native backend, through `http`, rather than `azure_core`'s default reqwest-on-tokio transport.
+fn client_options(http: AzureHttp) -> QueueClientOptions {
     QueueClientOptions {
         client_options: ClientOptions {
-            transport: Some(transport::ZenwaveHttpClient::transport(
-                crate::http::system_backend(),
-            )),
+            transport: Some(transport::ZenwaveHttpClient::transport(http)),
             ..ClientOptions::default()
         },
         ..QueueClientOptions::default()

@@ -16,9 +16,12 @@ use reqsign_core::{Context, SignRequest as _};
 use serde::Deserialize;
 use skyzen_services::storage::StorageError;
 use url::Url;
-use zenwave::{backend::NativeBackend, Body, Request};
+use zenwave::{Body, Request};
 
-use crate::status::{classify, retry_after, AzureStatus};
+use crate::{
+    status::{classify, retry_after, AzureStatus},
+    AzureHttp,
+};
 
 /// The Azure Storage REST version this client speaks.
 ///
@@ -41,7 +44,7 @@ pub(super) const WRITE_PERMISSION: &str = "cw";
 /// The Azure Blob REST endpoint of one container.
 pub(super) struct BlobRest {
     /// The backend the requests go out on; clones share its connection pool.
-    http: NativeBackend,
+    http: AzureHttp,
     /// The signer, which turns a request into a signed one or a URL into a presigned one.
     signer: RequestSigner,
     /// `reqsign`'s ambient context. Shared-key signing needs nothing from it.
@@ -63,7 +66,7 @@ impl core::fmt::Debug for BlobRest {
 impl BlobRest {
     /// Bind to the container at `endpoint`, authenticating with `credential`.
     pub(super) fn new(
-        http: NativeBackend,
+        http: AzureHttp,
         endpoint: &str,
         container: &str,
         credential: Credential,
@@ -90,6 +93,17 @@ impl BlobRest {
             credential,
             container_url,
         })
+    }
+
+    /// This endpoint with its requests sent through `http`.
+    pub(super) fn with_http(&self, http: AzureHttp) -> Self {
+        Self {
+            http,
+            signer: RequestSigner::new(),
+            context: self.context.clone(),
+            credential: self.credential.clone(),
+            container_url: self.container_url.clone(),
+        }
     }
 
     /// Whether this endpoint can mint a shared access signature of its own.
@@ -240,11 +254,9 @@ impl BlobRest {
 
         // The raw backend: a `reqsign` signature is bound to the URI it signs, so a redirect could
         // never be honored anyway, and a 3xx surfaces as itself rather than as a replayed hop.
-        let response = crate::http::send(&mut self.http.clone(), &mut request)
-            .await
-            .map_err(|error| {
-                StorageError::backend_with(format!("the {method} request to Azure failed"), error)
-            })?;
+        let response = self.http.send(&mut request).await.map_err(|error| {
+            StorageError::backend_with(format!("the {method} request to Azure failed"), error)
+        })?;
 
         let status = response.status();
         let retry_after_header = response
@@ -406,7 +418,7 @@ mod tests {
 
     fn rest() -> BlobRest {
         BlobRest::new(
-            crate::http::system_backend(),
+            crate::AzureHttp::system(),
             "https://skyzentest.blob.core.windows.net",
             "uploads",
             Credential::SharedKey {
@@ -483,7 +495,7 @@ mod tests {
         assert!(rest().can_presign());
 
         let sas = BlobRest::new(
-            crate::http::system_backend(),
+            crate::AzureHttp::system(),
             "https://skyzentest.blob.core.windows.net",
             "uploads",
             Credential::SasToken {

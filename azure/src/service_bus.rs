@@ -25,12 +25,14 @@ use skyzen_services::queue::{
 use time::{OffsetDateTime, UtcOffset};
 use url::Url;
 use zenwave::{
-    backend::NativeBackend,
     header::{HeaderMap, AUTHORIZATION, CONTENT_LENGTH, RETRY_AFTER},
     Body, Method, Request, Response, StatusCode,
 };
 
-use crate::status::{classify, retry_after, AzureStatus};
+use crate::{
+    status::{classify, retry_after, AzureStatus},
+    AzureHttp,
+};
 
 /// The message property this client tags a base64-encoded body with.
 ///
@@ -95,7 +97,7 @@ const TOKEN_TTL: time::Duration = time::Duration::seconds(300);
 pub struct ServiceBusQueue {
     /// The backend every request rides on. Its connection pool is shared by every clone, so
     /// cloning the queue keeps one pool.
-    http: NativeBackend,
+    http: AzureHttp,
     /// `https://{namespace}.servicebus.windows.net/{queue}`, the root of every request URL.
     queue_url: Url,
     /// The shared-access policy name that signs requests.
@@ -121,11 +123,20 @@ impl ServiceBusQueue {
         signing_key: &str,
     ) -> Result<Self, QueueError> {
         Ok(Self {
-            http: crate::http::system_backend(),
+            http: AzureHttp::system(),
             queue_url: queue_url(namespace, queue)?,
             policy_name: policy_name.into(),
             signing_key: SigningKey(signing_key.to_owned()),
         })
+    }
+
+    /// This queue with its requests sent through `http`.
+    ///
+    /// How a thread gets a client whose connections it owns: build the queue once and rebind a
+    /// clone on each thread with an [`AzureHttp::system_on_current_thread`].
+    #[must_use]
+    pub fn with_http(self, http: AzureHttp) -> Self {
+        Self { http, ..self }
     }
 
     /// Create a queue client from a Service Bus connection string.
@@ -218,7 +229,7 @@ impl ServiceBusQueue {
     /// The raw backend — a SAS signature is bound to the URI it signs, so a redirect could never
     /// be honored anyway, and a 3xx surfaces as itself rather than as a replayed hop.
     async fn send(&self, request: &mut Request) -> Result<Response, zenwave::Error> {
-        crate::http::send(&mut self.http.clone(), request).await
+        self.http.send(request).await
     }
 
     /// Build a bodyless request against `url`, signed with that URL's SAS token.
@@ -1117,6 +1128,44 @@ mod tests {
             tokio::runtime::Handle::try_current().is_err(),
             "the test must run with no tokio runtime"
         );
+    }
+
+    /// A queue rebound on a thread — what each serving thread does with the clients
+    /// `#[skyzen::main]` builds — sends on connections that thread dials and drives.
+    #[compio::test]
+    async fn a_rebound_queue_sends_on_connections_its_thread_dials() {
+        let (seen, received) = std::sync::mpsc::channel::<skyzen_test::ReceivedRequest>();
+        let server = skyzen_test::LoopbackServer::start(move |request| {
+            seen.send(request).expect("the test is still listening");
+            let mut response = http_kit::Response::new(http_kit::Body::empty());
+            *response.status_mut() = StatusCode::CREATED;
+            response
+        });
+        let (io, dials) = skyzen_test::DialRecorder::new();
+        let queue =
+            loopback_queue(&server).with_http(crate::AzureHttp::system_on_current_thread(io));
+
+        for _ in 0..2 {
+            MessageQueue::send(&queue, LOOPBACK_MESSAGE.as_bytes())
+                .await
+                .expect("the send should succeed");
+        }
+
+        let dials = dials.taken();
+        let this = std::thread::current().id();
+        assert!(
+            !dials.is_empty(),
+            "a send went out, so a connection was dialed"
+        );
+        assert!(
+            dials.iter().all(|dialed| *dialed == this),
+            "every connection was dialed on this thread, not {dials:?}"
+        );
+        let bodies: Vec<_> = received.try_iter().map(http::Request::into_body).collect();
+        assert_eq!(bodies.len(), 2, "both sends reached the server");
+        assert!(bodies
+            .iter()
+            .all(|body| body == LOOPBACK_MESSAGE.as_bytes()));
     }
 
     /// A send leaves through zenwave's native backend, signed with the queue's SAS, while the test
