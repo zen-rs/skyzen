@@ -550,6 +550,8 @@ enum RuntimeFailure {
     Steering(SteeringError),
     /// Busy polling was turned on and cannot be had.
     BusyPoll(BusyPollError),
+    /// A serving thread's region of registered buffers (`--fixed-buffers`) cannot be registered.
+    FixedBuffers(std::io::Error),
 }
 
 impl From<std::io::Error> for RuntimeFailure {
@@ -571,6 +573,11 @@ impl std::fmt::Display for RuntimeFailure {
             Self::Http3(error) => write!(f, "{error}"),
             Self::Steering(error) => write!(f, "{error}"),
             Self::BusyPoll(error) => write!(f, "{error}"),
+            Self::FixedBuffers(error) => write!(
+                f,
+                "--fixed-buffers: {error}; every serving thread's region is pinned and charged to \
+                 RLIMIT_MEMLOCK unless the process has CAP_IPC_LOCK"
+            ),
         }
     }
 }
@@ -578,7 +585,7 @@ impl std::fmt::Display for RuntimeFailure {
 impl std::error::Error for RuntimeFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Listener(error) => Some(error),
+            Self::Listener(error) | Self::FixedBuffers(error) => Some(error),
             Self::Mount(error) => Some(error),
             Self::Tls(error) => Some(error),
             Self::Http3(error) => Some(error),

@@ -37,6 +37,12 @@ use crate::{
 /// driven by another executor takes [`BlockingFs`](super::BlockingFs) through
 /// [`filesystem`](Self::filesystem).
 ///
+/// On Linux, when the native runtime's serving thread registered a region of registered buffers
+/// (`--fixed-buffers`), [`CompioFs`] reads a file the cache keeps in memory into that region if
+/// the file is at least the zero-copy threshold (`--zero-copy-threshold`), so its responses are
+/// written zero-copy from registered memory. A file the region has no room for, a smaller one,
+/// and every file under [`BlockingFs`](super::BlockingFs) are read into memory of their own.
+///
 /// SPA (Single Page Application) routing is **not** enabled by default. Call [`.spa()`](Self::spa)
 /// to enable it — extensionless paths that don't match a file will then fall back to the index
 /// file, while requests for missing assets (paths with a file extension) still return 404.
@@ -224,7 +230,7 @@ impl<F: FileSystem> Shared<F> {
             resource
         } else {
             let generation = self.cache.generation();
-            let resource = Rc::new(self.load(&relative).await?);
+            let resource = Rc::new(self.load(&relative, &Fill::of(request)).await?);
             self.cache.insert(&key, Rc::clone(&resource), generation);
             resource
         };
@@ -265,7 +271,7 @@ impl<F: FileSystem> Shared<F> {
 
     /// Resolve `relative` the way the cache stores it: the file, a directory's index, or the SPA
     /// fallback, each with its siblings.
-    async fn load(&self, relative: &Path) -> Result<Resource, StaticDirError> {
+    async fn load(&self, relative: &Path, fill: &Fill) -> Result<Resource, StaticDirError> {
         let target = if relative.as_os_str().is_empty() {
             self.directory.to_path_buf()
         } else {
@@ -288,7 +294,9 @@ impl<F: FileSystem> Shared<F> {
                 .into_file();
         }
         let found = found.ok_or(StaticDirError::FileNotFound)?;
-        self.resource(found).await.map_err(StaticDirError::IoError)
+        self.resource(found, fill)
+            .await
+            .map_err(StaticDirError::IoError)
     }
 
     /// Open `path` and look for each of its siblings, all in one submission.
@@ -331,7 +339,7 @@ impl<F: FileSystem> Shared<F> {
     }
 
     /// Turn what was opened into a cache entry, reading every file below the inline limit.
-    async fn resource(&self, found: Found<F::Handle>) -> io::Result<Resource> {
+    async fn resource(&self, found: Found<F::Handle>, fill: &Fill) -> io::Result<Resource> {
         let inline_limit = self.cache.inline_limit();
         let (path, identity) = found.identity;
         let codings: SmallVec<[Coding; 3]> =
@@ -344,7 +352,7 @@ impl<F: FileSystem> Shared<F> {
                         .into_iter()
                         .map(|(coding, opened)| (Some(coding), opened)),
                 )
-                .map(|(coding, opened)| self.representation(coding, opened, inline_limit)),
+                .map(|(coding, opened)| self.representation(coding, opened, inline_limit, fill)),
         )
         .await?;
 
@@ -364,6 +372,7 @@ impl<F: FileSystem> Shared<F> {
         coding: Option<Coding>,
         opened: Opened<F::Handle>,
         inline_limit: u64,
+        fill: &Fill,
     ) -> io::Result<Representation> {
         let Opened {
             handle,
@@ -371,7 +380,7 @@ impl<F: FileSystem> Shared<F> {
             modified,
         } = opened;
         let content = if len < inline_limit {
-            Content::Memory(self.fs.read(handle, len).await?)
+            Content::Memory(self.read(handle, len, fill).await?)
         } else {
             Content::File(std::sync::Arc::new(self.fs.std_file(handle)?))
         };
@@ -381,6 +390,57 @@ impl<F: FileSystem> Shared<F> {
             etag: metadata_etag(len, modified, coding),
             content,
         })
+    }
+
+    /// Read a file the cache keeps in memory: into the fill's region when it takes the file,
+    /// else into memory of its own, which is also where a file goes that the region has no room
+    /// for.
+    async fn read(&self, handle: F::Handle, len: u64, fill: &Fill) -> io::Result<Bytes> {
+        #[cfg(all(target_os = "linux", feature = "rt"))]
+        if let Some((region, threshold)) = &fill.region {
+            if usize::try_from(len).is_ok_and(|len| len >= *threshold) {
+                if let Some(bytes) = self.fs.read_fixed(&handle, len, region).await? {
+                    return Ok(bytes);
+                }
+            }
+        }
+        #[cfg(not(all(target_os = "linux", feature = "rt")))]
+        let _ = fill;
+        self.fs.read(handle, len).await
+    }
+}
+
+/// Where a cache fill reads a file it keeps in memory.
+///
+/// Into the serving thread's region of registered buffers, when the thread has one and the file
+/// is at least the zero-copy threshold, so that a response from it is a zero-copy write from
+/// registered memory. A smaller file is never written zero-copy, and gains nothing from the
+/// region. Both come from the `IoSettings` the native runtime puts into every request: the region is the ring's, and the threshold is the live
+/// `--zero-copy-threshold`, read at the fill. A request from any other host carries neither, and
+/// its files are read into memory of their own.
+#[derive(Debug, Default)]
+struct Fill {
+    /// The region, with the fewest bytes a write sends zero-copy.
+    #[cfg(all(target_os = "linux", feature = "rt"))]
+    region: Option<(http_kit_io::compio::FixedRegion, usize)>,
+}
+
+impl Fill {
+    /// Where the files of a fill for `request` go.
+    fn of(request: &Request) -> Self {
+        #[cfg(all(target_os = "linux", feature = "rt"))]
+        {
+            let region = request
+                .extensions()
+                .get::<crate::runtime::native::IoSettings>()
+                .and_then(|io| Some((io.fixed_region()?, io.zero_copy().threshold())));
+            Self { region }
+        }
+        #[cfg(not(all(target_os = "linux", feature = "rt")))]
+        {
+            let _ = request;
+            Self::default()
+        }
     }
 }
 
@@ -1084,5 +1144,122 @@ mod tests {
     fn a_directory_that_cannot_be_watched_stops_the_router() {
         let dir = tempfile::tempdir().unwrap();
         let _ = router(&dir.path().join("does-not-exist"));
+    }
+
+    /// The settings a serving thread hands its requests once its ring registered a region of
+    /// `fixed_buffers` bytes, with writes from `threshold` bytes sent zero-copy. Called inside
+    /// the thread's runtime.
+    #[cfg(feature = "rt")]
+    async fn serving_thread(
+        fixed_buffers: usize,
+        threshold: usize,
+    ) -> crate::runtime::native::IoSettings {
+        use crate::runtime::native::{IoOptions, IoSettings};
+
+        let options = IoOptions {
+            fixed_buffers: Some(fixed_buffers),
+            zero_copy_threshold: Some(threshold),
+            ..IoOptions::default()
+        };
+        let settings = IoSettings::new(
+            options.driver(),
+            options.recv_ring(core::num::NonZeroUsize::MIN),
+            None,
+        );
+        let ring = settings
+            .driver()
+            .register_fixed_region()
+            .await
+            .expect("the ring registers its region");
+        settings.on_ring(&ring)
+    }
+
+    /// `path`, asked for on the serving thread `settings` belong to.
+    #[cfg(feature = "rt")]
+    fn on_thread(path: &str, settings: &crate::runtime::native::IoSettings) -> http_kit::Request {
+        let mut request = get_request(path);
+        request.extensions_mut().insert(settings.clone());
+        request
+    }
+
+    /// A request from a serving thread whose ring has no region is served from memory of the
+    /// cache's own, whatever the file's size.
+    #[cfg(feature = "rt")]
+    #[test]
+    fn a_thread_without_a_region_serves_its_files_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let large = CJK.repeat(64);
+        std::fs::write(dir.path().join("小.txt"), CJK).unwrap();
+        std::fs::write(dir.path().join("大.txt"), &large).unwrap();
+        let router = router(dir.path());
+
+        run(async {
+            let settings = serving_thread(0, 0).await;
+            for (name, expected) in [("小.txt", CJK), ("大.txt", large.as_str())] {
+                let response = router
+                    .clone()
+                    .go(on_thread(&uri(name), &settings))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{name}");
+                assert_eq!(body(response).await, expected.as_bytes(), "{name}");
+            }
+        });
+    }
+
+    /// On a thread whose ring registered a region, a cached file at least the zero-copy
+    /// threshold is read into the region; a smaller one, and one the region has no room left
+    /// for, into memory of the cache's own. Each is served whole, from the cache too.
+    #[cfg(all(target_os = "linux", feature = "rt"))]
+    #[test]
+    fn a_cached_file_at_the_threshold_is_read_into_the_region() {
+        /// The fewest bytes a write sends zero-copy, below the files that go into the region.
+        const THRESHOLD: usize = 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let router = router(dir.path());
+
+        run(async {
+            // One byte asks for the smallest region the kernel registers, a page.
+            let settings = serving_thread(1, THRESHOLD).await;
+            let region = settings
+                .fixed_region()
+                .expect("an io_uring ring registers the region asked for");
+            let page = region.len();
+            let content = |len: usize| -> Vec<u8> { CJK.bytes().cycle().take(len).collect() };
+            // Half the region, which leaves the other half; one byte more than that cannot fit.
+            let files = [
+                ("小.txt", content(THRESHOLD - 1)),
+                ("半.bin", content(page / 2)),
+                ("余.bin", content(page / 2 + 1)),
+            ];
+            for (name, bytes) in &files {
+                std::fs::write(dir.path().join(name), bytes).unwrap();
+            }
+            let serve = |name: &'static str| {
+                let router = router.clone();
+                let request = on_thread(&uri(name), &settings);
+                async move {
+                    let response = router.go(request).await.unwrap();
+                    assert_eq!(response.status(), StatusCode::OK, "{name}");
+                    body(response).await
+                }
+            };
+
+            assert_eq!(serve("小.txt").await, files[0].1);
+            assert!(
+                region.alloc(page).is_some(),
+                "a file below the threshold left the region untouched"
+            );
+            assert_eq!(serve("半.bin").await, files[1].1);
+            assert!(
+                region.alloc(page).is_none(),
+                "a file at the threshold took its share of the region"
+            );
+            assert_eq!(serve("余.bin").await, files[2].1);
+            for (name, bytes) in &files {
+                assert_eq!(&serve(*name).await, bytes, "{name} from the cache");
+            }
+        });
     }
 }

@@ -419,6 +419,16 @@ fn work<F, A, W>(
     let executor = Rc::clone(&runtime);
     let io = plan.io.driver();
     runtime.block_on(async {
+        // The ring's region, registered before anything accepts: the listeners are made with the
+        // driver carrying it, so every connection sends from it, and the requests carry it, so
+        // the static file cache can read files into it.
+        let ring = match plan.io.register_region().await {
+            Ok(ring) => ring,
+            Err(error) => {
+                let _ = ready.send(Err(error)).await;
+                return;
+            }
+        };
         // The router is built here, on the thread that serves it, so it may hold anything.
         let endpoint = plan.factory.endpoint().await;
         let endpoint = match (plan.wrap)(endpoint) {
@@ -431,7 +441,7 @@ fn work<F, A, W>(
         let endpoint = WithContext {
             endpoint,
             context: WorkerContext::new(Arc::clone(&plan.executor), ShutdownGuard(drain)),
-            io: plan.io.clone(),
+            io: plan.io.on_ring(&ring),
         };
         let mut h1 = H1::default().with_max_connections(plan.max_connections);
         // The QUIC endpoint, registered with this thread's runtime before anything reports
@@ -473,7 +483,7 @@ fn work<F, A, W>(
         let tcp = async {
             match socket {
                 #[cfg(not(windows))]
-                Socket::Tcp(listener) => match io.tcp_listener(listener) {
+                Socket::Tcp(listener) => match ring.tcp_listener(listener) {
                     Ok(listener) => {
                         serve_tcp(plan, &h1, executor, io, listener, endpoint, shutdown, ready)
                             .await;
@@ -483,11 +493,11 @@ fn work<F, A, W>(
                     }
                 },
                 Socket::Handoff(incoming) => {
-                    let listener = incoming.adopted_by(io.clone());
+                    let listener = incoming.adopted_by(ring);
                     serve_tcp(plan, &h1, executor, io, listener, endpoint, shutdown, ready).await;
                 }
                 #[cfg(unix)]
-                Socket::Unix(listener) => match io.unix_listener(listener) {
+                Socket::Unix(listener) => match ring.unix_listener(listener) {
                     Ok(listener) => {
                         if announce(ready).await {
                             serve_cleartext(
@@ -1096,6 +1106,61 @@ mod tests {
             serving.stop();
             std::fs::remove_file(&path).expect("the socket file is ours to remove");
             assert!(body.starts_with("skyzen-"), "{server:?}: {body}");
+        }
+    }
+
+    /// With `--fixed-buffers`, every serving thread registers its region before it accepts, and a
+    /// static file its cache read into the region is served whole over TCP, by either server:
+    /// `skyzen-h1` writes it zero-copy from the region, with the head copied in beside it.
+    #[cfg(all(target_os = "linux", feature = "static-files"))]
+    #[test]
+    fn a_static_file_in_the_region_is_served_whole_over_tcp() {
+        use crate::{routing::Route, static_files::StaticDir};
+
+        /// Chinese, Japanese and Korean, so the body is checked as text that is not ASCII.
+        const CJK: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
+
+        let dir = tempfile::tempdir().unwrap();
+        // Above the threshold below, below the cache's inline limit, and well inside the region.
+        let document = CJK.repeat(128);
+        std::fs::write(dir.path().join("index.html"), &document).unwrap();
+        let root = Arc::new(dir.path().to_path_buf());
+        for server in [HttpServer::H1, HttpServer::Hyper] {
+            let bound = bind(
+                &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
+                NonZeroUsize::new(2).unwrap(),
+                Pins::default(),
+                None,
+                None,
+            )
+            .expect("bind");
+            let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
+            let root = Arc::clone(&root);
+            let serving = Serving::start_io(
+                bound,
+                server,
+                move || {
+                    let root = Arc::clone(&root);
+                    async move { Route::new((StaticDir::new("/", root.as_path()),)).build() }
+                },
+                IoOptions {
+                    // Two threads' regions stay inside a container's default `RLIMIT_MEMLOCK`,
+                    // 64 KiB, and each holds the document with room for its response's head.
+                    fixed_buffers: Some(16 * 1024),
+                    zero_copy_threshold: Some(1024),
+                    ..IoOptions::default()
+                },
+            )
+            .expect("every thread registers its region and serves");
+            // The first fills the cache of the thread that takes it; the rest are served from a
+            // cache, on whichever thread the kernel hands each connection to.
+            let bodies: Vec<String> = (0..4)
+                .map(|_| exchange(std::net::TcpStream::connect(addr).expect("connect")))
+                .collect();
+            serving.stop();
+            for body in bodies {
+                assert_eq!(body, document, "{server:?}");
+            }
         }
     }
 

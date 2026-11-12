@@ -211,6 +211,10 @@ http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", def
 libc = "0.2"
 # `IOU_PBUF_RING_INC`, the flag the serving threads' receive ring registers with.
 io-uring = { version = "0.7.16", default-features = false }
+# A serving thread's region of registered buffers is `!Send`, and reaches the static file cache
+# inside the `Send` `IoSettings` its requests carry: `Sticky` keeps it readable on that thread
+# alone and leaves a copy dropped elsewhere to that thread.
+fragile = { version = "3.0.0", default-features = false }
 skyzen-core = { workspace = true, features = ["steering", "busy-poll"] }
 http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, features = ["kernel"], optional = true }
 zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-compio", "native-kernel-tls"], optional = true }
