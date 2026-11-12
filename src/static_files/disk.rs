@@ -10,6 +10,8 @@ use std::{
 
 use bytes::Bytes;
 use headers::ETag;
+#[cfg(target_os = "linux")]
+use http_kit_io::compio::{Compio, Ring};
 use smallvec::SmallVec;
 
 use super::{
@@ -22,6 +24,7 @@ use super::{
 use crate::{
     header::HeaderValue,
     routing::{IntoRouteNode, RouteNode},
+    runtime::ServingThread,
     Body, Endpoint, Request, Response,
 };
 
@@ -37,11 +40,13 @@ use crate::{
 /// driven by another executor takes [`BlockingFs`](super::BlockingFs) through
 /// [`filesystem`](Self::filesystem).
 ///
-/// On Linux, when the native runtime's serving thread registered a region of registered buffers
-/// (`--fixed-buffers`), [`CompioFs`] reads a file the cache keeps in memory into that region if
-/// the file is at least the zero-copy threshold (`--zero-copy-threshold`), so its responses are
-/// written zero-copy from registered memory. A file the region has no room for, a smaller one,
-/// and every file under [`BlockingFs`](super::BlockingFs) are read into memory of their own.
+/// It is built from the [`ServingThread`] whose router it joins. On Linux, when that thread's
+/// ring registered a region of registered buffers (`--fixed-buffers`), [`CompioFs`] reads a file
+/// the cache keeps in memory into the region if the file is at least the thread's live zero-copy
+/// threshold (`--zero-copy-threshold`), so its responses are written zero-copy from registered
+/// memory. A file the region has no room for, a smaller one, every file on a thread without a
+/// region, and every file under [`BlockingFs`](super::BlockingFs) are read into memory of their
+/// own.
 ///
 /// SPA (Single Page Application) routing is **not** enabled by default. Call [`.spa()`](Self::spa)
 /// to enable it — extensionless paths that don't match a file will then fall back to the index
@@ -62,15 +67,26 @@ pub struct StaticDir<F = CompioFs> {
     cache_control: Option<HeaderValue>,
     settings: StaticCacheSettings,
     fs: F,
+    /// The driver of the thread's ring, whose region the cache reads files into and whose
+    /// zero-copy threshold says which; `None` on a thread without compio.
+    #[cfg(target_os = "linux")]
+    ring: Option<Compio<Ring>>,
 }
 
 impl StaticDir {
-    /// Create a new static directory handler mounted at `mount_path`.
+    /// Create a new static directory handler mounted at `mount_path`, for the router `thread`
+    /// builds.
     ///
     /// The path may be provided without a leading slash (`"assets"`); it will be normalized to `/assets`.
     #[must_use]
-    pub fn new(mount_path: impl Into<String>, directory: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        mount_path: impl Into<String>,
+        directory: impl Into<PathBuf>,
+        thread: &ServingThread,
+    ) -> Self {
         let mount_path_string = mount_path.into();
+        #[cfg(not(target_os = "linux"))]
+        let _ = thread;
         Self {
             mount_path: normalize_mount_path(&mount_path_string),
             directory: Arc::new(directory.into()),
@@ -79,6 +95,8 @@ impl StaticDir {
             cache_control: None,
             settings: StaticCacheSettings::default(),
             fs: CompioFs,
+            #[cfg(target_os = "linux")]
+            ring: thread.compio().cloned(),
         }
     }
 }
@@ -99,10 +117,12 @@ impl<F> StaticDir<F> {
     ///
     /// ```rust
     /// # #[cfg(not(target_arch = "wasm32"))] {
-    /// use skyzen::{header::HeaderValue, static_files::StaticDir};
+    /// use skyzen::{header::HeaderValue, runtime::ServingThread, static_files::StaticDir};
     ///
-    /// let assets = StaticDir::new("/assets", "./dist")
-    ///     .cache_control(HeaderValue::from_static("public, max-age=31536000, immutable"));
+    /// fn assets(thread: &ServingThread) -> StaticDir {
+    ///     StaticDir::new("/assets", "./dist", thread)
+    ///         .cache_control(HeaderValue::from_static("public, max-age=31536000, immutable"))
+    /// }
     /// # }
     /// ```
     #[must_use]
@@ -140,6 +160,8 @@ impl<F> StaticDir<F> {
             cache_control: self.cache_control,
             settings: self.settings,
             fs,
+            #[cfg(target_os = "linux")]
+            ring: self.ring,
         }
     }
 }
@@ -154,6 +176,8 @@ impl<F: FileSystem> IntoRouteNode for StaticDir<F> {
             cache_control: self.cache_control,
             fs: self.fs,
             cache,
+            #[cfg(target_os = "linux")]
+            ring: self.ring,
         }));
         route_node_for_static(self.mount_path, endpoint)
     }
@@ -178,6 +202,9 @@ struct Shared<F> {
     cache_control: Option<HeaderValue>,
     fs: F,
     cache: DirCache<Resource>,
+    /// See [`StaticDir`]'s field of the same name.
+    #[cfg(target_os = "linux")]
+    ring: Option<Compio<Ring>>,
 }
 
 /// A resolved file: the file itself and whichever precompressed siblings it has.
@@ -230,7 +257,7 @@ impl<F: FileSystem> Shared<F> {
             resource
         } else {
             let generation = self.cache.generation();
-            let resource = Rc::new(self.load(&relative, &Fill::of(request)).await?);
+            let resource = Rc::new(self.load(&relative).await?);
             self.cache.insert(&key, Rc::clone(&resource), generation);
             resource
         };
@@ -271,7 +298,7 @@ impl<F: FileSystem> Shared<F> {
 
     /// Resolve `relative` the way the cache stores it: the file, a directory's index, or the SPA
     /// fallback, each with its siblings.
-    async fn load(&self, relative: &Path, fill: &Fill) -> Result<Resource, StaticDirError> {
+    async fn load(&self, relative: &Path) -> Result<Resource, StaticDirError> {
         let target = if relative.as_os_str().is_empty() {
             self.directory.to_path_buf()
         } else {
@@ -294,9 +321,7 @@ impl<F: FileSystem> Shared<F> {
                 .into_file();
         }
         let found = found.ok_or(StaticDirError::FileNotFound)?;
-        self.resource(found, fill)
-            .await
-            .map_err(StaticDirError::IoError)
+        self.resource(found).await.map_err(StaticDirError::IoError)
     }
 
     /// Open `path` and look for each of its siblings, all in one submission.
@@ -339,7 +364,7 @@ impl<F: FileSystem> Shared<F> {
     }
 
     /// Turn what was opened into a cache entry, reading every file below the inline limit.
-    async fn resource(&self, found: Found<F::Handle>, fill: &Fill) -> io::Result<Resource> {
+    async fn resource(&self, found: Found<F::Handle>) -> io::Result<Resource> {
         let inline_limit = self.cache.inline_limit();
         let (path, identity) = found.identity;
         let codings: SmallVec<[Coding; 3]> =
@@ -352,7 +377,7 @@ impl<F: FileSystem> Shared<F> {
                         .into_iter()
                         .map(|(coding, opened)| (Some(coding), opened)),
                 )
-                .map(|(coding, opened)| self.representation(coding, opened, inline_limit, fill)),
+                .map(|(coding, opened)| self.representation(coding, opened, inline_limit)),
         )
         .await?;
 
@@ -372,7 +397,6 @@ impl<F: FileSystem> Shared<F> {
         coding: Option<Coding>,
         opened: Opened<F::Handle>,
         inline_limit: u64,
-        fill: &Fill,
     ) -> io::Result<Representation> {
         let Opened {
             handle,
@@ -380,7 +404,7 @@ impl<F: FileSystem> Shared<F> {
             modified,
         } = opened;
         let content = if len < inline_limit {
-            Content::Memory(self.read(handle, len, fill).await?)
+            Content::Memory(self.read(handle, len).await?)
         } else {
             Content::File(std::sync::Arc::new(self.fs.std_file(handle)?))
         };
@@ -392,55 +416,24 @@ impl<F: FileSystem> Shared<F> {
         })
     }
 
-    /// Read a file the cache keeps in memory: into the fill's region when it takes the file,
-    /// else into memory of its own, which is also where a file goes that the region has no room
-    /// for.
-    async fn read(&self, handle: F::Handle, len: u64, fill: &Fill) -> io::Result<Bytes> {
-        #[cfg(all(target_os = "linux", feature = "rt"))]
-        if let Some((region, threshold)) = &fill.region {
-            if usize::try_from(len).is_ok_and(|len| len >= *threshold) {
-                if let Some(bytes) = self.fs.read_fixed(&handle, len, region).await? {
-                    return Ok(bytes);
+    /// Read a file the cache keeps in memory: into the thread's region when it has one and the
+    /// file is at least the live zero-copy threshold, so that a response from it is a zero-copy
+    /// write from registered memory; else into memory of its own, which is also where a file goes
+    /// that the region has no room for. A smaller file is never written zero-copy, and gains
+    /// nothing from the region.
+    async fn read(&self, handle: F::Handle, len: u64) -> io::Result<Bytes> {
+        #[cfg(target_os = "linux")]
+        if let Some(ring) = &self.ring {
+            if let Some(region) = ring.fixed_region() {
+                let threshold = ring.zero_copy().threshold();
+                if usize::try_from(len).is_ok_and(|len| len >= threshold) {
+                    if let Some(bytes) = self.fs.read_fixed(&handle, len, region).await? {
+                        return Ok(bytes);
+                    }
                 }
             }
         }
-        #[cfg(not(all(target_os = "linux", feature = "rt")))]
-        let _ = fill;
         self.fs.read(handle, len).await
-    }
-}
-
-/// Where a cache fill reads a file it keeps in memory.
-///
-/// Into the serving thread's region of registered buffers, when the thread has one and the file
-/// is at least the zero-copy threshold, so that a response from it is a zero-copy write from
-/// registered memory. A smaller file is never written zero-copy, and gains nothing from the
-/// region. Both come from the `IoSettings` the native runtime puts into every request: the region is the ring's, and the threshold is the live
-/// `--zero-copy-threshold`, read at the fill. A request from any other host carries neither, and
-/// its files are read into memory of their own.
-#[derive(Debug, Default)]
-struct Fill {
-    /// The region, with the fewest bytes a write sends zero-copy.
-    #[cfg(all(target_os = "linux", feature = "rt"))]
-    region: Option<(http_kit_io::compio::FixedRegion, usize)>,
-}
-
-impl Fill {
-    /// Where the files of a fill for `request` go.
-    fn of(request: &Request) -> Self {
-        #[cfg(all(target_os = "linux", feature = "rt"))]
-        {
-            let region = request
-                .extensions()
-                .get::<crate::runtime::native::IoSettings>()
-                .and_then(|io| Some((io.fixed_region()?, io.zero_copy().threshold())));
-            Self { region }
-        }
-        #[cfg(not(all(target_os = "linux", feature = "rt")))]
-        {
-            let _ = request;
-            Self::default()
-        }
     }
 }
 
@@ -524,6 +517,7 @@ mod tests {
     use crate::{
         header::{self, HeaderValue},
         routing::{build, Route, Router},
+        runtime::ServingThread,
         static_files::{BlockingFs, StaticCacheSettings},
         Body, Method, Response, StatusCode,
     };
@@ -538,8 +532,21 @@ mod tests {
         crate::runtime::testing::block_on(future)
     }
 
+    /// The test runtime's thread, a compio one whose ring registers no region.
+    fn thread() -> ServingThread {
+        use futures_util::FutureExt as _;
+
+        // A ring asked for no region registers nothing, so this resolves without suspending.
+        let ring = http_kit_io::compio::Compio::default()
+            .register_fixed_region()
+            .now_or_never()
+            .expect("a ring asked for no region registers at once")
+            .expect("a ring asked for no region registers none");
+        ServingThread::on_ring(ring)
+    }
+
     fn router(dir: &Path) -> Router {
-        build(Route::new((StaticDir::new("/s", dir),))).unwrap()
+        build(Route::new((StaticDir::new("/s", dir, &thread()),))).unwrap()
     }
 
     fn get_request(path: &str) -> http_kit::Request {
@@ -715,7 +722,7 @@ mod tests {
         std::fs::write(dir.path().join("大きい.txt"), &payload).unwrap();
         let settings = StaticCacheSettings::new(16, 1024);
         let router = build(Route::new((
-            StaticDir::new("/s", dir.path()).cache(settings),
+            StaticDir::new("/s", dir.path(), &thread()).cache(settings),
         )))
         .unwrap();
 
@@ -753,7 +760,7 @@ mod tests {
         std::fs::write(dir.path().join("小.txt"), CJK).unwrap();
         let settings = StaticCacheSettings::new(16, 64 * 1024);
         let router = build(Route::new((
-            StaticDir::new("/s", dir.path()).cache(settings.clone()),
+            StaticDir::new("/s", dir.path(), &thread()).cache(settings.clone()),
         )))
         .unwrap();
 
@@ -802,7 +809,7 @@ mod tests {
     fn a_configured_cache_control_reaches_the_response() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("app.js"), b"console.log(1)").unwrap();
-        let router = build(Route::new((StaticDir::new("/s", dir.path())
+        let router = build(Route::new((StaticDir::new("/s", dir.path(), &thread())
             .cache_control(HeaderValue::from_static("public, max-age=60")),)))
         .unwrap();
 
@@ -985,7 +992,7 @@ mod tests {
         std::fs::write(&path, "옛날").unwrap();
         let settings = StaticCacheSettings::new(16, 0);
         let router = build(Route::new((
-            StaticDir::new("/s", dir.path()).cache(settings),
+            StaticDir::new("/s", dir.path(), &thread()).cache(settings),
         )))
         .unwrap();
 
@@ -1027,7 +1034,12 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), b"<h1>Home</h1>").unwrap();
 
         run(async {
-            let router = build(Route::new((StaticDir::new("/public", dir.path()),))).unwrap();
+            let router = build(Route::new((StaticDir::new(
+                "/public",
+                dir.path(),
+                &thread(),
+            ),)))
+            .unwrap();
             let response = router.go(get_request("/public")).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(body(response).await, b"<h1>Home</h1>");
@@ -1040,7 +1052,7 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), CJK).unwrap();
 
         run(async {
-            let router = build(Route::new((StaticDir::new("/", dir.path()),))).unwrap();
+            let router = build(Route::new((StaticDir::new("/", dir.path(), &thread()),))).unwrap();
             let response = router.go(get_request("/")).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(body(response).await, CJK.as_bytes());
@@ -1086,7 +1098,7 @@ mod tests {
 
         run(async {
             let router = build(Route::new((
-                StaticDir::new("/web", dir.path()).index_file("home.htm"),
+                StaticDir::new("/web", dir.path(), &thread()).index_file("home.htm"),
             )))
             .unwrap();
             let response = router.go(get_request("/web")).await.unwrap();
@@ -1100,7 +1112,10 @@ mod tests {
         std::fs::write(dir.path().join("index.html"), b"<h1>SPA</h1>").unwrap();
 
         run(async {
-            let router = build(Route::new((StaticDir::new("/app", dir.path()).spa(),))).unwrap();
+            let router = build(Route::new((
+                StaticDir::new("/app", dir.path(), &thread()).spa(),
+            )))
+            .unwrap();
             let response = router.clone().go(get_request("/app/about")).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(body(response).await, b"<h1>SPA</h1>");
@@ -1129,9 +1144,12 @@ mod tests {
     async fn blocking_fs_serves_outside_compio() {
         let dir = tempfile::tempdir().unwrap();
         with_variants(dir.path());
-        let router = build(Route::new((
-            StaticDir::new("/s", dir.path()).filesystem(BlockingFs),
-        )))
+        let router = build(Route::new((StaticDir::new(
+            "/s",
+            dir.path(),
+            &ServingThread::without_compio(),
+        )
+        .filesystem(BlockingFs),)))
         .unwrap();
 
         let response = router.go(accepting("/s/app.js", "zstd")).await.unwrap();
@@ -1146,61 +1164,34 @@ mod tests {
         let _ = router(&dir.path().join("does-not-exist"));
     }
 
-    /// The settings a serving thread hands its requests once its ring registered a region of
-    /// `fixed_buffers` bytes, with writes from `threshold` bytes sent zero-copy. Called inside
-    /// the thread's runtime.
-    #[cfg(feature = "rt")]
-    async fn serving_thread(
-        fixed_buffers: usize,
-        threshold: usize,
-    ) -> crate::runtime::native::IoSettings {
-        use crate::runtime::native::{IoOptions, IoSettings};
+    /// A serving thread whose ring registered a region of `fixed_buffers` bytes, with writes from
+    /// `threshold` bytes sent zero-copy. Called inside the thread's runtime.
+    async fn serving_thread(fixed_buffers: usize, threshold: usize) -> ServingThread {
+        use http_kit_io::compio::{Compio, FixedBuffers, ZeroCopySend};
 
-        let options = IoOptions {
-            fixed_buffers: Some(fixed_buffers),
-            zero_copy_threshold: Some(threshold),
-            ..IoOptions::default()
-        };
-        let settings = IoSettings::new(
-            options.driver(),
-            options.recv_ring(core::num::NonZeroUsize::MIN),
-            None,
-        );
-        let ring = settings
-            .driver()
+        let ring = Compio::default()
+            .with_zero_copy(ZeroCopySend::new(threshold))
+            .with_fixed_buffers(FixedBuffers::new(fixed_buffers))
             .register_fixed_region()
             .await
             .expect("the ring registers its region");
-        settings.on_ring(&ring)
+        ServingThread::on_ring(ring)
     }
 
-    /// `path`, asked for on the serving thread `settings` belong to.
-    #[cfg(feature = "rt")]
-    fn on_thread(path: &str, settings: &crate::runtime::native::IoSettings) -> http_kit::Request {
-        let mut request = get_request(path);
-        request.extensions_mut().insert(settings.clone());
-        request
-    }
-
-    /// A request from a serving thread whose ring has no region is served from memory of the
-    /// cache's own, whatever the file's size.
-    #[cfg(feature = "rt")]
+    /// A serving thread whose ring has no region serves from memory of the cache's own, whatever
+    /// the file's size, even with every write sent zero-copy.
     #[test]
     fn a_thread_without_a_region_serves_its_files_whole() {
         let dir = tempfile::tempdir().unwrap();
         let large = CJK.repeat(64);
         std::fs::write(dir.path().join("小.txt"), CJK).unwrap();
         std::fs::write(dir.path().join("大.txt"), &large).unwrap();
-        let router = router(dir.path());
 
         run(async {
-            let settings = serving_thread(0, 0).await;
+            let thread = serving_thread(0, 0).await;
+            let router = build(Route::new((StaticDir::new("/s", dir.path(), &thread),))).unwrap();
             for (name, expected) in [("小.txt", CJK), ("大.txt", large.as_str())] {
-                let response = router
-                    .clone()
-                    .go(on_thread(&uri(name), &settings))
-                    .await
-                    .unwrap();
+                let response = router.clone().go(get_request(&uri(name))).await.unwrap();
                 assert_eq!(response.status(), StatusCode::OK, "{name}");
                 assert_eq!(body(response).await, expected.as_bytes(), "{name}");
             }
@@ -1210,21 +1201,23 @@ mod tests {
     /// On a thread whose ring registered a region, a cached file at least the zero-copy
     /// threshold is read into the region; a smaller one, and one the region has no room left
     /// for, into memory of the cache's own. Each is served whole, from the cache too.
-    #[cfg(all(target_os = "linux", feature = "rt"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_cached_file_at_the_threshold_is_read_into_the_region() {
         /// The fewest bytes a write sends zero-copy, below the files that go into the region.
         const THRESHOLD: usize = 1024;
 
         let dir = tempfile::tempdir().unwrap();
-        let router = router(dir.path());
 
         run(async {
             // One byte asks for the smallest region the kernel registers, a page.
-            let settings = serving_thread(1, THRESHOLD).await;
-            let region = settings
-                .fixed_region()
-                .expect("an io_uring ring registers the region asked for");
+            let thread = serving_thread(1, THRESHOLD).await;
+            let router = build(Route::new((StaticDir::new("/s", dir.path(), &thread),))).unwrap();
+            let region = thread
+                .compio()
+                .and_then(|ring| ring.fixed_region())
+                .expect("an io_uring ring registers the region asked for")
+                .clone();
             let page = region.len();
             let content = |len: usize| -> Vec<u8> { CJK.bytes().cycle().take(len).collect() };
             // Half the region, which leaves the other half; one byte more than that cannot fit.
@@ -1238,7 +1231,7 @@ mod tests {
             }
             let serve = |name: &'static str| {
                 let router = router.clone();
-                let request = on_thread(&uri(name), &settings);
+                let request = get_request(&uri(name));
                 async move {
                     let response = router.go(request).await.unwrap();
                     assert_eq!(response.status(), StatusCode::OK, "{name}");

@@ -27,14 +27,16 @@ use syn::{
 /// The native setup future and the wasm endpoint factory `#[skyzen::main]` hands its runtimes.
 ///
 /// Natively the services are built once and the queue consumers from those same instances; the
-/// router is built by a `Send` factory that each serving thread calls on itself, layering clones
-/// of the services around that thread's endpoint — a service on zenwave rebound first to pools on
-/// that thread, as the `ServicePools` the runtime hands the setup says. The router never leaves its
+/// router is built by a `Send` factory that each serving thread calls on itself with its
+/// `ServingThread` (bound as `__skyzen_thread`, which `entry_call` may borrow), layering clones of
+/// the services around that thread's endpoint — a service on zenwave rebound first to pools on
+/// that thread, as the `ServicePools` of that `ServingThread` say. The router never leaves its
 /// thread, so nothing the entry function builds has to be `Send`.
 ///
 /// On wasm the factory receives the `WinterCG` env explicitly (as `__skyzen_wasm_env`), so endpoint
-/// construction never depends on an ambient thread-local that concurrent invocations could race.
-/// The platform owns event delivery there, so there are no consumers.
+/// construction never depends on an ambient thread-local that concurrent invocations could race,
+/// and the isolate's `ServingThread` is one without compio. The platform owns event delivery
+/// there, so there are no consumers.
 fn endpoint_factories(
     entry_call: &proc_macro2::TokenStream,
     shared: &proc_macro2::TokenStream,
@@ -57,17 +59,17 @@ fn endpoint_factories(
         .iter()
         .map(|injection| &injection.per_thread)
         .collect();
-    // `__skyzen_pools` is the platform's `ServicePools`, the parameter of the closure this setup
-    // is the body of; the factory hands a clone of it to every thread.
+    // `__skyzen_pools` is the coordinating thread's `ServicePools` in the setup, the parameter of
+    // the closure this setup is the body of, and inside the factory the serving thread's own.
     let native_setup = quote! {
         async move {
             #shared
             #(#bindings)*
             let __skyzen_consumers = #consumers;
-            let __skyzen_endpoint_factory = move || {
+            let __skyzen_endpoint_factory = move |__skyzen_thread: ::skyzen::runtime::ServingThread| {
                 #(let #captured = ::std::clone::Clone::clone(&#captured);)*
-                let __skyzen_pools = ::std::clone::Clone::clone(&__skyzen_pools);
                 async move {
+                    let __skyzen_pools = __skyzen_thread.service_pools();
                     #(#per_thread)*
                     let endpoint = #entry_call;
                     #(#layers)*
@@ -81,6 +83,7 @@ fn endpoint_factories(
         move |__skyzen_wasm_env: ::skyzen::runtime::wasm::Env| {
             let _ = &__skyzen_wasm_env;
             async move {
+                let __skyzen_thread = ::skyzen::runtime::ServingThread::without_compio();
                 let endpoint = #entry_call;
                 #(#bindings)*
                 #(#layers)*
@@ -91,7 +94,43 @@ fn endpoint_factories(
     (native_setup, wasm_factory)
 }
 
+/// The call of `#[skyzen::main]`'s entry function that builds one thread's router, renaming a
+/// function called `main` so the generated `main` can take its name.
+///
+/// Every factory binds the thread it builds on as `__skyzen_thread`, which the call borrows when
+/// the function takes it.
+fn entry_call_tokens(function: &mut ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+    let original_ident = function.sig.ident.clone();
+    let entry_ident = if original_ident == "main" {
+        let unique = format_ident!("__skyzen_entry_main");
+        function.sig.ident = unique.clone();
+        unique
+    } else {
+        original_ident
+    };
+    let thread_argument = match function.sig.inputs.len() {
+        0 => quote! {},
+        1 => quote! { &__skyzen_thread },
+        _ => {
+            return Err(Error::new(
+                function.sig.inputs.span(),
+                "a `#[skyzen::main]` entry function takes no argument, or only \
+                 `&skyzen::runtime::ServingThread`",
+            ));
+        }
+    };
+    Ok(if function.sig.asyncness.is_some() {
+        quote! { #entry_ident(#thread_argument).await }
+    } else {
+        quote! { #entry_ident(#thread_argument) }
+    })
+}
+
 /// Attribute macro that boots a Skyzen Endpoint on native or wasm runtimes.
+///
+/// The entry function builds the router, once on every thread that serves it. It takes no
+/// argument, or one, `&skyzen::runtime::ServingThread`: the thread it builds on, which an endpoint
+/// that needs that thread's driver or region (`StaticDir`, `Proxy`) is built from.
 #[proc_macro_attribute]
 pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args =
@@ -102,21 +141,9 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let mut function = parse_macro_input!(item as ItemFn);
-    let is_async = function.sig.asyncness.is_some();
-
-    let original_ident = function.sig.ident.clone();
-    let entry_ident = if original_ident == "main" {
-        let unique = format_ident!("__skyzen_entry_main");
-        function.sig.ident = unique.clone();
-        unique
-    } else {
-        original_ident
-    };
-
-    let entry_call = if is_async {
-        quote! { #entry_ident().await }
-    } else {
-        quote! { #entry_ident() }
+    let entry_call = match entry_call_tokens(&mut function) {
+        Ok(entry_call) => entry_call,
+        Err(error) => return error.to_compile_error().into(),
     };
     let wiring = match portable_injection_wrap_steps() {
         Ok(wiring) => wiring,
@@ -164,7 +191,9 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
             // built from the router the entry function returns, ahead of the service wiring the
             // factory does, so `skyzen openapi` works in a project whose backends do not exist
             // yet.
-            if ::skyzen::runtime::native::dump_openapi_if_requested(|| async { #entry_call }) {
+            if ::skyzen::runtime::native::dump_openapi_if_requested(
+                |__skyzen_thread: ::skyzen::runtime::ServingThread| async move { #entry_call },
+            ) {
                 return;
             }
             ::skyzen::runtime::native::launch(
@@ -4496,6 +4525,39 @@ mod tests {
     /// Parse a manifest through the same shared schema the macros use at compile time.
     fn manifest(source: &str) -> SkyzenManifest {
         document(source).data().clone()
+    }
+
+    /// An entry function with no argument is called with none; one that takes the thread is
+    /// handed the factory's `__skyzen_thread`; `main` is renamed out of the generated one's way.
+    #[test]
+    fn an_entry_function_is_called_with_the_thread_when_it_takes_it() {
+        use super::entry_call_tokens;
+
+        let mut bare: syn::ItemFn = parse_quote! { fn main() -> Router { todo!() } };
+        assert_eq!(
+            entry_call_tokens(&mut bare).unwrap().to_string(),
+            "__skyzen_entry_main ()"
+        );
+        assert_eq!(bare.sig.ident, "__skyzen_entry_main");
+
+        let mut threaded: syn::ItemFn =
+            parse_quote! { async fn app(thread: &ServingThread) -> Router { todo!() } };
+        assert_eq!(
+            entry_call_tokens(&mut threaded).unwrap().to_string(),
+            "app (& __skyzen_thread) . await"
+        );
+    }
+
+    /// The thread is the only argument an entry function can be handed.
+    #[test]
+    fn an_entry_function_with_two_arguments_is_refused() {
+        let mut function: syn::ItemFn =
+            parse_quote! { fn main(thread: &ServingThread, port: u16) -> Router { todo!() } };
+        let error = super::entry_call_tokens(&mut function).unwrap_err();
+        assert!(
+            error.to_string().contains("takes no argument, or only"),
+            "{error}"
+        );
     }
 
     /// The same parse, keeping the `[cloudflare.env.<name>]` overlays `#[skyzen::main]` reads.

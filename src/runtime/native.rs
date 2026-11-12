@@ -10,6 +10,7 @@ use crate::{
     runtime::{
         azure,
         consumer::{ConsumerFatal, ConsumerSet},
+        ServingThread,
     },
     Endpoint,
 };
@@ -659,11 +660,14 @@ pub use skyzen_core::OPENAPI_DUMP_ENV;
 /// not require credentials, a reachable database or a provisioned queue. `skyzen openapi` relies on
 /// that — it runs the binary in a project whose backends may not exist yet.
 ///
+/// `factory` is handed the thread it builds the router on: a compio runtime of its own, whose
+/// ring registers no region, since nothing is served from it.
+///
 /// # Panics
 ///
 /// Never returns on a failure: an unwritable path or a build with the `openapi` feature off exits
 /// non-zero, because a caller asked for a document and a silent empty one is worse than no answer.
-pub fn dump_openapi_if_requested<Fut, E>(factory: impl FnOnce() -> Fut) -> bool
+pub fn dump_openapi_if_requested<Fut, E>(factory: impl FnOnce(ServingThread) -> Fut) -> bool
 where
     Fut: Future<Output = E>,
     E: ServedRoutes,
@@ -674,7 +678,13 @@ where
 
     let document = Runtime::new()
         .expect("a compio runtime to build the router on")
-        .block_on(factory())
+        .block_on(async {
+            let ring = http_kit_io::compio::Compio::default()
+                .register_fixed_region()
+                .await
+                .expect("a ring asked for no region registers none");
+            factory(ServingThread::on_ring(ring)).await
+        })
         .openapi_document();
     if !document.is_enabled() {
         error!(
@@ -791,6 +801,9 @@ impl std::error::Error for StartupError {}
 /// The driver a client pools on is the one the serving threads' own sockets run on, carrying the
 /// operator's [`IoSettings`]: a ring's registered file table belongs to every stream of that
 /// ring, and a client's large writes are sent zero-copy from the same threshold as a response's.
+///
+/// `launch` hands the coordinating thread's to the setup; a serving thread's comes from the
+/// [`ServingThread`] its factory is handed ([`ServingThread::service_pools`]).
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct ServicePools {
@@ -798,6 +811,11 @@ pub struct ServicePools {
 }
 
 impl ServicePools {
+    /// Pools on `driver`, or on zenwave's own driver thread without one.
+    pub(super) const fn new(driver: Option<http_kit_io::compio::Compio>) -> Self {
+        Self { driver }
+    }
+
     /// The calling thread's compio driver, to pool on, where the platform's threads run compio;
     /// `None` where they do not, and a client keeps zenwave's own driver thread.
     #[must_use]
@@ -832,8 +850,10 @@ impl ServicePools {
 /// `[[native.queue_consumer]]` — so both are built from the same service instances rather than
 /// from two independent connections to one backend. Every serving thread calls the factory on
 /// itself, so each has a router of its own and the router and everything it holds may be `!Send`.
-/// `setup` is handed the platform's [`ServicePools`], which the factory carries to each thread so
-/// the thread rebinds its HTTP service clients to connection pools of its own.
+/// `setup` is handed the coordinating thread's [`ServicePools`], for the clients the consumers
+/// poll with; the factory is handed each thread's [`ServingThread`], from which the thread
+/// rebinds its HTTP service clients to connection pools of its own, and which carries the
+/// thread's compio driver for its ring, or says, under Lambda, that the thread runs none.
 ///
 /// # Where this ends up running
 ///
@@ -883,7 +903,7 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
     on_shutdown: Hook,
 ) where
     Setup: Future<Output = (F, C)>,
-    F: EndpointFactory,
+    F: EndpointFactory<ServingThread>,
     F::Endpoint: ServedRoutes,
     C: ConsumerSet,
     Hook: FnOnce() -> HookFut,
@@ -929,10 +949,7 @@ pub fn launch<Setup, F, C, Hook, HookFut>(
         // compio runtime its clients can pool on, with the driver the serving threads' sockets
         // run on.
         let driver = options.io.driver();
-        let (factory, consumers) = setup(ServicePools {
-            driver: Some(driver.clone()),
-        })
-        .await;
+        let (factory, consumers) = setup(ServicePools::new(Some(driver.clone()))).await;
         let outcome = match platform {
             Platform::Lambda => unreachable!("handed over before the runtime was built"),
             Platform::Server => {
@@ -1119,7 +1136,7 @@ async fn serve_cores<F, A, W, C>(
     setup: ListenerSetup,
 ) -> Result<Shutdown, RuntimeFailure>
 where
-    F: EndpointFactory,
+    F: EndpointFactory<ServingThread>,
     A: Endpoint + Clone + 'static,
     W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
     C: ConsumerSet,
@@ -1304,15 +1321,18 @@ fn run_on_lambda<Setup, F, C>(
 ) -> Result<core::convert::Infallible, StartupError>
 where
     Setup: Future<Output = (F, C)>,
-    F: EndpointFactory,
+    F: EndpointFactory<ServingThread>,
     C: ConsumerSet,
 {
     // The adapter's runtime is single-threaded, so the endpoint is built once, on the thread that
-    // serves every invocation. That thread runs tokio, which zenwave's per-thread pools cannot run
-    // on, so the HTTP service clients stay on zenwave's driver thread.
+    // serves every invocation. That thread runs tokio, not compio, so it has no driver to hand the
+    // factory and the HTTP service clients stay on zenwave's driver thread.
     skyzen_lambda::run(|| async move {
-        let (factory, consumers) = setup(ServicePools { driver: None }).await;
-        (factory.endpoint().await, LambdaConsumers(consumers))
+        let (factory, consumers) = setup(ServicePools::new(None)).await;
+        (
+            factory.endpoint(ServingThread::without_compio()).await,
+            LambdaConsumers(consumers),
+        )
     })
     .map_err(|error| StartupError::Lambda(error.to_string()))?;
 
@@ -1331,7 +1351,7 @@ fn run_on_lambda<Setup, F, C>(
 ) -> Result<core::convert::Infallible, StartupError>
 where
     Setup: Future<Output = (F, C)>,
-    F: EndpointFactory,
+    F: EndpointFactory<ServingThread>,
     C: ConsumerSet,
 {
     Err(StartupError::LambdaFeatureMissing)
@@ -1372,7 +1392,7 @@ async fn serve_functions_host<F, C>(
     port: u16,
 ) -> Result<Shutdown, RuntimeFailure>
 where
-    F: EndpointFactory,
+    F: EndpointFactory<ServingThread>,
     F::Endpoint: ServedRoutes,
     C: ConsumerSet,
 {

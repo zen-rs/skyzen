@@ -38,9 +38,11 @@
 //! before it accepts, each serving thread maps a region of `--fixed-buffers` bytes and registers
 //! it as its ring's one registered buffer, which a ring does once. The kernel pins every thread's
 //! region and charges it to `RLIMIT_MEMLOCK` unless the process has `CAP_IPC_LOCK`, so a size the
-//! limit refuses stops startup. [`StaticDir`](crate::static_files::StaticDir) reads a file it
-//! keeps in memory into its thread's region when the file is at least the zero-copy threshold,
-//! and a zero-copy write of those bytes then goes out from registered memory, which nothing pins
+//! limit refuses stops startup. The thread hands the driver carrying its region to the endpoint
+//! factory in its [`ServingThread`](crate::runtime::ServingThread), and a
+//! [`StaticDir`](crate::static_files::StaticDir) built from it reads a file it keeps in memory into
+//! the region when the file is at least the zero-copy threshold, so that a zero-copy write of
+//! those bytes then goes out from registered memory, which nothing pins
 //! or charges per send. A response's head copied in beside its body makes such a write two
 //! slices, which the kernel takes from a registered buffer from Linux 6.15; before it the write is
 //! sent zero-copy as it would be without a region. A file that does not fit the space left is
@@ -55,14 +57,8 @@ use core::{
     str::FromStr,
 };
 use std::fmt::Display;
-#[cfg(target_os = "linux")]
-use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
-use fragile::Sticky;
 use http_kit::http_error;
-#[cfg(target_os = "linux")]
-use http_kit_io::compio::FixedRegion;
 use http_kit_io::compio::{Compio, FileTable, FixedBuffers, Ring, ZeroCopySend};
 use skyzen_core::Extractor;
 use tracing::info;
@@ -233,8 +229,9 @@ impl RecvRing {
 
 /// The serving threads' I/O settings, as the runtime runs them.
 ///
-/// Extract it in a handler to read them, or to change the two that are shared live (see the
-/// module documentation for which change takes effect when):
+/// The native runtime puts them into every request it serves. Extract it in a handler to read
+/// them, or to change the two that are shared live (see the module documentation for which change
+/// takes effect when):
 ///
 /// ```rust,no_run
 /// use skyzen::runtime::native::IoSettings;
@@ -249,11 +246,6 @@ pub struct IoSettings {
     driver: Compio,
     recv_ring: RecvRing,
     busy_poll: Option<BusyPoll>,
-    /// The region of the serving thread whose requests carry these settings, when its ring
-    /// registered one. It is that thread's and reachable on it alone: a request is `Send`, and a
-    /// clone of it dropped elsewhere leaves the region to its thread.
-    #[cfg(target_os = "linux")]
-    region: Option<Arc<Sticky<FixedRegion>>>,
 }
 
 http_error!(
@@ -275,30 +267,7 @@ impl IoSettings {
             driver,
             recv_ring,
             busy_poll,
-            #[cfg(target_os = "linux")]
-            region: None,
         }
-    }
-
-    /// These settings as the serving thread that registered `ring` hands them to its requests:
-    /// carrying the region `ring` registered, if it registered one.
-    ///
-    /// Called on that thread.
-    pub(crate) fn on_ring(&self, ring: &Compio<Ring>) -> Self {
-        #[cfg_attr(
-            not(target_os = "linux"),
-            expect(unused_mut, reason = "only Linux registers a region to carry")
-        )]
-        let mut settings = self.clone();
-        #[cfg(target_os = "linux")]
-        {
-            settings.region = ring
-                .fixed_region()
-                .map(|region| Arc::new(Sticky::new(region.clone())));
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = ring;
-        settings
     }
 
     /// The threshold from which a write is sent zero-copy, shared by every serving thread.
@@ -327,13 +296,6 @@ impl IoSettings {
         self.driver.fixed_buffers().bytes()
     }
 
-    /// The region of the serving thread these settings came to, when its ring registered one and
-    /// this is that thread; anywhere else it is no region to read into.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn fixed_region(&self) -> Option<FixedRegion> {
-        self.region.as_ref()?.try_with(FixedRegion::clone).ok()
-    }
-
     /// Busy polling as every serving thread's ring and socket runs it; `None` is off.
     #[must_use]
     pub const fn busy_poll(&self) -> Option<BusyPoll> {
@@ -341,8 +303,8 @@ impl IoSettings {
     }
 
     /// The driver that holds the shared settings alone: a serving thread's timers and QUIC socket
-    /// run on it, and a proxy's upstream sockets are dialed with it. A thread's listeners take
-    /// [`register_region`](Self::register_region)'s instead.
+    /// run on it. A thread's listeners, and the [`ServingThread`](crate::runtime::ServingThread)
+    /// its factory is handed, take [`register_region`](Self::register_region)'s instead.
     pub(crate) fn driver(&self) -> Compio {
         self.driver.clone()
     }
@@ -486,16 +448,13 @@ mod tests {
         let _ = apply_io_overrides(args(&["--fixed-buffers=1M"]));
     }
 
-    /// The settings a serving thread built from `options` hands its requests, once its ring
+    /// The driver a serving thread built from `options` makes its listeners with, once its ring
     /// registered what `options` asks for. Called inside that thread's runtime.
-    async fn serving_thread_settings(options: IoOptions) -> super::IoSettings {
-        let settings =
-            super::IoSettings::new(options.driver(), options.recv_ring(NonZeroUsize::MIN), None);
-        let ring = settings
+    async fn serving_thread_ring(options: IoOptions) -> http_kit_io::compio::Compio<super::Ring> {
+        super::IoSettings::new(options.driver(), options.recv_ring(NonZeroUsize::MIN), None)
             .register_region()
             .await
-            .expect("the ring registers its region");
-        settings.on_ring(&ring)
+            .expect("the ring registers its region")
     }
 
     /// With a size of `0` a ring registers no region; off Linux no ring registers one at all, so
@@ -508,36 +467,30 @@ mod tests {
             ..IoOptions::default()
         };
         crate::runtime::testing::block_on(async {
-            let settings = serving_thread_settings(options).await;
+            let ring = serving_thread_ring(options).await;
             #[cfg(target_os = "linux")]
-            assert!(settings.fixed_region().is_none());
+            assert!(ring.fixed_region().is_none());
             #[cfg(not(target_os = "linux"))]
-            let _ = settings;
+            let _ = ring;
         });
     }
 
-    /// A serving thread's ring registers a region of the size asked for, and the settings its
-    /// requests carry reach it on that thread alone.
+    /// A serving thread's ring registers a region of the size asked for.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_serving_thread_registers_its_region_and_only_that_thread_reaches_it() {
+    fn a_serving_thread_registers_a_region_of_the_size_asked_for() {
         crate::runtime::testing::block_on(async {
             // Inside a container's default `RLIMIT_MEMLOCK`, 64 KiB.
             const BYTES: usize = 16 * 1024;
-            let settings = serving_thread_settings(IoOptions {
+            let ring = serving_thread_ring(IoOptions {
                 fixed_buffers: Some(BYTES),
                 ..IoOptions::default()
             })
             .await;
-            let region = settings
+            let region = ring
                 .fixed_region()
                 .expect("an io_uring ring registers the region asked for");
             assert!(region.len() >= BYTES, "{region:?}");
-            let elsewhere = settings.clone();
-            let reached = std::thread::spawn(move || elsewhere.fixed_region().is_some())
-                .join()
-                .expect("the other thread runs");
-            assert!(!reached, "another thread reached this thread's region");
         });
     }
 

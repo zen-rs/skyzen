@@ -6,10 +6,12 @@
 #[cfg(any(target_arch = "wasm32", test))]
 mod cf;
 mod context;
+mod thread;
 
 #[cfg(any(target_arch = "wasm32", test))]
 pub use cf::{CfBotManagement, CfProperties, CfPropertiesSlot, CfPropertiesUnavailable};
 pub use context::{WorkerContext, WorkerContextError, WorkerContextNotConfigured};
+pub use thread::ServingThread;
 
 /// Native (smol backed) runtime utilities.
 #[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]

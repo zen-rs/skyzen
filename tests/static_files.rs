@@ -16,6 +16,7 @@ use executor_core::compio::Runtime;
 use http_kit_io::{compio::Compio, Listen as _, Listener as _};
 use skyzen::{
     routing::{build, Route},
+    runtime::ServingThread,
     static_files::{StaticCacheSettings, StaticDir},
     Server as _,
 };
@@ -72,10 +73,16 @@ fn start(dir: std::path::PathBuf, log: Captured) -> SocketAddr {
                 addr_tx
                     .send(listener.local_addr().expect("local addr"))
                     .expect("the test is waiting for the address");
+                let thread = ServingThread::on_ring(
+                    Compio::default()
+                        .register_fixed_region()
+                        .await
+                        .expect("a ring asked for no region registers none"),
+                );
                 // Inline limit zero: every file is cached as an open descriptor and sent as a
                 // region.
                 let router = build(Route::new((
-                    StaticDir::new("/s", dir).cache(StaticCacheSettings::new(16, 0)),
+                    StaticDir::new("/s", dir, &thread).cache(StaticCacheSettings::new(16, 0)),
                 )))
                 .expect("the router builds");
                 H1::default()

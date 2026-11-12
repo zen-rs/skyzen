@@ -25,6 +25,7 @@ use skyzen::{
     header::{self, HeaderMap, HeaderValue},
     proxy::{Proxy, Upstream},
     routing::{CreateRouteNode, Route},
+    runtime::ServingThread,
     Body, Endpoint, Method, Request, Response, StatusCode,
 };
 use skyzen_h1::H1;
@@ -267,6 +268,20 @@ fn serve<E: Endpoint + Clone + 'static>(endpoint: E) -> SocketAddr {
     addr
 }
 
+/// The current runtime's thread, as a host that runs it hands an endpoint factory: a compio
+/// thread whose ring registers no region.
+fn thread() -> ServingThread {
+    use futures_util::FutureExt as _;
+
+    // A ring asked for no region registers nothing, so this resolves without suspending.
+    let ring = Compio::default()
+        .register_fixed_region()
+        .now_or_never()
+        .expect("a ring asked for no region registers at once")
+        .expect("a ring asked for no region registers none");
+    ServingThread::on_ring(ring)
+}
+
 /// The scenario's three parties.
 struct Stage {
     origin: Origin,
@@ -283,7 +298,10 @@ fn stage(configure: impl FnOnce(Route) -> Route) -> Stage {
         .parse()
         .expect("upstream URI");
     let upstream = Upstream::new(&target).expect("upstream");
-    let router = configure(Route::new(("/api".mount(Proxy::new(&upstream)),))).build();
+    let router = configure(Route::new(
+        ("/api".mount(Proxy::new(&upstream, &thread())),),
+    ))
+    .build();
     Stage {
         origin,
         proxy: serve(router),
@@ -535,7 +553,7 @@ fn an_unreachable_origin_is_a_bad_gateway() {
             .expect("local address");
         let target = format!("http://{closed}").parse().expect("URI");
         let upstream = Upstream::new(&target).expect("upstream");
-        let proxy = serve(Route::new(("/".mount(Proxy::new(&upstream)),)).build());
+        let proxy = serve(Route::new(("/".mount(Proxy::new(&upstream, &thread())),)).build());
         let send = connect(proxy).await;
         let response = send
             .send(request(Method::GET, "/anything", Body::empty()))
@@ -594,7 +612,7 @@ fn a_switch_the_client_did_not_ask_for_is_a_bad_gateway() {
 
         let target = format!("http://{origin}").parse().expect("URI");
         let upstream = Upstream::new(&target).expect("upstream");
-        let proxy = serve(Route::new(("/".mount(Proxy::new(&upstream)),)).build());
+        let proxy = serve(Route::new(("/".mount(Proxy::new(&upstream, &thread())),)).build());
         let send = connect(proxy).await;
         let response = send
             .send(request(Method::GET, "/chat", Body::empty()))
@@ -632,7 +650,7 @@ mod websocket {
         websocket::WebSocketMessage,
     };
 
-    use super::{run, run_logged, serve};
+    use super::{run, run_logged, serve, thread};
 
     /// The text messages: Chinese, Japanese and Korean.
     pub const GREETINGS: [&str; 3] = ["你好世界", "こんにちは", "안녕하세요"];
@@ -666,7 +684,7 @@ mod websocket {
         let origin = serve(echo_origin());
         let target = format!("http://{origin}/v1").parse().expect("upstream URI");
         let upstream = Upstream::new(&target).expect("upstream");
-        let proxy = serve(Route::new(("/api".mount(Proxy::new(&upstream)),)).build());
+        let proxy = serve(Route::new(("/api".mount(Proxy::new(&upstream, &thread())),)).build());
 
         let stream = Compio::default().connect(proxy).await.expect("connect");
         let (client, response) = client_async("ws://shop.example/api/echo", stream.into_poll())
@@ -882,7 +900,7 @@ mod kernel_tls {
     };
     use skyzen_h1::H1;
 
-    use super::{assert_spliced, bulk, read_frames, request, run_logged, Origin};
+    use super::{assert_spliced, bulk, read_frames, request, run_logged, thread, Origin};
 
     /// The record-layer mode of every connection a TLS server accepted.
     type Modes = Rc<RefCell<Vec<Mode>>>;
@@ -962,7 +980,7 @@ mod kernel_tls {
         let upstream = Upstream::new(&target)
             .expect("upstream")
             .transport(transport);
-        serve_tls(Route::new(("/api".mount(Proxy::new(&upstream)),)).build())
+        serve_tls(Route::new(("/api".mount(Proxy::new(&upstream, &thread())),)).build())
     }
 
     /// A TLS connection to `addr` trusting `der`, encrypted in user space.

@@ -3,9 +3,9 @@
 //! [`CompioFs`] is the default: the serving thread's own compio runtime, so on Linux the `open` and
 //! the `statx` of a path are `io_uring` operations, submitted in the same batch, and a small file's
 //! read is one too, into the thread's region of registered buffers when it has one (see
-//! [`StaticDir`](super::StaticDir)). [`BlockingFs`] runs the same calls on the `blocking` thread pool, which belongs
-//! to no runtime, for a router served by an executor of the application's own (the `hyper`
-//! embedding under Tokio).
+//! [`StaticDir`](super::StaticDir)). [`BlockingFs`] runs the same calls on the `blocking` thread
+//! pool, which belongs to no runtime, for a router served by an executor of the application's own
+//! (the `hyper` embedding under Tokio).
 
 use std::{fs::File, future::Future, io, path::PathBuf, time::SystemTime};
 
@@ -68,7 +68,7 @@ pub(super) mod sealed {
         /// Read the first `len` bytes of the file into `region`, the serving thread's region of
         /// registered buffers; `None` when the region has no room for them, or when the backend
         /// does not read on the ring the region belongs to.
-        #[cfg(all(target_os = "linux", feature = "rt"))]
+        #[cfg(target_os = "linux")]
         fn read_fixed(
             &self,
             handle: &Self::Handle,
@@ -140,7 +140,7 @@ impl sealed::Ops for CompioFs {
 
     /// Fixed reads (`IORING_OP_READ_FIXED`) on the serving thread's ring, straight into its
     /// region.
-    #[cfg(all(target_os = "linux", feature = "rt"))]
+    #[cfg(target_os = "linux")]
     async fn read_fixed(
         &self,
         handle: &Self::Handle,
@@ -196,7 +196,7 @@ impl sealed::Ops for BlockingFs {
     }
 
     /// The blocking pool reads on no ring, so it never reads into one's region.
-    #[cfg(all(target_os = "linux", feature = "rt"))]
+    #[cfg(target_os = "linux")]
     async fn read_fixed(
         &self,
         _: &Self::Handle,

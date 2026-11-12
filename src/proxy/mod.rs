@@ -10,14 +10,18 @@
 //! use skyzen::{
 //!     proxy::{Proxy, Upstream},
 //!     routing::{CreateRouteNode, Route, Router},
+//!     runtime::ServingThread,
 //! };
 //!
 //! // Once, before the serving threads start.
 //! let upstream = Upstream::new(&"http://127.0.0.1:9000/v1".parse()?)?;
 //!
-//! // On each serving thread, inside the endpoint factory.
-//! let router: Router = Route::new(("/api".mount(Proxy::new(&upstream)),)).build();
+//! // On each serving thread, inside the endpoint factory, from the thread it is handed.
+//! let router = |thread: &ServingThread| -> Router {
+//!     Route::new(("/api".mount(Proxy::new(&upstream, thread)),)).build()
+//! };
 //! // `/api/users?page=2` is forwarded as `http://127.0.0.1:9000/v1/users?page=2`.
+//! # let _ = router;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -55,14 +59,13 @@ mod body;
 mod headers;
 mod tunnel;
 
-use std::{cell::OnceCell, fmt, rc::Rc, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use executor_core::LocalExecutor;
 use http::{
     uri::{Authority, PathAndQuery, Scheme},
     Version,
 };
-use http_kit_io::compio::Compio;
 use zenwave::{
     backend::{NativeBackend, NativeIo, NativeResolve, Upgrade},
     dns::Getaddrinfo,
@@ -76,6 +79,7 @@ pub use zenwave::Transport;
 use crate::{
     extract::TrustedProxies,
     header::{self, HeaderValue},
+    runtime::ServingThread,
     Body, Endpoint, Request, Response, StatusCode, Uri,
 };
 use headers::{ForwardedElement, ViaMember};
@@ -219,9 +223,8 @@ impl Upstream {
 #[derive(Clone)]
 pub struct Proxy {
     upstream: Arc<Upstream>,
-    /// The upstream pool, which [`Proxy::new`] builds on the first request, with the driver that
-    /// request was served on.
-    client: Rc<OnceCell<NativeBackend>>,
+    /// The upstream pool, on the thread that built the proxy.
+    client: NativeBackend,
 }
 
 impl fmt::Debug for Proxy {
@@ -233,25 +236,28 @@ impl fmt::Debug for Proxy {
 }
 
 impl Proxy {
-    /// This thread's proxy to `upstream`, on the compio runtime `#[skyzen::main]` serves each
-    /// thread with.
+    /// This proxy to `upstream` for `thread`, the compio thread whose router it joins.
     ///
-    /// Its pool is built on the first request, with the driver of the serving thread that request
-    /// names in its `skyzen::runtime::native::IoSettings`, so upstream sockets follow
-    /// the operator's zero-copy threshold and file table; a request without them (an embedding
-    /// host, a test client) comes from no runtime with operator settings, and gets a default
-    /// driver.
+    /// Its pool is built now, on `thread`'s runtime and with the shared settings of its driver, so
+    /// upstream sockets follow the operator's zero-copy threshold and file table when the thread
+    /// is one `#[skyzen::main]` serves, and the defaults on a compio thread of another host's.
     ///
     /// # Panics
     ///
-    /// At its first request, when that request is served on a thread not running a compio
-    /// runtime; on another runtime use [`Proxy::on_current_thread`].
+    /// `thread` runs no compio runtime ([`ServingThread::without_compio`]), so there is no driver
+    /// to dial with; on another runtime use [`Proxy::on_current_thread`].
     #[must_use]
-    pub fn new(upstream: &Upstream) -> Self {
-        Self {
-            upstream: Arc::new(upstream.clone()),
-            client: Rc::new(OnceCell::new()),
-        }
+    pub fn new(upstream: &Upstream, thread: &ServingThread) -> Self {
+        let io = thread
+            .compio()
+            .expect(
+                "Proxy::new needs a thread that runs compio; on another runtime use \
+                 Proxy::on_current_thread",
+            )
+            .shared();
+        compio::runtime::Runtime::with_current(|runtime| {
+            Self::on_current_thread(upstream, io, Getaddrinfo, runtime)
+        })
     }
 
     /// This thread's proxy to `upstream`, its connections driven by `io`, the names it dials
@@ -265,30 +271,13 @@ impl Proxy {
     {
         Self {
             upstream: Arc::new(upstream.clone()),
-            client: Rc::new(OnceCell::from(NativeBackend::on_current_thread(
+            client: NativeBackend::on_current_thread(
                 upstream.transport.clone(),
                 io,
                 resolver,
                 executor,
-            ))),
+            ),
         }
-    }
-
-    /// This thread's pool, built on its first use with the driver `request` was served on.
-    fn client(&self, request: &Request) -> NativeBackend {
-        self.client
-            .get_or_init(|| {
-                let io = driver(request);
-                compio::runtime::Runtime::with_current(|runtime| {
-                    NativeBackend::on_current_thread(
-                        self.upstream.transport.clone(),
-                        io,
-                        Getaddrinfo,
-                        runtime,
-                    )
-                })
-            })
-            .clone()
     }
 
     /// The request to send upstream, built from the one the client sent; `accepts_trailers` is
@@ -426,27 +415,12 @@ impl Proxy {
     }
 }
 
-/// The driver of the serving thread `request` came from, or a default one when it came from no
-/// runtime that carries operator settings.
-fn driver(request: &Request) -> Compio {
-    #[cfg(feature = "rt")]
-    if let Some(settings) = request
-        .extensions()
-        .get::<crate::runtime::native::IoSettings>()
-    {
-        return settings.driver();
-    }
-    #[cfg(not(feature = "rt"))]
-    let _ = request;
-    Compio::default()
-}
-
 impl Endpoint for Proxy {
     type Error = ProxyError;
 
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let accepts_trailers = headers::accepts_trailers(request.headers());
-        let mut client = self.client(request);
+        let mut client = self.client.clone();
         let mut forwarded = self.forwarded_request(request, accepts_trailers)?;
         tracing::debug!(
             method = %forwarded.method(),
@@ -499,34 +473,17 @@ pub enum ProxyError {
     TrailersNotAccepted,
 }
 
-#[cfg(all(test, feature = "rt"))]
+#[cfg(test)]
 mod tests {
-    use core::num::NonZeroUsize;
+    use super::{Proxy, Upstream};
+    use crate::runtime::ServingThread;
 
-    use super::driver;
-    use crate::{Body, Request};
-
-    /// A request the native runtime served carries its driver, and the proxy's pool is built with
-    /// it: the zero-copy threshold and file table the operator changes are the ones its upstream
-    /// sockets read.
+    /// A thread that runs no compio runtime has no driver to dial with, and building a proxy for
+    /// it says so instead of guessing one.
     #[test]
-    fn a_request_from_the_native_runtime_hands_the_proxy_its_driver() {
-        use crate::runtime::native::{IoOptions, IoSettings};
-
-        let options = IoOptions::default();
-        let settings = IoSettings::new(
-            options.driver(),
-            options.recv_ring(NonZeroUsize::new(8).unwrap()),
-            None,
-        );
-        let mut request = Request::new(Body::empty());
-        request.extensions_mut().insert(settings.clone());
-
-        let io = driver(&request);
-        settings.zero_copy().set_threshold(12_345);
-        settings.file_table().set_slots(321);
-
-        assert_eq!(io.zero_copy().threshold(), 12_345);
-        assert_eq!(io.file_table().slots(), 321);
+    #[should_panic(expected = "Proxy::new needs a thread that runs compio")]
+    fn a_proxy_for_a_thread_without_compio_is_refused() {
+        let upstream = Upstream::new(&"http://127.0.0.1:9000".parse().unwrap()).unwrap();
+        let _ = Proxy::new(&upstream, &ServingThread::without_compio());
     }
 }

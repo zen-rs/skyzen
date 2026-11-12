@@ -41,12 +41,17 @@ use notify::{EventKind, RecursiveMode, Watcher as _};
 ///
 /// ```rust
 /// # #[cfg(not(target_arch = "wasm32"))] {
-/// use skyzen::static_files::{StaticCacheSettings, StaticDir};
+/// use skyzen::{
+///     runtime::ServingThread,
+///     static_files::{StaticCacheSettings, StaticDir},
+/// };
 ///
 /// let settings = StaticCacheSettings::new(4096, 256 * 1024);
-/// let assets = StaticDir::new("/assets", "./dist").cache(settings.clone());
+/// // On each serving thread, inside the endpoint factory.
+/// let assets = |thread: &ServingThread| StaticDir::new("/assets", "./dist", thread).cache(settings.clone());
 /// // Later, from an admin endpoint or a configuration reload:
 /// settings.set_entries(16_384);
+/// # let _ = assets;
 /// # }
 /// ```
 #[derive(Debug, Clone)]
