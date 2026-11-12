@@ -1129,20 +1129,19 @@ where
     let pins =
         steering::decide(steering, threads.get(), &addr).map_err(RuntimeFailure::Steering)?;
     busy_poll::check(io.busy_poll.as_ref(), &addr).map_err(RuntimeFailure::BusyPoll)?;
-    let mut bound = cores::bind(&addr, threads, pins, io.busy_poll.as_ref())?;
     // QUIC takes the port TLS has on TCP, so a client that follows `Alt-Svc` stays on the host
-    // and port it came to. Bound here, with the TCP sockets, so a port that cannot be had fails
-    // the start before any thread exists.
-    let http3_port = match (
-        &http3,
-        bound.sockets.first().and_then(cores::Socket::tcp_addr),
-    ) {
-        (Some(http3), Some(local)) => {
-            let local = local?;
-            bound.udp = http3.bind(local, threads, io.busy_poll.as_ref())?;
-            Some(local.port())
-        }
-        _ => None,
+    // and port it came to. Bound with the TCP sockets, so a port that cannot be had fails the
+    // start before any thread exists.
+    let bound = cores::bind(&addr, threads, pins, io.busy_poll.as_ref(), http3.as_ref())?;
+    let http3_port = if bound.udp.is_empty() {
+        None
+    } else {
+        bound
+            .sockets
+            .first()
+            .and_then(cores::Socket::tcp_addr)
+            .transpose()?
+            .map(|local| local.port())
     };
     let scheme = if tls.is_some() { "https" } else { "http" };
     let http3_note = http3_port.map_or_else(String::new, |port| format!(" (HTTP/3 on udp/{port})"));
