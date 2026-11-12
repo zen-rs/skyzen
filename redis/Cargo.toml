@@ -40,7 +40,7 @@ rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.14"
 # The tests run on a compio runtime, the one the native server runs; tokio is here only to assert
 # that no tokio runtime is running.
-compio = { version = "0.19.2", default-features = false, features = ["runtime", "time", "macros"] }
+compio = { workspace = true, features = ["runtime", "time", "macros"] }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 # `tls-rustls-insecure` lets the handshake test accept a self-signed peer via
 # `rediss://…#insecure`; verification stays on for every other URL. Upstream `tls-rustls` requires

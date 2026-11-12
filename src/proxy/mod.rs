@@ -455,7 +455,7 @@ impl Endpoint for Proxy {
         );
         let response = match client.respond(&mut forwarded).await {
             Ok(response) => response,
-            Err(zenwave::Error::Timeout) => return Err(ProxyError::Timeout),
+            Err(zenwave::Error::Timeout(_)) => return Err(ProxyError::Timeout),
             Err(error) => return Err(ProxyError::Upstream(error)),
         };
         Ok(self.returned_response(response, accepts_trailers))

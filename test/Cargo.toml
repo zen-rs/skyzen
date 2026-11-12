@@ -31,7 +31,7 @@ http = { version = "1.4", default-features = false, optional = true }
 
 [dev-dependencies]
 # The tests run on a compio runtime, the one the native server runs.
-compio = { version = "0.19.2", default-features = false, features = ["runtime", "macros"] }
+compio = { workspace = true, features = ["runtime", "macros"] }
 
 [features]
 # `InMemoryDb` and `InMemoryDurableDb` run on SQLite over sqlx (SQLite uses no TLS, so none is

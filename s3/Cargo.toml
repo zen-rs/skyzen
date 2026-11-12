@@ -30,7 +30,7 @@ tracing.workspace = true
 [dev-dependencies]
 # The tests run on a compio runtime, the one the native server runs, against a loopback server;
 # tokio is here only to assert that no tokio runtime is running.
-compio = { version = "0.19.2", default-features = false, features = ["runtime", "macros"] }
+compio = { workspace = true, features = ["runtime", "macros"] }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 skyzen-test = { workspace = true, features = ["loopback"] }
 

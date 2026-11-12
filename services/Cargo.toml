@@ -58,7 +58,7 @@ sqlite = ["dep:sqlx", "sqlx/sqlite"]
 [dev-dependencies]
 # Every test runs on a compio runtime, the one the native server runs; tokio is here only for its
 # runtime-free channels and for asserting that no tokio runtime is running.
-compio = { version = "0.19.2", default-features = false, features = ["runtime", "time", "macros"] }
+compio = { workspace = true, features = ["runtime", "time", "macros"] }
 tokio = { version = "1.49", default-features = false, features = ["rt", "sync"] }
 futures-util = { version = "0.3.32", default-features = false }
 tempfile = "3.25"
