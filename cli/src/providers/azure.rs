@@ -453,7 +453,7 @@ pub fn check_manifest(manifest: &Manifest) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{ensure_runs_on_linux, prepare, ELF_MAGIC};
-    use crate::providers::{Action, SecretAction, Step};
+    use crate::providers::{Action, DeployMode, SecretAction, Step};
     use secrecy::SecretString;
     use skyzen_manifest::{Manifest, VarName};
 
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn a_deploy_publishes_the_generated_bundle_and_builds_the_handler_first() {
         let plan = prepare(
-            &Action::Deploy { upload_only: false },
+            &Action::Deploy(DeployMode::Full),
             &manifest(&format!(
                 "{ADDRESSED}target = \"x86_64-unknown-linux-musl\"\n"
             )),
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn a_deploy_without_an_app_name_says_so_before_building_anything() {
         let error = prepare(
-            &Action::Deploy { upload_only: false },
+            &Action::Deploy(DeployMode::Full),
             &manifest("[azure]\n"),
             &project(),
         )
@@ -542,7 +542,7 @@ mod tests {
             ),
         ] {
             let error = prepare(
-                &Action::Deploy { upload_only: false },
+                &Action::Deploy(DeployMode::Full),
                 &manifest(source),
                 &project(),
             )
@@ -570,12 +570,7 @@ mod tests {
         )
         .expect("valid manifest");
 
-        let plan = prepare(
-            &Action::Deploy { upload_only: false },
-            &manifest,
-            &project(),
-        )
-        .expect("plan");
+        let plan = prepare(&Action::Deploy(DeployMode::Full), &manifest, &project()).expect("plan");
         let last = plan.steps.last().expect("a deploy delivers its settings");
         let described = last.describe();
 
@@ -595,7 +590,7 @@ mod tests {
     #[test]
     fn a_deploy_refuses_when_a_declared_variable_is_set_nowhere() {
         let error = prepare(
-            &Action::Deploy { upload_only: false },
+            &Action::Deploy(DeployMode::Full),
             &manifest(&format!(
                 "[[secret]]\nname = \"SKYZEN_TEST_AZURE_UNSET_SECRET\"\n\n{ADDRESSED}"
             )),

@@ -115,9 +115,17 @@ impl IoOptions {
 #[must_use]
 pub fn apply_io_overrides(args: impl IntoIterator<Item = String>) -> IoOptions {
     let args: Vec<String> = args.into_iter().skip(1).collect();
-    let prefer = setting(&args, "--busy-poll-prefer", "SKYZEN_BUSY_POLL_PREFER");
-    let budget = setting(&args, "--busy-poll-budget", "SKYZEN_BUSY_POLL_BUDGET");
-    let timeout = setting(&args, "--busy-poll", "SKYZEN_BUSY_POLL");
+    let prefer = setting(
+        &args,
+        "--busy-poll-prefer",
+        skyzen_core::BUSY_POLL_PREFER_ENV,
+    );
+    let budget = setting(
+        &args,
+        "--busy-poll-budget",
+        skyzen_core::BUSY_POLL_BUDGET_ENV,
+    );
+    let timeout = setting(&args, "--busy-poll", skyzen_core::BUSY_POLL_ENV);
     assert!(
         timeout.is_some() || (prefer.is_none() && budget.is_none()),
         "--busy-poll-prefer and --busy-poll-budget refine busy polling, which is off: set its \

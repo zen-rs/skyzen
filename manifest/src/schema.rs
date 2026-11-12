@@ -334,6 +334,147 @@ pub struct NativeSection {
     /// the same `#[skyzen::queue]` handler.
     #[serde(default)]
     pub queue_consumer: Vec<NativeQueueConsumer>,
+    /// `[native.linux]` — the kernel and NIC settings `skyzen deploy --provider native` applies to
+    /// the Linux host it runs on.
+    #[serde(default)]
+    pub linux: Option<NativeLinuxSection>,
+    /// `[native.server]` — how the service `skyzen deploy --provider native` installs serves.
+    #[serde(default)]
+    pub server: Option<NativeServerSection>,
+}
+
+/// `[native.server]` — the serving settings of a native deployment.
+///
+/// They reach the runtime as its own environment variables (`SKYZEN_ADDRESS`, `SKYZEN_BUSY_POLL`,
+/// …) in the installed systemd unit, and they decide which privileges that unit grants: binding a
+/// port below 1024 takes `CAP_NET_BIND_SERVICE`, and `busy_poll_prefer` or a `busy_poll_budget`
+/// take `CAP_NET_ADMIN`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeServerSection {
+    /// Where the server listens: a TCP `host:port`, or `{ unix = "<path>" }`.
+    #[serde(default)]
+    pub listen: Option<ListenSetting>,
+    /// How long a wait busy-polls before it sleeps, in microseconds; unset is off.
+    #[serde(default)]
+    pub busy_poll: Option<BusyPollMicros>,
+    /// Whether the kernel defers the queues' softirq processing to the polling.
+    #[serde(default)]
+    pub busy_poll_prefer: bool,
+    /// How many packets one poll of a socket processes; unset is the kernel's own.
+    #[serde(default)]
+    pub busy_poll_budget: Option<std::num::NonZeroU16>,
+}
+
+/// Where a native server listens.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum ListenSetting {
+    /// A TCP socket address, `"0.0.0.0:443"`.
+    Tcp(std::net::SocketAddr),
+    /// A filesystem unix socket, `{ unix = "/run/app/app.sock" }`.
+    Unix {
+        /// The socket path.
+        unix: PathBuf,
+    },
+}
+
+/// A busy-poll timeout: at least 1 µs and at most `i32::MAX`, since `SO_BUSY_POLL` takes an `int`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "u32")]
+pub struct BusyPollMicros(std::num::NonZeroU32);
+
+impl BusyPollMicros {
+    /// The timeout in microseconds.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl TryFrom<u32> for BusyPollMicros {
+    type Error = String;
+
+    fn try_from(micros: u32) -> Result<Self, Self::Error> {
+        i32::try_from(micros)
+            .ok()
+            .and_then(|_| std::num::NonZeroU32::new(micros))
+            .map(Self)
+            .ok_or_else(|| {
+                format!(
+                    "busy_poll is between 1 and {} microseconds, not {micros}",
+                    i32::MAX
+                )
+            })
+    }
+}
+
+/// `[native.linux]` — the machine-side acceleration of a Linux serving host.
+///
+/// Each key states a value the host is to have; a key left out is not touched. Deploy applies the
+/// stated values as stated, and a facility the host lacks or does not report fails the deploy
+/// naming it. The values use the kernel's own names and units, the ones `skyzen doctor` reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeLinuxSection {
+    /// The kernel `tls` module, which kernel TLS and NIC TLS offload need.
+    #[serde(default)]
+    pub kernel_tls: Option<KernelTlsState>,
+    /// `net.core.busy_poll`, in microseconds: how long a `poll`/`epoll` busy-polls a socket's
+    /// receive queue; 0 is off.
+    #[serde(default)]
+    pub busy_poll: Option<u32>,
+    /// `net.core.busy_read`, in microseconds: how long a blocking read busy-polls; 0 is off.
+    #[serde(default)]
+    pub busy_read: Option<u32>,
+    /// `[native.linux.nic.<interface>]`, keyed by the interface name.
+    #[serde(default)]
+    pub nic: BTreeMap<String, NativeLinuxNic>,
+}
+
+/// The state `kernel_tls` asks the `tls` module to be in.
+///
+/// Only `loaded`: a loaded module is held by every socket using it, so there is no state to
+/// return to by unloading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KernelTlsState {
+    /// The `tls` upper-layer protocol is registered with TCP.
+    Loaded,
+}
+
+/// One `[native.linux.nic.<interface>]` section: a physical network interface's settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeLinuxNic {
+    /// The `tls-hw-tx-offload` feature: the NIC encrypts the kernel-TLS records it sends.
+    #[serde(default)]
+    pub tls_hw_tx_offload: Option<bool>,
+    /// The `tls-hw-rx-offload` feature: the NIC decrypts the kernel-TLS records it receives.
+    #[serde(default)]
+    pub tls_hw_rx_offload: Option<bool>,
+    /// The `tcp-data-split` ring parameter: the NIC writes headers and payload to separate
+    /// buffers, which zero-copy receive needs.
+    #[serde(default)]
+    pub tcp_data_split: Option<bool>,
+    /// `napi_defer_hard_irqs`: how many empty polls defer re-enabling a queue's interrupt.
+    #[serde(default)]
+    pub napi_defer_hard_irqs: Option<u32>,
+    /// `gro_flush_timeout`, in nanoseconds: how long a deferred interrupt waits.
+    #[serde(default)]
+    pub gro_flush_timeout: Option<u64>,
+    /// Where the interface's receive-queue interrupts are delivered.
+    #[serde(default)]
+    pub rx_irqs: Option<RxIrqPlacement>,
+}
+
+/// Where `rx_irqs` places an interface's receive-queue interrupts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RxIrqPlacement {
+    /// Each receive queue's interrupt goes to one serving CPU, in order and wrapping around: the
+    /// layout automatic connection steering turns on for once every serving CPU takes one.
+    Serving,
 }
 
 /// One `[[native.queue_consumer]]` entry — a polling loop over one portable queue.

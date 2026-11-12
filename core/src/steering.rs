@@ -187,17 +187,9 @@ pub fn rx_layout() -> io::Result<RxLayout> {
 ///
 /// `class/net` under `sys` or `interrupts` under `proc` cannot be read.
 pub fn rx_layout_at(sys: &Path, proc: &Path) -> io::Result<RxLayout> {
-    let names = interrupt_names(&proc.join("interrupts"))?;
     let mut queues = Vec::new();
-    for nic in physical_nics_at(sys)? {
-        let device = sys.join("class/net").join(&nic).join("device");
-        for irq in device_irqs(&device)? {
-            let Some(name) = names.get(&irq) else {
-                continue;
-            };
-            if !is_receive_name(name) {
-                continue;
-            }
+    for (nic, irqs) in rx_interrupts_at(sys, proc)? {
+        for irq in irqs {
             if let Some(cpu) = irq_cpu(proc, irq) {
                 queues.push(RxQueue {
                     nic: nic.clone(),
@@ -209,6 +201,58 @@ pub fn rx_layout_at(sys: &Path, proc: &Path) -> io::Result<RxLayout> {
     }
     Ok(RxLayout { queues })
 }
+
+/// Each physical interface's receive-queue interrupts, wherever they are delivered, in ascending
+/// order: the interrupts [`rx_layout`] judges and `skyzen deploy` places.
+///
+/// # Errors
+///
+/// `/sys/class/net` or `/proc/interrupts` cannot be read.
+pub fn rx_interrupts() -> io::Result<Vec<(String, Vec<u32>)>> {
+    rx_interrupts_at(Path::new("/sys"), Path::new("/proc"))
+}
+
+/// [`rx_interrupts`] over a sysfs and a procfs mounted at `sys` and `proc`.
+///
+/// # Errors
+///
+/// `class/net` under `sys` or `interrupts` under `proc` cannot be read.
+pub fn rx_interrupts_at(sys: &Path, proc: &Path) -> io::Result<Vec<(String, Vec<u32>)>> {
+    let names = interrupt_names(&proc.join("interrupts"))?;
+    let mut nics = Vec::new();
+    for nic in physical_nics_at(sys)? {
+        let device = sys.join("class/net").join(&nic).join("device");
+        let mut irqs: Vec<u32> = device_irqs(&device)?
+            .into_iter()
+            .filter(|irq| names.get(irq).is_some_and(|name| is_receive_name(name)))
+            .collect();
+        irqs.sort_unstable();
+        nics.push((nic, irqs));
+    }
+    Ok(nics)
+}
+
+/// The CPUs interrupt `irq` may be delivered to, as an operator sets them
+/// (`/proc/irq/<irq>/smp_affinity_list`).
+///
+/// # Errors
+///
+/// The file cannot be read or does not hold a CPU list.
+pub fn irq_affinity(irq: u32) -> io::Result<Vec<usize>> {
+    let path = Path::new("/proc/irq")
+        .join(irq.to_string())
+        .join(SMP_AFFINITY_LIST);
+    let list = std::fs::read_to_string(&path)?;
+    parse_cpu_list(list.trim()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} holds `{}`, not a CPU list", path.display(), list.trim()),
+        )
+    })
+}
+
+/// The file under `/proc/irq/<irq>/` that holds, and sets, where an interrupt may be delivered.
+pub const SMP_AFFINITY_LIST: &str = "smp_affinity_list";
 
 /// The action name of each interrupt in `/proc/interrupts`, by number.
 fn interrupt_names(path: &Path) -> io::Result<HashMap<u32, String>> {
@@ -257,7 +301,7 @@ fn is_receive_name(name: &str) -> bool {
 fn irq_cpu(proc: &Path, irq: u32) -> Option<usize> {
     let dir = proc.join("irq").join(irq.to_string());
     let list = std::fs::read_to_string(dir.join("effective_affinity_list"))
-        .or_else(|_| std::fs::read_to_string(dir.join("smp_affinity_list")))
+        .or_else(|_| std::fs::read_to_string(dir.join(SMP_AFFINITY_LIST)))
         .ok()?;
     let cpus = parse_cpu_list(list.trim())?;
     match cpus.as_slice() {
@@ -321,6 +365,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(physical_nics_at(&root.join("sys")).unwrap(), ["eth0"]);
+        assert_eq!(
+            rx_interrupts_at(&root.join("sys"), &root.join("proc")).unwrap(),
+            [("eth0".to_owned(), vec![24, 25, 27])],
+            "every receive queue, the spread one included, and not the config vector"
+        );
         let layout = rx_layout_at(&root.join("sys"), &root.join("proc")).unwrap();
         let mut cpus: Vec<_> = layout.queues.iter().map(|queue| queue.cpu).collect();
         cpus.sort_unstable();
