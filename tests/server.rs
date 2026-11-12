@@ -3,11 +3,13 @@
 //! The handler below counts requests in an `Rc<Cell<_>>`, so neither it nor the router holding it
 //! can cross a thread. What crosses is the [`EndpointFactory`]: the serving thread asks it for the
 //! router, then hands that router to the server along with listeners and a thread-local executor.
+//! These threads run `async-io`, not compio, so the context they hand the factory says so.
 
 use http_kit_io::{async_io::AsyncIo, FromStd as _, Listen};
 use skyzen::{
     hyper::Hyper,
     routing::{CreateRouteNode, Route, Router},
+    runtime::ServingThread,
     EndpointFactory, Server,
 };
 use skyzen_h1::H1;
@@ -28,7 +30,7 @@ fn counting_router() -> Router {
 }
 
 /// Serve the factory's router with `server` on a thread of its own, and return the bound address.
-fn start<S>(server: S, factory: impl EndpointFactory) -> SocketAddr
+fn start<S>(server: S, factory: impl EndpointFactory<ServingThread>) -> SocketAddr
 where
     S: Server<AsyncIo, Listeners = <AsyncIo as Listen>::Listener> + Send + 'static,
 {
@@ -39,7 +41,7 @@ where
         let executor = Rc::new(async_executor::LocalExecutor::new());
         let listener = AsyncIo.tcp_listener(listener).expect("register listener");
         futures_lite::future::block_on(executor.run(async {
-            let endpoint = factory.endpoint().await;
+            let endpoint = factory.endpoint(ServingThread::without_compio()).await;
             server
                 .serve(
                     AsyncIo,
@@ -90,10 +92,12 @@ fn assert_counts(addr: SocketAddr) {
 
 #[test]
 fn an_rc_holding_handler_serves_through_our_h1_server() {
-    assert_counts(start(H1::default(), || async { counting_router() }));
+    assert_counts(start(H1::default(), |_: ServingThread| async {
+        counting_router()
+    }));
 }
 
 #[test]
 fn an_rc_holding_handler_serves_through_the_hyper_server() {
-    assert_counts(start(Hyper, || async { counting_router() }));
+    assert_counts(start(Hyper, |_: ServingThread| async { counting_router() }));
 }

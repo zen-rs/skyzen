@@ -1,6 +1,7 @@
 //! The operator's settings for the serving threads' I/O: the provided buffer ring each thread's
 //! compio runtime receives into, the size from which a write is sent zero-copy, the size of
-//! each ring's registered file table, and busy polling.
+//! each ring's registered file table, the size of each ring's region of registered buffers, and
+//! busy polling.
 //!
 //! Each is set like every other startup setting of the native runtime, by a flag that beats an
 //! environment variable (`--steering`/`SKYZEN_STEERING`):
@@ -11,6 +12,7 @@
 //! | `--recv-buffer-len <bytes>` | `SKYZEN_RECV_BUFFER_LEN` | compio's, 8 KiB |
 //! | `--zero-copy-threshold <bytes>` | `SKYZEN_ZERO_COPY_THRESHOLD` | [`ZeroCopySend::DEFAULT_THRESHOLD`] |
 //! | `--file-table-slots <count>` | `SKYZEN_FILE_TABLE_SLOTS` | [`FileTable::DEFAULT_SLOTS`] |
+//! | `--fixed-buffers <bytes>` | `SKYZEN_FIXED_BUFFERS` | `0`, no region |
 //! | `--busy-poll <µs>` | `SKYZEN_BUSY_POLL` | off |
 //! | `--busy-poll-prefer <true\|false>` | `SKYZEN_BUSY_POLL_PREFER` | `false` |
 //! | `--busy-poll-budget <packets>` | `SKYZEN_BUSY_POLL_BUDGET` | the kernel's, 8 |
@@ -32,6 +34,20 @@
 //! a serving thread does when its first connection arrives, so on a running server only `0` (no
 //! slots for connections created afterwards) still changes anything.
 //!
+//! The region of registered buffers is fixed when a thread starts serving, like the receive ring:
+//! before it accepts, each serving thread maps a region of `--fixed-buffers` bytes and registers
+//! it as its ring's one registered buffer, which a ring does once. The kernel pins every thread's
+//! region and charges it to `RLIMIT_MEMLOCK` unless the process has `CAP_IPC_LOCK`, so a size the
+//! limit refuses stops startup. The thread hands the driver carrying its region to the endpoint
+//! factory in its [`ServingThread`](crate::runtime::ServingThread), and a
+//! [`StaticDir`](crate::static_files::StaticDir) built from it reads a file it keeps in memory into
+//! the region when the file is at least the zero-copy threshold, so that a zero-copy write of
+//! those bytes then goes out from registered memory, which nothing pins
+//! or charges per send. A response's head copied in beside its body makes such a write two
+//! slices, which the kernel takes from a registered buffer from Linux 6.15; before it the write is
+//! sent zero-copy as it would be without a region. A file that does not fit the space left is
+//! read into memory of its own.
+//!
 //! All of it matters on Linux over `io_uring` only; elsewhere the values are accepted and unused,
 //! except busy polling, which refuses to start where it cannot be had.
 
@@ -43,7 +59,7 @@ use core::{
 use std::fmt::Display;
 
 use http_kit::http_error;
-use http_kit_io::compio::{Compio, FileTable, ZeroCopySend};
+use http_kit_io::compio::{Compio, FileTable, FixedBuffers, Ring, ZeroCopySend};
 use skyzen_core::Extractor;
 use tracing::info;
 
@@ -63,6 +79,8 @@ pub struct IoOptions {
     pub zero_copy_threshold: Option<usize>,
     /// How many sockets each ring's file table holds (`--file-table-slots`).
     pub file_table_slots: Option<u32>,
+    /// How many bytes each ring's region of registered buffers holds (`--fixed-buffers`).
+    pub fixed_buffers: Option<usize>,
     /// Busy polling, when `--busy-poll` turns it on; `None` is off.
     pub busy_poll: Option<BusyPoll>,
 }
@@ -73,7 +91,7 @@ const DEFAULT_RECV_BUFFER_LEN: NonZeroUsize = NonZeroUsize::new(8 * 1024).unwrap
 
 impl IoOptions {
     /// The driver every serving thread runs its sockets on, holding the two shared handles these
-    /// options start at.
+    /// options start at and the size each thread's region is registered with.
     #[must_use]
     pub(crate) fn driver(&self) -> Compio {
         Compio::default()
@@ -84,6 +102,10 @@ impl IoOptions {
             .with_file_table(FileTable::new(
                 self.file_table_slots.unwrap_or(FileTable::DEFAULT_SLOTS),
             ))
+            .with_fixed_buffers(
+                self.fixed_buffers
+                    .map_or_else(FixedBuffers::default, FixedBuffers::new),
+            )
     }
 
     /// The receive ring of a thread that keeps up to `connections` open.
@@ -141,6 +163,7 @@ pub fn apply_io_overrides(args: impl IntoIterator<Item = String>) -> IoOptions {
         recv_buffer_len: setting(&args, "--recv-buffer-len", "SKYZEN_RECV_BUFFER_LEN"),
         zero_copy_threshold: setting(&args, "--zero-copy-threshold", "SKYZEN_ZERO_COPY_THRESHOLD"),
         file_table_slots: setting(&args, "--file-table-slots", "SKYZEN_FILE_TABLE_SLOTS"),
+        fixed_buffers: setting(&args, "--fixed-buffers", "SKYZEN_FIXED_BUFFERS"),
         busy_poll,
     }
 }
@@ -206,8 +229,9 @@ impl RecvRing {
 
 /// The serving threads' I/O settings, as the runtime runs them.
 ///
-/// Extract it in a handler to read them, or to change the two that are shared live (see the
-/// module documentation for which change takes effect when):
+/// The native runtime puts them into every request it serves. Extract it in a handler to read
+/// them, or to change the two that are shared live (see the module documentation for which change
+/// takes effect when):
 ///
 /// ```rust,no_run
 /// use skyzen::runtime::native::IoSettings;
@@ -264,16 +288,43 @@ impl IoSettings {
         self.recv_ring
     }
 
+    /// How many bytes each serving thread's ring registered as its region of registered buffers
+    /// when the thread started; `0` is no region. Fixed for the process, since a ring registers
+    /// its region once.
+    #[must_use]
+    pub fn fixed_buffers(&self) -> usize {
+        self.driver.fixed_buffers().bytes()
+    }
+
     /// Busy polling as every serving thread's ring and socket runs it; `None` is off.
     #[must_use]
     pub const fn busy_poll(&self) -> Option<BusyPoll> {
         self.busy_poll
     }
 
-    /// The driver a serving thread's sockets are created and adopted with, and a proxy's upstream
-    /// sockets dialed with.
+    /// The driver that holds the shared settings alone: a serving thread's timers and QUIC socket
+    /// run on it. A thread's listeners, and the [`ServingThread`](crate::runtime::ServingThread)
+    /// its factory is handed, take [`register_region`](Self::register_region)'s instead.
     pub(crate) fn driver(&self) -> Compio {
         self.driver.clone()
+    }
+
+    /// Register the current serving thread's region of [`fixed_buffers`](Self::fixed_buffers)
+    /// bytes on its ring, and return the driver its listeners are made with, so every connection
+    /// they accept sends from the region. Without a region to register (a size of `0`, a ring
+    /// compio put on polling, a platform other than Linux) the driver carries none.
+    ///
+    /// Called once per thread, inside the runtime [`runtime`](Self::runtime) built for it,
+    /// before it accepts.
+    ///
+    /// # Errors
+    ///
+    /// The region cannot be mapped, or the kernel refuses to register it: over `RLIMIT_MEMLOCK`.
+    pub(super) async fn register_region(&self) -> Result<Compio<Ring>, RuntimeFailure> {
+        self.driver
+            .register_fixed_region()
+            .await
+            .map_err(RuntimeFailure::FixedBuffers)
     }
 
     /// A serving thread's runtime, its buffer ring sized as [`recv_ring`](Self::recv_ring) says,
@@ -368,6 +419,81 @@ mod tests {
             driver.file_table().slots(),
             http_kit_io::compio::FileTable::DEFAULT_SLOTS
         );
+        assert_eq!(driver.fixed_buffers().bytes(), 0, "no region unless asked");
+    }
+
+    #[test]
+    #[serial]
+    fn the_region_size_comes_from_the_variable_and_the_flag_beats_it() {
+        // SAFETY: the test is serial, so no other thread reads the environment meanwhile.
+        unsafe { std::env::set_var("SKYZEN_FIXED_BUFFERS", "2097152") };
+        let from_variable = apply_io_overrides(args(&[]));
+        let from_flag = apply_io_overrides(args(&["--fixed-buffers", "4194304"]));
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("SKYZEN_FIXED_BUFFERS") };
+        assert_eq!(from_variable.fixed_buffers, Some(2_097_152));
+        assert_eq!(from_flag.fixed_buffers, Some(4_194_304));
+        let settings = super::IoSettings::new(
+            from_flag.driver(),
+            from_flag.recv_ring(NonZeroUsize::MIN),
+            None,
+        );
+        assert_eq!(settings.fixed_buffers(), 4_194_304);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "invalid --fixed-buffers `1M`")]
+    fn a_region_size_that_is_not_a_byte_count_stops_the_process() {
+        let _ = apply_io_overrides(args(&["--fixed-buffers=1M"]));
+    }
+
+    /// The driver a serving thread built from `options` makes its listeners with, once its ring
+    /// registered what `options` asks for. Called inside that thread's runtime.
+    async fn serving_thread_ring(options: IoOptions) -> http_kit_io::compio::Compio<super::Ring> {
+        super::IoSettings::new(options.driver(), options.recv_ring(NonZeroUsize::MIN), None)
+            .register_region()
+            .await
+            .expect("the ring registers its region")
+    }
+
+    /// With a size of `0` a ring registers no region; off Linux no ring registers one at all, so
+    /// asking for one there still starts.
+    #[test]
+    fn a_ring_asked_for_no_region_registers_none() {
+        #[cfg(target_os = "linux")]
+        let options = IoOptions::default();
+        #[cfg(not(target_os = "linux"))]
+        let options = IoOptions {
+            fixed_buffers: Some(1024 * 1024),
+            ..IoOptions::default()
+        };
+        crate::runtime::testing::block_on(async {
+            let ring = serving_thread_ring(options).await;
+            #[cfg(target_os = "linux")]
+            assert!(ring.fixed_region().is_none());
+            #[cfg(not(target_os = "linux"))]
+            let _ = ring;
+        });
+    }
+
+    /// A serving thread's ring registers a region of the size asked for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_serving_thread_registers_a_region_of_the_size_asked_for() {
+        crate::runtime::testing::block_on(async {
+            // Inside a container's default `RLIMIT_MEMLOCK`, 64 KiB.
+            const BYTES: usize = 16 * 1024;
+            let ring = serving_thread_ring(IoOptions {
+                fixed_buffers: Some(BYTES),
+                ..IoOptions::default()
+            })
+            .await;
+            let region = ring
+                .fixed_region()
+                .expect("an io_uring ring registers the region asked for");
+            assert!(region.len() >= BYTES, "{region:?}");
+        });
     }
 
     #[test]
@@ -380,6 +506,7 @@ mod tests {
             "--zero-copy-threshold",
             "0",
             "--file-table-slots=65536",
+            "--fixed-buffers=1048576",
             "--busy-poll",
             "50",
             "--busy-poll-prefer=true",
@@ -393,6 +520,7 @@ mod tests {
                 recv_buffer_len: NonZeroUsize::new(16_384),
                 zero_copy_threshold: Some(0),
                 file_table_slots: Some(65_536),
+                fixed_buffers: Some(1_048_576),
                 busy_poll: Some(BusyPoll {
                     timeout: BusyPollTimeout::from_micros(50).unwrap(),
                     prefer: true,

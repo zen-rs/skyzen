@@ -46,31 +46,36 @@ pub trait Server<I: Listen> {
         E: Endpoint + Clone + 'static;
 }
 
-/// Builds the endpoint one serving thread answers with.
+/// Builds the endpoint one serving thread answers with, from what that thread hands it.
 ///
 /// The factory is `Send + Sync`, so it can be handed to every thread a runtime starts; what it
 /// builds is not, so each thread calls it once, on itself, and keeps the result. The services it
 /// captures are built once and shared — they are `Send + Sync` — while the router and its
 /// per-thread state are built anew on each thread and never leave it.
 ///
-/// Implemented for every `Fn() -> impl Future<Output = E> + Send + Sync`.
-pub trait EndpointFactory: Send + Sync + 'static {
+/// `Cx` is the thread's context, which the host that runs the thread names and builds on it: what
+/// an endpoint can only get from the thread it serves on, such as the I/O driver of that thread's
+/// runtime. It is a parameter rather than a type the factory chooses, because the host supplies it
+/// and a factory serves every host that supplies it.
+///
+/// Implemented for every `Fn(Cx) -> impl Future<Output = E> + Send + Sync`.
+pub trait EndpointFactory<Cx>: Send + Sync + 'static {
     /// The endpoint each thread serves.
     type Endpoint: Endpoint + Clone + 'static;
 
-    /// Build this thread's endpoint.
-    fn endpoint(&self) -> impl Future<Output = Self::Endpoint>;
+    /// Build this thread's endpoint from `context`, the thread's own.
+    fn endpoint(&self, context: Cx) -> impl Future<Output = Self::Endpoint>;
 }
 
-impl<F, Fut, E> EndpointFactory for F
+impl<F, Fut, E, Cx> EndpointFactory<Cx> for F
 where
-    F: Fn() -> Fut + Send + Sync + 'static,
+    F: Fn(Cx) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = E>,
     E: Endpoint + Clone + 'static,
 {
     type Endpoint = E;
 
-    fn endpoint(&self) -> impl Future<Output = E> {
-        self()
+    fn endpoint(&self, context: Cx) -> impl Future<Output = E> {
+        self(context)
     }
 }

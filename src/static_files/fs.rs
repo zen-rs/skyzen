@@ -2,9 +2,10 @@
 //!
 //! [`CompioFs`] is the default: the serving thread's own compio runtime, so on Linux the `open` and
 //! the `statx` of a path are `io_uring` operations, submitted in the same batch, and a small file's
-//! read is one too. [`BlockingFs`] runs the same calls on the `blocking` thread pool, which belongs
-//! to no runtime, for a router served by an executor of the application's own (the `hyper`
-//! embedding under Tokio).
+//! read is one too, into the thread's region of registered buffers when it has one (see
+//! [`StaticDir`](super::StaticDir)). [`BlockingFs`] runs the same calls on the `blocking` thread
+//! pool, which belongs to no runtime, for a router served by an executor of the application's own
+//! (the `hyper` embedding under Tokio).
 
 use std::{fs::File, future::Future, io, path::PathBuf, time::SystemTime};
 
@@ -63,6 +64,17 @@ pub(super) mod sealed {
 
         /// Read the first `len` bytes of the file, which must still hold that many.
         fn read(&self, handle: Self::Handle, len: u64) -> impl Future<Output = io::Result<Bytes>>;
+
+        /// Read the first `len` bytes of the file into `region`, the serving thread's region of
+        /// registered buffers; `None` when the region has no room for them, or when the backend
+        /// does not read on the ring the region belongs to.
+        #[cfg(target_os = "linux")]
+        fn read_fixed(
+            &self,
+            handle: &Self::Handle,
+            len: u64,
+            region: &http_kit_io::compio::FixedRegion,
+        ) -> impl Future<Output = io::Result<Option<Bytes>>>;
 
         /// The file as a `std` handle, which the cache shares among its file-region bodies.
         fn std_file(&self, handle: Self::Handle) -> io::Result<File>;
@@ -126,6 +138,21 @@ impl sealed::Ops for CompioFs {
         Ok(Bytes::from(buffer.into_inner()))
     }
 
+    /// Fixed reads (`IORING_OP_READ_FIXED`) on the serving thread's ring, straight into its
+    /// region.
+    #[cfg(target_os = "linux")]
+    async fn read_fixed(
+        &self,
+        handle: &Self::Handle,
+        len: u64,
+        region: &http_kit_io::compio::FixedRegion,
+    ) -> io::Result<Option<Bytes>> {
+        region
+            .read_at(handle.clone(), 0, in_memory(len)?)
+            .await
+            .map_err(shrank)
+    }
+
     /// One `dup` of the descriptor, once per cache fill, so the cache owns a plain `File`.
     fn std_file(&self, handle: Self::Handle) -> io::Result<File> {
         let owned = std::os::fd::AsFd::as_fd(&handle).try_clone_to_owned()?;
@@ -166,6 +193,17 @@ impl sealed::Ops for BlockingFs {
             Ok(Bytes::from(buffer))
         })
         .await
+    }
+
+    /// The blocking pool reads on no ring, so it never reads into one's region.
+    #[cfg(target_os = "linux")]
+    fn read_fixed(
+        &self,
+        _: &Self::Handle,
+        _: u64,
+        _: &http_kit_io::compio::FixedRegion,
+    ) -> impl Future<Output = io::Result<Option<Bytes>>> {
+        std::future::ready(Ok(None))
     }
 
     fn std_file(&self, handle: Self::Handle) -> io::Result<File> {

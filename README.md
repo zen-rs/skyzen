@@ -802,15 +802,21 @@ being discarded.
 ## Static Files & SPA Support
 
 ```rust
-use skyzen::routing::Route;
+use skyzen::routing::{Route, Router};
+use skyzen::runtime::ServingThread;
 use skyzen::static_files::{EmbeddedStaticDir, StaticDir};
 
-// From disk (native only). Streamed, with ETag, Last-Modified, Range and 304/206 handling.
-let disk_routes = Route::new((
-    StaticDir::new("/assets", "./public")
-        .index_file("index.html")
-        .spa(), // extensionless paths fall back to index.html
-));
+// From disk (native only). Streamed, with ETag, Last-Modified, Range and 304/206 handling, and
+// built from the thread it serves on, whose registered buffers (`--fixed-buffers`) it reads into.
+#[skyzen::main]
+fn main(thread: &ServingThread) -> Router {
+    Route::new((
+        StaticDir::new("/assets", "./public", thread)
+            .index_file("index.html")
+            .spa(), // extensionless paths fall back to index.html
+    ))
+    .build()
+}
 
 // Embedded at compile time — works on native and wasm alike.
 static ASSETS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/dist");

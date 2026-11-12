@@ -553,11 +553,14 @@ mod tests {
 
     impl Serving {
         fn start(pki: &Pki) -> Self {
-            Self::serve(pki, || async { router() })
+            Self::serve(pki, |_: crate::runtime::ServingThread| async { router() })
         }
 
         /// Serve the routers `factory` builds, one per thread.
-        fn serve(pki: &Pki, factory: impl crate::EndpointFactory) -> Self {
+        fn serve(
+            pki: &Pki,
+            factory: impl crate::EndpointFactory<crate::runtime::ServingThread>,
+        ) -> Self {
             let threads = NonZeroUsize::new(2).unwrap();
             let addr = loopback();
             let tls = tls::build(Some(&pki.files), &addr).expect("the pair loads");
@@ -922,9 +925,9 @@ mod tests {
             let upstream = Upstream::new(&target).expect("upstream");
 
             let pki = pki();
-            let serving = Serving::serve(&pki, move || {
+            let serving = Serving::serve(&pki, move |thread: crate::runtime::ServingThread| {
                 let upstream = upstream.clone();
-                async move { Route::new(("/api".mount(Proxy::new(&upstream)),)).build() }
+                async move { Route::new(("/api".mount(Proxy::new(&upstream, &thread)),)).build() }
             });
             let port = serving.addr.port();
             let mut client = client(&pki);

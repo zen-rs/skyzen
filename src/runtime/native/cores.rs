@@ -25,7 +25,7 @@ use http_kit_io::FromStd as _;
 #[cfg(unix)]
 use http_kit_io::FromStdUnix as _;
 use http_kit_io::{
-    compio::{Compio, TcpStream},
+    compio::{Compio, Ring, TcpStream},
     IntoPoll, Listener, ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions,
 };
 use skyzen_core::{EndpointFactory, PeerAddress};
@@ -42,7 +42,7 @@ use super::{
     HttpServer, IoSettings, RuntimeFailure,
 };
 use crate::{
-    runtime::{context::ShutdownGuard, WorkerContext},
+    runtime::{context::ShutdownGuard, ServingThread, WorkerContext},
     Endpoint, Request, Response,
 };
 
@@ -331,7 +331,7 @@ pub(super) fn start<F, A, W>(
     release: &Receiver<Infallible>,
 ) -> io::Result<Cores>
 where
-    F: EndpointFactory,
+    F: EndpointFactory<ServingThread>,
     A: Endpoint + Clone + 'static,
     W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
 {
@@ -394,6 +394,25 @@ where
     })
 }
 
+/// Register the current serving thread's region and build the endpoint it serves; called inside
+/// its runtime, before it accepts.
+///
+/// The listeners are made with the driver this returns, so every connection sends from the
+/// region, and the factory is handed it, so the static file cache can read files into it. The
+/// router is built here, on the thread that serves it, so it may hold anything.
+async fn build<F, A, W>(plan: &Plan<F, W>) -> Result<(Compio<Ring>, A), RuntimeFailure>
+where
+    F: EndpointFactory<ServingThread>,
+    W: Fn(F::Endpoint) -> Result<A, RuntimeFailure>,
+{
+    let ring = plan.io.register_region().await?;
+    let endpoint = plan
+        .factory
+        .endpoint(ServingThread::on_ring(ring.clone()))
+        .await;
+    Ok((ring, (plan.wrap)(endpoint)?))
+}
+
 /// The body of one serving thread: a compio runtime that serves until `stop` closes and runs until
 /// `release` does.
 fn work<F, A, W>(
@@ -405,7 +424,7 @@ fn work<F, A, W>(
     release: &Receiver<Infallible>,
     ready: &Sender<Result<(), RuntimeFailure>>,
 ) where
-    F: EndpointFactory,
+    F: EndpointFactory<ServingThread>,
     A: Endpoint + Clone + 'static,
     W: Fn(F::Endpoint) -> Result<A, RuntimeFailure> + Send + Sync + 'static,
 {
@@ -419,10 +438,8 @@ fn work<F, A, W>(
     let executor = Rc::clone(&runtime);
     let io = plan.io.driver();
     runtime.block_on(async {
-        // The router is built here, on the thread that serves it, so it may hold anything.
-        let endpoint = plan.factory.endpoint().await;
-        let endpoint = match (plan.wrap)(endpoint) {
-            Ok(endpoint) => endpoint,
+        let (ring, endpoint) = match build(plan).await {
+            Ok(built) => built,
             Err(error) => {
                 let _ = ready.send(Err(error)).await;
                 return;
@@ -473,7 +490,7 @@ fn work<F, A, W>(
         let tcp = async {
             match socket {
                 #[cfg(not(windows))]
-                Socket::Tcp(listener) => match io.tcp_listener(listener) {
+                Socket::Tcp(listener) => match ring.tcp_listener(listener) {
                     Ok(listener) => {
                         serve_tcp(plan, &h1, executor, io, listener, endpoint, shutdown, ready)
                             .await;
@@ -483,11 +500,11 @@ fn work<F, A, W>(
                     }
                 },
                 Socket::Handoff(incoming) => {
-                    let listener = incoming.adopted_by(io.clone());
+                    let listener = incoming.adopted_by(ring);
                     serve_tcp(plan, &h1, executor, io, listener, endpoint, shutdown, ready).await;
                 }
                 #[cfg(unix)]
-                Socket::Unix(listener) => match io.unix_listener(listener) {
+                Socket::Unix(listener) => match ring.unix_listener(listener) {
                     Ok(listener) => {
                         if announce(ready).await {
                             serve_cleartext(
@@ -629,10 +646,11 @@ async fn announce(ready: &Sender<Result<(), RuntimeFailure>>) -> bool {
 }
 
 /// An endpoint that hands every request the [`WorkerContext`] of the thread serving it, and the
-/// runtime's [`IoSettings`].
+/// runtime's [`IoSettings`], which a handler extracts to change the operator's live settings.
 ///
 /// The context carries a drain token, so a request in flight, and any post-response work it
-/// registers, keeps graceful shutdown waiting.
+/// registers, keeps graceful shutdown waiting. Both are `Send + Sync`: what is the thread's own
+/// reached the endpoint through the [`ServingThread`] its factory was handed.
 #[derive(Debug, Clone)]
 struct WithContext<E> {
     endpoint: E,
@@ -665,7 +683,10 @@ mod tests {
     use super::{bind, start, Bound, Cores, Pins, Plan, Socket};
     use crate::runtime::native::handoff;
     use crate::{
-        runtime::native::{HttpServer, IoOptions, IoSettings, ListenAddr, RuntimeFailure},
+        runtime::{
+            native::{HttpServer, IoOptions, IoSettings, ListenAddr, RuntimeFailure},
+            ServingThread,
+        },
         Endpoint, Request, Response,
     };
 
@@ -680,10 +701,10 @@ mod tests {
 
     impl Serving {
         fn start(bound: Bound, server: HttpServer) -> Self {
-            Self::start_with(bound, server, || async { ServingThread })
+            Self::start_with(bound, server, |_: ServingThread| async { ThreadName })
         }
 
-        fn start_with<F: skyzen_core::EndpointFactory>(
+        fn start_with<F: skyzen_core::EndpointFactory<ServingThread>>(
             bound: Bound,
             server: HttpServer,
             factory: F,
@@ -693,7 +714,7 @@ mod tests {
         }
 
         /// Start the threads on `options`, or report the first that could not start.
-        fn start_io<F: skyzen_core::EndpointFactory>(
+        fn start_io<F: skyzen_core::EndpointFactory<ServingThread>>(
             bound: Bound,
             server: HttpServer,
             factory: F,
@@ -759,9 +780,9 @@ mod tests {
 
     /// Answers with the name of the thread that served the request.
     #[derive(Clone)]
-    struct ServingThread;
+    struct ThreadName;
 
-    impl Endpoint for ServingThread {
+    impl Endpoint for ThreadName {
         type Error = BoxHttpError;
 
         fn respond(
@@ -777,16 +798,11 @@ mod tests {
         }
     }
 
-    /// Four serving threads on one address, and requests that land on more than one of them.
-    ///
-    /// Each connection goes to the listener the kernel picks, so asking for it over many
-    /// connections is what shows the work spreads; a single serving thread would answer every
-    /// one under the same name.
-    /// A proxy built by the factory, before any runtime settings reach it, builds its pool on the
-    /// serving thread at its first request and forwards through it.
+    /// A proxy the factory builds from the serving thread it is handed dials its pool from that
+    /// thread's driver, and forwards through it.
     #[cfg(feature = "proxy")]
     #[test]
-    fn a_proxy_served_by_the_runtime_builds_its_pool_on_the_serving_thread() {
+    fn a_proxy_built_from_the_serving_thread_forwards_through_its_pool() {
         use std::io::{Read, Write};
 
         use crate::{
@@ -823,9 +839,9 @@ mod tests {
         )
         .expect("bind");
         let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
-        let serving = Serving::start_with(bound, HttpServer::H1, move || {
+        let serving = Serving::start_with(bound, HttpServer::H1, move |thread: ServingThread| {
             let upstream = upstream.clone();
-            async move { Route::new(("/".mount(Proxy::new(&upstream)),)).build() }
+            async move { Route::new(("/".mount(Proxy::new(&upstream, &thread)),)).build() }
         });
 
         let body = exchange(std::net::TcpStream::connect(addr).expect("connect"));
@@ -834,6 +850,11 @@ mod tests {
         assert_eq!(body, "origin");
     }
 
+    /// Four serving threads on one address, and requests that land on more than one of them.
+    ///
+    /// Each connection goes to the listener the kernel picks, so asking for it over many
+    /// connections is what shows the work spreads; a single serving thread would answer every
+    /// one under the same name.
     #[test]
     fn connections_land_on_more_than_one_runtime_thread() {
         // Both servers a cleartext listener can be given run through the same threads.
@@ -990,7 +1011,7 @@ mod tests {
         let serving = Serving::start_io(
             bound,
             HttpServer::H1,
-            || async { ServingThread },
+            |_: ServingThread| async { ThreadName },
             IoOptions {
                 busy_poll: Some(busy_poll),
                 ..IoOptions::default()
@@ -1096,6 +1117,58 @@ mod tests {
             serving.stop();
             std::fs::remove_file(&path).expect("the socket file is ours to remove");
             assert!(body.starts_with("skyzen-"), "{server:?}: {body}");
+        }
+    }
+
+    /// With `--fixed-buffers`, every serving thread registers its region before it accepts, and a
+    /// static file its cache read into the region is served whole over TCP, by either server:
+    /// `skyzen-h1` writes it zero-copy from the region, with the head copied in beside it.
+    #[cfg(all(target_os = "linux", feature = "static-files"))]
+    #[test]
+    fn a_static_file_in_the_region_is_served_whole_over_tcp() {
+        use crate::{routing::Route, static_files::StaticDir};
+
+        /// Chinese, Japanese and Korean, so the body is checked as text that is not ASCII.
+        const CJK: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
+
+        let dir = tempfile::tempdir().unwrap();
+        // Above the threshold below, below the cache's inline limit, and well inside the region.
+        let document = CJK.repeat(128);
+        std::fs::write(dir.path().join("index.html"), &document).unwrap();
+        let root = Arc::new(dir.path().to_path_buf());
+        for server in [HttpServer::H1, HttpServer::Hyper] {
+            let bound = bind(
+                &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
+                NonZeroUsize::new(2).unwrap(),
+                Pins::default(),
+                None,
+                None,
+            )
+            .expect("bind");
+            let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
+            let root = Arc::clone(&root);
+            let factory = move |thread: ServingThread| {
+                let root = Arc::clone(&root);
+                async move { Route::new((StaticDir::new("/", root.as_path(), &thread),)).build() }
+            };
+            let options = IoOptions {
+                // Two threads' regions stay inside a container's default `RLIMIT_MEMLOCK`, 64 KiB,
+                // and each holds the document with room for its response's head.
+                fixed_buffers: Some(16 * 1024),
+                zero_copy_threshold: Some(1024),
+                ..IoOptions::default()
+            };
+            let serving = Serving::start_io(bound, server, factory, options)
+                .expect("every thread registers its region and serves");
+            // The first fills the cache of the thread that takes it; the rest are served from a
+            // cache, on whichever thread the kernel hands each connection to.
+            let bodies: Vec<String> = (0..4)
+                .map(|_| exchange(std::net::TcpStream::connect(addr).expect("connect")))
+                .collect();
+            serving.stop();
+            for body in bodies {
+                assert_eq!(body, document, "{server:?}");
+            }
         }
     }
 

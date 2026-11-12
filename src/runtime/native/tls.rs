@@ -1079,11 +1079,17 @@ mod tests {
         let (_tls_dir, tls, der) = acceptor();
         tracing::subscriber::with_default(log.subscriber(tracing::Level::TRACE), || {
             on_compio(|runtime| async move {
+                let thread = crate::runtime::ServingThread::on_ring(
+                    Compio::default()
+                        .register_fixed_region()
+                        .await
+                        .expect("a ring asked for no region registers none"),
+                );
                 // Inline limit zero: the file is cached as an open descriptor, sent as a region.
-                let router = build(Route::new((
-                    StaticDir::new("/", dir.path()).cache(StaticCacheSettings::new(16, 0)),
-                )))
-                .expect("the router builds");
+                let router =
+                    build(Route::new((StaticDir::new("/", dir.path(), &thread)
+                        .cache(StaticCacheSettings::new(16, 0)),)))
+                    .expect("the router builds");
                 let (addr, stop, task) = start(&runtime, tls, HttpServer::H1, router);
 
                 let mut client = tls_client(addr, &der, b"http/1.1").await;

@@ -19,7 +19,7 @@ use async_channel::{unbounded, Receiver, Sender};
 use async_io::Async;
 use futures_util::{future::Either, pin_mut};
 use http_kit_io::{
-    compio::{Compio, TcpStream},
+    compio::{Compio, Ring, TcpStream},
     Listener,
 };
 use socket2::{Domain, Protocol, Socket, Type};
@@ -39,8 +39,8 @@ pub(super) struct Incoming {
 
 impl Incoming {
     /// The dealt connections as the serving thread's listener, each adopted by `io`, the
-    /// thread's driver, on that thread's runtime.
-    pub(super) const fn adopted_by(self, io: Compio) -> Dealt {
+    /// thread's driver for its ring, on that thread's runtime.
+    pub(super) const fn adopted_by(self, io: Compio<Ring>) -> Dealt {
         Dealt { incoming: self, io }
     }
 
@@ -54,7 +54,7 @@ impl Incoming {
 #[derive(Debug)]
 pub(super) struct Dealt {
     incoming: Incoming,
-    io: Compio,
+    io: Compio<Ring>,
 }
 
 impl Listener for Dealt {
