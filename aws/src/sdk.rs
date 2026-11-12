@@ -19,7 +19,7 @@
 //! [`ZenwaveHttpClient::system`].
 
 use core::{fmt, future::Future, time::Duration};
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 /// The configuration [`load_config`] loads and every `from_config` constructor takes.
 pub use aws_config::SdkConfig;
@@ -42,14 +42,14 @@ use http_kit::{Body, Endpoint as _};
 use zenwave::{
     backend::{NativeBackend, NativeIo},
     dns::Getaddrinfo,
-    Transport, TransportBuilder,
+    Timeouts, Transport, TransportBuilder,
 };
 
 use crate::credential_process::CredentialProcessProvider;
 
 /// The AWS SDK's [`HttpClient`], on zenwave [`NativeBackend`]s.
 ///
-/// Clones share the backends and their connection pools. A `4xx` or `5xx` answer is handed to the
+/// Clones share the backend and its connection pool. A `4xx` or `5xx` answer is handed to the
 /// SDK as the response it is, so the SDK reads the service's error from its body as it does on any
 /// client.
 ///
@@ -69,22 +69,22 @@ use crate::credential_process::CredentialProcessProvider;
 /// # Timeouts
 ///
 /// The SDK's operation and attempt timeouts run on [`AsyncIoSleep`] and bound every call. The
-/// connect and read timeouts in the [`HttpConnectorSettings`] the SDK passes are zenwave's own:
-/// each distinct pair gets a [`NativeBackend`] over a [`Transport`] carrying exactly those
-/// timeouts, built on first use and kept, so the SDK's clients with equal settings share one pool,
-/// as they do on aws-smithy's own hyper client.
+/// connect and read timeouts in the [`HttpConnectorSettings`] the SDK passes ride on each request
+/// as zenwave's [`Timeouts`], over the defaults of the transport the client was built with, so one
+/// backend and one pool serve every SDK client whatever its settings. A timeout the SDK leaves
+/// unset leaves the transport's default in force.
 ///
-/// - The connect timeout bounds one connection attempt: DNS, TCP, a proxy tunnel and TLS. It
-///   reaches the SDK as a [`ConnectorError`] timeout.
-/// - The read timeout bounds each wait for bytes of the response, head and body. A head that
-///   takes longer is a [`ConnectorError`] timeout; a body that stalls fails its read with an
-///   [`std::io::ErrorKind::TimedOut`] error wrapping [`zenwave::Error::Timeout`].
+/// - The connect timeout bounds a request's wait for a connection: DNS, TCP, a proxy tunnel and
+///   TLS. It reaches the SDK as a [`ConnectorError`] timeout.
+/// - The read timeout bounds the wait for the response head and each wait for more of the body. A
+///   head that takes longer is a [`ConnectorError`] timeout; a body that stalls fails its read
+///   with zenwave's `ReceiveError::Stalled`.
 #[derive(Clone)]
 pub struct ZenwaveHttpClient<P = SharedDriver> {
-    /// Describes the base transport, proxy and trust roots, each backend's timeouts go on top of.
+    /// Describes the transport: proxy, trust roots and default timeouts.
     transport: Arc<dyn Fn() -> TransportBuilder + Send + Sync>,
-    /// One backend per distinct settings, shared by every clone.
-    backends: Backends,
+    /// The backend, built on first use and shared by every clone.
+    backend: Backend,
     /// Where a backend's pool is started.
     pools: P,
 }
@@ -92,7 +92,7 @@ pub struct ZenwaveHttpClient<P = SharedDriver> {
 impl<P: fmt::Debug> fmt::Debug for ZenwaveHttpClient<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ZenwaveHttpClient")
-            .field("backends", &self.backends)
+            .field("backend", &self.backend)
             .field("pools", &self.pools)
             .finish_non_exhaustive()
     }
@@ -103,65 +103,55 @@ pub trait Pools: sealed::Sealed {}
 
 /// What the sealed half of [`Pools`] names: public items no path outside this module reaches.
 mod sealed {
-    use core::{fmt, future::Future, time::Duration};
-    use std::{
-        collections::{hash_map::Entry, HashMap},
-        sync::{Arc, Mutex, PoisonError},
-    };
+    use core::{fmt, future::Future};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use zenwave::{backend::NativeBackend, Transport};
 
     /// How a pool is started; sealed, because the two kinds are the only two places a pool runs.
     pub trait Sealed: Clone + fmt::Debug + Send + Sync + 'static {
-        /// The backend for `timeouts`: the one in `backends`, or one built over `transport()` and
-        /// kept there.
+        /// The client's backend: the one in `backend`, or one built over `transport()` and kept
+        /// there.
         fn backend(
             &self,
-            backends: &Backends,
-            timeouts: Timeouts,
+            backend: &Backend,
             transport: impl FnOnce() -> Result<Transport, Unavailable> + Send,
         ) -> impl Future<Output = Result<NativeBackend, Unavailable>> + Send + 'static;
     }
 
-    /// The part of `HttpConnectorSettings` a backend depends on, which is not `Hash` itself.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct Timeouts {
-        pub connect: Option<Duration>,
-        pub read: Option<Duration>,
-    }
-
-    /// One backend per distinct settings. The SDK runs a call on whichever thread polls it, so the
-    /// map needs a lock; it is held only to look up, insert, or build one backend.
+    /// A client's one backend. The SDK runs a call on whichever thread polls it, so the slot needs
+    /// a lock; it is held only to look up, fill, or build the backend.
     #[derive(Clone, Debug, Default)]
-    pub struct Backends(Arc<Mutex<HashMap<Timeouts, NativeBackend>>>);
+    pub struct Backend(Arc<Mutex<Option<NativeBackend>>>);
 
-    impl Backends {
-        /// The backend for `timeouts`, if one was built.
-        pub fn get(&self, timeouts: Timeouts) -> Option<NativeBackend> {
-            // The map is never left half-written, so a lock poisoned by an unrelated panic is
+    impl Backend {
+        /// The backend, if one was built.
+        pub fn get(&self) -> Option<NativeBackend> {
+            // The slot is never left half-written, so a lock poisoned by an unrelated panic is
             // still a consistent cache.
-            let backends = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            backends.get(&timeouts).cloned()
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
 
-        /// The backend for `timeouts`, built by `build` under the lock when there is none, so two
-        /// threads asking for the same settings build one backend. A failed build is not cached.
+        /// The backend, built by `build` under the lock when there is none, so two threads asking
+        /// build one backend. A failed build is not cached.
         pub fn get_or_build(
             &self,
-            timeouts: Timeouts,
             build: impl FnOnce() -> Result<NativeBackend, Unavailable>,
         ) -> Result<NativeBackend, Unavailable> {
-            let mut backends = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            match backends.entry(timeouts) {
-                Entry::Occupied(entry) => Ok(entry.get().clone()),
-                Entry::Vacant(entry) => Ok(entry.insert(build()?).clone()),
+            let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(backend) = &*slot {
+                return Ok(backend.clone());
             }
+            Ok(slot.insert(build()?).clone())
         }
 
-        /// Keep `backend` for `timeouts` unless another was kept first, and return the one kept.
-        pub fn keep(&self, timeouts: Timeouts, backend: NativeBackend) -> NativeBackend {
-            let mut backends = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            backends.entry(timeouts).or_insert(backend).clone()
+        /// Keep `backend` unless another was kept first, and return the one kept.
+        pub fn keep(&self, backend: NativeBackend) -> NativeBackend {
+            let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            slot.get_or_insert(backend).clone()
         }
     }
 
@@ -197,9 +187,9 @@ mod sealed {
     }
 }
 
-use sealed::{Backends, Timeouts, Unavailable};
+use sealed::{Backend, Unavailable};
 
-/// Pools on zenwave's own driver thread, one per transport, started by the first request.
+/// Pools on zenwave's own driver thread, the client's one, started by the first request.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SharedDriver;
 
@@ -208,29 +198,27 @@ impl Pools for SharedDriver {}
 impl sealed::Sealed for SharedDriver {
     fn backend(
         &self,
-        backends: &Backends,
-        timeouts: Timeouts,
+        backend: &Backend,
         transport: impl FnOnce() -> Result<Transport, Unavailable> + Send,
     ) -> impl Future<Output = Result<NativeBackend, Unavailable>> + Send + 'static {
-        // Built synchronously, under the lock: every backend starts a driver thread of its own,
-        // so two racing requests must not build two.
-        let backend = backends.get_or_build(timeouts, || Ok(NativeBackend::new(transport()?)));
+        // Built synchronously, under the lock: a backend starts a driver thread of its own, so two
+        // racing requests must not build two.
+        let backend = backend.get_or_build(|| Ok(NativeBackend::new(transport()?)));
         core::future::ready(backend)
     }
 }
 
 /// Pools on the compio runtime of the thread a client was built on.
 ///
-/// A task on that runtime builds each pool, so a pool for settings first asked for later — or
-/// from another thread — still starts there.
+/// A task on that runtime builds the pool, so a pool first asked for later — or from another
+/// thread — still starts there.
 #[derive(Debug, Clone)]
 pub struct ThreadPools {
     builds: async_channel::Sender<Build>,
 }
 
-/// A request to the pool-building task for one set of settings.
+/// A request to the pool-building task.
 struct Build {
-    timeouts: Timeouts,
     transport: Transport,
     reply: async_channel::Sender<NativeBackend>,
 }
@@ -244,16 +232,10 @@ impl ThreadPools {
         // ever being torn down; it reaches it through `with_current` whenever it builds. It ends
         // when the last client clone is dropped.
         compio::runtime::spawn(async move {
-            let mut built = HashMap::new();
-            while let Ok(Build {
-                timeouts,
-                transport,
-                reply,
-            }) = requests.recv().await
-            {
+            let mut built = None;
+            while let Ok(Build { transport, reply }) = requests.recv().await {
                 let backend = built
-                    .entry(timeouts)
-                    .or_insert_with(|| {
+                    .get_or_insert_with(|| {
                         compio::runtime::Runtime::with_current(|runtime| {
                             // The system resolver, as on zenwave's own driver threads.
                             NativeBackend::on_current_thread(
@@ -279,15 +261,14 @@ impl Pools for ThreadPools {}
 impl sealed::Sealed for ThreadPools {
     fn backend(
         &self,
-        backends: &Backends,
-        timeouts: Timeouts,
+        backend: &Backend,
         transport: impl FnOnce() -> Result<Transport, Unavailable> + Send,
     ) -> impl Future<Output = Result<NativeBackend, Unavailable>> + Send + 'static {
         // The cached backend, or the transport to build one over: built here, so the future
         // holds no closure.
-        let lookup = backends.get(timeouts).ok_or_else(transport);
+        let lookup = backend.get().ok_or_else(transport);
         let builds = self.builds.clone();
-        let backends = backends.clone();
+        let backend = backend.clone();
         async move {
             let transport = match lookup {
                 Ok(backend) => return Ok(backend),
@@ -295,27 +276,23 @@ impl sealed::Sealed for ThreadPools {
             };
             let (reply, built) = async_channel::bounded(1);
             builds
-                .send(Build {
-                    timeouts,
-                    transport,
-                    reply,
-                })
+                .send(Build { transport, reply })
                 .await
                 .map_err(|_| Unavailable::Stopped)?;
-            let backend = built.recv().await.map_err(|_| Unavailable::Stopped)?;
-            Ok(backends.keep(timeouts, backend))
+            let built = built.recv().await.map_err(|_| Unavailable::Stopped)?;
+            Ok(backend.keep(built))
         }
     }
 }
 
 impl ZenwaveHttpClient {
-    /// A client whose backends are built on the transport `transport` describes, with the SDK's
-    /// timeouts added. `transport` runs once per distinct set of timeouts.
+    /// A client whose backend is built on the transport `transport` describes, its timeouts the
+    /// defaults the SDK's own override per request. `transport` runs until a backend is built.
     #[must_use]
     pub fn new(transport: impl Fn() -> TransportBuilder + Send + Sync + 'static) -> Self {
         Self {
             transport: Arc::new(transport),
-            backends: Backends::default(),
+            backend: Backend::default(),
             pools: SharedDriver,
         }
     }
@@ -329,8 +306,9 @@ impl ZenwaveHttpClient {
 }
 
 impl ZenwaveHttpClient<ThreadPools> {
-    /// A client whose backends are built on the transport `transport` describes, with the SDK's
-    /// timeouts added, and whose pools run on the current thread's compio runtime, driven by `io`.
+    /// A client whose backend is built on the transport `transport` describes, its timeouts the
+    /// defaults the SDK's own override per request, and whose pool runs on the current thread's
+    /// compio runtime, driven by `io`.
     ///
     /// # Panics
     ///
@@ -342,7 +320,7 @@ impl ZenwaveHttpClient<ThreadPools> {
     ) -> Self {
         Self {
             transport: Arc::new(transport),
-            backends: Backends::default(),
+            backend: Backend::default(),
             pools: ThreadPools::start(io),
         }
     }
@@ -359,31 +337,21 @@ impl ZenwaveHttpClient<ThreadPools> {
 }
 
 impl<P: Pools> ZenwaveHttpClient<P> {
-    /// The transport for `timeouts`. One that cannot be built, such as one whose system trust
-    /// store cannot be read, is not cached: the error is returned, and the next call tries again.
-    fn transport(&self, timeouts: Timeouts) -> Result<Transport, Unavailable> {
-        let mut transport = (self.transport)();
-        if let Some(connect) = timeouts.connect {
-            transport = transport.connect_timeout(connect);
-        }
-        if let Some(read) = timeouts.read {
-            transport = transport.read_timeout(read);
-        }
-        transport
+    /// The transport. One that cannot be built, such as one whose system trust store cannot be
+    /// read, is not cached: the error is returned, and the next call tries again.
+    fn transport(&self) -> Result<Transport, Unavailable> {
+        (self.transport)()
             .build()
             .map_err(|error| Unavailable::Transport(Arc::new(error)))
     }
 
-    /// The backend for `timeouts`, built on first use.
+    /// The backend, built on first use.
     fn backend(
         &self,
-        timeouts: Timeouts,
     ) -> impl Future<Output = Result<NativeBackend, Unavailable>> + Send + 'static + use<'_, P>
     {
         // `transport` runs before this returns, so the future borrows nothing.
-        sealed::Sealed::backend(&self.pools, &self.backends, timeouts, move || {
-            self.transport(timeouts)
-        })
+        sealed::Sealed::backend(&self.pools, &self.backend, move || self.transport())
     }
 }
 
@@ -395,16 +363,30 @@ impl<P: Pools> HttpClient for ZenwaveHttpClient<P> {
     ) -> SharedHttpConnector {
         SharedHttpConnector::new(ZenwaveConnector {
             client: self.clone(),
-            timeouts: Timeouts {
-                connect: settings.connect_timeout(),
-                read: settings.read_timeout(),
-            },
+            timeouts: request_timeouts(settings),
         })
     }
 }
 
-/// An [`HttpConnector`] on the [`NativeBackend`] for one set of [`HttpConnectorSettings`], looked
-/// up — and built on first use — by each call.
+/// What the SDK's [`HttpConnectorSettings`] ask of a request, as zenwave's per-request
+/// [`Timeouts`]: a field the SDK left unset stays unset, so the transport's default applies.
+fn request_timeouts(settings: &HttpConnectorSettings) -> Timeouts {
+    let mut timeouts = Timeouts::default();
+    if let Some(connect) = settings.connect_timeout() {
+        timeouts = timeouts.with_connect(connect);
+    }
+    // aws-smithy documents the read timeout (`HttpConnectorSettings::read_timeout`,
+    // `TimeoutConfig::read_timeout`) as the limit on reading the first byte of a response: the
+    // response-head wait. It also bounds each gap in the body, as zenwave's `read_timeout` this
+    // replaces did, so a stalled body cannot hang a call the SDK believes bounded.
+    if let Some(read) = settings.read_timeout() {
+        timeouts = timeouts.with_response_head(read).with_body_idle(read);
+    }
+    timeouts
+}
+
+/// An [`HttpConnector`] on the client's [`NativeBackend`], looked up — and built on first use — by
+/// each call, attaching one set of [`HttpConnectorSettings`]' timeouts to each request.
 #[derive(Debug, Clone)]
 struct ZenwaveConnector<P> {
     client: ZenwaveHttpClient<P>,
@@ -413,7 +395,8 @@ struct ZenwaveConnector<P> {
 
 impl<P: Pools> HttpConnector for ZenwaveConnector<P> {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        let backend = self.client.backend(self.timeouts);
+        let backend = self.client.backend();
+        let timeouts = self.timeouts;
         HttpConnectorFuture::new(async move {
             let mut backend = backend.await.map_err(|unavailable| {
                 if let Unavailable::Transport(error) = &unavailable {
@@ -425,6 +408,7 @@ impl<P: Pools> HttpConnector for ZenwaveConnector<P> {
                 .try_into_http1x()
                 .map_err(|error| ConnectorError::user(error.into()))?
                 .map(Body::new);
+            request.extensions_mut().insert(timeouts);
             let response = backend
                 .respond(&mut request)
                 .await
@@ -947,8 +931,11 @@ mod tests {
             elapsed < limit + SLACK,
             "failed late, after {elapsed:?}: {error:?}"
         );
+        // A head or connect timeout names itself; a body that goes quiet is zenwave's
+        // `ReceiveError::Stalled`.
+        let error_text = format!("{error:?}").to_lowercase();
         assert!(
-            format!("{error:?}").to_lowercase().contains("timeout"),
+            error_text.contains("timeout") || error_text.contains("stalled"),
             "{error:?}"
         );
     }

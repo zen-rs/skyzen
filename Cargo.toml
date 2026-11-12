@@ -22,7 +22,7 @@ compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default
 http-kit = { git = "https://github.com/zen-rs/http-kit", branch = "main" }
 http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
 http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
-executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "deps/22-compio-fork", default-features = false, features = ["std", "async-executor"] }
+executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "main", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper", version = "0.3.0" }
 skyzen-h1 = { path = "h1", version = "0.1.0" }
 skyzen-lambda = { path = "lambda", version = "0.3.0" }
@@ -194,7 +194,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["std", "tl
 # each serving thread. zenwave refuses to build without a default backend; `native-compio` is the
 # one whose runtime this crate already links, though the proxy only ever starts pools on the
 # serving thread's own runtime.
-zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "deps/208-fork-sources", default-features = false, features = ["native-compio"], optional = true }
+zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-compio"], optional = true }
 # HTTP/3 (`http3` feature): quiche over the same compio threads. quiche builds BoringSSL from
 # source, so only a build that asks for HTTP/3 pays for it; `fs` lets a file-region body (static
 # files) go out over a QUIC stream. A QUIC writer offers no pipe, so a proxied body reaches it as
@@ -213,7 +213,7 @@ libc = "0.2"
 io-uring = { version = "0.7.16", default-features = false }
 skyzen-core = { workspace = true, features = ["steering", "busy-poll"] }
 http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, features = ["kernel"], optional = true }
-zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "deps/208-fork-sources", default-features = false, features = ["native-compio", "native-kernel-tls"], optional = true }
+zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-compio", "native-kernel-tls"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The `Server` tests and `examples/embed_hyper.rs` run their own smol executor.
