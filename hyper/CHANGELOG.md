@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/skyzen/compare/hyper/v0.3.0...hyper/v0.4.0) - 2026-11-12
+
+### Added
+
+- *(runtime)* [**breaking**] serve on http-kit 0.8 and zenwave 0.12 with operator io_uring settings
+- *(core)* [**breaking**] build Upgraded from a connection's halves, spliceable on Linux
+
+### Other
+
+- *(runtime)* register the receive ring for incremental consumption
+
 ## [0.3.0](https://github.com/zen-rs/skyzen/compare/hyper/v0.2.1...hyper/v0.3.0) - 2026-11-11
 
 ### Added

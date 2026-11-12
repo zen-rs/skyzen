@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-aws"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "AWS service implementations for the Skyzen framework"
 license = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ keywords = ["aws", "dynamodb", "sqs", "skyzen", "services"]
 categories = ["web-programming::http-server", "database"]
 
 [dependencies]
-skyzen-services = { path = "../services", version = "0.4.0", default-features = false }
+skyzen-services = { path = "../services", version = "0.4.1", default-features = false }
 # The SDK's I/O (`sdk`): requests go out on zenwave's runtime-neutral native backend, whose
 # connection pool runs on a compio driver, and the SDK's timers on async-io's. Neither needs a tokio
 # context, so the SDK's own `rt-tokio` and `default-https-client` (hyper on tokio) are off
