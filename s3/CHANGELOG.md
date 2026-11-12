@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/zen-rs/skyzen/compare/s3/v0.4.0...s3/v0.4.1) - 2026-11-12
+
+### Other
+
+- *(runtime)* register the receive ring for incremental consumption
+
 ## [0.4.0](https://github.com/zen-rs/skyzen/compare/s3/v0.3.1...s3/v0.4.0) - 2026-11-11
 
 ### Added

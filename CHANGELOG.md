@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/zen-rs/skyzen/compare/v0.6.1...v0.7.0) - 2026-11-12
+
+### Added
+
+- [**breaking**] hand each serving thread's context to the endpoint factory
+- *(runtime)* serve cached static files from the ring's registered region
+- *(cli)* run the native service unprivileged, with its variables in an EnvironmentFile
+- *(manifest)* [native.server] for a native deployment's address and busy polling
+- *(cli)* apply [native.linux] with `skyzen deploy --provider native`
+- *(core)* list each interface's receive-queue interrupts for placement
+- *(manifest)* add the [native.linux] host acceleration section
+- *(runtime)* busy polling as an operator setting
+- *(core)* share the io_uring NAPI registration with skyzen doctor
+- *(cli)* report the zero-copy locked-memory limit in skyzen doctor
+- *(runtime)* [**breaking**] serve on http-kit 0.8 and zenwave 0.12 with operator io_uring settings
+- *(cli)* report Linux acceleration in skyzen doctor
+- *(proxy)* splice bodies and upgraded tunnels
+- *(core)* [**breaking**] build Upgraded from a connection's halves, spliceable on Linux
+
+### Fixed
+
+- *(runtime)* satisfy clippy on the Linux-only region code
+- *(runtime)* bind HTTP/3 and TCP on a port both can take
+- *(aws)* carry the SDK's timeouts on each request
+- *(cli)* import Context for every Linux-only helper of the native deploy
+- *(runtime)* convert the ring flag without a truncating cast
+- *(cli)* build the native deploy only for Linux
+- *(deps)* take http-kit-io 0.6.2, which reports a file round's partial progress
+- *(runtime)* keep the Windows build free of unix-only imports and lints
+- *(proxy)* dial upstreams with the serving thread's driver
+- *(runtime)* box the TLS handshake future the connection task awaits
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into perf/163-ring-inc
+- Merge remote-tracking branch 'origin/main' into feat/229-deploy
+- *(deps)* take zenwave and executor-core from git, drop the patch section
+- *(runtime)* register the receive ring for incremental consumption
+- document [native.server] and the native service's sandbox
+- *(core)* share the native server's variable names with the CLI
+- document [native.linux] and the native deployment
+- *(static-files)* print the server's record when a region arrives changed
+- *(proxy)* name IoSettings without a link the rt-less build cannot resolve
+- *(proxy)* box the kernel TLS tests' server handshake
+- *(runtime)* box the handshake inside negotiate rather than at each caller
+- *(runtime)* document why the handshake future is boxed on negotiate itself
+- *(proxy)* adopt the kernel TLS tests' sockets through a Compio value
+- *(proxy)* pass the consuming writer's pipe offer through
+- *(core)* read the steering placement in skyzen-core
+- fix rustls dependency spacing
+
 ## [0.6.1](https://github.com/zen-rs/skyzen/compare/v0.6.0...v0.6.1) - 2026-11-11
 
 ### Added

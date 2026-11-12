@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/zen-rs/skyzen/compare/h1/v0.1.0...h1/v0.2.0) - 2026-11-12
+
+### Added
+
+- [**breaking**] hand each serving thread's context to the endpoint factory
+- *(runtime)* [**breaking**] serve on http-kit 0.8 and zenwave 0.12 with operator io_uring settings
+- *(core)* [**breaking**] build Upgraded from a connection's halves, spliceable on Linux
+
 ## [0.1.0](https://github.com/zen-rs/skyzen/compare/h1/v0.0.0...h1/v0.1.0) - 2026-11-11
 
 ### Added

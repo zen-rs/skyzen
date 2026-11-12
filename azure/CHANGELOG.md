@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/skyzen/compare/azure/v0.5.0...azure/v0.6.0) - 2026-11-12
+
+### Added
+
+- *(runtime)* [**breaking**] serve on http-kit 0.8 and zenwave 0.12 with operator io_uring settings
+- *(core)* [**breaking**] build Upgraded from a connection's halves, spliceable on Linux
+
+### Fixed
+
+- *(aws)* carry the SDK's timeouts on each request
+
+### Other
+
+- *(deps)* take zenwave and executor-core from git, drop the patch section
+- *(runtime)* register the receive ring for incremental consumption
+
 ## [0.5.0](https://github.com/zen-rs/skyzen/compare/azure/v0.4.1...azure/v0.5.0) - 2026-11-11
 
 ### Added

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/zen-rs/skyzen/compare/cli/v0.6.1...cli/v0.7.0) - 2026-11-12
+
+### Added
+
+- *(cli)* run the native service unprivileged, with its variables in an EnvironmentFile
+- *(cli)* apply [native.linux] with `skyzen deploy --provider native`
+- *(core)* share the io_uring NAPI registration with skyzen doctor
+- *(cli)* report the zero-copy locked-memory limit in skyzen doctor
+- *(runtime)* [**breaking**] serve on http-kit 0.8 and zenwave 0.12 with operator io_uring settings
+- *(cli)* report Linux acceleration in skyzen doctor
+- *(core)* [**breaking**] build Upgraded from a connection's halves, spliceable on Linux
+
+### Fixed
+
+- *(aws)* carry the SDK's timeouts on each request
+- *(cli)* import Context for every Linux-only helper of the native deploy
+- *(cli)* build the native deploy only for Linux
+- *(runtime)* box the TLS handshake future the connection task awaits
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into perf/163-ring-inc
+- *(deps)* take zenwave and executor-core from git, drop the patch section
+
 ## [0.6.0](https://github.com/zen-rs/skyzen/compare/cli/v0.5.2...cli/v0.6.0) - 2026-11-11
 
 ### Added
