@@ -197,13 +197,13 @@ impl sealed::Ops for BlockingFs {
 
     /// The blocking pool reads on no ring, so it never reads into one's region.
     #[cfg(target_os = "linux")]
-    async fn read_fixed(
+    fn read_fixed(
         &self,
         _: &Self::Handle,
         _: u64,
         _: &http_kit_io::compio::FixedRegion,
-    ) -> io::Result<Option<Bytes>> {
-        Ok(None)
+    ) -> impl Future<Output = io::Result<Option<Bytes>>> {
+        std::future::ready(Ok(None))
     }
 
     fn std_file(&self, handle: Self::Handle) -> io::Result<File> {

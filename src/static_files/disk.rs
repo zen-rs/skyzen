@@ -1251,7 +1251,7 @@ mod tests {
             );
             assert_eq!(serve("余.bin").await, files[2].1);
             for (name, bytes) in &files {
-                assert_eq!(&serve(*name).await, bytes, "{name} from the cache");
+                assert_eq!(&serve(name).await, bytes, "{name} from the cache");
             }
         });
     }

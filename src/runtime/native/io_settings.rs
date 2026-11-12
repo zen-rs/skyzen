@@ -461,8 +461,10 @@ mod tests {
     /// asking for one there still starts.
     #[test]
     fn a_ring_asked_for_no_region_registers_none() {
+        #[cfg(target_os = "linux")]
+        let options = IoOptions::default();
+        #[cfg(not(target_os = "linux"))]
         let options = IoOptions {
-            #[cfg(not(target_os = "linux"))]
             fixed_buffers: Some(1024 * 1024),
             ..IoOptions::default()
         };
