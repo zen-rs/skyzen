@@ -5,6 +5,10 @@
 //! runs one `http-kit-h3` endpoint on its own compio runtime, next to its TCP accept loop: the
 //! same router, the same drain, the same certificate and key (read once, by [`super::tls`]).
 //!
+//! Both protocols are bound together, before any thread starts, so a port UDP refuses fails the
+//! start. An ephemeral listen port (`--port 0`) is chosen so both can take it (see [`pair`]); a
+//! port the operator named is taken on both or the start fails naming the refused protocol.
+//!
 //! # Which threads serve QUIC
 //!
 //! Where `SO_REUSEPORT` balances (Linux, Android) every thread binds the UDP port itself and the
@@ -104,7 +108,25 @@ impl std::fmt::Display for Http3Error {
             ),
             #[cfg(feature = "http3")]
             Self::Bind { addr, error } => {
-                write!(f, "could not bind UDP {addr} for HTTP/3: {error}")
+                let port = addr.port();
+                write!(
+                    f,
+                    "could not bind UDP {addr} for HTTP/3, the port the TCP listener has: "
+                )?;
+                if error.kind() == std::io::ErrorKind::AddrInUse {
+                    write!(f, "another socket holds udp/{port}")?;
+                } else if refused_by_windows(error) {
+                    write!(
+                        f,
+                        "Windows refuses udp/{port} to this process, which a bind is told when the \
+                         port lies in a range excluded for UDP (`netsh int ipv4 show \
+                         excludedportrange protocol=udp` lists them) or another socket holds it \
+                         with SO_EXCLUSIVEADDRUSE; choose a port outside those ranges"
+                    )?;
+                } else {
+                    write!(f, "the system refuses it")?;
+                }
+                write!(f, " ({error})")
             }
             #[cfg(feature = "http3")]
             Self::Register(error) => {
@@ -205,23 +227,35 @@ pub(super) const fn not_a_server() -> RuntimeFailure {
     RuntimeFailure::Http3(Http3Error::FeatureMissing)
 }
 
+/// The UDP sockets of every serving thread, in thread order; `None` for a thread that does not
+/// run QUIC.
+type UdpSockets = Vec<Option<std::net::UdpSocket>>;
+
 #[cfg(feature = "http3")]
 impl Http3 {
-    /// One UDP socket per serving thread on `local`'s address, or `None` for the threads that do
-    /// not run QUIC; see the module documentation for which are which. With `busy_poll`, each
-    /// carries its socket options.
+    /// Bind TCP on `addr` with `tcp`, which returns its listeners and the address they got, and
+    /// then one UDP socket per serving thread on that same address, or `None` for the threads that
+    /// do not run QUIC; see the module documentation for which are which. With `busy_poll`, each
+    /// UDP socket carries its socket options.
+    ///
+    /// # Errors
+    ///
+    /// TCP cannot be bound, or UDP cannot be bound on the TCP port; see [`pair`] for when an
+    /// ephemeral port is given up for another instead.
     #[expect(
         clippy::unused_self,
         reason = "the call exists without the feature too, where the receiver proves it unreachable"
     )]
-    pub(super) fn bind(
+    pub(super) fn bind_beside<T>(
         &self,
-        local: std::net::SocketAddr,
+        addr: std::net::SocketAddr,
         threads: std::num::NonZeroUsize,
         busy_poll: Option<&BusyPoll>,
-    ) -> Result<Vec<Option<std::net::UdpSocket>>, RuntimeFailure> {
-        bind_sockets(local, threads.get(), busy_poll)
-            .map_err(|error| RuntimeFailure::Http3(Http3Error::Bind { addr: local, error }))
+        tcp: impl FnMut(std::net::SocketAddr) -> std::io::Result<(T, std::net::SocketAddr)>,
+    ) -> Result<(T, UdpSockets), RuntimeFailure> {
+        pair(addr, tcp, |local| {
+            bind_sockets(local, threads.get(), busy_poll)
+        })
     }
 
     /// The QUIC endpoint of the calling thread, over its `socket`. Runs inside the thread's
@@ -242,12 +276,13 @@ impl Http3 {
 
 #[cfg(not(feature = "http3"))]
 impl Http3 {
-    pub(super) const fn bind(
+    pub(super) const fn bind_beside<T>(
         &self,
-        _local: std::net::SocketAddr,
+        _addr: std::net::SocketAddr,
         _threads: std::num::NonZeroUsize,
         _busy_poll: Option<&BusyPoll>,
-    ) -> Result<Vec<Option<std::net::UdpSocket>>, RuntimeFailure> {
+        _tcp: impl FnMut(std::net::SocketAddr) -> std::io::Result<(T, std::net::SocketAddr)>,
+    ) -> Result<(T, UdpSockets), RuntimeFailure> {
         match self.0 {}
     }
 
@@ -258,6 +293,72 @@ impl Http3 {
     ) -> Result<Http3Server, Http3Error> {
         match self.0 {}
     }
+}
+
+/// Bind TCP on `addr` with `tcp`, then UDP on the port TCP got with `udp`.
+///
+/// A port free on TCP need not be free on UDP: another socket may hold the UDP port, and Windows
+/// keeps a separate table of excluded port ranges per protocol, which the allocator of an
+/// ephemeral TCP port does not consult for UDP. So when `addr` asks the system for a port (port
+/// `0`) and UDP refuses the one TCP got for one of those reasons, that pair is set aside and TCP
+/// asks again. Every refused pair stays bound until a port is found, so the system cannot hand
+/// the same port out twice: the search ends at a port both protocols take, or when TCP itself
+/// can get none because the ephemeral range is exhausted, which fails the start like any TCP
+/// bind failure. A port the operator named is never exchanged: its refusal is the error.
+#[cfg(feature = "http3")]
+fn pair<T, U>(
+    addr: std::net::SocketAddr,
+    mut tcp: impl FnMut(std::net::SocketAddr) -> std::io::Result<(T, std::net::SocketAddr)>,
+    mut udp: impl FnMut(std::net::SocketAddr) -> std::io::Result<U>,
+) -> Result<(T, U), RuntimeFailure> {
+    let mut refused = Vec::new();
+    loop {
+        let (listeners, local) = tcp(addr)?;
+        match udp(local) {
+            Ok(sockets) => {
+                // Only now may the refused ports go back to the system.
+                drop(refused);
+                return Ok((listeners, sockets));
+            }
+            Err(error) if addr.port() == 0 && unavailable(&error) => {
+                tracing::debug!(
+                    port = local.port(),
+                    "the system's TCP port cannot be had on UDP ({error}); asking for another"
+                );
+                refused.push(listeners);
+            }
+            Err(error) => {
+                return Err(RuntimeFailure::Http3(Http3Error::Bind {
+                    addr: local,
+                    error,
+                }));
+            }
+        }
+    }
+}
+
+/// Whether a UDP bind failed because the port cannot be had, rather than because of the socket.
+#[cfg(feature = "http3")]
+fn unavailable(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::AddrInUse || refused_by_windows(error)
+}
+
+/// `WSAEACCES`, from Winsock2.h ("Windows Sockets Error Codes"). A bind gets it for a port in a
+/// range excluded for the socket's protocol, or one another socket holds with
+/// `SO_EXCLUSIVEADDRUSE`.
+#[cfg(all(feature = "http3", windows))]
+const WSAEACCES: i32 = 10013;
+
+/// Whether Windows refused the bind with `WSAEACCES`; see [`WSAEACCES`].
+#[cfg(all(feature = "http3", windows))]
+fn refused_by_windows(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(WSAEACCES)
+}
+
+/// Only Windows has excluded port ranges.
+#[cfg(all(feature = "http3", not(windows)))]
+const fn refused_by_windows(_error: &std::io::Error) -> bool {
+    false
 }
 
 #[cfg(all(feature = "http3", any(target_os = "linux", target_os = "android")))]
@@ -463,17 +564,15 @@ mod tests {
             let http3 = build(true, tls.as_ref(), &addr)
                 .expect("HTTP/3 is served")
                 .expect("with TLS, it is");
-            let mut bound = bind(
+            let bound = bind(
                 &addr,
                 threads,
                 crate::runtime::native::steering::Pins::default(),
                 None,
+                Some(&http3),
             )
-            .expect("bind TCP");
+            .expect("bind TCP and UDP on one port");
             let local = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
-            bound.udp = http3
-                .bind(local, threads, None)
-                .expect("bind UDP on the TCP port");
 
             let (stop, stopping) = bounded::<Infallible>(1);
             let (drain, drained) = bounded::<Infallible>(1);
@@ -913,26 +1012,99 @@ mod tests {
         }
     }
 
-    /// A UDP port something else holds fails the start and says which.
+    /// A named port whose UDP side something else holds fails the start, naming the address,
+    /// the protocol and why; it is never exchanged for another port.
     #[test]
-    fn a_udp_bind_failure_is_refused_naming_the_address() {
+    fn a_named_port_refused_on_udp_fails_the_start_saying_why() {
         let pki = pki();
-        let addr = loopback();
-        let tls = tls::build(Some(&pki.files), &addr).expect("the pair loads");
+        let tls = tls::build(Some(&pki.files), &loopback()).expect("the pair loads");
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let local = held.local_addr().unwrap();
+        let addr = ListenAddr::Tcp(local);
         let http3 = build(true, tls.as_ref(), &addr)
             .expect("no refusal")
             .expect("served");
-        let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
-        let local = held.local_addr().unwrap();
 
-        let error = http3
-            .bind(local, NonZeroUsize::new(2).unwrap(), None)
-            .expect_err("the port is taken");
+        let error = bind(
+            &addr,
+            NonZeroUsize::new(2).unwrap(),
+            crate::runtime::native::steering::Pins::default(),
+            None,
+            Some(&http3),
+        )
+        .expect_err("the UDP port is taken");
         assert!(
             matches!(error, RuntimeFailure::Http3(Http3Error::Bind { addr, .. }) if addr == local),
             "{error}"
         );
-        assert!(error.to_string().contains(&local.to_string()), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("could not bind UDP {local} for HTTP/3")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("another socket holds udp/{}", local.port())),
+            "{message}"
+        );
+    }
+
+    /// When the port TCP was given cannot be had on UDP, both move to another one the system
+    /// gives, and the refused one stays held until then so it is not given again.
+    #[test]
+    fn an_ephemeral_port_refused_on_udp_moves_both_protocols_to_another() {
+        let mut blocker = None;
+        let mut tried = Vec::new();
+        let (listener, sockets) = super::pair(
+            "127.0.0.1:0".parse().unwrap(),
+            |addr| {
+                let listener = std::net::TcpListener::bind(addr)?;
+                let local = listener.local_addr()?;
+                tried.push(local.port());
+                Ok((listener, local))
+            },
+            |local| {
+                // The first port's UDP side is taken before the server gets to it. Where the
+                // system already refuses that port on UDP (a Windows excluded range), holding it
+                // fails and the refusal is the system's own.
+                if blocker.is_none() {
+                    blocker = Some(std::net::UdpSocket::bind(local).ok());
+                }
+                super::bind_sockets(local, 1, None)
+            },
+        )
+        .expect("a port both protocols take");
+
+        assert!(tried.len() >= 2, "the refused port was kept: {tried:?}");
+        let distinct: std::collections::BTreeSet<_> = tried.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            tried.len(),
+            "a refused port was given again"
+        );
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(Some(&port), tried.last());
+        let udp = sockets[0].as_ref().expect("the first thread runs QUIC");
+        assert_eq!(udp.local_addr().unwrap().port(), port);
+    }
+
+    /// On Windows, `WSAEACCES` on the UDP bind names the excluded ranges and how to list them.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_udp_refusal_names_the_excluded_ranges() {
+        let addr: SocketAddr = "127.0.0.1:53766".parse().unwrap();
+        let error = Http3Error::Bind {
+            addr,
+            error: std::io::Error::from_raw_os_error(super::WSAEACCES),
+        };
+        let message = error.to_string();
+        assert!(message.contains("a range excluded for UDP"), "{message}");
+        assert!(
+            message.contains("netsh int ipv4 show excludedportrange protocol=udp"),
+            "{message}"
+        );
+        assert!(super::unavailable(&std::io::Error::from_raw_os_error(
+            super::WSAEACCES
+        )));
     }
 
     /// With busy polling on, every thread's QUIC socket carries the busy-poll options.

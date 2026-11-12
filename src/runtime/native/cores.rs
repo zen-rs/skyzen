@@ -115,38 +115,49 @@ impl Socket {
 /// connection it accepts inherits them; [`super::busy_poll::check`] has already refused it
 /// everywhere but on a Linux TCP address.
 ///
+/// With `http3`, a TCP address also gets its UDP sockets ([`Bound::udp`]) on the same port, bound
+/// here for the same reason; an ephemeral port is one both protocols can take.
+///
 /// # Errors
 ///
-/// The address cannot be bound, a socket cannot be duplicated, or the kernel refuses a busy-poll
-/// option.
+/// The address cannot be bound on TCP, or on UDP for `http3`, a socket cannot be duplicated, or
+/// the kernel refuses a busy-poll option.
 pub(super) fn bind(
     addr: &super::ListenAddr,
     threads: NonZeroUsize,
     pins: Pins,
     busy_poll: Option<&BusyPoll>,
-) -> io::Result<Bound> {
+    http3: Option<&Http3>,
+) -> Result<Bound, RuntimeFailure> {
     match addr {
         #[cfg(windows)]
         super::ListenAddr::Tcp(addr) => {
-            let _ = busy_poll;
-            let (incoming, acceptor) = super::handoff::bind(*addr, threads.get())?;
+            let ((incoming, acceptor), udp) = with_udp(*addr, threads, busy_poll, http3, |addr| {
+                let (incoming, acceptor) = super::handoff::bind(addr, threads.get())?;
+                let local = incoming[0].local_addr();
+                Ok(((incoming, acceptor), local))
+            })?;
             Ok(Bound {
                 sockets: incoming.into_iter().map(Socket::Handoff).collect(),
                 acceptor: Some(acceptor),
-                udp: Vec::new(),
+                udp,
                 pins,
             })
         }
         #[cfg(not(windows))]
-        super::ListenAddr::Tcp(addr) => Ok(Bound {
-            sockets: bind_tcp(*addr, threads.get(), &pins, busy_poll)?
-                .into_iter()
-                .map(Socket::Tcp)
-                .collect(),
-            acceptor: None,
-            udp: Vec::new(),
-            pins,
-        }),
+        super::ListenAddr::Tcp(addr) => {
+            let (listeners, udp) = with_udp(*addr, threads, busy_poll, http3, |addr| {
+                let listeners = bind_tcp(addr, threads.get(), &pins, busy_poll)?;
+                let local = listeners[0].local_addr()?;
+                Ok((listeners, local))
+            })?;
+            Ok(Bound {
+                sockets: listeners.into_iter().map(Socket::Tcp).collect(),
+                acceptor: None,
+                udp,
+                pins,
+            })
+        }
         #[cfg(unix)]
         super::ListenAddr::Unix(path) => {
             debug_assert!(
@@ -168,6 +179,20 @@ pub(super) fn bind(
                 pins,
             })
         }
+    }
+}
+
+/// Bind TCP on `addr` with `tcp`, and when `http3` is served, UDP beside it on the port TCP got.
+fn with_udp<T>(
+    addr: std::net::SocketAddr,
+    threads: NonZeroUsize,
+    busy_poll: Option<&BusyPoll>,
+    http3: Option<&Http3>,
+    mut tcp: impl FnMut(std::net::SocketAddr) -> io::Result<(T, std::net::SocketAddr)>,
+) -> Result<(T, Vec<Option<std::net::UdpSocket>>), RuntimeFailure> {
+    match http3 {
+        Some(http3) => http3.bind_beside(addr, threads, busy_poll, tcp),
+        None => Ok((tcp(addr)?.0, Vec::new())),
     }
 }
 
@@ -794,6 +819,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             Pins::default(),
             None,
+            None,
         )
         .expect("bind");
         let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
@@ -822,6 +848,7 @@ mod tests {
             &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
             threads,
             Pins::default(),
+            None,
             None,
         )
         .expect("bind");
@@ -886,6 +913,7 @@ mod tests {
             NonZeroUsize::new(served.len()).unwrap(),
             cpus,
             None,
+            None,
         )
         .expect("bind with steering");
         let addr = bound.sockets[0].tcp_addr().unwrap().expect("local addr");
@@ -934,6 +962,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             Pins::default(),
             Some(&busy_poll),
+            None,
         )
         .expect("bind");
         let Socket::Tcp(listener) = &accepting.sockets[0] else {
@@ -948,6 +977,7 @@ mod tests {
             NonZeroUsize::new(4).unwrap(),
             Pins::default(),
             Some(&busy_poll),
+            None,
         )
         .expect("bind");
         for socket in &bound.sockets {
@@ -989,6 +1019,7 @@ mod tests {
             NonZeroUsize::new(2).unwrap(),
             Pins::default(),
             None,
+            None,
         )
         .expect("bind");
         for socket in &bound.sockets {
@@ -1023,6 +1054,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             Pins::default(),
             Some(&busy_poll),
+            None,
         );
         if net_admin {
             let bound = bound.expect("a process with CAP_NET_ADMIN may prefer busy polling");
@@ -1031,7 +1063,11 @@ mod tests {
             };
             assert_eq!(read_socket_options(listener), (50, true));
         } else {
-            let error = bound.expect_err("only CAP_NET_ADMIN may prefer busy polling");
+            let RuntimeFailure::Listener(error) =
+                bound.expect_err("only CAP_NET_ADMIN may prefer busy polling")
+            else {
+                panic!("a busy-poll option the kernel refuses is a listener failure");
+            };
             assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(error.to_string().contains("CAP_NET_ADMIN"), "{error}");
         }
@@ -1049,6 +1085,7 @@ mod tests {
                 &ListenAddr::Unix(path.clone()),
                 NonZeroUsize::new(2).unwrap(),
                 Pins::default(),
+                None,
                 None,
             )
             .expect("bind the unix socket");
