@@ -140,7 +140,7 @@ impl ServerTls {
 /// hands the threads a fact rather than a promise.
 #[cfg(not(feature = "server-tls"))]
 #[derive(Debug, Clone)]
-pub(super) enum ServerTls {}
+pub(super) struct ServerTls(std::convert::Infallible);
 
 /// How long a freshly accepted TLS connection may take to handshake, and an `h2` one to send its
 /// preface, before it is dropped. Prevents idle clients from pinning per-connection tasks forever.
@@ -419,7 +419,7 @@ pub(super) async fn serve<L, E>(
     L: Listener<Stream = TcpStream, Addr = SocketAddr>,
     E: Endpoint + Clone + 'static,
 {
-    match tls {}
+    match tls.0 {}
 }
 
 /// Counts a connection against the limit for as long as it lives.
