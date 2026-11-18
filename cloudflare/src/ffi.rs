@@ -117,6 +117,23 @@ extern "C" {
         this: &DurableObjectNamespaceExt,
         jurisdiction: &str,
     ) -> Result<JsValue, JsValue>;
+
+    /// The residency controller the generated Worker shim hands each Durable Object instance.
+    ///
+    /// The shim owns it, one per application an instance runs on, so the timer it schedules
+    /// while held is cleared when the shim replaces a poisoned application — the old
+    /// application's guards are never dropped, and a timer they left would keep the object
+    /// from hibernating for good.
+    #[wasm_bindgen(extends = js_sys::Object)]
+    pub type ResidencyController;
+
+    /// Add one hold. The first hold schedules the timer that keeps the object resident.
+    #[wasm_bindgen(method)]
+    pub fn hold(this: &ResidencyController);
+
+    /// Remove one hold. The last release clears the timer. Throws when no hold is outstanding.
+    #[wasm_bindgen(method)]
+    pub fn release(this: &ResidencyController);
 }
 
 // ── Email Workers ──

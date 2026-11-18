@@ -3,7 +3,9 @@
 use core::future::Future;
 
 use skyzen::durable::DurableObjectState as HibernationDurableObjectState;
-use skyzen::durable::{DurableConnections, DurableContext, DurableObjectError, DurableObjectId};
+use skyzen::durable::{
+    DurableConnections, DurableContext, DurableObjectError, DurableObjectId, Residency,
+};
 use skyzen_services::durable::{Alarm, DurableDb, DurableKv};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -15,6 +17,7 @@ use crate::ffi;
 use super::{
     alarm::CfAlarm,
     kv::CfDurableKv,
+    residency::CfResidency,
     sql::CfDurableDb,
     websocket::{clone_state, CfDurableConnections, SendSyncDurableState},
 };
@@ -39,6 +42,7 @@ impl Default for AbortOptions {
 pub struct CfDurableState {
     state: worker_sys::DurableObjectState,
     env: JsValue,
+    residency: CfResidency,
 }
 
 impl Clone for CfDurableState {
@@ -46,6 +50,7 @@ impl Clone for CfDurableState {
         Self {
             state: clone_state(&self.state),
             env: self.env.clone(),
+            residency: self.residency.clone(),
         }
     }
 }
@@ -60,10 +65,19 @@ impl std::fmt::Debug for CfDurableState {
 }
 
 impl CfDurableState {
-    /// Create from raw Cloudflare `DurableObjectState`.
+    /// Create from raw Cloudflare `DurableObjectState`, the Worker's `env`, and the residency
+    /// controller the shim handed the instance.
     #[must_use]
-    pub const fn new(state: worker_sys::DurableObjectState, env: JsValue) -> Self {
-        Self { state, env }
+    pub const fn new(
+        state: worker_sys::DurableObjectState,
+        env: JsValue,
+        residency: CfResidency,
+    ) -> Self {
+        Self {
+            state,
+            env,
+            residency,
+        }
     }
 
     /// Clone and return the raw state handle.
@@ -234,6 +248,12 @@ impl CfDurableState {
         ))))
     }
 
+    /// Build the residency extractor wrapper.
+    #[must_use]
+    pub fn residency(&self) -> Residency {
+        self.residency.residency()
+    }
+
     /// Convert Cloudflare `DurableObjectId` into Skyzen `DurableObjectId`.
     ///
     /// # Errors
@@ -256,6 +276,7 @@ impl CfDurableState {
             self.db()?,
             self.alarm()?,
             self.connections(),
+            self.residency(),
             self.id()?,
         ))
     }
@@ -273,6 +294,7 @@ impl CfDurableState {
         request.extensions_mut().insert(self.db()?);
         request.extensions_mut().insert(self.alarm()?);
         request.extensions_mut().insert(self.connections());
+        request.extensions_mut().insert(self.residency());
         request
             .extensions_mut()
             .insert(skyzen::runtime::wasm::WasmEnv::new(self.env.clone()));

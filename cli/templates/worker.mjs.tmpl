@@ -79,20 +79,72 @@ export default {
 {%- endfor %}
 };
 {% if !durable_exports.is_empty() %}
+// Cloudflare's Durable Object lifecycle
+// (developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)
+// says an idle object hibernates only while no setTimeout/setInterval callback
+// is scheduled, and that a pending timer prevents eviction until it completes
+// or for up to 15 minutes from when it starts. So residency is a chain of
+// timeouts, each scheduling the next as it fires: one is always pending, and
+// it always started less than this period ago. The period matches the
+// documented 10-second hibernation window, well inside the 15 minutes.
+const RESIDENCY_TICK_MS = 10_000;
+
+// The keep-resident control one application of one Durable Object instance
+// gets: Rust's `KeepResident` guards count holds through it, and the timer
+// chain runs while any is outstanding. The shim owns it, not wasm, so
+// replacing a poisoned application disposes its timer — that application's
+// guards will never be dropped, and their late releases are ignored.
+function residency() {
+  let holds = 0;
+  let timer = null;
+  let disposed = false;
+  const tick = () => {
+    timer = setTimeout(tick, RESIDENCY_TICK_MS);
+  };
+  const stop = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  return {
+    hold() {
+      if (disposed) return;
+      holds += 1;
+      if (timer === null) tick();
+    },
+    release() {
+      if (disposed) return;
+      if (holds === 0) throw new Error("residency released with no hold outstanding");
+      holds -= 1;
+      if (holds === 0) stop();
+    },
+    dispose() {
+      disposed = true;
+      holds = 0;
+      stop();
+    },
+  };
+}
+
 // A Durable Object owns persistent in-memory state, so its application belongs
 // to the object, not an individual method call. Other objects and Worker events
 // never share its bindings — the shared `current` is for the Worker's
 // invocations only. The same poison check applies on every method entry, so a
-// killed or trapped method replaces only this object's application.
+// killed or trapped method replaces only this object's application, and with
+// it the residency that application held.
 function durableClass(name) {
   return class {
     constructor(...args) {
       let app;
       let instance;
+      let resident = null;
       function current() {
         if (!app || app.failed || app.depth !== 0 || app.stranded !== 0) {
+          if (resident !== null) resident.dispose();
           app = application();
-          instance = new app.exports[name](...args);
+          resident = residency();
+          instance = new app.exports[name](...args, resident);
         }
         return instance;
       }

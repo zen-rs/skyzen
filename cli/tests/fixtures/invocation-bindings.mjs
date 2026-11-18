@@ -8,7 +8,14 @@ export function createBindings(_module, onError) {
   let stranded = 0;
   class RoomObject {
     count = 0;
+    // The shim appends its residency controller to the platform's arguments.
+    constructor(...args) {
+      this.residency = args.at(-1);
+    }
     fetch(action) {
+      if (action === 'hold') { this.residency.hold(); return id; }
+      if (action === 'release') { this.residency.release(); return id; }
+      if (action === 'residency') return this.residency;
       if (action === 'trap') throw new WebAssembly.RuntimeError('trap');
       if (action === 'reject') return Promise.reject(new WebAssembly.RuntimeError('trap'));
       if (action === 'error') throw new Error('not a wasm trap');

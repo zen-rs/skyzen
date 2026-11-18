@@ -4423,9 +4423,14 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                 pub fn new(
                     state: ::skyzen_cloudflare::worker_sys::DurableObjectState,
                     env: ::skyzen::runtime::wasm::Env,
+                    // The residency controller the generated Worker shim appends to the
+                    // platform's arguments.
+                    residency: ::skyzen::wasm_bindgen::JsValue,
                 ) -> Self {
                     Self {
-                        runtime: ::skyzen_cloudflare::DurableObjectRuntime::new(state, env),
+                        runtime: ::skyzen_cloudflare::DurableObjectRuntime::new(
+                            state, env, residency,
+                        ),
                     }
                 }
 

@@ -22,7 +22,7 @@ use skyzen_services::durable::{
 
 use super::{
     DurableConnections, DurableConnectionsInner, DurableObject, DurableObjectError,
-    DurableObjectId, WebSocketConnection,
+    DurableObjectId, Residency, ResidencyInner, WebSocketConnection,
 };
 #[cfg(feature = "ws")]
 use super::{WebSocketConnectionInner, WebSocketEvent};
@@ -424,6 +424,7 @@ where
                     DurableDb::new(slot.db.clone()),
                     Alarm::new(slot.alarm.clone()),
                     DurableConnections::new(Box::new(slot.connections.clone())),
+                    Residency::new(Box::new(NativeResidency)),
                     id.clone(),
                 ),
             )
@@ -609,7 +610,25 @@ fn inject_durable_extensions<T>(
     request
         .extensions_mut()
         .insert(DurableConnections::new(Box::new(slot.connections.clone())));
+    request
+        .extensions_mut()
+        .insert(Residency::new(Box::new(NativeResidency)));
     request.extensions_mut().insert(id);
+}
+
+/// Residency in the simulator, where an instance lives as long as its namespace: nothing
+/// hibernates or evicts it, so every object is already resident and a hold changes nothing.
+#[derive(Debug, Clone, Copy)]
+struct NativeResidency;
+
+impl ResidencyInner for NativeResidency {
+    fn acquire(&self) {}
+
+    fn release(&self) {}
+
+    fn clone_box(&self) -> Box<dyn ResidencyInner> {
+        Box::new(*self)
+    }
 }
 
 fn alarm_request() -> Result<Request, http::Error> {

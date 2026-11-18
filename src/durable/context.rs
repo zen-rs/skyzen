@@ -4,6 +4,7 @@ use skyzen_services::durable::{Alarm, DurableDb, DurableKv};
 
 use super::connections::DurableConnections;
 use super::id::DurableObjectId;
+use super::residency::Residency;
 
 /// Provides service access in `websocket` and other non-routed contexts.
 ///
@@ -14,6 +15,7 @@ pub struct DurableContext {
     db: DurableDb,
     alarm: Alarm,
     connections: DurableConnections,
+    residency: Residency,
     id: DurableObjectId,
 }
 
@@ -34,6 +36,7 @@ impl DurableContext {
         db: DurableDb,
         alarm: Alarm,
         connections: DurableConnections,
+        residency: Residency,
         id: DurableObjectId,
     ) -> Self {
         Self {
@@ -41,6 +44,7 @@ impl DurableContext {
             db,
             alarm,
             connections,
+            residency,
             id,
         }
     }
@@ -67,6 +71,12 @@ impl DurableContext {
     #[must_use]
     pub const fn connections(&self) -> &DurableConnections {
         &self.connections
+    }
+
+    /// Keep the Durable Object resident while it has work.
+    #[must_use]
+    pub const fn residency(&self) -> &Residency {
+        &self.residency
     }
 
     /// The unique identity of this Durable Object instance.
