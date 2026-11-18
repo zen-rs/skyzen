@@ -1212,7 +1212,6 @@ mod tests {
         run(async {
             // One byte asks for the smallest region the kernel registers, a page.
             let thread = serving_thread(1, THRESHOLD).await;
-            let router = build(Route::new((StaticDir::new("/s", dir.path(), &thread),))).unwrap();
             let region = thread
                 .compio()
                 .and_then(|ring| ring.fixed_region())
@@ -1226,9 +1225,13 @@ mod tests {
                 ("半.bin", content(page / 2)),
                 ("余.bin", content(page / 2 + 1)),
             ];
+            // Written before the router starts watching the directory: the watcher reports a
+            // write some time after it, and a report that lands while a file loads clears the
+            // cache, which frees the file's span of the region the assertions below look for.
             for (name, bytes) in &files {
                 std::fs::write(dir.path().join(name), bytes).unwrap();
             }
+            let router = build(Route::new((StaticDir::new("/s", dir.path(), &thread),))).unwrap();
             let serve = |name: &'static str| {
                 let router = router.clone();
                 let request = get_request(&uri(name));
