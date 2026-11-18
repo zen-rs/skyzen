@@ -1179,9 +1179,7 @@ fn expand_test(mut function: ItemFn, options: &TestOptions) -> syn::Result<Token
     let output = function.sig.output.clone();
     let vis = function.vis.clone();
 
-    let databases = load_manifest()?
-        .map(|manifest| manifest.database)
-        .unwrap_or_default();
+    let databases = load_manifest()?.map_or_default(|manifest| manifest.database);
     let database_types = test_database_types(&databases)?;
     let bindings = collect_test_param_bindings(inputs, &database_types)?;
     let setup_statements = test_setup_statements(&bindings.requirements, &databases, options)?;

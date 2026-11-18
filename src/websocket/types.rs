@@ -91,14 +91,13 @@ pub(crate) fn offered_protocols(headers: &HeaderMap) -> Vec<String> {
     headers
         .get(SEC_WEBSOCKET_PROTOCOL)
         .and_then(|value| value.to_str().ok())
-        .map(|value| {
+        .map_or_default(|value| {
             value
                 .split(',')
                 .map(|protocol| protocol.trim().to_owned())
                 .filter(|protocol| !protocol.is_empty())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The first subprotocol the client offered that the handler also supports.
