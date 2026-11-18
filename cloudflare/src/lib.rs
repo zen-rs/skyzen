@@ -116,8 +116,8 @@ pub use database_error::CfDatabaseError;
 #[cfg(target_arch = "wasm32")]
 pub use durable::{
     AbortOptions, CfAlarm, CfDurableConnections, CfDurableDb, CfDurableKv, CfDurableNamespace,
-    CfDurableObjectStub, CfDurableState, CfJurisdiction, CfSqlCursor, CfWebSocketConnection,
-    DurableObjectRuntime, DurableWriteOptions,
+    CfDurableObjectStub, CfDurableState, CfJurisdiction, CfResidency, CfSqlCursor,
+    CfWebSocketConnection, DurableObjectRuntime, DurableWriteOptions,
 };
 #[cfg(target_arch = "wasm32")]
 pub use events::{

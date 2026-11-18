@@ -1620,8 +1620,7 @@ mod tests {
             .get()
             .await
             .unwrap()
-            .map(|cart| cart.items.join(","))
-            .unwrap_or_default()
+            .map_or_default(|cart| cart.items.join(","))
     }
 
     #[tokio::test]

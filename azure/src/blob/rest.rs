@@ -270,8 +270,7 @@ impl BlobRest {
                 .into_body()
                 .into_string()
                 .await
-                .map(|body| body.to_string())
-                .unwrap_or_default();
+                .map_or_default(|body| body.to_string());
             return Err(status_error(
                 status,
                 &method,

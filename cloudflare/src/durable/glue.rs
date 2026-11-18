@@ -18,6 +18,7 @@ use wasm_bindgen::{JsCast, JsValue};
 
 use super::{
     kv::CfDurableKv,
+    residency::CfResidency,
     state::CfDurableState,
     websocket::{clone_state, CfWebSocketConnection},
 };
@@ -33,6 +34,7 @@ const ALARM_REQUEST_PATH: &str = "/__skyzen_alarm";
 pub struct DurableObjectRuntime<T> {
     state: worker_sys::DurableObjectState,
     env: JsValue,
+    residency: CfResidency,
     instance: Rc<Instance<T>>,
 }
 
@@ -48,6 +50,7 @@ impl<T> Clone for DurableObjectRuntime<T> {
         Self {
             state: clone_state(&self.state),
             env: self.env.clone(),
+            residency: self.residency.clone(),
             instance: Rc::clone(&self.instance),
         }
     }
@@ -67,13 +70,15 @@ where
 {
     /// The runtime for the instance the platform just constructed.
     ///
-    /// Nothing is read here: the constructor is synchronous, so the object is loaded by the
-    /// first event.
+    /// `residency` is the controller the Worker shim passes after the platform's own arguments;
+    /// see [`CfResidency::from_constructor`]. Nothing is read here: the constructor is
+    /// synchronous, so the object is loaded by the first event.
     #[must_use]
-    pub fn new(state: worker_sys::DurableObjectState, env: JsValue) -> Self {
+    pub fn new(state: worker_sys::DurableObjectState, env: JsValue, residency: JsValue) -> Self {
         Self {
             state,
             env,
+            residency: CfResidency::from_constructor(residency),
             instance: Rc::new(Instance {
                 object: OnceCell::new(),
                 snapshot: RefCell::new(None),
@@ -88,7 +93,7 @@ where
     /// Returns `JsValue` when state I/O or request/response conversion fails.
     pub async fn fetch(&self, request: web_sys::Request) -> Result<web_sys::Response, JsValue> {
         let object = self.object().await?;
-        let durable_state = CfDurableState::new(clone_state(&self.state), self.env.clone());
+        let durable_state = self.durable_state();
 
         let mut request = from_js_request(&request).map_err(annotate_conversion)?;
         durable_state
@@ -131,7 +136,7 @@ where
     /// Returns `JsValue` when state I/O, alarm dispatch, or persistence fails.
     pub async fn alarm(&self) -> Result<(), JsValue> {
         let object = self.object().await?;
-        let durable_state = CfDurableState::new(clone_state(&self.state), self.env.clone());
+        let durable_state = self.durable_state();
 
         // `fetch()` returns a `Router`, which exposes the alarm handler registered via
         // `Route::on_alarm` directly — no runtime downcast required.
@@ -215,7 +220,7 @@ where
         event: WebSocketEvent,
     ) -> Result<(), JsValue> {
         let object = self.object().await?;
-        let durable_state = CfDurableState::new(clone_state(&self.state), self.env.clone());
+        let durable_state = self.durable_state();
         let context = durable_state.context().map_err(to_js)?;
         let connection = WebSocketConnection::new(Box::new(CfWebSocketConnection::new(
             websocket,
@@ -228,6 +233,15 @@ where
             .map_err(to_js)?;
 
         self.save(&object).await
+    }
+
+    /// The per-object handle every event's services are built from.
+    fn durable_state(&self) -> CfDurableState {
+        CfDurableState::new(
+            clone_state(&self.state),
+            self.env.clone(),
+            self.residency.clone(),
+        )
     }
 
     /// The instance's object, loaded on the first call.

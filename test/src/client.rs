@@ -298,8 +298,7 @@ mod tests {
             let content_type = request
                 .headers()
                 .get("content-type")
-                .map(|value| value.to_str().expect("header should be UTF-8").to_owned())
-                .unwrap_or_default();
+                .map_or_default(|value| value.to_str().expect("header should be UTF-8").to_owned());
             let body = core::mem::replace(request.body_mut(), Body::empty())
                 .into_string()
                 .await

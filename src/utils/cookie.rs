@@ -686,8 +686,7 @@ mod tests {
 
     async fn get_signed(mut jar: SignedCookieJar) -> String {
         jar.get("session")
-            .map(|cookie| cookie.value().to_owned())
-            .unwrap_or_default()
+            .map_or_default(|cookie| cookie.value().to_owned())
     }
 
     fn request_with_cookies(cookies: &str) -> Request {
@@ -744,8 +743,7 @@ mod tests {
 
     async fn get_private(mut jar: PrivateCookieJar) -> String {
         jar.get("session")
-            .map(|cookie| cookie.value().to_owned())
-            .unwrap_or_default()
+            .map_or_default(|cookie| cookie.value().to_owned())
     }
 
     #[tokio::test]
@@ -774,8 +772,7 @@ mod tests {
     async fn get_and_return_jar(mut jar: SignedCookieJar) -> (SignedCookieJar, String) {
         let value = jar
             .get("session")
-            .map(|cookie| cookie.value().to_owned())
-            .unwrap_or_default();
+            .map_or_default(|cookie| cookie.value().to_owned());
         (jar, value)
     }
 

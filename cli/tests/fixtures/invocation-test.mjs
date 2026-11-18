@@ -68,4 +68,53 @@ assert.notEqual(afterPanic, beforePanic);
 a.fetch('kill');
 assert.notEqual(a.fetch()[0], afterPanic);
 assert.deepEqual(b.fetch(), [bId, 3]);
+
+// residency: one pending timer while any hold is outstanding, re-armed as it
+// fires, cleared by the last release, and cleared with the application a
+// poison replaces
+const timers = new Map();
+let nextTimer = 0;
+globalThis.setTimeout = callback => {
+  nextTimer += 1;
+  timers.set(nextTimer, callback);
+  return nextTimer;
+};
+globalThis.clearTimeout = timer => {
+  timers.delete(timer);
+};
+const fire = () => {
+  assert.equal(timers.size, 1);
+  const [[timer, callback]] = timers;
+  timers.delete(timer);
+  callback();
+  return timer;
+};
+const r = new Room();
+r.fetch('hold');
+r.fetch('hold');
+assert.equal(timers.size, 1);
+const fired = fire();
+assert.equal(timers.size, 1);
+assert.notEqual([...timers.keys()][0], fired);
+r.fetch('release');
+assert.equal(timers.size, 1);
+r.fetch('release');
+assert.equal(timers.size, 0);
+assert.throws(() => r.fetch('release'), /no hold outstanding/);
+// an ordinary Error keeps the application, so the count is still zero
+r.fetch('hold');
+assert.equal(timers.size, 1);
+const stale = r.fetch('residency');
+assert.throws(() => r.fetch('trap'), WebAssembly.RuntimeError);
+r.fetch();
+assert.equal(timers.size, 0);
+// the replaced application's guards may still drop, and hold nothing
+stale.release();
+stale.hold();
+assert.equal(timers.size, 0);
+assert.notEqual(r.fetch('residency'), stale);
+r.fetch('hold');
+assert.equal(timers.size, 1);
+r.fetch('release');
+assert.equal(timers.size, 0);
 console.log('shared instance with poison recovery passed');

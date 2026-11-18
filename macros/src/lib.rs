@@ -1179,9 +1179,7 @@ fn expand_test(mut function: ItemFn, options: &TestOptions) -> syn::Result<Token
     let output = function.sig.output.clone();
     let vis = function.vis.clone();
 
-    let databases = load_manifest()?
-        .map(|manifest| manifest.database)
-        .unwrap_or_default();
+    let databases = load_manifest()?.map_or_default(|manifest| manifest.database);
     let database_types = test_database_types(&databases)?;
     let bindings = collect_test_param_bindings(inputs, &database_types)?;
     let setup_statements = test_setup_statements(&bindings.requirements, &databases, options)?;
@@ -4425,9 +4423,14 @@ fn expand_durable_object(item_struct: ItemStruct) -> proc_macro2::TokenStream {
                 pub fn new(
                     state: ::skyzen_cloudflare::worker_sys::DurableObjectState,
                     env: ::skyzen::runtime::wasm::Env,
+                    // The residency controller the generated Worker shim appends to the
+                    // platform's arguments.
+                    residency: ::skyzen::wasm_bindgen::JsValue,
                 ) -> Self {
                     Self {
-                        runtime: ::skyzen_cloudflare::DurableObjectRuntime::new(state, env),
+                        runtime: ::skyzen_cloudflare::DurableObjectRuntime::new(
+                            state, env, residency,
+                        ),
                     }
                 }
 

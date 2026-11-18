@@ -261,8 +261,7 @@ impl Plan {
             let irqs = nics
                 .iter()
                 .find(|nic| nic.nic == *name)
-                .map(|nic| nic.irqs.as_slice())
-                .unwrap_or_default();
+                .map_or_default(|nic| nic.irqs.as_slice());
             if irqs.is_empty() {
                 anyhow::bail!(
                     "[native.linux.nic.{name}] rx_irqs = \"serving\": {name} has no \

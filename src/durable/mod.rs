@@ -10,6 +10,7 @@
 //! - [`WebSocketConnection`] — Opaque handle to a hibernating WebSocket
 //! - [`HibernationWebSocketUpgrade`] — Responder for accepting hibernating WebSockets
 //! - [`DurableConnections`] — Manage all WebSocket connections
+//! - [`Residency`] — Keep the object resident while it has work, through a [`KeepResident`] guard
 //! - [`DurableObjectId`] — The unique identity of a Durable Object instance
 //! - [`DurableObjectError`] — Error type for Durable Object operations
 
@@ -22,6 +23,7 @@ mod id;
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 mod native;
 mod object;
+mod residency;
 mod websocket;
 
 pub use connections::DurableConnections;
@@ -32,6 +34,7 @@ pub use id::DurableObjectId;
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 pub use native::{NativeDurableNamespace, NativeDurableObjectStub};
 pub use object::DurableObject;
+pub use residency::{KeepResident, Residency, ResidencyInner, ResidencyNotConfigured};
 #[cfg(all(feature = "ws", target_arch = "wasm32"))]
 pub use websocket::DurableClientWebSocket;
 #[cfg(all(feature = "ws", target_arch = "wasm32"))]
