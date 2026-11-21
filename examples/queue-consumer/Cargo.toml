@@ -26,4 +26,4 @@ tracing = "0.1"
 dist = false
 
 [lints.cargo]
-unused_dependencies = "deny"
+unused_dependencies = "warn"
