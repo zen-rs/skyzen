@@ -1,6 +1,6 @@
 [package]
 name = "skyzen-s3"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "S3-compatible ObjectStorage implementation for the Skyzen framework"
 license = "MIT OR Apache-2.0"
@@ -10,11 +10,11 @@ keywords = ["s3", "object-storage", "skyzen", "services"]
 categories = ["web-programming::http-server", "database"]
 
 [dependencies]
-skyzen-services = { path = "../services", version = "0.4.0", default-features = false }
+skyzen-services = { path = "../services", version = "0.4.1", default-features = false }
 # The SDK's I/O: `skyzen_aws::sdk` sends requests on zenwave's runtime-neutral native backend and
 # runs the SDK's timers on async-io, so no tokio context is needed. No service of `skyzen-aws` is
 # wanted, only that module.
-skyzen-aws = { path = "../aws", version = "0.4.0", default-features = false }
+skyzen-aws = { path = "../aws", version = "0.5.0", default-features = false }
 # No `rt-tokio` and no `default-https-client` (hyper on tokio): the HTTP client and the sleep come
 # from `skyzen_aws::sdk`.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a"] }
