@@ -51,6 +51,7 @@ clippy.multiple_crate_versions = { level = "allow", priority = 1 }
 # Endpoints, middleware and the servers that drive them run on one thread and return `!Send`
 # futures by design (AGENTS.md §2a); this lint would flag every one of them.
 clippy.future_not_send = { level = "allow", priority = 1 }
+cargo.unused_dependencies = "warn"
 
 # `skyzen-cli` is the installable toolchain, and a source `cargo install` costs
 # ~20 minutes of compile per consumer (CI runners included). cargo-dist builds

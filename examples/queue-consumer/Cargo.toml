@@ -25,11 +25,5 @@ tracing = "0.1"
 # A runnable example, not a published binary: never a dist announcement target.
 dist = false
 
-[package.metadata.cargo-machete]
-# `utoipa` is reached only through what `#[derive(ToSchema)]` EXPANDS to — `::utoipa::…` paths —
-# so no source line names the crate and machete cannot see the use. The dependency is load-bearing
-# regardless: without it the derive does not resolve.
-#
-# Consumed by the code `#[skyzen::main]` GENERATES for `backend = "memory"`, which
-# cargo-machete cannot see in the source text.
-ignored = ["skyzen-test", "utoipa"]
+[lints.cargo]
+unused_dependencies = "warn"
