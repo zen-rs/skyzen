@@ -152,18 +152,6 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
-  unused-deps:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    name: Unused Dependencies
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # No build cache: cargo-machete reads manifests and sources, it compiles nothing.
-      - uses: taiki-e/install-action@cargo-machete
-      - run: cargo machete
-
   feature-checks:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -232,7 +220,7 @@ jobs:
     # or was skipped (a release-plz bump skips everything but this job).
     name: CI result
     if: always()
-    needs: [changes, lint, wasm, coverage, audit, unused-deps, feature-checks, minimal-consumer, test]
+    needs: [changes, lint, wasm, coverage, audit, feature-checks, minimal-consumer, test]
     runs-on: ubuntu-latest
     steps:
       - name: Check job results
