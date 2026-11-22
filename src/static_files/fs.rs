@@ -7,7 +7,14 @@
 //! pool, which belongs to no runtime, for a router served by an executor of the application's own
 //! (the `hyper` embedding under Tokio).
 
-use std::{fs::File, future::Future, io, path::PathBuf, time::SystemTime};
+use std::{
+    fs::File,
+    future::Future,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use bytes::Bytes;
 
@@ -41,6 +48,8 @@ pub enum Entry<H> {
     Directory,
     /// A file, open for reading.
     File(Opened<H>),
+    /// The path resolved outside the configured static root.
+    Escaped,
 }
 
 /// An open file, in the backend's own handle, and what `stat` said about the same path.
@@ -52,7 +61,7 @@ pub struct Opened<H> {
 }
 
 pub(super) mod sealed {
-    use super::{Bytes, Entry, File, Future, PathBuf};
+    use super::{Arc, Bytes, Entry, File, Future, PathBuf};
     use std::io;
 
     pub trait Ops {
@@ -60,7 +69,14 @@ pub(super) mod sealed {
         type Handle;
 
         /// Stat `path`, and open it read-only when it is a file.
-        fn open(&self, path: PathBuf) -> impl Future<Output = io::Result<Entry<Self::Handle>>>;
+        ///
+        /// When `canonical_root` is `Some`, `path` is canonicalized and rejected with
+        /// [`Entry::Escaped`] if it resolves outside `canonical_root`.
+        fn open(
+            &self,
+            path: PathBuf,
+            canonical_root: Option<Arc<PathBuf>>,
+        ) -> impl Future<Output = io::Result<Entry<Self::Handle>>>;
 
         /// Read the first `len` bytes of the file, which must still hold that many.
         fn read(&self, handle: Self::Handle, len: u64) -> impl Future<Output = io::Result<Bytes>>;
@@ -89,8 +105,12 @@ pub(super) mod sealed {
 impl sealed::Ops for CompioFs {
     type Handle = File;
 
-    async fn open(&self, path: PathBuf) -> io::Result<Entry<Self::Handle>> {
-        sealed::Ops::open(&BlockingFs, path).await
+    async fn open(
+        &self,
+        path: PathBuf,
+        canonical_root: Option<Arc<PathBuf>>,
+    ) -> io::Result<Entry<Self::Handle>> {
+        sealed::Ops::open(&BlockingFs, path, canonical_root).await
     }
 
     async fn read(&self, handle: Self::Handle, len: u64) -> io::Result<Bytes> {
@@ -106,11 +126,28 @@ impl sealed::Ops for CompioFs {
 impl sealed::Ops for CompioFs {
     type Handle = compio::fs::File;
 
-    async fn open(&self, path: PathBuf) -> io::Result<Entry<Self::Handle>> {
+    async fn open(
+        &self,
+        path: PathBuf,
+        canonical_root: Option<Arc<PathBuf>>,
+    ) -> io::Result<Entry<Self::Handle>> {
+        let (target, no_follow) = if let Some(root) = canonical_root {
+            let Some(resolved) =
+                blocking::unblock(move || resolve_within_root(&path, &root)).await?
+            else {
+                return Ok(Entry::Escaped);
+            };
+            (resolved, true)
+        } else {
+            (path, false)
+        };
+
         // Both operations are pushed before either is awaited, so they leave in one submission.
-        let (stat, file) =
-            futures_util::future::join(compio::fs::metadata(&path), compio::fs::File::open(&path))
-                .await;
+        let (stat, file) = futures_util::future::join(
+            compio::fs::metadata(&target),
+            open_compio_file(&target, no_follow),
+        )
+        .await;
         let stat = stat?;
         if stat.is_dir() {
             // Opening a directory read-only succeeds on Unix and fails on Windows; either way it
@@ -163,13 +200,26 @@ impl sealed::Ops for CompioFs {
 impl sealed::Ops for BlockingFs {
     type Handle = File;
 
-    async fn open(&self, path: PathBuf) -> io::Result<Entry<Self::Handle>> {
+    async fn open(
+        &self,
+        path: PathBuf,
+        canonical_root: Option<Arc<PathBuf>>,
+    ) -> io::Result<Entry<Self::Handle>> {
         blocking::unblock(move || {
+            let (target, no_follow) = if let Some(root) = canonical_root {
+                let Some(resolved) = resolve_within_root(&path, &root)? else {
+                    return Ok(Entry::Escaped);
+                };
+                (resolved, true)
+            } else {
+                (path, false)
+            };
+
             // Stat first: Windows cannot open a directory as a file, and nothing needs it open.
-            if std::fs::metadata(&path)?.is_dir() {
+            if std::fs::metadata(&target)?.is_dir() {
                 return Ok(Entry::Directory);
             }
-            let handle = File::open(&path)?;
+            let handle = open_blocking_file(&target, no_follow)?;
             let metadata = handle.metadata()?;
             Ok(Entry::File(Opened {
                 len: metadata.len(),
@@ -209,6 +259,44 @@ impl sealed::Ops for BlockingFs {
     fn std_file(&self, handle: Self::Handle) -> io::Result<File> {
         Ok(handle)
     }
+}
+
+fn resolve_within_root(path: &Path, root: &Path) -> io::Result<Option<PathBuf>> {
+    let resolved = std::fs::canonicalize(path)?;
+    if resolved.starts_with(root) {
+        Ok(Some(resolved))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(windows))]
+async fn open_compio_file(path: &Path, no_follow: bool) -> io::Result<compio::fs::File> {
+    #[cfg(target_os = "linux")]
+    if no_follow {
+        return compio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = no_follow;
+    compio::fs::File::open(path).await
+}
+
+fn open_blocking_file(path: &Path, no_follow: bool) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    if no_follow {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        return std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = no_follow;
+    File::open(path)
 }
 
 fn in_memory(len: u64) -> io::Result<usize> {
