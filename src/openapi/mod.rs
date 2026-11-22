@@ -127,7 +127,10 @@ pub fn schema_of<T>() -> Option<SchemaRef>
 where
     T: crate::ToSchema,
 {
-    Some(<T as crate::PartialSchema>::schema())
+    let mut schema = <T as crate::PartialSchema>::schema();
+    let parsed = parse_type_name(core::any::type_name::<T>());
+    visit_container_schema(&mut schema, &parsed, false, None, true);
+    Some(schema)
 }
 
 /// Return the extractor schema for `T` if it exposes `OpenAPI` metadata.
@@ -252,13 +255,300 @@ fn register_type<T>(defs: &mut BTreeMap<String, SchemaRef>)
 where
     T: crate::PartialSchema + crate::ToSchema,
 {
-    let name = <T as crate::ToSchema>::name().into_owned();
-    defs.entry(name)
-        .or_insert_with(<T as crate::PartialSchema>::schema);
     let mut nested = Vec::new();
     <T as crate::ToSchema>::schemas(&mut nested);
     for (dep_name, schema) in nested {
         defs.entry(dep_name).or_insert(schema);
+    }
+
+    let parsed = parse_type_name(core::any::type_name::<T>());
+    if container_kind(parsed.base).is_some() {
+        let mut schema = <T as crate::PartialSchema>::schema();
+        visit_container_schema(&mut schema, &parsed, false, Some(defs), false);
+        return;
+    }
+
+    if is_primitive(&parsed) {
+        return;
+    }
+
+    let name = <T as crate::ToSchema>::name().into_owned();
+    defs.entry(name)
+        .or_insert_with(<T as crate::PartialSchema>::schema);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContainerKind {
+    Sequence,
+    Option,
+    Map,
+    Transparent,
+    Ignore,
+}
+
+struct ParsedType<'a> {
+    base: &'a str,
+    args: Vec<Self>,
+}
+
+fn parse_type_name(input: &str) -> ParsedType<'_> {
+    let trimmed = input.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("&mut [")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        return ParsedType {
+            base: "[]",
+            args: vec![parse_type_name(inner)],
+        };
+    }
+    if let Some(inner) = trimmed.strip_prefix("&[").and_then(|s| s.strip_suffix(']')) {
+        return ParsedType {
+            base: "[]",
+            args: vec![parse_type_name(inner)],
+        };
+    }
+    if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return ParsedType {
+            base: "[]",
+            args: vec![parse_type_name(inner)],
+        };
+    }
+
+    if let Some((open_idx, close_idx)) = outer_angle_bounds(trimmed) {
+        let base = trimmed[..open_idx].trim();
+        let inner = &trimmed[open_idx + 1..close_idx];
+        let args = split_top_level_args(inner)
+            .into_iter()
+            .filter(|arg| !arg.starts_with('\''))
+            .map(parse_type_name)
+            .collect();
+        return ParsedType { base, args };
+    }
+
+    ParsedType {
+        base: trimmed,
+        args: Vec::new(),
+    }
+}
+
+fn outer_angle_bounds(input: &str) -> Option<(usize, usize)> {
+    if !input.ends_with('>') {
+        return None;
+    }
+    let mut angle_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut open_idx = None;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '<' if paren_depth == 0 && bracket_depth == 0 => {
+                if angle_depth == 0 {
+                    open_idx = Some(idx);
+                }
+                angle_depth += 1;
+            }
+            '>' if paren_depth == 0 && bracket_depth == 0 => {
+                angle_depth = angle_depth.checked_sub(1)?;
+                if angle_depth == 0 {
+                    return open_idx
+                        .map(|open| (open, idx))
+                        .filter(|(_, close)| *close == input.len() - 1);
+                }
+            }
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_args(input: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut angle_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ',' if angle_depth == 0 && paren_depth == 0 && bracket_depth == 0 => {
+                let piece = input[start..idx].trim();
+                if !piece.is_empty() {
+                    args.push(piece);
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        args.push(tail);
+    }
+    args
+}
+
+fn container_kind(base: &str) -> Option<ContainerKind> {
+    match base {
+        "[]"
+        | "alloc::vec::Vec"
+        | "std::vec::Vec"
+        | "alloc::collections::linked_list::LinkedList"
+        | "std::collections::linked_list::LinkedList"
+        | "alloc::collections::btree::set::BTreeSet"
+        | "std::collections::btree_set::BTreeSet"
+        | "std::collections::btree::set::BTreeSet"
+        | "std::collections::hash::set::HashSet"
+        | "indexmap::set::IndexSet" => Some(ContainerKind::Sequence),
+        "core::option::Option" | "std::option::Option" => Some(ContainerKind::Option),
+        "alloc::collections::btree::map::BTreeMap"
+        | "std::collections::btree_map::BTreeMap"
+        | "std::collections::btree::map::BTreeMap"
+        | "std::collections::hash::map::HashMap"
+        | "indexmap::map::IndexMap" => Some(ContainerKind::Map),
+        "alloc::boxed::Box"
+        | "std::boxed::Box"
+        | "alloc::borrow::Cow"
+        | "std::borrow::Cow"
+        | "core::cell::RefCell"
+        | "std::cell::RefCell"
+        | "alloc::rc::Rc"
+        | "std::rc::Rc"
+        | "alloc::sync::Arc"
+        | "std::sync::Arc"
+        | "skyzen::utils::json::Json"
+        | "skyzen::responder::json::PrettyJson"
+        | "skyzen::utils::form::Form"
+        | "skyzen::extract::query::Query" => Some(ContainerKind::Transparent),
+        "skyzen::utils::state::State" | "skyzen::openapi::builtins::IgnoreOpenApi" => {
+            Some(ContainerKind::Ignore)
+        }
+        _ => None,
+    }
+}
+
+fn is_primitive(parsed: &ParsedType<'_>) -> bool {
+    parsed.args.is_empty()
+        && matches!(
+            parsed.base,
+            "bool"
+                | "char"
+                | "str"
+                | "&str"
+                | "()"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "f32"
+                | "f64"
+                | "alloc::string::String"
+                | "std::string::String"
+                | "serde_json::value::Value"
+        )
+}
+
+fn short_name(base: &str) -> &str {
+    base.rsplit_once("::").map_or(base, |(_, name)| name)
+}
+
+fn is_null_schema(schema: &SchemaRef) -> bool {
+    matches!(
+        schema,
+        RefOr::T(Schema::Object(obj)) if obj.schema_type == SchemaType::from(Type::Null)
+    )
+}
+
+fn visit_container_schema(
+    schema: &mut SchemaRef,
+    parsed: &ParsedType<'_>,
+    in_container: bool,
+    mut defs: Option<&mut BTreeMap<String, SchemaRef>>,
+    rewrite_refs: bool,
+) {
+    match container_kind(parsed.base) {
+        Some(ContainerKind::Sequence) => {
+            if let (Some(item_ty), RefOr::T(Schema::Array(array))) = (parsed.args.first(), schema) {
+                if let utoipa::openapi::schema::ArrayItems::RefOrSchema(item_schema) =
+                    &mut array.items
+                {
+                    visit_container_schema(
+                        item_schema,
+                        item_ty,
+                        true,
+                        defs.as_deref_mut(),
+                        rewrite_refs,
+                    );
+                }
+            }
+        }
+        Some(ContainerKind::Option) => {
+            if let (Some(inner_ty), RefOr::T(Schema::OneOf(one_of))) = (parsed.args.first(), schema)
+            {
+                for item in &mut one_of.items {
+                    if !is_null_schema(item) {
+                        visit_container_schema(
+                            item,
+                            inner_ty,
+                            true,
+                            defs.as_deref_mut(),
+                            rewrite_refs,
+                        );
+                    }
+                }
+            }
+        }
+        Some(ContainerKind::Map) => {
+            if let (Some(val_ty), RefOr::T(Schema::Object(obj))) = (parsed.args.get(1), schema) {
+                if let Some(add_props) = &mut obj.additional_properties {
+                    if let utoipa::openapi::schema::AdditionalProperties::RefOr(val_schema) =
+                        add_props.as_mut()
+                    {
+                        visit_container_schema(
+                            val_schema,
+                            val_ty,
+                            true,
+                            defs.as_deref_mut(),
+                            rewrite_refs,
+                        );
+                    }
+                }
+            }
+        }
+        Some(ContainerKind::Transparent) => {
+            if let Some(inner_ty) = parsed.args.first() {
+                visit_container_schema(schema, inner_ty, true, defs, rewrite_refs);
+            }
+        }
+        Some(ContainerKind::Ignore) => {}
+        None => {
+            if in_container && !is_primitive(parsed) {
+                let name = short_name(parsed.base).to_owned();
+                if let Some(defs) = defs {
+                    defs.entry(name.clone()).or_insert_with(|| schema.clone());
+                }
+                if rewrite_refs {
+                    *schema = RefOr::Ref(utoipa::openapi::Ref::from_schema_name(name));
+                }
+            }
+        }
     }
 }
 
@@ -323,7 +613,7 @@ where
     #[doc(hidden)]
     #[must_use]
     pub fn maybe_schema(&self) -> Option<SchemaRef> {
-        Some(<T as crate::PartialSchema>::schema())
+        schema_of::<T>()
     }
 
     /// Register `T` and its dependencies into the components map.
