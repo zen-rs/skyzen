@@ -36,8 +36,8 @@ impl Endpoint for CountingEndpoint {
         request: &mut Request,
     ) -> impl Future<Output = Result<Response, Self::Error>> {
         let served = Rc::clone(&self.served);
-        let upgradable = request.extensions().get::<UpgradeAvailable>().is_some();
-        let peer = request.extensions().get::<PeerAddr>().copied();
+        let upgradable = UpgradeAvailable::is_set(request);
+        let peer = PeerAddr::of(request);
         let path = request.uri().path().to_owned();
         async move {
             // Held across an await on purpose: the future is `!Send`.
