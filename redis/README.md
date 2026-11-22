@@ -83,7 +83,7 @@ async fn main() -> Router {
     let kv = Kv::new(redis);
 
     Route::new((
-        "/cache/{key}".get(get_cached),
+        "/cache/{key}".at(get_cached),
     ))
     .with(kv)
     .build()

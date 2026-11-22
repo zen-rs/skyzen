@@ -668,17 +668,6 @@ impl RouteNode {
         self.on(Method::GET, handler)
     }
 
-    /// Alias for [`RouteNode::at`].
-    #[must_use]
-    pub fn get<H, T, R>(self, handler: H) -> Self
-    where
-        H: Handler<T, R>,
-        T: Extractor,
-        R: Responder,
-    {
-        self.at(handler)
-    }
-
     /// Attach a POST handler to the current route node.
     #[must_use]
     pub fn post<H, T, R>(self, handler: H) -> Self
@@ -1071,16 +1060,6 @@ pub trait CreateRouteNode: Sized {
         H: Handler<T, R>,
         T: Extractor,
         R: Responder;
-
-    /// Alias for [`CreateRouteNode::at`].
-    fn get<H, T, R>(self, handler: H) -> RouteNode
-    where
-        H: Handler<T, R>,
-        T: Extractor,
-        R: Responder,
-    {
-        self.at(handler)
-    }
 
     /// Attach a POST handler to the path.
     fn post<H, T, R>(self, handler: H) -> RouteNode
