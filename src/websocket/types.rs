@@ -8,6 +8,26 @@ use std::{
 use http_kit::header::{HeaderMap, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use skyzen_core::Extractor;
 
+/// Default maximum incoming (and on WASM, outbound) WebSocket message size: 16 MiB.
+///
+/// Bounds per-connection message reassembly buffers on multi-connection servers (tighter than
+/// `tungstenite`'s 64 MiB default while still accommodating large JSON and binary payloads).
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Default maximum incoming WebSocket frame size: 1 MiB.
+///
+/// Bounds single-frame allocations before message reassembly and matches common edge/proxy frame
+/// limits.
+pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
+
+/// Build Skyzen's hardened default [`WebSocketConfig`](http_kit::ws::WebSocketConfig).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn default_websocket_config() -> http_kit::ws::WebSocketConfig {
+    http_kit::ws::WebSocketConfig::default()
+        .with_max_message_size(Some(DEFAULT_MAX_MESSAGE_SIZE))
+        .with_max_frame_size(Some(DEFAULT_MAX_FRAME_SIZE))
+}
+
 /// Result type used by websocket operations.
 pub type WebSocketResult<T> = Result<T, WebSocketError>;
 

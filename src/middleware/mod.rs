@@ -60,6 +60,8 @@ use skyzen_core::{
     Error,
 };
 
+#[cfg(feature = "multipart")]
+pub use crate::utils::multipart::MultipartLimits;
 pub use body_limit::BodyLimit;
 pub use compression::{CompressionEncoding, CompressionLevel, CompressionMiddleware};
 pub use cors::{AllowOrigin, Cors, CorsConfigError};
