@@ -18,7 +18,10 @@ use core::{
 };
 use std::io;
 
-use http_kit::utils::{AsyncRead, AsyncWrite, Bytes};
+use http_kit::{
+    utils::{ready, AsyncRead, AsyncWrite, ByteStr, Bytes, Stream as _},
+    Body, BodyError, BodyFrame,
+};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use http_kit_io::splice::SpliceDuplex;
 use http_kit_io::{poll::CopyingPoll, SpliceRead, SpliceWrite, Split};
@@ -124,6 +127,30 @@ impl Upgraded {
         }
     }
 
+    /// A full-duplex byte stream backed by an incoming request [`Body`] and an outgoing response
+    /// [`Body`], as RFC 8441 Extended `CONNECT` runs a session over a single HTTP/2 stream.
+    ///
+    /// Writes are bounded by an internal frame queue so HTTP/2 send-window backpressure propagates
+    /// to the session writer; closing the [`Upgraded`] writer ends the returned response [`Body`].
+    #[must_use]
+    pub fn from_bodies(incoming: Body) -> (Self, Body) {
+        /// Bounded frame capacity so a stalled HTTP/2 peer applies backpressure to the session.
+        const OUTBOX_CAPACITY: usize = 16;
+
+        let (sender, receiver) =
+            async_channel::bounded::<Result<BodyFrame, BodyError>>(OUTBOX_CAPACITY);
+        let stream = BodyDuplex {
+            incoming,
+            chunk: Bytes::new(),
+            sender: Some(sender),
+            flushing: None,
+        };
+        (
+            Self::from_stream(Bytes::new(), stream),
+            Body::from_frames(receiver),
+        )
+    }
+
     /// Whether [`into_splice`](Self::into_splice) would succeed: the connection was handed over
     /// as its halves, neither has been read or written through the `futures_io` traits yet, and
     /// both can move bytes through a pipe (a plain socket, or a kernel TLS one; a TLS session in
@@ -217,6 +244,143 @@ impl AsyncWrite for Upgraded {
 /// refuses with `426` instead of sending a `101` into the void.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpgradeAvailable;
+
+/// The RFC 8441 `:protocol` token of an Extended `CONNECT` request whose stream the server will
+/// connect to an [`OnUpgrade`] session once answered with a `2xx` response.
+///
+/// Inserted by HTTP/2 servers that advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` and spawn the
+/// response's [`OnUpgrade`] over [`Upgraded::from_bodies`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConnectProtocol(pub ByteStr);
+
+impl ConnectProtocol {
+    /// Wrap a protocol token (such as `"websocket"`).
+    #[must_use]
+    pub fn new(protocol: impl Into<ByteStr>) -> Self {
+        Self(protocol.into())
+    }
+
+    /// The protocol token as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl core::ops::Deref for ConnectProtocol {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_str()
+    }
+}
+
+type PendingSend = Pin<
+    Box<dyn Future<Output = Result<(), async_channel::SendError<Result<BodyFrame, BodyError>>>>>,
+>;
+
+/// Adapts an incoming [`Body`] and an outgoing [`BodyFrame`] sender into one [`AsyncRead`] +
+/// [`AsyncWrite`] stream for RFC 8441 Extended `CONNECT` sessions.
+struct BodyDuplex {
+    incoming: Body,
+    chunk: Bytes,
+    sender: Option<async_channel::Sender<Result<BodyFrame, BodyError>>>,
+    flushing: Option<PendingSend>,
+}
+
+impl BodyDuplex {
+    fn poll_drain_flushing(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(fut) = &mut self.flushing {
+            let res = ready!(fut.as_mut().poll(cx));
+            self.flushing = None;
+            if res.is_err() {
+                self.sender = None;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "extended CONNECT response stream closed",
+                )));
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for BodyDuplex {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let this = &mut *self;
+        loop {
+            if !this.chunk.is_empty() {
+                let len = this.chunk.len().min(buf.len());
+                buf[..len].copy_from_slice(&this.chunk.split_to(len));
+                return Poll::Ready(Ok(len));
+            }
+            match ready!(Pin::new(&mut this.incoming).poll_next(cx)) {
+                Some(Ok(BodyFrame::Data(bytes))) => {
+                    this.chunk = bytes;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    return Poll::Ready(Err(io::Error::other(error)));
+                }
+                None => return Poll::Ready(Ok(0)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for BodyDuplex {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let this = &mut *self;
+        ready!(this.poll_drain_flushing(cx))?;
+        let Some(sender) = &this.sender else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "extended CONNECT response stream closed",
+            )));
+        };
+        let frame = Ok(BodyFrame::Data(Bytes::copy_from_slice(buf)));
+        match sender.try_send(frame) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(async_channel::TrySendError::Full(frame)) => {
+                let sender = sender.clone();
+                this.flushing = Some(Box::pin(async move { sender.send(frame).await }));
+                Poll::Ready(Ok(buf.len()))
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                this.sender = None;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "extended CONNECT response stream closed",
+                )))
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_drain_flushing(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        ready!(this.poll_drain_flushing(cx))?;
+        this.sender = None;
+        Poll::Ready(Ok(()))
+    }
+}
 
 type Session = Box<dyn FnOnce(Upgraded) -> LocalBoxFuture<'static, ()> + Send>;
 

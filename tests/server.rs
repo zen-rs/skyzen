@@ -5,7 +5,10 @@
 //! router, then hands that router to the server along with listeners and a thread-local executor.
 //! These threads run `async-io`, not compio, so the context they hand the factory says so.
 
-use http_kit_io::{async_io::AsyncIo, FromStd as _, Listen};
+use futures_lite::future::zip;
+use http_kit::{Body, Request, StatusCode};
+use http_kit_h2::{handshake_stream, ClientConfig};
+use http_kit_io::{async_io::AsyncIo, Dial as _, FromStd as _, Listen};
 use skyzen::{
     hyper::Hyper,
     routing::{CreateRouteNode, Route, Router},
@@ -13,6 +16,7 @@ use skyzen::{
     EndpointFactory, Server,
 };
 use skyzen_h1::H1;
+use skyzen_h2::H2;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use std::{cell::Cell, net::SocketAddr, rc::Rc};
 
@@ -95,6 +99,31 @@ fn an_rc_holding_handler_serves_through_our_h1_server() {
     assert_counts(start(H1::default(), |_: ServingThread| async {
         counting_router()
     }));
+}
+
+#[test]
+fn an_rc_holding_handler_serves_through_our_h2_server() {
+    let addr = start(H2::default(), |_: ServingThread| async {
+        counting_router()
+    });
+    smol::block_on(async move {
+        for expected in ["1", "2"] {
+            let stream = AsyncIo.connect(addr).await.expect("connect");
+            let (send, conn) = handshake_stream(stream, AsyncIo, ClientConfig::default());
+            let mut req = Request::new(Body::empty());
+            *req.uri_mut() = format!("http://{addr}/count").parse().unwrap();
+            let (ran, body) = zip(conn.run(), async move {
+                let resp = send.send(req).await.expect("h2 request");
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = resp.into_body().into_bytes().await.expect("h2 body");
+                drop(send);
+                bytes
+            })
+            .await;
+            ran.expect("h2 connection");
+            assert_eq!(&body[..], expected.as_bytes());
+        }
+    });
 }
 
 #[test]

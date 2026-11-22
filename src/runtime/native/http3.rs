@@ -489,7 +489,7 @@ mod tests {
     use http_kit::{Body, Method, Request, StatusCode};
     use http_kit_h3::{Client, ClientConfig, Roots};
     use http_kit_io::{compio::Compio, Datagram as _, DatagramSocket as _};
-    use skyzen_hyper::AltSvc;
+    use skyzen_core::AltSvc;
 
     use super::{build, Http3Error};
     use crate::{
@@ -591,7 +591,7 @@ mod tests {
                     options.recv_ring(max_connections),
                     None,
                 ),
-                server: HttpServer::H1,
+                server: HttpServer::Auto,
                 tls,
                 http3: Some(Http3Plan {
                     http3,

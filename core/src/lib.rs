@@ -8,7 +8,7 @@
 //! - [`Responder`] — Convert types into HTTP responses
 //! - [`Middleware`] — Wrap request handling, sharing one value across every request
 //! - [`Server`] — HTTP protocol implementations serving one thread's endpoint over `http-kit-io`
-//!   listeners (implemented by `skyzen-h1` and `skyzen-hyper`)
+//!   listeners (implemented by `skyzen-h1`, `skyzen-h2`, and `skyzen-hyper`)
 //!
 //! Also re-exports HTTP primitives from `http-kit`: [`Request`], [`Response`],
 //! [`Body`], [`Endpoint`], [`StatusCode`], and more.
@@ -52,7 +52,7 @@ mod net;
 pub mod upgrade;
 #[cfg(feature = "std")]
 pub use net::{
-    apply_pending_headers, error_response, log_endpoint_error, panic_message, ErrorDetails,
+    apply_pending_headers, error_response, log_endpoint_error, panic_message, AltSvc, ErrorDetails,
     MissingRemoteAddr, PeerAddr, PeerAddress, PendingResponseHeaders, PlatformRequestId,
 };
 #[cfg(feature = "std")]

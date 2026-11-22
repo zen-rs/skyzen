@@ -875,6 +875,62 @@ fn a_slow_client_paces_the_origin_download() {
     });
 }
 
+#[test]
+fn an_h2_client_uploads_and_downloads_through_the_proxy() {
+    use futures_lite::future::zip;
+    use http_kit_h2::{handshake_stream, ClientConfig};
+    use skyzen_h2::H2;
+
+    run(async {
+        let (origin, _release) = Origin::new();
+        let origin_addr = serve(origin.clone());
+        let target = format!("http://{origin_addr}/v1").parse().unwrap();
+        let upstream = Upstream::new(&target).expect("upstream");
+        let router = Route::new(("/api".mount(Proxy::new(&upstream, &thread())),)).build();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind h2 proxy");
+        let proxy_addr = listener.local_addr().expect("local addr");
+        let io = Compio::default();
+        let listener = io.tcp_listener(listener).expect("register listener");
+        compio::runtime::spawn(async move {
+            H2::default()
+                .serve_listener(
+                    io,
+                    compio::runtime::Runtime::current(),
+                    listener,
+                    router,
+                    core::future::pending(),
+                )
+                .await;
+        })
+        .detach();
+
+        let io = Compio::default();
+        let stream = io.connect(proxy_addr).await.expect("connect h2 proxy");
+        let (send, conn) = handshake_stream(stream, io, ClientConfig::default());
+        let payload = bulk();
+        let (ran, ()) = zip(conn.run(), async {
+            let mut up = Request::new(Body::from(payload.clone()));
+            *up.method_mut() = Method::PUT;
+            *up.uri_mut() = format!("http://{proxy_addr}/api/upload").parse().unwrap();
+            let up_resp = send.send(up).await.expect("h2 upload");
+            assert_eq!(up_resp.status(), StatusCode::NO_CONTENT);
+            assert!(origin.last().body == payload, "h2 upload arrived changed");
+
+            let mut down = Request::new(Body::empty());
+            *down.method_mut() = Method::GET;
+            *down.uri_mut() = format!("http://{proxy_addr}/api/download").parse().unwrap();
+            let down_resp = send.send(down).await.expect("h2 download");
+            assert_eq!(down_resp.status(), StatusCode::OK);
+            let (data, _) = read_frames(down_resp.into_body()).await;
+            assert!(data == payload, "h2 download arrived changed");
+            drop(send);
+        })
+        .await;
+        ran.expect("h2 proxy connection");
+    });
+}
+
 /// The proxy between two kernel TLS connections (Linux, with the kernel's `tls` module loaded, as
 /// CI loads it): its bodies and its tunnel splice exactly as they do between plain sockets, the
 /// records sealed and opened by the kernel on both sides.

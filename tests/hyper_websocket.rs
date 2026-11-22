@@ -10,8 +10,8 @@ use async_tungstenite::{
 };
 use futures_util::StreamExt;
 use http_kit_io::{async_io::AsyncIo, FromStd as _};
-use hyper::header::SEC_WEBSOCKET_PROTOCOL;
 use skyzen::{
+    header::SEC_WEBSOCKET_PROTOCOL,
     hyper::Hyper,
     routing::{CreateRouteNode, Route},
     websocket::WebSocketUpgrade,
@@ -658,4 +658,107 @@ async fn websocket_answers_a_credential_bearing_subprotocol_verbatim() {
 
     let _ = client.close(None).await;
     drop(handle);
+}
+
+#[test]
+fn websocket_roundtrip_over_http2_extended_connect_on_compio() {
+    use async_tungstenite::tungstenite::protocol::Role;
+    use futures_lite::future::zip;
+    use http_kit::{Body, Method, Request, StatusCode};
+    use http_kit_h2::{handshake_stream, ClientConfig, Protocol};
+    use http_kit_io::{compio::Compio, Dial as _};
+    use skyzen_core::upgrade::Upgraded;
+    use skyzen_h2::H2;
+
+    const CJK: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind h2 ws listener");
+    let addr = listener.local_addr().expect("local addr");
+    let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
+
+    std::thread::spawn(move || {
+        let runtime = Rc::new(executor_core::compio::Runtime::new().expect("compio runtime"));
+        let serve_rt = Rc::clone(&runtime);
+        runtime.block_on(async move {
+            let io = Compio::default();
+            let listener = io.tcp_listener(listener).expect("register listener");
+            let router = Route::new(("/echo".at(|ws: WebSocketUpgrade| async move {
+                ws.protocols(["chat", "v2.skyzen"])
+                    .on_upgrade(|mut socket| async move {
+                        while let Some(Ok(message)) = socket.next().await {
+                            if let Some(text) = message.into_text() {
+                                let _ = socket.send_text(text).await;
+                            }
+                        }
+                    })
+            }),))
+            .build();
+            H2::default()
+                .serve(io, serve_rt, listener, router, async move {
+                    let _ = stop_rx.recv().await;
+                })
+                .await;
+        });
+    });
+
+    let runtime = executor_core::compio::Runtime::new().expect("client compio runtime");
+    runtime.block_on(async move {
+        let io = Compio::default();
+        let stream = io.connect(addr).await.expect("connect");
+        let (send, conn) = handshake_stream(stream, io, ClientConfig::default());
+
+        let client = async move {
+            let (out_tx, out_rx) =
+                async_channel::bounded::<Result<http_kit::BodyFrame, http_kit::BodyError>>(16);
+            let mut req = Request::new(Body::from_frames(out_rx));
+            *req.method_mut() = Method::CONNECT;
+            *req.uri_mut() = format!("http://{addr}/echo").parse().unwrap();
+            req.headers_mut().insert(
+                skyzen::header::SEC_WEBSOCKET_VERSION,
+                skyzen::header::HeaderValue::from_static("13"),
+            );
+            req.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                skyzen::header::HeaderValue::from_static("v2.skyzen"),
+            );
+            req.extensions_mut()
+                .insert(Protocol::from_static("websocket"));
+
+            let resp = send.send(req).await.expect("RFC 8441 CONNECT");
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers()[SEC_WEBSOCKET_PROTOCOL], "v2.skyzen");
+            assert!(resp.headers().get(skyzen::header::CONNECTION).is_none());
+            assert!(resp.headers().get(skyzen::header::UPGRADE).is_none());
+
+            let (mut server_to_client_io, bridge_body) = Upgraded::from_bodies(resp.into_body());
+            let pump_outgoing = async move {
+                let mut bridge_body = bridge_body;
+                while let Some(frame) = bridge_body.next().await {
+                    if out_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                drop(out_tx);
+            };
+            let exchange = async move {
+                let mut ws =
+                    WebSocketStream::from_raw_socket(&mut server_to_client_io, Role::Client, None)
+                        .await;
+                ws.send(Message::text(CJK)).await.expect("send CJK text");
+                let echoed = ws
+                    .next()
+                    .await
+                    .expect("echo frame")
+                    .expect("valid ws frame");
+                assert_eq!(echoed.into_text().unwrap().as_str(), CJK);
+                ws.close(None).await.expect("close ws");
+            };
+            zip(pump_outgoing, exchange).await;
+            drop(send);
+        };
+
+        let (ran, ()) = zip(conn.run(), client).await;
+        ran.expect("h2 client connection");
+        drop(stop_tx);
+    });
 }
