@@ -152,6 +152,19 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
+  deny:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Supply Chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No build cache: this job compiles nothing.
+      - name: Generate Lockfile
+        run: cargo generate-lockfile
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny --workspace --all-features check
+
   feature-checks:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -220,7 +233,7 @@ jobs:
     # or was skipped (a release-plz bump skips everything but this job).
     name: CI result
     if: always()
-    needs: [changes, lint, wasm, coverage, audit, feature-checks, minimal-consumer, test]
+    needs: [changes, lint, wasm, coverage, audit, deny, feature-checks, minimal-consumer, test]
     runs-on: ubuntu-latest
     steps:
       - name: Check job results

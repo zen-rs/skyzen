@@ -149,3 +149,208 @@ fn a_tuple_responder_documents_its_payload_too() {
         "{content:#}"
     );
 }
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+struct DtoA {
+    alpha: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+struct DtoB {
+    beta: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+struct DtoC {
+    gamma: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+struct DtoD {
+    delta: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+struct NestedChild {
+    leaf: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+struct DtoE {
+    epsilon: String,
+    child: NestedChild,
+}
+
+#[skyzen::openapi]
+async fn list_a() -> Json<Vec<DtoA>> {
+    Json(Vec::new())
+}
+
+#[skyzen::openapi]
+async fn list_b() -> Json<Vec<DtoB>> {
+    Json(Vec::new())
+}
+
+#[skyzen::openapi]
+async fn list_c() -> skyzen::responder::PrettyJson<Vec<DtoC>> {
+    skyzen::responder::PrettyJson(Vec::new())
+}
+
+#[skyzen::openapi]
+async fn create_d(Json(items): Json<Vec<DtoD>>) -> Json<Vec<DtoD>> {
+    Json(items)
+}
+
+#[skyzen::openapi]
+async fn list_e() -> Json<Option<Vec<DtoE>>> {
+    Json(None)
+}
+
+#[skyzen::openapi]
+async fn list_strings() -> Json<Vec<String>> {
+    Json(Vec::new())
+}
+
+#[skyzen::openapi]
+async fn list_nested_vecs() -> Json<Vec<Vec<DtoA>>> {
+    Json(Vec::new())
+}
+
+#[skyzen::openapi]
+async fn list_wrapped_a() -> Outcome<Json<Vec<DtoA>>> {
+    Outcome(Json(Vec::new()))
+}
+
+#[test]
+fn vec_routes_register_element_schemas_and_ref_them_without_vec_collision() {
+    let router: Router = Route::new((
+        "/a".at(list_a),
+        "/b".at(list_b),
+        "/c".at(list_c),
+        "/d".post(create_d),
+        "/e".at(list_e),
+        "/strings".at(list_strings),
+        "/nested".at(list_nested_vecs),
+        "/wrapped-a".at(list_wrapped_a),
+    ))
+    .build();
+    let spec = serde_json::to_value(router.openapi().to_utoipa_spec()).expect("serializes");
+    let schemas = spec["components"]["schemas"]
+        .as_object()
+        .expect("components.schemas should be an object");
+
+    for expected in ["DtoA", "DtoB", "DtoC", "DtoD", "DtoE", "NestedChild"] {
+        assert!(
+            schemas.contains_key(expected),
+            "expected {expected} in components.schemas: {schemas:#?}"
+        );
+    }
+
+    for forbidden in ["Vec", "Option", "Json", "PrettyJson", "String"] {
+        assert!(
+            !schemas.contains_key(forbidden),
+            "did not expect {forbidden} in components.schemas: {schemas:#?}"
+        );
+    }
+
+    assert_eq!(
+        response_content(&spec, "/a")["application/json"]["schema"],
+        serde_json::json!({
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DtoA" }
+        })
+    );
+    assert_eq!(
+        response_content(&spec, "/b")["application/json"]["schema"],
+        serde_json::json!({
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DtoB" }
+        })
+    );
+    assert_eq!(
+        response_content(&spec, "/c")["application/json"]["schema"],
+        serde_json::json!({
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DtoC" }
+        })
+    );
+    assert_eq!(
+        spec["paths"]["/d"]["post"]["requestBody"]["content"]["application/json"]["schema"],
+        serde_json::json!({
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DtoD" }
+        })
+    );
+    assert_eq!(
+        response_content(&spec, "/e")["application/json"]["schema"],
+        serde_json::json!({
+            "oneOf": [
+                { "type": "null" },
+                {
+                    "type": "array",
+                    "items": { "$ref": "#/components/schemas/DtoE" }
+                }
+            ]
+        })
+    );
+    assert_eq!(
+        response_content(&spec, "/strings")["application/json"]["schema"],
+        serde_json::json!({
+            "type": "array",
+            "items": { "type": "string" }
+        })
+    );
+    assert_eq!(
+        response_content(&spec, "/nested")["application/json"]["schema"],
+        serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/DtoA" }
+            }
+        })
+    );
+    assert_eq!(
+        response_content(&spec, "/wrapped-a")["application/json"]["schema"],
+        serde_json::json!({
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DtoA" }
+        })
+    );
+}
+
+#[test]
+fn generic_containers_register_inner_dtos_without_container_names() {
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+    let mut defs = BTreeMap::new();
+    skyzen::openapi::register_schema_for::<BTreeMap<String, DtoA>>(&mut defs);
+    skyzen::openapi::register_schema_for::<HashMap<String, DtoB>>(&mut defs);
+    skyzen::openapi::register_schema_for::<BTreeSet<DtoC>>(&mut defs);
+    skyzen::openapi::register_schema_for::<HashSet<DtoD>>(&mut defs);
+    skyzen::openapi::register_schema_for::<Box<DtoE>>(&mut defs);
+
+    for expected in ["DtoA", "DtoB", "DtoC", "DtoD", "DtoE", "NestedChild"] {
+        assert!(
+            defs.contains_key(expected),
+            "expected {expected} in registered schemas: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    for forbidden in ["BTreeMap", "HashMap", "BTreeSet", "HashSet", "Box"] {
+        assert!(
+            !defs.contains_key(forbidden),
+            "did not expect {forbidden} in registered schemas"
+        );
+    }
+
+    let map_schema = serde_json::to_value(
+        skyzen::openapi::schema_of::<BTreeMap<String, DtoA>>().expect("map schema"),
+    )
+    .expect("serializes");
+    assert_eq!(
+        map_schema["additionalProperties"],
+        serde_json::json!({ "$ref": "#/components/schemas/DtoA" })
+    );
+}
