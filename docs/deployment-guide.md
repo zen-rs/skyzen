@@ -66,13 +66,13 @@ With the `server-tls` feature, `--tls-cert`/`--tls-key` (and `SKYZEN_TLS_CERT`/
 `SKYZEN_TLS_KEY`) terminate TLS on every serving thread, with rustls running directly
 over the owned-buffer socket. On Linux the kernel takes over each connection's record
 layer when it supports the negotiated suite, so file bodies go out through
-`sendfile`. ALPN chooses the protocol: `h2` serves HTTP/2 through Hyper and anything
-else HTTP/1.1 through the selected server (Skyzen's own by default). Half a pair refuses to start, and so does a pair under AWS Lambda
+`sendfile`. ALPN chooses the protocol: `h2` serves HTTP/2 through `skyzen-h2` and anything
+else HTTP/1.1 through `skyzen-h1`, both directly over the owned-buffer TLS stream. Half a pair refuses to start, and so does a pair under AWS Lambda
 or Azure Functions, where the platform terminates TLS, or without the feature.
 
-Cleartext HTTP is served by Skyzen's own HTTP/1.1 server by default. `--server hyper`
-(or `SKYZEN_SERVER=hyper`) serves it with Hyper instead, which adds prior-knowledge
-HTTP/2 (h2c), on a `unix:` listener as on TCP.
+Cleartext HTTP (`--server`/`SKYZEN_SERVER`: `auto` by default, or `h1`/`h2`) sniffs up to
+the 24-byte HTTP/2 connection preface without copying and routes each connection straight
+to `skyzen-h1` or `skyzen-h2` (prior-knowledge h2c), on a `unix:` listener as on TCP.
 
 ### Docker
 

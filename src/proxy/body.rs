@@ -2,13 +2,13 @@
 //!
 //! The proxy never inspects a body, so its bytes need not enter user space: each frame is asked
 //! for with the [`PipeOffer`] of the writer consuming it, passed through as it came, and a source
-//! whose bytes are still in a socket (an HTTP/1.1 connection with a run of raw body bytes) answers
-//! with a pipe that writer splices into its own socket. An HTTP/1.1 writer, the server's writing
-//! the response as much as the upstream connection's writing the request, offers exactly when its
-//! socket can splice, carrying the pipe it drained last, so one pipe serves a connection's whole
-//! body; a writer that cannot splice (a TLS session in user space, HTTP/2, HTTP/3) offers nothing
-//! and is handed data frames. Where no source can splice, or on a platform without pipes, the
-//! offer is declined and data frames pass as before.
+//! whose bytes are still in a socket (an HTTP/1.1 body run or an unpadded HTTP/2 `DATA` payload)
+//! answers with a pipe that writer splices into its own socket. HTTP/1.1 and HTTP/2 writers — the
+//! server's writing the response as much as the upstream connection's writing the request — offer
+//! whenever their socket can splice (plain TCP or Linux kernel TLS), carrying the pipe drained
+//! last, so one pipe serves a connection's bodies; a writer that cannot splice (a TLS session in
+//! user space, HTTP/3) offers nothing and is handed data frames. Where no source can splice, or on
+//! a platform without pipes, the offer is declined and data frames pass as before.
 
 use std::{
     pin::Pin,

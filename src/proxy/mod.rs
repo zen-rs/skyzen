@@ -408,9 +408,11 @@ impl Proxy {
             }
             .to_value(),
         );
-        // Only a chunked body has a trailer section to bring.
+        // Only a chunked HTTP/1.1 body or an HTTP/2 / HTTP/3 stream may end in trailers.
+        let may_carry_trailers =
+            chunked || version == Version::HTTP_2 || version == Version::HTTP_3;
         let body = core::mem::replace(response.body_mut(), Body::empty());
-        *response.body_mut() = body::forward(body, chunked && !accepts_trailers);
+        *response.body_mut() = body::forward(body, may_carry_trailers && !accepts_trailers);
         response
     }
 }
