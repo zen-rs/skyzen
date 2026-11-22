@@ -82,17 +82,29 @@ impl Extractor for WorkerContext {
     fn extract(
         request: &mut crate::Request,
     ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
-        ready(
-            request
-                .extensions()
-                .get::<Self>()
-                .cloned()
-                .ok_or_else(WorkerContextNotConfigured::new),
-        )
+        #[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
+        let found = request
+            .extensions()
+            .get::<std::sync::Arc<NativeRequestContext>>()
+            .map(|shared| shared.worker.clone())
+            .or_else(|| request.extensions().get::<Self>().cloned());
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "rt")))]
+        let found = request.extensions().get::<Self>().cloned();
+        ready(found.ok_or_else(WorkerContextNotConfigured::new))
     }
 }
 
 // ── Native ──
+
+/// Per-serving-thread bundle of [`WorkerContext`] and [`IoSettings`](crate::runtime::native::IoSettings),
+/// wrapped in one thread-local [`Arc`](std::sync::Arc) so per-request insertion touches a single
+/// core-local reference count instead of five cross-core atomics and two extension slots.
+#[cfg(all(not(target_arch = "wasm32"), feature = "rt"))]
+#[derive(Debug)]
+pub struct NativeRequestContext {
+    pub worker: WorkerContext,
+    pub io: crate::runtime::native::IoSettings,
+}
 
 /// A token that keeps the built-in runtime's graceful shutdown waiting on whatever holds it.
 ///

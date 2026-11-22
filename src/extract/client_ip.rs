@@ -283,10 +283,7 @@ impl Extractor for ClientIp {
 
 /// Resolve the client address from the peer and whichever proxy headers the peer may write.
 fn client_ip(request: &Request) -> Result<ClientIp, ClientIpError> {
-    let peer = request
-        .extensions()
-        .get::<PeerAddr>()
-        .map(|peer| peer.0.ip());
+    let peer = PeerAddr::of(request).map(|peer| peer.0.ip());
     let trusted = request.extensions().get::<TrustedProxies>();
 
     // Cloudflare sets `CF-Connecting-IP` at the edge and removes the client's own, so on a Worker

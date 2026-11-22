@@ -14,8 +14,8 @@ use crate::{
         ffi,
         session::{internal_error_frame, IntoWebSocketOutcome},
         types::{
-            offered_protocols, select_protocol, WebSocketCloseFrame, WebSocketError,
-            WebSocketResult,
+            default_websocket_config, offered_protocols, select_protocol, WebSocketCloseFrame,
+            WebSocketError, WebSocketResult,
         },
     },
     Method, Request, Response, StatusCode,
@@ -598,7 +598,7 @@ impl WebSocketUpgrade {
             pair: SendSyncWebSocketPair(ffi::WebSocketPair::new()),
             requested_protocols,
             response_protocol: None,
-            config: WebSocketConfig::default(),
+            config: default_websocket_config(),
         }
     }
 
@@ -654,6 +654,10 @@ impl WebSocketUpgrade {
 
     /// Set the maximum message size accepted/sent by the websocket.
     ///
+    /// Defaults to [`DEFAULT_MAX_MESSAGE_SIZE`](super::DEFAULT_MAX_MESSAGE_SIZE) (16 MiB).
+    /// Pass `None` (or call [`without_message_size_limit`](Self::without_message_size_limit))
+    /// to disable the Skyzen-enforced cap.
+    ///
     /// # Platform Notes
     /// - **Native**: Enforced by async-tungstenite on both directions.
     /// - **WASM**: Enforced by Skyzen on both outbound sends and inbound messages (oversized
@@ -663,6 +667,37 @@ impl WebSocketUpgrade {
     #[must_use]
     pub const fn max_message_size(mut self, max_size: Option<usize>) -> Self {
         self.config.max_message_size = max_size;
+        self
+    }
+
+    /// Disable the Skyzen-enforced maximum message size limit.
+    ///
+    /// Note that the WASM host runtime may still impose its own cap (e.g. Cloudflare Workers
+    /// limits messages to 1 MiB).
+    #[must_use]
+    pub const fn without_message_size_limit(mut self) -> Self {
+        self.config.max_message_size = None;
+        self
+    }
+
+    /// Set the maximum incoming frame size accepted by the websocket.
+    ///
+    /// Defaults to [`DEFAULT_MAX_FRAME_SIZE`](super::DEFAULT_MAX_FRAME_SIZE) (1 MiB).
+    /// Provided for API parity with native; `WinterCG` delivers complete messages rather than
+    /// individual frames.
+    #[must_use]
+    pub const fn max_frame_size(mut self, max_size: Option<usize>) -> Self {
+        self.config.max_frame_size = max_size;
+        self
+    }
+
+    /// Disable the maximum incoming frame size limit.
+    ///
+    /// Provided for API parity with native; `WinterCG` delivers complete messages rather than
+    /// individual frames.
+    #[must_use]
+    pub const fn without_frame_size_limit(mut self) -> Self {
+        self.config.max_frame_size = None;
         self
     }
 

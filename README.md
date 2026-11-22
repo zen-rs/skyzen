@@ -1037,6 +1037,7 @@ refuses to load are all in [Secrets](docs/skyzen-toml-reference.md#secrets) and
 
 ## Guides & Examples
 
+- [Skyzen Agent Skill](skills/skyzen/SKILL.md)
 - [Using Portable Services](docs/services-guide.md)
 - [SQL Migrations](docs/migrations.md)
 - [Testing Guide](docs/testing-guide.md)
