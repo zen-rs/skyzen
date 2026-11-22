@@ -127,6 +127,11 @@ where
             "`.with(AuthMiddleware::new(authenticator))`",
         )]
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi_security() -> Vec<crate::openapi::SecuritySchemeInfo> {
+        <AuthUser<U> as Extractor>::openapi_security()
+    }
 }
 
 /// Macro to define custom role guard extractors.
@@ -197,6 +202,11 @@ macro_rules! define_role_guard {
                 ::std::vec![$crate::extract::Requirement::of::<
                     $crate::middleware::auth::AuthUser<U>,
                 >("`.with(AuthMiddleware::new(authenticator))`")]
+            }
+
+            #[cfg(feature = "openapi")]
+            fn openapi_security() -> ::std::vec::Vec<$crate::openapi::SecuritySchemeInfo> {
+                <$crate::middleware::auth::AuthUser<U> as $crate::extract::Extractor>::openapi_security()
             }
         }
     };
