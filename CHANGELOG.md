@@ -10,9 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - *(perf)* trim per-request overhead on the dispatch hot path ([#173](https://github.com/zen-rs/skyzen/issues/173)):
-  - the `request completed` log line is demoted from `INFO` to `DEBUG` in the h1, h2, Hyper, HTTP/3 and Lambda adapters, and the request path is no longer copied per request. Applications that want INFO-level request logs should attach the `Trace` middleware (`Route::layer(Trace::new())`).
-  - `Params` + `MatchedPath` now share a single `RouteMatch` extension insert, `Params` clones are a refcount bump, and the router no longer inserts the default `RequestBodyLimit` — extractors treat absence as the default.
-  - handler routes dispatch directly without rebuilding and re-boxing the endpoint per request; a `Router` clone is one `Rc` bump.
+  - the `request completed` log line is demoted from `INFO` to `DEBUG` in the h1, h2, Hyper, HTTP/3 and Lambda adapters, and neither the request path nor the method is copied per request. Applications that want INFO-level request logs should attach the `Trace` middleware (`Route::layer(Trace::new())`).
+  - `Params` + `MatchedPath` now travel in a single `RouteMatch` extension insert per matched route — with the route parameters stored inline (no heap allocation for ordinary names and values) — and the router no longer inserts the default `RequestBodyLimit`: extractors treat absence as the default.
+  - a `Router` clone is a single `Rc` bump, so per-request dispatch clones one refcount instead of several.
 
 ## [0.6.1](https://github.com/zen-rs/skyzen/compare/v0.6.0...v0.6.1) - 2026-11-11
 

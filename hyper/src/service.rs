@@ -157,7 +157,6 @@ where
         let alt_svc = self.alt_svc.clone();
         let upgrade = Rc::clone(&self.upgrade);
         let fut = async move {
-            let method = req.method().clone();
             let mut request: skyzen_core::Request =
                 skyzen_core::Request::from(req.map(BodyDataStream::new).map(|body| {
                     skyzen_core::Body::from_stream(
@@ -172,7 +171,7 @@ where
             let mut response: skyzen_core::Response = match endpoint.respond(&mut request).await {
                 Ok(response) => {
                     tracing::debug!(
-                        method = method.as_str(),
+                        method = request.method().as_str(),
                         path = request.uri().path(),
                         status = response.status().as_u16(),
                         "request completed"
@@ -180,7 +179,7 @@ where
                     response
                 }
                 Err(error) => {
-                    log_endpoint_error(&error, &method, request.uri().path());
+                    log_endpoint_error(&error, request.method(), request.uri().path());
                     let mut response = error_response(&error);
                     apply_pending_headers(&request, &mut response);
                     response

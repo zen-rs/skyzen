@@ -351,16 +351,12 @@ where
             slot.object()?
         };
 
-        // Capture the request identity before `respond` takes the request mutably, so the error
-        // log can name the call that failed the way the HTTP backends do.
-        let method = request.method().clone();
-
         let response = {
             let mut endpoint = object.fetch();
             match endpoint.respond(&mut request).await {
                 Ok(response) => response,
                 Err(error) => {
-                    skyzen_core::log_endpoint_error(&error, &method, request.uri().path());
+                    skyzen_core::log_endpoint_error(&error, request.method(), request.uri().path());
                     let mut response = skyzen_core::error_response(&error);
                     skyzen_core::apply_pending_headers(&request, &mut response);
                     response

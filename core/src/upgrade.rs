@@ -239,11 +239,23 @@ impl AsyncWrite for Upgraded {
 
 /// Marks a request whose connection the server can hand over after a `101`.
 ///
-/// A server inserts it into every request it could upgrade — an HTTP/1.1 connection, never an
+/// A server sets this on every request it could upgrade — an HTTP/1.1 connection, never an
 /// HTTP/2 stream — so a handler that answers an upgrade where nothing would pick the connection up
 /// refuses with `426` instead of sending a `101` into the void.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpgradeAvailable;
+
+impl UpgradeAvailable {
+    /// Whether `request` arrived on a connection the server can hand over after a `101`.
+    #[must_use]
+    pub fn is_set(request: &http_kit::Request) -> bool {
+        let extensions = request.extensions();
+        extensions
+            .get::<crate::ConnectionInfo>()
+            .is_some_and(crate::ConnectionInfo::upgrade_available)
+            || extensions.get::<Self>().is_some()
+    }
+}
 
 /// The RFC 8441 `:protocol` token of an Extended `CONNECT` request whose stream the server will
 /// connect to an [`OnUpgrade`] session once answered with a `2xx` response.

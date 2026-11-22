@@ -211,8 +211,6 @@ impl<E: Endpoint> RequestBuilder<E> {
         self.services.install(&mut request);
 
         let mut endpoint = self.endpoint;
-        // Capture the request identity before `respond` takes the request mutably.
-        let method = request.method().clone();
         // Render endpoint errors exactly the way production server backends
         // do (see `skyzen_core::error_response`): 5xx bodies are redacted to
         // a generic message, everything else surfaces the error's display
@@ -221,7 +219,7 @@ impl<E: Endpoint> RequestBuilder<E> {
         let response: Response = match endpoint.respond(&mut request).await {
             Ok(resp) => resp,
             Err(err) => {
-                skyzen_core::log_endpoint_error(&err, &method, request.uri().path());
+                skyzen_core::log_endpoint_error(&err, request.method(), request.uri().path());
                 let mut response = skyzen_core::error_response(&err);
                 skyzen_core::apply_pending_headers(&request, &mut response);
                 response

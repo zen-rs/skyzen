@@ -100,10 +100,6 @@ where
             .inject_request_extensions(&mut request)
             .map_err(to_js)?;
 
-        // Capture the request identity before `respond` takes the request mutably, so the error
-        // log can name the call that failed the way the HTTP backends do.
-        let method = request.method().clone();
-
         // State is persisted only when the handler succeeds, matching the
         // websocket and alarm paths.
         let (response, succeeded) = {
@@ -114,7 +110,7 @@ where
                 Err(error) => {
                     // Log and render through the shared helpers so every backend emits the same
                     // fields and applies the same 4xx/5xx redaction policy.
-                    skyzen::log_endpoint_error(&error, &method, request.uri().path());
+                    skyzen::log_endpoint_error(&error, request.method(), request.uri().path());
                     let mut response = skyzen::error_response(&error);
                     skyzen::apply_pending_headers(&request, &mut response);
                     (response, false)

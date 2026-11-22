@@ -326,7 +326,7 @@ pub async fn take_body_bytes<T: ?Sized>(request: &mut Request) -> Result<Bytes, 
         }
     }
 
-    read_capped(body, limit).await
+    read_capped(body, limit, declared).await
 }
 
 /// The body length the request declares, when it declares a usable one.
@@ -341,7 +341,16 @@ fn declared_length(request: &Request) -> Option<usize> {
 }
 
 /// Read `body` to the end, giving up as soon as more than `limit` bytes have arrived.
-async fn read_capped(body: Body, limit: Option<usize>) -> Result<Bytes, BodyReadError> {
+async fn read_capped(
+    body: Body,
+    limit: Option<usize>,
+    declared: Option<usize>,
+) -> Result<Bytes, BodyReadError> {
+    /// Maximum initial reservation taken from a client-supplied `Content-Length`
+    /// before the bytes themselves arrive, bounding memory against a lying header
+    /// while avoiding repeated growth on ordinary payloads.
+    const MAX_PREALLOC: usize = 64 * 1024;
+
     let Some(limit) = limit else {
         return body
             .into_bytes()
@@ -349,10 +358,39 @@ async fn read_capped(body: Body, limit: Option<usize>) -> Result<Bytes, BodyRead
             .map_err(|_| InvalidBody::new().into());
     };
 
-    // Deliberately not sized from `Content-Length`: a lying header must not let a client
-    // pre-allocate for it.
-    let mut buffered = Vec::new();
+    if let Some(known) = body.len() {
+        if known > limit {
+            return Err(PayloadTooLarge { limit }.into());
+        }
+        return body
+            .into_bytes()
+            .await
+            .map_err(|_| InvalidBody::new().into());
+    }
+
     let mut body = pin!(body.into_data_stream());
+    let Some(first) = body.next().await else {
+        return Ok(Bytes::new());
+    };
+    let first = first.map_err(|_| BodyReadError::from(InvalidBody::new()))?;
+    if first.len() > limit {
+        return Err(PayloadTooLarge { limit }.into());
+    }
+
+    // A single-frame body returns its `Bytes` directly without copying.
+    let Some(second) = body.next().await else {
+        return Ok(first);
+    };
+    let second = second.map_err(|_| BodyReadError::from(InvalidBody::new()))?;
+    let initial = first.len() + second.len();
+    if initial > limit {
+        return Err(PayloadTooLarge { limit }.into());
+    }
+
+    let hinted = declared.unwrap_or(0).min(limit).min(MAX_PREALLOC);
+    let mut buffered = Vec::with_capacity(initial.max(hinted));
+    buffered.extend_from_slice(&first);
+    buffered.extend_from_slice(&second);
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|_| BodyReadError::from(InvalidBody::new()))?;
         if buffered.len() + chunk.len() > limit {
@@ -447,5 +485,33 @@ mod tests {
 
         let error = take_body_stream::<u16>(&mut request).unwrap_err();
         assert_eq!(error.owner(), "u8");
+    }
+
+    #[test]
+    fn a_single_streamed_frame_returns_without_copying() {
+        let payload = http_kit::utils::Bytes::from(vec![b'x'; 16 * 1024]);
+        let ptr = payload.as_ptr();
+        let chunks = stream::iter([Ok::<_, http_kit::BodyError>(payload)]);
+        let mut request = request_with(Body::from_stream(chunks));
+        assert_eq!(request.body().len(), None);
+
+        let out = block_on(take_body_bytes::<()>(&mut request)).expect("single frame within limit");
+        assert_eq!(out.len(), 16 * 1024);
+        assert_eq!(out.as_ptr(), ptr, "single-frame body must not copy");
+    }
+
+    #[test]
+    fn multi_frame_body_with_declared_length_concatenates_cleanly() {
+        let chunks =
+            stream::iter((0..4).map(|i| Ok::<_, http_kit::BodyError>(vec![b'a' + i; 512])));
+        let mut request = request_with(Body::from_stream(chunks));
+        request
+            .headers_mut()
+            .insert(CONTENT_LENGTH, "2048".parse().expect("valid header"));
+
+        let out = block_on(take_body_bytes::<()>(&mut request)).expect("within default limit");
+        assert_eq!(out.len(), 2048);
+        assert_eq!(&out[..512], &[b'a'; 512]);
+        assert_eq!(&out[1536..], &[b'd'; 512]);
     }
 }

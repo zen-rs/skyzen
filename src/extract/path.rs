@@ -8,7 +8,11 @@ use serde::de::{
 };
 use serde::forward_to_deserialize_any;
 
-use crate::{extract::Extractor, routing::Params, Request, StatusCode};
+use crate::{
+    extract::Extractor,
+    routing::{Params, ParamsIter},
+    Request, StatusCode,
+};
 
 /// Deserializes the route's path parameters into `T`.
 ///
@@ -94,21 +98,21 @@ impl<T: Send + Sync + DeserializeOwned + 'static> Extractor for Path<T> {
 /// Deserializes the whole capture list: by name for structs and maps, by position for sequences,
 /// and as the single captured value for a primitive.
 struct PathDeserializer<'de> {
-    params: &'de [(String, String)],
+    params: ParamsIter<'de>,
 }
 
 impl<'de> PathDeserializer<'de> {
-    const fn new(params: &'de [(String, String)]) -> Self {
+    const fn new(params: ParamsIter<'de>) -> Self {
         Self { params }
     }
 
     /// The one captured parameter a primitive target needs, or an error naming the mismatch.
-    fn single(&self) -> Result<ParamDeserializer<'de>, PathError> {
-        match self.params {
-            [(name, value)] => Ok(ParamDeserializer { name, value }),
-            other => Err(PathError(format!(
-                "the route captures {} parameters, but the handler asks for a single value",
-                other.len()
+    fn single(mut self) -> Result<ParamDeserializer<'de>, PathError> {
+        let count = self.params.len();
+        match (self.params.next(), self.params.next()) {
+            (Some((name, value)), None) => Ok(ParamDeserializer { name, value }),
+            _ => Err(PathError(format!(
+                "the route captures {count} parameters, but the handler asks for a single value",
             ))),
         }
     }
@@ -156,7 +160,7 @@ impl<'de> de::Deserializer<'de> for PathDeserializer<'de> {
     );
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        if self.params.is_empty() {
+        if self.params.len() == 0 {
             visitor.visit_none()
         } else {
             visitor.visit_some(self)
@@ -244,7 +248,7 @@ impl<'de> de::Deserializer<'de> for PathDeserializer<'de> {
 
 /// Walks the captures in the order the route declares them, for a tuple or sequence target.
 struct SeqParams<'de> {
-    params: &'de [(String, String)],
+    params: ParamsIter<'de>,
 }
 
 impl<'de> SeqAccess<'de> for SeqParams<'de> {
@@ -254,10 +258,9 @@ impl<'de> SeqAccess<'de> for SeqParams<'de> {
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, Self::Error> {
-        let Some(((name, value), rest)) = self.params.split_first() else {
+        let Some((name, value)) = self.params.next() else {
             return Ok(None);
         };
-        self.params = rest;
         seed.deserialize(ParamDeserializer { name, value })
             .map(Some)
     }
@@ -269,8 +272,8 @@ impl<'de> SeqAccess<'de> for SeqParams<'de> {
 
 /// Walks the captures as name/value pairs, for a struct or map target.
 struct MapParams<'de> {
-    params: &'de [(String, String)],
-    value: Option<&'de (String, String)>,
+    params: ParamsIter<'de>,
+    value: Option<(&'de str, &'de str)>,
 }
 
 impl<'de> MapAccess<'de> for MapParams<'de> {
@@ -280,13 +283,11 @@ impl<'de> MapAccess<'de> for MapParams<'de> {
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, Self::Error> {
-        let Some((pair, rest)) = self.params.split_first() else {
+        let Some((name, value)) = self.params.next() else {
             return Ok(None);
         };
-        self.params = rest;
-        self.value = Some(pair);
-        seed.deserialize(pair.0.as_str().into_deserializer())
-            .map(Some)
+        self.value = Some((name, value));
+        seed.deserialize(name.into_deserializer()).map(Some)
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(
@@ -480,12 +481,7 @@ mod tests {
             .extensions_mut()
             .insert(crate::routing::RouteMatch::new(
                 MatchedPath::new("/test/{*path}"),
-                Params::new(
-                    params
-                        .iter()
-                        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                        .collect(),
-                ),
+                Params::from_pairs(params),
             ));
         request
     }

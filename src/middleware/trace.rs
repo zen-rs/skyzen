@@ -202,7 +202,7 @@ impl Middleware for Trace {
         );
         // The socket peer, not `Forwarded`/XFF: those headers are client-controlled and a
         // spoofed `client.address` in the span is worse than none.
-        if let Some(peer) = request.extensions().get::<PeerAddr>() {
+        if let Some(peer) = PeerAddr::of(request) {
             span.record("client.address", field::display(peer.0.ip()));
         }
         let allow_listed = render_headers(request.headers(), &self.include_headers);

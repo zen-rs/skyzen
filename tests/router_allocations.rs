@@ -72,10 +72,11 @@ fn passthrough() -> impl skyzen::middleware::Middleware {
 #[test]
 fn dispatches_stay_within_their_allocation_budgets() {
     // The budgets are per-request `alloc` calls measured on this code path: 7 for the static
-    // route (extensions map, `RouteMatch`, the boxed dispatch future), 15 with two `Path`
-    // params (captured names/values plus the `Params` `Arc` and handler `format!`), 16
-    // through a four-deep middleware chain, and 5 on the unmatched path. Each bound leaves a
-    // little slack for allocator internals but fails on a new per-request box or insert.
+    // route (extensions map, `RouteMatch`, the boxed dispatch future), 9 with two `Path`
+    // params (the captures sit inline in `Params` — only the `RouteMatch` insert and the
+    // handler `format!` allocate on top of the static baseline), 16 through a four-deep
+    // middleware chain, and 5 on the unmatched path. Each bound leaves a little slack for
+    // allocator internals but fails on a new per-request box or insert.
     // See <https://github.com/zen-rs/skyzen/issues/173> for what they protect.
 
     assert!(
@@ -88,7 +89,7 @@ fn dispatches_stay_within_their_allocation_budgets() {
     ),))
     .build();
     assert!(
-        allocs_per_request(&params, "/users/lexo/posts/42") <= 19,
+        allocs_per_request(&params, "/users/lexo/posts/42") <= 12,
         "two-param route"
     );
 
@@ -99,7 +100,7 @@ fn dispatches_stay_within_their_allocation_budgets() {
         .layer(passthrough())
         .build();
     assert!(
-        allocs_per_request(&layered, "/work") <= 20,
+        allocs_per_request(&layered, "/work") <= 19,
         "three layers + one route middleware"
     );
 

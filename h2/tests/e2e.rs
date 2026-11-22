@@ -40,12 +40,12 @@ impl Endpoint for CountingEndpoint {
         request: &mut Request,
     ) -> impl Future<Output = Result<Response, Self::Error>> {
         let served = Rc::clone(&self.served);
-        let upgradable = request.extensions().get::<UpgradeAvailable>().is_some();
+        let upgradable = UpgradeAvailable::is_set(request);
         let connect_proto = request
             .extensions()
             .get::<ConnectProtocol>()
             .map(|p| p.as_str().to_owned());
-        let peer = request.extensions().get::<PeerAddr>().copied();
+        let peer = PeerAddr::of(request);
         let path = request.uri().path().to_owned();
         let method = request.method().clone();
         let incoming = if path == "/echo" && method == Method::POST {

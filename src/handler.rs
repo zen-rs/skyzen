@@ -8,10 +8,7 @@
 
 use core::{future::Future, marker::PhantomData};
 use http_kit::{Endpoint, Request, Response};
-use skyzen_core::{
-    middleware::{Dispatch, LocalBoxFuture},
-    Error, Extractor, Responder,
-};
+use skyzen_core::{Extractor, Responder};
 use std::fmt::Display;
 
 /// Error type for handler operations.
@@ -172,21 +169,5 @@ impl<H: Handler<T, R>, T: Extractor, R: Responder> Endpoint for IntoEndpoint<H, 
     type Error = HandlerError<T, R>;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.handler.call_handler(request).await
-    }
-}
-
-// The router's fast path: a handler endpoint answers `&self`, so it dispatches per request
-// without being cloned or rebuilt — one boxed future, no factory.
-impl<H: Handler<T, R>, T: Extractor, R: Responder> Dispatch for IntoEndpoint<H, T, R> {
-    fn dispatch<'a>(
-        &'a self,
-        request: &'a mut Request,
-    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
-        Box::pin(async move {
-            self.handler
-                .call_handler(request)
-                .await
-                .map_err(Error::from)
-        })
     }
 }

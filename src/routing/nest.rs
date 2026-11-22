@@ -49,7 +49,7 @@ impl<E> Mounted<E> {
 )]
 pub struct MountPathError(String);
 
-impl<E: Endpoint<Error = BoxHttpError>> Endpoint for Mounted<E> {
+impl<E: Endpoint> Endpoint for Mounted<E> {
     type Error = BoxHttpError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let original = request.uri().clone();
@@ -69,7 +69,11 @@ impl<E: Endpoint<Error = BoxHttpError>> Endpoint for Mounted<E> {
             None => self.prefix.to_string(),
         };
         let previous = request.extensions_mut().insert(MountPrefix(accumulated));
-        let result = self.endpoint.respond(request).await;
+        let result = self
+            .endpoint
+            .respond(request)
+            .await
+            .map_err(|error| Box::new(error) as BoxHttpError);
         // Put the path back so an outer layer that inspects the request after the inner router
         // returns still sees the URL the client asked for.
         *request.uri_mut() = original;

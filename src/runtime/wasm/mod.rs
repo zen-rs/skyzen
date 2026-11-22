@@ -177,16 +177,12 @@ where
         .extensions_mut()
         .insert(super::WorkerContext::new(ctx));
 
-    // Capture the request identity before `respond` takes the request mutably, so the error log
-    // can name the call that failed the way the native backends do.
-    let method = sky_request.method().clone();
-
     let response = match endpoint.respond(&mut sky_request).await {
         Ok(response) => response,
         Err(error) => {
             // Log and render through the shared helpers so every backend emits the same fields
             // and applies the same 4xx/5xx redaction policy.
-            skyzen_core::log_endpoint_error(&error, &method, sky_request.uri().path());
+            skyzen_core::log_endpoint_error(&error, sky_request.method(), sky_request.uri().path());
             let mut response = skyzen_core::error_response(&error);
             skyzen_core::apply_pending_headers(&sky_request, &mut response);
             response

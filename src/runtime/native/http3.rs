@@ -442,20 +442,21 @@ async fn answer<E>(mut endpoint: E, mut request: crate::Request) -> crate::Respo
 where
     E: crate::Endpoint + 'static,
 {
-    use skyzen_core::{apply_pending_headers, error_response, log_endpoint_error, PeerAddr};
+    use skyzen_core::{apply_pending_headers, error_response, log_endpoint_error, ConnectionInfo};
 
     let peer = request
         .extensions()
         .get::<http_kit_h3::ConnectionInfo>()
         .expect("http-kit-h3 attaches a ConnectionInfo to every request")
         .peer_addr();
-    request.extensions_mut().insert(PeerAddr::new(peer));
-    let method = request.method().clone();
+    request
+        .extensions_mut()
+        .insert(ConnectionInfo::new(Some(peer), false));
 
     match endpoint.respond(&mut request).await {
         Ok(response) => {
             tracing::debug!(
-                method = method.as_str(),
+                method = request.method().as_str(),
                 path = request.uri().path(),
                 status = response.status().as_u16(),
                 "request completed"
@@ -463,7 +464,7 @@ where
             response
         }
         Err(error) => {
-            log_endpoint_error(&error, &method, request.uri().path());
+            log_endpoint_error(&error, request.method(), request.uri().path());
             let mut response = error_response(&error);
             apply_pending_headers(&request, &mut response);
             response

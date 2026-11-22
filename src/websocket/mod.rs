@@ -148,6 +148,10 @@
 //!
 //! # Configuration
 //!
+//! By default, Skyzen caps incoming (and on WASM, outbound) messages at
+//! [`DEFAULT_MAX_MESSAGE_SIZE`] (16 MiB) and incoming frames at [`DEFAULT_MAX_FRAME_SIZE`]
+//! (1 MiB). Override or opt out per route on [`WebSocketUpgrade`]:
+//!
 //! ```no_run
 //! # use skyzen::websocket::{WebSocketConfig, WebSocketUpgrade};
 //! # use skyzen::Responder;
