@@ -841,10 +841,9 @@ pub(crate) fn upgrade_from_request(
     }
 
     let (key, requested_protocols) = validate_upgrade(request)?;
-    request
-        .extensions()
-        .get::<UpgradeAvailable>()
-        .ok_or(WebSocketUpgradeError::UpgradeUnavailable)?;
+    if !UpgradeAvailable::is_set(request) {
+        return Err(WebSocketUpgradeError::UpgradeUnavailable);
+    }
 
     Ok(WebSocketUpgrade {
         handshake: Handshake::Http1(key),
