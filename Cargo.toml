@@ -149,6 +149,7 @@ garde = { version = "0.22", features = ["derive", "email"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-tungstenite = { version = "0.33.0", optional = true }
+zstd = { version = "0.13", default-features = false, optional = true }
 color-eyre = "0.6"
 linkme = "0.3"
 tracing-log = "0.2"
@@ -325,6 +326,8 @@ default = [
     "decompress-deflate",
     "decompress-br",
     "decompress-zstd",
+    "compress-br",
+    "compress-zstd",
 ]
 openapi = ["skyzen-core/openapi", "skyzen-macros/openapi"]
 auth = ["dep:base64"]
@@ -355,6 +358,11 @@ decompress-zstd = ["decompress", "dep:ruzstd"]
 # Internal: on whenever any `decompress-*` coding is, so the streaming decoder machinery is
 # compiled exactly when some coding uses it. Not meant to be enabled directly.
 decompress = []
+# Response compression codings for `CompressionMiddleware` beyond `gzip` and `deflate`
+# (which ride on `flate2`). `br` is pure Rust and works on wasm32 too; `zstd` wraps
+# libzstd and is native-only.
+compress-br = ["dep:brotli"]
+compress-zstd = ["dep:zstd"]
 # Database drivers and TLS backends. None is on by default: an application picks the ones it uses,
 # and each forwards to the `skyzen-services` feature of the same name. sqlx runs on its
 # runtime-neutral runtime, so there is no runtime to pick.

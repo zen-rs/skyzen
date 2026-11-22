@@ -57,20 +57,23 @@
 
 mod body;
 mod headers;
+mod pool;
 mod tunnel;
 
-use std::{fmt, sync::Arc};
+use std::{borrow::Borrow, fmt, rc::Rc, sync::Arc, time::Duration};
 
 use executor_core::LocalExecutor;
 use http::{
-    uri::{Authority, PathAndQuery, Scheme},
-    Version,
+    uri::{Authority, PathAndQuery},
+    Method, Version,
 };
 use zenwave::{
     backend::{NativeBackend, NativeIo, NativeResolve, Upgrade},
     dns::Getaddrinfo,
+    Timeouts,
 };
 
+pub use pool::{HealthCheck, LoadBalance, PassiveHealth, RetryPolicy};
 /// The connection settings a [`Transport`] is built from.
 pub use zenwave::transport;
 /// How connections to an upstream are made: trusted roots, a forward proxy, a unix socket.
@@ -78,11 +81,12 @@ pub use zenwave::Transport;
 
 use crate::{
     extract::TrustedProxies,
-    header::{self, HeaderValue},
+    header::{self, HeaderMap, HeaderValue},
     runtime::ServingThread,
     Body, Endpoint, Request, Response, StatusCode, Uri,
 };
 use headers::{ForwardedElement, ViaMember};
+use pool::{PoolState, Target};
 use skyzen_core::{upgrade::UpgradeAvailable, PeerAddr};
 
 /// The pseudonym a proxy records itself under in `Via` until [`Upstream::via`] names another.
@@ -94,10 +98,14 @@ const DEFAULT_PSEUDONYM: &str = "skyzen";
 /// thread's endpoint.
 #[derive(Clone)]
 pub struct Upstream {
-    scheme: Scheme,
-    authority: Authority,
-    /// The upstream path every forwarded path is appended to, without its trailing `/`.
-    base: String,
+    targets: Vec<Target>,
+    load_balance: LoadBalance,
+    passive_health: Option<PassiveHealth>,
+    health_check: Option<HealthCheck>,
+    retry_policy: Option<RetryPolicy>,
+    connect_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
+    body_idle_timeout: Option<Duration>,
     transport: Transport,
     pseudonym: String,
     preserve_host: bool,
@@ -106,9 +114,14 @@ pub struct Upstream {
 impl fmt::Debug for Upstream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Upstream")
-            .field("scheme", &self.scheme)
-            .field("authority", &self.authority)
-            .field("base", &self.base)
+            .field("targets", &self.targets)
+            .field("load_balance", &self.load_balance)
+            .field("passive_health", &self.passive_health)
+            .field("health_check", &self.health_check)
+            .field("retry_policy", &self.retry_policy)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("body_idle_timeout", &self.body_idle_timeout)
             .field("pseudonym", &self.pseudonym)
             .field("preserve_host", &self.preserve_host)
             .finish_non_exhaustive()
@@ -118,6 +131,9 @@ impl fmt::Debug for Upstream {
 /// Why an [`Upstream`] cannot be built.
 #[skyzen::error(status = StatusCode::INTERNAL_SERVER_ERROR)]
 pub enum UpstreamError {
+    /// The upstream pool was given no origins.
+    #[error("upstream pool must contain at least one origin")]
+    EmptyPool,
     /// The upstream URI's scheme is neither `http` nor `https`.
     #[error("upstream `{0}` must use `http` or `https`")]
     Scheme(String),
@@ -148,27 +164,95 @@ impl Upstream {
     /// The URI is not an `http` or `https` URI with a host and no query, or the platform's trust
     /// store cannot be loaded.
     pub fn new(uri: &Uri) -> Result<Self, UpstreamError> {
-        let scheme = match uri.scheme() {
-            Some(scheme) if *scheme == Scheme::HTTP || *scheme == Scheme::HTTPS => scheme.clone(),
-            _ => return Err(UpstreamError::Scheme(uri.to_string())),
-        };
-        let Some(authority) = uri.authority().cloned() else {
-            return Err(UpstreamError::MissingAuthority(uri.to_string()));
-        };
-        if uri.query().is_some() {
-            return Err(UpstreamError::Query(uri.to_string()));
+        Self::pool([uri])
+    }
+
+    /// Forward to a pool of origin URIs, distributed according to [`Upstream::load_balance`]
+    /// (round-robin by default).
+    ///
+    /// Every URI is validated the same way as [`Upstream::new`]: `http` or `https`, with a host
+    /// and no query.
+    ///
+    /// # Errors
+    ///
+    /// `uris` is empty, any URI is invalid, or the platform's trust store cannot be loaded.
+    pub fn pool<I>(uris: I) -> Result<Self, UpstreamError>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<Uri>,
+    {
+        let targets = uris
+            .into_iter()
+            .map(|uri| Target::parse(uri.borrow()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if targets.is_empty() {
+            return Err(UpstreamError::EmptyPool);
         }
         let transport = Transport::builder()
             .proxy(transport::Proxy::none())
             .build()?;
         Ok(Self {
-            scheme,
-            authority,
-            base: uri.path().trim_end_matches('/').to_owned(),
+            targets,
+            load_balance: LoadBalance::default(),
+            passive_health: None,
+            health_check: None,
+            retry_policy: None,
+            connect_timeout: None,
+            request_timeout: None,
+            body_idle_timeout: None,
             transport,
             pseudonym: DEFAULT_PSEUDONYM.to_owned(),
             preserve_host: false,
         })
+    }
+
+    /// Set how requests are distributed across multiple origins (default: [`LoadBalance::RoundRobin`]).
+    #[must_use]
+    pub const fn load_balance(mut self, strategy: LoadBalance) -> Self {
+        self.load_balance = strategy;
+        self
+    }
+
+    /// Enable passive outlier ejection on consecutive failures.
+    #[must_use]
+    pub const fn passive_health(mut self, policy: PassiveHealth) -> Self {
+        self.passive_health = Some(policy);
+        self
+    }
+
+    /// Enable periodic active HTTP health probing for each origin.
+    #[must_use]
+    pub fn health_check(mut self, check: HealthCheck) -> Self {
+        self.health_check = Some(check);
+        self
+    }
+
+    /// Enable idempotent retries for empty-body requests on failure before a response is committed.
+    #[must_use]
+    pub const fn retries(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
+    }
+
+    /// Set the upstream connection establishment timeout (`504 Gateway Timeout` on expiry).
+    #[must_use]
+    pub const fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the upstream response-head timeout (`504 Gateway Timeout` on expiry).
+    #[must_use]
+    pub const fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the per-read idle timeout for streaming upstream response bodies.
+    #[must_use]
+    pub const fn body_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.body_idle_timeout = Some(timeout);
+        self
     }
 
     /// Make connections to the upstream through `transport`: extra trusted roots for a private
@@ -200,18 +284,25 @@ impl Upstream {
         self
     }
 
-    /// The upstream URI a request for `path_and_query` goes to.
-    fn target(&self, path_and_query: Option<&PathAndQuery>) -> Result<Uri, ProxyError> {
-        let path = path_and_query.map_or("/", PathAndQuery::as_str);
-        let mut joined = String::with_capacity(self.base.len() + path.len());
-        joined.push_str(&self.base);
-        joined.push_str(path);
-        Uri::builder()
-            .scheme(self.scheme.clone())
-            .authority(self.authority.clone())
-            .path_and_query(joined)
-            .build()
-            .map_err(|error| ProxyError::Target(error.to_string()))
+    /// Per-request timeouts configured on this upstream, if any.
+    fn timeouts(&self) -> Option<Timeouts> {
+        if self.connect_timeout.is_none()
+            && self.request_timeout.is_none()
+            && self.body_idle_timeout.is_none()
+        {
+            return None;
+        }
+        let mut timeouts = Timeouts::default();
+        if let Some(connect) = self.connect_timeout {
+            timeouts = timeouts.with_connect(connect);
+        }
+        if let Some(request) = self.request_timeout {
+            timeouts = timeouts.with_response_head(request);
+        }
+        if let Some(idle) = self.body_idle_timeout {
+            timeouts = timeouts.with_body_idle(idle);
+        }
+        Some(timeouts)
     }
 }
 
@@ -225,14 +316,26 @@ pub struct Proxy {
     upstream: Arc<Upstream>,
     /// The upstream pool, on the thread that built the proxy.
     client: NativeBackend,
+    /// Per-thread load-balancing and health state shared across clones on this thread.
+    pool: Rc<PoolState>,
 }
 
 impl fmt::Debug for Proxy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Proxy")
             .field("upstream", &self.upstream)
+            .field("pool", &self.pool)
             .finish_non_exhaustive()
     }
+}
+
+/// The target-independent parts of a forwarded request, prepared once per client request.
+struct PreparedRequest {
+    method: Method,
+    path_and_query: Option<PathAndQuery>,
+    headers: HeaderMap,
+    body: Option<Body>,
+    can_retry: bool,
 }
 
 impl Proxy {
@@ -269,37 +372,35 @@ impl Proxy {
         R: NativeResolve,
         E: LocalExecutor,
     {
+        let upstream = Arc::new(upstream.clone());
+        let client =
+            NativeBackend::on_current_thread(upstream.transport.clone(), io, resolver, executor);
+        let pool = PoolState::new(&upstream, &client, executor);
         Self {
-            upstream: Arc::new(upstream.clone()),
-            client: NativeBackend::on_current_thread(
-                upstream.transport.clone(),
-                io,
-                resolver,
-                executor,
-            ),
+            upstream,
+            client,
+            pool,
         }
     }
 
-    /// The request to send upstream, built from the one the client sent; `accepts_trailers` is
-    /// whether that client accepts trailer fields in the response.
-    fn forwarded_request(
+    /// Validate and rewrite the target-independent parts of `request`.
+    fn prepare_forward(
         &self,
         request: &mut Request,
         accepts_trailers: bool,
-    ) -> Result<Request, ProxyError> {
+    ) -> Result<PreparedRequest, ProxyError> {
         let settings = &*self.upstream;
         if request.method() == http::Method::CONNECT {
             return Err(ProxyError::Connect);
         }
         // The protocols the client offers to switch to, kept only where the server can hand its
         // connection over once the upstream switches.
-        let offered = if headers::requests_upgrade(request.headers())
-            && request.extensions().get::<UpgradeAvailable>().is_some()
-        {
-            headers::upgrade_fields(request.headers())
-        } else {
-            Vec::new()
-        };
+        let offered =
+            if headers::requests_upgrade(request.headers()) && UpgradeAvailable::is_set(request) {
+                headers::upgrade_fields(request.headers())
+            } else {
+                Vec::new()
+            };
 
         let version = request.version();
         let mut fields = request.headers().clone();
@@ -323,13 +424,9 @@ impl Proxy {
                 let host = HeaderValue::try_from(host).map_err(|_| ProxyError::InvalidHost)?;
                 fields.insert(header::HOST, host);
             }
-        } else {
-            let host = HeaderValue::try_from(settings.authority.as_str())
-                .expect("a parsed authority is a valid field value");
-            fields.insert(header::HOST, host);
         }
 
-        let peer = request.extensions().get::<PeerAddr>().map(|peer| peer.ip());
+        let peer = PeerAddr::of(request).map(|peer| peer.ip());
         let trusted = peer.is_some_and(|peer| {
             request
                 .extensions()
@@ -370,16 +467,66 @@ impl Proxy {
             .body_mut()
             .take()
             .map_err(|_| ProxyError::BodyConsumed)?;
-        let mut forwarded = Request::new(body::forward(body, false));
-        *forwarded.method_mut() = request.method().clone();
-        *forwarded.uri_mut() = self.upstream.target(request.uri().path_and_query())?;
+        let can_retry = settings.retry_policy.is_some()
+            && request.method().is_idempotent()
+            && !upgrade
+            && body.len() == Some(0);
+        Ok(PreparedRequest {
+            method: request.method().clone(),
+            path_and_query: request.uri().path_and_query().cloned(),
+            headers: fields,
+            body: Some(body),
+            can_retry,
+        })
+    }
+
+    /// Build the forwarded request for `target` from `prepared`.
+    fn build_attempt(
+        &self,
+        prepared: &mut PreparedRequest,
+        target: &Target,
+        is_last: bool,
+    ) -> Result<Request, ProxyError> {
+        let mut headers = if is_last {
+            core::mem::take(&mut prepared.headers)
+        } else {
+            prepared.headers.clone()
+        };
+        if !self.upstream.preserve_host {
+            let host = HeaderValue::try_from(target.authority.as_str())
+                .expect("a parsed authority is a valid field value");
+            headers.insert(header::HOST, host);
+        }
+        let body = if prepared.can_retry {
+            Body::empty()
+        } else {
+            body::forward(
+                prepared
+                    .body
+                    .take()
+                    .expect("non-retryable request is sent once"),
+                false,
+                None,
+            )
+        };
+        let mut forwarded = Request::new(body);
+        *forwarded.method_mut() = prepared.method.clone();
+        *forwarded.uri_mut() = target.request_uri(prepared.path_and_query.as_ref())?;
         *forwarded.version_mut() = Version::HTTP_11;
-        *forwarded.headers_mut() = fields;
+        *forwarded.headers_mut() = headers;
+        if let Some(timeouts) = self.upstream.timeouts() {
+            forwarded.extensions_mut().insert(timeouts);
+        }
         Ok(forwarded)
     }
 
     /// The response to send the client, built from the one the upstream sent.
-    fn returned_response(&self, mut response: Response, accepts_trailers: bool) -> Response {
+    fn returned_response(
+        &self,
+        mut response: Response,
+        accepts_trailers: bool,
+        guard: Option<pool::InFlightGuard>,
+    ) -> Response {
         // The backend hands over a switched connection only for the upgrade this proxy forwarded.
         let switched = Upgrade::on(&mut response);
         let chunked = headers::is_chunked(response.headers());
@@ -412,7 +559,7 @@ impl Proxy {
         let may_carry_trailers =
             chunked || version == Version::HTTP_2 || version == Version::HTTP_3;
         let body = core::mem::replace(response.body_mut(), Body::empty());
-        *response.body_mut() = body::forward(body, may_carry_trailers && !accepts_trailers);
+        *response.body_mut() = body::forward(body, may_carry_trailers && !accepts_trailers, guard);
         response
     }
 }
@@ -422,19 +569,91 @@ impl Endpoint for Proxy {
 
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let accepts_trailers = headers::accepts_trailers(request.headers());
-        let mut client = self.client.clone();
-        let mut forwarded = self.forwarded_request(request, accepts_trailers)?;
-        tracing::debug!(
-            method = %forwarded.method(),
-            target = %forwarded.uri(),
-            "forwarding upstream"
-        );
-        let response = match client.respond(&mut forwarded).await {
-            Ok(response) => response,
-            Err(zenwave::Error::Timeout(_)) => return Err(ProxyError::Timeout),
-            Err(error) => return Err(ProxyError::Upstream(error)),
+        let mut prepared = self.prepare_forward(request, accepts_trailers)?;
+        let max_attempts = if prepared.can_retry {
+            self.upstream
+                .retry_policy
+                .map_or(1, RetryPolicy::max_attempts)
+        } else {
+            1
         };
-        Ok(self.returned_response(response, accepts_trailers))
+        let mut tried = vec![false; self.upstream.targets.len()];
+
+        for attempt in 0..max_attempts {
+            let target_idx = self
+                .pool
+                .select(self.upstream.load_balance, &tried)
+                .unwrap_or_else(|| {
+                    tried.fill(false);
+                    self.pool
+                        .select(self.upstream.load_balance, &tried)
+                        .expect("pool is non-empty")
+                });
+            tried[target_idx] = true;
+            let target = &self.upstream.targets[target_idx];
+            let is_last = attempt + 1 == max_attempts;
+            let mut forwarded = self.build_attempt(&mut prepared, target, is_last)?;
+            let guard = self.pool.acquire(target_idx);
+            let mut client = self.client.clone();
+
+            tracing::debug!(
+                method = %forwarded.method(),
+                target = %forwarded.uri(),
+                attempt = attempt + 1,
+                "forwarding upstream"
+            );
+
+            match client.respond(&mut forwarded).await {
+                Ok(response) => {
+                    if self
+                        .upstream
+                        .passive_health
+                        .is_some_and(|policy| policy.is_failure_status(response.status()))
+                    {
+                        self.pool
+                            .record_failure(target_idx, self.upstream.passive_health);
+                    } else {
+                        self.pool.record_success(target_idx);
+                    }
+                    if !is_last
+                        && prepared.can_retry
+                        && self
+                            .upstream
+                            .retry_policy
+                            .is_some_and(|policy| policy.retries_status(response.status()))
+                    {
+                        drop(guard);
+                        continue;
+                    }
+                    return Ok(self.returned_response(response, accepts_trailers, Some(guard)));
+                }
+                Err(zenwave::Error::Timeout(_)) => {
+                    self.pool
+                        .record_failure(target_idx, self.upstream.passive_health);
+                    drop(guard);
+                    if !is_last
+                        && prepared.can_retry
+                        && self
+                            .upstream
+                            .retry_policy
+                            .is_some_and(RetryPolicy::retries_timeout)
+                    {
+                        continue;
+                    }
+                    return Err(ProxyError::Timeout);
+                }
+                Err(error) => {
+                    self.pool
+                        .record_failure(target_idx, self.upstream.passive_health);
+                    drop(guard);
+                    if !is_last && prepared.can_retry {
+                        continue;
+                    }
+                    return Err(ProxyError::Upstream(error));
+                }
+            }
+        }
+        unreachable!("max_attempts >= 1 always returns inside the loop")
     }
 }
 

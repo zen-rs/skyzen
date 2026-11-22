@@ -35,7 +35,10 @@ provider:
   Function URL;
 - for Azure, that `[azure]` names the Function App to publish to — `app_name`, `subscription_id`
   and `resource_group` — and that the Linux target it names is installed;
-- for every selected provider, which of the runtime variables it delivers have a value here.
+- for every selected provider, which of the runtime variables it delivers have a value here;
+- on Linux, the host's acceleration facilities via ethtool netlink, sysfs, procfs, and syscalls:
+  kernel `tls` module, NIC TLS offload, header/data split, `io_uring` NAPI busy polling, RX IRQ
+  placement, automatic connection steering, and `RLIMIT_MEMLOCK` / `CAP_IPC_LOCK`.
 
 Every check runs even after one fails, and the command exits non-zero if any did.
 
@@ -73,6 +76,60 @@ or Azure Functions, where the platform terminates TLS, or without the feature.
 Cleartext HTTP (`--server`/`SKYZEN_SERVER`: `auto` by default, or `h1`/`h2`) sniffs up to
 the 24-byte HTTP/2 connection preface without copying and routes each connection straight
 to `skyzen-h1` or `skyzen-h2` (prior-knowledge h2c), on a `unix:` listener as on TCP.
+
+### HTTP/3
+
+With the `http3` feature (which implies `server-tls`), Skyzen serves HTTP/3 over UDP through
+`http-kit-h3` (`quiche`) on the same port and PEM certificate/key as the TLS TCP listener,
+advertising it with `Alt-Svc` on TLS responses:
+
+```toml
+[dependencies]
+skyzen = { version = "0.6", features = ["http3"] }
+```
+
+```sh
+./target/release/my-app --listen 0.0.0.0:443 \
+  --tls-cert /etc/ssl/cert.pem --tls-key /etc/ssl/key.pem --http3
+```
+
+On `SO_REUSEPORT` platforms (Linux, Android) every serving thread runs a QUIC endpoint; elsewhere
+the first thread serves QUIC. Passing `--http3` (or `SKYZEN_HTTP3=true`) makes any start that
+cannot serve HTTP/3 (missing feature, no TLS, `unix:` listener, serverless host, UDP bind failure)
+fail loudly. On targets where `native-tls` links OpenSSL (non-Apple, non-Windows), `http3` cannot
+be combined with `tls-native-tls` because quiche's BoringSSL exports the same symbols; use
+`tls-rustls` for database TLS.
+
+### Linux `io_uring` & Host Acceleration
+
+On Linux over `io_uring`, the native server accepts operator settings via flags or environment
+variables (flags take precedence):
+
+| Flag | Environment variable | Purpose |
+|---|---|---|
+| `--recv-buffers <count>`, `--recv-buffer-len <bytes>` | `SKYZEN_RECV_BUFFERS`, `SKYZEN_RECV_BUFFER_LEN` | Per-thread provided buffer ring with incremental consumption (`IOU_PBUF_RING_INC`, Linux 6.12+) |
+| `--fixed-buffers <bytes>` | `SKYZEN_FIXED_BUFFERS` | Per-thread registered fixed-buffer region (`RLIMIT_MEMLOCK` / `CAP_IPC_LOCK`) for zero-copy static file sends |
+| `--zero-copy-threshold <bytes>`, `--file-table-slots <count>` | `SKYZEN_ZERO_COPY_THRESHOLD`, `SKYZEN_FILE_TABLE_SLOTS` | Zero-copy send threshold and registered file table slots (also live-tunable via the `IoSettings` extractor) |
+| `--busy-poll <µs>`, `--busy-poll-prefer`, `--busy-poll-budget <n>` | `SKYZEN_BUSY_POLL`, `SKYZEN_BUSY_POLL_PREFER`, `SKYZEN_BUSY_POLL_BUDGET` | `io_uring` NAPI busy polling (`IORING_REGISTER_NAPI`, Linux 6.9+) and socket busy-poll options |
+| `--steering <auto\|on\|off>` | `SKYZEN_STEERING` | CPU pinning and `SO_ATTACH_REUSEPORT_CBPF` aligned with NIC RX IRQs |
+
+### Systemd Deployment (Linux)
+
+Declare `[native.server]` (and optional `[native.linux]` kernel/NIC settings) in `Skyzen.toml`,
+compile as the project owner (never as root, which would leave `target/` root-owned), and deploy:
+
+```sh
+skyzen build --provider native --release
+sudo -E env "PATH=$PATH" skyzen deploy --provider native --dry-run
+sudo -E env "PATH=$PATH" skyzen deploy --provider native
+```
+
+`skyzen deploy --provider native` applies `[native.linux]` through netlink/sysfs/procfs and
+re-verifies every setting, writes resolved `[[secret]]` and wiring variables to
+`/etc/skyzen/<bin>.env` (`0600`), installs `/etc/systemd/system/<bin>.service` running as
+`DynamicUser=yes` with `LimitMEMLOCK=infinity`, `ExecStartPre=+… deploy --host-only`, and only the
+capabilities `[native.server]` needs, then reloads and restarts the unit. See
+[Native Linux Deployment](skyzen-toml-reference.md#deploying).
 
 ### Docker
 
