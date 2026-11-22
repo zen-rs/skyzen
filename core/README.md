@@ -13,7 +13,7 @@ Foundational traits for the Skyzen HTTP framework.
 - **`Extractor`** — Types that extract themselves from a `&mut Request` (a JSON body, a header, the raw bytes). Tuples of extractors are extractors, up to arity 15.
 - **`Responder`** — Types that write themselves into a `&mut Response` (`String`, `StatusCode`, `HeaderMap`, tuples of the above)
 - **`Middleware`** — Skyzen's own middleware trait, taking **`&self`** so a middleware value is stored once and shared across requests, with `Next::run` continuing the chain. It lives here rather than in `skyzen` so `skyzen-services` can implement it without depending on the framework.
-- **`Server`** — Trait for HTTP server backends (implemented by `skyzen-hyper`)
+- **`Server`** — Trait for HTTP server backends (implemented by `skyzen-h1`, `skyzen-h2`, and `skyzen-hyper`)
 - **The error vocabulary** — `Error`, `HttpError`, `Result`, `ResultExt` and `Context`, including the policy that redacts a 5xx body while keeping the whole `source()` chain in the log.
 - **The body rules** — `RequestBodyLimit` (2 MiB by default, enforced from `Content-Length` and mid-stream) and `BodyConsumed`, which makes a second body-consuming extractor a loud error rather than a silent empty body.
 
@@ -25,7 +25,7 @@ This crate also re-exports foundational HTTP types from `http-kit`: `Request`, `
 
 ```toml
 [dependencies]
-skyzen-core = { version = "0.1", default-features = false }
+skyzen-core = { version = "0.3", default-features = false }
 ```
 
 ## Features

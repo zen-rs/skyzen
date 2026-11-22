@@ -10,10 +10,10 @@ Hyper server backend for the Skyzen HTTP framework.
 
 `skyzen-hyper` provides the `Hyper` struct, which implements the `Server` trait from `skyzen-core`. It bridges Skyzen's `Endpoint` abstraction with Hyper's HTTP/1 and HTTP/2 server.
 
-Most users don't need this crate directly — `#[skyzen::main]` sets up Hyper automatically. Use this crate when you want to:
+Most users don't need this crate directly — `#[skyzen::main]` serves HTTP/1.1 and HTTP/2 natively on `skyzen-h1` and `skyzen-h2` over `compio`. Use this crate when you want to:
 
 - **Embed Skyzen** into an existing application with a custom async runtime
-- **Use a non-Tokio executor** (e.g. `smol`, `async-std`)
+- **Use a non-compio executor** (e.g. `smol`, `tokio`)
 - **Control connection handling** and error recovery directly
 
 ## Usage
@@ -22,7 +22,7 @@ Enable the `hyper` feature on the `skyzen` crate:
 
 ```toml
 [dependencies]
-skyzen = { version = "0.1", features = ["hyper"] }
+skyzen = { version = "0.6", features = ["hyper"] }
 ```
 
 Then use `Hyper.serve()` with an `http-kit-io` backend, a listener registered with it, a
@@ -30,7 +30,7 @@ thread-local executor and a shutdown signal. The endpoint never leaves the threa
 so it may be `!Send`:
 
 ```rust
-use http_kit_io::{async_io::AsyncIo, Io};
+use http_kit_io::{async_io::AsyncIo, FromStd as _};
 use skyzen_core::Server;
 use skyzen_hyper::Hyper;
 use std::rc::Rc;

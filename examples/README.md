@@ -40,7 +40,7 @@ crate-type = ["cdylib", "rlib"]
 Run natively (helpful during development because you get logging, CLI overrides, and Ctrl+C handling automatically):
 
 ```sh
-cargo run --example worker
+cargo run --example worker --features sqlite
 ```
 
 For real Cloudflare local simulation or deployment, prefer a normal project with `Skyzen.toml`.
@@ -100,7 +100,7 @@ Features:
 Requires the `hyper` feature:
 
 ```sh
-cargo run --example embed_hyper
+cargo run --example embed_hyper --features hyper
 ```
 
 ## `services.rs`
