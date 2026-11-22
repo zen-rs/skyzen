@@ -17,21 +17,22 @@ use std::{
 
 use http_kit::{BodyFrame, FrameSource, PipeOffer};
 
-use super::ProxyError;
+use super::{pool::InFlightGuard, ProxyError};
 use crate::{Body, BodyError};
 
 /// Wrap `body` to pass pipe offers through it; `refuse_trailers` fails the body at trailer fields,
 /// which its reader did not accept, instead of dropping them.
 ///
 /// A body whose length is known is already in memory, has nothing to splice and no trailers, and
-/// is returned as it is.
-pub(super) fn forward(body: Body, refuse_trailers: bool) -> Body {
+/// is returned as it is (dropping any `guard` because the upstream exchange is already complete).
+pub(super) fn forward(body: Body, refuse_trailers: bool, guard: Option<InFlightGuard>) -> Body {
     if body.len().is_some() {
         return body;
     }
     Body::from_source(Forwarded {
         body: Some(body),
         refuse_trailers,
+        _guard: guard,
     })
 }
 
@@ -40,6 +41,7 @@ struct Forwarded {
     /// `None` once the body failed on trailers it may not bring.
     body: Option<Body>,
     refuse_trailers: bool,
+    _guard: Option<InFlightGuard>,
 }
 
 impl FrameSource for Forwarded {
