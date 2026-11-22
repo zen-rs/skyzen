@@ -287,7 +287,6 @@ where
 {
     async fn call(&self, mut request: Request) -> Response {
         let method = request.method().clone();
-        let path = request.uri().path().to_owned();
         if let Some(peer) = self.peer {
             request.extensions_mut().insert(PeerAddr::new(peer));
         }
@@ -302,16 +301,16 @@ where
         let mut endpoint = self.endpoint.clone();
         let mut response = match endpoint.respond(&mut request).await {
             Ok(response) => {
-                tracing::info!(
+                tracing::debug!(
                     method = method.as_str(),
-                    path = path.as_str(),
+                    path = request.uri().path(),
                     status = response.status().as_u16(),
                     "request completed"
                 );
                 response
             }
             Err(error) => {
-                log_endpoint_error(&error, &method, path.as_str());
+                log_endpoint_error(&error, &method, request.uri().path());
                 let mut response = error_response(&error);
                 apply_pending_headers(&request, &mut response);
                 response

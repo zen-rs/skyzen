@@ -1,13 +1,20 @@
 use core::future::{ready, Future};
 use std::convert::Infallible;
 use std::fmt;
+use std::sync::Arc;
 
 use http_kit::{HttpError, Request, StatusCode};
 use skyzen_core::Extractor;
 
+use super::RouteMatch;
+
 /// Extract param defined in route.
-#[derive(Debug, Clone)]
-pub struct Params(Vec<(String, String)>);
+///
+/// The captured pairs live behind an `Arc`, so cloning an extracted `Params` — which every
+/// `Params` and [`Path<T>`](crate::extract::Path) extraction does — is a refcount bump rather
+/// than a copy of every captured name and value.
+#[derive(Debug, Clone, Default)]
+pub struct Params(Option<Arc<[(String, String)]>>);
 
 /// Error returned when attempting to read a missing route parameter.
 #[derive(Debug, Clone)]
@@ -37,8 +44,8 @@ impl HttpError for MissingParam {
 }
 
 impl Params {
-    pub(crate) const fn new(vec: Vec<(String, String)>) -> Self {
-        Self(vec)
+    pub(crate) fn new(vec: Vec<(String, String)>) -> Self {
+        Self((!vec.is_empty()).then(|| Arc::from(vec)))
     }
 
     /// The captured parameters, in the order the route pattern declares them.
@@ -47,11 +54,11 @@ impl Params {
     /// only when the parameter names are not known until runtime.
     #[must_use]
     pub fn pairs(&self) -> &[(String, String)] {
-        &self.0
+        self.0.as_deref().unwrap_or_default()
     }
 
     pub(crate) const fn empty() -> Self {
-        Self(Vec::new())
+        Self(None)
     }
 
     /// Get the route parameter by the name.
@@ -60,7 +67,7 @@ impl Params {
     ///
     /// Returns an error if the requested parameter is not present.
     pub fn get(&self, name: &str) -> Result<&str, MissingParam> {
-        self.0
+        self.pairs()
             .iter()
             .find_map(|(k, v)| if k == name { Some(v.as_str()) } else { None })
             .ok_or_else(|| MissingParam::new(name))
@@ -69,15 +76,15 @@ impl Params {
 
 impl Extractor for Params {
     type Error = Infallible;
-    // Reading the params back out of the extensions is a synchronous clone, so the future is ready
-    // on creation rather than an `async` block with nothing to await.
+    // Reading the params back out of the route match is a synchronous clone, so the future is
+    // ready on creation rather than an `async` block with nothing to await.
     fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
-        // Clone rather than remove so the params survive repeated extraction.
+        // Clone rather than remove so the params survive repeated extraction. A request with no
+        // `RouteMatch` — or a matched route that captures nothing — extracts an empty `Params`.
         ready(Ok(request
             .extensions()
-            .get::<Self>()
-            .cloned()
-            .unwrap_or(Self::empty())))
+            .get::<RouteMatch>()
+            .map_or_else(Self::empty, |matched| matched.params().clone())))
     }
 
     // Individual path parameters are derived from the route's `{name}` segments when the OpenAPI

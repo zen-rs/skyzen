@@ -27,10 +27,10 @@ use crate::Extractor;
 
 /// How many request-body bytes the body extractors may buffer for one request.
 ///
-/// The router inserts this into every request's extensions before dispatch, defaulting to
-/// [`RequestBodyLimit::DEFAULT`]. A `BodyLimit` middleware attached to a route (or as a router
-/// layer) replaces it for the requests it covers, and body extractors read it back with
-/// [`RequestBodyLimit::of`].
+/// Requests carry no limit by default: [`RequestBodyLimit::of`] — which every body extractor
+/// consults — reports [`RequestBodyLimit::DEFAULT`] when no override was inserted, so the
+/// router does not spend an extension insert on it per request. A `BodyLimit` middleware
+/// attached to a route (or as a router layer) inserts an override for the requests it covers.
 ///
 /// [`take_body_bytes`] enforces it: an oversized payload is rejected with
 /// `413 Payload Too Large`, both when `Content-Length` declares the excess up front and when a

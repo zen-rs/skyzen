@@ -160,8 +160,8 @@ mod router;
 pub use router::{build, AllowedMethods, NotFound, RouteBuildError, Router};
 
 mod matched_path;
-pub(crate) use matched_path::MountPrefix;
 pub use matched_path::{MatchedPath, NoMatchedPath};
+pub(crate) use matched_path::{MountPrefix, RouteMatch};
 
 mod nest;
 pub use nest::{MountPathError, Mounted};
@@ -229,7 +229,7 @@ impl fmt::Display for MethodFilter {
 
 /// A handler registered on a route, together with the wiring it depends on.
 struct EndpointEntry {
-    factory: EndpointFactory,
+    endpoint: Rc<dyn skyzen_core::middleware::Dispatch>,
     requirements: Vec<Requirement>,
 }
 
@@ -279,8 +279,8 @@ pub enum RouteNodeType {
     Route(Route),
     /// Terminal endpoint located at the provided path and method.
     Endpoint {
-        /// Factory producing a fresh endpoint that can be safely shared.
-        endpoint_factory: EndpointFactory,
+        /// Per-thread dispatch that answers the request without rebuilding the endpoint.
+        endpoint: Rc<dyn skyzen_core::middleware::Dispatch>,
         /// Which requests the node answers.
         method: MethodFilter,
         /// Handler metadata for `OpenAPI` export.
@@ -299,8 +299,8 @@ pub enum RouteNodeType {
     },
     /// An endpoint answering every method at the node's path and everything beneath it.
     Mounted {
-        /// Factory producing the mounted endpoint, which sees paths with the mount prefix removed.
-        endpoint_factory: EndpointFactory,
+        /// Dispatch for the mounted endpoint, which sees paths with the mount prefix removed.
+        endpoint: Rc<dyn skyzen_core::middleware::Dispatch>,
         /// Middleware wrapping the mounted endpoint, outermost first.
         middleware: Vec<BoxMiddleware>,
     },
@@ -545,7 +545,7 @@ impl RouteWithAlarm {
     pub fn build(self) -> Router {
         let alarm_factory = self.alarm_endpoint;
         let mut router = self.route.build();
-        router.alarm_handler = Some(alarm_factory);
+        Rc::make_mut(&mut router.inner).alarm_handler = Some(alarm_factory);
         router
     }
 
@@ -575,11 +575,38 @@ impl RouteNode {
     where
         E: Endpoint + Clone + 'static,
     {
-        let endpoint_factory: EndpointFactory = Rc::new(move || AnyEndpoint::new(endpoint.clone()));
+        let endpoint: Rc<dyn skyzen_core::middleware::Dispatch> =
+            Rc::new(router::Cloning(endpoint));
         Self {
             path: path.into(),
             node_type: RouteNodeType::Endpoint {
-                endpoint_factory,
+                endpoint,
+                method,
+                openapi,
+                requirements,
+                middleware: Vec::new(),
+            },
+        }
+    }
+
+    /// Construct an endpoint node from a handler endpoint, which answers `&self` and so
+    /// dispatches per request without being cloned or rebuilt.
+    pub(crate) fn new_handler<H, T, R>(
+        path: impl Into<String>,
+        method: MethodFilter,
+        endpoint: handler::IntoEndpoint<H, T, R>,
+        openapi: Option<openapi::RouteHandlerDoc>,
+        requirements: Vec<Requirement>,
+    ) -> Self
+    where
+        H: Handler<T, R>,
+        T: Extractor,
+        R: Responder,
+    {
+        Self {
+            path: path.into(),
+            node_type: RouteNodeType::Endpoint {
+                endpoint: Rc::new(endpoint),
                 method,
                 openapi,
                 requirements,
@@ -615,11 +642,12 @@ impl RouteNode {
     where
         E: Endpoint + Clone + 'static,
     {
-        let endpoint_factory: EndpointFactory = Rc::new(move || AnyEndpoint::new(endpoint.clone()));
+        let endpoint: Rc<dyn skyzen_core::middleware::Dispatch> =
+            Rc::new(router::Cloning(endpoint));
         Self {
             path: path.into(),
             node_type: RouteNodeType::Mounted {
-                endpoint_factory,
+                endpoint,
                 middleware: Vec::new(),
             },
         }
@@ -956,23 +984,25 @@ where
     T: Extractor,
     R: Responder,
 {
-    let endpoint = handler::into_endpoint(handler);
     EndpointEntry {
-        factory: Rc::new(move || AnyEndpoint::new(endpoint.clone())),
+        endpoint: Rc::new(handler::into_endpoint(handler)),
         requirements: T::requirements(),
     }
 }
 
-fn endpoint_node_from_handler<P, H, T, R>(path: P, method: MethodFilter, handler: H) -> RouteNode
+fn endpoint_node_from_handler<H, T, R>(
+    path: impl Into<String>,
+    method: MethodFilter,
+    handler: H,
+) -> RouteNode
 where
-    P: Into<String>,
     H: Handler<T, R>,
     T: Extractor,
     R: Responder,
 {
     let handler_doc = openapi::describe_handler::<H>();
     let endpoint = handler::into_endpoint(handler);
-    RouteNode::new_endpoint(
+    RouteNode::new_handler(
         path.into(),
         method,
         endpoint,

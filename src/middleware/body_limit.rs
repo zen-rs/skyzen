@@ -6,9 +6,8 @@ use skyzen_core::{
 
 /// Override how many request-body bytes the body extractors may buffer.
 ///
-/// Every request the router dispatches carries a [`RequestBodyLimit`] extension, defaulting to
-/// [`RequestBodyLimit::DEFAULT`] (2 MiB). Attach this middleware to raise, lower or lift that cap
-/// for the routes it covers:
+/// Without an override, body extractors cap reads at [`RequestBodyLimit::DEFAULT`] (2 MiB).
+/// Attach this middleware to raise, lower or lift that cap for the routes it covers:
 ///
 /// ```rust
 /// use skyzen::{middleware::BodyLimit, routing::{CreateRouteNode, Route}, Result};

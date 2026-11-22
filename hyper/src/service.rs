@@ -158,7 +158,6 @@ where
         let upgrade = Rc::clone(&self.upgrade);
         let fut = async move {
             let method = req.method().clone();
-            let path = req.uri().path().to_owned();
             let mut request: skyzen_core::Request =
                 skyzen_core::Request::from(req.map(BodyDataStream::new).map(|body| {
                     skyzen_core::Body::from_stream(
@@ -172,16 +171,16 @@ where
 
             let mut response: skyzen_core::Response = match endpoint.respond(&mut request).await {
                 Ok(response) => {
-                    tracing::info!(
+                    tracing::debug!(
                         method = method.as_str(),
-                        path = path.as_str(),
+                        path = request.uri().path(),
                         status = response.status().as_u16(),
                         "request completed"
                     );
                     response
                 }
                 Err(error) => {
-                    log_endpoint_error(&error, &method, path.as_str());
+                    log_endpoint_error(&error, &method, request.uri().path());
                     let mut response = error_response(&error);
                     apply_pending_headers(&request, &mut response);
                     response
