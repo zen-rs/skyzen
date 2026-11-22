@@ -16,8 +16,8 @@
 //! - `rt` - Enables the built-in runtime for `#[skyzen::main]`. This provides:
 //!   - Logging setup via tracing
 //!   - Signal handling (ctrl+c graceful shutdown)
-//!   - Thread-per-core HTTP/1.1, HTTP/2, and optional HTTP/3 server via compio
-//!   - CLI argument parsing for address, TLS, HTTP/3, and I/O configuration
+//!   - HTTP server via hyper + tokio
+//!   - CLI argument parsing for port configuration
 //!
 //! - `hyper` - Enables only the Hyper server adapter (`skyzen::hyper`). Use this when
 //!   embedding Skyzen into your own application. You provide your own:
@@ -30,7 +30,7 @@
 //! ```toml
 //! [dependencies]
 //! # Only enable hyper feature, not rt
-//! skyzen = { version = "0.6", default-features = false, features = ["json", "hyper"] }
+//! skyzen = { version = "0.1", default-features = false, features = ["json", "hyper"] }
 //! smol = "2.0"
 //! async-executor = "1.13"
 //! http-kit-io = { version = "0.2", default-features = false, features = ["async-io"] }
@@ -41,7 +41,7 @@
 //! tracing-subscriber = "0.3"
 //! ```
 //!
-//! Run with: `cargo run --example embed_hyper --features hyper`
+//! Run with: `cargo run --example embed_hyper`
 
 use async_executor::LocalExecutor;
 use http_kit_io::{async_io::AsyncIo, FromStd as _};
