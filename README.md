@@ -372,6 +372,10 @@ let router = |thread: &ServingThread| -> Router {
 };
 ```
 
+- Supports multi-origin pools via `Upstream::pool` with `LoadBalance` (`RoundRobin` or
+  `LeastConnections`), passive outlier ejection (`PassiveHealth`), active HTTP probing
+  (`HealthCheck`), upstream timeouts (`connect_timeout`, `request_timeout`, `body_idle_timeout` —
+  `504` on expiry), and idempotent empty-body retries (`RetryPolicy`).
 - Streams request and response bodies frame-by-frame with chunked trailers, strips hop-by-hop
   headers, writes RFC 7239 `Forwarded` and `Via`, and trusts inbound forwarding headers only from
   peers matched by `TrustedProxies`.
