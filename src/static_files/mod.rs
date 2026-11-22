@@ -12,11 +12,11 @@
 //! descriptor that each response sends as a file region — `sendfile`/`splice` on the HTTP/1.1
 //! server, through kernel TLS too where Linux has it.
 //!
-//! Two deliberate limits: a multi-range request is answered with the whole file and `200`, because
-//! `multipart/byteranges` is rarely worth its complexity, and `If-Range` is not consulted — an
-//! `If-None-Match` on the same request already covers the case it guards. Only the filesystem
-//! server sends `Last-Modified`; an embedded file has no modification time, so it validates by
-//! `ETag` alone.
+//! Both servers honour `If-Range` (strong `ETag` match or `Last-Modified` HTTP-date) and serve
+//! multi-range requests (up to 16 satisfiable byte ranges) as `206 Partial Content` with
+//! `multipart/byteranges`. Only the filesystem server sends `Last-Modified`; an embedded file has
+//! no modification time, so it validates by `ETag` alone and treats a date `If-Range` as a
+//! mismatch (`200 OK`).
 
 use core::future::{ready, Future};
 use std::collections::HashMap;
@@ -28,7 +28,9 @@ use std::{
 };
 
 use base64::Engine;
-use headers::{AcceptRanges, ContentRange, ETag, HeaderMapExt, LastModified, Range as RangeHeader};
+use headers::{
+    AcceptRanges, ContentRange, ETag, HeaderMapExt, IfRange, LastModified, Range as RangeHeader,
+};
 use include_dir::{Dir, File};
 use sha1::{Digest, Sha1};
 
@@ -163,31 +165,40 @@ where
     RouteNode::new_route(mount_path, route)
 }
 
+/// Maximum number of byte ranges served in a single `multipart/byteranges` response.
+const MAX_RANGES: usize = 16;
+
 /// What the request's conditional and range headers ask for.
 #[derive(Debug, PartialEq, Eq)]
 enum Disposition {
     /// The client's copy is still good.
     NotModified,
-    /// A `Range` was asked for that this file cannot satisfy.
+    /// A `Range` was asked for that this file cannot satisfy (or exceeds [`MAX_RANGES`]).
     Unsatisfiable,
     /// One byte range, inclusive at both ends.
     Partial { start: u64, end: u64 },
+    /// Multiple byte ranges, inclusive at both ends, with the multipart boundary.
+    MultiPartial {
+        ranges: smallvec::SmallVec<[(u64, u64); 2]>,
+        boundary: String,
+    },
     /// The whole file.
     Full,
 }
 
 impl Disposition {
-    /// The bytes to send, as `(offset, length)`, or `None` when the response has no body.
+    /// The bytes to send for a single-part response, as `(offset, length)`, or `None` when the
+    /// response has no single-part body.
     const fn span(&self, len: u64) -> Option<(u64, u64)> {
         match self {
-            Self::NotModified | Self::Unsatisfiable => None,
+            Self::NotModified | Self::Unsatisfiable | Self::MultiPartial { .. } => None,
             Self::Partial { start, end } => Some((*start, *end - *start + 1)),
             Self::Full => Some((0, len)),
         }
     }
 }
 
-/// Decide what to send, from the request's validators and range.
+/// Decide what to send, from the request's validators, `If-Range`, and `Range`.
 ///
 /// Validators win over the range: a client whose cached copy is current gets `304` and no body,
 /// whatever byte range it asked for.
@@ -207,30 +218,51 @@ fn negotiate(
         return Disposition::Full;
     };
 
-    let mut satisfiable = range.satisfiable_ranges(len);
-    let Some(first) = satisfiable.next() else {
-        return Disposition::Unsatisfiable;
-    };
-    if satisfiable.next().is_some() {
-        // Multi-range: answered in full, as documented on the module.
-        return Disposition::Full;
+    // RFC 9110 §13.1.5: If `If-Range` is present and does not strong-match the current
+    // representation (weak ETags never match, and invalid/missing validators fail), ignore
+    // `Range` and serve the full representation with `200 OK`.
+    if headers.contains_key(header::IF_RANGE) {
+        let last_mod = last_modified.map(LastModified::from);
+        let modified = headers
+            .typed_get::<IfRange>()
+            .is_none_or(|if_range| if_range.is_modified(etag, last_mod.as_ref()));
+        if modified {
+            return Disposition::Full;
+        }
     }
 
-    let start = match first.0 {
-        std::ops::Bound::Included(start) => start,
-        std::ops::Bound::Excluded(start) => start.saturating_add(1),
-        std::ops::Bound::Unbounded => 0,
-    };
-    let end = match first.1 {
-        std::ops::Bound::Included(end) => end.min(len.saturating_sub(1)),
-        std::ops::Bound::Excluded(end) => end.saturating_sub(1).min(len.saturating_sub(1)),
-        std::ops::Bound::Unbounded => len.saturating_sub(1),
-    };
-
-    if len == 0 || start > end || start >= len {
-        return Disposition::Unsatisfiable;
+    let mut ranges = smallvec::SmallVec::<[(u64, u64); 2]>::new();
+    for (start_bound, end_bound) in range.satisfiable_ranges(len) {
+        let start = match start_bound {
+            std::ops::Bound::Included(start) => start,
+            std::ops::Bound::Excluded(start) => start.saturating_add(1),
+            std::ops::Bound::Unbounded => 0,
+        };
+        let end = match end_bound {
+            std::ops::Bound::Included(end) => end.min(len.saturating_sub(1)),
+            std::ops::Bound::Excluded(end) => end.saturating_sub(1).min(len.saturating_sub(1)),
+            std::ops::Bound::Unbounded => len.saturating_sub(1),
+        };
+        if len == 0 || start > end || start >= len {
+            continue;
+        }
+        if ranges.len() >= MAX_RANGES {
+            return Disposition::Unsatisfiable;
+        }
+        ranges.push((start, end));
     }
-    Disposition::Partial { start, end }
+
+    match ranges.len() {
+        0 => Disposition::Unsatisfiable,
+        1 => Disposition::Partial {
+            start: ranges[0].0,
+            end: ranges[0].1,
+        },
+        _ => Disposition::MultiPartial {
+            ranges,
+            boundary: uuid::Uuid::now_v7().simple().to_string(),
+        },
+    }
 }
 
 /// Everything the response needs that does not depend on where the bytes come from.
@@ -252,7 +284,9 @@ impl ServedFile {
         let status = match disposition {
             Disposition::NotModified => StatusCode::NOT_MODIFIED,
             Disposition::Unsatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
-            Disposition::Partial { .. } => StatusCode::PARTIAL_CONTENT,
+            Disposition::Partial { .. } | Disposition::MultiPartial { .. } => {
+                StatusCode::PARTIAL_CONTENT
+            }
             Disposition::Full => StatusCode::OK,
         };
         *response.status_mut() = status;
@@ -286,6 +320,17 @@ impl ServedFile {
                     headers.typed_insert(content_range);
                 }
                 self.set_representation(headers);
+            }
+            Disposition::MultiPartial { boundary, .. } => {
+                headers.typed_insert(AcceptRanges::bytes());
+                if let Ok(value) =
+                    HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}"))
+                {
+                    headers.insert(header::CONTENT_TYPE, value);
+                }
+                if let Some(coding) = self.coding {
+                    headers.insert(header::CONTENT_ENCODING, coding.header_value());
+                }
             }
             Disposition::Full => {
                 headers.typed_insert(AcceptRanges::bytes());
@@ -443,12 +488,50 @@ impl EmbeddedStaticDirEndpoint {
 
         let disposition = negotiate(request.headers(), served.etag.as_ref(), None, len);
         let mut response = served.head(&disposition, self.cache_control.as_ref());
-        if let Some((offset, length)) = disposition.span(len) {
+        if let Disposition::MultiPartial { ranges, boundary } = &disposition {
+            let mut chunks: Vec<Result<http_kit::utils::Bytes, core::convert::Infallible>> =
+                Vec::with_capacity(ranges.len() * 3 + 1);
+            for &(start, end) in ranges {
+                chunks.push(Ok(multipart_part_header(
+                    boundary,
+                    served.content_type.as_ref(),
+                    start,
+                    end,
+                    len,
+                )));
+                let slice = &contents[usize_range(start, end - start + 1)];
+                chunks.push(Ok(http_kit::utils::Bytes::from_static(slice)));
+                chunks.push(Ok(http_kit::utils::Bytes::from_static(b"\r\n")));
+            }
+            chunks.push(Ok(multipart_closing_boundary(boundary)));
+            *response.body_mut() = Body::from_stream(futures_util::stream::iter(chunks));
+        } else if let Some((offset, length)) = disposition.span(len) {
             let slice = &contents[usize_range(offset, length)];
             *response.body_mut() = Body::from_bytes(http_kit::utils::Bytes::from_static(slice));
         }
         Ok(response)
     }
+}
+
+fn multipart_part_header(
+    boundary: &str,
+    content_type: Option<&HeaderValue>,
+    start: u64,
+    end: u64,
+    total: u64,
+) -> http_kit::utils::Bytes {
+    use std::fmt::Write as _;
+
+    let mut header = format!("--{boundary}\r\n");
+    if let Some(mime) = content_type.and_then(|value| value.to_str().ok()) {
+        let _ = write!(header, "Content-Type: {mime}\r\n");
+    }
+    let _ = write!(header, "Content-Range: bytes {start}-{end}/{total}\r\n\r\n");
+    http_kit::utils::Bytes::from(header)
+}
+
+fn multipart_closing_boundary(boundary: &str) -> http_kit::utils::Bytes {
+    http_kit::utils::Bytes::from(format!("--{boundary}--\r\n"))
 }
 
 /// `length` bytes from `offset`, as a slice range; the span came from [`negotiate`], which kept it
@@ -559,9 +642,89 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_range_request_is_answered_in_full() {
+    fn a_multi_range_request_produces_multi_partial() {
         let mut headers = header::HeaderMap::new();
         headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-1,4-5"));
-        assert_eq!(negotiate(&headers, None, None, 10), Disposition::Full);
+        let Disposition::MultiPartial { ranges, boundary } = negotiate(&headers, None, None, 10)
+        else {
+            panic!("expected MultiPartial");
+        };
+        assert_eq!(ranges.as_slice(), &[(0, 1), (4, 5)]);
+        assert_ne!(boundary, "");
+    }
+
+    #[test]
+    fn too_many_ranges_is_unsatisfiable() {
+        let mut headers = header::HeaderMap::new();
+        let spec = (0..17)
+            .map(|i| format!("{i}-{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        headers.insert(
+            header::RANGE,
+            HeaderValue::from_str(&format!("bytes={spec}")).unwrap(),
+        );
+        assert_eq!(
+            negotiate(&headers, None, None, 100),
+            Disposition::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn if_range_etag_and_date_behaviour() {
+        let strong: headers::ETag = "\"abc\"".parse().unwrap();
+        let weak: headers::ETag = "W/\"abc\"".parse().unwrap();
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let earlier = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(250);
+
+        // Matching strong ETag -> Partial
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+        headers.insert(header::IF_RANGE, HeaderValue::from_static("\"abc\""));
+        assert_eq!(
+            negotiate(&headers, Some(&strong), Some(now), 10),
+            Disposition::Partial { start: 0, end: 3 }
+        );
+
+        // Mismatched ETag -> Full (200)
+        headers.insert(header::IF_RANGE, HeaderValue::from_static("\"other\""));
+        assert_eq!(
+            negotiate(&headers, Some(&strong), Some(now), 10),
+            Disposition::Full
+        );
+
+        // Weak ETag in If-Range -> Full (200) per RFC 9110 §13.1.5
+        headers.insert(header::IF_RANGE, HeaderValue::from_static("W/\"abc\""));
+        assert_eq!(
+            negotiate(&headers, Some(&strong), Some(now), 10),
+            Disposition::Full
+        );
+        headers.insert(header::IF_RANGE, HeaderValue::from_static("\"abc\""));
+        assert_eq!(
+            negotiate(&headers, Some(&weak), Some(now), 10),
+            Disposition::Full
+        );
+
+        // Date If-Range: matches current Last-Modified -> Partial
+        let mut date_headers = header::HeaderMap::new();
+        date_headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+        headers::HeaderMapExt::typed_insert(&mut date_headers, headers::IfRange::date(now));
+        assert_eq!(
+            negotiate(&date_headers, Some(&strong), Some(now), 10),
+            Disposition::Partial { start: 0, end: 3 }
+        );
+
+        // Date If-Range: embedded file has no Last-Modified -> Full (200)
+        assert_eq!(
+            negotiate(&date_headers, Some(&strong), None, 10),
+            Disposition::Full
+        );
+
+        // Date If-Range: earlier than Last-Modified -> Full (200)
+        headers::HeaderMapExt::typed_insert(&mut date_headers, headers::IfRange::date(earlier));
+        assert_eq!(
+            negotiate(&date_headers, Some(&strong), Some(now), 10),
+            Disposition::Full
+        );
     }
 }

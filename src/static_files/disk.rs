@@ -18,8 +18,9 @@ use super::{
     cache::{DirCache, StaticCacheSettings},
     encoding::{self, Coding},
     fs::{CompioFs, Entry, FileSystem, Opened},
-    guess_content_type, negotiate, normalize_mount_path, requested_path, route_node_for_static,
-    ServedFile, StaticDirError,
+    guess_content_type, multipart_closing_boundary, multipart_part_header, negotiate,
+    normalize_mount_path, requested_path, route_node_for_static, Disposition, ServedFile,
+    StaticDirError,
 };
 use crate::{
     header::HeaderValue,
@@ -272,6 +273,138 @@ impl Representation {
             )),
         }
     }
+
+    fn multi_range_body(
+        &self,
+        ranges: &[(u64, u64)],
+        boundary: &str,
+        content_type: Option<&HeaderValue>,
+    ) -> Body {
+        let total = self.len;
+        match &self.content {
+            Content::Memory(bytes) => {
+                let mut chunks: Vec<Result<Bytes, core::convert::Infallible>> =
+                    Vec::with_capacity(ranges.len() * 3 + 1);
+                for &(start, end) in ranges {
+                    chunks.push(Ok(multipart_part_header(
+                        boundary,
+                        content_type,
+                        start,
+                        end,
+                        total,
+                    )));
+                    let range = super::usize_range(start, end - start + 1);
+                    chunks.push(Ok(bytes.slice(range)));
+                    chunks.push(Ok(Bytes::from_static(b"\r\n")));
+                }
+                chunks.push(Ok(multipart_closing_boundary(boundary)));
+                Body::from_stream(futures_util::stream::iter(chunks))
+            }
+            Content::File(file) => {
+                stream_file_multi_range(Arc::clone(file), ranges, boundary, content_type, total)
+            }
+        }
+    }
+}
+
+fn stream_file_multi_range(
+    file: Arc<std::fs::File>,
+    ranges: &[(u64, u64)],
+    boundary: &str,
+    content_type: Option<&HeaderValue>,
+    total: u64,
+) -> Body {
+    const CHUNK_SIZE: u64 = 64 * 1024;
+    enum State {
+        StartPart {
+            index: usize,
+        },
+        ReadSlice {
+            index: usize,
+            offset: u64,
+            remaining: u64,
+        },
+        Done,
+    }
+
+    struct Ctx {
+        file: Arc<std::fs::File>,
+        ranges: SmallVec<[(u64, u64); 2]>,
+        boundary: String,
+        content_type: Option<HeaderValue>,
+        total: u64,
+        state: State,
+    }
+
+    let ctx = Ctx {
+        file,
+        ranges: SmallVec::from_slice(ranges),
+        boundary: boundary.to_owned(),
+        content_type: content_type.cloned(),
+        total,
+        state: State::StartPart { index: 0 },
+    };
+
+    let stream = futures_util::stream::unfold(ctx, |mut ctx| async move {
+        match ctx.state {
+            State::StartPart { index } => {
+                if index >= ctx.ranges.len() {
+                    ctx.state = State::Done;
+                    let closing = multipart_closing_boundary(&ctx.boundary);
+                    return Some((Ok(closing), ctx));
+                }
+                let (start, end) = ctx.ranges[index];
+                let header = multipart_part_header(
+                    &ctx.boundary,
+                    ctx.content_type.as_ref(),
+                    start,
+                    end,
+                    ctx.total,
+                );
+                ctx.state = State::ReadSlice {
+                    index,
+                    offset: start,
+                    remaining: end - start + 1,
+                };
+                Some((Ok(header), ctx))
+            }
+            State::ReadSlice {
+                index,
+                offset,
+                remaining,
+            } => {
+                if remaining == 0 {
+                    ctx.state = State::StartPart { index: index + 1 };
+                    return Some((Ok(Bytes::from_static(b"\r\n")), ctx));
+                }
+                let to_read = usize::try_from(remaining.min(CHUNK_SIZE)).unwrap_or(usize::MAX);
+                let file = Arc::clone(&ctx.file);
+                let result = blocking::unblock(move || {
+                    let mut buf = vec![0u8; to_read];
+                    read_at_exact(&file, offset, &mut buf).map(|()| Bytes::from(buf))
+                })
+                .await;
+                match result {
+                    Ok(bytes) => {
+                        let read_len = u64::try_from(bytes.len()).unwrap_or(0);
+                        ctx.state = State::ReadSlice {
+                            index,
+                            offset: offset + read_len,
+                            remaining: remaining.saturating_sub(read_len),
+                        };
+                        Some((Ok(bytes), ctx))
+                    }
+                    Err(err) => {
+                        ctx.state = State::Done;
+                        Some((Err(err), ctx))
+                    }
+                }
+            }
+            State::Done => None,
+        }
+    });
+
+    Body::from_stream(stream)
 }
 
 impl<F: FileSystem> Shared<F> {
@@ -315,7 +448,10 @@ impl<F: FileSystem> Shared<F> {
             served.len,
         );
         let mut response = served.head(&disposition, self.cache_control.as_ref());
-        if let Some((offset, length)) = disposition.span(served.len) {
+        if let Disposition::MultiPartial { ranges, boundary } = &disposition {
+            *response.body_mut() =
+                representation.multi_range_body(ranges, boundary, served.content_type.as_ref());
+        } else if let Some((offset, length)) = disposition.span(served.len) {
             *response.body_mut() = representation.body(offset, length);
         }
         Ok(response)
@@ -524,6 +660,33 @@ fn metadata_etag(len: u64, modified: Option<SystemTime>, coding: Option<Coding>)
         )
         .parse()
         .ok()
+}
+
+/// Read `buf.len()` bytes from `file` starting at `offset` without mutating the file cursor.
+fn read_at_exact(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut offset = offset;
+        let mut read = 0;
+        while read < buf.len() {
+            let n = file.seek_read(&mut buf[read..], offset)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF reading static file range",
+                ));
+            }
+            read += n;
+            offset += n as u64;
+        }
+        Ok(())
+    }
 }
 
 impl<F: FileSystem> Endpoint for StaticDirEndpoint<F> {
@@ -1288,6 +1451,80 @@ mod tests {
             for (name, bytes) in &files {
                 assert_eq!(&serve(name).await, bytes, "{name} from the cache");
             }
+        });
+    }
+
+    #[test]
+    fn static_dir_honours_if_range_and_serves_multipart_byteranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let small_payload = b"0123456789abcdef";
+        std::fs::write(dir.path().join("small.txt"), small_payload).unwrap();
+        // Large file (> inline limit 64 KiB) backed by Content::File
+        let large_payload: Vec<u8> = (0..80_000)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        std::fs::write(dir.path().join("large.bin"), &large_payload).unwrap();
+
+        run(async {
+            let router = router(dir.path());
+
+            // Fetch ETag of small.txt
+            let full = router
+                .clone()
+                .go(get_request("/s/small.txt"))
+                .await
+                .unwrap();
+            assert_eq!(full.status(), StatusCode::OK);
+            let etag = header(&full, header::ETAG).unwrap().to_owned();
+
+            // If-Range matching ETag -> 206 single range
+            let mut req = get_request("/s/small.txt");
+            req.headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+            req.headers_mut()
+                .insert(header::IF_RANGE, HeaderValue::from_str(&etag).unwrap());
+            let resp = router.clone().go(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(body(resp).await, b"0123");
+
+            // If-Range mismatching ETag -> 200 full
+            let mut req = get_request("/s/small.txt");
+            req.headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+            req.headers_mut()
+                .insert(header::IF_RANGE, HeaderValue::from_static("\"stale\""));
+            let resp = router.clone().go(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body(resp).await, small_payload);
+
+            // Multi-range on in-memory file
+            let mut req = get_request("/s/small.txt");
+            req.headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-2,10-12"));
+            let resp = router.clone().go(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+            let ct = header(&resp, header::CONTENT_TYPE).unwrap().to_owned();
+            assert!(ct.starts_with("multipart/byteranges; boundary="), "{ct}");
+            let boundary = ct.strip_prefix("multipart/byteranges; boundary=").unwrap();
+            let raw = String::from_utf8(body(resp).await).unwrap();
+            assert!(raw.contains(&format!("--{boundary}\r\n")));
+            assert!(raw.contains("Content-Range: bytes 0-2/16\r\n\r\n012\r\n"));
+            assert!(raw.contains("Content-Range: bytes 10-12/16\r\n\r\nabc\r\n"));
+            assert!(raw.ends_with(&format!("--{boundary}--\r\n")));
+
+            // Multi-range on disk-backed file (Content::File)
+            let mut req = get_request("/s/large.bin");
+            req.headers_mut().insert(
+                header::RANGE,
+                HeaderValue::from_static("bytes=0-3,79996-79999"),
+            );
+            let resp = router.go(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+            let ct = header(&resp, header::CONTENT_TYPE).unwrap().to_owned();
+            assert!(ct.starts_with("multipart/byteranges; boundary="), "{ct}");
+            let raw = body(resp).await;
+            assert!(raw.windows(4).any(|w| w == &large_payload[0..4]));
+            assert!(raw.windows(4).any(|w| w == &large_payload[79996..80000]));
         });
     }
 
