@@ -5,8 +5,8 @@
 //!
 //! # Re-exports
 //!
-//! - [`BearerToken`]: Bearer token extractor (requires `auth` feature)
-//! - [`JwtConfig`], [`JwtAuthenticator`], [`JwtError`]: JWT support (requires `jwt` feature, native only)
+//! - [`BearerToken`], [`BasicAuth`], [`ApiKey`]: Credential extractors (requires `auth` feature)
+//! - [`JwtConfig`], [`JwtAuthenticator`], [`JwtError`]: JWT support (requires `jwt` feature)
 //! - [`Admin`], [`HasRoles`], [`AuthorizationError`]: Role-based guards (requires `auth` feature)
 
 use std::{
@@ -23,13 +23,22 @@ use skyzen_core::{
 
 // Re-export auth types for convenience
 #[cfg(feature = "auth")]
-pub use crate::extract::auth::BearerToken;
+pub use crate::extract::auth::{ApiKey, ApiKeyError, BasicAuth, BasicAuthError, BearerToken};
 
-#[cfg(all(feature = "jwt", not(target_arch = "wasm32")))]
+#[cfg(feature = "jwt")]
 pub use crate::auth::jwt::{JwtAuthenticator, JwtConfig, JwtError};
+
+#[cfg(feature = "jwt")]
+pub use crate::auth::jwks::{JwksAuthenticator, JwksError, JwtKeySet};
+
+#[cfg(feature = "oidc")]
+pub use crate::auth::jwks::RemoteJwks;
 
 #[cfg(feature = "auth")]
 pub use crate::auth::guard::{Admin, AuthorizationError, HasRoles, RoleExtractor};
+
+#[cfg(feature = "auth")]
+pub use crate::auth::session::SessionAuthenticator;
 
 /// The identity [`AuthMiddleware`] established for the current request.
 ///
@@ -79,6 +88,22 @@ impl<U: Send + Sync + Clone + 'static> Extractor for AuthUser<U> {
             "`.with(AuthMiddleware::new(authenticator))`",
         )]
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi_security() -> Vec<crate::openapi::SecuritySchemeInfo> {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+
+        vec![crate::openapi::SecuritySchemeInfo {
+            name: "bearerAuth",
+            scheme: SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+            optional: false,
+        }]
+    }
 }
 
 /// Trait for authenticating users from requests.
@@ -122,6 +147,80 @@ where
 
     fn provisions(&self) -> Vec<TypeId> {
         vec![TypeId::of::<AuthUser<A::User>>()]
+    }
+}
+
+/// Authenticator that reads an API key from a configurable request header (default `X-API-Key`)
+/// and validates it with a user-supplied function.
+#[cfg(feature = "auth")]
+#[derive(Clone)]
+pub struct ApiKeyAuthenticator<F> {
+    header: http::header::HeaderName,
+    verify: F,
+}
+
+#[cfg(feature = "auth")]
+impl<F> std::fmt::Debug for ApiKeyAuthenticator<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyAuthenticator")
+            .field("header", &self.header)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "auth")]
+impl<F> ApiKeyAuthenticator<F> {
+    /// Create a new API key authenticator reading from `X-API-Key`.
+    #[must_use]
+    pub const fn new(verify: F) -> Self {
+        Self {
+            header: crate::extract::auth::DEFAULT_API_KEY_HEADER,
+            verify,
+        }
+    }
+
+    /// Override the request header from which the API key is read.
+    #[must_use]
+    pub fn with_header(mut self, header: http::header::HeaderName) -> Self {
+        self.header = header;
+        self
+    }
+}
+
+/// Error returned by [`ApiKeyAuthenticator`].
+#[cfg(feature = "auth")]
+#[skyzen::error(status = http::StatusCode::UNAUTHORIZED)]
+pub enum ApiKeyAuthError {
+    /// The API key header is missing or malformed.
+    #[error("{0}")]
+    Extract(#[from] crate::extract::auth::ApiKeyError),
+    /// The API key was rejected by the verifier.
+    #[error("Invalid API key")]
+    Rejected,
+}
+
+#[cfg(feature = "auth")]
+impl<F, Fut, U> Authenticator for ApiKeyAuthenticator<F>
+where
+    F: Fn(skyzen_core::Secret) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<U, ApiKeyAuthError>> + Send,
+    U: Send + Sync + Clone + 'static,
+{
+    type User = U;
+    type Error = ApiKeyAuthError;
+
+    fn authenticate(
+        &self,
+        req: &Request,
+    ) -> impl Future<Output = std::result::Result<Self::User, Self::Error>> + Send {
+        let extracted = crate::extract::auth::ApiKey::from_header(req, &self.header);
+        let fut = extracted.map(|key| (self.verify)(key.0));
+        async move {
+            match fut {
+                Ok(fut) => fut.await,
+                Err(err) => Err(ApiKeyAuthError::Extract(err)),
+            }
+        }
     }
 }
 

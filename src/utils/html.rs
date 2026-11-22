@@ -50,6 +50,61 @@ impl<T: Into<Body> + Send + Sync + 'static> Responder for Html<T> {
     }
 }
 
+/// Errors that can occur when rendering a [`Template`].
+#[cfg(feature = "templates")]
+#[skyzen::error(
+    message = "Failed to render template: {0}",
+    status = crate::StatusCode::INTERNAL_SERVER_ERROR
+)]
+pub struct TemplateError(#[from] askama::Error);
+
+/// Renders a compile-time `askama` template as `text/html; charset=utf-8`.
+///
+/// Enable the `templates` feature to use this responder.
+///
+/// ```rust,ignore
+/// use askama::Template as AskamaTemplate;
+/// use skyzen::{responder::Template, Result};
+///
+/// #[derive(AskamaTemplate)]
+/// #[template(source = "<h1>Hello, {{ name }}!</h1>", ext = "html")]
+/// struct Greeting<'a> {
+///     name: &'a str,
+/// }
+///
+/// async fn greet() -> Result<Template<Greeting<'static>>> {
+///     Ok(Template(Greeting { name: "World" }))
+/// }
+/// ```
+#[cfg(feature = "templates")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Template<T>(pub T);
+
+#[cfg(feature = "templates")]
+impl_deref!(Template);
+
+#[cfg(feature = "templates")]
+impl<T: askama::Template + Send + Sync + 'static> Responder for Template<T> {
+    type Error = TemplateError;
+
+    fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
+        let rendered = self.0.render()?;
+        *response.body_mut() = Body::from(rendered);
+        response.headers_mut().insert(CONTENT_TYPE, TEXT_HTML);
+        Ok(())
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi() -> Option<Vec<crate::openapi::ResponseSchema>> {
+        Some(vec![crate::openapi::ResponseSchema {
+            status: None,
+            description: None,
+            schema: Some(skyzen_core::openapi::plain_string_schema()),
+            content_type: Some("text/html; charset=utf-8"),
+        }])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Html;
@@ -69,5 +124,34 @@ mod tests {
         );
         let body = response.into_body().into_string().await.unwrap();
         assert_eq!(body, "<h1>Hi</h1>");
+    }
+
+    #[cfg(feature = "templates")]
+    #[tokio::test]
+    async fn template_renders_html_and_escapes_values() {
+        #[derive(askama::Template)]
+        #[template(source = "<p>Hello, {{ name }}!</p>", ext = "html")]
+        struct Greeting<'a> {
+            name: &'a str,
+        }
+
+        let mut response = Response::new(Body::empty());
+        super::Template(Greeting { name: "<World>" })
+            .respond_to(&Request::new(Body::empty()), &mut response)
+            .expect("template renders");
+
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = response.into_body().into_string().await.unwrap();
+        assert_eq!(body, "<p>Hello, &#60;World&#62;!</p>");
+
+        #[cfg(feature = "openapi")]
+        {
+            let schemas = <super::Template<Greeting<'static>> as Responder>::openapi().unwrap();
+            assert_eq!(schemas.len(), 1);
+            assert_eq!(schemas[0].content_type, Some("text/html; charset=utf-8"));
+        }
     }
 }

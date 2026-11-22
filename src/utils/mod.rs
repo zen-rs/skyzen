@@ -29,6 +29,8 @@ pub use cookie::{
 
 pub mod html;
 pub use html::Html;
+#[cfg(feature = "templates")]
+pub use html::{Template, TemplateError};
 
 pub mod redirect;
 pub use redirect::{InvalidRedirectLocation, Redirect};

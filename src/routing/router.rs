@@ -8,8 +8,9 @@ use std::{
 };
 
 use super::{
-    join_path, AlarmFactory, BoxEndpoint, MatchedPath, MethodFilter, MountPrefix, Mounted,
-    ParamStr, Params, Route, RouteEndpoint, RouteMatch, RouteNode, RouteNodeType,
+    join_path, predicate::Predicates, AlarmFactory, BoxEndpoint, MatchedPath, MethodFilter,
+    MountPrefix, Mounted, ParamStr, Params, Route, RouteEndpoint, RouteMatch, RouteNode,
+    RouteNodeType,
 };
 #[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
@@ -52,12 +53,19 @@ impl App {
     }
 }
 
+/// One registered handler plus its predicates.
+#[derive(Debug, Clone)]
+struct PredicatedApp {
+    predicates: Predicates,
+    app: App,
+}
+
 /// The handlers registered for one path.
 #[derive(Debug, Default, Clone)]
 struct MethodTable {
-    entries: Vec<(Method, App)>,
-    /// Handler registered with `.any`, answering whatever the exact entries do not.
-    any: Option<App>,
+    entries: Vec<(Method, PredicatedApp)>,
+    /// Handlers registered with `.any`, answering whatever the exact entries do not.
+    any: Vec<PredicatedApp>,
     /// The route template this table was registered under, e.g. `"/users/{id}"` —
     /// `matchit` reports params but not the pattern that produced them, so the router
     /// keeps it to expose as [`MatchedPath`].
@@ -220,62 +228,79 @@ enum RouteLookup<'app> {
 }
 
 impl Router {
-    fn lookup(&self, path: &str, method: &Method, extended_connect: bool) -> RouteLookup<'_> {
-        let Ok(Match { value, params }) = self.inner.matcher.at(path) else {
+    fn lookup(
+        &self,
+        request: &Request,
+        method: &Method,
+        extended_connect: bool,
+    ) -> RouteLookup<'_> {
+        let Ok(Match { value, params }) = self.inner.matcher.at(request.uri().path()) else {
             return RouteLookup::Unmatched;
         };
 
-        let found = value
+        let matching_entries = value
             .entries
             .iter()
-            .find(|(app_method, ..)| app_method == method)
-            .map(|(.., app)| (app, FallbackKind::None))
+            .filter(|(_, entry)| entry.predicates.matches(request));
+
+        let found = matching_entries
+            .clone()
+            .find(|(app_method, _)| app_method == method)
+            .map(|(_, entry)| (&entry.app, FallbackKind::None))
             .or_else(|| {
                 // A HEAD request without a dedicated handler falls back to the
                 // GET handler; the response body is discarded after it runs.
                 if *method == Method::HEAD {
-                    value
-                        .entries
-                        .iter()
-                        .find(|(app_method, ..)| *app_method == Method::GET)
-                        .map(|(.., app)| (app, FallbackKind::Head))
+                    matching_entries
+                        .clone()
+                        .find(|(app_method, _)| *app_method == Method::GET)
+                        .map(|(_, entry)| (&entry.app, FallbackKind::Head))
                 } else if *method == Method::CONNECT && extended_connect {
                     // RFC 8441 Extended CONNECT (`:protocol = websocket`) targets routes
                     // registered via `.ws(...)` or `.at(|ws: WebSocketUpgrade| ...)`.
-                    value
-                        .entries
-                        .iter()
-                        .find(|(app_method, ..)| *app_method == Method::GET)
-                        .map(|(.., app)| (app, FallbackKind::ExtendedConnect))
+                    matching_entries
+                        .clone()
+                        .find(|(app_method, _)| *app_method == Method::GET)
+                        .map(|(_, entry)| (&entry.app, FallbackKind::ExtendedConnect))
                 } else {
                     None
                 }
             })
-            .or_else(|| value.any.as_ref().map(|app| (app, FallbackKind::None)));
+            .or_else(|| {
+                value
+                    .any
+                    .iter()
+                    .find(|entry| entry.predicates.matches(request))
+                    .map(|entry| (&entry.app, FallbackKind::None))
+            });
 
-        found.map_or_else(
-            || RouteLookup::MethodNotAllowed {
-                allow: allowed_methods(&value.entries),
+        if let Some((app, fallback)) = found {
+            let mut captured = Params::empty();
+            for (key, value) in params.iter() {
+                captured.push(ParamStr::from_str_slice(key), percent_decode(value));
+            }
+            RouteLookup::Endpoint {
+                app,
+                fallback,
+                allow_on_unupgraded_connect: if fallback == FallbackKind::ExtendedConnect {
+                    allowed_methods_matching(&value.entries, request)
+                } else {
+                    Vec::new()
+                },
+                params: captured,
                 path: &value.path,
-            },
-            |(app, fallback)| {
-                let mut captured = Params::empty();
-                for (key, value) in params.iter() {
-                    captured.push(ParamStr::from_str_slice(key), percent_decode(value));
-                }
-                RouteLookup::Endpoint {
-                    app,
-                    fallback,
-                    allow_on_unupgraded_connect: if fallback == FallbackKind::ExtendedConnect {
-                        allowed_methods(&value.entries)
-                    } else {
-                        Vec::new()
-                    },
-                    params: captured,
+            }
+        } else {
+            let allow = allowed_methods_matching(&value.entries, request);
+            if allow.is_empty() {
+                RouteLookup::Unmatched
+            } else {
+                RouteLookup::MethodNotAllowed {
+                    allow,
                     path: &value.path,
                 }
-            },
-        )
+            }
+        }
     }
 
     /// Match the request and run the endpoint it selects, or the fallback that stands in for it.
@@ -291,8 +316,7 @@ impl Router {
                 .is_some();
         #[cfg(target_arch = "wasm32")]
         let extended_connect = false;
-        let lookup = self.lookup(request.uri().path(), request.method(), extended_connect);
-        match lookup {
+        match self.lookup(request, request.method(), extended_connect) {
             RouteLookup::Endpoint {
                 app,
                 fallback,
@@ -450,9 +474,15 @@ impl Router {
     }
 }
 
-/// Collect the methods registered for a path, advertising HEAD alongside GET.
-fn allowed_methods(entries: &[(Method, App)]) -> Vec<Method> {
-    let mut methods: Vec<Method> = entries.iter().map(|(method, ..)| method.clone()).collect();
+/// Collect the methods registered for a path whose predicates match `request`, advertising HEAD
+/// alongside GET.
+fn allowed_methods_matching(entries: &[(Method, PredicatedApp)], request: &Request) -> Vec<Method> {
+    let mut methods = Vec::new();
+    for (method, entry) in entries {
+        if entry.predicates.matches(request) && !methods.contains(method) {
+            methods.push(method.clone());
+        }
+    }
     if methods.contains(&Method::GET) && !methods.contains(&Method::HEAD) {
         methods.push(Method::HEAD);
     }
@@ -606,6 +636,7 @@ struct FlatEndpoint {
     endpoint: RouteEndpoint,
     middleware: Vec<BoxMiddleware>,
     requirements: Vec<Requirement>,
+    predicates: Predicates,
 }
 
 type FlattenBuf = HashMap<String, Vec<FlatEndpoint>>;
@@ -635,6 +666,7 @@ fn flatten(
                 openapi,
                 requirements,
                 middleware,
+                predicates,
             } => {
                 if !path.starts_with('/') {
                     return Err(RouteBuildError::InvalidPath { path });
@@ -656,9 +688,14 @@ fn flatten(
                     endpoint,
                     middleware,
                     requirements,
+                    predicates,
                 });
             }
-            RouteNodeType::Nested { router, middleware } => {
+            RouteNodeType::Nested {
+                router,
+                middleware,
+                predicates,
+            } => {
                 if !path.starts_with('/') {
                     return Err(RouteBuildError::InvalidPath { path });
                 }
@@ -674,11 +711,12 @@ fn flatten(
                 let nested = RouteEndpoint::new(Mounted::new(Arc::from(path.as_str()), router));
                 // The mount point itself and everything beneath it, for every method: the inner
                 // router decides which of them it answers, including its own 404 and 405.
-                mount(&path, buf, &middleware, &nested);
+                mount(&path, buf, &middleware, &predicates, &nested);
             }
             RouteNodeType::Mounted {
                 endpoint,
                 middleware,
+                predicates,
             } => {
                 if !path.starts_with('/') {
                     return Err(RouteBuildError::InvalidPath { path });
@@ -687,7 +725,7 @@ fn flatten(
                     return Err(RouteBuildError::MountPatternPrefix { path });
                 }
                 let mounted = RouteEndpoint::new(Mounted::new(Arc::from(path.as_str()), endpoint));
-                mount(&path, buf, &middleware, &mounted);
+                mount(&path, buf, &middleware, &predicates, &mounted);
             }
         }
     }
@@ -696,13 +734,20 @@ fn flatten(
 }
 
 /// Register `endpoint` at `path` and at every path beneath it, for every method.
-fn mount(path: &str, buf: &mut FlattenBuf, middleware: &[BoxMiddleware], endpoint: &RouteEndpoint) {
+fn mount(
+    path: &str,
+    buf: &mut FlattenBuf,
+    middleware: &[BoxMiddleware],
+    predicates: &Predicates,
+    endpoint: &RouteEndpoint,
+) {
     for mounted in [path.to_owned(), join_path(path, "/{*skyzen_nested}")] {
         buf.entry(mounted).or_default().push(FlatEndpoint {
             method: MethodFilter::Any,
             endpoint: endpoint.clone(),
             middleware: middleware.to_vec(),
             requirements: Vec::new(),
+            predicates: predicates.clone(),
         });
     }
 }
@@ -785,6 +830,7 @@ fn build_method_table(
         ..MethodTable::default()
     };
     let mut seen = HashSet::new();
+    let mut seen_any = HashSet::new();
 
     for endpoint in endpoints {
         let mut provisions = global_provisions.clone();
@@ -801,31 +847,50 @@ fn build_method_table(
             &provisions,
         )?;
 
-        let app = App {
-            endpoint: endpoint.endpoint,
-            middleware: endpoint.middleware,
+        let predicated = PredicatedApp {
+            predicates: endpoint.predicates,
+            app: App {
+                endpoint: endpoint.endpoint,
+                middleware: endpoint.middleware,
+            },
         };
 
         routes.push((endpoint.method.clone(), path.to_owned()));
         match endpoint.method {
             MethodFilter::Exact(method) => {
-                if !seen.insert(method.clone()) {
+                if !seen.insert((method.clone(), predicated.predicates.clone())) {
                     return Err(RouteBuildError::RepeatedMethod {
                         path: path.to_owned(),
                         method,
                     });
                 }
-                table.entries.push((method, app));
+                table.entries.push((method, predicated));
             }
             MethodFilter::Any => {
-                if table.any.replace(app).is_some() {
+                if !seen_any.insert(predicated.predicates.clone()) {
                     return Err(RouteBuildError::RepeatedAny {
                         path: path.to_owned(),
                     });
                 }
+                table.any.push(predicated);
             }
         }
     }
+
+    // Order most specific predicates first so constrained routes match ahead of unconstrained
+    // fallbacks, preserving registration order on ties.
+    table.entries.sort_by(|(_, left), (_, right)| {
+        right
+            .predicates
+            .specificity()
+            .cmp(&left.predicates.specificity())
+    });
+    table.any.sort_by(|left, right| {
+        right
+            .predicates
+            .specificity()
+            .cmp(&left.predicates.specificity())
+    });
 
     Ok(table)
 }
@@ -1910,6 +1975,176 @@ mod tests {
         let response = router.go(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(response.headers()["allow"], "GET, HEAD");
+    }
+
+    #[tokio::test]
+    async fn host_and_wildcard_predicates_dispatch_and_fall_back_to_404() {
+        let router = build(Route::new((
+            "/info".at(|| async { "api" }).host("api.example.com"),
+            "/info".at(|| async { "sub" }).host("*.example.com"),
+            "/info".at(|| async { "default" }),
+            "/admin".at(|| async { "admin" }).host("admin.example.com"),
+        )))
+        .unwrap();
+
+        let mut req = get_request("/info");
+        req.headers_mut().insert(
+            header::HOST,
+            header::HeaderValue::from_static("API.Example.COM:8080"),
+        );
+        let resp = router.clone().go(req).await.unwrap();
+        assert_eq!(resp.into_body().into_string().await.unwrap(), "api");
+
+        let mut req = get_request("/info");
+        req.headers_mut().insert(
+            header::HOST,
+            header::HeaderValue::from_static("docs.example.com"),
+        );
+        let resp = router.clone().go(req).await.unwrap();
+        assert_eq!(resp.into_body().into_string().await.unwrap(), "sub");
+
+        let mut req = get_request("/info");
+        req.headers_mut()
+            .insert(header::HOST, header::HeaderValue::from_static("other.org"));
+        let resp = router.clone().go(req).await.unwrap();
+        assert_eq!(resp.into_body().into_string().await.unwrap(), "default");
+
+        let mut req = get_request("/admin");
+        req.headers_mut()
+            .insert(header::HOST, header::HeaderValue::from_static("other.org"));
+        let resp = router.clone().go(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn header_predicates_and_scoped_405_and_head_and_nest() {
+        let inner = build(Route::new(("/users/{id}".at(
+            |path: crate::routing::MatchedPath| async move { path.as_str().to_owned() },
+        ),)))
+        .unwrap();
+
+        let router = build(Route::new((
+            "/items"
+                .at(|| async { "v2" })
+                .header("x-api-version", "2")
+                .post(|| async { "created-v2" })
+                .header("x-api-version", "2"),
+            "/items".at(|| async { "v1" }).header_exists("x-legacy"),
+            "/items".at(|| async { "fallback" }),
+            "/api".nest(inner).host("api.example.com"),
+        )))
+        .unwrap();
+
+        // Exact header beats unconstrained fallback
+        let mut req = get_request("/items");
+        req.headers_mut().insert(
+            header::HeaderName::from_static("x-api-version"),
+            header::HeaderValue::from_static("2"),
+        );
+        assert_eq!(
+            router
+                .clone()
+                .go(req)
+                .await
+                .unwrap()
+                .into_body()
+                .into_string()
+                .await
+                .unwrap(),
+            "v2"
+        );
+
+        // HEAD -> GET fallback respects predicates
+        let mut head_req = request_with_method("/items", Method::HEAD);
+        head_req.headers_mut().insert(
+            header::HeaderName::from_static("x-legacy"),
+            header::HeaderValue::from_static("1"),
+        );
+        let head_resp = router.clone().go(head_req).await.unwrap();
+        assert_eq!(head_resp.status(), StatusCode::OK);
+        assert!(head_resp
+            .into_body()
+            .into_string()
+            .await
+            .unwrap()
+            .is_empty());
+
+        // 405 AllowedMethods is scoped to matching predicates
+        let mut del_v1 = request_with_method("/items", Method::DELETE);
+        del_v1.headers_mut().insert(
+            header::HeaderName::from_static("x-legacy"),
+            header::HeaderValue::from_static("1"),
+        );
+        let resp_405 = router.clone().go(del_v1).await.unwrap();
+        assert_eq!(resp_405.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp_405.headers()["allow"], "GET, HEAD");
+
+        let mut del_v2 = request_with_method("/items", Method::DELETE);
+        del_v2.headers_mut().insert(
+            header::HeaderName::from_static("x-api-version"),
+            header::HeaderValue::from_static("2"),
+        );
+        let resp_405_v2 = router.clone().go(del_v2).await.unwrap();
+        assert_eq!(resp_405_v2.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp_405_v2.headers()["allow"], "GET, POST, HEAD");
+
+        // Nested router with host predicate preserves MatchedPath
+        let mut nest_ok = get_request("/api/users/42");
+        nest_ok.headers_mut().insert(
+            header::HOST,
+            header::HeaderValue::from_static("api.example.com"),
+        );
+        let resp_nest = router.clone().go(nest_ok).await.unwrap();
+        assert_eq!(
+            resp_nest.into_body().into_string().await.unwrap(),
+            "/api/users/{id}"
+        );
+
+        let mut nest_miss = get_request("/api/users/42");
+        nest_miss.headers_mut().insert(
+            header::HOST,
+            header::HeaderValue::from_static("wrong.example.com"),
+        );
+        let resp_nest = router.go(nest_miss).await.unwrap();
+        assert_eq!(resp_nest.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn route_subtree_predicates_apply_to_all_children() {
+        let sub = Route::new(("/a".at(|| async { "a" }), "/b".at(|| async { "b" })))
+            .host("sub.example.com")
+            .header("x-tenant", "acme");
+        let router = build(Route::new((sub,))).unwrap();
+
+        let mut ok = get_request("/a");
+        ok.headers_mut().insert(
+            header::HOST,
+            header::HeaderValue::from_static("sub.example.com"),
+        );
+        ok.headers_mut().insert(
+            header::HeaderName::from_static("x-tenant"),
+            header::HeaderValue::from_static("acme"),
+        );
+        assert_eq!(
+            router
+                .clone()
+                .go(ok)
+                .await
+                .unwrap()
+                .into_body()
+                .into_string()
+                .await
+                .unwrap(),
+            "a"
+        );
+
+        let mut missing_header = get_request("/b");
+        missing_header.headers_mut().insert(
+            header::HOST,
+            header::HeaderValue::from_static("sub.example.com"),
+        );
+        let resp = router.go(missing_header).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -689,6 +689,8 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
     let mut param_response_extends = Vec::new();
     let mut schema_collector_idents = Vec::new();
     let mut schema_collector_defs = Vec::new();
+    let mut security_collector_idents = Vec::new();
+    let mut security_collector_defs = Vec::new();
 
     for (included_idx, meta) in parameter_schemas.iter().enumerate() {
         let ty = &meta.ty;
@@ -696,6 +698,19 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
             responses.extend(
                 ::skyzen::openapi::extractor_responses_of::<#ty>().unwrap_or_default(),
             );
+        });
+        let security_ident = format_ident!(
+            "__SKYZEN_OPENAPI_SECURITY_{}_{}",
+            fn_ident.to_string().to_uppercase(),
+            included_idx
+        );
+        security_collector_idents.push(security_ident.clone());
+        security_collector_defs.push(quote! {
+            fn #security_ident(
+                security: &mut ::std::vec::Vec<::skyzen::openapi::SecuritySchemeInfo>
+            ) {
+                ::skyzen::openapi::register_extractor_security_for::<#ty>(security);
+            }
         });
         let schema_ident = format_ident!(
             "__SKYZEN_OPENAPI_PARAM_SCHEMA_{}_{}",
@@ -873,6 +888,12 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         quote! { &[#(#parameter_name_lists),*] }
     };
 
+    let security_collectors = if security_collector_idents.is_empty() {
+        quote! { &[] }
+    } else {
+        quote! { &[#(#security_collector_idents),*] }
+    };
+
     let type_name_literal = quote! { concat!(module_path!(), "::", stringify!(#fn_ident)) };
     let operation_name_literal = quote! { #type_name_literal };
     let spec_ident = format_ident!(
@@ -900,6 +921,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
         };
 
         #(#schema_collector_defs)*
+        #(#security_collector_defs)*
 
         ::skyzen::__register_handler_spec!(
             #spec_ident,
@@ -912,6 +934,7 @@ fn expand_openapi_fn(mut function: ItemFn) -> syn::Result<TokenStream> {
                 parameter_names: #parameter_names_array,
                 response: #response_schema_fn,
                 schemas: #schema_collectors,
+                security: #security_collectors,
             }
         );
     }

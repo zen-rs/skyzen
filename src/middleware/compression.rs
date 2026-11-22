@@ -1,30 +1,39 @@
 //! Response compression middleware.
 //!
 //! This middleware inspects the `Accept-Encoding` header and compresses responses using
-//! `gzip` or `deflate` when the client signals support for those algorithms. Compression is
-//! automatically skipped for responses that are already encoded, are too small, or when the
-//! negotiated encoding would not improve the payload size.
+//! `zstd`, `br`, `gzip`, or `deflate` when the client signals support for those algorithms.
+//! Compression is automatically skipped for responses that are already encoded, are too small,
+//! use an incompressible content type (including `text/event-stream`), or — for known-length
+//! responses — when the negotiated encoding would not improve the payload size. Streaming
+//! responses of unknown length are compressed frame-by-frame and flushed after each chunk.
 
-use std::{cmp::Ordering, io::Write, mem};
+use std::{
+    cmp::Ordering,
+    io::{self, Write},
+    mem,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use flate2::{
     write::{GzEncoder, ZlibEncoder},
     Compression as FlateCompression,
 };
+use futures_core::Stream;
 use http::{
     header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING, VARY},
     HeaderMap, HeaderValue, Method, StatusCode,
 };
-use http_kit::{http_error, Body, Request, Response};
+use http_kit::{http_error, utils::Bytes, Body, DataStream, Request, Response};
 use skyzen_core::{
     middleware::{Middleware, Next},
     Error,
 };
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 
 use crate::utils::accept_encoding::{AcceptEncoding, Preference};
 
-type EncodingList = SmallVec<[CompressionEncoding; 3]>;
+type EncodingList = SmallVec<[CompressionEncoding; 4]>;
 
 http_error!(
     /// Compression middleware encountered an unexpected error.
@@ -108,11 +117,6 @@ impl CompressionMiddleware {
             return false;
         }
 
-        // Streaming bodies of unknown length (e.g. SSE) must not be buffered.
-        if response.body().len().is_none() {
-            return false;
-        }
-
         if !is_compressible_content_type(response.headers()) {
             return false;
         }
@@ -125,6 +129,10 @@ impl CompressionMiddleware {
         response: &mut Response,
         encoding: CompressionEncoding,
     ) -> Result<(), CompressionError> {
+        if response.body().len().is_none() {
+            return self.compress_streaming_response(response, encoding);
+        }
+
         let body = mem::take(response.body_mut());
         let original = body
             .into_bytes()
@@ -153,6 +161,24 @@ impl CompressionMiddleware {
             .headers_mut()
             .insert(CONTENT_ENCODING, encoding.header_value());
         ensure_vary_accept_encoding(response.headers_mut());
+        Ok(())
+    }
+
+    fn compress_streaming_response(
+        &self,
+        response: &mut Response,
+        encoding: CompressionEncoding,
+    ) -> Result<(), CompressionError> {
+        let body = mem::take(response.body_mut());
+        let stream = CompressStream::new(body, encoding, self.config.level)
+            .map_err(|_| CompressionError::new())?;
+        response.headers_mut().remove(CONTENT_LENGTH);
+        response.headers_mut().remove(TRANSFER_ENCODING);
+        response
+            .headers_mut()
+            .insert(CONTENT_ENCODING, encoding.header_value());
+        ensure_vary_accept_encoding(response.headers_mut());
+        *response.body_mut() = Body::from_stream(stream);
         Ok(())
     }
 }
@@ -189,7 +215,14 @@ impl Default for CompressionConfig {
 }
 
 fn default_encodings() -> EncodingList {
-    smallvec![CompressionEncoding::Gzip, CompressionEncoding::Deflate]
+    let mut encodings = EncodingList::new();
+    #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+    encodings.push(CompressionEncoding::Zstd);
+    #[cfg(feature = "compress-br")]
+    encodings.push(CompressionEncoding::Brotli);
+    encodings.push(CompressionEncoding::Gzip);
+    encodings.push(CompressionEncoding::Deflate);
+    encodings
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -311,6 +344,12 @@ pub enum CompressionEncoding {
     Gzip,
     /// Deflate (zlib) encoding.
     Deflate,
+    /// Brotli (`br`) encoding, behind `compress-br`.
+    #[cfg(feature = "compress-br")]
+    Brotli,
+    /// Zstandard (`zstd`) encoding, behind `compress-zstd` (native targets only).
+    #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+    Zstd,
 }
 
 impl CompressionEncoding {
@@ -319,6 +358,10 @@ impl CompressionEncoding {
         match self {
             Self::Gzip => &["gzip", "x-gzip"],
             Self::Deflate => &["deflate"],
+            #[cfg(feature = "compress-br")]
+            Self::Brotli => &["br"],
+            #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+            Self::Zstd => &["zstd"],
         }
     }
 
@@ -326,19 +369,37 @@ impl CompressionEncoding {
         match self {
             Self::Gzip => HeaderValue::from_static("gzip"),
             Self::Deflate => HeaderValue::from_static("deflate"),
+            #[cfg(feature = "compress-br")]
+            Self::Brotli => HeaderValue::from_static("br"),
+            #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+            Self::Zstd => HeaderValue::from_static("zstd"),
         }
     }
 
-    fn compress(self, body: &[u8], level: CompressionLevel) -> std::io::Result<Vec<u8>> {
-        let compression = level.into_impl();
+    fn compress(self, body: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {
         match self {
             Self::Gzip => {
-                let mut encoder = GzEncoder::new(Vec::new(), compression);
+                let mut encoder = GzEncoder::new(Vec::new(), level.into_impl());
                 encoder.write_all(body)?;
                 encoder.finish()
             }
             Self::Deflate => {
-                let mut encoder = ZlibEncoder::new(Vec::new(), compression);
+                let mut encoder = ZlibEncoder::new(Vec::new(), level.into_impl());
+                encoder.write_all(body)?;
+                encoder.finish()
+            }
+            #[cfg(feature = "compress-br")]
+            Self::Brotli => {
+                let mut encoder =
+                    brotli::CompressorWriter::new(Vec::new(), 4096, level.brotli_quality(), 22);
+                encoder.write_all(body)?;
+                encoder.flush()?;
+                Ok(encoder.into_inner())
+            }
+            #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+            Self::Zstd => {
+                let mut encoder =
+                    zstd::stream::write::Encoder::new(Vec::new(), level.zstd_level())?;
                 encoder.write_all(body)?;
                 encoder.finish()
             }
@@ -353,9 +414,9 @@ pub enum CompressionLevel {
     Fast,
     /// Best compression ratio with a possible CPU trade-off.
     Best,
-    /// Custom compression level (0-9).
+    /// Custom compression level (0-9 for zlib/gzip, 0-11 for brotli, 0-22 for zstd).
     Precise(u32),
-    /// Uses the zlib default.
+    /// Uses the encoder's default level.
     #[default]
     Default,
 }
@@ -367,6 +428,171 @@ impl CompressionLevel {
             Self::Best => FlateCompression::best(),
             Self::Default => FlateCompression::default(),
             Self::Precise(level) => FlateCompression::new(level.min(9)),
+        }
+    }
+
+    #[cfg(feature = "compress-br")]
+    fn brotli_quality(self) -> u32 {
+        match self {
+            Self::Fast => 1,
+            Self::Default => 5,
+            Self::Best => 9,
+            Self::Precise(level) => level.min(11),
+        }
+    }
+
+    #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+    fn zstd_level(self) -> i32 {
+        match self {
+            Self::Fast => 1,
+            Self::Default => 3,
+            Self::Best => 9,
+            Self::Precise(level) => i32::try_from(level.min(22)).unwrap_or(22),
+        }
+    }
+}
+
+enum StreamEncoder {
+    Gzip(GzEncoder<Vec<u8>>),
+    Deflate(ZlibEncoder<Vec<u8>>),
+    #[cfg(feature = "compress-br")]
+    Brotli(Box<brotli::CompressorWriter<Vec<u8>>>),
+    #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+    Zstd(zstd::stream::write::Encoder<'static, Vec<u8>>),
+}
+
+impl StreamEncoder {
+    #[allow(clippy::unnecessary_wraps)]
+    fn new(encoding: CompressionEncoding, level: CompressionLevel) -> io::Result<Self> {
+        Ok(match encoding {
+            CompressionEncoding::Gzip => Self::Gzip(GzEncoder::new(Vec::new(), level.into_impl())),
+            CompressionEncoding::Deflate => {
+                Self::Deflate(ZlibEncoder::new(Vec::new(), level.into_impl()))
+            }
+            #[cfg(feature = "compress-br")]
+            CompressionEncoding::Brotli => Self::Brotli(Box::new(brotli::CompressorWriter::new(
+                Vec::new(),
+                4096,
+                level.brotli_quality(),
+                22,
+            ))),
+            #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+            CompressionEncoding::Zstd => Self::Zstd(zstd::stream::write::Encoder::new(
+                Vec::new(),
+                level.zstd_level(),
+            )?),
+        })
+    }
+
+    fn write_and_flush(&mut self, chunk: &[u8]) -> io::Result<Bytes> {
+        let buf = match self {
+            Self::Gzip(encoder) => {
+                encoder.write_all(chunk)?;
+                encoder.flush()?;
+                encoder.get_mut()
+            }
+            Self::Deflate(encoder) => {
+                encoder.write_all(chunk)?;
+                encoder.flush()?;
+                encoder.get_mut()
+            }
+            #[cfg(feature = "compress-br")]
+            Self::Brotli(encoder) => {
+                encoder.write_all(chunk)?;
+                encoder.flush()?;
+                encoder.get_mut()
+            }
+            #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+            Self::Zstd(encoder) => {
+                encoder.write_all(chunk)?;
+                encoder.flush()?;
+                encoder.get_mut()
+            }
+        };
+        Ok(Bytes::from(mem::take(buf)))
+    }
+
+    fn finish(self) -> io::Result<Bytes> {
+        let buf = match self {
+            Self::Gzip(encoder) => encoder.finish()?,
+            Self::Deflate(encoder) => encoder.finish()?,
+            #[cfg(feature = "compress-br")]
+            Self::Brotli(mut encoder) => {
+                encoder.flush()?;
+                encoder.into_inner()
+            }
+            #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+            Self::Zstd(encoder) => encoder.finish()?,
+        };
+        Ok(Bytes::from(buf))
+    }
+}
+
+struct CompressStream {
+    stream: DataStream,
+    encoder: Option<StreamEncoder>,
+    finished: bool,
+}
+
+impl CompressStream {
+    fn new(body: Body, encoding: CompressionEncoding, level: CompressionLevel) -> io::Result<Self> {
+        Ok(Self {
+            stream: body.into_data_stream(),
+            encoder: Some(StreamEncoder::new(encoding, level)?),
+            finished: false,
+        })
+    }
+}
+
+impl Stream for CompressStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.finished {
+                return Poll::Ready(None);
+            }
+
+            match Pin::new(&mut self.stream).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let Some(encoder) = self.encoder.as_mut() else {
+                        self.finished = true;
+                        return Poll::Ready(None);
+                    };
+                    match encoder.write_and_flush(&chunk) {
+                        Ok(out) => {
+                            if !out.is_empty() {
+                                return Poll::Ready(Some(Ok(out)));
+                            }
+                        }
+                        Err(err) => {
+                            self.finished = true;
+                            self.encoder = None;
+                            return Poll::Ready(Some(Err(err)));
+                        }
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    self.finished = true;
+                    self.encoder = None;
+                    return Poll::Ready(Some(Err(io::Error::other(err))));
+                }
+                Poll::Ready(None) => {
+                    self.finished = true;
+                    let Some(encoder) = self.encoder.take() else {
+                        return Poll::Ready(None);
+                    };
+                    return match encoder.finish() {
+                        Ok(out) if out.is_empty() => Poll::Ready(None),
+                        Ok(out) => Poll::Ready(Some(Ok(out))),
+                        Err(err) => Poll::Ready(Some(Err(err))),
+                    };
+                }
+            }
         }
     }
 }
@@ -554,12 +780,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn skips_streaming_bodies_of_unknown_length() {
+    async fn compresses_streaming_bodies_of_unknown_length() {
         let middleware = CompressionMiddleware::new().minimum_size(0);
         let mut request = request_with_encoding(Some("gzip"));
         let endpoint = FnEndpoint(|| {
-            let stream = futures_util::stream::iter(vec![Ok::<_, Infallible>("streamed chunk")]);
+            let stream = futures_util::stream::iter(vec![
+                Ok::<_, Infallible>("first streamed chunk "),
+                Ok::<_, Infallible>("second streamed chunk"),
+            ]);
             Response::new(Body::from_stream(stream))
+        });
+
+        let response = apply(&middleware, &mut request, endpoint.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+        assert!(response.headers().get(CONTENT_LENGTH).is_none());
+        let decoded = decode_gzip(response.into_body()).await;
+        assert_eq!(decoded, "first streamed chunk second streamed chunk");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skips_sse_streaming_bodies() {
+        let middleware = CompressionMiddleware::new().minimum_size(0);
+        let mut request = request_with_encoding(Some("gzip"));
+        let endpoint = FnEndpoint(|| {
+            let stream = futures_util::stream::iter(vec![Ok::<_, Infallible>("data: hello\n\n")]);
+            let mut response = Response::new(Body::from_stream(stream));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            response
         });
 
         let response = apply(&middleware, &mut request, endpoint.clone())
@@ -568,7 +826,7 @@ mod tests {
 
         assert!(response.headers().get(CONTENT_ENCODING).is_none());
         let body = response.into_body().into_string().await.unwrap();
-        assert_eq!(body, "streamed chunk");
+        assert_eq!(body, "data: hello\n\n");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -625,7 +883,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn wildcard_does_not_override_explicit_zero_quality() {
-        let middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new()
+            .encodings([CompressionEncoding::Gzip, CompressionEncoding::Deflate])
+            .minimum_size(0);
         // `gzip;q=0, *` forbids gzip; the wildcard covers deflate only.
         let mut request = request_with_encoding(Some("gzip;q=0, *"));
         let endpoint = StaticEndpoint::new(&"payload".repeat(80));
@@ -647,7 +907,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn specific_quality_beats_wildcard_quality() {
-        let middleware = CompressionMiddleware::new().minimum_size(0);
+        let middleware = CompressionMiddleware::new()
+            .encodings([CompressionEncoding::Gzip, CompressionEncoding::Deflate])
+            .minimum_size(0);
         // `*` at q=1 applies to deflate; gzip keeps its explicit q=0.5.
         let mut request = request_with_encoding(Some("*, gzip;q=0.5"));
         let endpoint = StaticEndpoint::new(&"payload".repeat(80));
@@ -686,5 +948,101 @@ mod tests {
             .unwrap();
         let vary = response.headers().get(VARY).unwrap().to_str().unwrap();
         assert_eq!(vary, "Accept-Language, Accept-Encoding");
+    }
+
+    #[cfg(feature = "compress-br")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compresses_with_brotli_buffered_and_streaming() {
+        let middleware = CompressionMiddleware::new().minimum_size(0);
+        let mut request = request_with_encoding(Some("br"));
+        let endpoint = StaticEndpoint::new(&"Brotli payload! ".repeat(40));
+
+        let response = apply(&middleware, &mut request, endpoint.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("br")
+        );
+        let compressed = response.into_body().into_bytes().await.unwrap();
+        let mut decoded = String::new();
+        brotli::Decompressor::new(compressed.as_ref(), 4096)
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, endpoint.payload());
+
+        // Streaming
+        let mut stream_req = request_with_encoding(Some("br"));
+        let stream_endpoint = FnEndpoint(|| {
+            let stream = futures_util::stream::iter(vec![
+                Ok::<_, Infallible>("brotli chunk 1 "),
+                Ok::<_, Infallible>("brotli chunk 2"),
+            ]);
+            Response::new(Body::from_stream(stream))
+        });
+        let stream_resp = apply(&middleware, &mut stream_req, stream_endpoint)
+            .await
+            .unwrap();
+        assert_eq!(
+            stream_resp
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("br")
+        );
+        let compressed = stream_resp.into_body().into_bytes().await.unwrap();
+        let mut decoded = String::new();
+        brotli::Decompressor::new(compressed.as_ref(), 4096)
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, "brotli chunk 1 brotli chunk 2");
+    }
+
+    #[cfg(all(feature = "compress-zstd", not(target_arch = "wasm32")))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compresses_with_zstd_buffered_and_streaming() {
+        let middleware = CompressionMiddleware::new().minimum_size(0);
+        let mut request = request_with_encoding(Some("zstd"));
+        let endpoint = StaticEndpoint::new(&"Zstd payload! ".repeat(40));
+
+        let response = apply(&middleware, &mut request, endpoint.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("zstd")
+        );
+        let compressed = response.into_body().into_bytes().await.unwrap();
+        let decoded = zstd::stream::decode_all(compressed.as_ref()).unwrap();
+        assert_eq!(decoded, endpoint.payload().as_bytes());
+
+        // Streaming
+        let mut stream_req = request_with_encoding(Some("zstd"));
+        let stream_endpoint = FnEndpoint(|| {
+            let stream = futures_util::stream::iter(vec![
+                Ok::<_, Infallible>("zstd chunk 1 "),
+                Ok::<_, Infallible>("zstd chunk 2"),
+            ]);
+            Response::new(Body::from_stream(stream))
+        });
+        let stream_resp = apply(&middleware, &mut stream_req, stream_endpoint)
+            .await
+            .unwrap();
+        assert_eq!(
+            stream_resp
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("zstd")
+        );
+        let compressed = stream_resp.into_body().into_bytes().await.unwrap();
+        let decoded = zstd::stream::decode_all(compressed.as_ref()).unwrap();
+        assert_eq!(decoded, b"zstd chunk 1 zstd chunk 2");
     }
 }
