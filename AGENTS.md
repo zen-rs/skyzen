@@ -303,4 +303,5 @@ remain Cloudflare-only, because nothing else has those events.
 - **Strict Clippy Lints**: The workspace enforces `pedantic` and `nursery` lint groups. All crates warn on `missing_docs` and `missing_debug_implementations`.
 - **Dependencies**: Core HTTP primitives (`Request`, `Response`, `Body`, `Endpoint`) come from `http-kit`. The `Middleware` trait is Skyzen's own, in `skyzen-core`.
 - **Formatting**: Run `cargo fmt` before finishing changes.
+- **Agent Skill**: Whenever Skyzen changes, update `skills/skyzen/SKILL.md` in the same change so it never drifts from the implementation.
 
