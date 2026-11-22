@@ -270,6 +270,14 @@ remain Cloudflare-only, because nothing else has those events.
   thread running the proxy's pool, and it holds because both servers run the session on the
   connection's thread, the one that built the router. `CONNECT` is refused with
   `ProxyError::Connect` (501).
+- `Upstream::pool` configures multiple origins on one `Upstream` with `LoadBalance` (`RoundRobin`
+  or `LeastConnections`), `PassiveHealth` outlier ejection, `HealthCheck` active HTTP probing,
+  upstream `Timeouts` (`504 Gateway Timeout` on expiry), and `RetryPolicy`. Per-thread selection and
+  health state live in `Rc<PoolState>` shared across `Proxy` clones on that thread (with lock-free
+  atomic `in_flight` counters so response-body guards remain `Send + Sync`), and active probe tasks
+  hold only `Weak<PoolState>` plus a drop-signaled stop channel so dropping `Proxy` stops probing.
+  Only idempotent requests with no upgrade offer and an empty body (`len() == Some(0)`) are
+  retried; streaming or non-empty request bodies and `POST`/`PATCH` are sent at most once.
 
 ### 5f. Busy Polling (native, Linux)
 - An operator setting in `src/runtime/native/io_settings.rs`, off unless `--busy-poll <µs>` /
