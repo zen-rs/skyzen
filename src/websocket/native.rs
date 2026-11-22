@@ -25,8 +25,8 @@ use crate::{
     websocket::{
         session::{internal_error_frame, IntoWebSocketOutcome},
         types::{
-            offered_protocols, select_protocol, WebSocketCloseFrame, WebSocketError,
-            WebSocketResult,
+            default_websocket_config, offered_protocols, select_protocol, WebSocketCloseFrame,
+            WebSocketError, WebSocketResult,
         },
     },
     Method, Request, Response, StatusCode,
@@ -666,10 +666,44 @@ impl WebSocketUpgrade {
 
     /// Set the maximum incoming message size accepted by the websocket.
     ///
-    /// Pass `None` to disable the limit enforced by the backend implementation.
+    /// Defaults to [`DEFAULT_MAX_MESSAGE_SIZE`](super::DEFAULT_MAX_MESSAGE_SIZE) (16 MiB).
+    /// Pass `None` (or call [`without_message_size_limit`](Self::without_message_size_limit))
+    /// to disable the limit enforced by the backend implementation.
     #[must_use]
     pub const fn max_message_size(mut self, max_size: Option<usize>) -> Self {
         self.config.max_message_size = max_size;
+        self
+    }
+
+    /// Disable the maximum incoming message size limit.
+    ///
+    /// By default, messages are capped at
+    /// [`DEFAULT_MAX_MESSAGE_SIZE`](super::DEFAULT_MAX_MESSAGE_SIZE) (16 MiB) to prevent
+    /// unbounded memory growth per connection.
+    #[must_use]
+    pub const fn without_message_size_limit(mut self) -> Self {
+        self.config.max_message_size = None;
+        self
+    }
+
+    /// Set the maximum incoming frame size accepted by the websocket.
+    ///
+    /// Defaults to [`DEFAULT_MAX_FRAME_SIZE`](super::DEFAULT_MAX_FRAME_SIZE) (1 MiB).
+    /// Pass `None` (or call [`without_frame_size_limit`](Self::without_frame_size_limit))
+    /// to disable the frame-level limit enforced by the backend implementation.
+    #[must_use]
+    pub const fn max_frame_size(mut self, max_size: Option<usize>) -> Self {
+        self.config.max_frame_size = max_size;
+        self
+    }
+
+    /// Disable the maximum incoming frame size limit.
+    ///
+    /// By default, frames are capped at
+    /// [`DEFAULT_MAX_FRAME_SIZE`](super::DEFAULT_MAX_FRAME_SIZE) (1 MiB).
+    #[must_use]
+    pub const fn without_frame_size_limit(mut self) -> Self {
+        self.config.max_frame_size = None;
         self
     }
 
@@ -836,7 +870,7 @@ pub(crate) fn upgrade_from_request(
             handshake: Handshake::ExtendedConnect,
             requested_protocols,
             response_protocol: None,
-            config: WebSocketConfig::default(),
+            config: default_websocket_config(),
         });
     }
 
@@ -850,7 +884,7 @@ pub(crate) fn upgrade_from_request(
         handshake: Handshake::Http1(key),
         requested_protocols,
         response_protocol: None,
-        config: WebSocketConfig::default(),
+        config: default_websocket_config(),
     })
 }
 
@@ -1168,6 +1202,54 @@ mod tests {
         let err = to_websocket_msg(TungsteniteMessage::Frame(frame))
             .expect_err("frame messages are not supported");
         assert!(matches!(err, WebSocketError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn default_limits_are_finite_and_opt_outs_clear_them() {
+        use crate::websocket::{DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_MESSAGE_SIZE};
+
+        let (upgrade, _) = build_valid_upgrade().await;
+        assert_eq!(
+            upgrade.config.max_message_size,
+            Some(DEFAULT_MAX_MESSAGE_SIZE)
+        );
+        assert_eq!(upgrade.config.max_frame_size, Some(DEFAULT_MAX_FRAME_SIZE));
+
+        let tcfg = to_tungstenite_config(&upgrade.config);
+        assert_eq!(tcfg.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
+        assert_eq!(tcfg.max_frame_size, Some(DEFAULT_MAX_FRAME_SIZE));
+
+        let custom = upgrade
+            .max_frame_size(Some(64 * 1024))
+            .without_message_size_limit();
+        assert_eq!(custom.config.max_message_size, None);
+        assert_eq!(custom.config.max_frame_size, Some(64 * 1024));
+
+        let unbounded = custom.without_frame_size_limit();
+        assert_eq!(unbounded.config.max_frame_size, None);
+    }
+
+    #[tokio::test]
+    async fn extended_connect_uses_hardened_default_limits() {
+        use crate::websocket::{DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_MESSAGE_SIZE};
+
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = Method::CONNECT;
+        *request.version_mut() = http::Version::HTTP_2;
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_VERSION,
+            header::HeaderValue::from_static("13"),
+        );
+        request
+            .extensions_mut()
+            .insert(ConnectProtocol::new("websocket"));
+
+        let upgrade = WebSocketUpgrade::extract(&mut request).await.unwrap();
+        assert_eq!(
+            upgrade.config.max_message_size,
+            Some(DEFAULT_MAX_MESSAGE_SIZE)
+        );
+        assert_eq!(upgrade.config.max_frame_size, Some(DEFAULT_MAX_FRAME_SIZE));
     }
 
     // NOTE: Direct WebSocket tests live in tests/hyper_websocket.rs
