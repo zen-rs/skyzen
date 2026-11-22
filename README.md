@@ -312,7 +312,7 @@ async fn greet_user(
 fn app() -> Router {
     Route::new((
         "/health".at(health),
-        "/greet/{name}".get(greet_user),
+        "/greet/{name}".at(greet_user),
     ))
     .build()
 }
@@ -341,7 +341,7 @@ use skyzen::routing::{CreateRouteNode, Route, Router};
 fn router() -> Router {
     Route::new((
         "/".at(home),                     // GET shorthand
-        "/posts".get(list_posts).post(create_post),
+        "/posts".at(list_posts).post(create_post),
         "/posts/{id}".put(update_post).patch(patch_post).delete(delete_post),
         "/ws".ws(chat_websocket),         // WebSocket upgrade — native and wasm
     ))
@@ -371,8 +371,8 @@ async fn serve_asset(params: Params) -> Result<String> {
 }
 
 let routes = Route::new((
-    "/users/{user_id}/posts/{post_id}".get(get_user_post),
-    "/assets/{*path}".get(serve_asset),
+    "/users/{user_id}/posts/{post_id}".at(get_user_post),
+    "/assets/{*path}".at(serve_asset),
 ));
 ```
 
@@ -384,8 +384,8 @@ repeating the parent's segment registers it twice:
 ```rust
 let api = Route::new((
     "/v1".route((
-        "/users".get(list_users).post(create_user),   // /v1/users
-        "/users/{id}".get(get_user).delete(delete_user),
+        "/users".at(list_users).post(create_user),   // /v1/users
+        "/users/{id}".at(get_user).delete(delete_user),
     )),
 ));
 ```
@@ -725,7 +725,7 @@ impl DurableObject for ChatRoom {
     const PERSIST: bool = false;
 
     fn fetch(&self) -> Router {
-        Route::new(("/messages".get(get_messages),)).build()
+        Route::new(("/messages".at(get_messages),)).build()
     }
 }
 
@@ -852,7 +852,7 @@ async fn get_item(Path(id): Path<u64>) -> Result<Json<Item>> {
 }
 
 fn router() -> Router {
-    let routes = Route::new(("/items/{id}".get(get_item),));
+    let routes = Route::new(("/items/{id}".at(get_item),));
     let docs = routes.openapi().scalar_route("/docs"); // interactive Scalar page
     Route::new((routes, docs)).build()
 }

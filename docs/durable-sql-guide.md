@@ -55,7 +55,7 @@ impl DurableObject for Room {
     fn fetch(&self) -> Router {
         Route::new((
             "/join".post(join_room),
-            "/members".get(list_members),
+            "/members".at(list_members),
         ))
         .on_alarm(compact_room)
         .build()
