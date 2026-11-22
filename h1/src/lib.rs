@@ -304,7 +304,7 @@ impl<E: Endpoint + Clone> Service for H1Service<E> {
         let mut endpoint = self.endpoint.clone();
         let mut response = match endpoint.respond(&mut request).await {
             Ok(response) => {
-                tracing::info!(
+                tracing::debug!(
                     method = request.method().as_str(),
                     path = request.uri().path(),
                     status = response.status().as_u16(),

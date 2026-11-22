@@ -6,9 +6,39 @@ use std::sync::Arc;
 use http_kit::{Request, StatusCode};
 use skyzen_core::Extractor;
 
+use super::Params;
+
+/// What the routing tree recorded for the request's match: the route template and the
+/// parameters it captured, stored as one extension so a match costs a single insert.
+///
+/// Handlers never name this type — [`MatchedPath`] and [`Params`] extract from it, keeping
+/// their public signatures and semantics.
+#[derive(Debug, Clone)]
+pub struct RouteMatch {
+    matched: MatchedPath,
+    params: Params,
+}
+
+impl RouteMatch {
+    /// Record `matched` and its captured `params`.
+    pub const fn new(matched: MatchedPath, params: Params) -> Self {
+        Self { matched, params }
+    }
+
+    /// The template the request matched.
+    pub const fn matched(&self) -> &MatchedPath {
+        &self.matched
+    }
+
+    /// The parameters the match captured.
+    pub const fn params(&self) -> &Params {
+        &self.params
+    }
+}
+
 /// The route pattern that matched the request: `"/users/{id}"`, not `"/users/42"`.
 ///
-/// The router inserts it next to [`Params`](crate::routing::Params) when a request matches,
+/// The router records it alongside [`Params`](crate::routing::Params) when a request matches,
 /// so handlers can log or emit the low-cardinality template instead of the raw path:
 ///
 /// ```rust
@@ -77,8 +107,8 @@ impl Extractor for MatchedPath {
         ready(
             request
                 .extensions()
-                .get::<Self>()
-                .cloned()
+                .get::<RouteMatch>()
+                .map(|matched| matched.matched().clone())
                 .ok_or_else(NoMatchedPath::new),
         )
     }
@@ -138,7 +168,10 @@ mod tests {
                 let captured = Arc::clone(&captured);
                 Box::pin(async move {
                     let result = next.run(request).await;
-                    *captured.lock().unwrap() = request.extensions().get::<MatchedPath>().cloned();
+                    *captured.lock().unwrap() = request
+                        .extensions()
+                        .get::<super::RouteMatch>()
+                        .map(|matched| matched.matched().clone());
                     result
                 })
             }))

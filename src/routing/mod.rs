@@ -229,8 +229,8 @@ mod router;
 pub use router::{build, AllowedMethods, NotFound, RouteBuildError, Router};
 
 mod matched_path;
-pub(crate) use matched_path::MountPrefix;
 pub use matched_path::{MatchedPath, NoMatchedPath};
+pub(crate) use matched_path::{MountPrefix, RouteMatch};
 
 mod nest;
 pub use nest::{MountPathError, Mounted};
@@ -686,7 +686,7 @@ impl RouteWithAlarm {
     pub fn build(self) -> Router {
         let alarm_factory = self.alarm_endpoint;
         let mut router = self.route.build();
-        router.alarm_handler = Some(alarm_factory);
+        Rc::make_mut(&mut router.inner).alarm_handler = Some(alarm_factory);
         router
     }
 

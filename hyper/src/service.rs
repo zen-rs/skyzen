@@ -170,7 +170,7 @@ where
 
             let mut response: skyzen_core::Response = match endpoint.respond(&mut request).await {
                 Ok(response) => {
-                    tracing::info!(
+                    tracing::debug!(
                         method = request.method().as_str(),
                         path = request.uri().path(),
                         status = response.status().as_u16(),

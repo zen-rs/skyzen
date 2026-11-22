@@ -7,6 +7,8 @@ use http_kit::{HttpError, Request, StatusCode};
 use skyzen_core::Extractor;
 use smallvec::SmallVec;
 
+use super::RouteMatch;
+
 /// Inline UTF-8 capacity matching `size_of::<Box<str>>()` stack footprint so
 /// ordinary route parameter names and values avoid heap allocation.
 const INLINE_CAP: usize = 23;
@@ -188,15 +190,15 @@ impl Params {
 
 impl Extractor for Params {
     type Error = Infallible;
-    // Reading the params back out of the extensions is a synchronous clone, so the future is ready
-    // on creation rather than an `async` block with nothing to await.
+    // Reading the params back out of the route match is a synchronous clone, so the future is
+    // ready on creation rather than an `async` block with nothing to await.
     fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
-        // Clone rather than remove so the params survive repeated extraction.
+        // Clone rather than remove so the params survive repeated extraction. A request with no
+        // `RouteMatch` — or a matched route that captures nothing — extracts an empty `Params`.
         ready(Ok(request
             .extensions()
-            .get::<Self>()
-            .cloned()
-            .unwrap_or_else(Self::empty)))
+            .get::<RouteMatch>()
+            .map_or_else(Self::empty, |matched| matched.params().clone())))
     }
 
     // Individual path parameters are derived from the route's `{name}` segments when the OpenAPI

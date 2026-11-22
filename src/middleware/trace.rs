@@ -18,7 +18,7 @@ use skyzen_core::{
 use tracing::{field, Instrument, Level};
 
 use super::RequestId;
-use crate::routing::MatchedPath;
+use crate::routing::RouteMatch;
 
 // `tracing` puts the level inside a `static` callsite, so `span!`/`event!` only take a
 // statically-known `Level`. Dispatching on the configured level keeps a `Level` builder knob
@@ -216,8 +216,8 @@ impl Middleware for Trace {
 
         let mut result = next.run(request).instrument(span.clone()).await;
 
-        if let Some(path) = request.extensions().get::<MatchedPath>() {
-            span.record("http.route", path.as_str());
+        if let Some(matched) = request.extensions().get::<RouteMatch>() {
+            span.record("http.route", matched.matched().as_str());
         } else {
             span.record("http.route", "<unmatched>");
         }

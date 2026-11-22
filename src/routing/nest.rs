@@ -7,7 +7,7 @@ use http_kit::uri::PathAndQuery;
 
 use crate::{Endpoint, Request, Response, StatusCode, Uri};
 
-use super::{join_path, MatchedPath, MountPrefix};
+use super::{join_path, MountPrefix, RouteMatch};
 
 /// Serves a mounted endpoint, with the mount prefix stripped from the request path.
 ///
@@ -57,13 +57,13 @@ impl<E: Endpoint> Endpoint for Mounted<E> {
             .ok_or_else(|| Box::new(MountPathError(original.to_string())) as BoxHttpError)?;
 
         *request.uri_mut() = rewritten;
-        // The mount's own template (`/api` or `/api/{*skyzen_nested}`) is an internal
-        // routing artifact, not a user route — drop it before the inner router runs so
-        // inner handlers and fallbacks extracting `Option<MatchedPath>` see `None` unless
-        // a real inner route matches. The accumulated mount prefix travels as an
-        // extension: `dispatch_matched` composes it into the full template
-        // (`/api` + `/users/{id}`) at insertion time, before the handler extracts it.
-        request.extensions_mut().remove::<MatchedPath>();
+        // The mount's own template and `skyzen_nested` capture (`/api` or
+        // `/api/{*skyzen_nested}`) are internal routing artifacts, not a user route — drop
+        // them before the inner router runs so inner handlers and fallbacks extracting
+        // `Option<MatchedPath>` see `None` unless a real inner route matches. The accumulated
+        // mount prefix travels as an extension: `dispatch_matched` composes it into the full
+        // template (`/api` + `/users/{id}`) at insertion time, before the handler extracts it.
+        request.extensions_mut().remove::<RouteMatch>();
         let accumulated = match request.extensions().get::<MountPrefix>() {
             Some(parent) => join_path(&parent.0, &self.prefix),
             None => self.prefix.to_string(),

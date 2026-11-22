@@ -36,7 +36,7 @@ use sha1::{Digest, Sha1};
 
 use crate::{
     header::{self, HeaderMap, HeaderValue},
-    routing::{IntoRouteNode, MethodFilter, Params, Route, RouteNode},
+    routing::{IntoRouteNode, MethodFilter, Route, RouteNode},
     Body, Endpoint, Method, Request, Response, StatusCode,
 };
 
@@ -409,8 +409,8 @@ fn sanitize_relative_path(path: &str) -> Option<PathBuf> {
 fn requested_path(request: &Request) -> Result<PathBuf, StaticDirError> {
     let requested = request
         .extensions()
-        .get::<Params>()
-        .and_then(|params| params.get("path").ok())
+        .get::<crate::routing::RouteMatch>()
+        .and_then(|matched| matched.params().get("path").ok())
         .unwrap_or("");
     sanitize_relative_path(requested).ok_or(StaticDirError::InvalidPath)
 }

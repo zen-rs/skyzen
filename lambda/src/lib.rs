@@ -383,21 +383,19 @@ async fn serve_http<E: Endpoint>(
             .extensions_mut()
             .insert(skyzen_core::PlatformRequestId(request_id));
     }
-    let method = request.method().clone();
-    let path = request.uri().path().to_owned();
 
     let response = match endpoint.respond(&mut request).await {
         Ok(response) => {
-            info!(
-                method = method.as_str(),
-                path = path.as_str(),
+            debug!(
+                method = request.method().as_str(),
+                path = request.uri().path(),
                 status = response.status().as_u16(),
                 "request completed"
             );
             response
         }
         Err(error) => {
-            skyzen_core::log_endpoint_error(&error, &method, path.as_str());
+            skyzen_core::log_endpoint_error(&error, request.method(), request.uri().path());
             let mut response = skyzen_core::error_response(&error);
             skyzen_core::apply_pending_headers(&request, &mut response);
             response
@@ -412,8 +410,8 @@ async fn serve_http<E: Endpoint>(
             // responses, so the client gets the framework's 500 instead of a truncated body that
             // would look like a complete one.
             error!(
-                method = method.as_str(),
-                path = path.as_str(),
+                method = request.method().as_str(),
+                path = request.uri().path(),
                 error = %error,
                 "response body failed part way through"
             );

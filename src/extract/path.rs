@@ -461,7 +461,10 @@ impl<'de> VariantAccess<'de> for UnitVariant<'de> {
 #[cfg(test)]
 mod tests {
     use super::Path;
-    use crate::{routing::Params, Body, Request, StatusCode};
+    use crate::{
+        routing::{MatchedPath, Params},
+        Body, Request, StatusCode,
+    };
     use http_kit::HttpError;
     use serde::Deserialize;
     use skyzen_core::Extractor;
@@ -474,7 +477,12 @@ mod tests {
 
     fn request_with(params: &[(&str, &str)]) -> Request {
         let mut request = Request::new(Body::empty());
-        request.extensions_mut().insert(Params::from_pairs(params));
+        request
+            .extensions_mut()
+            .insert(crate::routing::RouteMatch::new(
+                MatchedPath::new("/test/{*path}"),
+                Params::from_pairs(params),
+            ));
         request
     }
 
