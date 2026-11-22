@@ -11,7 +11,10 @@ pub use form::Form;
 #[cfg(feature = "multipart")]
 pub mod multipart;
 #[cfg(feature = "multipart")]
-pub use multipart::{Field, Multipart, MultipartBoundaryError, MultipartError};
+pub use multipart::{
+    Field, Multipart, MultipartBoundaryError, MultipartError, MultipartLimits, DEFAULT_MAX_FIELDS,
+    DEFAULT_MAX_FIELD_SIZE,
+};
 
 pub mod state;
 pub use state::State;

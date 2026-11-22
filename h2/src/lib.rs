@@ -30,7 +30,7 @@ use http_kit_io::{Listen, Listener, ReadOwned, SendFile, SpliceRead, SpliceWrite
 use skyzen_core::{
     apply_pending_headers, error_response, log_endpoint_error,
     upgrade::{ConnectProtocol, OnUpgrade, Upgraded},
-    Endpoint, PeerAddr, PeerAddress, Server,
+    ConnectionInfo, Endpoint, PeerAddress, Server,
 };
 use tracing::{debug, error, warn};
 
@@ -286,12 +286,12 @@ where
     Ex: LocalExecutor,
 {
     async fn call(&self, mut request: Request) -> Response {
-        let method = request.method().clone();
-        let path = request.uri().path().to_owned();
         if let Some(peer) = self.peer {
-            request.extensions_mut().insert(PeerAddr::new(peer));
+            request
+                .extensions_mut()
+                .insert(ConnectionInfo::new(Some(peer), false));
         }
-        if method == Method::CONNECT {
+        if request.method() == Method::CONNECT {
             if let Some(protocol) = request.extensions().get::<Protocol>().cloned() {
                 request
                     .extensions_mut()
@@ -303,15 +303,15 @@ where
         let mut response = match endpoint.respond(&mut request).await {
             Ok(response) => {
                 tracing::info!(
-                    method = method.as_str(),
-                    path = path.as_str(),
+                    method = request.method().as_str(),
+                    path = request.uri().path(),
                     status = response.status().as_u16(),
                     "request completed"
                 );
                 response
             }
             Err(error) => {
-                log_endpoint_error(&error, &method, path.as_str());
+                log_endpoint_error(&error, request.method(), request.uri().path());
                 let mut response = error_response(&error);
                 apply_pending_headers(&request, &mut response);
                 response

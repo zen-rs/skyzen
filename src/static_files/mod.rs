@@ -585,6 +585,9 @@ pub enum StaticDirError {
     /// The requested file was not found.
     #[error("File not found", status = StatusCode::NOT_FOUND)]
     FileNotFound,
+    /// Access to the requested path is forbidden.
+    #[error("Forbidden", status = StatusCode::FORBIDDEN)]
+    Forbidden,
     /// An I/O error occurred while reading the file.
     #[error("Failed to read file: {0}", status = StatusCode::INTERNAL_SERVER_ERROR)]
     IoError(#[from] io::Error),

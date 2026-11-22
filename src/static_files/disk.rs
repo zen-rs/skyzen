@@ -65,6 +65,7 @@ pub struct StaticDir<F = CompioFs> {
     directory: Arc<PathBuf>,
     index_file: String,
     spa: bool,
+    allow_external_symlinks: bool,
     cache_control: Option<HeaderValue>,
     settings: StaticCacheSettings,
     fs: F,
@@ -93,6 +94,7 @@ impl StaticDir {
             directory: Arc::new(directory.into()),
             index_file: "index.html".to_owned(),
             spa: false,
+            allow_external_symlinks: false,
             cache_control: None,
             settings: StaticCacheSettings::default(),
             fs: CompioFs,
@@ -143,6 +145,17 @@ impl<F> StaticDir<F> {
         self
     }
 
+    /// Allow symlinks inside the directory that resolve outside the static root.
+    ///
+    /// By default (`false`), symlinks pointing outside the served directory are refused with
+    /// `403 Forbidden`, while symlinks whose target remains inside the root continue to work.
+    /// Call `.allow_external_symlinks(true)` only when intentionally serving external targets.
+    #[must_use]
+    pub const fn allow_external_symlinks(mut self, allow: bool) -> Self {
+        self.allow_external_symlinks = allow;
+        self
+    }
+
     /// Size the per-thread cache from `settings`, a handle the operator can change at runtime.
     #[must_use]
     pub fn cache(mut self, settings: StaticCacheSettings) -> Self {
@@ -158,6 +171,7 @@ impl<F> StaticDir<F> {
             directory: self.directory,
             index_file: self.index_file,
             spa: self.spa,
+            allow_external_symlinks: self.allow_external_symlinks,
             cache_control: self.cache_control,
             settings: self.settings,
             fs,
@@ -170,8 +184,18 @@ impl<F> StaticDir<F> {
 impl<F: FileSystem> IntoRouteNode for StaticDir<F> {
     fn into_route_node(self) -> RouteNode {
         let cache = DirCache::new(&self.directory, self.settings);
+        let canonical_root = if self.allow_external_symlinks {
+            None
+        } else {
+            Some(Arc::new(
+                std::fs::canonicalize(&*self.directory).unwrap_or_else(|error| {
+                    panic!("cannot canonicalize {}: {error}", self.directory.display())
+                }),
+            ))
+        };
         let endpoint = StaticDirEndpoint(Rc::new(Shared {
             directory: self.directory,
+            canonical_root,
             index_file: self.index_file,
             spa: self.spa,
             cache_control: self.cache_control,
@@ -198,6 +222,7 @@ impl<F> Clone for StaticDirEndpoint<F> {
 #[derive(Debug)]
 struct Shared<F> {
     directory: Arc<PathBuf>,
+    canonical_root: Option<Arc<PathBuf>>,
     index_file: String,
     spa: bool,
     cache_control: Option<HeaderValue>,
@@ -461,20 +486,27 @@ impl<F: FileSystem> Shared<F> {
     }
 
     /// Open `path` and look for each of its siblings, all in one submission.
-    async fn open_file(&self, path: PathBuf) -> io::Result<Lookup<F::Handle>> {
+    async fn open_file(&self, path: PathBuf) -> Result<Lookup<F::Handle>, StaticDirError> {
         let siblings = Coding::ALL.map(|coding| {
             let mut sibling = path.clone().into_os_string();
             sibling.push(".");
             sibling.push(coding.extension());
-            self.fs.open(PathBuf::from(sibling))
+            self.fs
+                .open(PathBuf::from(sibling), self.canonical_root.clone())
         });
         let [brotli, zstd, gzip] = siblings;
-        let (identity, brotli, zstd, gzip) =
-            futures_util::future::join4(self.fs.open(path.clone()), brotli, zstd, gzip).await;
+        let (identity, brotli, zstd, gzip) = futures_util::future::join4(
+            self.fs.open(path.clone(), self.canonical_root.clone()),
+            brotli,
+            zstd,
+            gzip,
+        )
+        .await;
 
         let identity = match absent_is_none(identity)? {
             Some(Entry::File(identity)) => identity,
             Some(Entry::Directory) => return Ok(Lookup::Directory),
+            Some(Entry::Escaped) => return Err(StaticDirError::Forbidden),
             None => return Ok(Lookup::Missing),
         };
         let mut variants = SmallVec::new();
@@ -1493,6 +1525,79 @@ mod tests {
             let raw = body(resp).await;
             assert!(raw.windows(4).any(|w| w == &large_payload[0..4]));
             assert!(raw.windows(4).any(|w| w == &large_payload[79996..80000]));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_escaping_root_are_rejected_by_default() {
+        run(async {
+            let outside = tempfile::tempdir().unwrap();
+            let secret = outside.path().join("secret.txt");
+            std::fs::write(&secret, b"top-secret").unwrap();
+
+            let root = tempfile::tempdir().unwrap();
+            let inside = root.path().join("inside.txt");
+            std::fs::write(&inside, b"public").unwrap();
+
+            // Direct file symlink escaping root, directory symlink escaping root, and an
+            // internal symlink that stays inside root.
+            std::os::unix::fs::symlink(&secret, root.path().join("escape.txt")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.path().join("outside_dir")).unwrap();
+            std::os::unix::fs::symlink(&inside, root.path().join("alias.txt")).unwrap();
+
+            // Default StaticDir (CompioFs): rejects escaping file and directory symlinks,
+            // allows internal symlinks.
+            let compio_router = router(root.path());
+            let err = compio_router
+                .clone()
+                .go(get_request("/s/escape.txt"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+            let err = compio_router
+                .clone()
+                .go(get_request("/s/outside_dir/secret.txt"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+            let ok = compio_router
+                .clone()
+                .go(get_request("/s/alias.txt"))
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+            assert_eq!(body(ok).await, b"public");
+
+            // BlockingFs also rejects escaping symlinks by default.
+            let blocking_router = build(Route::new((StaticDir::new(
+                "/s",
+                root.path(),
+                &ServingThread::without_compio(),
+            )
+            .filesystem(BlockingFs),)))
+            .unwrap();
+            let err = blocking_router
+                .clone()
+                .go(get_request("/s/escape.txt"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+            // Explicit opt-in serves external symlinks.
+            let permissive_router =
+                build(Route::new((
+                    StaticDir::new("/s", root.path(), &thread()).allow_external_symlinks(true),
+                )))
+                .unwrap();
+            let ok = permissive_router
+                .go(get_request("/s/escape.txt"))
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+            assert_eq!(body(ok).await, b"top-secret");
         });
     }
 }

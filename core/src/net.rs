@@ -84,11 +84,43 @@ http_error!(
     "Missing remote addr, maybe it's not a tcp/udp connection"
 );
 
+/// Per-connection metadata attached in a single extension slot by an HTTP server backend.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnectionInfo {
+    peer: Option<PeerAddr>,
+    upgrade_available: bool,
+}
+
+impl ConnectionInfo {
+    /// Metadata for a connection with optional `peer` and HTTP/1.1 upgrade capability.
+    #[must_use]
+    pub const fn new(peer: Option<SocketAddr>, upgrade_available: bool) -> Self {
+        Self {
+            peer: match peer {
+                Some(addr) => Some(PeerAddr::new(addr)),
+                None => None,
+            },
+            upgrade_available,
+        }
+    }
+
+    /// Remote socket address, if the transport exposes one.
+    #[must_use]
+    pub const fn peer(&self) -> Option<PeerAddr> {
+        self.peer
+    }
+
+    /// Whether the server can hand the connection over after a `101` response.
+    #[must_use]
+    pub const fn upgrade_available(&self) -> bool {
+        self.upgrade_available
+    }
+}
+
 /// Remote socket address of the current connection.
 ///
-/// Server backends insert this into the request extensions for every request; the [`PeerAddr`]
-/// extractor (and the higher-level `ClientIp` extractor) read it back. Defining the type here lets
-/// any backend populate it without depending on the top-level `skyzen` crate.
+/// Server backends record this in [`ConnectionInfo`] (or directly in request extensions in tests);
+/// [`PeerAddr::of`], the [`PeerAddr`] extractor, and `ClientIp` read it back.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerAddr(pub SocketAddr);
 
@@ -97,6 +129,16 @@ impl PeerAddr {
     #[must_use]
     pub const fn new(addr: SocketAddr) -> Self {
         Self(addr)
+    }
+
+    /// Read the connection's remote address from `request`.
+    #[must_use]
+    pub fn of(request: &Request) -> Option<Self> {
+        let extensions = request.extensions();
+        extensions
+            .get::<ConnectionInfo>()
+            .and_then(ConnectionInfo::peer)
+            .or_else(|| extensions.get::<Self>().copied())
     }
 }
 
@@ -133,13 +175,7 @@ impl core::ops::Deref for PeerAddr {
 impl Extractor for PeerAddr {
     type Error = MissingRemoteAddr;
     fn extract(request: &mut Request) -> impl Future<Output = Result<Self, Self::Error>> + Send {
-        core::future::ready(
-            request
-                .extensions()
-                .get::<Self>()
-                .copied()
-                .ok_or(MissingRemoteAddr::new()),
-        )
+        core::future::ready(Self::of(request).ok_or(MissingRemoteAddr::new()))
     }
 }
 

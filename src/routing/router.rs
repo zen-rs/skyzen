@@ -8,8 +8,8 @@ use std::{
 };
 
 use super::{
-    join_path, predicate::Predicates, BoxEndpoint, EndpointFactory, MatchedPath, MethodFilter,
-    MountPrefix, Mounted, Params, Route, RouteNode, RouteNodeType,
+    join_path, predicate::Predicates, AlarmFactory, BoxEndpoint, MatchedPath, MethodFilter,
+    MountPrefix, Mounted, ParamStr, Params, Route, RouteEndpoint, RouteNode, RouteNodeType,
 };
 #[cfg(feature = "openapi")]
 use crate::openapi::RouteOpenApiEntry;
@@ -21,13 +21,13 @@ use matchit::Match;
 use skyzen_core::{
     error_response,
     middleware::{boxed, BoxMiddleware, Dispatch, LocalBoxFuture, Middleware, Next},
-    Error, Extractor, RequestBodyLimit, Requirement,
+    Error, Extractor, Requirement,
 };
 use tracing::debug;
 
 /// One registered handler plus the middleware wrapping it.
 struct App {
-    endpoint_factory: EndpointFactory,
+    endpoint: RouteEndpoint,
     middleware: Vec<BoxMiddleware>,
 }
 
@@ -42,8 +42,12 @@ impl Debug for App {
 impl App {
     /// Run this endpoint's middleware chain and then the endpoint.
     async fn run(&self, request: &mut Request) -> Result<Response, Error> {
-        let terminal = FactoryDispatch(&self.endpoint_factory);
-        Next::new(&self.middleware, &terminal).run(request).await
+        if self.middleware.is_empty() {
+            return self.endpoint.respond(request).await;
+        }
+        Next::new(&self.middleware, &self.endpoint)
+            .run(request)
+            .await
     }
 }
 
@@ -64,21 +68,6 @@ struct MethodTable {
     /// `matchit` reports params but not the pattern that produced them, so the router
     /// keeps it to expose as [`MatchedPath`].
     path: Arc<str>,
-}
-
-/// Chain terminal that serves a request from a freshly built endpoint.
-struct FactoryDispatch<'a>(&'a EndpointFactory);
-
-impl Dispatch for FactoryDispatch<'_> {
-    fn dispatch<'a>(
-        &'a self,
-        request: &'a mut Request,
-    ) -> LocalBoxFuture<'a, Result<Response, Error>> {
-        Box::pin(async move {
-            let mut endpoint = (self.0)();
-            endpoint.respond(request).await.map_err(Error::from)
-        })
-    }
 }
 
 /// Chain terminal that performs route matching once the router's layers have run.
@@ -116,11 +105,11 @@ pub struct Router {
     inner: Rc<matchit::Router<MethodTable>>,
     /// Middleware wrapping the entire dispatch, outermost first.
     layers: Rc<Vec<BoxMiddleware>>,
-    fallback: Option<EndpointFactory>,
-    method_not_allowed: Option<EndpointFactory>,
+    fallback: Option<RouteEndpoint>,
+    method_not_allowed: Option<RouteEndpoint>,
     routes: Rc<Vec<(MethodFilter, String)>>,
     /// Optional alarm handler for Durable Object alarm events.
-    pub(crate) alarm_handler: Option<EndpointFactory>,
+    pub(crate) alarm_handler: Option<AlarmFactory>,
     #[cfg(feature = "openapi")]
     openapi_entries: Rc<Vec<RouteOpenApiEntry>>,
 }
@@ -212,7 +201,7 @@ enum RouteLookup<'app> {
         app: &'app App,
         fallback: FallbackKind,
         allow_on_unupgraded_connect: Vec<Method>,
-        params: Vec<(String, String)>,
+        params: Params,
         /// The route template the matchit match came from.
         path: &'app Arc<str>,
     },
@@ -274,6 +263,10 @@ impl Router {
             });
 
         if let Some((app, fallback)) = found {
+            let mut captured = Params::empty();
+            for (key, value) in params.iter() {
+                captured.push(ParamStr::from_str_slice(key), percent_decode(value));
+            }
             RouteLookup::Endpoint {
                 app,
                 fallback,
@@ -282,10 +275,7 @@ impl Router {
                 } else {
                     Vec::new()
                 },
-                params: params
-                    .iter()
-                    .map(|(key, value)| (key.to_owned(), percent_decode(value)))
-                    .collect(),
+                params: captured,
                 path: &value.path,
             }
         } else {
@@ -306,15 +296,15 @@ impl Router {
     /// Router layers have already run by the time this is reached, which is what lets a CORS or
     /// tracing layer see the 404 and 405 responses produced here.
     async fn dispatch_matched(&self, request: &mut Request) -> Result<Response, Error> {
-        let method = request.method().clone();
         #[cfg(not(target_arch = "wasm32"))]
-        let extended_connect = request
-            .extensions()
-            .get::<skyzen_core::upgrade::ConnectProtocol>()
-            .is_some();
+        let extended_connect = request.method() == Method::CONNECT
+            && request
+                .extensions()
+                .get::<skyzen_core::upgrade::ConnectProtocol>()
+                .is_some();
         #[cfg(target_arch = "wasm32")]
         let extended_connect = false;
-        match self.lookup(request, &method, extended_connect) {
+        match self.lookup(request, request.method(), extended_connect) {
             RouteLookup::Endpoint {
                 app,
                 fallback,
@@ -324,7 +314,9 @@ impl Router {
             } => {
                 let matched = Self::matched_path(request, path);
                 request.extensions_mut().insert(matched);
-                request.extensions_mut().insert(Params::new(params));
+                if !params.is_empty() {
+                    request.extensions_mut().insert(params);
+                }
                 let mut response = app.run(request).await?;
                 match fallback {
                     FallbackKind::None => {}
@@ -341,9 +333,9 @@ impl Router {
                         {
                             let allow = AllowedMethods(allow_on_unupgraded_connect);
                             return match &self.method_not_allowed {
-                                Some(factory) => {
+                                Some(endpoint) => {
                                     request.extensions_mut().insert(allow);
-                                    run_endpoint(factory, request).await
+                                    endpoint.respond(request).await
                                 }
                                 None => Ok(method_not_allowed_response(&allow)),
                             };
@@ -359,15 +351,15 @@ impl Router {
                 request.extensions_mut().insert(matched);
                 let allow = AllowedMethods(allow);
                 match &self.method_not_allowed {
-                    Some(factory) => {
+                    Some(endpoint) => {
                         request.extensions_mut().insert(allow);
-                        run_endpoint(factory, request).await
+                        endpoint.respond(request).await
                     }
                     None => Ok(method_not_allowed_response(&allow)),
                 }
             }
             RouteLookup::Unmatched => match &self.fallback {
-                Some(factory) => run_endpoint(factory, request).await,
+                Some(endpoint) => endpoint.respond(request).await,
                 None => Ok(error_response(&NotFound::new())),
             },
         }
@@ -396,12 +388,11 @@ impl Router {
             "request received"
         );
 
-        // Insert-if-absent: a router mounted as an endpoint inside another router must not clear
-        // the outer router's `BodyLimit`.
-        if request.extensions().get::<RequestBodyLimit>().is_none() {
-            request.extensions_mut().insert(RequestBodyLimit::default());
+        // `RequestBodyLimit::of` defaults to `RequestBodyLimit::DEFAULT` when absent, so no
+        // per-request insertion is needed unless a `BodyLimit` middleware overrides it.
+        if self.layers.is_empty() {
+            return self.dispatch_matched(request).await;
         }
-
         let terminal = MatchDispatch(self);
         Next::new(&self.layers, &terminal).run(request).await
     }
@@ -468,12 +459,6 @@ impl Router {
     }
 }
 
-/// Build and run a stored endpoint once.
-async fn run_endpoint(factory: &EndpointFactory, request: &mut Request) -> Result<Response, Error> {
-    let mut endpoint = factory();
-    endpoint.respond(request).await.map_err(Error::from)
-}
-
 /// Collect the methods registered for a path whose predicates match `request`, advertising HEAD
 /// alongside GET.
 fn allowed_methods_matching(entries: &[(Method, PredicatedApp)], request: &Request) -> Vec<Method> {
@@ -503,9 +488,9 @@ fn method_not_allowed_response(allow: &AllowedMethods) -> Response {
 ///
 /// Invalid percent sequences or non-UTF-8 results leave the raw value untouched
 /// instead of failing the request.
-fn percent_decode(raw: &str) -> String {
+fn percent_decode(raw: &str) -> ParamStr {
     if !raw.contains('%') {
-        return raw.to_owned();
+        return ParamStr::from_str_slice(raw);
     }
 
     let bytes = raw.as_bytes();
@@ -517,7 +502,7 @@ fn percent_decode(raw: &str) -> String {
             let high = bytes.get(index + 1).copied().and_then(hex_value);
             let low = bytes.get(index + 2).copied().and_then(hex_value);
             let (Some(high), Some(low)) = (high, low) else {
-                return raw.to_owned();
+                return ParamStr::from_str_slice(raw);
             };
             decoded.push((high << 4) | low);
             index += 3;
@@ -527,7 +512,7 @@ fn percent_decode(raw: &str) -> String {
         }
     }
 
-    String::from_utf8(decoded).unwrap_or_else(|_| raw.to_owned())
+    String::from_utf8(decoded).map_or_else(|_| ParamStr::from_str_slice(raw), ParamStr::from_string)
 }
 
 const fn hex_value(byte: u8) -> Option<u8> {
@@ -633,7 +618,7 @@ impl From<matchit::InsertError> for RouteBuildError {
 /// One endpoint, flattened out of the tree with its full path and ancestor middleware.
 struct FlatEndpoint {
     method: MethodFilter,
-    factory: EndpointFactory,
+    endpoint: RouteEndpoint,
     middleware: Vec<BoxMiddleware>,
     requirements: Vec<Requirement>,
     predicates: Predicates,
@@ -661,7 +646,7 @@ fn flatten(
                 )?;
             }
             RouteNodeType::Endpoint {
-                endpoint_factory,
+                endpoint,
                 method,
                 openapi,
                 requirements,
@@ -685,7 +670,7 @@ fn flatten(
 
                 buf.entry(path).or_default().push(FlatEndpoint {
                     method,
-                    factory: endpoint_factory,
+                    endpoint,
                     middleware,
                     requirements,
                     predicates,
@@ -708,15 +693,13 @@ fn flatten(
                 #[cfg(feature = "openapi")]
                 openapi_entries.extend(super::prefixed_openapi_entries(&path, &router));
 
-                let nested = Mounted::new(Arc::from(path.as_str()), router);
+                let nested = RouteEndpoint::new(Mounted::new(Arc::from(path.as_str()), router));
                 // The mount point itself and everything beneath it, for every method: the inner
                 // router decides which of them it answers, including its own 404 and 405.
-                mount(&path, buf, &middleware, &predicates, move || {
-                    BoxEndpoint::new(nested.clone())
-                });
+                mount(&path, buf, &middleware, &predicates, &nested);
             }
             RouteNodeType::Mounted {
-                endpoint_factory,
+                endpoint,
                 middleware,
                 predicates,
             } => {
@@ -726,10 +709,8 @@ fn flatten(
                 if path.contains('{') {
                     return Err(RouteBuildError::MountPatternPrefix { path });
                 }
-                let prefix: Arc<str> = Arc::from(path.as_str());
-                mount(&path, buf, &middleware, &predicates, move || {
-                    BoxEndpoint::new(Mounted::new(Arc::clone(&prefix), endpoint_factory()))
-                });
+                let mounted = RouteEndpoint::new(Mounted::new(Arc::from(path.as_str()), endpoint));
+                mount(&path, buf, &middleware, &predicates, &mounted);
             }
         }
     }
@@ -737,19 +718,18 @@ fn flatten(
     Ok(())
 }
 
-/// Register `factory` at `path` and at every path beneath it, for every method.
+/// Register `endpoint` at `path` and at every path beneath it, for every method.
 fn mount(
     path: &str,
     buf: &mut FlattenBuf,
     middleware: &[BoxMiddleware],
     predicates: &Predicates,
-    factory: impl Fn() -> BoxEndpoint + 'static,
+    endpoint: &RouteEndpoint,
 ) {
-    let factory: EndpointFactory = Rc::new(factory);
     for mounted in [path.to_owned(), join_path(path, "/{*skyzen_nested}")] {
         buf.entry(mounted).or_default().push(FlatEndpoint {
             method: MethodFilter::Any,
-            factory: Rc::clone(&factory),
+            endpoint: endpoint.clone(),
             middleware: middleware.to_vec(),
             requirements: Vec::new(),
             predicates: predicates.clone(),
@@ -812,8 +792,8 @@ pub fn build(route: Route) -> Result<Router, RouteBuildError> {
     Ok(Router {
         inner: Rc::new(matcher),
         layers: Rc::new(layers),
-        fallback: fallback.map(|entry| entry.factory),
-        method_not_allowed: method_not_allowed.map(|entry| entry.factory),
+        fallback: fallback.map(|entry| entry.endpoint),
+        method_not_allowed: method_not_allowed.map(|entry| entry.endpoint),
         routes: Rc::new(routes),
         alarm_handler: None,
         #[cfg(feature = "openapi")]
@@ -853,7 +833,7 @@ fn build_method_table(
         let predicated = PredicatedApp {
             predicates: endpoint.predicates,
             app: App {
-                endpoint_factory: endpoint.factory,
+                endpoint: endpoint.endpoint,
                 middleware: endpoint.middleware,
             },
         };
@@ -2148,5 +2128,36 @@ mod tests {
         );
         let resp = router.go(missing_header).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn parameterless_routes_leave_params_extension_unset_and_cjk_pairs_iterate() {
+        let router = build(Route::new((
+            "/plain".at(|params: Params| async move { params.len().to_string() }),
+            "/cjk/{short}/{long}".at(|params: Params| async move {
+                params
+                    .pairs()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&")
+            }),
+        )))
+        .unwrap();
+
+        let mut plain_req = get_request("/plain");
+        let resp = router.call(&mut plain_req).await.unwrap();
+        assert!(plain_req.extensions().get::<Params>().is_none());
+        assert_eq!(resp.into_body().into_string().await.unwrap(), "0");
+
+        let resp = router
+            .go(get_request(
+                "/cjk/%E4%B8%AD%E6%96%87/%E6%97%A5%E6%9C%AC%E8%AA%9E-%ED%95%9C%EA%B5%AD%EC%96%B4-abcdefghijklmnopqrstuvwxyz",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.into_body().into_string().await.unwrap(),
+            "short=中文&long=日本語-한국어-abcdefghijklmnopqrstuvwxyz"
+        );
     }
 }
