@@ -107,4 +107,6 @@ mod tests {
 
 pub mod conditional;
 pub use crate::utils::conditional::EntityTag;
+#[cfg(feature = "templates")]
+pub use crate::utils::html::{Template, TemplateError};
 pub use conditional::{Conditional, Lazy};

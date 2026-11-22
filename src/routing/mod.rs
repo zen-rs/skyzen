@@ -166,6 +166,9 @@ pub use matched_path::{MatchedPath, NoMatchedPath};
 mod nest;
 pub use nest::{MountPathError, Mounted};
 
+mod predicate;
+use predicate::{HeaderPredicate, HostPattern, Predicates};
+
 /// An endpoint that can say which routes it serves.
 ///
 /// The built-in runtime is entitled to know this: a platform integration that has to mount a route
@@ -289,6 +292,8 @@ pub enum RouteNodeType {
         requirements: Vec<Requirement>,
         /// Middleware wrapping this endpoint, outermost first.
         middleware: Vec<BoxMiddleware>,
+        /// Host/header predicates that must hold for this endpoint to match.
+        predicates: Predicates,
     },
     /// An already-built [`Router`] mounted under the node's path.
     Nested {
@@ -296,6 +301,8 @@ pub enum RouteNodeType {
         router: Router,
         /// Middleware wrapping the mounted router, outermost first.
         middleware: Vec<BoxMiddleware>,
+        /// Host/header predicates that must hold for this nested router to match.
+        predicates: Predicates,
     },
     /// An endpoint answering every method at the node's path and everything beneath it.
     Mounted {
@@ -303,6 +310,8 @@ pub enum RouteNodeType {
         endpoint_factory: EndpointFactory,
         /// Middleware wrapping the mounted endpoint, outermost first.
         middleware: Vec<BoxMiddleware>,
+        /// Host/header predicates that must hold for this mounted endpoint to match.
+        predicates: Predicates,
     },
 }
 
@@ -317,7 +326,9 @@ impl fmt::Debug for RouteNodeType {
                 .field("method", method)
                 .field("middleware", &middleware.len())
                 .finish(),
-            Self::Nested { router, middleware } => f
+            Self::Nested {
+                router, middleware, ..
+            } => f
                 .debug_struct("Nested")
                 .field("router", router)
                 .field("middleware", &middleware.len())
@@ -419,6 +430,67 @@ impl Route {
         for node in &mut self.nodes {
             node.apply_middleware(middleware);
         }
+    }
+
+    fn apply_predicate(&mut self, predicate: &Predicates) {
+        for node in &mut self.nodes {
+            node.apply_predicate(predicate);
+        }
+    }
+
+    /// Restrict every route in this subtree to requests whose `Host` header (or URI authority)
+    /// matches `host`.
+    ///
+    /// Supports exact hostnames (e.g. `"api.example.com"`) and wildcard subdomains
+    /// (e.g. `"*.example.com"`). Matching is case-insensitive and ignores any port suffix.
+    #[must_use]
+    pub fn host(mut self, host: impl AsRef<str>) -> Self {
+        let mut predicates = Predicates::default();
+        predicates.add_host(HostPattern::parse(host.as_ref()));
+        self.apply_predicate(&predicates);
+        self
+    }
+
+    /// Restrict every route in this subtree to requests carrying header `name` with `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not a valid HTTP header name or `value` is not a valid HTTP header value.
+    #[must_use]
+    pub fn header<N, V>(mut self, name: N, value: V) -> Self
+    where
+        N: TryInto<crate::header::HeaderName>,
+        V: TryInto<crate::header::HeaderValue>,
+    {
+        let name = name
+            .try_into()
+            .unwrap_or_else(|_| panic!("invalid header name"));
+        let value = value
+            .try_into()
+            .unwrap_or_else(|_| panic!("invalid header value"));
+        let mut predicates = Predicates::default();
+        predicates.add_header(HeaderPredicate::Exact(name, value));
+        self.apply_predicate(&predicates);
+        self
+    }
+
+    /// Restrict every route in this subtree to requests carrying header `name` (with any value).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not a valid HTTP header name.
+    #[must_use]
+    pub fn header_exists<N>(mut self, name: N) -> Self
+    where
+        N: TryInto<crate::header::HeaderName>,
+    {
+        let name = name
+            .try_into()
+            .unwrap_or_else(|_| panic!("invalid header name"));
+        let mut predicates = Predicates::default();
+        predicates.add_header(HeaderPredicate::Exists(name));
+        self.apply_predicate(&predicates);
+        self
     }
 
     /// Convert this route into plain nodes for mounting inside a larger tree.
@@ -584,6 +656,7 @@ impl RouteNode {
                 openapi,
                 requirements,
                 middleware: Vec::new(),
+                predicates: Predicates::default(),
             },
         }
     }
@@ -605,6 +678,7 @@ impl RouteNode {
             node_type: RouteNodeType::Nested {
                 router,
                 middleware: Vec::new(),
+                predicates: Predicates::default(),
             },
         }
     }
@@ -621,6 +695,7 @@ impl RouteNode {
             node_type: RouteNodeType::Mounted {
                 endpoint_factory,
                 middleware: Vec::new(),
+                predicates: Predicates::default(),
             },
         }
     }
@@ -638,6 +713,72 @@ impl RouteNode {
                 middleware: stack, ..
             } => stack.insert(0, Rc::clone(middleware)),
         }
+    }
+
+    fn apply_predicate(&mut self, predicate: &Predicates) {
+        match &mut self.node_type {
+            RouteNodeType::Route(route) => route.apply_predicate(predicate),
+            RouteNodeType::Endpoint { predicates, .. }
+            | RouteNodeType::Nested { predicates, .. }
+            | RouteNodeType::Mounted { predicates, .. } => predicates.merge_from(predicate),
+        }
+    }
+
+    /// Restrict this node (and any nested children) to requests whose `Host` header (or URI
+    /// authority) matches `host`.
+    ///
+    /// Supports exact hostnames (e.g. `"api.example.com"`) and wildcard subdomains
+    /// (e.g. `"*.example.com"`). Matching is case-insensitive and ignores any port suffix.
+    #[must_use]
+    pub fn host(mut self, host: impl AsRef<str>) -> Self {
+        let mut predicates = Predicates::default();
+        predicates.add_host(HostPattern::parse(host.as_ref()));
+        self.apply_predicate(&predicates);
+        self
+    }
+
+    /// Restrict this node (and any nested children) to requests carrying header `name` with
+    /// `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not a valid HTTP header name or `value` is not a valid HTTP header value.
+    #[must_use]
+    pub fn header<N, V>(mut self, name: N, value: V) -> Self
+    where
+        N: TryInto<crate::header::HeaderName>,
+        V: TryInto<crate::header::HeaderValue>,
+    {
+        let name = name
+            .try_into()
+            .unwrap_or_else(|_| panic!("invalid header name"));
+        let value = value
+            .try_into()
+            .unwrap_or_else(|_| panic!("invalid header value"));
+        let mut predicates = Predicates::default();
+        predicates.add_header(HeaderPredicate::Exact(name, value));
+        self.apply_predicate(&predicates);
+        self
+    }
+
+    /// Restrict this node (and any nested children) to requests carrying header `name` (with any
+    /// value).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not a valid HTTP header name.
+    #[must_use]
+    pub fn header_exists<N>(mut self, name: N) -> Self
+    where
+        N: TryInto<crate::header::HeaderName>,
+    {
+        let name = name
+            .try_into()
+            .unwrap_or_else(|_| panic!("invalid header name"));
+        let mut predicates = Predicates::default();
+        predicates.add_header(HeaderPredicate::Exists(name));
+        self.apply_predicate(&predicates);
+        self
     }
 
     /// Attach middleware to just this node's endpoints.
