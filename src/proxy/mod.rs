@@ -293,13 +293,12 @@ impl Proxy {
         }
         // The protocols the client offers to switch to, kept only where the server can hand its
         // connection over once the upstream switches.
-        let offered = if headers::requests_upgrade(request.headers())
-            && request.extensions().get::<UpgradeAvailable>().is_some()
-        {
-            headers::upgrade_fields(request.headers())
-        } else {
-            Vec::new()
-        };
+        let offered =
+            if headers::requests_upgrade(request.headers()) && UpgradeAvailable::is_set(request) {
+                headers::upgrade_fields(request.headers())
+            } else {
+                Vec::new()
+            };
 
         let version = request.version();
         let mut fields = request.headers().clone();
@@ -329,7 +328,7 @@ impl Proxy {
             fields.insert(header::HOST, host);
         }
 
-        let peer = request.extensions().get::<PeerAddr>().map(|peer| peer.ip());
+        let peer = PeerAddr::of(request).map(|peer| peer.ip());
         let trusted = peer.is_some_and(|peer| {
             request
                 .extensions()

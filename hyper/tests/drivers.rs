@@ -88,7 +88,7 @@ impl Endpoint for App {
         let file = Rc::clone(&self.file);
         let path = request.uri().path().to_owned();
         let version = request.version();
-        let upgradable = request.extensions().get::<UpgradeAvailable>().is_some();
+        let upgradable = UpgradeAvailable::is_set(request);
         async move {
             // Held across an await on purpose: the future is `!Send`.
             yield_now().await;

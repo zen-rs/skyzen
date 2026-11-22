@@ -462,8 +462,10 @@ fn work<F, A, W>(
         };
         let endpoint = WithContext {
             endpoint,
-            context: WorkerContext::new(Arc::clone(&plan.executor), ShutdownGuard(drain)),
-            io: plan.io.clone(),
+            shared: Arc::new(crate::runtime::context::NativeRequestContext {
+                worker: WorkerContext::new(Arc::clone(&plan.executor), ShutdownGuard(drain)),
+                io: plan.io.clone(),
+            }),
         };
         let (h1, h2) = servers(plan);
         // The QUIC endpoint, registered with this thread's runtime before anything reports
@@ -912,8 +914,7 @@ async fn announce(ready: &Sender<Result<(), RuntimeFailure>>) -> bool {
 #[derive(Debug, Clone)]
 struct WithContext<E> {
     endpoint: E,
-    context: WorkerContext,
-    io: IoSettings,
+    shared: Arc<crate::runtime::context::NativeRequestContext>,
 }
 
 impl<E: Endpoint> Endpoint for WithContext<E> {
@@ -923,8 +924,7 @@ impl<E: Endpoint> Endpoint for WithContext<E> {
         &mut self,
         request: &mut Request,
     ) -> impl core::future::Future<Output = Result<Response, Self::Error>> {
-        request.extensions_mut().insert(self.context.clone());
-        request.extensions_mut().insert(self.io.clone());
+        request.extensions_mut().insert(Arc::clone(&self.shared));
         self.endpoint.respond(request)
     }
 }

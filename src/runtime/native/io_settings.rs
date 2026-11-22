@@ -376,13 +376,12 @@ impl Extractor for IoSettings {
     fn extract(
         request: &mut crate::Request,
     ) -> impl Future<Output = Result<Self, Self::Error>> + Send {
-        ready(
-            request
-                .extensions()
-                .get::<Self>()
-                .cloned()
-                .ok_or_else(IoSettingsNotConfigured::new),
-        )
+        let extensions = request.extensions();
+        let found = extensions
+            .get::<std::sync::Arc<crate::runtime::context::NativeRequestContext>>()
+            .map(|shared| shared.io.clone())
+            .or_else(|| extensions.get::<Self>().cloned());
+        ready(found.ok_or_else(IoSettingsNotConfigured::new))
     }
 }
 

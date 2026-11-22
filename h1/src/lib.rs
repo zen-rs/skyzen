@@ -29,8 +29,8 @@ use http_kit_h1::{ServerConfig, ServerConnection, ServerOutcome, Service};
 use http_kit_io::{Listen, Listener, ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, Timer};
 use skyzen_core::{
     apply_pending_headers, error_response, log_endpoint_error,
-    upgrade::{OnUpgrade, UpgradeAvailable, Upgraded},
-    Endpoint, PeerAddr, PeerAddress, Server,
+    upgrade::{OnUpgrade, Upgraded},
+    ConnectionInfo, Endpoint, PeerAddress, Server,
 };
 use tracing::{debug, error, warn};
 
@@ -38,7 +38,7 @@ use tracing::{debug, error, warn};
 ///
 /// Requests on a connection are answered strictly in order, keep-alive and pipelining included,
 /// with the timeouts and limits [`ServerConfig`] sets. Every request carries the connection's
-/// `PeerAddr` and [`UpgradeAvailable`].
+/// `PeerAddr` and [`UpgradeAvailable`](skyzen_core::upgrade::UpgradeAvailable).
 #[derive(Debug, Clone, Default)]
 pub struct H1 {
     config: ServerConfig,
@@ -297,26 +297,23 @@ struct H1Service<E> {
 
 impl<E: Endpoint + Clone> Service for H1Service<E> {
     async fn call(&self, mut request: Request) -> Response {
-        let method = request.method().clone();
-        let path = request.uri().path().to_owned();
-        if let Some(peer) = self.peer {
-            request.extensions_mut().insert(PeerAddr::new(peer));
-        }
-        request.extensions_mut().insert(UpgradeAvailable);
+        request
+            .extensions_mut()
+            .insert(ConnectionInfo::new(self.peer, true));
 
         let mut endpoint = self.endpoint.clone();
         let mut response = match endpoint.respond(&mut request).await {
             Ok(response) => {
                 tracing::info!(
-                    method = method.as_str(),
-                    path = path.as_str(),
+                    method = request.method().as_str(),
+                    path = request.uri().path(),
                     status = response.status().as_u16(),
                     "request completed"
                 );
                 response
             }
             Err(error) => {
-                log_endpoint_error(&error, &method, path.as_str());
+                log_endpoint_error(&error, request.method(), request.uri().path());
                 let mut response = error_response(&error);
                 apply_pending_headers(&request, &mut response);
                 response
