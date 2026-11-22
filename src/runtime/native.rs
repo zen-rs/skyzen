@@ -414,18 +414,20 @@ pub fn apply_tls_overrides(args: impl IntoIterator<Item = String>) -> Option<Tls
     }
 }
 
-/// The server that answers cleartext HTTP on the serving threads.
+/// The protocol selection for cleartext HTTP connections on the serving threads.
 ///
-/// TLS is not a choice: `skyzen-h1` serves cleartext only, so a TLS listener is always hyper's,
-/// with ALPN choosing HTTP/1.1 or HTTP/2.
+/// TLS connections negotiate their protocol through ALPN (`h2` on `skyzen-h2`, `http/1.1` on
+/// `skyzen-h1`) directly over `http-kit-tls`'s owned-buffer stream, independent of this setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HttpServer {
-    /// Skyzen's own HTTP/1.1 server on owned-buffer I/O (`skyzen-h1`), the default.
+    /// Sniff up to the 24-byte HTTP/2 connection preface over `ReadOwned` and hand the buffered
+    /// prefix straight to `skyzen-h1` or `skyzen-h2` without copying (default).
     #[default]
+    Auto,
+    /// Serve HTTP/1.1 exclusively (`skyzen-h1`), without sniffing the opening bytes.
     H1,
-    /// Hyper: HTTP/1.1 and prior-knowledge HTTP/2 (h2c), over the compio stream's copying
-    /// poll-style bridge. Without the per-thread connection limit the default server applies.
-    Hyper,
+    /// Serve prior-knowledge HTTP/2 exclusively (`skyzen-h2`).
+    H2,
 }
 
 impl std::str::FromStr for HttpServer {
@@ -433,18 +435,21 @@ impl std::str::FromStr for HttpServer {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "auto" => Ok(Self::Auto),
             "h1" => Ok(Self::H1),
-            "hyper" => Ok(Self::Hyper),
-            other => Err(format!("`{other}` is not a server; use `h1` or `hyper`")),
+            "h2" => Ok(Self::H2),
+            other => Err(format!(
+                "`{other}` is not a server; use `auto`, `h1` or `h2`"
+            )),
         }
     }
 }
 
-/// Parse `--server`, falling back to `SKYZEN_SERVER`, and to the default [`HttpServer::H1`].
+/// Parse `--server`, falling back to `SKYZEN_SERVER`, and to the default [`HttpServer::Auto`].
 ///
 /// # Panics
 ///
-/// A value that names no server kills the process at startup: silently serving the other
+/// A value that names no server kills the process at startup: silently serving a different
 /// protocol set than the one asked for is worse than not starting.
 #[must_use]
 pub fn apply_server_override(args: impl IntoIterator<Item = String>) -> HttpServer {
@@ -459,7 +464,7 @@ pub fn apply_server_override(args: impl IntoIterator<Item = String>) -> HttpServ
         } else if arg == "--server" {
             flag = Some(
                 args.next()
-                    .unwrap_or_else(|| panic!("--server expects `h1` or `hyper` after it")),
+                    .unwrap_or_else(|| panic!("--server expects `auto`, `h1` or `h2` after it")),
             );
         }
     }
@@ -1195,7 +1200,7 @@ where
         tls,
         http3: http3.zip(http3_port).map(|(http3, port)| cores::Http3Plan {
             http3,
-            alt_svc: skyzen_hyper::AltSvc::h3(port),
+            alt_svc: skyzen_core::AltSvc::h3(port),
         }),
     };
     let started = cores::start(plan, bound, &stopping, &drain, &released)?;
@@ -1912,9 +1917,9 @@ mod tests {
 
     #[test]
     #[serial]
-    fn the_default_server_is_h1() {
+    fn the_default_server_is_auto() {
         let _env = EnvGuard::clear_var("SKYZEN_SERVER");
-        assert_eq!(server_override(&["app"]), super::HttpServer::H1);
+        assert_eq!(server_override(&["app"]), super::HttpServer::Auto);
     }
 
     #[test]
@@ -1922,21 +1927,21 @@ mod tests {
     fn the_server_flag_beats_the_environment() {
         let _env = EnvGuard::set_var("SKYZEN_SERVER", "h1");
         assert_eq!(
-            server_override(&["app", "--server", "hyper"]),
-            super::HttpServer::Hyper
+            server_override(&["app", "--server", "h2"]),
+            super::HttpServer::H2
         );
         assert_eq!(
-            server_override(&["app", "--server=hyper"]),
-            super::HttpServer::Hyper
+            server_override(&["app", "--server=auto"]),
+            super::HttpServer::Auto
         );
         assert_eq!(server_override(&["app"]), super::HttpServer::H1);
     }
 
     #[test]
     #[serial]
-    fn the_server_environment_variable_selects_hyper() {
-        let _env = EnvGuard::set_var("SKYZEN_SERVER", "hyper");
-        assert_eq!(server_override(&["app"]), super::HttpServer::Hyper);
+    fn the_server_environment_variable_selects_h2() {
+        let _env = EnvGuard::set_var("SKYZEN_SERVER", "h2");
+        assert_eq!(server_override(&["app"]), super::HttpServer::H2);
     }
 
     #[test]
@@ -1945,6 +1950,14 @@ mod tests {
     fn an_unknown_server_stops_the_process() {
         let _env = EnvGuard::clear_var("SKYZEN_SERVER");
         let _ = server_override(&["app", "--server", "apache"]);
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "not a server")]
+    fn the_removed_hyper_server_stops_the_process() {
+        let _env = EnvGuard::clear_var("SKYZEN_SERVER");
+        let _ = server_override(&["app", "--server", "hyper"]);
     }
 
     /// `apply_tls_overrides` through the same iterator shape `#[skyzen::main]` hands it:

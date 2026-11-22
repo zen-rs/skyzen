@@ -1,8 +1,8 @@
 [workspace]
-members = ["core", "h1", "hyper", "lambda", "macros", "manifest", "services", "test", "redis", "s3", "cloudflare", "cloudflare-admin", "aws", "azure", "cli", "examples/queue-consumer"]
+members = ["core", "h1", "h2", "hyper", "lambda", "macros", "manifest", "services", "test", "redis", "s3", "cloudflare", "cloudflare-admin", "aws", "azure", "cli", "examples/queue-consumer"]
 # cloudflare is wasm32-only — exclude from default builds, build with:
 #   cargo check -p skyzen-cloudflare --target wasm32-unknown-unknown
-default-members = ["core", "h1", "hyper", "lambda", "macros", "manifest", "services", "test", "redis", "s3", "cloudflare-admin", "aws", "azure", "cli", "examples/queue-consumer", "."]
+default-members = ["core", "h1", "h2", "hyper", "lambda", "macros", "manifest", "services", "test", "redis", "s3", "cloudflare-admin", "aws", "azure", "cli", "examples/queue-consumer", "."]
 resolver = "2"
 
 [workspace.dependencies]
@@ -22,9 +22,11 @@ compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default
 http-kit = { git = "https://github.com/zen-rs/http-kit", branch = "main" }
 http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
 http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
+http-kit-h2 = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false }
 executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "main", default-features = false, features = ["std", "async-executor"] }
 skyzen-hyper = { path = "hyper", version = "0.3.0" }
 skyzen-h1 = { path = "h1", version = "0.1.0" }
+skyzen-h2 = { path = "h2", version = "0.1.0" }
 skyzen-lambda = { path = "lambda", version = "0.3.0" }
 tracing = "0.1.44"
 skyzen = { path = ".", version = "0.6.1" }
@@ -162,6 +164,7 @@ executor-core = { workspace = true, features = ["smol", "compio"] }
 compio = { workspace = true, features = ["runtime", "net", "time", "io", "fs"] }
 http-kit-io = { workspace = true, features = ["compio"] }
 skyzen-h1.workspace = true
+skyzen-h2.workspace = true
 # One `SO_REUSEPORT` listener per serving thread, which `std` cannot configure.
 socket2 = { version = "0.6.5", default-features = false, features = ["all"] }
 # File-region bodies, so the static file server's responses can be sent with sendfile/splice.
@@ -177,11 +180,9 @@ async-io.workspace = true
 # available on WASM when the `sse` feature is enabled
 async-channel = "2.5"
 ctrlc.workspace = true
-hyper = { version = "1.8", features = ["server", "http1", "http2"] }
-http-body-util = "0.1.3"
 # Optional native dependencies
 tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "signal"], optional = true }
-skyzen-hyper.workspace = true
+skyzen-hyper = { workspace = true, optional = true }
 jsonwebtoken = { version = "10", optional = true, features = ["aws_lc_rs"] }
 # The AWS Lambda adapter, which brings its own Tokio runtime; see the `lambda` feature.
 skyzen-lambda = { workspace = true, optional = true }
@@ -191,11 +192,11 @@ skyzen-lambda = { workspace = true, optional = true }
 http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
 # The reverse proxy's upstream client (`proxy`): zenwave's native backend, HTTP/1.1 on
-# `http-kit-h1` over the same `http-kit-io` sockets the server runs on, with a connection pool on
-# each serving thread. zenwave refuses to build without a default backend; `native-compio` is the
-# one whose runtime this crate already links, though the proxy only ever starts pools on the
-# serving thread's own runtime.
-zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-compio"], optional = true }
+# `http-kit-h1` and HTTP/2 on `http-kit-h2` over the same `http-kit-io` sockets the server runs on,
+# with a connection pool on each serving thread. zenwave refuses to build without a default backend;
+# `native-compio` is the one whose runtime this crate already links, though the proxy only ever
+# starts pools on the serving thread's own runtime.
+zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-compio", "native-http2"], optional = true }
 # HTTP/3 (`http3` feature): quiche over the same compio threads. quiche builds BoringSSL from
 # source, so only a build that asks for HTTP/3 pays for it; `fs` lets a file-region body (static
 # files) go out over a QUIC stream. A QUIC writer offers no pipe, so a proxied body reaches it as
@@ -214,7 +215,7 @@ libc = "0.2"
 io-uring = { version = "0.7.16", default-features = false }
 skyzen-core = { workspace = true, features = ["steering", "busy-poll"] }
 http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, features = ["kernel"], optional = true }
-zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-compio", "native-kernel-tls"], optional = true }
+zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-compio", "native-http2", "native-kernel-tls"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The `Server` tests and `examples/embed_hyper.rs` run their own smol executor.
@@ -253,6 +254,7 @@ zstd = { version = "0.13", default-features = false }
 # `tests/proxy.rs` drives the proxy with a raw HTTP/1.1 client, which sends and reads trailers and
 # pulls a body only as fast as the test asks.
 http-kit-h1.workspace = true
+http-kit-h2.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The wasm half of the OpenAPI handler registry; see `src/openapi/registry.rs` for why
@@ -390,10 +392,7 @@ lambda = ["dep:skyzen-lambda"]
 # The `hyper` feature provides the Hyper server adapter (`skyzen::hyper`).
 # Use this when embedding Skyzen into your own application with a custom runtime.
 # You only need to bring your own tokio runtime; no need to import hyper or hyper-util directly.
-# Note: `skyzen-hyper` is a plain native dependency — the built-in runtime installs its
-# `hyper::rt::Timer` rather than carrying a second copy — so this feature only controls whether
-# the adapter is re-exported as `skyzen::hyper`.
-hyper = []
+hyper = ["dep:skyzen-hyper"]
 
 [[example]]
 name = "embed_hyper"
@@ -406,7 +405,7 @@ required-features = ["sqlite"]
 
 [[test]]
 name = "hyper_websocket"
-required-features = ["sqlite"]
+required-features = ["sqlite", "hyper"]
 
 [[test]]
 name = "proxy"

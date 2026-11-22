@@ -17,6 +17,7 @@ fs = ["http-kit-h1/fs"]
 
 [dependencies]
 skyzen-core.workspace = true
+bytes = { version = "1.11", default-features = false }
 http-kit.workspace = true
 http-kit-io.workspace = true
 # `pipe`: a request body splices into a consumer that offers a pipe, and a pipe frame in a

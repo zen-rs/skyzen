@@ -15,23 +15,26 @@
 //! Windows cannot share a socket that way, since a completion port takes a socket only once: one
 //! thread accepts and deals the connections out to the serving threads (see [`super::handoff`]).
 
-use core::{convert::Infallible, future::Future};
-use std::{io, num::NonZeroUsize, rc::Rc, sync::Arc, thread};
+use core::{convert::Infallible, future::Future, pin::pin};
+use std::{cell::Cell, io, num::NonZeroUsize, rc::Rc, sync::Arc, thread, time::Duration};
 
 use async_channel::{bounded, Receiver, Sender};
-use executor_core::{compio::Runtime, AnyExecutor};
+use bytes::BytesMut;
+use executor_core::{compio::Runtime, AnyExecutor, LocalExecutor as _, Task as _};
+use futures_util::future::{select, Either};
 #[cfg(not(windows))]
 use http_kit_io::FromStd as _;
 #[cfg(unix)]
 use http_kit_io::FromStdUnix as _;
 use http_kit_io::{
     compio::{Compio, Ring, TcpStream},
-    IntoPoll, Listener, ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions,
+    BufResult, Listener, Read, ReadOwned, Received, SendFile, SpliceRead, SpliceWrite, Split,
+    TcpOptions, Timer as _, Write,
 };
-use skyzen_core::{EndpointFactory, PeerAddress};
+use skyzen_core::{AltSvc, EndpointFactory, PeerAddress};
 use skyzen_h1::H1;
-use skyzen_hyper::{AltSvc, Hyper};
-use tracing::error;
+use skyzen_h2::{CLIENT_PREFACE, H2};
+use tracing::{debug, error, warn};
 
 use super::{
     busy_poll::BusyPoll,
@@ -276,8 +279,8 @@ pub(super) struct Plan<F, W> {
     pub(super) wrap: W,
     /// Where `WorkerContext::wait_until` runs post-response work.
     pub(super) executor: Arc<AnyExecutor>,
-    /// How many connections one thread keeps open before it refuses more. Applies to the default
-    /// server and to TLS; [`Hyper`] on a cleartext listener has no such limit.
+    /// How many connections one thread keeps open before it refuses more, on cleartext and TLS
+    /// listeners alike.
     pub(super) max_connections: NonZeroUsize,
     /// The receive ring every thread's runtime is built with, and the driver, carrying the shared
     /// zero-copy and file-table settings, its sockets run on.
@@ -413,6 +416,18 @@ where
     Ok((ring, (plan.wrap)(endpoint)?))
 }
 
+/// Build the per-thread HTTP/1.1 and HTTP/2 servers from `plan`.
+fn servers<F, W>(plan: &Plan<F, W>) -> (H1, H2) {
+    let mut h1 = H1::default().with_max_connections(plan.max_connections);
+    let mut h2 = H2::default().with_max_connections(plan.max_connections);
+    if let Some(http3) = &plan.http3 {
+        let alt_svc = http3.alt_svc.header_value();
+        h1 = h1.with_alt_svc(alt_svc.clone());
+        h2 = h2.with_alt_svc(alt_svc);
+    }
+    (h1, h2)
+}
+
 /// The body of one serving thread: a compio runtime that serves until `stop` closes and runs until
 /// `release` does.
 fn work<F, A, W>(
@@ -450,13 +465,10 @@ fn work<F, A, W>(
             context: WorkerContext::new(Arc::clone(&plan.executor), ShutdownGuard(drain)),
             io: plan.io.clone(),
         };
-        let mut h1 = H1::default().with_max_connections(plan.max_connections);
+        let (h1, h2) = servers(plan);
         // The QUIC endpoint, registered with this thread's runtime before anything reports
         // ready: a certificate QUIC cannot load is a failed start, not a TLS-only server.
         // Every thread's TLS responses advertise it, including one that does not run QUIC itself.
-        if let Some(plan) = &plan.http3 {
-            h1 = h1.with_alt_svc(plan.alt_svc.header_value());
-        }
         let http3 = match (&plan.http3, udp) {
             (Some(plan), Some(udp)) => match plan.http3.server(udp, &io) {
                 Ok(server) => Some(server),
@@ -492,8 +504,10 @@ fn work<F, A, W>(
                 #[cfg(not(windows))]
                 Socket::Tcp(listener) => match ring.tcp_listener(listener) {
                     Ok(listener) => {
-                        serve_tcp(plan, &h1, executor, io, listener, endpoint, shutdown, ready)
-                            .await;
+                        serve_tcp(
+                            plan, &h1, &h2, executor, io, listener, endpoint, shutdown, ready,
+                        )
+                        .await;
                     }
                     Err(error) => {
                         let _ = ready.send(Err(error.into())).await;
@@ -501,7 +515,10 @@ fn work<F, A, W>(
                 },
                 Socket::Handoff(incoming) => {
                     let listener = incoming.adopted_by(ring);
-                    serve_tcp(plan, &h1, executor, io, listener, endpoint, shutdown, ready).await;
+                    serve_tcp(
+                        plan, &h1, &h2, executor, io, listener, endpoint, shutdown, ready,
+                    )
+                    .await;
                 }
                 #[cfg(unix)]
                 Socket::Unix(listener) => match ring.unix_listener(listener) {
@@ -509,7 +526,9 @@ fn work<F, A, W>(
                         if announce(ready).await {
                             serve_cleartext(
                                 plan.server,
+                                plan.max_connections,
                                 &h1,
+                                &h2,
                                 executor,
                                 io,
                                 listener,
@@ -541,6 +560,7 @@ fn work<F, A, W>(
 async fn serve_tcp<F, W, L, E>(
     plan: &Plan<F, W>,
     h1: &H1,
+    h2: &H2,
     executor: Rc<Runtime>,
     io: Compio,
     listener: L,
@@ -556,8 +576,8 @@ async fn serve_tcp<F, W, L, E>(
     }
     let listener = NoDelay(listener);
     match &plan.tls {
-        // ALPN chooses the protocol on the decrypted stream: `h2` is hyper's, anything else is
-        // HTTP/1.1 served by the plan's selected server.
+        // ALPN chooses the protocol on the decrypted stream: `h2` goes straight to `skyzen-h2`,
+        // anything else to `skyzen-h1`, both directly over the owned-buffer TLS stream.
         Some(tls) => {
             super::tls::serve(
                 executor,
@@ -568,15 +588,25 @@ async fn serve_tcp<F, W, L, E>(
                 plan.max_connections,
                 Protocols {
                     io,
-                    server: plan.server,
                     h1: h1.clone(),
-                    alt_svc: plan.http3.as_ref().map(|plan| plan.alt_svc.clone()),
+                    h2: h2.clone(),
                 },
             )
             .await;
         }
         None => {
-            serve_cleartext(plan.server, h1, executor, io, listener, endpoint, shutdown).await;
+            serve_cleartext(
+                plan.server,
+                plan.max_connections,
+                h1,
+                h2,
+                executor,
+                io,
+                listener,
+                endpoint,
+                shutdown,
+            )
+            .await;
         }
     }
 }
@@ -605,10 +635,128 @@ where
     }
 }
 
+/// Recombines already-split read and write halves into a [`Split`] value so a connection whose
+/// opening bytes were sniffed over [`ReadOwned`] can be handed straight to `skyzen-h1` or
+/// `skyzen-h2` without wrapping the stream.
+struct SplitHalves<R, W>(R, W);
+
+impl<R: Read + 'static, W: Write + 'static> Split for SplitHalves<R, W> {
+    type ReadHalf = R;
+    type WriteHalf = W;
+
+    fn split(self) -> (R, W) {
+        (self.0, self.1)
+    }
+}
+
+/// Counts an open connection on an `Auto` cleartext listener against `max_connections`.
+struct ConnSlot(Rc<Cell<usize>>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+/// Outcome of sniffing up to `CLIENT_PREFACE.len()` (24) opening bytes over [`ReadOwned`].
+enum Sniffed {
+    Http1(BytesMut),
+    Http2(BytesMut),
+    Closed,
+}
+
+/// Read opening bytes on `read` over [`ReadOwned`] (with [`Read::read`] fallback when no ring
+/// buffer is lent) to distinguish prior-knowledge HTTP/2 (`CLIENT_PREFACE`) from HTTP/1.1 without
+/// placing a copying stream adapter in front of the socket.
+///
+/// Any byte that diverges from `CLIENT_PREFACE` returns [`Sniffed::Http1`] immediately after the
+/// first read, and while waiting on an idle connection `read_owned` pins no buffer of its own on
+/// Linux's multishot receive ring.
+async fn sniff_cleartext<R: ReadOwned>(
+    read: &mut R,
+    timer: &Compio,
+    timeout: Option<Duration>,
+) -> Sniffed {
+    let mut buf = BytesMut::with_capacity(CLIENT_PREFACE.len());
+    let mut deadline = pin!(async {
+        match timeout {
+            Some(duration) => timer.sleep(duration).await,
+            None => core::future::pending().await,
+        }
+    });
+
+    while buf.len() < CLIENT_PREFACE.len() {
+        let wanted = CLIENT_PREFACE.len() - buf.len();
+        let received = {
+            let next = pin!(read.read_owned());
+            match select(next, deadline.as_mut()).await {
+                Either::Left((Ok(received), _)) => received,
+                Either::Left((Err(error), _)) => {
+                    debug!("cleartext preface sniff failed: {error}");
+                    return Sniffed::Closed;
+                }
+                Either::Right(((), _)) => {
+                    debug!("timed out waiting for cleartext request or HTTP/2 preface");
+                    return Sniffed::Closed;
+                }
+            }
+        };
+        let empty = match received {
+            Received::Lent(lent) => {
+                buf.extend_from_slice(&lent);
+                lent.is_empty()
+            }
+            Received::Owned(bytes) => {
+                let empty = bytes.is_empty();
+                buf.extend_from_slice(&bytes);
+                empty
+            }
+            Received::End => true,
+            Received::ReadInstead => {
+                let scratch = Vec::with_capacity(wanted);
+                let next = pin!(read.read(scratch));
+                match select(next, deadline.as_mut()).await {
+                    Either::Left((BufResult(Ok(0), _), _)) => true,
+                    Either::Left((BufResult(Ok(_), filled), _)) => {
+                        buf.extend_from_slice(&filled);
+                        false
+                    }
+                    Either::Left((BufResult(Err(error), _), _)) => {
+                        debug!("cleartext preface read failed: {error}");
+                        return Sniffed::Closed;
+                    }
+                    Either::Right(((), _)) => {
+                        debug!("timed out waiting for cleartext request or HTTP/2 preface");
+                        return Sniffed::Closed;
+                    }
+                }
+            }
+        };
+        if empty {
+            return if buf.is_empty() {
+                Sniffed::Closed
+            } else {
+                Sniffed::Http1(buf)
+            };
+        }
+        let check_len = buf.len().min(CLIENT_PREFACE.len());
+        if CLIENT_PREFACE[..check_len] != buf[..check_len] {
+            return Sniffed::Http1(buf);
+        }
+    }
+    Sniffed::Http2(buf)
+}
+
 /// Serve `listener`, TCP or unix, in cleartext with the chosen server.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one serving thread's pieces, each owned by the caller's frame"
+)]
 async fn serve_cleartext<L, E>(
     server: HttpServer,
+    max_connections: NonZeroUsize,
     h1: &H1,
+    h2: &H2,
     executor: Rc<Runtime>,
     io: Compio,
     listener: L,
@@ -616,24 +764,134 @@ async fn serve_cleartext<L, E>(
     shutdown: impl Future<Output = ()> + 'static,
 ) where
     L: Listener,
-    L::Stream: Split + IntoPoll + 'static,
-    <L::Stream as IntoPoll>::Poll: 'static,
+    L::Stream: Split + 'static,
     <L::Stream as Split>::ReadHalf: ReadOwned + SpliceRead,
     <L::Stream as Split>::WriteHalf: SendFile + SpliceWrite,
     L::Addr: PeerAddress,
     E: Endpoint + Clone + 'static,
 {
     match server {
+        HttpServer::Auto => {
+            serve_auto_cleartext(
+                max_connections,
+                h1,
+                h2,
+                executor,
+                io,
+                listener,
+                endpoint,
+                shutdown,
+            )
+            .await;
+        }
         HttpServer::H1 => {
             h1.serve_listener(io, executor, listener, endpoint, shutdown)
                 .await;
         }
-        HttpServer::Hyper => {
-            Hyper
-                .serve_listener(io, executor, listener, endpoint, shutdown)
+        HttpServer::H2 => {
+            h2.serve_listener(io, executor, listener, endpoint, shutdown)
                 .await;
         }
     }
+}
+
+/// Accept cleartext connections and route each without copying to [`H1`] or [`H2`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one serving thread's pieces, each owned by the caller's frame"
+)]
+async fn serve_auto_cleartext<L, E>(
+    max_connections: NonZeroUsize,
+    h1: &H1,
+    h2: &H2,
+    executor: Rc<Runtime>,
+    io: Compio,
+    listener: L,
+    endpoint: E,
+    shutdown: impl Future<Output = ()> + 'static,
+) where
+    L: Listener,
+    L::Stream: Split + 'static,
+    <L::Stream as Split>::ReadHalf: ReadOwned + SpliceRead,
+    <L::Stream as Split>::WriteHalf: SendFile + SpliceWrite,
+    L::Addr: PeerAddress,
+    E: Endpoint + Clone + 'static,
+{
+    let (stop, stopping) = bounded::<Infallible>(1);
+    let (live, drained) = bounded::<Infallible>(1);
+    let open = Rc::new(Cell::new(0_usize));
+    let timeout = h2.config().handshake_timeout;
+
+    let mut shutdown = pin!(shutdown);
+    loop {
+        let accept = pin!(listener.accept());
+        let (stream, peer) = match select(accept, shutdown.as_mut()).await {
+            Either::Left((Ok(accepted), _)) => accepted,
+            Either::Left((Err(error), _)) => {
+                error!("accept failed: {error}");
+                continue;
+            }
+            Either::Right(((), _)) => break,
+        };
+        if open.get() >= max_connections.get() {
+            warn!("connection limit reached; closing a connection");
+            continue;
+        }
+        let peer = peer.socket_addr();
+        debug!(?peer, "accepted a cleartext connection");
+
+        open.set(open.get() + 1);
+        let slot = ConnSlot(Rc::clone(&open));
+        let h1 = h1.clone();
+        let h2 = h2.clone();
+        let io = io.clone();
+        let conn_executor = Rc::clone(&executor);
+        let endpoint = endpoint.clone();
+        let stopping = stopping.clone();
+        let live = live.clone();
+        executor
+            .spawn_local(async move {
+                let _slot = slot;
+                let (mut read, write) = stream.split();
+                let sniffed = sniff_cleartext(&mut read, &io, timeout).await;
+                let stop = async move {
+                    let _ = stopping.recv().await;
+                };
+                match sniffed {
+                    Sniffed::Http1(read_buf) => {
+                        h1.serve_connection_with_read_buf(
+                            io,
+                            SplitHalves(read, write),
+                            read_buf,
+                            peer,
+                            endpoint,
+                            stop,
+                            live,
+                        )
+                        .await;
+                    }
+                    Sniffed::Http2(read_buf) => {
+                        h2.serve_connection_with_read_buf(
+                            io,
+                            conn_executor,
+                            SplitHalves(read, write),
+                            read_buf,
+                            peer,
+                            endpoint,
+                            stop,
+                            live,
+                        )
+                        .await;
+                    }
+                    Sniffed::Closed => drop(live),
+                }
+            })
+            .detach();
+    }
+
+    drop(stop);
+    drop(live);
+    let _ = drained.recv().await;
 }
 
 /// Report that this thread is accepting. `false` when nobody is waiting for the report any more.
@@ -850,6 +1108,72 @@ mod tests {
         assert_eq!(body, "origin");
     }
 
+    /// The body of an HTTP/2 request over a newly connected TCP socket to `addr`.
+    fn exchange_h2_tcp(addr: std::net::SocketAddr) -> String {
+        use futures_lite::future::zip;
+        use http_kit::StatusCode;
+        use http_kit_h2::{handshake_stream, ClientConfig};
+        use http_kit_io::{compio::Compio, Dial as _};
+
+        executor_core::compio::Runtime::new()
+            .expect("compio runtime")
+            .block_on(async move {
+                let io = Compio::default();
+                let stream = io.connect(addr).await.expect("connect h2c");
+                let (send, conn) = handshake_stream(stream, io, ClientConfig::default());
+                let mut req = Request::new(Body::empty());
+                *req.uri_mut() = format!("http://{addr}/").parse().unwrap();
+                let (ran, body) = zip(conn.run(), async move {
+                    let resp = send.send(req).await.expect("send h2c");
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    let bytes = resp.into_body().into_bytes().await.expect("read h2c body");
+                    drop(send);
+                    bytes
+                })
+                .await;
+                ran.expect("h2c connection");
+                String::from_utf8(body.to_vec()).expect("UTF-8 body")
+            })
+    }
+
+    #[cfg(unix)]
+    fn exchange_h2_unix(path: &std::path::Path) -> String {
+        use futures_lite::future::zip;
+        use http_kit::StatusCode;
+        use http_kit_h2::{handshake_stream, ClientConfig};
+        use http_kit_io::{compio::Compio, DialUnix as _};
+
+        executor_core::compio::Runtime::new()
+            .expect("compio runtime")
+            .block_on(async move {
+                let io = Compio::default();
+                let stream = io.connect_unix(path).await.expect("connect unix h2c");
+                let (send, conn) = handshake_stream(stream, io, ClientConfig::default());
+                let mut req = Request::new(Body::empty());
+                *req.uri_mut() = "http://localhost/".parse().unwrap();
+                let (ran, body) = zip(conn.run(), async move {
+                    let resp = send.send(req).await.expect("send unix h2c");
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    let bytes = resp.into_body().into_bytes().await.expect("unix h2c body");
+                    drop(send);
+                    bytes
+                })
+                .await;
+                ran.expect("unix h2c connection");
+                String::from_utf8(body.to_vec()).expect("UTF-8 body")
+            })
+    }
+
+    fn exchange_tcp(addr: std::net::SocketAddr, server: HttpServer, turn: usize) -> String {
+        match server {
+            HttpServer::H1 => exchange(std::net::TcpStream::connect(addr).expect("connect")),
+            HttpServer::Auto if turn.is_multiple_of(2) => {
+                exchange(std::net::TcpStream::connect(addr).expect("connect"))
+            }
+            HttpServer::H2 | HttpServer::Auto => exchange_h2_tcp(addr),
+        }
+    }
+
     /// Four serving threads on one address, and requests that land on more than one of them.
     ///
     /// Each connection goes to the listener the kernel picks, so asking for it over many
@@ -857,8 +1181,7 @@ mod tests {
     /// one under the same name.
     #[test]
     fn connections_land_on_more_than_one_runtime_thread() {
-        // Both servers a cleartext listener can be given run through the same threads.
-        for server in [HttpServer::H1, HttpServer::Hyper] {
+        for server in [HttpServer::Auto, HttpServer::H1, HttpServer::H2] {
             connections_spread_over_threads(server);
         }
     }
@@ -885,7 +1208,7 @@ mod tests {
     /// The same, through the acceptor that Windows uses in place of a shared socket.
     #[test]
     fn dealt_connections_land_on_more_than_one_runtime_thread() {
-        for server in [HttpServer::H1, HttpServer::Hyper] {
+        for server in [HttpServer::Auto, HttpServer::H1, HttpServer::H2] {
             let (incoming, acceptor) =
                 handoff::bind("127.0.0.1:0".parse().unwrap(), 4).expect("bind");
             let bound = Bound {
@@ -904,8 +1227,9 @@ mod tests {
     }
 
     fn assert_spread(addr: std::net::SocketAddr, server: HttpServer, serving: Serving) {
-        let served_by: BTreeSet<String> = (0..128)
-            .map(|_| exchange(std::net::TcpStream::connect(addr).expect("connect")))
+        let count = if server == HttpServer::H1 { 128 } else { 48 };
+        let served_by: BTreeSet<String> = (0..count)
+            .map(|turn| exchange_tcp(addr, server, turn))
             .collect();
 
         serving.stop();
@@ -1094,12 +1418,15 @@ mod tests {
         }
     }
 
-    /// A unix socket is served by the same threads under either server, and the file goes away
+    /// A unix socket is served by the same threads under every server mode, and the file goes away
     /// with the socket's owner, not with a connection.
     #[test]
     #[cfg(unix)]
     fn a_unix_socket_is_served_by_the_serving_threads() {
-        for (index, server) in [HttpServer::H1, HttpServer::Hyper].into_iter().enumerate() {
+        for (index, server) in [HttpServer::Auto, HttpServer::H1, HttpServer::H2]
+            .into_iter()
+            .enumerate()
+        {
             let path = std::env::temp_dir()
                 .join(format!("skyzen-cores-{}-{index}.sock", std::process::id()));
             let sockets = bind(
@@ -1112,17 +1439,33 @@ mod tests {
             .expect("bind the unix socket");
             let serving = Serving::start(sockets, server);
 
-            let body = exchange(std::os::unix::net::UnixStream::connect(&path).expect("connect"));
+            match server {
+                HttpServer::H1 => {
+                    let body =
+                        exchange(std::os::unix::net::UnixStream::connect(&path).expect("connect"));
+                    assert!(body.starts_with("skyzen-"), "{server:?}: {body}");
+                }
+                HttpServer::H2 => {
+                    let body = exchange_h2_unix(&path);
+                    assert!(body.starts_with("skyzen-"), "{server:?}: {body}");
+                }
+                HttpServer::Auto => {
+                    let b1 =
+                        exchange(std::os::unix::net::UnixStream::connect(&path).expect("connect"));
+                    let b2 = exchange_h2_unix(&path);
+                    assert!(b1.starts_with("skyzen-"), "{server:?}: {b1}");
+                    assert!(b2.starts_with("skyzen-"), "{server:?}: {b2}");
+                }
+            }
 
             serving.stop();
             std::fs::remove_file(&path).expect("the socket file is ours to remove");
-            assert!(body.starts_with("skyzen-"), "{server:?}: {body}");
         }
     }
 
     /// With `--fixed-buffers`, every serving thread registers its region before it accepts, and a
-    /// static file its cache read into the region is served whole over TCP, by either server:
-    /// `skyzen-h1` writes it zero-copy from the region, with the head copied in beside it.
+    /// static file its cache read into the region is served whole over TCP, by every server mode:
+    /// `skyzen-h1` and `skyzen-h2` write it zero-copy from the region.
     #[cfg(all(target_os = "linux", feature = "static-files"))]
     #[test]
     fn a_static_file_in_the_region_is_served_whole_over_tcp() {
@@ -1136,7 +1479,7 @@ mod tests {
         let document = CJK.repeat(128);
         std::fs::write(dir.path().join("index.html"), &document).unwrap();
         let root = Arc::new(dir.path().to_path_buf());
-        for server in [HttpServer::H1, HttpServer::Hyper] {
+        for server in [HttpServer::Auto, HttpServer::H1, HttpServer::H2] {
             let bound = bind(
                 &ListenAddr::Tcp("127.0.0.1:0".parse().unwrap()),
                 NonZeroUsize::new(2).unwrap(),
@@ -1163,7 +1506,7 @@ mod tests {
             // The first fills the cache of the thread that takes it; the rest are served from a
             // cache, on whichever thread the kernel hands each connection to.
             let bodies: Vec<String> = (0..4)
-                .map(|_| exchange(std::net::TcpStream::connect(addr).expect("connect")))
+                .map(|turn| exchange_tcp(addr, server, turn))
                 .collect();
             serving.stop();
             for body in bodies {

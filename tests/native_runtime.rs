@@ -115,23 +115,74 @@ fn the_example_serves_a_unix_socket_and_removes_it_on_sigint() {
 }
 
 #[test]
-fn the_example_serves_a_unix_socket_with_hyper_too() {
-    let path =
-        std::env::temp_dir().join(format!("skyzen-native-hyper-{}.sock", std::process::id()));
-    let server = Server::start(&[
+fn the_example_serves_h2c_on_tcp_and_unix_sockets_and_stops_on_sigint() {
+    use futures_lite::future::zip;
+    use http_kit::{Body, Request, StatusCode};
+    use http_kit_h2::{handshake_stream, ClientConfig};
+    use http_kit_io::{compio::Compio, Dial as _, DialUnix as _};
+
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        probe.local_addr().expect("local addr").port()
+    };
+    // Default (`auto`) serves prior-knowledge h2c on TCP alongside HTTP/1.1.
+    let tcp_server = Server::start(&["--port", &port.to_string()]);
+    drop(connect_when_ready(|| {
+        std::net::TcpStream::connect(("127.0.0.1", port))
+    }));
+
+    let runtime = executor_core::compio::Runtime::new().expect("compio runtime");
+    runtime.block_on(async {
+        let io = Compio::default();
+        let stream = io
+            .connect(([127, 0, 0, 1], port).into())
+            .await
+            .expect("connect tcp");
+        let (send, conn) = handshake_stream(stream, io, ClientConfig::default());
+        let mut req = Request::new(Body::empty());
+        *req.uri_mut() = format!("http://127.0.0.1:{port}/healthz").parse().unwrap();
+        let (ran, body) = zip(conn.run(), async move {
+            let resp = send.send(req).await.expect("send h2c");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.into_body().into_bytes().await.expect("h2c body");
+            drop(send);
+            bytes
+        })
+        .await;
+        ran.expect("h2c tcp connection");
+        assert!(std::str::from_utf8(&body).unwrap().contains("OK"));
+    });
+    assert!(tcp_server.interrupt(), "SIGINT is a graceful shutdown");
+
+    // Explicit `--server h2` serves prior-knowledge h2c over a unix domain socket too.
+    let path = std::env::temp_dir().join(format!("skyzen-native-h2-{}.sock", std::process::id()));
+    let unix_server = Server::start(&[
         "--server",
-        "hyper",
+        "h2",
         "--listen",
         &format!("unix:{}", path.display()),
     ]);
-
-    let response = exchange(connect_when_ready(|| {
+    drop(connect_when_ready(|| {
         std::os::unix::net::UnixStream::connect(&path)
     }));
-
-    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert!(body(&response).contains("OK"), "{response}");
-    assert!(server.interrupt(), "SIGINT is a graceful shutdown");
+    runtime.block_on(async {
+        let io = Compio::default();
+        let stream = io.connect_unix(&path).await.expect("connect unix h2c");
+        let (send, conn) = handshake_stream(stream, io, ClientConfig::default());
+        let mut req = Request::new(Body::empty());
+        *req.uri_mut() = "http://localhost/healthz".parse().unwrap();
+        let (ran, body) = zip(conn.run(), async move {
+            let resp = send.send(req).await.expect("send unix h2c");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.into_body().into_bytes().await.expect("unix h2c body");
+            drop(send);
+            bytes
+        })
+        .await;
+        ran.expect("h2c unix connection");
+        assert!(std::str::from_utf8(&body).unwrap().contains("OK"));
+    });
+    assert!(unix_server.interrupt(), "SIGINT is a graceful shutdown");
     assert!(!path.exists(), "the socket file is removed on shutdown");
 }
 

@@ -201,10 +201,10 @@ jobs:
           cache-on-failure: true
       - name: Build
         run: cargo build --manifest-path ci/minimal-consumer/Cargo.toml
-      - name: Dependency tree carries no other driver, runtime or TLS backend
+      - name: Dependency tree carries no other driver, runtime, Hyper or TLS backend
         run: |
           tree=$(cargo tree --manifest-path ci/minimal-consumer/Cargo.toml -e all --target all --prefix none)
-          if echo "$tree" | grep -E '^(sqlx-mysql|sqlx-postgres|async-std|native-tls) '; then
+          if echo "$tree" | grep -E '^(sqlx-mysql|sqlx-postgres|async-std|native-tls|hyper|h2|skyzen-hyper) '; then
             echo "::error::the minimal consumer's tree carries a crate it did not ask for"
             exit 1
           fi

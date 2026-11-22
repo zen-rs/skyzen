@@ -4,13 +4,61 @@
 //! `skyzen-hyper` adapter) so that peer-address handling and error-to-response conversion are
 //! defined exactly once.
 
-use core::future::Future;
+use core::{future::Future, time::Duration};
 use std::net::SocketAddr;
 
 use http_kit::{header, http_error, Body, HttpError, Method, Request, Response, StatusCode};
 use serde::Serialize;
 
 use crate::{error::ErrorChain, Extractor};
+
+/// An `Alt-Svc` value (RFC 7838) announcing an HTTP/3 endpoint.
+///
+/// A server that terminates TLS on TCP and serves HTTP/3 on UDP attaches it to its TCP responses
+/// so a client that reached it over HTTP/1.1 or HTTP/2 learns it can switch. Clients only honour
+/// the header over a secure connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AltSvc {
+    port: u16,
+    max_age: Duration,
+}
+
+impl AltSvc {
+    /// How long a client may remember the alternative unless [`max_age`](Self::max_age) says
+    /// otherwise: the 24 hours RFC 7838 §3.1 names as the default.
+    pub const DEFAULT_MAX_AGE: Duration = Duration::from_hours(24);
+
+    /// HTTP/3 on UDP `port` of the same host.
+    #[must_use]
+    pub const fn h3(port: u16) -> Self {
+        Self {
+            port,
+            max_age: Self::DEFAULT_MAX_AGE,
+        }
+    }
+
+    /// Let clients remember the alternative for `max_age`.
+    #[must_use]
+    pub const fn max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    /// The `Alt-Svc` header value this announces, for a server that attaches it by itself.
+    ///
+    /// # Panics
+    ///
+    /// Never: the value is visible ASCII by construction.
+    #[must_use]
+    pub fn header_value(&self) -> header::HeaderValue {
+        header::HeaderValue::from_str(&alloc::format!(
+            "h3=\":{}\"; ma={}",
+            self.port,
+            self.max_age.as_secs()
+        ))
+        .expect("an Alt-Svc value is visible ASCII")
+    }
+}
 
 /// The message a panicking task carried, when it carried a printable one.
 ///

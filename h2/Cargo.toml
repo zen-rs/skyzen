@@ -1,0 +1,39 @@
+[package]
+name = "skyzen-h2"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP/2 server backend for the Skyzen framework, on http-kit-h2 and owned-buffer I/O"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zen-rs/skyzen"
+readme = "../README.md"
+keywords = ["http", "http2", "web", "framework", "io-uring"]
+categories = ["web-programming::http-server"]
+
+[features]
+default = ["fs"]
+# File-region body frames — what the static file server emits natively — sent with the driver's
+# file-to-socket path (`sendfile`/`splice`, kernel TLS included).
+fs = ["http-kit-h2/fs"]
+
+[dependencies]
+skyzen-core.workspace = true
+bytes = { version = "1.11", default-features = false }
+http-kit.workspace = true
+http-kit-io.workspace = true
+# `pipe`: unpadded request `DATA` payloads splice into a consumer that offers a pipe, and a pipe
+# frame in a response body splices into `DATA` frames on the socket.
+http-kit-h2 = { workspace = true, features = ["pipe"] }
+executor-core.workspace = true
+tracing.workspace = true
+futures-util = { version = "0.3.32", default-features = false }
+async-channel = "2.5"
+
+[dev-dependencies]
+async-executor.workspace = true
+futures-lite = "2.6"
+http-kit-io = { workspace = true, features = ["async-io", "compio"] }
+executor-core = { workspace = true, features = ["compio"] }
+smol.workspace = true
+
+[lints]
+workspace = true

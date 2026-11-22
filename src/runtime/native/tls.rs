@@ -5,10 +5,9 @@
 //! `into_poll()` copy in front of the handshake. On Linux the record layer is then handed to the
 //! kernel, so a file-region body leaves through `sendfile`/`splice` already encrypted.
 //!
-//! ALPN picks the protocol the decrypted stream speaks. `h2` is hyper's HTTP/2 over the stream's
-//! copying poll view, after the connection preface has been read; anything else is HTTP/1.1,
-//! served by the server the plan selected — skyzen's own `skyzen-h1` by default, on the
-//! owned-buffer stream itself, or hyper when `--server hyper` picked it.
+//! ALPN picks the protocol the decrypted stream speaks: `h2` goes directly to `skyzen-h2` and
+//! anything else to `skyzen-h1`, both over the owned-buffer TLS stream without a copying poll
+//! bridge. On Linux both HTTP/1.1 and HTTP/2 run over kernel TLS with `sendfile` and `splice`.
 //!
 //! Without the `server-tls` feature [`ServerTls`] has no values, which is what makes "TLS was
 //! configured but this build cannot serve it" a refusal to start rather than a cleartext
@@ -26,8 +25,6 @@ use http_kit_io::{
 use skyzen_core::Endpoint;
 use std::net::SocketAddr;
 
-#[cfg(feature = "server-tls")]
-use super::HttpServer;
 use super::{ListenAddr, RuntimeFailure, TlsFiles};
 
 /// Why the server cannot terminate TLS.
@@ -270,19 +267,17 @@ fn load_tls_acceptor(files: &TlsFiles) -> Result<ServerTls, TlsError> {
 pub(super) struct Protocols {
     /// The serving thread's driver, whose timer bounds the handshake and serves the connection.
     pub(super) io: Compio,
-    /// The server that answers HTTP/1.1.
-    pub(super) server: super::HttpServer,
-    /// `skyzen-h1`'s server, for [`HttpServer::H1`]; it carries the `Alt-Svc` value itself.
+    /// `skyzen-h1`'s server, carrying `Alt-Svc` when HTTP/3 is active.
     pub(super) h1: skyzen_h1::H1,
-    /// The HTTP/3 endpoint to advertise on every response, which `h1` already does for its own.
-    pub(super) alt_svc: Option<skyzen_hyper::AltSvc>,
+    /// `skyzen-h2`'s server, carrying `Alt-Svc` when HTTP/3 is active.
+    pub(super) h2: skyzen_h2::H2,
 }
 
 /// Serve TLS connections from `listener` until `shutdown`, then wait for the open ones.
 ///
 /// Nothing is shared with the other threads but the acceptor: the handshake, the protocol choice
 /// and the connection all run on the thread that accepted it, on a task of its own, so a client
-/// that stalls its handshake holds up nobody else's accept. HTTP/1.1 is served by `server`.
+/// that stalls its handshake holds up nobody else's accept.
 #[cfg(feature = "server-tls")]
 pub(super) async fn serve<L, E>(
     executor: Rc<Runtime>,
@@ -300,8 +295,6 @@ pub(super) async fn serve<L, E>(
 
     use executor_core::{LocalExecutor as _, Task as _};
     use futures_util::future::{select, Either};
-    use http_kit_io::CopyingPoll;
-    use skyzen_hyper::{serve_connection, IntoService, Prefixed, Protocol};
     use tracing::{debug, debug_span, error, warn, Instrument as _};
 
     // Nothing is ever sent on either channel. Dropping `stop` closes it, which every connection
@@ -334,12 +327,7 @@ pub(super) async fn serve<L, E>(
         let stopping = stopping.clone();
         let tls = tls.clone();
         let endpoint = endpoint.clone();
-        let Protocols {
-            io,
-            server,
-            h1,
-            alt_svc,
-        } = protocols.clone();
+        let Protocols { io, h1, h2 } = protocols.clone();
         let connection_executor = Rc::clone(&executor);
         executor
             .spawn_local(
@@ -354,38 +342,21 @@ pub(super) async fn serve<L, E>(
                         // Resolves with an error once `stop` is dropped.
                         let _ = stopping.recv().await;
                     };
-                    let service = |endpoint: E| {
-                        let service = IntoService::new(endpoint).with_peer_addr(peer);
-                        match &alt_svc {
-                            Some(alt_svc) => service.with_alt_svc(alt_svc),
-                            None => service,
-                        }
-                    };
-                    match (accepted, server) {
-                        (Accepted::Http1(stream), HttpServer::H1) => {
+                    match accepted {
+                        Accepted::Http1(stream) => {
                             h1.serve_connection(io, stream, Some(peer), endpoint, stop, live)
                                 .await;
                         }
-                        (Accepted::Http1(stream), HttpServer::Hyper) => {
-                            let _live = live;
-                            let stream = Prefixed::new(CopyingPoll::new(stream), Vec::new());
-                            serve_connection(
-                                stream,
-                                Protocol::Http1,
-                                service(endpoint),
+                        Accepted::Http2(stream, read_buf) => {
+                            h2.serve_connection_with_read_buf(
+                                io,
                                 connection_executor,
-                                stop,
-                            )
-                            .await;
-                        }
-                        (Accepted::Http2(stream), _) => {
-                            let _live = live;
-                            serve_connection(
                                 stream,
-                                Protocol::Http2,
-                                service(endpoint),
-                                connection_executor,
+                                read_buf,
+                                Some(peer),
+                                endpoint,
                                 stop,
+                                live,
                             )
                             .await;
                         }
@@ -438,11 +409,10 @@ impl Drop for Slot {
 enum Accepted<S: http_kit_tls::Transport> {
     /// HTTP/1.1, on the TLS stream itself.
     Http1(http_kit_tls::TlsStream<S, http_kit_tls::Server>),
-    /// HTTP/2, whose preface has been read and is replayed ahead of the stream.
+    /// HTTP/2, on the TLS stream itself, with the validated 24-byte connection preface.
     Http2(
-        skyzen_hyper::Prefixed<
-            http_kit_io::CopyingPoll<http_kit_tls::TlsStream<S, http_kit_tls::Server>>,
-        >,
+        http_kit_tls::TlsStream<S, http_kit_tls::Server>,
+        bytes::BytesMut,
     ),
 }
 
@@ -483,12 +453,16 @@ async fn handshake_and_sniff<S>(
 where
     S: http_kit_tls::Transport,
 {
-    use http_kit_io::CopyingPoll;
-    use skyzen_hyper::{sniff_protocol, Protocol};
+    use core::pin::pin;
+
+    use bytes::BytesMut;
+    use futures_util::future::{select, Either};
+    use http_kit_io::{BufResult, Read as _, Timer as _};
+    use skyzen_h2::CLIENT_PREFACE;
     use tracing::debug;
 
     let acceptor = tls.acceptor.clone().with_handshake_timeout(Some(handshake));
-    let stream = match acceptor.accept(stream, timer).await {
+    let mut stream = match acceptor.accept(stream, timer).await {
         Ok(stream) => stream,
         Err(http_kit_tls::HandshakeError::TimedOut(_)) => {
             debug!("timed out in TLS handshake");
@@ -516,17 +490,37 @@ where
     // and any other negotiated outcome is served HTTP/1.1 whatever bytes the client sends. There
     // is no h2c-by-sniffing on a TLS connection.
     match stream.alpn_protocol() {
-        Some(b"h2") => match sniff_protocol(CopyingPoll::new(stream), preface).await {
-            Ok((prefixed, Protocol::Http2)) => Some(Accepted::Http2(prefixed)),
-            Ok(_) => {
-                debug!("ALPN negotiated h2 but the connection does not open with the preface");
-                None
+        Some(b"h2") => {
+            let mut buf = BytesMut::with_capacity(CLIENT_PREFACE.len());
+            let mut deadline = pin!(timer.sleep(preface));
+            while buf.len() < CLIENT_PREFACE.len() {
+                let wanted = CLIENT_PREFACE.len() - buf.len();
+                let scratch = Vec::with_capacity(wanted);
+                let next = pin!(stream.read(scratch));
+                match select(next, deadline.as_mut()).await {
+                    Either::Left((BufResult(Ok(0), _), _)) => {
+                        debug!("ALPN negotiated h2 but the connection closed inside the preface");
+                        return None;
+                    }
+                    Either::Left((BufResult(Ok(_), filled), _)) => {
+                        buf.extend_from_slice(&filled);
+                    }
+                    Either::Left((BufResult(Err(error), _), _)) => {
+                        debug!("failed to read the connection preface: {error}");
+                        return None;
+                    }
+                    Either::Right(((), _)) => {
+                        debug!("timed out waiting for the HTTP/2 connection preface");
+                        return None;
+                    }
+                }
+                if CLIENT_PREFACE[..buf.len()] != buf[..] {
+                    debug!("ALPN negotiated h2 but the connection does not open with the preface");
+                    return None;
+                }
             }
-            Err(error) => {
-                debug!("failed to read the connection preface: {error}");
-                None
-            }
-        },
+            Some(Accepted::Http2(stream, buf))
+        }
         _ => Some(Accepted::Http1(stream)),
     }
 }
@@ -544,16 +538,13 @@ mod tests {
     };
     use http_kit_tls::{rustls, TlsConnector};
     use skyzen_h1::H1;
-    use skyzen_hyper::HTTP2_PREFACE;
+    use skyzen_h2::{CLIENT_PREFACE, H2};
 
     use super::{
         load_tls_acceptor, negotiate, serve, Accepted, Protocols, ServerTls, TlsError,
         HANDSHAKE_TIMEOUT,
     };
-    use crate::{
-        runtime::native::{HttpServer, TlsFiles},
-        Endpoint,
-    };
+    use crate::{runtime::native::TlsFiles, Endpoint};
 
     /// The preface wait of the test whose client completes its handshake and then goes silent.
     /// Only that wait is shortened: every handshake in these tests runs under the production
@@ -753,12 +744,11 @@ mod tests {
         }
     }
 
-    /// Start the whole per-thread pipeline on `runtime`, serving `endpoint` with `server`, and
-    /// return the address plus the handle that stops it.
+    /// Start the whole per-thread pipeline on `runtime`, serving `endpoint`, and return the
+    /// address plus the handle that stops it.
     fn start<E: Endpoint + Clone + 'static>(
         runtime: &Rc<Runtime>,
         tls: ServerTls,
-        server: HttpServer,
         endpoint: E,
     ) -> (
         std::net::SocketAddr,
@@ -783,67 +773,64 @@ mod tests {
                 8.try_into().unwrap(),
                 Protocols {
                     io: Compio::default(),
-                    server,
                     h1: H1::default(),
-                    alt_svc: None,
+                    h2: H2::default(),
                 },
             ),
         );
         (addr, stop, task)
     }
 
-    /// A real loopback handshake through the whole per-thread pipeline, for each server HTTP/1.1
-    /// can be given: ALPN `http/1.1` gets an actual response over the decrypted stream, with a
-    /// body of Chinese, Japanese and Korean text.
+    /// A real loopback handshake through the whole per-thread pipeline: ALPN `http/1.1` gets an
+    /// actual response over the decrypted stream, with a body of Chinese, Japanese and Korean text.
     #[test]
-    fn https_http1_is_served_by_either_server() {
-        for server in [HttpServer::H1, HttpServer::Hyper] {
-            let (_dir, tls, der) = acceptor();
-            on_compio(|runtime| async move {
-                let (addr, stop, task) = start(&runtime, tls, server, TlsEndpoint);
+    fn https_http1_is_served() {
+        let (_dir, tls, der) = acceptor();
+        on_compio(|runtime| async move {
+            let (addr, stop, task) = start(&runtime, tls, TlsEndpoint);
 
-                let mut client = tls_client(addr, &der, b"http/1.1").await;
-                assert_eq!(client.alpn_protocol(), Some(b"http/1.1".as_slice()));
-                let (head, body) = get(&mut client).await;
-                assert!(head.starts_with("HTTP/1.1 200"), "{server:?}: {head}");
-                assert_eq!(
-                    String::from_utf8(body).expect("UTF-8 body"),
-                    CJK,
-                    "{server:?}"
-                );
+            let mut client = tls_client(addr, &der, b"http/1.1").await;
+            assert_eq!(client.alpn_protocol(), Some(b"http/1.1".as_slice()));
+            let (head, body) = get(&mut client).await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            assert_eq!(String::from_utf8(body).expect("UTF-8 body"), CJK);
 
-                drop(stop);
-                task.await;
-            });
-        }
+            drop(stop);
+            task.await;
+        });
     }
 
-    /// ALPN `h2` is hyper's HTTP/2: after the client preface and an empty `SETTINGS` frame the
-    /// server answers with its own `SETTINGS` frame (type 4), whichever server HTTP/1.1 uses.
+    /// ALPN `h2` goes straight to `skyzen-h2` over the owned-buffer TLS stream: a full HTTP/2
+    /// request returns the CJK response body intact without any copying poll adapter.
     #[test]
     fn https_h2_is_negotiated_and_served() {
-        for server in [HttpServer::H1, HttpServer::Hyper] {
-            let (_dir, tls, der) = acceptor();
-            on_compio(|runtime| async move {
-                let (addr, stop, task) = start(&runtime, tls, server, TlsEndpoint);
+        use futures_lite::future::zip;
+        use http_kit::{Request, StatusCode};
+        use http_kit_h2::{handshake_stream, ClientConfig};
 
-                let mut client = tls_client(addr, &der, b"h2").await;
-                assert_eq!(client.alpn_protocol(), Some(b"h2".as_slice()));
-                let mut hello = HTTP2_PREFACE.to_vec();
-                hello.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
-                write_all(&mut client, hello).await;
-                let frame = read_at_least(&mut client, 9).await;
-                assert!(
-                    frame.len() >= 9,
-                    "{server:?}: no frame header, got {frame:?}"
-                );
-                assert_eq!(frame[3], 4, "{server:?}: expected a SETTINGS frame");
+        let (_dir, tls, der) = acceptor();
+        on_compio(|runtime| async move {
+            let (addr, stop, task) = start(&runtime, tls, TlsEndpoint);
 
-                drop(client);
-                drop(stop);
-                task.await;
-            });
-        }
+            let client = tls_client(addr, &der, b"h2").await;
+            assert_eq!(client.alpn_protocol(), Some(b"h2".as_slice()));
+            let (send, conn) = handshake_stream(client, Compio::default(), ClientConfig::default());
+            let mut req = Request::new(Body::empty());
+            *req.uri_mut() = "https://localhost/".parse().unwrap();
+            let (ran, body) = zip(conn.run(), async move {
+                let resp = send.send(req).await.expect("h2 response");
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = resp.into_body().into_bytes().await.expect("h2 body");
+                drop(send);
+                bytes
+            })
+            .await;
+            ran.expect("h2 client connection");
+            assert_eq!(std::str::from_utf8(&body).expect("UTF-8 body"), CJK);
+
+            drop(stop);
+            task.await;
+        });
     }
 
     /// An `h2` client still owes the connection its preface inside the same bound a cleartext
@@ -914,7 +901,7 @@ mod tests {
             };
             let request = async {
                 let mut tls = tls_client(addr, &der, b"http/1.1").await;
-                write_all(&mut tls, HTTP2_PREFACE.to_vec()).await;
+                write_all(&mut tls, CLIENT_PREFACE.to_vec()).await;
                 tls
             };
             // Boxed: on Linux the stream carries kernel TLS state, which makes the join large.
@@ -1039,12 +1026,33 @@ mod tests {
         tracing::subscriber::with_default(log.subscriber(tracing::Level::DEBUG), || {
             on_compio(|runtime| async move {
                 let endpoint = FileEndpoint(path, payload.len() as u64);
-                let (addr, stop, task) = start(&runtime, tls, HttpServer::H1, endpoint);
+                let (addr, stop, task) = start(&runtime, tls, endpoint);
 
                 let mut client = tls_client(addr, &der, b"http/1.1").await;
                 let (head, body) = get(&mut client).await;
                 assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-                assert!(body == payload, "the file region arrived changed");
+                assert!(body == payload, "the file region arrived changed over h1");
+
+                let h2_client = tls_client(addr, &der, b"h2").await;
+                let (send, conn) = http_kit_h2::handshake_stream(
+                    h2_client,
+                    Compio::default(),
+                    http_kit_h2::ClientConfig::default(),
+                );
+                let mut req = crate::Request::new(Body::empty());
+                *req.uri_mut() = "https://localhost/".parse().unwrap();
+                let (ran, h2_body) = futures_lite::future::zip(conn.run(), async move {
+                    let resp = send.send(req).await.expect("h2 kTLS response");
+                    let bytes = resp.into_body().into_bytes().await.expect("h2 kTLS body");
+                    drop(send);
+                    bytes
+                })
+                .await;
+                ran.expect("h2 kTLS connection");
+                assert!(
+                    &h2_body[..] == payload.as_slice(),
+                    "the file region arrived changed over h2"
+                );
 
                 drop(stop);
                 task.await;
@@ -1090,7 +1098,7 @@ mod tests {
                     build(Route::new((StaticDir::new("/", dir.path(), &thread)
                         .cache(StaticCacheSettings::new(16, 0)),)))
                     .expect("the router builds");
-                let (addr, stop, task) = start(&runtime, tls, HttpServer::H1, router);
+                let (addr, stop, task) = start(&runtime, tls, router);
 
                 let mut client = tls_client(addr, &der, b"http/1.1").await;
                 let (head, body) = get(&mut client).await;

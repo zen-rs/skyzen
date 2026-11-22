@@ -18,6 +18,7 @@
 use core::{future::Future, pin::pin};
 use std::{cell::Cell, convert::Infallible, net::SocketAddr, num::NonZeroUsize, rc::Rc};
 
+use bytes::BytesMut;
 use executor_core::{LocalExecutor, Task};
 use futures_util::future::{select, Either};
 use http_kit::{
@@ -60,7 +61,7 @@ impl H1 {
     /// its own, error responses included.
     ///
     /// The value is a complete `Alt-Svc` header value (RFC 7838), such as the one
-    /// `skyzen_hyper::AltSvc::header_value` renders for an HTTP/3 endpoint.
+    /// [`skyzen_core::AltSvc::header_value`] renders for an HTTP/3 endpoint.
     #[must_use]
     pub fn with_alt_svc(mut self, alt_svc: HeaderValue) -> Self {
         self.alt_svc = Some(alt_svc);
@@ -218,8 +219,44 @@ impl H1 {
         <S as Split>::WriteHalf: SendFile + SpliceWrite,
         E: Endpoint + Clone + 'static,
     {
+        self.serve_connection_with_read_buf(
+            timer,
+            stream,
+            BytesMut::new(),
+            peer,
+            endpoint,
+            stop,
+            live,
+        )
+        .await;
+    }
+
+    /// [`serve_connection`](Self::serve_connection) seeded with opening bytes already read from
+    /// `stream` into `read_buf` (for example when a cleartext listener sniffed for an HTTP/2
+    /// connection preface).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-connection state a protocol dispatcher hands in"
+    )]
+    pub async fn serve_connection_with_read_buf<T, S, E, G>(
+        &self,
+        timer: T,
+        stream: S,
+        read_buf: BytesMut,
+        peer: Option<SocketAddr>,
+        endpoint: E,
+        stop: impl Future<Output = ()>,
+        live: G,
+    ) where
+        T: Timer + Clone + 'static,
+        S: Split + 'static,
+        <S as Split>::ReadHalf: ReadOwned + SpliceRead,
+        <S as Split>::WriteHalf: SendFile + SpliceWrite,
+        E: Endpoint + Clone + 'static,
+    {
         let (read, write) = stream.split();
-        let connection = ServerConnection::new(read, write, timer, self.config.clone());
+        let connection =
+            ServerConnection::with_read_buf(read, write, read_buf, timer, self.config.clone());
         let service = H1Service {
             endpoint,
             peer,

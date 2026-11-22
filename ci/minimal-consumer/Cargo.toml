@@ -10,7 +10,7 @@ description = "The smallest application that serves HTTP and uses SQLite; CI ass
 [workspace]
 
 [dependencies]
-skyzen = { path = "../..", default-features = false, features = ["hyper"] }
+skyzen = { path = "../..", default-features = false }
 skyzen-services = { path = "../../services", default-features = false, features = ["sqlite"] }
 
 [package.metadata.dist]

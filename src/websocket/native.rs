@@ -53,7 +53,7 @@ use http_kit::{
 use serde::Serialize;
 use skyzen_core::{
     error::ErrorChain,
-    upgrade::{OnUpgrade, UpgradeAvailable, Upgraded},
+    upgrade::{ConnectProtocol, OnUpgrade, UpgradeAvailable, Upgraded},
     Extractor, Responder,
 };
 use std::{
@@ -587,9 +587,17 @@ impl Stream for WebSocketReceiver {
     }
 }
 
+/// How the incoming request bootstrapped the WebSocket session.
+enum Handshake {
+    /// RFC 6455 §4.2 HTTP/1.1 `101 Switching Protocols`, carrying `Sec-WebSocket-Key`.
+    Http1(header::HeaderValue),
+    /// RFC 8441 HTTP/2 Extended `CONNECT` (`:protocol = websocket`), answered with `200 OK`.
+    ExtendedConnect,
+}
+
 /// Helper that contains the state required to accept a WebSocket connection.
 pub struct WebSocketUpgrade {
-    key: header::HeaderValue,
+    handshake: Handshake,
     requested_protocols: Vec<String>,
     response_protocol: Option<header::HeaderValue>,
     config: WebSocketConfig,
@@ -794,7 +802,25 @@ fn validate_upgrade(
     Ok((key, requested_protocols))
 }
 
-/// Validate the handshake of a request whose connection the server can hand over.
+fn validate_extended_connect(request: &Request) -> Result<Vec<String>, WebSocketUpgradeError> {
+    let Some(protocol) = request.extensions().get::<ConnectProtocol>() else {
+        return if request.version() == http::Version::HTTP_2 {
+            Err(WebSocketUpgradeError::MissingUpgradeHeader)
+        } else {
+            Err(WebSocketUpgradeError::UpgradeUnavailable)
+        };
+    };
+    if !protocol.as_str().eq_ignore_ascii_case("websocket") {
+        return Err(WebSocketUpgradeError::InvalidUpgradeHeader);
+    }
+    match request.headers().get(header::SEC_WEBSOCKET_VERSION) {
+        Some(version) if version == "13" => {}
+        _ => return Err(WebSocketUpgradeError::UnsupportedVersion),
+    }
+    Ok(offered_protocols(request.headers()))
+}
+
+/// Validate the handshake of a request whose connection or HTTP/2 stream the server can hand over.
 ///
 /// Hibernating Durable Object upgrades are responders rather than extractors, so they only hold a
 /// shared request reference; the handshake needs nothing more.
@@ -804,6 +830,16 @@ fn validate_upgrade(
 pub(crate) fn upgrade_from_request(
     request: &Request,
 ) -> Result<WebSocketUpgrade, WebSocketUpgradeError> {
+    if request.method() == Method::CONNECT {
+        let requested_protocols = validate_extended_connect(request)?;
+        return Ok(WebSocketUpgrade {
+            handshake: Handshake::ExtendedConnect,
+            requested_protocols,
+            response_protocol: None,
+            config: WebSocketConfig::default(),
+        });
+    }
+
     let (key, requested_protocols) = validate_upgrade(request)?;
     request
         .extensions()
@@ -811,7 +847,7 @@ pub(crate) fn upgrade_from_request(
         .ok_or(WebSocketUpgradeError::UpgradeUnavailable)?;
 
     Ok(WebSocketUpgrade {
-        key,
+        handshake: Handshake::Http1(key),
         requested_protocols,
         response_protocol: None,
         config: WebSocketConfig::default(),
@@ -850,28 +886,40 @@ impl std::fmt::Debug for WebSocketUpgradeResponder {
 impl Responder for WebSocketUpgradeResponder {
     type Error = WebSocketUpgradeError;
     fn respond_to(self, _request: &Request, response: &mut Response) -> Result<(), Self::Error> {
-        let accept = compute_accept_header(&self.upgrade.key);
-        *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+        match &self.upgrade.handshake {
+            Handshake::Http1(key) => {
+                let accept = compute_accept_header(key);
+                *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
 
-        {
-            let headers = response.headers_mut();
-            headers.insert(
-                header::CONNECTION,
-                header::HeaderValue::from_static("upgrade"),
-            );
-            headers.insert(
-                header::UPGRADE,
-                header::HeaderValue::from_static("websocket"),
-            );
-            headers.insert(header::SEC_WEBSOCKET_ACCEPT, accept);
+                let headers = response.headers_mut();
+                headers.insert(
+                    header::CONNECTION,
+                    header::HeaderValue::from_static("upgrade"),
+                );
+                headers.insert(
+                    header::UPGRADE,
+                    header::HeaderValue::from_static("websocket"),
+                );
+                headers.insert(header::SEC_WEBSOCKET_ACCEPT, accept);
 
-            if let Some(protocol) = self.upgrade.response_protocol.clone() {
-                headers.insert(header::SEC_WEBSOCKET_PROTOCOL, protocol);
+                if let Some(protocol) = self.upgrade.response_protocol.clone() {
+                    headers.insert(header::SEC_WEBSOCKET_PROTOCOL, protocol);
+                }
+            }
+            Handshake::ExtendedConnect => {
+                // RFC 8441 §5: an accepted Extended CONNECT carries `:status = 200` and omits the
+                // HTTP/1.1 `Connection`, `Upgrade`, and `Sec-WebSocket-Accept` fields.
+                *response.status_mut() = StatusCode::OK;
+                if let Some(protocol) = self.upgrade.response_protocol.clone() {
+                    response
+                        .headers_mut()
+                        .insert(header::SEC_WEBSOCKET_PROTOCOL, protocol);
+                }
             }
         }
 
-        // The server takes this back out once the `101` is on the wire and runs the session on
-        // the connection.
+        // The server takes this back out once the response head is ready and runs the session on
+        // the upgraded connection or HTTP/2 stream.
         response.extensions_mut().insert(self.session);
 
         Ok(())
@@ -964,19 +1012,19 @@ mod tests {
         let mut request = build_request();
         request.headers_mut().insert(
             header::SEC_WEBSOCKET_KEY,
-            hyper::header::HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+            header::HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
         );
         request.headers_mut().insert(
             header::CONNECTION,
-            hyper::header::HeaderValue::from_static("Upgrade"),
+            header::HeaderValue::from_static("Upgrade"),
         );
         request.headers_mut().insert(
             header::UPGRADE,
-            hyper::header::HeaderValue::from_static("websocket"),
+            header::HeaderValue::from_static("websocket"),
         );
         request.headers_mut().insert(
             header::SEC_WEBSOCKET_VERSION,
-            hyper::header::HeaderValue::from_static("13"),
+            header::HeaderValue::from_static("13"),
         );
         // What a server inserts on a connection it can hand over.
         request.extensions_mut().insert(UpgradeAvailable);
@@ -991,22 +1039,91 @@ mod tests {
 
         request.headers_mut().insert(
             header::SEC_WEBSOCKET_KEY,
-            hyper::header::HeaderValue::from_static("x"),
+            header::HeaderValue::from_static("x"),
         );
         request.headers_mut().insert(
             header::CONNECTION,
-            hyper::header::HeaderValue::from_static("close"),
+            header::HeaderValue::from_static("close"),
         );
         request.headers_mut().insert(
             header::UPGRADE,
-            hyper::header::HeaderValue::from_static("websocket"),
+            header::HeaderValue::from_static("websocket"),
         );
         request.headers_mut().insert(
             header::SEC_WEBSOCKET_VERSION,
-            hyper::header::HeaderValue::from_static("12"),
+            header::HeaderValue::from_static("12"),
         );
 
         assert!(WebSocketUpgrade::extract(&mut request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn accepts_extended_connect_and_builds_rfc8441_response() {
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = Method::CONNECT;
+        *request.version_mut() = http::Version::HTTP_2;
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_VERSION,
+            header::HeaderValue::from_static("13"),
+        );
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            header::HeaderValue::from_static("chat, superchat"),
+        );
+        request
+            .extensions_mut()
+            .insert(ConnectProtocol::new("websocket"));
+
+        let upgrade = WebSocketUpgrade::extract(&mut request)
+            .await
+            .expect("valid RFC 8441 request")
+            .protocols(["superchat"]);
+        let responder = upgrade.on_upgrade(|_socket| async move {});
+        let mut response = Response::new(Body::empty());
+        responder
+            .respond_to(&request, &mut response)
+            .expect("RFC 8441 response builds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::CONNECTION).is_none());
+        assert!(response.headers().get(header::UPGRADE).is_none());
+        assert!(response
+            .headers()
+            .get(header::SEC_WEBSOCKET_ACCEPT)
+            .is_none());
+        assert_eq!(
+            response.headers().get(header::SEC_WEBSOCKET_PROTOCOL),
+            Some(&header::HeaderValue::from_static("superchat"))
+        );
+        assert!(response.extensions().get::<OnUpgrade>().is_some());
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_extended_connect() {
+        // Non-websocket `:protocol` is rejected.
+        let mut bad_proto = Request::new(Body::empty());
+        *bad_proto.method_mut() = Method::CONNECT;
+        *bad_proto.version_mut() = http::Version::HTTP_2;
+        bad_proto.headers_mut().insert(
+            header::SEC_WEBSOCKET_VERSION,
+            header::HeaderValue::from_static("13"),
+        );
+        bad_proto
+            .extensions_mut()
+            .insert(ConnectProtocol::new("webtransport"));
+        assert!(matches!(
+            WebSocketUpgrade::extract(&mut bad_proto).await,
+            Err(WebSocketUpgradeError::InvalidUpgradeHeader)
+        ));
+
+        // Missing `:protocol` on HTTP/2 CONNECT is rejected.
+        let mut missing_proto = Request::new(Body::empty());
+        *missing_proto.method_mut() = Method::CONNECT;
+        *missing_proto.version_mut() = http::Version::HTTP_2;
+        assert!(matches!(
+            WebSocketUpgrade::extract(&mut missing_proto).await,
+            Err(WebSocketUpgradeError::MissingUpgradeHeader)
+        ));
     }
 
     #[tokio::test]

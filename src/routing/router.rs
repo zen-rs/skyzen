@@ -190,13 +190,21 @@ impl Extractor for AllowedMethods {
     }
 }
 
+/// How a matched `GET` handler was selected when the incoming method was not `GET`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FallbackKind {
+    None,
+    Head,
+    ExtendedConnect,
+}
+
 /// Outcome of matching a request against the routing tree.
 enum RouteLookup<'app> {
-    /// The path and method matched. `head_fallback` marks a HEAD request served
-    /// by the GET handler, whose body must be discarded.
+    /// The path and method matched.
     Endpoint {
         app: &'app App,
-        head_fallback: bool,
+        fallback: FallbackKind,
+        allow_on_unupgraded_connect: Vec<Method>,
         params: Vec<(String, String)>,
         /// The route template the matchit match came from.
         path: &'app Arc<str>,
@@ -212,7 +220,7 @@ enum RouteLookup<'app> {
 }
 
 impl Router {
-    fn lookup(&self, path: &str, method: &Method) -> RouteLookup<'_> {
+    fn lookup(&self, path: &str, method: &Method, extended_connect: bool) -> RouteLookup<'_> {
         let Ok(Match { value, params }) = self.inner.at(path) else {
             return RouteLookup::Unmatched;
         };
@@ -221,7 +229,7 @@ impl Router {
             .entries
             .iter()
             .find(|(app_method, ..)| app_method == method)
-            .map(|(.., app)| (app, false))
+            .map(|(.., app)| (app, FallbackKind::None))
             .or_else(|| {
                 // A HEAD request without a dedicated handler falls back to the
                 // GET handler; the response body is discarded after it runs.
@@ -230,21 +238,34 @@ impl Router {
                         .entries
                         .iter()
                         .find(|(app_method, ..)| *app_method == Method::GET)
-                        .map(|(.., app)| (app, true))
+                        .map(|(.., app)| (app, FallbackKind::Head))
+                } else if *method == Method::CONNECT && extended_connect {
+                    // RFC 8441 Extended CONNECT (`:protocol = websocket`) targets routes
+                    // registered via `.ws(...)` or `.at(|ws: WebSocketUpgrade| ...)`.
+                    value
+                        .entries
+                        .iter()
+                        .find(|(app_method, ..)| *app_method == Method::GET)
+                        .map(|(.., app)| (app, FallbackKind::ExtendedConnect))
                 } else {
                     None
                 }
             })
-            .or_else(|| value.any.as_ref().map(|app| (app, false)));
+            .or_else(|| value.any.as_ref().map(|app| (app, FallbackKind::None)));
 
         found.map_or_else(
             || RouteLookup::MethodNotAllowed {
                 allow: allowed_methods(&value.entries),
                 path: &value.path,
             },
-            |(app, head_fallback)| RouteLookup::Endpoint {
+            |(app, fallback)| RouteLookup::Endpoint {
                 app,
-                head_fallback,
+                fallback,
+                allow_on_unupgraded_connect: if fallback == FallbackKind::ExtendedConnect {
+                    allowed_methods(&value.entries)
+                } else {
+                    Vec::new()
+                },
                 params: params
                     .iter()
                     .map(|(key, value)| (key.to_owned(), percent_decode(value)))
@@ -260,10 +281,18 @@ impl Router {
     /// tracing layer see the 404 and 405 responses produced here.
     async fn dispatch_matched(&self, request: &mut Request) -> Result<Response, Error> {
         let method = request.method().clone();
-        match self.lookup(request.uri().path(), &method) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let extended_connect = request
+            .extensions()
+            .get::<skyzen_core::upgrade::ConnectProtocol>()
+            .is_some();
+        #[cfg(target_arch = "wasm32")]
+        let extended_connect = false;
+        match self.lookup(request.uri().path(), &method, extended_connect) {
             RouteLookup::Endpoint {
                 app,
-                head_fallback,
+                fallback,
+                allow_on_unupgraded_connect,
                 params,
                 path,
             } => {
@@ -271,8 +300,31 @@ impl Router {
                 request.extensions_mut().insert(matched);
                 request.extensions_mut().insert(Params::new(params));
                 let mut response = app.run(request).await?;
-                if head_fallback {
-                    *response.body_mut() = Body::empty();
+                match fallback {
+                    FallbackKind::None => {}
+                    FallbackKind::Head => {
+                        *response.body_mut() = Body::empty();
+                    }
+                    FallbackKind::ExtendedConnect => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if response.status().is_success()
+                            && response
+                                .extensions()
+                                .get::<skyzen_core::upgrade::OnUpgrade>()
+                                .is_none()
+                        {
+                            let allow = AllowedMethods(allow_on_unupgraded_connect);
+                            return match &self.method_not_allowed {
+                                Some(factory) => {
+                                    request.extensions_mut().insert(allow);
+                                    run_endpoint(factory, request).await
+                                }
+                                None => Ok(method_not_allowed_response(&allow)),
+                            };
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        let _ = allow_on_unupgraded_connect;
+                    }
                 }
                 Ok(response)
             }
@@ -1851,5 +1903,18 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn extended_connect_to_a_plain_get_route_returns_method_not_allowed() {
+        let router = build(Route::new(("/plain".at(|| async { "hello" }),))).unwrap();
+        let mut req = request_with_method("/plain", Method::CONNECT);
+        *req.version_mut() = http::Version::HTTP_2;
+        req.extensions_mut()
+            .insert(skyzen_core::upgrade::ConnectProtocol::new("websocket"));
+        let response = router.go(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()["allow"], "GET, HEAD");
     }
 }
