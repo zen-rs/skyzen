@@ -82,12 +82,19 @@ impl Extractor for BearerToken {
     }
 
     #[cfg(feature = "openapi")]
-    fn openapi() -> Option<crate::openapi::ExtractorSchema> {
-        Some(crate::openapi::ExtractorSchema {
-            location: crate::openapi::ParameterLocation::Header,
-            content_type: None,
-            schema: None,
-        })
+    fn openapi_security() -> Vec<crate::openapi::SecuritySchemeInfo> {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+
+        vec![crate::openapi::SecuritySchemeInfo {
+            name: "bearerAuth",
+            scheme: SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+            optional: false,
+        }]
     }
 }
 

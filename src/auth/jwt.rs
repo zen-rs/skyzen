@@ -21,12 +21,26 @@
 //! let middleware = AuthMiddleware::new(authenticator);
 //! ```
 
-use core::future::{ready, Future};
+#[cfg(not(target_arch = "wasm32"))]
+use core::future::ready;
+use core::future::Future;
 use std::marker::PhantomData;
 
 use http::StatusCode;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, TokenData, Validation};
+#[cfg(not(target_arch = "wasm32"))]
+use jsonwebtoken::{decode, DecodingKey, TokenData, Validation};
 use serde::de::DeserializeOwned;
+
+#[cfg(target_arch = "wasm32")]
+pub use super::wasm_jwt::Algorithm;
+#[cfg(not(target_arch = "wasm32"))]
+pub use jsonwebtoken::Algorithm;
+
+#[cfg(target_arch = "wasm32")]
+use super::wasm_jwt::{
+    decode_header as wasm_decode_header, parse_pem_spki, verify_and_decode, WasmKeyMaterial,
+    WasmValidation,
+};
 
 use crate::{
     extract::auth::parse_bearer, extract::auth::BearerTokenError, middleware::auth::Authenticator,
@@ -39,15 +53,16 @@ use crate::{
 /// otherwise enable algorithm-confusion attacks (e.g. accepting an `HS256` token verified against
 /// an RSA public key used as an HMAC secret).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KeyFamily {
+pub(crate) enum KeyFamily {
     Hmac,
     Rsa,
     Ec,
+    Ed,
 }
 
 impl KeyFamily {
     /// Returns whether `algorithm` belongs to this key's family.
-    const fn permits(self, algorithm: Algorithm) -> bool {
+    pub(crate) const fn permits(self, algorithm: Algorithm) -> bool {
         match self {
             Self::Hmac => matches!(
                 algorithm,
@@ -63,6 +78,7 @@ impl KeyFamily {
                     | Algorithm::PS512
             ),
             Self::Ec => matches!(algorithm, Algorithm::ES256 | Algorithm::ES384),
+            Self::Ed => matches!(algorithm, Algorithm::EdDSA),
         }
     }
 }
@@ -80,8 +96,14 @@ impl KeyFamily {
 /// be widened across families.
 #[derive(Clone)]
 pub struct JwtConfig {
+    #[cfg(not(target_arch = "wasm32"))]
     decoding_key: DecodingKey,
+    #[cfg(not(target_arch = "wasm32"))]
     validation: Validation,
+    #[cfg(target_arch = "wasm32")]
+    material: WasmKeyMaterial,
+    #[cfg(target_arch = "wasm32")]
+    validation: WasmValidation,
     key_family: KeyFamily,
 }
 
@@ -99,10 +121,21 @@ impl JwtConfig {
     /// Uses HS256 algorithm by default.
     #[must_use]
     pub fn with_secret(secret: &[u8]) -> Self {
-        Self {
-            decoding_key: DecodingKey::from_secret(secret),
-            validation: Validation::default(),
-            key_family: KeyFamily::Hmac,
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self {
+                decoding_key: DecodingKey::from_secret(secret),
+                validation: Validation::default(),
+                key_family: KeyFamily::Hmac,
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self {
+                material: WasmKeyMaterial::Hmac(secret.to_vec()),
+                validation: WasmValidation::default(),
+                key_family: KeyFamily::Hmac,
+            }
         }
     }
 
@@ -111,6 +144,7 @@ impl JwtConfig {
     /// # Errors
     ///
     /// Returns an error if the PEM data is invalid.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_rsa_pem(pem: &[u8]) -> Result<Self, jsonwebtoken::errors::Error> {
         Ok(Self {
             decoding_key: DecodingKey::from_rsa_pem(pem)?,
@@ -123,11 +157,30 @@ impl JwtConfig {
         })
     }
 
+    /// Create a new JWT configuration with an RSA public key in PEM format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JwtError::Malformed`] if the PEM data is invalid.
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_rsa_pem(pem: &[u8]) -> Result<Self, JwtError> {
+        let der = parse_pem_spki(pem, true)?;
+        Ok(Self {
+            material: WasmKeyMaterial::RsaSpki(der),
+            validation: WasmValidation {
+                algorithms: vec![Algorithm::RS256],
+                ..Default::default()
+            },
+            key_family: KeyFamily::Rsa,
+        })
+    }
+
     /// Create a new JWT configuration with an EC public key in PEM format.
     ///
     /// # Errors
     ///
     /// Returns an error if the PEM data is invalid.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_ec_pem(pem: &[u8]) -> Result<Self, jsonwebtoken::errors::Error> {
         Ok(Self {
             decoding_key: DecodingKey::from_ec_pem(pem)?,
@@ -140,17 +193,45 @@ impl JwtConfig {
         })
     }
 
+    /// Create a new JWT configuration with an EC public key in PEM format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JwtError::Malformed`] if the PEM data is invalid.
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_ec_pem(pem: &[u8]) -> Result<Self, JwtError> {
+        let der = parse_pem_spki(pem, false)?;
+        Ok(Self {
+            material: WasmKeyMaterial::EcSpki(der),
+            validation: WasmValidation {
+                algorithms: vec![Algorithm::ES256],
+                ..Default::default()
+            },
+            key_family: KeyFamily::Ec,
+        })
+    }
+
     /// Set the expected issuer claim.
     #[must_use]
     pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         self.validation.set_issuer(&[issuer.into()]);
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.validation.issuer = Some(vec![issuer.into()]);
+        }
         self
     }
 
     /// Set the expected audience claim.
     #[must_use]
     pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         self.validation.set_audience(&[audience.into()]);
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.validation.audience = Some(vec![audience.into()]);
+        }
         self
     }
 
@@ -195,12 +276,31 @@ impl JwtConfig {
         self
     }
 
+    /// Enable or disable `nbf` (not before) claim validation.
+    #[must_use]
+    pub const fn with_nbf_validation(mut self, validate: bool) -> Self {
+        self.validation.validate_nbf = validate;
+        self
+    }
+
     /// Decode a JWT token using this configuration.
+    #[cfg(not(target_arch = "wasm32"))]
     fn decode<C: DeserializeOwned>(
         &self,
         token: &str,
     ) -> Result<TokenData<C>, jsonwebtoken::errors::Error> {
         decode::<C>(token, &self.decoding_key, &self.validation)
+    }
+
+    /// Decode a JWT token using `WebCrypto` on `wasm32`.
+    #[cfg(target_arch = "wasm32")]
+    async fn decode_wasm<C: DeserializeOwned>(&self, token: &str) -> Result<C, JwtError> {
+        let header = wasm_decode_header(token)?;
+        if !self.key_family.permits(header.alg) || !self.validation.algorithms.contains(&header.alg)
+        {
+            return Err(JwtError::InvalidAlgorithm);
+        }
+        verify_and_decode(token, &self.material, header.alg, &self.validation).await
     }
 }
 
@@ -230,6 +330,7 @@ pub enum JwtError {
     Malformed,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<jsonwebtoken::errors::Error> for JwtError {
     fn from(err: jsonwebtoken::errors::Error) -> Self {
         use jsonwebtoken::errors::ErrorKind;
@@ -292,6 +393,7 @@ where
 
     // Decoding a JWT is pure computation over the request's own header, so the future is ready
     // on creation rather than an `async` block with nothing to await.
+    #[cfg(not(target_arch = "wasm32"))]
     fn authenticate(
         &self,
         req: &Request,
@@ -301,6 +403,19 @@ where
                 .map_err(Self::Error::from)
                 .and_then(|token| Ok(self.config.decode::<C>(token)?.claims)),
         )
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn authenticate(
+        &self,
+        req: &Request,
+    ) -> impl Future<Output = Result<Self::User, Self::Error>> + Send {
+        let token = parse_bearer(req).map(str::to_owned);
+        let config = self.config.clone();
+        super::wasm_jwt::SendFuture(async move {
+            let token = token.map_err(Self::Error::from)?;
+            config.decode_wasm::<C>(&token).await
+        })
     }
 }
 

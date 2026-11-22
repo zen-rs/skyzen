@@ -120,6 +120,13 @@ pub trait Extractor: Sized + Send + Sync + 'static {
     /// Register dependent schemas into the `OpenAPI` components map.
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(_defs: &mut BTreeMap<String, SchemaRef>) {}
+
+    /// `OpenAPI` security schemes required (or optionally accepted) by this extractor.
+    #[cfg(feature = "openapi")]
+    #[must_use]
+    fn openapi_security() -> Vec<crate::openapi::SecuritySchemeInfo> {
+        Vec::new()
+    }
 }
 
 macro_rules! impl_tuple_extractor {
@@ -207,6 +214,13 @@ macro_rules! impl_tuple_extractor {
                     defs: &mut alloc::collections::BTreeMap<String, crate::openapi::SchemaRef>,
                 ) {
                     $(<$ty as Extractor>::register_openapi_schemas(defs);)+
+                }
+
+                #[cfg(feature = "openapi")]
+                fn openapi_security() -> alloc::vec::Vec<crate::openapi::SecuritySchemeInfo> {
+                    let mut schemes = alloc::vec::Vec::new();
+                    $(schemes.extend(<$ty as Extractor>::openapi_security());)+
+                    schemes
                 }
             }
         };
@@ -347,6 +361,17 @@ impl<T: Extractor> Extractor for Option<T> {
     fn register_openapi_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
         T::register_openapi_schemas(defs);
     }
+
+    #[cfg(feature = "openapi")]
+    fn openapi_security() -> Vec<crate::openapi::SecuritySchemeInfo> {
+        T::openapi_security()
+            .into_iter()
+            .map(|mut info| {
+                info.optional = true;
+                info
+            })
+            .collect()
+    }
 }
 
 // Let's erase the error for Result<T,E>, otherwise user have to deal with double error types.
@@ -366,5 +391,16 @@ impl<T: Extractor> Extractor for Result<T, BoxHttpError> {
     #[cfg(feature = "openapi")]
     fn register_openapi_schemas(defs: &mut BTreeMap<String, SchemaRef>) {
         T::register_openapi_schemas(defs);
+    }
+
+    #[cfg(feature = "openapi")]
+    fn openapi_security() -> Vec<crate::openapi::SecuritySchemeInfo> {
+        T::openapi_security()
+            .into_iter()
+            .map(|mut info| {
+                info.optional = true;
+                info
+            })
+            .collect()
     }
 }

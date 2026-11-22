@@ -149,3 +149,112 @@ fn a_tuple_responder_documents_its_payload_too() {
         "{content:#}"
     );
 }
+
+#[cfg(feature = "auth")]
+mod security_schemes {
+    use serde::{Deserialize, Serialize};
+    use skyzen::{
+        auth::{
+            guard::{Admin, HasRoles},
+            SessionAuthenticator,
+        },
+        extract::{ApiKey, BasicAuth, BearerToken},
+        middleware::auth::AuthUser,
+        routing::{CreateRouteNode, Route},
+    };
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct TestClaims {
+        roles: Vec<String>,
+    }
+
+    impl HasRoles for TestClaims {
+        fn has_role(&self, role: &str) -> bool {
+            self.roles.iter().any(|r| r == role)
+        }
+    }
+
+    #[skyzen::openapi]
+    async fn bearer_route(BearerToken(_tok): BearerToken) -> &'static str {
+        "ok"
+    }
+
+    #[skyzen::openapi]
+    async fn optional_bearer_route(_tok: Option<BearerToken>) -> &'static str {
+        "ok"
+    }
+
+    #[skyzen::openapi]
+    async fn basic_route(_auth: BasicAuth) -> &'static str {
+        "ok"
+    }
+
+    #[skyzen::openapi]
+    async fn api_key_route(_key: ApiKey) -> &'static str {
+        "ok"
+    }
+
+    #[skyzen::openapi]
+    async fn auth_user_route(AuthUser(_user): AuthUser<TestClaims>) -> &'static str {
+        "ok"
+    }
+
+    #[skyzen::openapi]
+    async fn admin_route(Admin(_admin): Admin<TestClaims>) -> &'static str {
+        "ok"
+    }
+
+    #[test]
+    fn auth_extractors_register_security_schemes_and_operation_requirements() {
+        let router = Route::new((
+            "/bearer".at(bearer_route),
+            "/optional".at(optional_bearer_route),
+            "/basic".at(basic_route),
+            "/apikey".at(api_key_route),
+            "/user".at(auth_user_route),
+            "/admin".at(admin_route),
+        ))
+        .with(SessionAuthenticator::<TestClaims>::typed())
+        .build();
+
+        let spec = serde_json::to_value(router.openapi().to_utoipa_spec()).expect("serializes");
+        let schemes = &spec["components"]["securitySchemes"];
+        assert_eq!(schemes["bearerAuth"]["type"], "http");
+        assert_eq!(schemes["bearerAuth"]["scheme"], "bearer");
+        assert_eq!(schemes["basicAuth"]["type"], "http");
+        assert_eq!(schemes["basicAuth"]["scheme"], "basic");
+        assert_eq!(schemes["apiKeyAuth"]["type"], "apiKey");
+        assert_eq!(schemes["apiKeyAuth"]["in"], "header");
+        assert_eq!(schemes["apiKeyAuth"]["name"], "X-API-Key");
+
+        assert_eq!(
+            spec["paths"]["/bearer"]["get"]["security"],
+            serde_json::json!([{"bearerAuth": []}])
+        );
+        // BearerToken must not emit a bogus parameter named after the Rust variable
+        assert!(spec["paths"]["/bearer"]["get"]["parameters"].is_null());
+
+        // Optional auth includes `{}` requirement
+        assert_eq!(
+            spec["paths"]["/optional"]["get"]["security"],
+            serde_json::json!([{"bearerAuth": []}, {}])
+        );
+
+        assert_eq!(
+            spec["paths"]["/basic"]["get"]["security"],
+            serde_json::json!([{"basicAuth": []}])
+        );
+        assert_eq!(
+            spec["paths"]["/apikey"]["get"]["security"],
+            serde_json::json!([{"apiKeyAuth": []}])
+        );
+        assert_eq!(
+            spec["paths"]["/user"]["get"]["security"],
+            serde_json::json!([{"bearerAuth": []}])
+        );
+        assert_eq!(
+            spec["paths"]["/admin"]["get"]["security"],
+            serde_json::json!([{"bearerAuth": []}])
+        );
+    }
+}

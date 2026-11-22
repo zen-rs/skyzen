@@ -25,6 +25,7 @@ use utoipa::openapi::{
     request_body::RequestBodyBuilder,
     response::{ResponseBuilder, ResponsesBuilder},
     schema::{ComponentsBuilder, ObjectBuilder, Schema, SchemaType, Type},
+    security::{SecurityRequirement, SecurityScheme},
     Deprecated, OpenApi as UtoipaSpec, RefOr, Required,
 };
 use utoipa_redoc::Redoc;
@@ -35,7 +36,8 @@ pub type SchemaRef = RefOr<Schema>;
 
 #[cfg(feature = "openapi")]
 pub use skyzen_core::openapi::{
-    ExtractorSchema, ParameterLocation, ResponseSchema, SchemaCollector,
+    ExtractorSchema, ParameterLocation, ResponseSchema, SchemaCollector, SecurityCollector,
+    SecuritySchemeInfo,
 };
 
 #[cfg(not(feature = "openapi"))]
@@ -104,6 +106,32 @@ impl fmt::Debug for ResponseSchema {
 #[cfg(not(feature = "openapi"))]
 /// Function type that collects `OpenAPI` schemas into a definitions map.
 pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
+
+#[cfg(not(feature = "openapi"))]
+/// Security scheme metadata declared by an extractor for `OpenAPI` (stubbed when `openapi` is disabled).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecuritySchemeInfo {
+    /// Unique name of the security scheme in `components.securitySchemes`.
+    pub name: &'static str,
+    /// The `OpenAPI` security scheme definition.
+    pub scheme: SecurityScheme,
+    /// Whether this security requirement is optional.
+    pub optional: bool,
+}
+
+#[cfg(not(feature = "openapi"))]
+impl fmt::Debug for SecuritySchemeInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecuritySchemeInfo")
+            .field("name", &self.name)
+            .field("optional", &self.optional)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(not(feature = "openapi"))]
+/// Function type that collects `OpenAPI` security schemes from an extractor (stubbed when `openapi` is disabled).
+pub type SecurityCollector = fn(&mut Vec<SecuritySchemeInfo>);
 
 pub mod registry;
 
@@ -204,6 +232,23 @@ where
     }
 }
 
+/// Collect `OpenAPI` security schemes declared by `T`.
+#[allow(clippy::missing_const_for_fn)]
+pub fn register_extractor_security_for<T>(out: &mut Vec<SecuritySchemeInfo>)
+where
+    T: Extractor,
+{
+    #[cfg(feature = "openapi")]
+    {
+        out.extend(<T as Extractor>::openapi_security());
+    }
+
+    #[cfg(not(feature = "openapi"))]
+    {
+        let _ = (core::marker::PhantomData::<T>, out);
+    }
+}
+
 /// Register dependent schemas for the responder type if `OpenAPI` metadata is available.
 #[allow(clippy::missing_const_for_fn)]
 pub fn register_responder_schemas_for<T>(defs: &mut BTreeMap<String, SchemaRef>)
@@ -240,6 +285,8 @@ pub struct HandlerSpec {
     pub response: Option<ResponderSchemaFn>,
     /// Schema collectors for parameters and responders, including their transitive dependencies.
     pub schemas: &'static [SchemaCollector],
+    /// Security scheme collectors for extractor arguments.
+    pub security: &'static [SecurityCollector],
 }
 
 #[cfg(feature = "openapi")]
@@ -381,6 +428,31 @@ fn collect_schemas(collectors: &[SchemaCollector], defs: &mut BTreeMap<String, S
     }
 }
 
+#[cfg(feature = "openapi")]
+fn collect_security(
+    collectors: &[SecurityCollector],
+    scheme_defs: &mut BTreeMap<String, SecurityScheme>,
+) -> Vec<SecuritySchemeInfo> {
+    let mut collected = Vec::new();
+    for collector in collectors {
+        collector(&mut collected);
+    }
+    let mut deduped: BTreeMap<&'static str, SecuritySchemeInfo> = BTreeMap::new();
+    for info in collected {
+        scheme_defs
+            .entry(info.name.to_owned())
+            .or_insert_with(|| info.scheme.clone());
+        deduped
+            .entry(info.name)
+            .and_modify(|existing| {
+                // If any extractor requires the scheme non-optionally, the operation requires it.
+                existing.optional &= info.optional;
+            })
+            .or_insert(info);
+    }
+    deduped.into_values().collect()
+}
+
 /// Handler metadata attached to each endpoint.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteHandlerDoc {
@@ -496,6 +568,8 @@ pub struct OpenApi {
     operations: Vec<OpenApiOperation>,
     #[cfg(feature = "openapi")]
     schemas: Vec<(String, SchemaRef)>,
+    #[cfg(feature = "openapi")]
+    security_schemes: Vec<(String, SecurityScheme)>,
 }
 
 impl Debug for OpenApi {
@@ -503,6 +577,7 @@ impl Debug for OpenApi {
         f.debug_struct("OpenApi")
             .field("operations", &"[..]")
             .field("schemas", &"[..]")
+            .field("security_schemes", &"[..]")
             .finish()
     }
 }
@@ -513,6 +588,7 @@ impl OpenApi {
     #[must_use]
     pub(crate) fn from_entries(entries: &[RouteOpenApiEntry]) -> Self {
         let mut schema_defs = BTreeMap::new();
+        let mut security_defs = BTreeMap::new();
         let operations = entries
             .iter()
             .map(|entry| {
@@ -527,9 +603,11 @@ impl OpenApi {
                         deprecated: false,
                         parameters: Vec::new(),
                         responses: Vec::new(),
+                        security: Vec::new(),
                     },
                     |spec| {
                         collect_schemas(spec.schemas, &mut schema_defs);
+                        let security = collect_security(spec.security, &mut security_defs);
                         let docs = spec.docs;
                         let mut parameters = Vec::new();
                         for (idx, schema_fn) in spec.parameters.iter().enumerate() {
@@ -555,16 +633,19 @@ impl OpenApi {
                             deprecated: spec.deprecated,
                             parameters,
                             responses,
+                            security,
                         }
                     },
                 )
             })
             .collect();
         let schemas = schema_defs.into_iter().collect();
+        let security_schemes = security_defs.into_iter().collect();
         Self {
             info: None,
             operations,
             schemas,
+            security_schemes,
         }
     }
 
@@ -742,11 +823,18 @@ impl OpenApi {
 
     #[cfg(feature = "openapi")]
     fn build_components(&self) -> utoipa::openapi::schema::Components {
-        self.schemas
+        let builder = self
+            .schemas
             .iter()
             .cloned()
             .fold(ComponentsBuilder::new(), |builder, (name, schema)| {
                 builder.schema(name, schema)
+            });
+        self.security_schemes
+            .iter()
+            .cloned()
+            .fold(builder, |builder, (name, scheme)| {
+                builder.security_scheme(name, scheme)
             })
             .build()
     }
@@ -786,6 +874,8 @@ pub struct OpenApiOperation {
     pub parameters: Vec<NamedExtractorSchema>,
     /// Schemas describing all potential responses.
     pub responses: Vec<ResponseSchema>,
+    /// Security schemes required (or optionally accepted) by this operation.
+    pub security: Vec<SecuritySchemeInfo>,
 }
 
 impl fmt::Debug for OpenApiOperation {
@@ -799,6 +889,7 @@ impl fmt::Debug for OpenApiOperation {
             .field("deprecated", &self.deprecated)
             .field("parameters", &self.parameters.len())
             .field("responses", &self.responses.len())
+            .field("security", &self.security.len())
             .finish()
     }
 }
@@ -929,6 +1020,18 @@ fn build_operation(op: &OpenApiOperation) -> Operation {
 
     if let Some(docs) = op.docs {
         builder = builder.description(Some(docs.to_owned()));
+    }
+
+    if !op.security.is_empty() {
+        let mut requirements: Vec<SecurityRequirement> = op
+            .security
+            .iter()
+            .map(|info| SecurityRequirement::new(info.name, Vec::<String>::new()))
+            .collect();
+        if op.security.iter().all(|info| info.optional) {
+            requirements.push(SecurityRequirement::default());
+        }
+        builder = builder.securities(Some(requirements));
     }
 
     builder.build()
