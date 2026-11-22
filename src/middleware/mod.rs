@@ -40,12 +40,12 @@
 //! 404 and 405 responses, which is what CORS and tracing layers need.
 
 mod body_limit;
+mod concurrency_limit;
 mod cors;
 mod decompression;
 mod error_handling;
 mod request_id;
 mod session;
-#[cfg(not(target_arch = "wasm32"))]
 mod timeout;
 mod trace;
 
@@ -62,6 +62,7 @@ use skyzen_core::{
 
 pub use body_limit::BodyLimit;
 pub use compression::{CompressionEncoding, CompressionLevel, CompressionMiddleware};
+pub use concurrency_limit::{ConcurrencyLimit, Overloaded};
 pub use cors::{AllowOrigin, Cors, CorsConfigError};
 pub use decompression::{DecompressionEncoding, DecompressionMiddleware};
 pub use error_handling::ErrorHandlingMiddleware;
@@ -73,8 +74,7 @@ pub use session::{
 pub use skyzen_core::middleware::{
     apply, from_fn, BoxMiddleware, FromFn, Middleware, MiddlewareFn, Next,
 };
-#[cfg(not(target_arch = "wasm32"))]
-pub use timeout::Timeout;
+pub use timeout::{RequestTimeout, Timeout};
 pub use trace::Trace;
 
 /// Whole milliseconds in a `js_sys::Date` reading or difference.

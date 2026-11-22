@@ -1,4 +1,5 @@
-//! `RateLimit` — a fixed-window counter over the portable `Kv` service, or process memory.
+//! `RateLimit` — fixed-window, sliding-window, or token-bucket rate limiting over the portable
+//! `Kv` service, Durable Objects, or process memory.
 //!
 //! ```rust,ignore
 //! // Per-IP, 100 requests per 60s, backed by a manifest [[service]] KV binding.
@@ -57,10 +58,18 @@ http_error!(
     "the rate limiter could not reach its counter backend"
 );
 
-/// One hit's outcome: the running count in this window and the seconds until it resets.
+/// One hit's outcome: whether the request is admitted and the seconds until retry.
 struct Hit {
-    count: u64,
+    allowed: bool,
     retry_after: u64,
+}
+
+/// Rate-limiting algorithm and parameters evaluated by a [`RateLimitStore`].
+#[derive(Debug, Clone, Copy)]
+enum Policy {
+    FixedWindow { limit: u64, window: Duration },
+    SlidingWindow { limit: u64, window: Duration },
+    TokenBucket { capacity: u64, refill_per_sec: f64 },
 }
 
 /// Why a count could not be taken.
@@ -75,7 +84,7 @@ enum HitError {
 /// The counter backend — `Kv` bindings and the in-process map both fill it.
 #[allow(clippy::manual_async_fn)]
 trait RateLimitStore: fmt::Debug + Send + Sync + 'static {
-    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>>;
+    fn hit<'a>(&'a self, key: &'a str, policy: Policy) -> BoxFuture<'a, Result<Hit, HitError>>;
 }
 
 /// Builds the per-request counter backend — a KV binding or a shared in-process store.
@@ -89,14 +98,13 @@ type Resolver = Arc<
 type KeyFn =
     Arc<dyn for<'a> Fn(&'a mut Request) -> BoxFuture<'a, Result<String, Error>> + Send + Sync>;
 
-/// A fixed-window rate limiter.
+/// A rate limiter supporting fixed-window (default), sliding-window, and token-bucket policies.
 ///
 /// `resolve` builds the per-request counter — a `kv::<S>` binding extracted from the request
 /// extensions, or a shared in-process store. `key` names the thing being limited — the
 /// client IP by default.
 pub struct RateLimit {
-    limit: u64,
-    window: Duration,
+    policy: Policy,
     resolve: Resolver,
     key: KeyFn,
     name: String,
@@ -106,8 +114,7 @@ pub struct RateLimit {
 impl fmt::Debug for RateLimit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RateLimit")
-            .field("limit", &self.limit)
-            .field("window", &self.window)
+            .field("policy", &self.policy)
             .field("fail_open", &self.fail_open)
             .finish_non_exhaustive()
     }
@@ -170,8 +177,7 @@ impl RateLimit {
             "rate limit window must be at least 1ms"
         );
         Self {
-            limit,
-            window,
+            policy: Policy::FixedWindow { limit, window },
             resolve,
             key: Arc::new(|request| {
                 Box::pin(async move {
@@ -186,6 +192,41 @@ impl RateLimit {
             name: format!("{limit}/{}", window.as_millis()),
             fail_open: true,
         }
+    }
+
+    /// Use a sliding-window counter (weighted previous window + current window) instead of a
+    /// hard-reset fixed window, smoothing boundary bursts across both in-memory and `Kv` backends.
+    #[must_use]
+    pub const fn sliding_window(mut self) -> Self {
+        self.policy = match self.policy {
+            Policy::FixedWindow { limit, window } | Policy::SlidingWindow { limit, window } => {
+                Policy::SlidingWindow { limit, window }
+            }
+            Policy::TokenBucket { capacity, .. } => Policy::SlidingWindow {
+                limit: capacity,
+                window: Duration::from_secs(1),
+            },
+        };
+        self
+    }
+
+    /// Use a token-bucket policy with burst `capacity` refilling at `refill_per_sec` tokens/s.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity == 0` or `refill_per_sec` is not finite and positive.
+    #[must_use]
+    pub fn token_bucket(mut self, capacity: u64, refill_per_sec: f64) -> Self {
+        assert!(capacity > 0, "token bucket capacity must be at least 1");
+        assert!(
+            refill_per_sec.is_finite() && refill_per_sec > 0.0,
+            "token bucket refill_per_sec must be finite and positive"
+        );
+        self.policy = Policy::TokenBucket {
+            capacity,
+            refill_per_sec,
+        };
+        self
     }
 
     /// Names this policy's bucket namespace on a shared backend. Two limiters that must
@@ -251,8 +292,8 @@ impl Middleware for RateLimit {
                 name,
                 bound_key_component(&(self.key)(request).await?),
             );
-            match store.hit(&key, self.window).await {
-                Ok(hit) if hit.count <= self.limit => next.run(request).await,
+            match store.hit(&key, self.policy).await {
+                Ok(hit) if hit.allowed => next.run(request).await,
                 Ok(hit) => {
                     // A 429 is an error — it propagates through the shared error path, with
                     // the wait riding the request as a must-deliver header: whichever
@@ -374,69 +415,206 @@ fn now_ms() -> u64 {
     }
 }
 
-/// A `Kv`-backed counter: fixed window indexed by epoch, so `Retry-After` is exact.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn sliding_weighted_count(prev: u64, curr: u64, elapsed_ms: u64, window_ms: u64) -> u64 {
+    let prev_weight = window_ms.saturating_sub(elapsed_ms) as f64 / window_ms as f64;
+    let weighted_prev = (prev as f64 * prev_weight).floor() as u64;
+    weighted_prev.saturating_add(curr)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn refill_token_bucket(
+    tokens: f64,
+    last_ms: u64,
+    now_ms: u64,
+    capacity: u64,
+    refill_per_sec: f64,
+) -> (bool, f64, u64) {
+    let elapsed_sec = now_ms.saturating_sub(last_ms) as f64 / 1000.0;
+    let refilled = elapsed_sec
+        .mul_add(refill_per_sec, tokens)
+        .min(capacity as f64);
+    if refilled >= 1.0 {
+        (true, refilled - 1.0, 0)
+    } else {
+        let retry_after = ((1.0 - refilled) / refill_per_sec).ceil().max(1.0) as u64;
+        (false, refilled, retry_after)
+    }
+}
+
+/// A `Kv`-backed counter: fixed window, sliding window, or CAS token bucket.
 #[derive(Debug)]
 struct KvStore {
     kv: Kv,
 }
 
-impl RateLimitStore for KvStore {
-    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
-        Box::pin(async move {
-            // Millisecond indexing, same as the in-memory store — a sub-second window must
-            // not silently widen to a second on one backend and not the other.
-            let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
-            let now = now_ms();
-            let index = now / window_ms;
-            let bucket = format!("rl:{key}:{index}");
-            // The counter is born already carrying its deadline — `increment_with_ttl`
-            // arms the TTL in the same atomic write, so no record can exist without expiry
-            // regardless of what fails afterwards. A backend that cannot do both (a Cosmos
-            // container without TTL enabled, Cloudflare KV without `increment`) answers a
-            // capability error rather than piling counters forever.
-            let count = match self
-                .kv
-                .increment_with_ttl(&bucket, 1, window.saturating_mul(2))
-                .await
-            {
-                // A counter only ever grows by +1, so after an increment it is always at
-                // least one — a stored negative corrupted to zero or below is not a fresh
-                // bucket, and counting it as one hands the key a free quota. Re-arming the
-                // poison keeps it non-positive: a corrupt -1 would otherwise climb through
-                // 0 into a fresh-looking 1 on the very next request. The swap is
-                // conditional — it only poisons the value we actually saw, so a racing
-                // increment is never overwritten — and it carries the record's deadline
-                // with it instead of stripping the TTL the way a plain write would.
-                Ok(count) if count <= 0 => {
-                    let _ = self
-                        .kv
-                        .compare_and_swap(&bucket, Some(count.to_string().as_bytes()), b"-1")
-                        .await;
-                    return Err(HitError::Unsupported(Error::msg(format!(
-                        "rate-limit counter under {bucket:?} is not positive"
-                    ))));
-                }
-                Ok(count) => count.cast_unsigned(),
-                // No atomic increment — the Cloudflare case — is a capability gap, not a
-                // transient outage; rejected credentials and an undecodable counter are
-                // just as permanent, and all of them fail closed because fail-open only
-                // exists for errors that can pass.
+impl KvStore {
+    async fn increment_bucket(&self, bucket: &str, ttl: Duration) -> Result<u64, HitError> {
+        match self.kv.increment_with_ttl(bucket, 1, ttl).await {
+            Ok(count) if count <= 0 => {
+                let _ = self
+                    .kv
+                    .compare_and_swap(bucket, Some(count.to_string().as_bytes()), b"-1")
+                    .await;
+                Err(HitError::Unsupported(Error::msg(format!(
+                    "rate-limit counter under {bucket:?} is not positive"
+                ))))
+            }
+            Ok(count) => Ok(count.cast_unsigned()),
+            Err(
+                error @ (KvError::Unsupported(_)
+                | KvError::Unauthorized
+                | KvError::Decode(_)
+                | KvError::Serialization(_)),
+            ) => Err(HitError::Unsupported(Error::new(error))),
+            Err(KvError::Conflict) => Ok(u64::MAX),
+            Err(other) => Err(HitError::Backend(Error::new(other))),
+        }
+    }
+
+    async fn read_bucket(&self, bucket: &str) -> Result<u64, HitError> {
+        match self.kv.get(bucket).await {
+            Ok(Some(raw)) => Ok(std::str::from_utf8(&raw)
+                .ok()
+                .and_then(|text| text.trim().parse::<i64>().ok())
+                .filter(|&v| v > 0)
+                .map_or(0, i64::cast_unsigned)),
+            Ok(None) => Ok(0),
+            Err(
+                error @ (KvError::Unsupported(_)
+                | KvError::Unauthorized
+                | KvError::Decode(_)
+                | KvError::Serialization(_)),
+            ) => Err(HitError::Unsupported(Error::new(error))),
+            Err(other) => Err(HitError::Backend(Error::new(other))),
+        }
+    }
+
+    async fn hit_token_bucket(
+        &self,
+        key: &str,
+        capacity: u64,
+        refill_per_sec: f64,
+    ) -> Result<Hit, HitError> {
+        const MAX_CAS_ATTEMPTS: usize = 8;
+        let bucket = format!("rl:tb:{key}");
+        let now = now_ms();
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let raw = match self.kv.get(&bucket).await {
+                Ok(raw) => raw,
                 Err(
                     error @ (KvError::Unsupported(_)
                     | KvError::Unauthorized
                     | KvError::Decode(_)
                     | KvError::Serialization(_)),
                 ) => return Err(HitError::Unsupported(Error::new(error))),
-                // A counter hot enough to exhaust its CAS retries is by definition under a
-                // burst — admitting the request fail-open would let the burst slip the
-                // limit, so count it against a spent bucket the way at-capacity keys are.
-                Err(KvError::Conflict) => u64::MAX,
                 Err(other) => return Err(HitError::Backend(Error::new(other))),
             };
-            Ok(Hit {
-                count,
-                retry_after: ((index + 1) * window_ms).saturating_sub(now) / 1000,
-            })
+            #[allow(clippy::cast_precision_loss)]
+            let (tokens, last_ms) = match raw.as_deref() {
+                None => (capacity as f64, now),
+                Some(bytes) => {
+                    let Some((t, ms)) = std::str::from_utf8(bytes)
+                        .ok()
+                        .and_then(|s| s.split_once(':'))
+                        .and_then(|(t, ms)| {
+                            Some((t.parse::<f64>().ok()?, ms.parse::<u64>().ok()?))
+                        })
+                    else {
+                        return Err(HitError::Unsupported(Error::msg(format!(
+                            "token-bucket record under {bucket:?} is malformed"
+                        ))));
+                    };
+                    (t, ms)
+                }
+            };
+            let (allowed, next_tokens, retry_after) =
+                refill_token_bucket(tokens, last_ms, now, capacity, refill_per_sec);
+            if !allowed {
+                return Ok(Hit {
+                    allowed: false,
+                    retry_after,
+                });
+            }
+            let encoded = format!("{next_tokens:.6}:{now}");
+            match self
+                .kv
+                .compare_and_swap(&bucket, raw.as_deref(), encoded.as_bytes())
+                .await
+            {
+                Ok(true) => {
+                    return Ok(Hit {
+                        allowed: true,
+                        retry_after: 0,
+                    });
+                }
+                Ok(false) | Err(KvError::Conflict) => {}
+                Err(
+                    error @ (KvError::Unsupported(_)
+                    | KvError::Unauthorized
+                    | KvError::Decode(_)
+                    | KvError::Serialization(_)),
+                ) => return Err(HitError::Unsupported(Error::new(error))),
+                Err(other) => return Err(HitError::Backend(Error::new(other))),
+            }
+        }
+        Ok(Hit {
+            allowed: false,
+            retry_after: 1,
+        })
+    }
+}
+
+impl RateLimitStore for KvStore {
+    fn hit<'a>(&'a self, key: &'a str, policy: Policy) -> BoxFuture<'a, Result<Hit, HitError>> {
+        Box::pin(async move {
+            match policy {
+                Policy::FixedWindow { limit, window } => {
+                    let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+                    let now = now_ms();
+                    let index = now / window_ms;
+                    let bucket = format!("rl:{key}:{index}");
+                    let count = self
+                        .increment_bucket(&bucket, window.saturating_mul(2))
+                        .await?;
+                    Ok(Hit {
+                        allowed: count <= limit,
+                        retry_after: ((index + 1) * window_ms).saturating_sub(now) / 1000,
+                    })
+                }
+                Policy::SlidingWindow { limit, window } => {
+                    let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+                    let now = now_ms();
+                    let index = now / window_ms;
+                    let elapsed = now % window_ms;
+                    let curr_bucket = format!("rl:sw:{key}:{index}");
+                    let curr = self
+                        .increment_bucket(&curr_bucket, window.saturating_mul(2))
+                        .await?;
+                    let prev = if let Some(prev_idx) = index.checked_sub(1) {
+                        self.read_bucket(&format!("rl:sw:{key}:{prev_idx}")).await?
+                    } else {
+                        0
+                    };
+                    let weighted = sliding_weighted_count(prev, curr, elapsed, window_ms);
+                    Ok(Hit {
+                        allowed: weighted <= limit,
+                        retry_after: window_ms.saturating_sub(elapsed) / 1000,
+                    })
+                }
+                Policy::TokenBucket {
+                    capacity,
+                    refill_per_sec,
+                } => self.hit_token_bucket(key, capacity, refill_per_sec).await,
+            }
         })
     }
 }
@@ -538,59 +716,153 @@ impl DurableKvRateStore {
     }
 }
 
-impl RateLimitStore for DurableKvRateStore {
-    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
-        Box::pin(async move {
-            // One record per limiter key — `{count}:{reset_ms}` — updated in place. Window
-            // rollover resets the counter where it sits, so storage stays proportional to the
-            // client space instead of accumulating one dead key per window.
-            let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
-            let now = now_ms();
-            let bucket = format!("rl:counter:{key}");
-            let stored = self
-                .kv
-                .get(&bucket)
-                .await
-                .map_err(|error| HitError::Backend(Error::new(error)))?;
-            let (count, reset) = match stored.as_deref() {
-                None => (0, ((now / window_ms) + 1) * window_ms),
-                // A record the format cannot read never decodes — treating it as absent
-                // would hand the key a fresh counter every window, so it fails closed.
-                Some(raw) => match std::str::from_utf8(raw)
+impl DurableKvRateStore {
+    async fn hit_fixed(&self, key: &str, limit: u64, window: Duration) -> Result<Hit, HitError> {
+        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+        let now = now_ms();
+        let bucket = format!("rl:counter:{key}");
+        let stored = self
+            .kv
+            .get(&bucket)
+            .await
+            .map_err(|error| HitError::Backend(Error::new(error)))?;
+        let (count, reset) = match stored.as_deref() {
+            None => (0, ((now / window_ms) + 1) * window_ms),
+            Some(raw) => match std::str::from_utf8(raw)
+                .ok()
+                .and_then(|text| text.split_once(':'))
+                .and_then(|(count, reset)| {
+                    Some((count.parse::<u64>().ok()?, reset.parse::<u64>().ok()?))
+                }) {
+                Some((count, reset)) if now < reset => (count, reset),
+                Some(_) => (0, ((now / window_ms) + 1) * window_ms),
+                None => {
+                    return Err(HitError::Unsupported(Error::msg(format!(
+                        "rate-limit record under {bucket:?} is not a counter"
+                    ))))
+                }
+            },
+        };
+        let Some(count) = count.checked_add(1) else {
+            return Err(HitError::Unsupported(Error::msg(format!(
+                "rate-limit record under {bucket:?} cannot grow past u64::MAX"
+            ))));
+        };
+        self.kv
+            .put(&bucket, format!("{count}:{reset}").as_bytes())
+            .await
+            .map_err(|error| HitError::Backend(Error::new(error)))?;
+        self.sweep_dead(now, reset, window_ms).await;
+        Ok(Hit {
+            allowed: count <= limit,
+            retry_after: reset.saturating_sub(now) / 1000,
+        })
+    }
+
+    async fn hit_sliding(&self, key: &str, limit: u64, window: Duration) -> Result<Hit, HitError> {
+        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+        let now = now_ms();
+        let index = now / window_ms;
+        let elapsed = now % window_ms;
+        let bucket = format!("rl:sw:{key}");
+        let stored = self
+            .kv
+            .get(&bucket)
+            .await
+            .map_err(|error| HitError::Backend(Error::new(error)))?;
+        let (prev, curr) = match stored.as_deref() {
+            None => (0, 0),
+            Some(raw) => {
+                let Some((p, c, idx)) = std::str::from_utf8(raw).ok().and_then(|s| {
+                    let mut parts = s.split(':');
+                    Some((
+                        parts.next()?.parse::<u64>().ok()?,
+                        parts.next()?.parse::<u64>().ok()?,
+                        parts.next()?.parse::<u64>().ok()?,
+                    ))
+                }) else {
+                    return Err(HitError::Unsupported(Error::msg(format!(
+                        "sliding-window record under {bucket:?} is malformed"
+                    ))));
+                };
+                if idx == index {
+                    (p, c)
+                } else if idx + 1 == index {
+                    (c, 0)
+                } else {
+                    (0, 0)
+                }
+            }
+        };
+        let curr = curr.saturating_add(1);
+        self.kv
+            .put(&bucket, format!("{prev}:{curr}:{index}").as_bytes())
+            .await
+            .map_err(|error| HitError::Backend(Error::new(error)))?;
+        let weighted = sliding_weighted_count(prev, curr, elapsed, window_ms);
+        Ok(Hit {
+            allowed: weighted <= limit,
+            retry_after: window_ms.saturating_sub(elapsed) / 1000,
+        })
+    }
+
+    async fn hit_token_bucket(
+        &self,
+        key: &str,
+        capacity: u64,
+        refill_per_sec: f64,
+    ) -> Result<Hit, HitError> {
+        let now = now_ms();
+        let bucket = format!("rl:tb:{key}");
+        let stored = self
+            .kv
+            .get(&bucket)
+            .await
+            .map_err(|error| HitError::Backend(Error::new(error)))?;
+        #[allow(clippy::cast_precision_loss)]
+        let (tokens, last_ms) = match stored.as_deref() {
+            None => (capacity as f64, now),
+            Some(raw) => {
+                let Some((t, ms)) = std::str::from_utf8(raw)
                     .ok()
-                    .and_then(|text| text.split_once(':'))
-                    .and_then(|(count, reset)| {
-                        Some((count.parse::<u64>().ok()?, reset.parse::<u64>().ok()?))
-                    }) {
-                    Some((count, reset)) if now < reset => (count, reset),
-                    Some(_) => (0, ((now / window_ms) + 1) * window_ms),
-                    None => {
-                        return Err(HitError::Unsupported(Error::msg(format!(
-                            "rate-limit record under {bucket:?} is not a counter"
-                        ))))
-                    }
-                },
-            };
-            // A counter only ever grows — u64::MAX cannot be the next value, so an
-            // overflow is corrupted state that fails closed rather than wrapping to zero
-            // and reading as a fresh bucket.
-            let Some(count) = count.checked_add(1) else {
-                return Err(HitError::Unsupported(Error::msg(format!(
-                    "rate-limit record under {bucket:?} cannot grow past u64::MAX"
-                ))));
-            };
+                    .and_then(|s| s.split_once(':'))
+                    .and_then(|(t, ms)| Some((t.parse::<f64>().ok()?, ms.parse::<u64>().ok()?)))
+                else {
+                    return Err(HitError::Unsupported(Error::msg(format!(
+                        "token-bucket record under {bucket:?} is malformed"
+                    ))));
+                };
+                (t, ms)
+            }
+        };
+        let (allowed, next_tokens, retry_after) =
+            refill_token_bucket(tokens, last_ms, now, capacity, refill_per_sec);
+        if allowed {
             self.kv
-                .put(&bucket, format!("{count}:{reset}").as_bytes())
+                .put(&bucket, format!("{next_tokens:.6}:{now}").as_bytes())
                 .await
                 .map_err(|error| HitError::Backend(Error::new(error)))?;
-            // Every hit advances the sweep one page — a marker keyed to the window index
-            // short-circuits once the pass is done, and the cursor keeps pages flowing to
-            // whichever request comes next rather than only the first of a bucket.
-            self.sweep_dead(now, reset, window_ms).await;
-            Ok(Hit {
-                count,
-                retry_after: reset.saturating_sub(now) / 1000,
-            })
+        }
+        Ok(Hit {
+            allowed,
+            retry_after,
+        })
+    }
+}
+
+impl RateLimitStore for DurableKvRateStore {
+    fn hit<'a>(&'a self, key: &'a str, policy: Policy) -> BoxFuture<'a, Result<Hit, HitError>> {
+        Box::pin(async move {
+            match policy {
+                Policy::FixedWindow { limit, window } => self.hit_fixed(key, limit, window).await,
+                Policy::SlidingWindow { limit, window } => {
+                    self.hit_sliding(key, limit, window).await
+                }
+                Policy::TokenBucket {
+                    capacity,
+                    refill_per_sec,
+                } => self.hit_token_bucket(key, capacity, refill_per_sec).await,
+            }
         })
     }
 }
@@ -604,6 +876,7 @@ struct MemoryStore {
 #[derive(Debug, Default)]
 struct MemoryInner {
     buckets: HashMap<String, (u64, u64)>,
+    token_buckets: HashMap<String, (f64, u64)>,
     /// The window index the last full expiry sweep ran for — one sweep per index, so a
     /// churned key space past the cap cannot make every request rescan the map, and the
     /// boundary rollover always gets a fresh pass where dead buckets actually die.
@@ -614,51 +887,140 @@ struct MemoryInner {
 /// key space cannot grow memory without bound.
 const MAX_MEMORY_BUCKETS: usize = 4096;
 
-impl RateLimitStore for MemoryStore {
+impl MemoryStore {
     #[allow(clippy::significant_drop_tightening)]
-    fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit, HitError>> {
-        Box::pin(std::future::ready({
-            // `hit` can be called on a store directly, outside the layer's assertion —
-            // treat a sub-millisecond window as 1ms rather than divide by zero.
-            let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
-            let now = now_ms();
-            let index = now / window_ms;
-            let bucket = format!("rl:{key}:{index}");
-            let (count, reset) = {
-                let mut inner = self
-                    .inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if inner.buckets.len() > MAX_MEMORY_BUCKETS && inner.last_sweep_index != Some(index)
-                {
-                    inner.buckets.retain(|_, (_, reset)| *reset > now);
-                    inner.last_sweep_index = Some(index);
+    fn hit_fixed(&self, key: &str, limit: u64, window: Duration) -> Hit {
+        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+        let now = now_ms();
+        let index = now / window_ms;
+        let bucket = format!("rl:{key}:{index}");
+        let (count, reset) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.buckets.len() > MAX_MEMORY_BUCKETS && inner.last_sweep_index != Some(index) {
+                inner.buckets.retain(|_, (_, reset)| *reset > now);
+                inner.last_sweep_index = Some(index);
+            }
+            if inner.buckets.len() > MAX_MEMORY_BUCKETS && !inner.buckets.contains_key(&bucket) {
+                (u64::MAX, (index + 1) * window_ms)
+            } else {
+                let entry = inner
+                    .buckets
+                    .entry(bucket)
+                    .or_insert((0, (index + 1) * window_ms));
+                if now >= entry.1 {
+                    *entry = (0, (index + 1) * window_ms);
                 }
-                if inner.buckets.len() > MAX_MEMORY_BUCKETS && !inner.buckets.contains_key(&bucket)
-                {
-                    // The key space outran the sweep — evicting a live bucket would hand the
-                    // churn an easy reset of someone's real quota, and an error would fail
-                    // open by default and admit the key uncounted. Count the request against
-                    // a spent bucket instead: the limiter answers 429, existing counters
-                    // keep their counts, and the map stays bounded.
-                    (u64::MAX, (index + 1) * window_ms)
-                } else {
-                    let entry = inner
+                entry.0 += 1;
+                (entry.0, entry.1)
+            }
+        };
+        Hit {
+            allowed: count <= limit,
+            retry_after: reset.saturating_sub(now) / 1000,
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn hit_sliding(&self, key: &str, limit: u64, window: Duration) -> Hit {
+        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+        let now = now_ms();
+        let index = now / window_ms;
+        let elapsed = now % window_ms;
+        let curr_bucket = format!("rl:sw:{key}:{index}");
+        let prev_bucket = index.checked_sub(1).map(|p| format!("rl:sw:{key}:{p}"));
+        let (prev, curr) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.buckets.len() > MAX_MEMORY_BUCKETS && inner.last_sweep_index != Some(index) {
+                inner.buckets.retain(|_, (_, reset)| *reset > now);
+                inner.last_sweep_index = Some(index);
+            }
+            let prev = prev_bucket
+                .and_then(|b| {
+                    inner
                         .buckets
-                        .entry(bucket)
-                        .or_insert((0, (index + 1) * window_ms));
-                    if now >= entry.1 {
-                        *entry = (0, (index + 1) * window_ms);
-                    }
-                    entry.0 += 1;
-                    (entry.0, entry.1)
+                        .get(&b)
+                        .filter(|(_, reset)| *reset > now)
+                        .map(|(c, _)| *c)
+                })
+                .unwrap_or(0);
+            if inner.buckets.len() > MAX_MEMORY_BUCKETS && !inner.buckets.contains_key(&curr_bucket)
+            {
+                (prev, u64::MAX)
+            } else {
+                // Keep each sliding-window bucket alive for two windows so the
+                // previous window remains readable throughout the current window.
+                let expiry = (index + 2) * window_ms;
+                let entry = inner.buckets.entry(curr_bucket).or_insert((0, expiry));
+                if now >= entry.1 {
+                    *entry = (0, expiry);
                 }
-            };
-            Ok(Hit {
-                count,
-                retry_after: (reset - now) / 1000,
-            })
-        }))
+                entry.0 += 1;
+                (prev, entry.0)
+            }
+        };
+        let weighted = sliding_weighted_count(prev, curr, elapsed, window_ms);
+        Hit {
+            allowed: weighted <= limit,
+            retry_after: window_ms.saturating_sub(elapsed) / 1000,
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening, clippy::cast_precision_loss)]
+    fn hit_token_bucket(&self, key: &str, capacity: u64, refill_per_sec: f64) -> Hit {
+        let now = now_ms();
+        let bucket = format!("rl:tb:{key}");
+        let (allowed, retry_after) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.token_buckets.len() > MAX_MEMORY_BUCKETS {
+                inner.token_buckets.retain(|_, (tokens, last)| {
+                    let elapsed_sec = now.saturating_sub(*last) as f64 / 1000.0;
+                    elapsed_sec.mul_add(refill_per_sec, *tokens) < capacity as f64
+                });
+            }
+            if inner.token_buckets.len() > MAX_MEMORY_BUCKETS
+                && !inner.token_buckets.contains_key(&bucket)
+            {
+                (false, 1)
+            } else {
+                let entry = inner
+                    .token_buckets
+                    .entry(bucket)
+                    .or_insert((capacity as f64, now));
+                let (allowed, next_tokens, retry_after) =
+                    refill_token_bucket(entry.0, entry.1, now, capacity, refill_per_sec);
+                if allowed {
+                    entry.0 = next_tokens;
+                    entry.1 = now;
+                }
+                (allowed, retry_after)
+            }
+        };
+        Hit {
+            allowed,
+            retry_after,
+        }
+    }
+}
+
+impl RateLimitStore for MemoryStore {
+    fn hit<'a>(&'a self, key: &'a str, policy: Policy) -> BoxFuture<'a, Result<Hit, HitError>> {
+        Box::pin(std::future::ready(Ok(match policy {
+            Policy::FixedWindow { limit, window } => self.hit_fixed(key, limit, window),
+            Policy::SlidingWindow { limit, window } => self.hit_sliding(key, limit, window),
+            Policy::TokenBucket {
+                capacity,
+                refill_per_sec,
+            } => self.hit_token_bucket(key, capacity, refill_per_sec),
+        })))
     }
 }
 
@@ -749,7 +1111,7 @@ mod tests {
             fn hit<'a>(
                 &'a self,
                 _: &'a str,
-                _: Duration,
+                _: super::Policy,
             ) -> futures_core::future::BoxFuture<'a, Result<super::Hit, super::HitError>>
             {
                 Box::pin(std::future::ready(Err(super::HitError::Backend(
@@ -795,5 +1157,54 @@ mod tests {
             .build();
         let error = closed_router.go(get()).await.unwrap_err();
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn sliding_window_enforces_limit_and_recovers() {
+        let router: Router = Route::new(("/hi".at(hello),))
+            .layer(
+                RateLimit::memory(2, Duration::from_secs(60))
+                    .sliding_window()
+                    .key_by(|_| Box::pin(std::future::ready(Ok("sw".to_owned())))),
+            )
+            .build();
+
+        assert_eq!(
+            router.clone().go(get()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            router.clone().go(get()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let err = router.go(get()).await.unwrap_err();
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn token_bucket_allows_burst_then_refills() {
+        let router: Router = Route::new(("/hi".at(hello),))
+            .layer(
+                RateLimit::memory(2, Duration::from_secs(1))
+                    .token_bucket(2, 50.0)
+                    .key_by(|_| Box::pin(std::future::ready(Ok("tb".to_owned())))),
+            )
+            .build();
+
+        // Burst of 2 succeeds, 3rd is rejected.
+        assert_eq!(
+            router.clone().go(get()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            router.clone().go(get()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let err = router.clone().go(get()).await.unwrap_err();
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Wait 30ms -> at 50 tokens/s, >1.5 tokens refill -> next request succeeds.
+        async_io::Timer::after(Duration::from_millis(30)).await;
+        assert_eq!(router.go(get()).await.unwrap().status(), StatusCode::OK);
     }
 }
