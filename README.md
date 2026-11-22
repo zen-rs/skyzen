@@ -11,6 +11,14 @@ same function body runs against Redis and Postgres on a server, Cloudflare KV an
 DynamoDB and SQS on AWS, Cosmos DB and Blob Storage on Azure — and against in-process fakes in your
 tests, with no sockets, no containers and no `wrangler` running.
 
+Natively, Skyzen runs a thread-per-core completion-based server on `compio` (`io_uring` on Linux,
+IOCP on Windows, kqueue on macOS) with owned-buffer HTTP/1.1 (`skyzen-h1`), HTTP/2 (`skyzen-h2`),
+TLS with Linux kernel TLS (`server-tls`), HTTP/3 over QUIC (`http3`), a splicing reverse proxy
+(`proxy`), and opt-in Linux `io_uring`/NIC acceleration. It can also be embedded into an existing
+`tokio`, `smol`, or `compio` runtime via the `Server` trait (`skyzen-h1`, `skyzen-h2`, or the
+optional `skyzen-hyper` adapter), and its foundational traits live in `no_std`-capable
+`skyzen-core`.
+
 ```rust
 use skyzen::{extract::Path, utils::Json, Result};
 use skyzen_services::{Db, Kv};
@@ -37,6 +45,9 @@ async fn order(Path(id): Path<u64>, kv: Kv, db: Db) -> Result<Json<Order>> {
 - [Portable Services](#portable-services)
 - [Testing Without Infrastructure](#testing-without-infrastructure)
 - [One Binary, Four Deployments](#one-binary-four-deployments)
+- [Native Server: HTTP/1.1, HTTP/2, HTTP/3 & `io_uring`](#native-server-http11-http2-http3--io_uring)
+- [Embedding & `no_std` Support](#embedding--no_std-support)
+- [Reverse Proxy](#reverse-proxy)
 - [Coming From axum](#coming-from-axum)
 - [Quick Start](#quick-start)
 - [Routing](#routing)
@@ -207,7 +218,7 @@ before it binds anything, and the `wasm32` build is the Worker:
 
 | Target | How it is selected | Entry point |
 |---|---|---|
-| Native server | nothing else matched | One compio runtime per core serving HTTP/1.1, `--port` / `--host` / `--listen` |
+| Native server | nothing else matched | One `compio` runtime per core (`io_uring` / IOCP / kqueue) serving HTTP/1.1, HTTP/2, TLS/kTLS, and optional HTTP/3; `--port` / `--host` / `--listen` (`unix:` included) |
 | AWS Lambda | `AWS_LAMBDA_RUNTIME_API` is set (needs the `lambda` feature) | `lambda_http` for HTTP, partial-batch responses for SQS |
 | Azure Functions | `FUNCTIONS_CUSTOMHANDLER_PORT` is set | custom handler; HTTP triggers reach the router, queue triggers reach `#[skyzen::queue]` |
 | Cloudflare Workers | compiled to `wasm32-unknown-unknown` | the WinterCG `fetch` export |
@@ -215,6 +226,162 @@ before it binds anything, and the `wasm32` build is the Worker:
 One `#[skyzen::queue]` handler is driven four ways: by Skyzen's own polling loop natively, by the
 platform on Workers and Lambda, and by the Functions host on Azure. See the
 [Deployment Guide](docs/deployment-guide.md).
+
+---
+
+## Native Server: HTTP/1.1, HTTP/2, HTTP/3 & `io_uring`
+
+### Thread-Per-Core & `!Send` Routers
+
+`#[skyzen::main]` starts one `compio` runtime per core (`available_parallelism`), each with its own
+listener (`SO_REUSEPORT` on Linux, shared socket elsewhere) and its own `!Send` `Router` built from
+an `EndpointFactory<ServingThread>`. Because handlers and middleware never leave their thread,
+`Rc`, `RefCell` and `Cell` work without locks. Outbound HTTP service clients (`S3Storage`,
+`DynamoKv`, `SqsQueue`, `RdsDataDb`, `AzureBlob`, `ServiceBusQueue`, `AzureStorageQueue`) and
+`Proxy` pool connections per thread on each thread's own `compio` runtime.
+
+### Owned-Buffer HTTP/1.1 & HTTP/2
+
+Native servers run `skyzen-h1` (`http-kit-h1`) and `skyzen-h2` (`http-kit-h2`) directly on
+`http-kit-io`'s owned-buffer streams — no copying poll bridge between `io_uring`/IOCP and the HTTP
+codec:
+
+- **Cleartext h2c & HTTP/1.1**: `--server` / `SKYZEN_SERVER` (`auto` by default, or `h1` / `h2`)
+  sniffs up to the 24-byte HTTP/2 preface without copying and routes connections directly to
+  `skyzen-h1` or `skyzen-h2`, on TCP and `unix:` sockets alike.
+- **HTTP/2 features**: RFC 8441 Extended `CONNECT` WebSockets (`:protocol = websocket`),
+  two-phase `GOAWAY` graceful draining, and `sendfile`/Linux `splice` for static files and proxied
+  bodies.
+
+### TLS, Kernel TLS & HTTP/3
+
+- **TLS & Linux kTLS (`server-tls` feature)**: `--tls-cert` / `--tls-key` (`SKYZEN_TLS_CERT` /
+  `SKYZEN_TLS_KEY`) terminate TLS with `rustls` (`http-kit-tls`) directly over owned-buffer
+  sockets, with ALPN selecting `h2` or `http/1.1`. On Linux, negotiated connections hand record
+  crypto to kernel TLS (kTLS), so `sendfile` and `splice` continue to work over HTTPS.
+- **HTTP/3 / QUIC (`http3` feature)**: Implies `server-tls`. Serves HTTP/3 through `http-kit-h3`
+  (`quiche`) on UDP alongside the TLS TCP listener, sharing the same port and PEM certificate/key,
+  and advertising `Alt-Svc` on TLS responses. On `SO_REUSEPORT` platforms (Linux, Android) every
+  serving thread runs a QUIC endpoint; elsewhere the first thread serves QUIC. Pass `--http3` /
+  `SKYZEN_HTTP3` to make any start that cannot serve HTTP/3 fail loudly.
+
+```toml
+[dependencies]
+skyzen = { version = "0.6", features = ["http3"] } # implies server-tls
+```
+
+```sh
+./target/release/my-app --listen 0.0.0.0:443 \
+  --tls-cert /etc/ssl/cert.pem --tls-key /etc/ssl/key.pem --http3
+```
+
+*On targets where `native-tls` links OpenSSL (non-Apple, non-Windows), `http3` cannot be combined
+with `tls-native-tls` because quiche's BoringSSL exports the same symbols; use `tls-rustls` for
+database TLS.*
+
+### Linux `io_uring` & Kernel/NIC Acceleration
+
+On Linux over `io_uring`, the native runtime exposes operator settings via CLI flags or environment
+variables (flags win):
+
+| Flag | Environment variable | Purpose |
+|---|---|---|
+| `--recv-buffers <count>`, `--recv-buffer-len <bytes>` | `SKYZEN_RECV_BUFFERS`, `SKYZEN_RECV_BUFFER_LEN` | Sizes each thread's `io_uring` provided buffer ring, registered for incremental consumption (`IOU_PBUF_RING_INC`, falling back automatically on kernels before 6.12) |
+| `--fixed-buffers <bytes>` | `SKYZEN_FIXED_BUFFERS` | Per-thread registered fixed-buffer region (`RLIMIT_MEMLOCK` / `CAP_IPC_LOCK`); cached static files at or above the zero-copy threshold are read into registered memory and sent zero-copy |
+| `--zero-copy-threshold <bytes>`, `--file-table-slots <count>` | `SKYZEN_ZERO_COPY_THRESHOLD`, `SKYZEN_FILE_TABLE_SLOTS` | Zero-copy send threshold and registered file table slots — also live-tunable from a handler via the `IoSettings` extractor |
+| `--busy-poll <µs>`, `--busy-poll-prefer`, `--busy-poll-budget <n>` | `SKYZEN_BUSY_POLL`, `SKYZEN_BUSY_POLL_PREFER`, `SKYZEN_BUSY_POLL_BUDGET` | `io_uring` NAPI busy polling (`IORING_REGISTER_NAPI`, Linux 6.9+) and socket busy-poll options |
+| `--steering <auto\|on\|off>` | `SKYZEN_STEERING` | Pins serving threads to CPUs and attaches `SO_ATTACH_REUSEPORT_CBPF` so connections stay on the core that received their NIC RX IRQ (`auto` enables it when every serving CPU handles a queue) |
+
+`skyzen doctor` inspects these host facilities directly via ethtool netlink, sysfs, procfs, and
+syscalls (kTLS, NIC TLS offload, header/data split, busy polling, IRQ placement, steering, and
+`RLIMIT_MEMLOCK`), and `skyzen deploy --provider native` applies `[native.linux]` and
+`[native.server]` from `Skyzen.toml` and installs a sandboxed `systemd` unit (`DynamicUser=yes`).
+See [Skyzen.toml Reference](docs/skyzen-toml-reference.md).
+
+---
+
+## Embedding & `no_std` Support
+
+### Embedding Skyzen in an Existing Runtime
+
+`#[skyzen::main]` and the `rt` feature are optional. To embed a Skyzen `Router` inside an existing
+`tokio`, `smol`, or `compio` application, disable `rt` and drive the router through the
+`skyzen::Server` trait with any `http-kit-io` backend (`Compio`, `Tokio`, or `AsyncIo`) and any
+`executor_core::LocalExecutor`:
+
+- **`skyzen-h1::H1`** / **`skyzen-h2::H2`**: owned-buffer HTTP/1.1 and HTTP/2 servers directly on
+  `http-kit-io`.
+- **`skyzen::hyper::Hyper`** (`hyper` feature): Hyper HTTP/1.1 (with upgrades) and prior-knowledge
+  HTTP/2 adapter, driving `!Send` routers without `with_upgrades()`.
+
+```toml
+[dependencies]
+skyzen = { version = "0.6", default-features = false, features = ["json", "hyper"] }
+```
+
+```rust
+use std::rc::Rc;
+use async_executor::LocalExecutor;
+use http_kit_io::{async_io::AsyncIo, FromStd as _};
+use skyzen::{hyper::Hyper, routing::{CreateRouteNode, Route}, Server};
+
+let router = Route::new(("/health".at(|| async { "OK" }),)).build();
+let executor = Rc::new(LocalExecutor::new());
+let listener = AsyncIo.tcp_listener(std::net::TcpListener::bind("127.0.0.1:3000")?)?;
+
+let serve = Hyper.serve(AsyncIo, Rc::clone(&executor), listener, router, shutdown_signal);
+smol::block_on(executor.run(serve));
+```
+
+See [`examples/embed_hyper.rs`](examples/embed_hyper.rs) for the complete runnable example. When
+mounting `StaticDir` under a non-compio executor, pass `ServingThread::without_compio()`.
+
+### `no_std` Core (`skyzen-core`)
+
+`skyzen-core` supports `no_std` (with `alloc`) when its default `std` feature is disabled:
+
+```toml
+[dependencies]
+skyzen-core = { version = "0.3", default-features = false }
+```
+
+Without `std`, `skyzen-core` provides `Extractor`, `Responder`, `Middleware`, `RequestBodyLimit` /
+`BodyConsumed`, and the HTTP error vocabulary (`Error`, `HttpError`, `Result`, `ResultExt`,
+`Context`) for constrained environments, custom runtimes, and shared libraries. `Server`,
+`upgrade`, `Secret`, Linux `steering`/`busy-poll`, and the full `skyzen` crate require `std`.
+
+---
+
+## Reverse Proxy
+
+Enable the `proxy` feature (native only) to forward a route prefix to an upstream HTTP/1.1 or
+HTTP/2 origin via `zenwave`, with one connection pool per serving thread:
+
+```rust
+use skyzen::{
+    proxy::{Proxy, Upstream},
+    routing::{CreateRouteNode, Route, Router},
+    runtime::ServingThread,
+};
+
+let upstream = Upstream::new(&"http://127.0.0.1:9000/v1".parse()?)?;
+
+// Inside the per-thread endpoint factory:
+let router = |thread: &ServingThread| -> Router {
+    Route::new(("/api".mount(Proxy::new(&upstream, thread)),)).build()
+};
+```
+
+- Supports multi-origin pools via `Upstream::pool` with `LoadBalance` (`RoundRobin` or
+  `LeastConnections`), passive outlier ejection (`PassiveHealth`), active HTTP probing
+  (`HealthCheck`), upstream timeouts (`connect_timeout`, `request_timeout`, `body_idle_timeout` —
+  `504` on expiry), and idempotent empty-body retries (`RetryPolicy`).
+- Streams request and response bodies frame-by-frame with chunked trailers, strips hop-by-hop
+  headers, writes RFC 7239 `Forwarded` and `Via`, and trusts inbound forwarding headers only from
+  peers matched by `TrustedProxies`.
+- Tunnels HTTP/1.1 `101 Switching Protocols` upgrades (including WebSockets).
+- On Linux, splices HTTP/1.1 and unpadded HTTP/2 bodies as well as upgraded tunnels directly
+  between plain TCP or kernel-TLS sockets without copying payload bytes into user space.
 
 ---
 
@@ -245,9 +412,13 @@ Most of what you reach for has a direct equivalent:
 
 What is genuinely different:
 
-- **No `tower`.** `Middleware` is Skyzen's own trait taking `&self`, so the whole `tower`/
-  `tower-http` ecosystem is unavailable. The shipped middleware above is what there is; anything
-  else you write yourself, which is ~10 lines.
+- **No `tower`.** `Middleware` is Skyzen's own trait taking `&self`, so the `tower`/`tower-http`
+  ecosystem does not apply. Skyzen ships its own layers (`Cors`, `Trace`, `RequestId`,
+  `CompressionMiddleware`, `DecompressionMiddleware`, `BodyLimit`, `Timeout`, `Sessions`, `Csrf`,
+  `RateLimit`, `SecurityHeaders`, `AutoETag`, `AuthMiddleware`), and writing a custom one is ~10
+  lines.
+- **Routers are per-thread and `!Send`.** Handlers and middleware can hold `Rc`, `RefCell`, or
+  `Cell` directly; what crosses threads is the factory that builds one router per core.
 - **Routing is a tree of values, not a builder chain.** `Route::new((..))` takes a tuple of nodes,
   and `Route::build()` validates the wiring before the first request rather than 500-ing on it.
 - **Extraction is `&mut Request`,** not `FromRequest`/`FromRequestParts`. There is one trait, and
@@ -270,7 +441,7 @@ Two defaults are safer than axum's, and worth knowing before you port:
 
 ```toml
 [dependencies]
-skyzen = "0.1"
+skyzen = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 ```
 
@@ -432,8 +603,14 @@ async fn update_profile(
 | `State<T>` | `skyzen::utils::State` | Shared state attached with `.with(State(..))` |
 | `CookieJar` | `skyzen::utils::CookieJar` | Reads request cookies; also a `Responder` for setting them |
 | `BearerToken` | `skyzen::extract::BearerToken` | The bearer token from `Authorization` |
-| `ClientIp` | `skyzen::extract::ClientIp` | Client IP, honouring `X-Forwarded-For` and `CF-Connecting-IP` |
+| `ClientIp` | `skyzen::extract::ClientIp` | Client IP, honouring `Forwarded` / `X-Forwarded-For` / `CF-Connecting-IP` from `TrustedProxies` |
+| `PeerAddr` | `skyzen::extract::PeerAddr` | Direct TCP peer address of the connection |
 | `TypedHeader<H>` | `skyzen::extract::TypedHeader` | One RFC-typed header via `headers` (`typed-header` feature) |
+| `Valid<E>` | `skyzen::extract::Valid` | Runs `garde` validation on `Json`, `Form`, `Query`, or `Path` (`validate` feature) |
+| `Preconditions` | `skyzen::extract::Preconditions` | Evaluates write-side `If-Match` / `If-None-Match` / `If-Unmodified-Since` (`412` / `428`) |
+| `RequestId` | `skyzen::middleware::RequestId` | Per-request UUIDv7 (or trusted inbound) identifier |
+| `Session`, `TypedSession<T>` | `skyzen::middleware::*` | Lazy-loaded, dirty-tracked session backed by KV, encrypted cookie, or memory |
+| `IoSettings` | `skyzen::runtime::native::IoSettings` | Native `io_uring` settings handle for live-tuning zero-copy threshold and file table slots |
 | `Kv`, `Storage`, `Queue`, `Db` | `skyzen_services::*` | Portable services injected into the request |
 | `String`, `Bytes`, `ByteStr`, `Body` | `skyzen::http_kit::*` | The request body, buffered or streamed |
 | `HeaderMap`, `Uri`, `Method` | `skyzen::http_kit::*` | Request metadata |
@@ -462,6 +639,7 @@ those parameters by probing the payload at the handler's own call site instead.
 | `Redirect` | `to` (302), `see_other` (303), `temporary` (307), `permanent` (308), or `with_status` |
 | `HeaderMap`, `(HeaderName, HeaderValue)` | Sets response headers |
 | `Sse` | Streams Server-Sent Events, with keep-alives |
+| `Conditional<R>` / `Conditional::lazy` | Attaches `ETag`/`Last-Modified` validators and short-circuits `304 Not Modified` without serializing `R` |
 | `CookieJar` | Emits the `Set-Cookie` headers it accumulated |
 | `(StatusCode, T)`, `(HeaderMap, T)`, tuples | Compose an explicit status or headers with any responder |
 | `Result<T, E>` | `T` on `Ok`; `E: HttpError` becomes an HTTP error response |
@@ -555,8 +733,9 @@ fn router() -> Router {
 
 ### Writing Middleware
 
-`Middleware` takes **`&self`** and is stored once as `Arc<dyn MiddlewareObj>`, never cloned per
-request — so state kept in an atomic or a channel really persists:
+`Middleware` takes **`&self`** and is stored once per serving thread as `Rc<dyn MiddlewareObj>`,
+never cloned per request — so state kept in a `Cell`, `RefCell`, atomic, or channel persists across
+requests:
 
 ```rust
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -603,10 +782,18 @@ whose registered methods are `GET`/`POST`, so it has to be answered before the r
 | Middleware | Purpose |
 |---|---|
 | `Cors` | Answers preflights and decorates cross-origin responses; rejects credentials + wildcard origin at construction |
+| `Trace` | One `tracing` span per request with OpenTelemetry field names, covering 404/405 paths |
+| `RequestId` | Mints or trusts an inbound request ID, echoes it on the response, and exposes it as an extractor |
 | `CompressionMiddleware` | gzip/deflate negotiation, skipping HEAD and unknown-length streams |
 | `DecompressionMiddleware` | Decodes `Content-Encoding` request bodies (gzip/deflate/br/zstd), `415` + `Accept-Encoding` for the rest |
 | `BodyLimit` | Sets the request body cap for the routes it covers (2 MiB applies with no middleware at all) |
+| `MultipartLimits` | Configures field, file, and total size limits for `Multipart` extraction |
 | `Timeout` | Abandons a request that outruns its budget with `408` (native targets only) |
+| `Sessions` / `SessionsLayer` | Portable sessions backed by `Kv`, encrypted cookies, or process memory |
+| `Csrf` | `Sec-Fetch-Site` / `Origin` / `Referer` (and optional double-submit) protection for unsafe methods |
+| `RateLimit` | Fixed-window rate limiter backed by portable `Kv` or process memory (`429` + `Retry-After`) |
+| `SecurityHeaders` | Standard hardening response headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, HSTS, …) |
+| `AutoETag` | Emits weak `ETag` (`xxh3`) and answers `304` on buffered `GET` responses |
 | `ErrorHandlingMiddleware` | Renders endpoint errors into responses |
 | `AuthMiddleware` | Authenticates the request and injects `AuthUser<U>` |
 | `State<T>`, `Kv`, `Storage`, `Queue`, `Db` | Inject a value the matching extractor reads back |
@@ -752,7 +939,8 @@ same code is testable without wasm. See the [Durable Object + SQL Guide](docs/du
 
 ## WebSockets
 
-One API compiling to `async-tungstenite` natively and `WebSocketPair` on wasm:
+One API compiling to `async-tungstenite` natively (over both HTTP/1.1 `101` upgrades and HTTP/2
+RFC 8441 Extended `CONNECT` streams via `skyzen-h2`) and `WebSocketPair` on wasm:
 
 ```rust
 use futures_util::StreamExt;
@@ -826,6 +1014,13 @@ let embedded_routes = Route::new((
 ));
 ```
 
+On native targets, `StaticDir` keeps a lock-free per-thread LRU cache invalidated automatically by
+filesystem notifications (`notify`) and tunable live via `StaticCacheSettings`. Large files stream
+through `sendfile`/`splice` (including over Linux kTLS), and cached files at or above the zero-copy
+threshold read into the serving thread's registered buffer region (`--fixed-buffers`). Add
+`[static_files] precompress = ["public"]` in `Skyzen.toml` to have `skyzen build` pre-generate
+`.br`, `.zst`, and `.gz` siblings served automatically by `Accept-Encoding`.
+
 ---
 
 ## OpenAPI & Documentation
@@ -863,7 +1058,7 @@ fn router() -> Router {
 The document is the same on every target — a native server, Lambda, Azure Functions and a
 Cloudflare Worker all serve what `#[skyzen::openapi]` collected, in release as in debug. The
 `openapi` cargo feature is the only switch, and it is on by default; a bundle that has no use for a
-schema turns it off with `skyzen = { version = "0.2", default-features = false, features = [...] }`
+schema turns it off with `skyzen = { version = "0.6", default-features = false, features = [...] }`
 and pays for nothing — no specs, no schema functions, no registration.
 
 *How the metadata is collected differs by target, and only in cost. Natively it is linker-section
@@ -876,6 +1071,8 @@ only on the edge. See `src/openapi/registry.rs`.*
 ## Skyzen CLI
 
 ```sh
+cargo binstall skyzen-cli   # prebuilt binary (GitHub Releases)
+# or build from source:
 cargo install skyzen-cli
 ```
 
@@ -885,7 +1082,7 @@ toolchain — there is no `wasm-bindgen` or `wasm-opt` to add.
 ```sh
 skyzen new my-api --template api      # also: minimal, serverless-events, durable-realtime
 skyzen add redis postgres             # `cargo add` the crates a capability needs
-skyzen doctor                         # toolchain, wasm target, manifest, bindings, auth
+skyzen doctor                         # toolchain, wasm target, manifest, bindings, auth, Linux acceleration
 skyzen dev                            # native, restarts on change
 skyzen dev --provider cloudflare      # workerd, rebuilding the wasm on change
 skyzen openapi                        # open the API reference in a browser
@@ -894,7 +1091,7 @@ skyzen build --provider cloudflare    # artifacts only; prints raw and gzipped w
 skyzen provision                      # create the KV/D1 resources the manifest has no id for
 skyzen migrate                        # apply pending SQL migrations
 skyzen migrate status                 # what is applied, what is pending
-skyzen deploy --provider cloudflare   # or aws, or azure — same application, no code changes
+skyzen deploy --provider cloudflare   # or native (systemd + [native.linux]), aws, or azure
 skyzen logs --env staging             # stream the deployed application's logs
 skyzen secret set API_KEY             # value read from stdin
 skyzen secret push                    # deliver every declared [[secret]]
@@ -1017,13 +1214,15 @@ refuses to load are all in [Secrets](docs/skyzen-toml-reference.md#secrets) and
 
 | Crate | Path | Description |
 |---|---|---|
-| [`skyzen`](.) | Root | Routing, extractors, responders, middleware, static files, WebSockets, runtime |
-| [`skyzen-core`](core/) | `core/` | `Extractor`, `Responder`, `Middleware`, `Server`, `Secret`, the error types; `no_std`-capable |
+| [`skyzen`](.) | Root | Routing, extractors, responders, middleware, static files, reverse proxy (`proxy`), WebSockets, TLS/kTLS (`server-tls`), HTTP/3 (`http3`), native `compio` runtime |
+| [`skyzen-core`](core/) | `core/` | `Extractor`, `Responder`, `Middleware`, `Server`, `EndpointFactory`, `Secret`, Linux `steering`/`busy-poll`, error types; `no_std`-capable (`default-features = false`) |
 | [`skyzen-macros`](macros/) | `macros/` | `#[skyzen::main]`, `#[skyzen::error]`, `#[skyzen::openapi]`, `#[skyzen::queue]`, `#[skyzen::test]`, `import_config!` (services, databases and `[[secret]]` types), `embed_migrations!`, … |
 | [`skyzen-manifest`](manifest/) | `manifest/` | The one typed `Skyzen.toml` schema, shared by the macros and the CLI |
 | [`skyzen-services`](services/) | `services/` | The portable capabilities: `Kv`, `Storage`, `Queue`, `Db`, migrations, durable variants |
 | [`skyzen-test`](test/) | `test/` | `TestClient`, `TestContext`, in-memory backends, assertions, `insta` snapshots |
-| [`skyzen-hyper`](hyper/) | `hyper/` | The Hyper `Server` implementation for native runtimes |
+| [`skyzen-h1`](h1/) | `h1/` | Owned-buffer HTTP/1.1 `Server` on `http-kit-h1` and `http-kit-io` (`compio`, `tokio`, `async-io`) |
+| [`skyzen-h2`](h2/) | `h2/` | Owned-buffer HTTP/2 `Server` on `http-kit-h2` and `http-kit-io` (RFC 8441 WebSockets, `sendfile`/`splice`, two-phase `GOAWAY`) |
+| [`skyzen-hyper`](hyper/) | `hyper/` | Optional Hyper `Server` adapter (`hyper` feature) for embedding Skyzen into a caller-supplied runtime |
 | [`skyzen-lambda`](lambda/) | `lambda/` | AWS Lambda adapter — HTTP invocations and SQS batches (root crate's `lambda` feature) |
 | [`skyzen-redis`](redis/) | `redis/` | Redis `KeyValueStore` |
 | [`skyzen-s3`](s3/) | `s3/` | S3-compatible `ObjectStorage` |
@@ -1031,12 +1230,13 @@ refuses to load are all in [Secrets](docs/skyzen-toml-reference.md#secrets) and
 | [`skyzen-cloudflare-admin`](cloudflare-admin/) | `cloudflare-admin/` | Shared Cloudflare API response envelopes and token-source types for tools that call the control-plane API |
 | [`skyzen-aws`](aws/) | `aws/` | `DynamoKv`, `SqsQueue`, `RdsDataDb`, and `S3Storage` re-exported |
 | [`skyzen-azure`](azure/) | `azure/` | `CosmosKv`, `AzureBlob`, `ServiceBusQueue`, `AzureStorageQueue`, `AzureSqlDb` |
-| [`skyzen-cli`](cli/) | `cli/` | The `skyzen` binary: scaffolding, local emulation, provisioning, migrations, secret delivery, deployment |
+| [`skyzen-cli`](cli/) | `cli/` | The `skyzen` binary: scaffolding, local emulation, Linux host diagnostics/deploy, provisioning, migrations, secret delivery, deployment |
 
 ---
 
 ## Guides & Examples
 
+- [Skyzen Agent Skill](skills/skyzen/SKILL.md)
 - [Using Portable Services](docs/services-guide.md)
 - [SQL Migrations](docs/migrations.md)
 - [Testing Guide](docs/testing-guide.md)

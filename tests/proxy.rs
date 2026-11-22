@@ -1166,3 +1166,406 @@ mod kernel_tls {
         );
     }
 }
+
+/// Multi-upstream load balancing, passive/active health checks, timeouts, and idempotent retries.
+mod load_balancing {
+    use std::{
+        cell::{Cell, RefCell},
+        convert::Infallible,
+        net::SocketAddr,
+        rc::Rc,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use skyzen::{
+        header,
+        proxy::{
+            HealthCheck, LoadBalance, PassiveHealth, Proxy, RetryPolicy, Upstream, UpstreamError,
+        },
+        routing::{CreateRouteNode, Route},
+        Body, Endpoint, Method, Request, Response, StatusCode, Uri,
+    };
+
+    use super::{connect, read_frames, request, run, serve, thread};
+
+    #[derive(Clone)]
+    struct MockOrigin {
+        id: &'static str,
+        hits: Rc<AtomicUsize>,
+        hosts_seen: Rc<RefCell<Vec<String>>>,
+        healthy: Arc<AtomicBool>,
+        status: Rc<Cell<StatusCode>>,
+        delay: Rc<Cell<Option<Duration>>>,
+        gate: Option<async_channel::Receiver<()>>,
+    }
+
+    impl MockOrigin {
+        fn new(id: &'static str) -> Self {
+            Self {
+                id,
+                hits: Rc::new(AtomicUsize::new(0)),
+                hosts_seen: Rc::new(RefCell::new(Vec::new())),
+                healthy: Arc::new(AtomicBool::new(true)),
+                status: Rc::new(Cell::new(StatusCode::OK)),
+                delay: Rc::new(Cell::new(None)),
+                gate: None,
+            }
+        }
+
+        fn with_gate(mut self, gate: async_channel::Receiver<()>) -> Self {
+            self.gate = Some(gate);
+            self
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Endpoint for MockOrigin {
+        type Error = Infallible;
+
+        async fn respond(&mut self, request: &mut Request) -> Result<Response, Infallible> {
+            let path = request.uri().path().to_owned();
+            if path == "/healthz" {
+                let mut resp = Response::new(Body::empty());
+                *resp.status_mut() = if self.healthy.load(Ordering::SeqCst) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                return Ok(resp);
+            }
+
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            if let Some(host) = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+            {
+                self.hosts_seen.borrow_mut().push(host.to_owned());
+            }
+
+            if let Some(delay) = self.delay.get() {
+                compio::time::sleep(delay).await;
+            }
+            if path == "/v1/hold" {
+                if let Some(gate) = &self.gate {
+                    let _ = gate.recv().await;
+                }
+            }
+
+            let mut resp = Response::new(Body::from(self.id));
+            *resp.status_mut() = self.status.get();
+            Ok(resp)
+        }
+    }
+
+    fn uri_for(addr: SocketAddr, prefix: &str) -> Uri {
+        format!("http://{addr}{prefix}").parse().expect("valid URI")
+    }
+
+    fn closed_addr() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("local addr")
+    }
+
+    #[test]
+    fn empty_pool_is_rejected() {
+        let err = Upstream::pool(std::iter::empty::<Uri>()).expect_err("empty pool");
+        assert!(matches!(err, UpstreamError::EmptyPool));
+    }
+
+    #[test]
+    fn round_robin_distributes_across_origins_and_rewrites_host() {
+        run(async {
+            let o1 = MockOrigin::new("one");
+            let o2 = MockOrigin::new("two");
+            let o3 = MockOrigin::new("three");
+            let a1 = serve(o1.clone());
+            let a2 = serve(o2.clone());
+            let a3 = serve(o3.clone());
+
+            let upstream =
+                Upstream::pool([uri_for(a1, "/v1"), uri_for(a2, "/v1"), uri_for(a3, "/v1")])
+                    .expect("pool")
+                    .load_balance(LoadBalance::RoundRobin);
+            let proxy =
+                serve(Route::new(("/api".mount(Proxy::new(&upstream, &thread())),)).build());
+            let send = connect(proxy).await;
+
+            let mut seen = Vec::new();
+            for _ in 0..6 {
+                let resp = send
+                    .send(request(Method::GET, "/api/item", Body::empty()))
+                    .await
+                    .expect("response");
+                assert_eq!(resp.status(), StatusCode::OK);
+                let (body, _) = read_frames(resp.into_body()).await;
+                seen.push(String::from_utf8(body).expect("utf8"));
+            }
+
+            assert_eq!(seen, ["one", "two", "three", "one", "two", "three"]);
+            assert_eq!(o1.hits(), 2);
+            assert_eq!(o2.hits(), 2);
+            assert_eq!(o3.hits(), 2);
+            assert_eq!(
+                o1.hosts_seen.borrow().as_slice(),
+                [a1.to_string(), a1.to_string()]
+            );
+            assert_eq!(
+                o2.hosts_seen.borrow().as_slice(),
+                [a2.to_string(), a2.to_string()]
+            );
+        });
+    }
+
+    #[test]
+    fn least_connections_routes_away_from_busy_origin() {
+        run(async {
+            let (tx, rx) = async_channel::bounded::<()>(1);
+            let o1 = MockOrigin::new("one").with_gate(rx);
+            let o2 = MockOrigin::new("two");
+            let a1 = serve(o1.clone());
+            let a2 = serve(o2.clone());
+
+            let upstream = Upstream::pool([uri_for(a1, "/v1"), uri_for(a2, "/v1")])
+                .expect("pool")
+                .load_balance(LoadBalance::LeastConnections);
+            let proxy =
+                serve(Route::new(("/api".mount(Proxy::new(&upstream, &thread())),)).build());
+
+            // Start one long-lived in-flight request that lands on `o1`.
+            let send1 = connect(proxy).await;
+            let held = compio::runtime::spawn(async move {
+                let resp = send1
+                    .send(request(Method::GET, "/api/hold", Body::empty()))
+                    .await
+                    .expect("held response");
+                let (body, _) = read_frames(resp.into_body()).await;
+                String::from_utf8(body).expect("utf8")
+            });
+
+            // Wait until `o1` has received the held request.
+            while o1.hits() == 0 {
+                compio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            // While `o1` has 1 in-flight request, subsequent requests must all go to `o2`.
+            let send2 = connect(proxy).await;
+            for _ in 0..3 {
+                let resp = send2
+                    .send(request(Method::GET, "/api/fast", Body::empty()))
+                    .await
+                    .expect("fast response");
+                let (body, _) = read_frames(resp.into_body()).await;
+                assert_eq!(body, b"two");
+            }
+            assert_eq!(o1.hits(), 1);
+            assert_eq!(o2.hits(), 3);
+
+            // Release `o1` and confirm the held request finishes cleanly.
+            tx.send(()).await.expect("release");
+            assert_eq!(held.await.expect("held task"), "one");
+        });
+    }
+
+    #[test]
+    fn passive_health_ejects_failing_origin_and_recovers_after_cooldown() {
+        run(async {
+            let o1 = MockOrigin::new("one");
+            o1.status.set(StatusCode::SERVICE_UNAVAILABLE);
+            let o2 = MockOrigin::new("two");
+            let a1 = serve(o1.clone());
+            let a2 = serve(o2.clone());
+
+            let upstream = Upstream::pool([uri_for(a1, "/v1"), uri_for(a2, "/v1")])
+                .expect("pool")
+                .passive_health(PassiveHealth::new(2, Duration::from_millis(120)));
+            let proxy =
+                serve(Route::new(("/api".mount(Proxy::new(&upstream, &thread())),)).build());
+            let send = connect(proxy).await;
+
+            // Round-robin: req1->o1 (fail 1), req2->o2 (ok), req3->o1 (fail 2 => ejected), req4->o2 (ok).
+            for _ in 0..4 {
+                let resp = send
+                    .send(request(Method::GET, "/api/ping", Body::empty()))
+                    .await
+                    .expect("response");
+                drop(read_frames(resp.into_body()).await);
+            }
+            assert_eq!(o1.hits(), 2);
+            assert_eq!(o2.hits(), 2);
+
+            // While `o1` is ejected, 3 more requests go solely to `o2`.
+            for _ in 0..3 {
+                let resp = send
+                    .send(request(Method::GET, "/api/ping", Body::empty()))
+                    .await
+                    .expect("response");
+                assert_eq!(resp.status(), StatusCode::OK);
+                let (body, _) = read_frames(resp.into_body()).await;
+                assert_eq!(body, b"two");
+            }
+            assert_eq!(o1.hits(), 2);
+            assert_eq!(o2.hits(), 5);
+
+            // Heal `o1` and wait past the 120ms ejection cooldown.
+            o1.status.set(StatusCode::OK);
+            compio::time::sleep(Duration::from_millis(160)).await;
+
+            // `o1` is tried again and recovers.
+            let mut got_one = false;
+            for _ in 0..4 {
+                let resp = send
+                    .send(request(Method::GET, "/api/ping", Body::empty()))
+                    .await
+                    .expect("response");
+                assert_eq!(resp.status(), StatusCode::OK);
+                let (body, _) = read_frames(resp.into_body()).await;
+                if body == b"one" {
+                    got_one = true;
+                }
+            }
+            assert!(got_one, "origin one did not recover after cooldown");
+        });
+    }
+
+    #[test]
+    fn active_health_check_marks_unhealthy_down_and_restores_on_200() {
+        run(async {
+            let o1 = MockOrigin::new("one");
+            o1.healthy.store(false, Ordering::SeqCst);
+            let o2 = MockOrigin::new("two");
+            let a1 = serve(o1.clone());
+            let a2 = serve(o2.clone());
+
+            let upstream = Upstream::pool([uri_for(a1, "/v1"), uri_for(a2, "/v1")])
+                .expect("pool")
+                .health_check(
+                    HealthCheck::get("/healthz")
+                        .interval(Duration::from_millis(40))
+                        .timeout(Duration::from_millis(200)),
+                );
+            let proxy =
+                serve(Route::new(("/api".mount(Proxy::new(&upstream, &thread())),)).build());
+
+            // Give the initial probe time to complete and mark `o1` unhealthy.
+            compio::time::sleep(Duration::from_millis(60)).await;
+
+            let send = connect(proxy).await;
+            for _ in 0..4 {
+                let resp = send
+                    .send(request(Method::GET, "/api/ping", Body::empty()))
+                    .await
+                    .expect("response");
+                assert_eq!(resp.status(), StatusCode::OK);
+                let (body, _) = read_frames(resp.into_body()).await;
+                assert_eq!(body, b"two");
+            }
+            assert_eq!(o1.hits(), 0);
+            assert_eq!(o2.hits(), 4);
+
+            // Restore `/healthz` on `o1` and wait for the next probe cycle.
+            o1.healthy.store(true, Ordering::SeqCst);
+            compio::time::sleep(Duration::from_millis(100)).await;
+
+            let mut got_one = false;
+            for _ in 0..4 {
+                let resp = send
+                    .send(request(Method::GET, "/api/ping", Body::empty()))
+                    .await
+                    .expect("response");
+                assert_eq!(resp.status(), StatusCode::OK);
+                let (body, _) = read_frames(resp.into_body()).await;
+                if body == b"one" {
+                    got_one = true;
+                }
+            }
+            assert!(got_one, "active health check did not restore origin one");
+        });
+    }
+
+    #[test]
+    fn upstream_request_timeout_returns_504_gateway_timeout() {
+        run(async {
+            let o1 = MockOrigin::new("slow");
+            o1.delay.set(Some(Duration::from_millis(250)));
+            let a1 = serve(o1);
+
+            let upstream = Upstream::new(&uri_for(a1, "/v1"))
+                .expect("upstream")
+                .request_timeout(Duration::from_millis(60));
+            let proxy =
+                serve(Route::new(("/api".mount(Proxy::new(&upstream, &thread())),)).build());
+            let send = connect(proxy).await;
+
+            let resp = send
+                .send(request(Method::GET, "/api/slow", Body::empty()))
+                .await
+                .expect("response");
+            assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        });
+    }
+
+    #[test]
+    fn idempotent_get_retries_on_failure_while_post_and_non_empty_put_do_not() {
+        run(async {
+            let dead = closed_addr();
+            let o2 = MockOrigin::new("two");
+            let a2 = serve(o2.clone());
+
+            let upstream = Upstream::pool([uri_for(dead, "/v1"), uri_for(a2, "/v1")])
+                .expect("pool")
+                .retries(RetryPolicy::idempotent(2));
+            let proxy =
+                serve(Route::new(("/api".mount(Proxy::new(&upstream, &thread())),)).build());
+            let send = connect(proxy).await;
+
+            // Cursor starts at 0 (dead): GET has empty body and is idempotent => retries onto `o2`.
+            let resp = send
+                .send(request(Method::GET, "/api/get", Body::empty()))
+                .await
+                .expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let (body, _) = read_frames(resp.into_body()).await;
+            assert_eq!(body, b"two");
+            assert_eq!(o2.hits(), 1);
+
+            // Cursor is now at 0 (dead) again (because `o2` was index 1 -> cursor wrapped to 0):
+            // POST is NOT idempotent => must NOT retry onto `o2`, returns 502 Bad Gateway.
+            let resp = send
+                .send(request(Method::POST, "/api/post", Body::from("payload")))
+                .await
+                .expect("response");
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            drop(read_frames(resp.into_body()).await);
+            assert_eq!(o2.hits(), 1);
+
+            // Next request lands on `o2` (cursor 1), advance cursor back to 0 (dead).
+            let send = connect(proxy).await;
+            let resp = send
+                .send(request(Method::GET, "/api/advance", Body::empty()))
+                .await
+                .expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            drop(read_frames(resp.into_body()).await);
+            assert_eq!(o2.hits(), 2);
+
+            // Cursor is at 0 (dead): PUT with a non-empty body cannot be rewound => must NOT retry.
+            let resp = send
+                .send(request(Method::PUT, "/api/put", Body::from("non-empty")))
+                .await
+                .expect("response");
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+            drop(read_frames(resp.into_body()).await);
+            assert_eq!(o2.hits(), 2);
+        });
+    }
+}

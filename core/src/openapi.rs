@@ -1,11 +1,13 @@
 //! `OpenAPI` primitives shared by the core traits.
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::fmt;
 
 use http_kit::StatusCode;
 use utoipa::openapi::{
     schema::{Schema, SchemaType, Type},
+    security::SecurityScheme,
     RefOr,
 };
 
@@ -82,3 +84,26 @@ pub fn plain_string_schema() -> SchemaRef {
 
 /// Function pointer used to register schemas in the `OpenAPI` components section.
 pub type SchemaCollector = fn(&mut BTreeMap<String, SchemaRef>);
+
+/// Security scheme metadata declared by an extractor for `OpenAPI`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecuritySchemeInfo {
+    /// Unique name of the security scheme in `components.securitySchemes`.
+    pub name: &'static str,
+    /// The `OpenAPI` security scheme definition.
+    pub scheme: SecurityScheme,
+    /// Whether this security requirement is optional (e.g. `Option<BearerToken>`).
+    pub optional: bool,
+}
+
+impl fmt::Debug for SecuritySchemeInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecuritySchemeInfo")
+            .field("name", &self.name)
+            .field("optional", &self.optional)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Function pointer used to collect `OpenAPI` security schemes from an extractor.
+pub type SecurityCollector = fn(&mut Vec<SecuritySchemeInfo>);

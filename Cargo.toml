@@ -150,6 +150,7 @@ askama = { version = "0.16", default-features = false, features = ["derive", "st
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-tungstenite = { version = "0.33.0", optional = true }
+zstd = { version = "0.13", default-features = false, optional = true }
 color-eyre = "0.6"
 linkme = "0.3"
 tracing-log = "0.2"
@@ -272,7 +273,8 @@ wasm-bindgen-futures = "0.4.60"
 js-sys = "0.3.87"
 wasm-streams = "0.5"
 serde-wasm-bindgen = "0.6"
-web-sys = { version = "0.3.87", features = ["Request", "RequestInit", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket"] }
+web-sys = { version = "0.3.87", features = ["Request", "RequestInit", "Response", "ResponseInit", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamDefaultController", "WebSocket", "Crypto", "SubtleCrypto", "CryptoKey"] }
+zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, optional = true }
 
 # `serde_html_form` rather than `serde_urlencoded`: it deserializes repeated keys
 # (`tags=a&tags=b`) into `Vec<_>`, which the query and form extractors both need.
@@ -325,10 +327,13 @@ default = [
     "decompress-deflate",
     "decompress-br",
     "decompress-zstd",
+    "compress-br",
+    "compress-zstd",
 ]
 openapi = ["skyzen-core/openapi", "skyzen-macros/openapi"]
-auth = []
+auth = ["dep:base64"]
 jwt = ["auth", "dep:jsonwebtoken"]
+oidc = ["jwt", "dep:zenwave", "dep:async-channel"]
 json = ["http-kit/json"]
 # The `query` feature enables the `Query` extractor without pulling in form bodies.
 query = ["dep:serde_html_form"]
@@ -356,6 +361,11 @@ decompress-zstd = ["decompress", "dep:ruzstd"]
 # Internal: on whenever any `decompress-*` coding is, so the streaming decoder machinery is
 # compiled exactly when some coding uses it. Not meant to be enabled directly.
 decompress = []
+# Response compression codings for `CompressionMiddleware` beyond `gzip` and `deflate`
+# (which ride on `flate2`). `br` is pure Rust and works on wasm32 too; `zstd` wraps
+# libzstd and is native-only.
+compress-br = ["dep:brotli"]
+compress-zstd = ["dep:zstd"]
 # Database drivers and TLS backends. None is on by default: an application picks the ones it uses,
 # and each forwards to the `skyzen-services` feature of the same name. sqlx runs on its
 # runtime-neutral runtime, so there is no runtime to pick.

@@ -19,7 +19,7 @@ pub use client_ip::{ClientIp, PeerAddr, TrustedProxies};
 #[cfg(feature = "auth")]
 pub mod auth;
 #[cfg(feature = "auth")]
-pub use auth::BearerToken;
+pub use auth::{ApiKey, ApiKeyError, BasicAuth, BasicAuthError, BearerToken};
 
 #[cfg(feature = "validate")]
 mod valid;
