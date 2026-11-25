@@ -117,6 +117,19 @@ pub struct StorageObject {
     pub metadata: ObjectMetadata,
 }
 
+/// Precondition that must hold on the destination key for a write to apply.
+///
+/// A write whose condition fails returns [`StorageError::Conflict`] without replacing the stored
+/// object — the HTTP `If-None-Match: *` and `If-Match: <etag>` primitives shared by S3, R2 and
+/// Azure Blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutCondition {
+    /// Succeed only when no object currently exists under the key (`If-None-Match: *`).
+    IfNotExists,
+    /// Succeed only when the stored object's `ETag` matches this value (`If-Match`).
+    IfMatch(String),
+}
+
 /// Options for storing an object.
 ///
 /// `content_type` and `metadata` are the two every backend records. The rest are *extended*
@@ -144,6 +157,8 @@ pub struct PutOptions {
     /// Raw digest bytes, not hex and not base64: each backend encodes them the way its own API
     /// wants. A mismatch is the backend's error, which is the point of sending it.
     pub content_md5: Option<Vec<u8>>,
+    /// Precondition that must hold on the destination key for the write to succeed.
+    pub condition: Option<PutCondition>,
 }
 
 /// One extended [`PutOptions`] field — everything past content type and custom metadata.
@@ -159,16 +174,19 @@ pub enum PutOption {
     StorageClass,
     /// [`PutOptions::content_md5`].
     ContentMd5,
+    /// [`PutOptions::condition`].
+    Condition,
 }
 
 impl PutOption {
     /// Every extended option, in the order [`PutOptions`] declares them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::CacheControl,
         Self::ContentEncoding,
         Self::ContentDisposition,
         Self::StorageClass,
         Self::ContentMd5,
+        Self::Condition,
     ];
 
     /// What [`PutOptions::reject_unsupported`] reports when a backend cannot honour this option.
@@ -181,6 +199,7 @@ impl PutOption {
             }
             Self::StorageClass => "storage classes are not supported by this storage backend",
             Self::ContentMd5 => "upload checksums are not supported by this storage backend",
+            Self::Condition => "conditional writes are not supported by this storage backend",
         }
     }
 }
@@ -241,6 +260,25 @@ impl PutOptions {
         self
     }
 
+    /// Require `condition` to hold on the destination key for the write to apply.
+    #[must_use]
+    pub fn with_condition(mut self, condition: PutCondition) -> Self {
+        self.condition = Some(condition);
+        self
+    }
+
+    /// Succeed only when no object currently exists under the key (`If-None-Match: *`).
+    #[must_use]
+    pub fn if_not_exists(self) -> Self {
+        self.with_condition(PutCondition::IfNotExists)
+    }
+
+    /// Succeed only when the stored object's `ETag` matches `etag` (`If-Match`).
+    #[must_use]
+    pub fn if_match(self, etag: impl Into<String>) -> Self {
+        self.with_condition(PutCondition::IfMatch(etag.into()))
+    }
+
     /// Returns `true` when no option is set, i.e. the put is equivalent to a
     /// plain [`ObjectStorage::put`].
     #[must_use]
@@ -256,6 +294,7 @@ impl PutOptions {
             PutOption::ContentDisposition => self.content_disposition.is_some(),
             PutOption::StorageClass => self.storage_class.is_some(),
             PutOption::ContentMd5 => self.content_md5.is_some(),
+            PutOption::Condition => self.condition.is_some(),
         })
     }
 

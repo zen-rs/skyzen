@@ -37,16 +37,22 @@
 //! [`ZenwaveHttpClient::system_on_current_thread`] moves a storage's connections onto the calling
 //! thread's own compio runtime.
 
+use core::fmt;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use core::time::Duration;
 use std::collections::HashMap;
 
+use skyzen_aws::sdk::AsyncIoSleep;
 /// The SDK's HTTP client this crate's storages send on, and the loader of the configuration
 /// [`S3Storage::from_config`] takes, re-exported so a storage can be built from one configuration
 /// and rebound to a thread's own pools without naming `skyzen-aws`.
 pub use skyzen_aws::sdk::{load_config, SdkConfig, ZenwaveHttpClient};
 
-use aws_sdk_s3::config::Builder as S3ConfigBuilder;
+use aws_sdk_s3::config::{
+    retry::RetryConfig, timeout::TimeoutConfig, BehaviorVersion, Builder as S3ConfigBuilder,
+    Credentials, Region, SharedHttpClient,
+};
 use aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
@@ -62,8 +68,8 @@ use futures_core::Stream;
 use http_kit::header::{HeaderName, HeaderValue};
 use http_kit::Method;
 use skyzen_services::storage::{
-    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest, PutOption,
-    PutOptions, StorageError, StorageObject, StorageStream,
+    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest,
+    PutCondition, PutOption, PutOptions, StorageError, StorageObject, StorageStream,
 };
 
 /// Above this many bytes a streamed upload becomes a multipart upload.
@@ -85,7 +91,7 @@ const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
 const MAX_MULTIPART_PARTS: i32 = 10_000;
 
 /// Extended [`PutOptions`] a single `PutObject` records: S3 has a header for every one.
-const SINGLE_PUT_OPTIONS: [PutOption; 5] = PutOption::ALL;
+const SINGLE_PUT_OPTIONS: [PutOption; 6] = PutOption::ALL;
 
 /// Extended [`PutOptions`] a multipart upload records.
 ///
@@ -93,11 +99,12 @@ const SINGLE_PUT_OPTIONS: [PutOption; 5] = PutOption::ALL;
 /// rather than from the whole body, so there is nothing for a whole-object MD5 to verify against
 /// and `CreateMultipartUpload` has no `Content-MD5` field. Refusing the option is better than
 /// accepting an upload whose integrity was silently never checked.
-const MULTIPART_PUT_OPTIONS: [PutOption; 4] = [
+const MULTIPART_PUT_OPTIONS: [PutOption; 5] = [
     PutOption::CacheControl,
     PutOption::ContentEncoding,
     PutOption::ContentDisposition,
     PutOption::StorageClass,
+    PutOption::Condition,
 ];
 
 /// Codes S3 uses to say the caller is over a request-rate limit.
@@ -110,6 +117,224 @@ const UNAUTHORIZED_CODES: [&str; 4] = [
     "InvalidAccessKeyId",
     "SignatureDoesNotMatch",
 ];
+
+/// Codes S3 uses when a conditional write (`If-None-Match` / `If-Match`) fails.
+const CONFLICT_CODES: [&str; 2] = ["PreconditionFailed", "ConditionalRequestConflict"];
+
+/// Static S3 credentials passed explicitly to [`S3StorageBuilder::credentials`].
+///
+/// [`fmt::Debug`] redacts the secret key and session token so credentials never leak into logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3Credentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+}
+
+impl S3Credentials {
+    /// Construct static credentials from an access key id and secret access key.
+    #[must_use]
+    pub fn new(access_key_id: impl Into<String>, secret_access_key: impl Into<String>) -> Self {
+        Self {
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+            session_token: None,
+        }
+    }
+
+    /// Attach a temporary session token (`AWS_SESSION_TOKEN`).
+    #[must_use]
+    pub fn with_session_token(mut self, session_token: impl Into<String>) -> Self {
+        self.session_token = Some(session_token.into());
+        self
+    }
+
+    fn into_sdk_credentials(self) -> Credentials {
+        Credentials::new(
+            self.access_key_id,
+            self.secret_access_key,
+            self.session_token,
+            None,
+            "skyzen-s3-static",
+        )
+    }
+}
+
+impl fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Credentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Request and connection timeout bounds for [`S3StorageBuilder::timeouts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct S3Timeouts {
+    /// Maximum wait to establish a connection (DNS, TCP, TLS).
+    pub connect: Option<Duration>,
+    /// Maximum wait for response headers or stalled body reads.
+    pub read: Option<Duration>,
+    /// Maximum duration of a single attempt.
+    pub operation_attempt: Option<Duration>,
+    /// Maximum total duration of an operation across retries.
+    pub operation: Option<Duration>,
+}
+
+impl S3Timeouts {
+    /// Convert into the AWS SDK's [`TimeoutConfig`].
+    fn into_sdk_timeout_config(self) -> TimeoutConfig {
+        let mut builder = TimeoutConfig::builder();
+        if let Some(connect) = self.connect {
+            builder = builder.connect_timeout(connect);
+        }
+        if let Some(read) = self.read {
+            builder = builder.read_timeout(read);
+        }
+        if let Some(operation_attempt) = self.operation_attempt {
+            builder = builder.operation_attempt_timeout(operation_attempt);
+        }
+        if let Some(operation) = self.operation {
+            builder = builder.operation_timeout(operation);
+        }
+        builder.build()
+    }
+}
+
+/// Builder for [`S3Storage`] supporting custom endpoints, regions, explicit credentials,
+/// path-style addressing, retry limits, and request timeouts without mutating process environment
+/// variables.
+#[derive(Debug)]
+pub struct S3StorageBuilder {
+    bucket: String,
+    endpoint_url: Option<String>,
+    region: Option<String>,
+    force_path_style: Option<bool>,
+    credentials: Option<S3Credentials>,
+    timeouts: Option<S3Timeouts>,
+    max_attempts: Option<u32>,
+    http_client: Option<SharedHttpClient>,
+}
+
+impl S3StorageBuilder {
+    /// Create a builder targeting `bucket`.
+    #[must_use]
+    pub fn new(bucket: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            endpoint_url: None,
+            region: None,
+            force_path_style: None,
+            credentials: None,
+            timeouts: None,
+            max_attempts: None,
+            http_client: None,
+        }
+    }
+
+    /// Set a custom S3-compatible endpoint URL (Cloudflare R2, `MinIO`, Tigris, local mock).
+    ///
+    /// Unless [`force_path_style`](Self::force_path_style) is set explicitly, providing a custom
+    /// endpoint enables path-style addressing by default.
+    #[must_use]
+    pub fn endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
+        self.endpoint_url = Some(endpoint_url.into());
+        self
+    }
+
+    /// Set the signing region (for example `"auto"` for Cloudflare R2 or `"us-east-1"` for AWS).
+    #[must_use]
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
+        self
+    }
+
+    /// Explicitly enable or disable path-style bucket URLs (`https://endpoint/bucket/key`).
+    #[must_use]
+    pub const fn force_path_style(mut self, enabled: bool) -> Self {
+        self.force_path_style = Some(enabled);
+        self
+    }
+
+    /// Provide static credentials explicitly instead of reading the ambient environment chain.
+    #[must_use]
+    pub fn credentials(mut self, credentials: S3Credentials) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    /// Configure connection, read, attempt, and overall operation timeouts.
+    #[must_use]
+    pub const fn timeouts(mut self, timeouts: S3Timeouts) -> Self {
+        self.timeouts = Some(timeouts);
+        self
+    }
+
+    /// Set the maximum number of attempts (1 disables retries).
+    #[must_use]
+    pub const fn max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = Some(max_attempts);
+        self
+    }
+
+    /// Override the HTTP client used to issue S3 requests.
+    #[must_use]
+    pub fn http_client(mut self, http: impl aws_sdk_s3::config::HttpClient + 'static) -> Self {
+        self.http_client = Some(SharedHttpClient::new(http));
+        self
+    }
+
+    /// Build the configured [`S3Storage`].
+    ///
+    /// When both [`credentials`](Self::credentials) and [`region`](Self::region) are supplied
+    /// explicitly, the ambient process environment and `~/.aws` files are not read. Otherwise
+    /// missing fields fall back to [`load_config`].
+    pub async fn build(self) -> S3Storage {
+        let http = self
+            .http_client
+            .unwrap_or_else(|| SharedHttpClient::new(ZenwaveHttpClient::system()));
+
+        let mut s3_builder = if self.credentials.is_some() && self.region.is_some() {
+            S3ConfigBuilder::new()
+                .behavior_version(BehaviorVersion::latest())
+                .http_client(http)
+                .sleep_impl(AsyncIoSleep)
+        } else {
+            let shared_config = load_config(http).await;
+            S3ConfigBuilder::from(&shared_config)
+        };
+
+        let force_path_style = self
+            .force_path_style
+            .unwrap_or_else(|| self.endpoint_url.is_some());
+        if let Some(endpoint_url) = self.endpoint_url {
+            s3_builder = s3_builder.endpoint_url(endpoint_url);
+        }
+        if force_path_style {
+            s3_builder = s3_builder.force_path_style(true);
+        }
+        if let Some(region) = self.region {
+            s3_builder = s3_builder.region(Region::new(region));
+        }
+        if let Some(credentials) = self.credentials {
+            s3_builder = s3_builder.credentials_provider(credentials.into_sdk_credentials());
+        }
+        if let Some(timeouts) = self.timeouts {
+            s3_builder = s3_builder.timeout_config(timeouts.into_sdk_timeout_config());
+        }
+        if let Some(max_attempts) = self.max_attempts {
+            s3_builder =
+                s3_builder.retry_config(RetryConfig::standard().with_max_attempts(max_attempts));
+        }
+
+        S3Storage::new(Client::from_conf(s3_builder.build()), self.bucket)
+    }
+}
 
 /// An S3-compatible object storage backend.
 ///
@@ -130,6 +355,12 @@ impl S3Storage {
             client,
             bucket: bucket.into(),
         }
+    }
+
+    /// Start building an [`S3Storage`] with custom endpoint, region, credentials, or timeouts.
+    #[must_use]
+    pub fn builder(bucket: impl Into<String>) -> S3StorageBuilder {
+        S3StorageBuilder::new(bucket)
     }
 
     /// Create a new `S3Storage` from environment configuration.
@@ -208,7 +439,14 @@ impl S3Storage {
         };
 
         let result = self
-            .run_multipart(key, upload_id, first_part, stream, content_length)
+            .run_multipart(
+                key,
+                upload_id,
+                first_part,
+                stream,
+                content_length,
+                options.condition,
+            )
             .await;
 
         if let Err(error) = result {
@@ -238,6 +476,7 @@ impl S3Storage {
         first_part: Vec<u8>,
         mut stream: StorageStream,
         content_length: Option<u64>,
+        condition: Option<PutCondition>,
     ) -> Result<(), StorageError> {
         let mut parts = Vec::new();
         let mut part_number: i32 = 1;
@@ -300,7 +539,8 @@ impl S3Storage {
             }
         }
 
-        self.client
+        let mut complete = self
+            .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
@@ -309,10 +549,17 @@ impl S3Storage {
                 CompletedMultipartUpload::builder()
                     .set_parts(Some(parts))
                     .build(),
-            )
-            .send()
-            .await
-            .map_err(sdk_error)?;
+            );
+        match &condition {
+            Some(PutCondition::IfNotExists) => {
+                complete = complete.if_none_match("*");
+            }
+            Some(PutCondition::IfMatch(etag)) => {
+                complete = complete.if_match(etag);
+            }
+            None => {}
+        }
+        complete.send().await.map_err(sdk_error)?;
 
         Ok(())
     }
@@ -357,6 +604,7 @@ where
             StorageError::Throttled { retry_after: None }
         }
         Some(code) if UNAUTHORIZED_CODES.contains(&code) => StorageError::Unauthorized,
+        Some(code) if CONFLICT_CODES.contains(&code) => StorageError::Conflict,
         _ => StorageError::backend_with(DisplayErrorContext(&err).to_string(), err),
     }
 }
@@ -700,6 +948,15 @@ impl ObjectStorage for S3Storage {
         if let Some(digest) = &options.content_md5 {
             request = request.content_md5(content_md5_header(digest));
         }
+        match &options.condition {
+            Some(PutCondition::IfNotExists) => {
+                request = request.if_none_match("*");
+            }
+            Some(PutCondition::IfMatch(etag)) => {
+                request = request.if_match(etag);
+            }
+            None => {}
+        }
 
         request.send().await.map_err(sdk_error)?;
         Ok(())
@@ -984,6 +1241,15 @@ impl ObjectStorage for S3Storage {
 
         if let Some(digest) = &options.content_md5 {
             request = request.content_md5(content_md5_header(digest));
+        }
+        match &options.condition {
+            Some(PutCondition::IfNotExists) => {
+                request = request.if_none_match("*");
+            }
+            Some(PutCondition::IfMatch(etag)) => {
+                request = request.if_match(etag);
+            }
+            None => {}
         }
 
         let presigned = request
@@ -1423,5 +1689,119 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("one week"), "{error}");
+    }
+
+    #[test]
+    fn s3_credentials_debug_redacts_secrets() {
+        let creds = super::S3Credentials::new("AKIDPUBLIC", "top-secret-value")
+            .with_session_token("session-secret-token");
+        let rendered = format!("{creds:?}");
+        assert!(rendered.contains("AKIDPUBLIC"), "{rendered}");
+        assert!(!rendered.contains("top-secret-value"), "{rendered}");
+        assert!(!rendered.contains("session-secret-token"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[compio::test]
+    async fn builder_sends_conditional_puts_and_maps_precondition_failed_to_conflict() {
+        use http_kit::{Body, Response, StatusCode};
+        use skyzen_test::{LoopbackServer, ReceivedRequest};
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<ReceivedRequest>();
+        let server = LoopbackServer::start(move |request| {
+            let if_none_match = request
+                .headers()
+                .get("if-none-match")
+                .and_then(|v| v.to_str().ok())
+                .map(ToOwned::to_owned);
+            let if_match = request
+                .headers()
+                .get("if-match")
+                .and_then(|v| v.to_str().ok())
+                .map(ToOwned::to_owned);
+            tx.send(request).expect("test still listening");
+            if if_none_match.as_deref() == Some("*") {
+                let xml = "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>";
+                let mut response = Response::new(Body::from_bytes(xml.as_bytes().to_vec()));
+                *response.status_mut() = StatusCode::PRECONDITION_FAILED;
+                return response;
+            }
+            if if_match.as_deref() == Some("\"stale\"") {
+                let xml = "<Error><Code>ConditionalRequestConflict</Code><Message>Conflict</Message></Error>";
+                let mut response = Response::new(Body::from_bytes(xml.as_bytes().to_vec()));
+                *response.status_mut() = StatusCode::CONFLICT;
+                return response;
+            }
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::OK;
+            response
+        });
+
+        let store = S3Storage::builder("stow-cache")
+            .endpoint_url(format!("http://{}", server.addr()))
+            .region("auto")
+            .credentials(super::S3Credentials::new("AKIDR2TEST", "r2-secret"))
+            .timeouts(super::S3Timeouts {
+                connect: Some(core::time::Duration::from_secs(2)),
+                read: Some(core::time::Duration::from_secs(5)),
+                ..super::S3Timeouts::default()
+            })
+            .max_attempts(1)
+            .build()
+            .await;
+
+        let err = store
+            .put_with(
+                "v1/local/demo.tar.zst",
+                b"payload".to_vec(),
+                PutOptions::new().if_not_exists(),
+            )
+            .await
+            .expect_err("412 PreconditionFailed must map to StorageError::Conflict");
+        assert!(matches!(err, StorageError::Conflict), "got {err:?}");
+
+        let err2 = store
+            .put_with(
+                "v1/local/demo.tar.zst",
+                b"payload".to_vec(),
+                PutOptions::new().if_match("\"stale\""),
+            )
+            .await
+            .expect_err("409 ConditionalRequestConflict must map to StorageError::Conflict");
+        assert!(matches!(err2, StorageError::Conflict), "got {err2:?}");
+
+        store
+            .put_with(
+                "v1/local/demo.tar.zst",
+                b"payload".to_vec(),
+                PutOptions::new().if_match("\"fresh\""),
+            )
+            .await
+            .expect("matching If-Match succeeds");
+
+        let first = rx.recv().expect("first request");
+        assert_eq!(first.uri().path(), "/stow-cache/v1/local/demo.tar.zst");
+        assert_eq!(first.headers()["if-none-match"], "*");
+        assert!(
+            first.headers()["authorization"]
+                .to_str()
+                .unwrap()
+                .contains("Credential=AKIDR2TEST/"),
+            "{:?}",
+            first.headers()["authorization"]
+        );
+        assert!(
+            first.headers()["authorization"]
+                .to_str()
+                .unwrap()
+                .contains("/auto/s3/aws4_request"),
+            "{:?}",
+            first.headers()["authorization"]
+        );
+        let second = rx.recv().expect("second request");
+        assert_eq!(second.headers()["if-match"], "\"stale\"");
+        let third = rx.recv().expect("third request");
+        assert_eq!(third.headers()["if-match"], "\"fresh\"");
     }
 }
