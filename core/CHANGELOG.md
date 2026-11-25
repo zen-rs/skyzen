@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/skyzen/compare/core/v0.3.0...core/v0.4.0) - 2026-11-25
+
+### Added
+
+- *(auth)* add wasm32 JWT, JWKS/OIDC, Basic/ApiKey extractors, and OpenAPI security schemes
+- add native owned-buffer HTTP/2 server and RFC 8441 WebSockets
+- [**breaking**] hand each serving thread's context to the endpoint factory
+- *(core)* list each interface's receive-queue interrupts for placement
+- *(core)* share the io_uring NAPI registration with skyzen doctor
+- *(runtime)* [**breaking**] serve on http-kit 0.8 and zenwave 0.12 with operator io_uring settings
+- *(core)* [**breaking**] build Upgraded from a connection's halves, spliceable on Linux
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into perf/173-hotpath
+- Merge remote-tracking branch 'origin/main' into feat/254-auth-wasm-jwks
+- Merge branch 'main' into perf/173-hotpath
+- update READMEs for HTTP/2, HTTP/3, io_uring, proxy, embedding, and no_std
+- trim per-request dispatch, extension, and log overhead on the hot path
+- perf!(core, routing, runtime): cut per-request allocations, cross-core atomics, and body copies
+- *(core)* share the native server's variable names with the CLI
+- *(core)* read the steering placement in skyzen-core
+
 ## [0.3.0](https://github.com/zen-rs/skyzen/compare/core/v0.2.1...core/v0.3.0) - 2026-11-11
 
 ### Added

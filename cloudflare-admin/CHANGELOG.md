@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/zen-rs/skyzen/compare/cloudflare-admin/v0.6.1...cloudflare-admin/v0.7.0) - 2026-11-25
+
+### Added
+
+- [**breaking**] hand each serving thread's context to the endpoint factory
+
+### Other
+
+- sync deployment guide, proxy resilience docs, and embed_hyper.rs comments
+- Merge remote-tracking branch 'origin/main' into docs/update-readme
+- add in-repo skyzen skill and require keeping it synced in AGENTS.md
+- update READMEs for HTTP/2, HTTP/3, io_uring, proxy, embedding, and no_std
+- Drop the `get` route-builder alias
+
 ## [0.6.0](https://github.com/zen-rs/skyzen/compare/cloudflare-admin/v0.5.2...cloudflare-admin/v0.6.0) - 2026-11-11
 
 ### Added

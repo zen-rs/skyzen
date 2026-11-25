@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/zen-rs/skyzen/compare/manifest/v0.2.2...manifest/v0.2.3) - 2026-11-25
+
+### Added
+
+- *(manifest)* [native.server] for a native deployment's address and busy polling
+- *(manifest)* add the [native.linux] host acceleration section
+
+### Other
+
+- replace the cargo-machete job with cargo::unused_dependencies
+
 ## [0.2.2](https://github.com/zen-rs/skyzen/compare/manifest/v0.2.1...manifest/v0.2.2) - 2026-11-11
 
 ### Added

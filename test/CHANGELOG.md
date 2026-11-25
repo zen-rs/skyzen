@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/zen-rs/skyzen/compare/test/v0.4.0...test/v0.5.0) - 2026-11-25
+
+### Added
+
+- *(storage,s3)* add conditional puts and S3StorageBuilder
+- *(runtime)* [**breaking**] serve on http-kit 0.8 and zenwave 0.12 with operator io_uring settings
+
+### Other
+
+- Merge branch 'main' into perf/173-hotpath
+- trim per-request dispatch, extension, and log overhead on the hot path
+- take map_or_default where clippy 1.100 asks for it in azure and test
+- *(runtime)* register the receive ring for incremental consumption
+
 ## [0.4.0](https://github.com/zen-rs/skyzen/compare/test/v0.3.2...test/v0.4.0) - 2026-11-11
 
 ### Added

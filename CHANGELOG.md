@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/zen-rs/skyzen/compare/v0.6.1...v0.7.0) - 2026-11-25
+
+### Added
+
+- *(storage,s3)* add conditional puts and S3StorageBuilder
+- *(web)* add host/header route predicates, askama Template responder, and static multi-range / If-Range
+- *(proxy)* add load balancing, health checks, timeouts, and retries
+- *(auth)* add wasm32 JWT, JWKS/OIDC, Basic/ApiKey extractors, and OpenAPI security schemes
+- *(middleware)* add br/zstd and streaming compression, wasm32 Timeout, sliding-window rate limits, and ConcurrencyLimit
+- harden WebSocket, Multipart, and StaticDir defaults
+- enable native HTTP/2 on outbound proxy, AWS, and Azure clients
+- add native owned-buffer HTTP/2 server and RFC 8441 WebSockets
+- *(durable)* [**breaking**] keep a Durable Object resident while a guard is held
+- [**breaking**] hand each serving thread's context to the endpoint factory
+- *(runtime)* serve cached static files from the ring's registered region
+- *(cli)* run the native service unprivileged, with its variables in an EnvironmentFile
+- *(manifest)* [native.server] for a native deployment's address and busy polling
+- *(cli)* apply [native.linux] with `skyzen deploy --provider native`
+- *(core)* list each interface's receive-queue interrupts for placement
+- *(manifest)* add the [native.linux] host acceleration section
+- *(runtime)* busy polling as an operator setting
+- *(core)* share the io_uring NAPI registration with skyzen doctor
+- *(cli)* report the zero-copy locked-memory limit in skyzen doctor
+- *(runtime)* [**breaking**] serve on http-kit 0.8 and zenwave 0.12 with operator io_uring settings
+- *(cli)* report Linux acceleration in skyzen doctor
+- *(proxy)* splice bodies and upgraded tunnels
+- *(core)* [**breaking**] build Upgraded from a connection's halves, spliceable on Linux
+
+### Fixed
+
+- *(openapi)* register element schemas instead of bare Vec components
+- *(runtime)* satisfy clippy 1.100 on the native server without its features
+- *(runtime)* satisfy clippy on the Linux-only region code
+- *(runtime)* bind HTTP/3 and TCP on a port both can take
+- *(aws)* carry the SDK's timeouts on each request
+- *(cli)* import Context for every Linux-only helper of the native deploy
+- *(runtime)* convert the ring flag without a truncating cast
+- *(cli)* build the native deploy only for Linux
+- *(deps)* take http-kit-io 0.6.2, which reports a file round's partial progress
+- *(runtime)* keep the Windows build free of unix-only imports and lints
+- *(proxy)* dial upstreams with the serving thread's driver
+- *(runtime)* box the TLS handshake future the connection task awaits
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into perf/173-hotpath
+- Merge remote-tracking branch 'origin/main' into feat/256-web-routing-templates
+- Merge remote-tracking branch 'origin/main' into feat/254-auth-wasm-jwks
+- Merge remote-tracking branch 'origin/main' into feat/255-middleware
+- Merge remote-tracking branch 'origin/main' into feat/255-middleware
+- sync deployment guide, proxy resilience docs, and embed_hyper.rs comments
+- keep PR markdown-only by dropping embed_hyper.rs comment tweak
+- Merge remote-tracking branch 'origin/main' into docs/update-readme
+- Merge remote-tracking branch 'origin/main' into feat/255-middleware
+- Merge branch 'main' into perf/173-hotpath
+- Merge remote-tracking branch 'origin/main' into docs/update-readme
+- Merge branch 'main' into feat/256-web-routing-templates
+- Merge remote-tracking branch 'origin/main' into feat/258-proxy-lb-resilience
+- add in-repo skyzen skill and require keeping it synced in AGENTS.md
+- Merge remote-tracking branch 'origin/main' into feat/258-proxy-lb-resilience
+- update READMEs for HTTP/2, HTTP/3, io_uring, proxy, embedding, and no_std
+- trim per-request dispatch, extension, and log overhead on the hot path
+- Merge remote-tracking branch 'origin/main' into perf/261-hotpath
+- Merge remote-tracking branch 'origin/main' into feat/258-proxy-lb-resilience
+- Merge branch 'main' into feat/254-auth-wasm-jwks
+- Merge remote-tracking branch 'origin/main' into feat/108-harden-defaults
+- perf!(core, routing, runtime): cut per-request allocations, cross-core atomics, and body copies
+- Merge remote-tracking branch 'origin/main' into fix/26-openapi-vec-schema
+- add cargo-deny supply-chain check
+- Drop the `get` route-builder alias
+- Drop unused_dependencies from scaffold templates and keep the example at warn
+- Leave cargo::unused_dependencies at warn: several member deps serve feature/platform-intersection domains Cargo cannot express
+- replace the cargo-machete job with cargo::unused_dependencies
+- *(static-files)* write the region test's files before the router watches the directory
+- *(cli)* take map_or_default for the NIC interrupt lookup
+- take map_or_default where clippy 1.100 asks for it in azure and test
+- take map_or_default where clippy 1.100 asks for it
+- Merge remote-tracking branch 'origin/main' into perf/163-ring-inc
+- Merge remote-tracking branch 'origin/main' into feat/229-deploy
+- *(deps)* take zenwave and executor-core from git, drop the patch section
+- *(runtime)* register the receive ring for incremental consumption
+- document [native.server] and the native service's sandbox
+- *(core)* share the native server's variable names with the CLI
+- document [native.linux] and the native deployment
+- *(static-files)* print the server's record when a region arrives changed
+- *(proxy)* name IoSettings without a link the rt-less build cannot resolve
+- *(proxy)* box the kernel TLS tests' server handshake
+- *(runtime)* box the handshake inside negotiate rather than at each caller
+- *(runtime)* document why the handshake future is boxed on negotiate itself
+- *(proxy)* adopt the kernel TLS tests' sockets through a Compio value
+- *(proxy)* pass the consuming writer's pipe offer through
+- *(core)* read the steering placement in skyzen-core
+- fix rustls dependency spacing
+
 ### Changed
 
 - *(perf)* trim per-request overhead on the dispatch hot path ([#173](https://github.com/zen-rs/skyzen/issues/173)):
