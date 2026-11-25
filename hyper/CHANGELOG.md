@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/skyzen/compare/hyper/v0.3.0...hyper/v0.4.0) - 2026-11-25
+
+### Added
+
+- add native owned-buffer HTTP/2 server and RFC 8441 WebSockets
+- *(runtime)* [**breaking**] serve on http-kit 0.8 and zenwave 0.12 with operator io_uring settings
+- *(core)* [**breaking**] build Upgraded from a connection's halves, spliceable on Linux
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into perf/173-hotpath
+- Merge branch 'main' into perf/173-hotpath
+- update READMEs for HTTP/2, HTTP/3, io_uring, proxy, embedding, and no_std
+- trim per-request dispatch, extension, and log overhead on the hot path
+- perf!(core, routing, runtime): cut per-request allocations, cross-core atomics, and body copies
+- *(runtime)* register the receive ring for incremental consumption
+
 ## [0.3.0](https://github.com/zen-rs/skyzen/compare/hyper/v0.2.1...hyper/v0.3.0) - 2026-11-11
 
 ### Added
