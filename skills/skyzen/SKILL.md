@@ -271,7 +271,7 @@ When integrating into an existing `tokio`, `smol`, or `compio` process (without 
 
 ## 7. Building Portable Multi-Cloud Web Applications
 
-1. **Depend on capabilities, never vendor SDKs in handlers:** Ask for `Kv`, `Storage`, `Queue`, `Db` (or generated named wrappers from `[[service]]` / `[[database]]` / `[[secret]]` via `import_config!`). Wire backends per target in `Skyzen.toml` (`[native.service.*]`, `[cloudflare.service.*]`, etc.).
+1. **Depend on capabilities, never vendor SDKs in handlers:** Ask for `Kv`, `Storage`, `Queue`, `Db` (or generated named wrappers from `[[service]]` / `[[database]]` / `[[secret]]` via `import_config!`). Wire backends per target in `Skyzen.toml` (`[native.service.*]`, `[cloudflare.service.*]`, etc.). Use `PutOptions::if_not_exists()` / `PutOptions::if_match(etag)` for conditional object writes (mapping precondition failures to `StorageError::Conflict`), and `S3Storage::builder(bucket)` when configuring custom S3-compatible endpoints, regions, static credentials, or timeouts outside ambient process env.
 2. **Use portable SQL patterns:**
    - Decode rows with `#[derive(FromRow)]` and column newtypes/enums with `#[derive(Column)]` so types like `Uuid`, `DateTime<Utc>`, and `BigDecimal` decode identically across Postgres, MySQL, SQLite, D1, Aurora Data API, and Azure SQL.
    - Embed migrations with `embed_migrations!("migrations")` and apply with `db.migrate(&MIGRATIONS)` or `skyzen migrate`.

@@ -11,8 +11,8 @@ use http::{header::HeaderName, HeaderValue, Method};
 use opendal::{services::Azblob, ErrorKind, HttpTransporter, OperationContext, Operator};
 use reqsign_azure_storage::Credential;
 use skyzen_services::storage::{
-    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest, PutOption,
-    PutOptions, StorageError, StorageObject, StorageStream,
+    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest,
+    PutCondition, PutOption, PutOptions, StorageError, StorageObject, StorageStream,
 };
 
 use self::rest::{BlobRest, READ_PERMISSION, WRITE_PERMISSION};
@@ -763,6 +763,12 @@ fn upload_headers(options: &PutOptions) -> Result<Vec<(HeaderName, HeaderValue)>
             HeaderName::from_static("content-md5"),
             &base64::engine::general_purpose::STANDARD.encode(digest),
         )?;
+    }
+    if let Some(condition) = &options.condition {
+        match condition {
+            PutCondition::IfNotExists => push(HeaderName::from_static("if-none-match"), "*")?,
+            PutCondition::IfMatch(etag) => push(HeaderName::from_static("if-match"), etag)?,
+        }
     }
     for (name, value) in &options.metadata {
         let name = HeaderName::try_from(format!("x-ms-meta-{name}")).map_err(|error| {

@@ -104,8 +104,8 @@ pub use sql::{
     JsonRow, LocationMapper, QuerySource, Row, RowError, SqlQuery,
 };
 pub use storage::{
-    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest, PutOption,
-    PutOptions, Storage, StorageError, StorageObject, StorageStream,
+    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest,
+    PutCondition, PutOption, PutOptions, Storage, StorageError, StorageObject, StorageStream,
 };
 
 #[cfg(test)]

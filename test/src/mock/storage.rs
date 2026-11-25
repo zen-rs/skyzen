@@ -3,7 +3,10 @@
 use core::future::{ready, Future};
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +17,7 @@ use http_kit::{
 
 use skyzen_services::storage::{
     ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PresignedRequest,
-    PutOptions, StorageError, StorageObject, StorageStream,
+    PutCondition, PutOptions, StorageError, StorageObject, StorageStream,
 };
 
 /// The scheme of the URLs [`InMemoryStorage`] presigns.
@@ -30,6 +33,7 @@ struct StoredObject {
     /// [`PutOptions`] grows.
     options: PutOptions,
     last_modified: u64,
+    etag: String,
 }
 
 /// An in-memory object storage backed by a `HashMap`.
@@ -59,6 +63,7 @@ struct StoredObject {
 pub struct InMemoryStorage {
     data: Arc<RwLock<HashMap<String, StoredObject>>>,
     fail_next: Arc<RwLock<Option<String>>>,
+    next_etag: Arc<AtomicU64>,
 }
 
 impl InMemoryStorage {
@@ -68,6 +73,7 @@ impl InMemoryStorage {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
             fail_next: Arc::new(RwLock::new(None)),
+            next_etag: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -98,18 +104,37 @@ impl InMemoryStorage {
         })
     }
 
-    fn insert(&self, key: &str, body: Vec<u8>, options: PutOptions) {
-        self.data
-            .write()
-            .expect("InMemoryStorage lock poisoned")
-            .insert(
-                key.to_owned(),
-                StoredObject {
-                    body,
-                    options,
-                    last_modified: unix_now(),
-                },
-            );
+    fn insert(&self, key: &str, body: Vec<u8>, options: PutOptions) -> Result<(), StorageError> {
+        let mut data = self.data.write().expect("InMemoryStorage lock poisoned");
+        if let Some(condition) = &options.condition {
+            match condition {
+                PutCondition::IfNotExists => {
+                    if data.contains_key(key) {
+                        return Err(StorageError::Conflict);
+                    }
+                }
+                PutCondition::IfMatch(expected) => {
+                    let matches = data
+                        .get(key)
+                        .is_some_and(|existing| existing.etag == *expected);
+                    if !matches {
+                        return Err(StorageError::Conflict);
+                    }
+                }
+            }
+        }
+        let generation = self.next_etag.fetch_add(1, Ordering::Relaxed);
+        data.insert(
+            key.to_owned(),
+            StoredObject {
+                body,
+                options,
+                last_modified: unix_now(),
+                etag: format!("\"{generation}\""),
+            },
+        );
+        drop(data);
+        Ok(())
     }
 }
 
@@ -132,9 +157,7 @@ fn metadata_for(key: &str, object: &StoredObject) -> ObjectMetadata {
         content_type: object.options.content_type.clone(),
         last_modified: Some(object.last_modified),
         metadata: object.options.metadata.clone(),
-        // A HashMap keeps no version history and mints no entity tag, and inventing either would
-        // let a test assert on something no real backend guarantees.
-        etag: None,
+        etag: Some(object.etag.clone()),
         version: None,
     }
 }
@@ -162,7 +185,7 @@ impl ObjectStorage for InMemoryStorage {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         ready(
             self.take_injected_failure()
-                .map(|()| self.insert(key, body, PutOptions::default())),
+                .and_then(|()| self.insert(key, body, PutOptions::default())),
         )
     }
 
@@ -174,7 +197,7 @@ impl ObjectStorage for InMemoryStorage {
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         ready(
             self.take_injected_failure()
-                .map(|()| self.insert(key, body, options)),
+                .and_then(|()| self.insert(key, body, options)),
         )
     }
 
@@ -273,8 +296,7 @@ impl ObjectStorage for InMemoryStorage {
                 )));
             }
         }
-        self.insert(key, body, options);
-        Ok(())
+        self.insert(key, body, options)
     }
 
     fn get_range(
@@ -611,5 +633,65 @@ mod tests {
         );
 
         assert!(storage.get("key").await.unwrap().is_some());
+    }
+
+    #[compio::test]
+    async fn conditional_puts_enforce_if_not_exists_and_if_match() {
+        let storage = InMemoryStorage::new();
+
+        storage
+            .put_with(
+                "v1/local/demo.tar.zst",
+                b"first".to_vec(),
+                PutOptions::new().if_not_exists(),
+            )
+            .await
+            .expect("first if_not_exists succeeds");
+
+        let err = storage
+            .put_with(
+                "v1/local/demo.tar.zst",
+                b"second".to_vec(),
+                PutOptions::new().if_not_exists(),
+            )
+            .await
+            .expect_err("second if_not_exists must conflict");
+        assert!(matches!(err, StorageError::Conflict));
+
+        let stored = storage
+            .get("v1/local/demo.tar.zst")
+            .await
+            .unwrap()
+            .expect("stored object");
+        assert_eq!(stored.body, b"first");
+        let etag = stored.metadata.etag.expect("in-memory object has etag");
+
+        let mismatch = storage
+            .put_with(
+                "v1/local/demo.tar.zst",
+                b"wrong".to_vec(),
+                PutOptions::new().if_match("\"wrong\""),
+            )
+            .await
+            .expect_err("mismatched etag must conflict");
+        assert!(matches!(mismatch, StorageError::Conflict));
+
+        storage
+            .put_with(
+                "v1/local/demo.tar.zst",
+                b"updated".to_vec(),
+                PutOptions::new().if_match(&etag),
+            )
+            .await
+            .expect("matching etag updates object");
+        assert_eq!(
+            storage
+                .get("v1/local/demo.tar.zst")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            b"updated"
+        );
     }
 }

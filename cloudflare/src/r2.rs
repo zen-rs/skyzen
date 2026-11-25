@@ -36,8 +36,8 @@ use worker_sys::{
 };
 
 use skyzen_services::storage::{
-    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PutOption, PutOptions,
-    StorageError, StorageObject, StorageStream,
+    ByteRange, ListOptions, ListResult, ObjectMetadata, ObjectStorage, PutCondition, PutOption,
+    PutOptions, StorageError, StorageObject, StorageStream,
 };
 
 /// R2 accepts at most 1000 keys in one bulk delete.
@@ -162,13 +162,17 @@ impl ObjectStorage for CfR2 {
         body: Vec<u8>,
         options: PutOptions,
     ) -> Result<(), StorageError> {
-        let js_options = build_put_options(&options)?;
+        let conditional = options.condition.is_some();
+        let js_options = build_put_options(&options, true)?;
         let array = js_sys::Uint8Array::from(body.as_slice());
         let promise = self
             .bucket
             .put(key.to_owned(), array.into(), js_options)
             .map_err(js_err)?;
-        JsFuture::from(promise).into_send().await.map_err(js_err)?;
+        let result = JsFuture::from(promise).into_send().await.map_err(js_err)?;
+        if conditional && (result.is_null() || result.is_undefined()) {
+            return Err(StorageError::Conflict);
+        }
         Ok(())
     }
 
@@ -310,7 +314,8 @@ impl ObjectStorage for CfR2 {
                  use `CfR2::create_multipart_upload` when the total is not known",
             ));
         };
-        let js_options = build_put_options(&options)?;
+        let conditional = options.condition.is_some();
+        let js_options = build_put_options(&options, true)?;
 
         let length = u32::try_from(content_length).map_err(|_| {
             StorageError::backend(
@@ -334,7 +339,13 @@ impl ObjectStorage for CfR2 {
         // pipe fills the writable one, so awaiting either alone deadlocks. `Promise.all` also
         // means a failure on either side surfaces instead of becoming an unhandled rejection.
         let both = js_sys::Promise::all(&js_sys::Array::of2(&piped, &put));
-        JsFuture::from(both).into_send().await.map_err(js_err)?;
+        let results = JsFuture::from(both).into_send().await.map_err(js_err)?;
+        if conditional {
+            let put_result = js_sys::Array::from(&results).get(1);
+            if put_result.is_null() || put_result.is_undefined() {
+                return Err(StorageError::Conflict);
+            }
+        }
         Ok(())
     }
 }
@@ -653,7 +664,7 @@ impl CfR2 {
         key: &str,
         options: PutOptions,
     ) -> Result<CfR2MultipartUpload, StorageError> {
-        let js_options = build_put_options(&options)?;
+        let js_options = build_put_options(&options, false)?;
         let promise = self
             .bucket
             .create_multipart_upload(key.to_owned(), js_options)
@@ -864,14 +875,24 @@ fn js_value_to_bytes(value: &JsValue) -> Result<Bytes, StorageError> {
     }
 }
 
+/// Extended [`PutOptions`] accepted by R2's `createMultipartUpload` (which has no `onlyIf`).
+const MULTIPART_PUT_OPTIONS: [PutOption; 5] = [
+    PutOption::CacheControl,
+    PutOption::ContentEncoding,
+    PutOption::ContentDisposition,
+    PutOption::StorageClass,
+    PutOption::ContentMd5,
+];
+
 /// Build the JS options object an R2 `put` (or `createMultipartUpload`) takes.
-///
-/// R2 honours every extended [`PutOptions`] field, so nothing is refused here — the
-/// `reject_unsupported` guard other backends need has nothing to reject.
-fn build_put_options(options: &PutOptions) -> Result<JsValue, StorageError> {
+fn build_put_options(options: &PutOptions, allow_condition: bool) -> Result<JsValue, StorageError> {
     // Named so a future addition to `PutOptions` that R2 does *not* map fails loudly rather than
     // being silently dropped by this builder.
-    options.reject_unsupported(&PutOption::ALL)?;
+    if allow_condition {
+        options.reject_unsupported(&PutOption::ALL)?;
+    } else {
+        options.reject_unsupported(&MULTIPART_PUT_OPTIONS)?;
+    }
 
     let js_options = js_sys::Object::new();
 
@@ -916,6 +937,19 @@ fn build_put_options(options: &PutOptions) -> Result<JsValue, StorageError> {
             "md5",
             &js_sys::Uint8Array::from(digest.as_slice()).into(),
         )?;
+    }
+
+    if let Some(condition) = &options.condition {
+        let only_if = js_sys::Object::new();
+        match condition {
+            PutCondition::IfNotExists => {
+                set(&only_if, "etagDoesNotMatch", &JsValue::from_str("*"))?;
+            }
+            PutCondition::IfMatch(etag) => {
+                set(&only_if, "etagMatches", &JsValue::from_str(etag))?;
+            }
+        }
+        set(&js_options, "onlyIf", &only_if)?;
     }
 
     Ok(js_options.into())
